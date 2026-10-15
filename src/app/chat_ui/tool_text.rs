@@ -198,7 +198,7 @@ impl ToolText {
         target: Target,
         find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(theme, limit.map(|height| (height, true)), target, find)
+        self.surface(theme, limit.map(|height| (height, true)), target, find, None)
     }
 
     /// Patches and read results open at their first line.
@@ -209,7 +209,14 @@ impl ToolText {
         target: Target,
         find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(theme, Some((height, false)), target, find)
+        self.surface(theme, Some((height, false)), target, find, None)
+    }
+
+    pub(super) fn view_logical(
+        &self, theme: crate::settings::EditorSyntaxTheme, limit: Option<(f32, bool)>,
+        target: Target, find: Option<&str>, logical: selectable_prose::Logical,
+    ) -> Element<'static, Message> {
+        self.surface(theme, limit, target, find, Some(logical))
     }
 
     /// `limit` is the height the text scrolls within and whether it follows
@@ -220,9 +227,11 @@ impl ToolText {
         limit: Option<(f32, bool)>,
         target: Target,
         find: Option<&str>,
+        logical: Option<selectable_prose::Logical>,
     ) -> Element<'static, Message> {
         let mut syntax = self.syntax.borrow_mut();
-        if syntax
+        if self.text.len() > CachedItem::HIGHLIGHT_LIMIT { *syntax = None; }
+        else if syntax
             .as_ref()
             .is_none_or(|(previous, _)| *previous != theme)
         {
@@ -231,22 +240,14 @@ impl ToolText {
                 prose::CodeBlock::new(self.language.token(), &self.text, theme),
             ));
         }
-        let spans = syntax
-            .as_ref()
-            .unwrap()
-            .1
-            .spans(cosmic::theme::is_dark())
-            .clone();
-        let body: Element<'static, Message> = widget::container(selectable_prose::text(
-            spans,
-            design::TEXT_BODY.into(),
-            iced::Font::MONOSPACE,
-            target,
-            find,
+        let spans = syntax.as_ref().map(|(_, block)| block.spans(cosmic::theme::is_dark()).clone())
+            .unwrap_or_else(|| Arc::from([]));
+        let body: Element<'static, Message> = widget::container(prose::code_text(
+            self.text.clone(), spans, design::TEXT_BODY.into(), iced::Font::MONOSPACE,
+            target, find, logical,
         ))
         .padding(design::with_vertical_rail(iced::Padding::from([
-            step::GAP_S,
-            step::GAP_M,
+            step::GAP_S, step::GAP_M,
         ])))
         .width(Length::Fill)
         .into();

@@ -81,6 +81,39 @@ impl<'a> TranscriptRows<'a> {
     }
 }
 
+/// The loaded transcript keeps row descriptions; only its visible exchanges
+/// create widget trees. Finished visible exchanges still use retained::kept.
+struct VirtualRows<'a> {
+    children: Vec<virtualized::Row<'a>>,
+    gap: f32,
+    trailing_footer: f32,
+}
+impl<'a> VirtualRows<'a> {
+    fn new(gap: f32) -> Self { Self { children: vec![], gap, trailing_footer: 0.0 } }
+    fn push(&mut self, row: Element<'a, Message>) -> usize { self.message(row, 0.0) }
+    fn message(&mut self, row: Element<'a, Message>, footer: f32) -> usize {
+        self.lazy(0, 0, 80.0, vec![], self.gap, footer, move || row)
+    }
+    fn lazy(&mut self, key: u64, revision: u64, estimate: f32, aliases: Vec<iced::advanced::widget::Id>,
+        gap: f32, footer: f32, build: impl FnOnce() -> Element<'a, Message> + 'a) -> usize {
+        if !self.children.is_empty() {
+            let gap = (gap - self.trailing_footer).max(0.0);
+            if gap > 0.0 {
+                let key = self.children.len() as u64;
+                self.children.push(virtualized::Row::new(key, 0, gap, None,
+                    move || widget::Space::new().height(gap).into()));
+            }
+        }
+        let index = self.children.len();
+        let mut row = virtualized::Row::new(if key == 0 { index as u64 } else { key },
+            revision, estimate, None, build);
+        row.aliases = aliases;
+        self.children.push(row);
+        self.trailing_footer = footer;
+        index
+    }
+}
+
 /// Reserve an external action row so hovering never shifts the transcript.
 /// Iced's hover widget also keeps controls visible while keyboard-focused.
 pub(super) fn message_actions<'a>(
@@ -903,7 +936,9 @@ impl Cagents {
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
                     &self.settings.keyboard_shortcuts,
-                    self.workspace.viewport_width() * self.settings.chat_content_fraction,
+                    self.workspace.presentation_geometry().card(card)
+                        .map_or(self.workspace.viewport_width(), |card| card.width())
+                        .min(design::READABLE_MEASURE + 2.0 * step::GAP_M),
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
@@ -1114,6 +1149,70 @@ impl Runtime {
         }
     }
 
+    /// The logical copy/selection catalog is rebuilt only when exposed text
+    /// or disclosure changes, never for mouse motion, copying, find or timers.
+    fn selection_document(&self) -> (Arc<selection::Catalog>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>) {
+        use std::hash::{Hash, Hasher};
+        let mut fingerprint = std::hash::DefaultHasher::new();
+        self.selected_subagent.hash(&mut fingerprint);
+        let selected = self.selected_subagent.as_ref().and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let items = selected.map_or(self.snapshot.items.as_slice(), |agent| agent.items.as_slice());
+        // Snapshot generation covers transcript edits. Avoid walking every
+        // loaded item during pointer/selection/timer-only view rebuilds.
+        self.snapshot.generation.hash(&mut fingerprint);
+        let mut expanded: Vec<_> = self.expanded.iter().collect(); expanded.sort_unstable(); expanded.hash(&mut fingerprint);
+        let mut opened: Vec<_> = self.opened.iter().collect(); opened.sort_unstable(); opened.hash(&mut fingerprint);
+        self.tool_groups_expanded.hash(&mut fingerprint);
+        self.failures.hash(&mut fingerprint);
+        self.queued.as_ref().map(|queued| &queued.text).hash(&mut fingerprint);
+        let fingerprint = fingerprint.finish();
+        let mut document = self.selection_document.borrow_mut();
+        if document.as_ref().is_none_or(|(revision, _)| *revision != fingerprint) {
+            let mut builder = selection::Catalog::builder();
+            if selected.is_some() {
+                for item in items { self.selection_item(&mut builder, item, turn::slot_of(item), true); }
+            } else {
+                for turn in &self.turns {
+                    for index in &turn.prompt { if let Some(item) = items.get(*index) { self.selection_item(&mut builder, item, turn::Slot::Prose, true); } }
+                    if self.opened.get(&turn.key).copied().unwrap_or(self.tool_groups_expanded) {
+                        for placed in &turn.steps { if let Some(item) = items.get(placed.index) { self.selection_item(&mut builder, item, placed.slot, true); } }
+                    }
+                    for placed in &turn.prose { if let Some(item) = items.get(placed.index) { self.selection_item(&mut builder, item, placed.slot, true); } }
+                }
+                for (_, error) in &self.failures { builder.plain(&format!("failure-{error}"), &[2], Arc::from(error.as_str())); }
+                if let Some(queued) = &self.queued { builder.plain("queued-prompt", &[2], Arc::from(queued.text.trim_end())); }
+            }
+            *document = Some((fingerprint, builder.finish()));
+        }
+        let catalog = document.as_ref().unwrap().1.clone();
+        let bookmark = self.selection_bookmarks.borrow_mut().entry(self.selected_subagent.clone())
+            .or_insert_with(Default::default).clone();
+        (catalog, bookmark)
+    }
+
+    fn selection_item(&self, builder: &mut selection::DocumentBuilder, item: &chat::Item, slot: turn::Slot, detail: bool) {
+        if item.role == chat::Role::User && !matches!(item.content, ItemContent::Delivery { .. }) {
+            let (text, _, _) = self.prompt_text(item);
+            builder.plain(&item.id, &[2], text.into()); return;
+        }
+        let Some(cached) = self.cache.get(&item.id) else { return; };
+        if slot == turn::Slot::Thinking && !self.expanded.contains(&item.id) { return; }
+        if matches!(item.content, ItemContent::Text { .. } | ItemContent::Delivery { .. }) {
+            if let ItemContent::Delivery { kind: chat::DeliveryKind::Notice, body, .. } = &item.content {
+                let body = if !self.expanded.contains(&item.id) { body.lines().take(NOTICE_LINES).collect::<Vec<_>>().join("\n") } else { body.clone() };
+                if !body.is_empty() { builder.plain(&item.id, &[2], body.into()); }
+            } else { builder.markdown(&item.id, &[0], cached.markdown.items()); }
+        }
+        if let Some(coordinated) = &cached.coordination {
+            for (index, content) in coordinated.contents().enumerate() { builder.markdown(&item.id, &[1, index as u32], content.items()); }
+        }
+        if detail && self.expanded.contains(&item.id) {
+            if let Some(input) = &cached.tool_input { builder.plain(&item.id, &[4], input.text.clone()); }
+            if let Some(output) = &cached.tool_output { if !output.text.is_empty() { builder.plain(&item.id, &[5], output.text.clone()); } }
+            for (index, patch) in cached.patches.iter().enumerate() { if !patch.text.is_empty() { builder.plain(&item.id, &[6, index as u32], patch.text.clone()); } }
+        }
+    }
+
     fn view<'a>(
         &'a self,
         recovery: Option<auth_recovery::Recovery>,
@@ -1148,7 +1247,7 @@ impl Runtime {
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let mut anchors = Vec::new();
-        let mut transcript = TranscriptRows::new(step::GAP_L);
+        let mut transcript = VirtualRows::new(step::GAP_L);
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
             let provider = match self.session.launch.provider {
@@ -1227,7 +1326,28 @@ impl Runtime {
                 let Some(cached) = self.cache.get(&item.id) else {
                     continue;
                 };
-                let row_index = transcript.message(
+                let footer = if (item.role == chat::Role::User && !item.content.is_step())
+                        || matches!(item.content, ItemContent::Text { .. })
+                        || cached
+                            .coordination
+                            .as_deref()
+                            .is_some_and(Coordinated::is_card)
+                    {
+                        MESSAGE_ACTION_FOOTER
+                    } else {
+                        0.0
+                    };
+                use std::hash::{Hash, Hasher};
+                let mut key = std::hash::DefaultHasher::new();
+                ("selected-child-item", &item.id).hash(&mut key);
+                let mut revision = std::hash::DefaultHasher::new();
+                (cached.revision, self.expanded.contains(&item.id), &self.find, dark).hash(&mut revision);
+                let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
+                    (body.len() as f32 / (content_width / 8.0).max(20.0)).ceil().max(1.0) * 22.0 + footer
+                });
+                let row_index = transcript.lazy(key.finish(), revision.finish(), estimate,
+                    vec![scroll::item_id(&item.id)], step::GAP_L, footer, move || {
+                        scroll::item(&item.id, widget::container(
                     if item.role == chat::Role::User && !item.content.is_step() {
                         if matches!(item.content, ItemContent::Delivery { .. }) {
                             self.delivery_view(item, cached, markdown_settings)
@@ -1255,20 +1375,10 @@ impl Runtime {
                             ItemContent::Image { .. } => self.image_preview(item, cached),
                             _ => self.step_view(item, cached, markdown_settings),
                         }
-                    },
-                    if (item.role == chat::Role::User && !item.content.is_step())
-                        || matches!(item.content, ItemContent::Text { .. })
-                        || cached
-                            .coordination
-                            .as_deref()
-                            .is_some_and(Coordinated::is_card)
-                    {
-                        MESSAGE_ACTION_FOOTER
-                    } else {
-                        0.0
-                    },
-                );
-                anchors.push((row_index, item.id.as_str()));
+                    }
+                        ).width(Length::Fill))
+                    });
+                let _ = row_index; // Virtual placeholder bounds supply item anchors.
             }
         } else {
             if snapshot.has_earlier {
@@ -1300,15 +1410,20 @@ impl Runtime {
                 transcript.push(notice_entry(error, target));
             }
             for turn in &self.turns {
-                transcript.push_with_gap(
-                    self.turn_view(turn, markdown_settings, dark),
-                    if turn.prompt.is_empty() {
-                        step::GAP_M
-                    } else {
-                        step::GAP_L
-                    },
+                use std::hash::{Hash, Hasher};
+                let mut key = std::hash::DefaultHasher::new();
+                turn.key.hash(&mut key);
+                let estimate = turn.prompt.iter().chain(turn.prose.iter().map(|placed| &placed.index))
+                    .filter_map(|index| snapshot.items.get(*index))
+                    .map(|item| CachedItem::prose(&item.content).map_or(60.0, |body| {
+                        ((body.len() as f32 / (content_width / 8.0).max(20.0)).ceil().max(1.0) * 22.0) + 40.0
+                    })).sum::<f32>() + if turn.steps.is_empty() { 0.0 } else { 48.0 };
+                let aliases = turn.prompt.iter().chain(turn.prose.iter().chain(&turn.steps).map(|placed| &placed.index))
+                    .filter_map(|index| snapshot.items.get(*index)).map(|item| scroll::item_id(&item.id)).collect();
+                transcript.lazy(key.finish(), self.turn_fingerprint(turn, dark), estimate, aliases,
+                    if turn.prompt.is_empty() { step::GAP_M } else { step::GAP_L },
                     self.turn_trailing_footer(turn),
-                );
+                    move || self.turn_view(turn, markdown_settings, dark));
                 for (_, error) in self.failures.iter().filter(|(anchor, error)| {
                     anchor.as_ref() == Some(&turn.key) && !self.active_auth_notice(anchor, error)
                 }) {
@@ -1423,19 +1538,19 @@ impl Runtime {
                 .into(),
             );
         }
-        let transcript = widget::column::with_children(transcript.children)
-            .padding(design::with_vertical_rail(iced::Padding::new(step::GAP_M)))
+        let transcript = widget::container(virtualized::column(transcript.children, Default::default()))
+            .padding(iced::Padding::new(step::GAP_M))
             .width(Length::Fill);
         let transcript_index = content.len();
-        content.push(selection::transcript(
+        let (catalog, bookmark) = self.selection_document();
+        content.push(selection::transcript_virtualized(
             scroll::transcript(
                 transcript,
                 target,
                 self.selected_subagent.as_deref(),
                 anchors,
                 selected.is_some() || (!snapshot.has_later && self.paging().is_none()),
-                snapshot
-                    .items
+                selected.map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice())
                     .iter()
                     .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
                     .chain(self.turns.iter().flat_map(|turn| {
@@ -1454,6 +1569,8 @@ impl Runtime {
             ),
             target,
             self.selected_subagent.as_deref(),
+            catalog,
+            bookmark,
         ));
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(
@@ -2325,7 +2442,6 @@ impl Runtime {
                     iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
                 )
                 .into(),
-            content_width.max(1.0),
         ))
         .width(Length::Fill)
         .height(Length::Fill);
@@ -2962,38 +3078,21 @@ impl Runtime {
     /// An exchange is kept between frames, and built and laid out again only
     /// when something it draws changes, which is what stops a streaming
     /// answer from paying for every exchange above it twenty times a second.
-    /// The one thing that cannot be kept is an open step's raw output, whose
-    /// read-only editor borrows its text from the cache; an exchange showing
-    /// one is built afresh each frame, in the same place in the tree.
+    /// Open details own their text and share the same retained path. A
+    /// disclosure or changed item only invalidates its own exchange.
     fn turn_view<'a>(
         &'a self,
         turn: &'a turn::Turn,
         settings: markdown::Settings,
         dark: bool,
     ) -> Element<'a, Message> {
-        if !self.retainable(turn) {
-            return retained::fresh(self.turn_rows(
-                turn,
+        retained::kept(self.turn_fingerprint(turn, dark), move || {
+            self.turn_rows(turn,
                 |item, cached| self.step_view(item, cached, settings),
                 |item, cached, coordinated| {
-                    let raw = self
-                        .expanded
-                        .contains(&item.id)
-                        .then(|| self.step_detail(item, cached, settings));
+                    let raw = self.expanded.contains(&item.id).then(|| self.step_detail(item, cached, settings));
                     self.coordination_card(item, cached, coordinated, settings, raw)
-                },
-                settings,
-            ));
-        }
-        retained::kept(self.turn_fingerprint(turn, dark), move || {
-            self.turn_rows(
-                turn,
-                |item, cached| self.step_header(item, cached, false),
-                |item, cached, coordinated| {
-                    self.coordination_card(item, cached, coordinated, settings, None)
-                },
-                settings,
-            )
+                }, settings)
         })
     }
 
@@ -3003,25 +3102,15 @@ impl Runtime {
         self.turn_view(&self.turns[0], settings, cosmic::theme::is_dark())
     }
 
-    /// Whether `turn` can be kept between frames: none of its steps is open.
-    fn retainable(&self, turn: &turn::Turn) -> bool {
-        turn.prompt
-            .iter()
-            .chain(
-                turn.steps
-                    .iter()
-                    .chain(&turn.prose)
-                    .map(|placed| &placed.index),
-            )
-            .filter_map(|index| self.snapshot.items.get(*index))
-            .all(|item| !self.expanded.contains(&item.id))
-    }
-
     /// Everything a retained exchange draws, folded into the value that
     /// decides whether it is drawn again.
     ///
     /// It reads the items' change tokens rather than their bodies, so it
     /// costs the same for a one-line answer as for a long one.
+    pub(super) fn find_turn_matches(&self, key: &str) -> bool {
+        self.find_matches.iter().any(|candidate| candidate == key)
+    }
+
     fn turn_fingerprint(&self, turn: &turn::Turn, dark: bool) -> u64 {
         self.turn_fingerprint_at(turn, dark, self.source_now_ms())
     }
@@ -3038,7 +3127,7 @@ impl Runtime {
             .hash(&mut hasher);
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
-        self.find.hash(&mut hasher);
+        self.find.as_ref().filter(|_| self.find_turn_matches(&turn.key)).hash(&mut hasher);
         // Only reasoning uses the transcript's busy state to decide whether
         // its disclosure has finished. Other rows derive activity from their
         // own items and the group's status and duration.
@@ -3069,7 +3158,7 @@ impl Runtime {
             };
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
-            (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
+            (&item.id, item.started_at.or(item.at), slot, self.expanded.contains(&item.id)).hash(&mut hasher);
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
             self.copied
@@ -3202,7 +3291,20 @@ impl Runtime {
                 turn.steps
                     .iter()
                     .filter_map(|placed_step| placed(placed_step.index))
-                    .map(|(item, cached)| scroll::item(&item.id, step(item, cached)))
+                    .map(|(item, cached)| {
+                        let key = selection::logical_identity(&item.id, &[9]);
+                        let revision = cached.revision;
+                        // Header elements are cheap owned metadata; only a
+                        // mounted row creates their widget tree and geometry.
+                        let row = step(item, cached);
+                        let id = item.id.clone();
+                        let mut row = virtualized::Row::new(key, revision, 56.0 + step::GAP_XS,
+                            Some(scroll::item_id(&id)), move || {
+                                widget::container(scroll::item(&id, row))
+                                    .padding(iced::Padding::ZERO.bottom(step::GAP_XS)).into()
+                            });
+                        row.anchor = true; row
+                    })
                     .collect()
             });
             // One measured strip supplies aliases for folded steps; expanded
@@ -3548,7 +3650,7 @@ impl Runtime {
     /// its author squared off. That asymmetry is what identifies the author
     /// without printing "You" above every message, and the narrower measure
     /// keeps a turn's opening findable when scrolling back.
-    fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
+    fn prompt_text(&self, item: &chat::Item) -> (String, bool, bool) {
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
             ItemContent::Text { text, .. } => text.as_str(),
@@ -3572,26 +3674,25 @@ impl Runtime {
         } else {
             text
         };
+        (text, attachment, long)
+    }
+
+    fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
+        let (text, attachment, long) = self.prompt_text(item);
+        let expanded = self.expanded.contains(&item.id);
+        let logical = selectable_prose::Logical { identity: selection::logical_identity(&item.id, &[2]), start: 0 };
         let body: Element<'static, Message> = if attachment {
             widget::row::with_children(vec![
                 widget::icon(Icon::Attachment.handle()).size(12).into(),
-                selectable_prose::plain(
-                    text,
-                    design::TEXT_CAPTION,
-                    iced::Font::default(),
-                    self.target,
-                ),
+                selectable_prose::logical_text(vec![iced::widget::text::Span::new(text)].into(),
+                    design::TEXT_CAPTION.into(), iced::Font::default(), self.target, None, logical),
             ])
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
             .into()
         } else {
-            let text = selectable_prose::plain(
-                text,
-                design::TEXT_PROSE,
-                iced::Font::default(),
-                self.target,
-            );
+            let text = selectable_prose::logical_text(vec![iced::widget::text::Span::new(text)].into(),
+                design::TEXT_PROSE.into(), iced::Font::default(), self.target, None, logical);
             if long {
                 widget::column::with_children(vec![
                     text,
@@ -6432,10 +6533,10 @@ mod tests {
         assert_ne!(toggled, fingerprint(&runtime, false), "the syntax theme");
     }
 
-    /// An open step shows its output in an editor that borrows from the
-    /// cache, so its exchange is built afresh rather than kept.
+    /// Open details own their content, and remain reusable until a rendered
+    /// input changes. Disclosure itself must change that key.
     #[test]
-    fn an_exchange_with_an_open_step_is_not_retained() {
+    fn an_open_steps_retained_key_changes_once_for_its_disclosure() {
         let items = frame_cost::transcript(1);
         let (mut runtime, _handle) = frame_cost::live_runtime(&items);
         let strip = runtime
@@ -6443,12 +6544,14 @@ mod tests {
             .iter()
             .position(|turn| !turn.steps.is_empty())
             .expect("a group with steps");
-        assert!(runtime.retainable(&runtime.turns[strip]));
+        let closed = runtime.turn_fingerprint(&runtime.turns[strip], true);
         let step = runtime.turns[strip].steps[0].index;
         runtime
             .expanded
             .insert(runtime.snapshot.items[step].id.clone());
-        assert!(!runtime.retainable(&runtime.turns[strip]));
+        let opened = runtime.turn_fingerprint(&runtime.turns[strip], true);
+        assert_ne!(closed, opened);
+        assert_eq!(opened, runtime.turn_fingerprint(&runtime.turns[strip], true));
     }
 
     /// Every kind of Markdown block an answer can hold is drawn by the
