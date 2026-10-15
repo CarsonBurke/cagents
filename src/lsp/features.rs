@@ -139,7 +139,7 @@ impl LspManager {
     pub fn signature_trigger_with_context(&self,doc:LspDocumentId,ch:char,visible:bool)->bool {
         let Some(session)=self.documents.get(&doc).and_then(|document|self.sessions.get(&document.session)) else{return false;};
         if session.retired.load(Ordering::Acquire)||session.commands.is_closed()||!session.status.lock().unwrap_or_else(|p|p.into_inner()).is_ready(){return false;}
-        let caps=session.capabilities.lock().unwrap_or_else(|p|p.into_inner());let mut encoded=[0;4];let ch=ch.encode_utf8(&mut encoded);
+        let caps=session.capabilities.lock().unwrap_or_else(|p|p.into_inner());let mut encoded=[0;4];let ch:&str=ch.encode_utf8(&mut encoded);
         caps.signature_help && (caps.signature_triggers.iter().any(|trigger|trigger==ch)||(visible&&caps.signature_retriggers.iter().any(|trigger|trigger==ch)))
     }
     fn feature_request(&mut self,doc:LspDocumentId,at:LspPosition,kind:RequestKind,args:RequestArgs,timeout:Duration, supported:bool)->LspRequestId {
