@@ -4707,6 +4707,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         for dependency in &mut policy.attributes {
             if dependency.is_relative() { *dependency = worktree.join(&*dependency); }
         }
+        policy.attributes.sort();
+        policy.attributes.dedup();
+        if policy.attributes.len() > 8192 {
+            policy.reusable = false;
+            policy.attributes.truncate(8192);
+        }
         Ok(policy)
     }
 
