@@ -141,6 +141,20 @@ impl RecoveryPlacement {
     /// subsequent effect. Do not call while holding a lock/IPC turn that the
     /// registry callback itself needs; this method invokes that check twice.
     pub fn validate_against_roots(&self, current_roots: &[Arc<Root>]) -> io::Result<()> {
+        self.validate_from_root(&self.parent, current_roots)
+    }
+    /// Check the actual retained Published holding before payload writes, file
+    /// acquisition/publication and retry. Its original outside parent remaining
+    /// safe does not prove that this directory has not moved into a checkout.
+    pub fn validate_payload_root(&self, payload: &Root) -> io::Result<()> {
+        self.validate_payload_against_roots(payload, &[])
+    }
+    /// Registry/adoption companion for an actual held pending payload. Retain
+    /// the exact payload Root and census through the domain's admission turn.
+    pub fn validate_payload_against_roots(&self, payload: &Root, current_roots: &[Arc<Root>]) -> io::Result<()> {
+        self.validate_from_root(payload, current_roots)
+    }
+    fn validate_from_root(&self, start: &Root, current_roots: &[Arc<Root>]) -> io::Result<()> {
         if current_roots.len() > MAX_EXCLUDED_ROOTS {
             return Err(unsupported("The current recovery root census exceeds its bounded inspection."));
         }
@@ -149,13 +163,16 @@ impl RecoveryPlacement {
             || mount_identity(&self.source)? != self.source_mount || mount_identity(&self.parent)? != self.parent_mount {
             return Err(unsupported("The retained recovery source or placement identity changed."));
         }
+        if identity(start)?.0 != self.parent_identity.0 || mount_identity(start)? != self.parent_mount {
+            return Err(unsupported("The retained recovery payload is not on the captured source mount; this step was refused."));
+        }
         let mut excluded = HashSet::from([self.source_identity]);
         for root in self.excluded.iter() { excluded.insert(identity(root)?); }
         for root in current_roots { excluded.insert(identity(root)?); }
         if excluded.len() > MAX_EXCLUDED_ROOTS {
             return Err(unsupported("The combined recovery root census exceeds its bounded inspection."));
         }
-        let mut cursor = self.parent.try_clone()?;
+        let mut cursor = start.try_clone()?;
         for _ in 0..MAX_ANCESTORS {
             let current = identity(&cursor)?;
             let current_mount = mount_identity(&cursor)?;
@@ -261,6 +278,27 @@ mod tests {
         assert_eq!(recovery_directory_stamp(&source).unwrap(), recovery_directory_stamp(&source.try_clone().unwrap()).unwrap());
         placement.validate_for_source(&source).unwrap();
         assert!(placement.validate_for_source(&root(&tree.path().join("unrelated"))).is_err());
+    }
+
+    #[test]
+    fn actual_published_payload_relocation_is_checked_separately_from_its_parent() {
+        let tree = tempfile::tempdir().unwrap();
+        for path in ["source", "outside", "foreign", "foreign/.git"] { fs::create_dir(tree.path().join(path)).unwrap(); }
+        let placement = RecoveryPlacement::acquire(root(&tree.path().join("outside")), root(&tree.path().join("source")), Arc::from([]), registry()).unwrap();
+        let DirectoryCreation::Published(publication) = create_directory_in_namespace(placement.namespace(), placement.directory(), Path::new("holding"), 0o700).unwrap() else { panic!("fixture must own the published holding"); };
+        fs::write(tree.path().join("outside/holding/retained"), b"synthetic retained bytes\n").unwrap();
+        placement.validate_payload_root(publication.directory()).unwrap();
+        fs::rename(tree.path().join("outside/holding"), tree.path().join("source/moved")).unwrap();
+        placement.validate().unwrap();
+        assert!(placement.validate_payload_root(publication.directory()).is_err());
+        fs::rename(tree.path().join("source/moved"), tree.path().join("foreign/moved")).unwrap();
+        placement.validate().unwrap();
+        assert!(placement.validate_payload_root(publication.directory()).is_err());
+        assert_eq!(fs::read(tree.path().join("foreign/moved/retained")).unwrap(), b"synthetic retained bytes\n");
+        assert!(!tree.path().join("foreign/moved/new-payload").exists());
+        fs::rename(tree.path().join("foreign/moved"), tree.path().join("outside/holding")).unwrap();
+        placement.validate_payload_root(publication.directory()).unwrap();
+        assert!(placement.validate_payload_against_roots(publication.directory(), &[root(tree.path())]).is_err());
     }
 
     #[test]
