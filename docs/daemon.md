@@ -64,7 +64,9 @@ an upgrade preserves the helper until its successor reattaches.
 The journal holds at most 4096 unacknowledged semantic events within a default
 64 MiB payload budget; each event is at most 1 MiB. Execution and attention
 outcomes remain there until the daemon confirms its durable registry and
-notification transactions. Acknowledgement deletes those replay rows using a
+notification transactions. Exact turn-to-item metadata additionally requires its
+captured-account annotation transaction, including on cursor replay; a failed
+store write never acknowledges the helper event. Acknowledgement deletes those replay rows using a
 FULL-synchronous SQLite transaction. A stopped provider's helper and cache stay
 owned until the final outcomes are acknowledged and helper retirement is proved.
 

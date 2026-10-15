@@ -241,6 +241,8 @@ pub struct Preferences {
     pub waiting: bool,
     pub while_focused: bool,
     pub review_requests: bool,
+    /// Explicit opt-in; existing configurations retain metadata-only alerts.
+    pub message_previews: bool,
 }
 
 impl Default for Preferences {
@@ -252,6 +254,7 @@ impl Default for Preferences {
             waiting: true,
             while_focused: false,
             review_requests: true,
+            message_previews: false,
         }
     }
 }
@@ -341,6 +344,7 @@ pub enum Field {
     Waiting,
     WhileFocused,
     ReviewRequests,
+    MessagePreviews,
 }
 
 impl Preferences {
@@ -352,6 +356,7 @@ impl Preferences {
             Field::Waiting => self.waiting,
             Field::WhileFocused => self.while_focused,
             Field::ReviewRequests => self.review_requests,
+            Field::MessagePreviews => self.message_previews,
         }
     }
     pub fn set(&mut self, field: Field, value: bool) {
@@ -362,6 +367,7 @@ impl Preferences {
             Field::Waiting => &mut self.waiting,
             Field::WhileFocused => &mut self.while_focused,
             Field::ReviewRequests => &mut self.review_requests,
+            Field::MessagePreviews => &mut self.message_previews,
         } = value;
     }
 }
