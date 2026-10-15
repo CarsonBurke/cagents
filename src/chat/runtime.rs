@@ -8054,116 +8054,57 @@ mod tests {
     #[test]
     fn bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure() {
         use std::os::unix::fs::OpenOptionsExt;
-        const CHILD: &str = "CAGENTS_RETAINED_CLOSE_RETRY_TEST";
+        const CHILD:&str="CAGENTS_RETAINED_CLOSE_RETRY_TEST";
         if std::env::var_os(CHILD).is_none() {
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let directory=tempfile::tempdir_in("/var/tmp").unwrap();
             let output=Process::new(std::env::current_exe().unwrap()).args(["--exact","chat::runtime::tests::bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure","--nocapture"])
                 .env(CHILD,"1").env("XDG_RUNTIME_DIR",directory.path()).env("XDG_DATA_HOME",directory.path().join("data"))
                 .env("XDG_CONFIG_HOME",directory.path().join("config")).env("XDG_CACHE_HOME",directory.path().join("cache"))
                 .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
-            assert!(
-                output.status.success(),
-                "stdout={} stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
             return;
         }
-        let mut source = super::super::native_holder::fixture_source();
-        let boot = crate::daemon::read_boot_id().unwrap();
-        source.proof.as_mut().unwrap().boot_id = boot.clone();
-        source
-            .owned_codex_listener
-            .as_mut()
-            .unwrap()
-            .allocator
-            .boot_id = boot;
-        let paths = crate::daemon::RuntimePaths::discover().unwrap();
-        let _lease =
-            crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec = ProcessSpec {
-            execution: None,
-            messages: None,
-            unset_environment: Default::default(),
-            transport: TransportSpec::OwnedUnixWebSocket {
-                socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
-            },
-            program: "/bin/sleep".into(),
-            arguments: vec!["60".into()],
-            working_directory: directory.path().into(),
-            environment: BTreeMap::new(),
-        };
-        let holder = super::super::native_holder::spawn(spec, source.clone()).unwrap();
-        let root =
-            crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native)
-                .unwrap();
-        let record = crate::daemon::holder_registry::evidence(
-            &crate::daemon::holder_registry::socket(&root, source.id),
-            crate::daemon::holder_registry::Kind::Native,
-        )
-        .unwrap()
-        .unwrap();
+        for broken_control in [false,true] {
+        let mut source=super::super::native_holder::fixture_source();
+        let boot=crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id=boot.clone();
+        source.owned_codex_listener.as_mut().unwrap().allocator.boot_id=boot;
+        let paths=crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease=crate::daemon::HostLease::acquire(&paths,source.proof.as_ref().unwrap()).unwrap();
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::OwnedUnixWebSocket {socket:source.owned_codex_listener.as_ref().unwrap().socket.clone()},program:"/bin/sleep".into(),arguments:vec!["60".into()],working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut holder=super::super::native_holder::spawn(spec,source.clone()).unwrap();
+        let root=crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
+        let record=crate::daemon::holder_registry::evidence(&crate::daemon::holder_registry::socket(&root,source.id),crate::daemon::holder_registry::Kind::Native).unwrap().unwrap();
         assert!(record.root.is_current());
-        let receipt = root.join(format!(
-            "{}-{}-{}.closed",
-            source.id, record.holder.pid, record.holder.start
-        ));
-        let mut invalid = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&receipt)
-            .unwrap();
-        invalid
-            .write_all(b"transient invalid cleanup receipt")
-            .unwrap();
-        drop(invalid);
-        let spec = ProcessSpec {
-            execution: None,
-            messages: None,
-            unset_environment: Default::default(),
-            transport: TransportSpec::JsonLines,
-            program: "/bin/cat".into(),
-            arguments: Vec::new(),
-            working_directory: directory.path().into(),
-            environment: BTreeMap::new(),
-        };
-        let mut initial = Step::default();
-        let store = preflight(&spec, &mut initial).unwrap();
-        let handle =
-            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let receipt=root.join(format!("{}-{}-{}.closed",source.id,record.holder.pid,record.holder.start));
+        if broken_control {
+            holder.confirm(uuid::Uuid::new_v4().to_string(),super::super::native_holder::fixture_identity(),record.root.clone()).unwrap();
+            holder.disconnect_control_for_test();
+        } else {
+            let mut invalid=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
+            invalid.write_all(b"transient invalid cleanup receipt").unwrap();drop(invalid);
+        }
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
         handle.close().unwrap();
-        *handle.0.retained_native.lock().unwrap() = Some(holder);
-        handle.0.completed.store(false, Ordering::Release);
-        *handle.0.failure.lock().unwrap() = Some("Native teardown remains unconfirmed".into());
-        assert!(
-            handle
-                .close_until(Instant::now() + Duration::from_secs(2))
-                .is_err()
-        );
-        let deadline = Instant::now() + Duration::from_secs(2);
+        *handle.0.retained_native.lock().unwrap()=Some(holder);
+        handle.0.completed.store(false,Ordering::Release);
+        *handle.0.failure.lock().unwrap()=Some("Native teardown remains unconfirmed".into());
+        assert!(handle.close_until(Instant::now()+Duration::from_secs(2)).is_err());
+        let deadline=Instant::now()+Duration::from_secs(2);
         while handle.0.native_reconciling.load(Ordering::Acquire) {
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(5));
+            assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));
         }
         assert!(handle.0.retained_native.lock().unwrap().is_some());
-        assert!(
-            record.root.is_current(),
-            "the failed attempt must retain the same actual provider owner"
-        );
-        assert!(!handle.is_completed());
-        assert!(handle.owns_work());
-        std::fs::remove_file(&receipt).unwrap();
-        handle
-            .close_until(Instant::now() + Duration::from_secs(5))
-            .unwrap();
-        assert!(handle.0.retained_native.lock().unwrap().is_none());
-        assert!(handle.is_completed());
-        assert!(
-            !record.root.is_current(),
-            "the later same close API must progress through exact native cleanup"
-        );
+        assert!(record.root.is_current(),"the failed attempt must retain the same actual provider owner");
+        assert!(!handle.is_completed());assert!(handle.owns_work());
+        if !broken_control {std::fs::remove_file(&receipt).unwrap();}
+        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        assert!(handle.0.retained_native.lock().unwrap().is_none());assert!(handle.is_completed());
+        assert!(!record.root.is_current(),"the later same close API must progress through exact native cleanup");
+        }
     }
 
     fn worker_blocked_in_tls_destruction()->(JoinHandle<()>,crossbeam_channel::Sender<()>,crossbeam_channel::Receiver<()>) {
