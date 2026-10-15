@@ -195,6 +195,9 @@ pub(super) struct Prepared {
     request: Request,
     pub(super) parsed: Parsed,
     blocks: HashMap<u64, prose::CodeBlock>,
+    // Retain the source lease through queued output as well as execution.
+    // Evicting State cannot make the global counter forget this input owner.
+    _owner: Arc<Shared>,
     // Hold admission through UI consumption: completed outputs cannot build
     // an unbounded queue while a busy UI has not handled their messages yet.
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -275,7 +278,7 @@ fn execute(shared: Arc<Shared>,permit:tokio::sync::OwnedSemaphorePermit) -> Resu
             blocks.entry(key).or_insert_with(||prose::CodeBlock::new(language.and_then(prose::fence_language),code,request.theme));
         });
         if shared.cancelled.load(Ordering::Relaxed) {return Err("Message loading was cancelled.".into());}
-        Ok(Prepared { request, parsed, blocks, _permit: permit })
+        Ok(Prepared { request, parsed, blocks, _owner: shared, _permit: permit })
 }
 
 /// Rendering fixtures explicitly complete the production engine before
