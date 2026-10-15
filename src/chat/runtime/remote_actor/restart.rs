@@ -236,6 +236,8 @@ impl Server {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .generation;
+        let next_generation = old_generation.checked_add(1)
+            .ok_or("Provider replacement was refused before launch because its source generation is exhausted")?;
         // restart() already positively closed/joined this exact old actor.
         // Include ALL final metadata generations before the same Store is
         // bound to a replacement LocalHandle; preparation's Store is unused.
@@ -273,9 +275,9 @@ impl Server {
         }
         {
             let mut state = actor.0.state.lock().unwrap_or_else(|p| p.into_inner());
-            state.generation = old_generation
-                .saturating_add(1)
-                .saturating_add(state.generation);
+            // The retained Store seed may already have floored this state.
+            // Never add the old floor a second time after start_inner returns.
+            state.generation = replacement_generation(next_generation, state.generation);
             state.turn_generation = old.turn_generation.saturating_add(state.turn_generation);
             confirm_installed_snapshot(&mut state);
         }
@@ -285,5 +287,25 @@ impl Server {
         self.actor = actor;
         self.changed.fetch_add(1, Ordering::Release);
         self.actor.provider_process().ok_or("The restarted provider has no verified process identity; inspect its retained failure before another restart".into())
+    }
+}
+
+fn replacement_generation(next_generation: u64, seeded_generation: u64) -> u64 {
+    next_generation.max(seeded_generation)
+}
+#[cfg(test)]
+mod source_generation_tests {
+    use super::*;
+    #[test]
+    fn replacement_seed_before_return_never_doubles_retained_store_clock() {
+        let mut old = 12;
+        for _ in 0..128 {
+            let next = old + 1;
+            assert_eq!(replacement_generation(next, old), next);
+            assert_eq!(replacement_generation(next, 0), next);
+            assert_eq!(replacement_generation(next, next + 2), next + 2);
+            old = replacement_generation(next, old);
+        }
+        assert_eq!(old, 140);
     }
 }

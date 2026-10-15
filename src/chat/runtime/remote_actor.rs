@@ -74,6 +74,8 @@ pub(crate) struct Resident {
     /// Exact Store-issued invalidation scalar; absent on legacy helpers.
     #[serde(default)]
     pub source_authority: Option<SourceAuthority>,
+    #[serde(default)]
+    pub source_authority_conflict: Option<SourceAuthority>,
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub ready: bool,
@@ -264,6 +266,7 @@ impl RemoteActor {
             provider_process: Some(process.clone()),
             generation: 1,
             source_authority: None,
+            source_authority_conflict: None,
             session_id: None,
             title: None,
             ready: true,
@@ -1186,11 +1189,11 @@ impl RemoteActor {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
         {
-            return (after != Some(snapshot.generation) && self.accepts_body(snapshot.generation))
+            return (after != Some(snapshot.generation) && self.accepts_body(snapshot))
                 .then(|| snapshot.as_ref().clone());
         }
         self.call::<Option<Snapshot>>("snapshot", json!([after])).ok().flatten()
-            .filter(|snapshot| self.accepts_body(snapshot.generation))
+            .filter(|snapshot| self.accepts_body(snapshot))
     }
     pub fn pinned_directory(
         &self,
@@ -1390,7 +1393,7 @@ impl RemoteActor {
                     return Err(error);
                 }
                 let publication = final_snapshot::read_publication(&self.0.identity,&self.0.proof).map_err(|detail|format!("Provider cleanup is proved, but the exact final publication is unavailable: {detail}"))?;
-                self.publish_source_authority(publication.source_authority);
+                self.publish_source_authority(publication.source_authority, publication.source_authority_conflict);
                 publication.snapshot
             }
         };
@@ -1833,6 +1836,7 @@ impl Server {
             provider_process,
             generation,
             source_authority: journal.source_authority(),
+            source_authority_conflict: journal.source_authority_conflict(),
             session_id,
             title,
             ready,
@@ -2408,8 +2412,11 @@ impl Server {
         // A closing actor may be adopted by a new authenticated daemon before
         // its last semantic ACK. Refresh receipt authority without changing
         // the exact immutable final publication.
-        let source_authority = self.journal.lock().unwrap_or_else(|p| p.into_inner()).source_authority();
-        final_snapshot::save(&self.identity, &self.proof, &snapshot, source_authority)?;
+        let (source_authority, source_authority_conflict) = {
+            let journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+            (journal.source_authority(), journal.source_authority_conflict())
+        };
+        final_snapshot::save(&self.identity, &self.proof, &snapshot, source_authority, source_authority_conflict)?;
         chat::native_holder::publish_actor_close(
             &self.identity.record,
             &self.proof,

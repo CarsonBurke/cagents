@@ -23,6 +23,11 @@ impl Handle {
             Owner::Remote(remote) => remote.state().source_authority,
         }
     }
+    /// Sticky original conflicting token, if an authenticated retained scope
+    /// contradicted itself. Attach must replay both cached tokens before body.
+    pub(crate) fn source_authority_conflict(&self) -> Option<super::SourceAuthority> {
+        match &self.0 { Owner::Local(_) => None, Owner::Remote(remote) => remote.state().source_authority_conflict }
+    }
     /// Exact authenticated helper metadata. Callers must compare the complete
     /// record against an installed host entry; this is never cleanup authority.
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {

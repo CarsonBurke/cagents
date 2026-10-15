@@ -8,6 +8,8 @@ struct Receipt {
     snapshot: Snapshot,
     #[serde(default)]
     source_authority: Option<SourceAuthority>,
+    #[serde(default)]
+    source_authority_conflict: Option<SourceAuthority>,
 }
 fn path(record: &Record) -> Result<PathBuf, String> {
     Ok(registry::directory(Kind::Native)?.join(format!(
@@ -20,13 +22,15 @@ pub(super) fn save(
     proof: &HostSessionProof,
     snapshot: &Snapshot,
     source_authority: Option<SourceAuthority>,
+    source_authority_conflict: Option<SourceAuthority>,
 ) -> Result<(), String> {
-    validate_source_authority(snapshot, source_authority)?;
+    validate_source_authority(snapshot, source_authority, source_authority_conflict)?;
     let bytes = serde_json::to_vec(&Receipt {
         identity: identity.clone(),
         proof: proof.clone(),
         snapshot: snapshot.clone(),
         source_authority,
+        source_authority_conflict,
     })
     .map_err(|error| error.to_string())?;
     if bytes.len() > MAX_FRAME - 64 * 1024 {
@@ -63,6 +67,7 @@ fn save_at(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
 pub(super) struct Publication {
     pub snapshot: Snapshot,
     pub source_authority: Option<SourceAuthority>,
+    pub source_authority_conflict: Option<SourceAuthority>,
 }
 pub(super) fn read_publication(identity: &ActorIdentity, proof: &HostSessionProof) -> Result<Publication, String> {
     let file = crate::secure_file::open_existing_private_file(&path(&identity.record)?)
@@ -81,15 +86,27 @@ fn decode_publication(identity: &ActorIdentity, proof: &HostSessionProof, bytes:
     if &receipt.identity != identity || &receipt.proof != proof {
         return Err("Final retained snapshot belongs to another actor or attachment".into());
     }
-    validate_source_authority(&receipt.snapshot, receipt.source_authority)?;
-    Ok(Publication { snapshot: receipt.snapshot, source_authority: receipt.source_authority })
+    validate_source_authority(&receipt.snapshot, receipt.source_authority, receipt.source_authority_conflict)?;
+    Ok(Publication { snapshot: receipt.snapshot, source_authority: receipt.source_authority, source_authority_conflict: receipt.source_authority_conflict })
 }
-fn validate_source_authority(snapshot: &Snapshot, authority: Option<SourceAuthority>) -> Result<(), String> {
-    if authority.is_some_and(|authority| authority.incarnation.is_nil() || authority.generation > snapshot.generation) {
-        return Err("Final retained source authority is invalid or newer than its body".into());
+fn validate_source_authority(snapshot: &Snapshot, authority: Option<SourceAuthority>, conflict: Option<SourceAuthority>) -> Result<(), String> {
+    if let Some(conflict) = conflict {
+        let first = authority.ok_or("Final retained conflict lacks its original source token")?;
+        if conflict.generation != first.generation || conflict.incarnation == first.incarnation {
+            return Err("Final retained conflict does not contain the original contradictory tokens".into());
+        }
+        // Keep both exact facts even though the body is quarantined. They
+        // neither grant source access nor certify provider/session retirement.
+        return Ok(());
+    }
+    if authority.is_some_and(|authority| authority.incarnation.is_nil()
+        || snapshot.source_incarnation != Some(authority.incarnation)
+        || authority.generation > snapshot.generation) {
+        return Err("Final retained source authority is invalid or disagrees with its body".into());
     }
     Ok(())
 }
+
 #[derive(Serialize, Deserialize)]
 struct Retirement {
     protocol: u32,
@@ -171,7 +188,7 @@ mod tests {
         let proof = actor.0.proof.clone();
         let token = SourceAuthority { incarnation: uuid::Uuid::new_v4(), generation: 17 };
         let receipt = Receipt { identity: identity.clone(), proof: proof.clone(),
-            snapshot: Snapshot { generation: 20, ..Default::default() }, source_authority: Some(token) };
+            snapshot: Snapshot { generation: 20, source_incarnation:Some(token.incarnation), ..Default::default() }, source_authority: Some(token), source_authority_conflict:None };
         let bytes = serde_json::to_vec(&receipt).unwrap();
         let read = decode_publication(&identity, &proof, &bytes).unwrap();
         assert_eq!(read.source_authority, Some(token));
@@ -180,7 +197,13 @@ mod tests {
         assert_eq!(decode_publication(&identity, &proof, &serde_json::to_vec(&legacy).unwrap()).unwrap().source_authority, None);
         let mut other = identity.clone(); other.instance = uuid::Uuid::new_v4();
         assert!(decode_publication(&other, &proof, &bytes).is_err());
-        let mut malformed = receipt;
+        let mut contradictory = receipt;
+        contradictory.source_authority_conflict = Some(SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:17});
+        let reopened = decode_publication(&identity, &proof, &serde_json::to_vec(&contradictory).unwrap()).unwrap();
+        assert_eq!(reopened.source_authority, Some(token));
+        assert_eq!(reopened.source_authority_conflict, contradictory.source_authority_conflict);
+        let mut malformed = contradictory;
+        malformed.source_authority_conflict = None;
         malformed.source_authority = Some(SourceAuthority { generation:21, ..token });
         assert!(decode_publication(&identity, &proof, &serde_json::to_vec(&malformed).unwrap()).is_err());
     }
@@ -195,7 +218,8 @@ mod tests {
         let receipt = Receipt {
             identity: identity.clone(),
             proof: proof.clone(),
-            source_authority: Some(SourceAuthority { incarnation: uuid::Uuid::new_v4(), generation: 76 }),
+            source_authority: None,
+            source_authority_conflict: None,
             snapshot: Snapshot {
                 generation: 77,
                 title: Some("final".into()),

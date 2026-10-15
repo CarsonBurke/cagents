@@ -55,6 +55,7 @@ pub(super) struct Journal {
     outcome_ack: u64,
     outcome_latest: u64,
     source_authority: Option<super::SourceAuthority>,
+    source_authority_conflict: Option<super::SourceAuthority>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
 /// independently authoritative evidence or block later execution settlements.
@@ -103,6 +104,7 @@ impl Journal {
             outcome_ack: 0,
             outcome_latest: 0,
             source_authority: None,
+            source_authority_conflict: None,
         })
     }
     pub fn continuity_loss(&self) -> Result<Option<ContinuityLoss>, String> {
@@ -169,12 +171,13 @@ impl Journal {
     pub fn source_authority(&self) -> Option<super::SourceAuthority> {
         self.source_authority
     }
+    pub fn source_authority_conflict(&self) -> Option<super::SourceAuthority> { self.source_authority_conflict }
     pub fn append(&mut self, update: &Update) -> Result<(), String> {
         // Invalidation survives even a failed Reset/storage write. It is a
         // coalesced scalar of this exact retained Store, never a semantic row
         // or a cursor/ACK. Never derive it from a Snapshot or raw-owner nonce.
         if let Update::SourceAuthority { incarnation, generation } = update {
-            super::source_authority::advance(&mut self.source_authority, Some(super::SourceAuthority {
+            super::source_authority::advance(&mut self.source_authority, &mut self.source_authority_conflict, Some(super::SourceAuthority {
                 incarnation: *incarnation, generation: *generation,
             }));
             return Ok(());
@@ -1224,5 +1227,10 @@ mod source_authority_tests {
         assert_eq!(journal.latest().unwrap(), 0);
         assert_eq!(journal.acknowledged().unwrap(), 0);
         assert!(journal.continuity_loss().unwrap().is_none());
+        let conflict = SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:11};
+        journal.append(&Update::SourceAuthority {incarnation:conflict.incarnation,generation:11}).unwrap();
+        journal.append(&Update::SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:12}).unwrap();
+        assert_eq!(journal.source_authority(), Some(reset));
+        assert_eq!(journal.source_authority_conflict(), Some(conflict));
     }
 }
