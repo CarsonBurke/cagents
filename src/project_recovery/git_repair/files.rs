@@ -11,6 +11,7 @@ impl Directory {
         directory.require_current()?;Ok(directory)
     }
     pub(super) fn path(&self)->&Path { &self.path }
+    pub(super) fn original(&self)->(PathBuf,Arc<File>) {(self.path.clone(),self.file.clone())}
     pub(super) fn sync(&self)->Result<(),String> { self.file.sync_all().map_err(|error|error.to_string()) }
     pub(super) fn anchor(&self)->PathBuf { PathBuf::from(format!("/proc/{}/fd/{}",std::process::id(),self.file.as_raw_fd())) }
     pub(super) fn require_current(&self)->Result<(),String> {
@@ -32,6 +33,7 @@ impl Edit {
     pub(super) fn new(directory:Directory,name:&'static str,before:Vec<u8>,after:Vec<u8>)->Self {Self{directory,name,before,after}}
     pub(super) fn apply(&self)->Result<(),String> { self.apply_with(||{}) }
     pub(super) fn retained_bytes(&self)->usize {self.before.len().saturating_add(self.after.len())}
+    pub(super) fn original_directory(&self)->(PathBuf,Arc<File>) {self.directory.original()}
     pub(super) fn require_current(&self)->Result<(),String> {self.directory.require_current()}
     /// A prior attempt may have published the exact after-image before reporting
     /// a sync/name-check failure. Finish its durability, never publish it twice.
