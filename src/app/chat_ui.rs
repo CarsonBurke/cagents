@@ -35,6 +35,7 @@ mod step;
 mod thumbnails;
 mod tool_text;
 mod raw_original;
+mod disclosure_intent;
 mod clipboard_intent;
 mod turn;
 mod view;
