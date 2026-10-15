@@ -1575,8 +1575,9 @@ impl Runtime {
             .padding(iced::Padding::new(step::GAP_M))
             .width(Length::Fill);
         let transcript_index = content.len();
-        let (catalog, bookmark) = self.selection_document();
-        content.push(selection::transcript_virtualized(
+        content.push(if self.visible.load(Ordering::Relaxed) {
+            let (catalog, bookmark) = self.selection_document();
+            crate::ui_memory::gate(selection::transcript_virtualized(
             scroll::transcript_observed(
                 transcript,
                 target,
@@ -1606,7 +1607,12 @@ impl Runtime {
             self.selected_subagent.as_deref(),
             catalog,
             bookmark,
-        ));
+            ))
+        } else {
+            // Overscan cards can remain mounted after model dehydration.
+            // Diff to a cheap child so no old retained paragraph survives.
+            crate::ui_memory::gate(widget::Space::new().width(Length::Fill).height(Length::Fill))
+        });
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(
                 widget::button::custom(design::caption("↓ New activity"))
