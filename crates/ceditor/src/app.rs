@@ -106,6 +106,8 @@ struct Tab {
     discard_authority: Option<WorktreeAuthority>,
     marker_authority: Option<WorktreeAuthority>,
     mutation_operation: u64,
+    git_mutation_revision: u64,
+    discard_recovery: Option<Arc<cagents::repository::DiscardRecovery>>,
     /// The pull request review behind the sidebar's Pull requests panel. It
     /// lists the GitHub repository the worktree's remotes name and drives
     /// `runtime` through the files of whichever pull request is open.
@@ -182,6 +184,20 @@ pub enum Message {
     ChangeGroupResolved {
         request: git_mutations::GroupRequest,
         result: Result<git_mutations::GroupSelection, String>,
+    },
+    DiffPatchPrepared {
+        origin: git_mutations::GroupOrigin,
+        result: Result<Option<repository_widget::PreparedDiffMutation>, String>,
+    },
+    UndoMutationFinished {
+        card: CardId,
+        expires_unix_ms: u64,
+        paths: Vec<RepoPath>,
+        result: Result<MutationOutcome, String>,
+    },
+    PatchMutationFinished {
+        card: CardId,
+        result: Result<(MutationOutcome, Option<cagents::repository::DiscardRecovery>), String>,
     },
     StageMarkers {
         card: CardId,
@@ -1576,6 +1592,8 @@ impl Editor {
             discard_authority: None,
             marker_authority: None,
             mutation_operation: 0,
+            git_mutation_revision: 0,
+            discard_recovery: None,
             review,
         });
         if self.active.is_none() || (focus && !self.modal_open()) {
@@ -2314,6 +2332,14 @@ impl Editor {
     }
 
     fn refresh_visible(&mut self) -> Task<Message> {
+        // Reuse the existing refresh clock only while a bounded Undo receipt
+        // is retained; expiry never performs a Git operation.
+        for tab in &mut self.tabs {
+            if tab.discard_recovery.as_ref().is_some_and(|recovery| !recovery.can_undo()) {
+                tab.discard_recovery = None;
+                if let Some(source) = tab.sidebar.source_control.as_mut() { source.undo_discard_until_unix_ms = None; }
+            }
+        }
         if !self.can_refresh_visible() {
             return Task::none();
         }
@@ -2766,6 +2792,7 @@ impl Editor {
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
                 tab.mutation = None;
+                tab.git_mutation_revision = tab.git_mutation_revision.wrapping_add(1);
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
                     source.set_mutation(None);
                     source.set_error(notice.clone());
@@ -3499,6 +3526,9 @@ impl Application for Editor {
                     });
                     Task::batch([task, self.drain(card)])
                 }
+                Message::Repository(RepositoryAction::ApplyDiffHunk { card, kind, request }) => {
+                    self.start_diff_patch(card, kind, request)
+                }
                 Message::Repository(RepositoryAction::Review { card, action }) => {
                     self.handle_review(card, action)
                 }
@@ -3951,6 +3981,8 @@ impl Application for Editor {
                         | SidebarAction::RequestDiscard { key, .. }
                         | SidebarAction::ConfirmDiscard { key, .. }
                         | SidebarAction::ConfirmStageMarkers { key, .. }
+                        | SidebarAction::UndoDiscard { key }
+                        | SidebarAction::ToggleGitOutput { key }
                         | SidebarAction::CommitMessageChanged { key, .. }
                         | SidebarAction::Commit { key, .. }
                         | SidebarAction::AmendChanged { key, .. }
@@ -3989,6 +4021,22 @@ impl Application for Editor {
                     tab.navigation.apply(&action);
                     let persist_expansion = matches!(action, SidebarAction::ToggleDirectory { .. });
                     let task = match action {
+                        SidebarAction::ToggleGitOutput { .. } => {
+                            if let Some(source) = tab.sidebar.source_control.as_mut() { source.output_expanded = !source.output_expanded; }
+                            Task::none()
+                        }
+                        SidebarAction::UndoDiscard { .. } => {
+                            let Some(recovery) = tab.discard_recovery.clone().filter(|recovery| recovery.can_undo()) else { return Task::none(); };
+                            let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
+                            if self.begin_mutation(id, MutationKind::Discard).is_none() { return Task::none(); }
+                            let expires_unix_ms = recovery.expires_unix_ms;
+                            let paths = recovery.entries.iter().map(|entry| entry.path.clone()).collect();
+                            cosmic::task::future(async move {
+                                let result = tokio::task::spawn_blocking(move || RepositoryService::system("git").with_worktree_authority(authority)?.undo_discard(&recovery, &CancellationToken::default()))
+                                    .await.map_err(|error| error.to_string()).and_then(|result| result.map_err(|error| error.to_string()));
+                                Message::UndoMutationFinished { card: id, expires_unix_ms, paths, result }
+                            })
+                        }
                         SidebarAction::ConfirmStageMarkers { confirmed, .. } => {
                             if tab.mutation.is_some() { return Task::none(); }
                             let Some(source) = tab.sidebar.source_control.as_mut() else { return Task::none(); };
@@ -4018,18 +4066,15 @@ impl Application for Editor {
                                 return Task::none();
                             }
                             cosmic::task::future(async move {
-                                let mut paths =
-                                    cagents::repository::selection_pathspecs(&request.tracked);
-                                paths.extend(request.untracked.iter().cloned());
                                 let result = tokio::task::spawn_blocking(move || {
                                     RepositoryService::system("git")
                                         .with_worktree_authority(authority)?
-                                        .discard(&request, &CancellationToken::default())
+                                        .discard_recoverable(&request, &CancellationToken::default())
                                 })
                                 .await
                                 .map_err(|error| error.to_string())
                                 .and_then(|result| result.map_err(|error| error.to_string()));
-                                Message::Discarded(id, paths, result)
+                                Message::PatchMutationFinished { card: id, result: result.map(|result| (result.outcome, Some(result.recovery))) }
                             })
                         }
                         SidebarAction::Commit { message, amend, .. } => {
@@ -4089,6 +4134,7 @@ impl Application for Editor {
                                     return Task::none();
                                 }
                             }
+                            let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
                             let Some(worktree) = self.begin_mutation(id, MutationKind::Other)
                             else {
                                 return Task::none();
@@ -4101,7 +4147,7 @@ impl Application for Editor {
                             }
                             cosmic::task::future(async move {
                                 let result = tokio::task::spawn_blocking(move || {
-                                    RepositoryService::system("git").git_operation(
+                                    RepositoryService::system("git").with_worktree_authority(authority)?.git_operation(
                                         &worktree,
                                         &operation,
                                         &CancellationToken::default(),
@@ -4114,12 +4160,13 @@ impl Application for Editor {
                             })
                         }
                         SidebarAction::Push { branch, target, .. } => {
+                            let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
                             let Some(worktree) = self.begin_mutation(id, MutationKind::Push) else {
                                 return Task::none();
                             };
                             cosmic::task::future(async move {
                                 let result = tokio::task::spawn_blocking(move || {
-                                    RepositoryService::system("git").push(
+                                    RepositoryService::system("git").with_worktree_authority(authority)?.push(
                                         &PushRequest {
                                             worktree,
                                             branch,
@@ -4186,12 +4233,13 @@ impl Application for Editor {
                             if !eligible {
                                 return Task::none();
                             }
+                            let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
                             let Some(root) = self.begin_mutation(id, MutationKind::Other) else {
                                 return Task::none();
                             };
                             cosmic::task::future(async move {
                                 let result = tokio::task::spawn_blocking(move || {
-                                    RepositoryService::system("git").git_operation(
+                                    RepositoryService::system("git").with_worktree_authority(authority)?.git_operation(
                                         &root,
                                         &cagents::repository::GitOperation::IgnorePath { path },
                                         &CancellationToken::default(),
@@ -4457,6 +4505,39 @@ impl Application for Editor {
                     self.finish_mutation(card, Some("Conflict markers remain; confirm Stage anyway or cancel.".into()))
                 }
                 Message::ChangeGroupResolved { request, result } => self.finish_change_group(request, result),
+                Message::DiffPatchPrepared { origin, result } => self.finish_diff_patch(origin, result),
+                Message::UndoMutationFinished { card, expires_unix_ms, paths, result } => {
+                    if matches!(result, Ok(MutationOutcome::Applied { .. })) {
+                        if let Some(root) = self.tab(card).map(|tab| tab.runtime.descriptor.worktree.clone()) {
+                            for tab in &mut self.tabs {
+                                if tab.runtime.descriptor.worktree == root && tab.discard_recovery.as_ref().is_some_and(|recovery| recovery.expires_unix_ms == expires_unix_ms) {
+                                    tab.discard_recovery = None;
+                                    if let Some(source) = tab.sidebar.source_control.as_mut() { source.undo_discard_until_unix_ms = None; }
+                                }
+                            }
+                        }
+                    }
+                    self.update(Message::Discarded(card, paths, result))
+                },
+                Message::PatchMutationFinished { card, result } => {
+                    match result {
+                        Ok((outcome, recovery)) => {
+                            let paths = recovery.as_ref().map(|recovery| recovery.entries.iter().map(|entry| entry.path.clone()).collect()).unwrap_or_default();
+                            if let Some(recovery) = recovery.filter(|recovery| recovery.can_undo()) {
+                                let root = recovery.worktree.clone();
+                                let recovery = Arc::new(recovery);
+                                for tab in &mut self.tabs {
+                                    if tab.runtime.descriptor.worktree == root {
+                                        tab.discard_recovery = Some(recovery.clone());
+                                        if let Some(source) = tab.sidebar.source_control.as_mut() { source.undo_discard_until_unix_ms = Some(recovery.expires_unix_ms); }
+                                    }
+                                }
+                            }
+                            self.update(Message::Discarded(card, paths, Ok(outcome)))
+                        }
+                        Err(error) => self.update(Message::Mutation(card, Err(error))),
+                    }
+                },
                 Message::Mutation(id, result) => {
                     let notice = match result {
                         Ok(MutationOutcome::Applied { .. }) => None,
@@ -5007,7 +5088,7 @@ impl Application for Editor {
             }
             _ => None,
         });
-        let refresh = if self.can_refresh_visible() {
+        let refresh = if self.can_refresh_visible() || self.tabs.iter().any(|tab| tab.discard_recovery.is_some()) {
             iced::time::every(std::time::Duration::from_secs(10)).map(|_| Message::RefreshVisible)
         } else {
             Subscription::none()
@@ -5806,17 +5887,19 @@ mod tests {
     use super::*;
     use cagents::repository_widget::AsyncIdentity;
 
+    fn fixture_git_command(root: &Path, args: &[&str]) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        for (name, _) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) { command.env_remove(name); }
+        command.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
+            .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
+            .current_dir(root).args(args);
+        command
+    }
+
     fn git(root: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(root)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let output = fixture_git_command(root, args).output().unwrap();
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
@@ -7920,7 +8003,7 @@ mod tests {
         git(root, &["checkout", "main"]);
         std::fs::write(root.join("tracked.txt"), "main\n").unwrap();
         git(root, &["commit", "-am", "Main"]);
-        let merged = std::process::Command::new("git").current_dir(root).args(["merge", "other"]).output().unwrap();
+        let merged = fixture_git_command(root, &["merge", "other"]).output().unwrap();
         assert!(!merged.status.success());
         let mut app = editor();
         let id = open_real_git(&mut app, root, None);
@@ -7990,6 +8073,114 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
         std::fs::rename(parked, root).unwrap();
         assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "original work\n");
+    }
+
+    fn open_real_change(app: &mut Editor, id: CardId, path: &str, area: cagents::repository::ChangeArea) {
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        sidebar_action(app, SidebarAction::OpenChange { key, path: RepoPath::parse(path).unwrap(), area });
+    }
+
+    fn apply_real_hunk(app: &mut Editor, id: CardId, kind: cagents::git_patch::Kind) {
+        let action = app.tab(id).unwrap().runtime.diff_hunk_mutation_action(id, kind).expect("actual Ready diff must emit a hunk action");
+        let task = app.update(Message::Repository(action));
+        run_tasks(app, task);
+    }
+
+    #[test]
+    fn standalone_hunk_dispatch_stages_unstages_and_reverts_with_one_undo() {
+        use cagents::{git_patch::Kind, repository::ChangeArea};
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        let mut app = editor();
+        app.settings.editor_auto_save = false;
+        let id = open_real_git(&mut app, root, None);
+        open_real_change(&mut app, id, "tracked.txt", ChangeArea::Unstaged);
+        apply_real_hunk(&mut app, id, Kind::Stage);
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "changed");
+        open_real_change(&mut app, id, "tracked.txt", ChangeArea::Staged);
+        apply_real_hunk(&mut app, id, Kind::Unstage);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        open_real_change(&mut app, id, "tracked.txt", ChangeArea::Unstaged);
+        apply_real_hunk(&mut app, id, Kind::Revert);
+        assert_eq!(app.tab(id).unwrap().runtime.editor_text().unwrap(), "original\n");
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "changed\n", "buffer Revert does not silently persist");
+        let undo = app.update(Message::Repository(RepositoryAction::Undo { card: id }));
+        run_tasks(&mut app, undo);
+        assert_eq!(app.tab(id).unwrap().runtime.editor_text().unwrap(), "changed\n");
+        assert!(!app.tab(id).unwrap().runtime.can_step_editor_history(false), "one Undo restores the whole native transaction");
+        // Actual selected-line producer uses the same host adapter.
+        let request = app.tab(id).unwrap().runtime.diff_mutation_request(id, 0..1).unwrap();
+        let selection = app.update(Message::Repository(RepositoryAction::SelectDiffRow {
+            identity: request.identity.clone(), basis: request.basis.clone(), mode: request.mode,
+            revision: request.layout_revision, row: 0, side: cagents::diff_interaction::Side::New,
+            extend: false, context: false, drag: false,
+        }));
+        run_tasks(&mut app, selection);
+        let selected = app.tab(id).unwrap().runtime.diff_selection_mutation_action(id, Kind::Stage).unwrap();
+        let task = app.update(Message::Repository(selected));
+        run_tasks(&mut app, task);
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "changed");
+    }
+
+    #[test]
+    fn standalone_partial_revert_new_and_deleted_files_keep_native_or_recovery_undo() {
+        use cagents::{git_patch::Kind, repository::ChangeArea};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("new.sh"), "new script\n").unwrap();
+        std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o751)).unwrap();
+        let mut app = editor();
+        app.settings.editor_auto_save = false;
+        let id = open_real_git(&mut app, root, None);
+        open_real_change(&mut app, id, "new.sh", ChangeArea::Untracked);
+        apply_real_hunk(&mut app, id, Kind::Revert);
+        let save = app.update(Message::Repository(RepositoryAction::Save { card: id, overwrite: false }));
+        run_tasks(&mut app, save);
+        assert!(!root.join("new.sh").exists());
+        let undo = app.update(Message::Repository(RepositoryAction::Undo { card: id }));
+        run_tasks(&mut app, undo);
+        let save = app.update(Message::Repository(RepositoryAction::Save { card: id, overwrite: false }));
+        run_tasks(&mut app, save);
+        assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), "new script\n");
+        assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().mode() & 0o777, 0o751);
+        std::fs::remove_file(root.join("tracked.txt")).unwrap();
+        let refresh = app.refresh_snapshot(id, true);
+        run_tasks(&mut app, refresh);
+        open_real_change(&mut app, id, "tracked.txt", ChangeArea::Unstaged);
+        apply_real_hunk(&mut app, id, Kind::Revert);
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "original\n");
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        assert!(app.tab(id).unwrap().discard_recovery.as_ref().unwrap().can_undo());
+        sidebar_action(&mut app, SidebarAction::UndoDiscard { key });
+        assert!(!root.join("tracked.txt").exists(), "recovery Undo restores the original absence");
+        assert!(app.tab(id).unwrap().discard_recovery.is_none());
+    }
+
+    #[test]
+    fn standalone_prepared_hunk_refuses_a_replaced_root_before_queue_turn() {
+        let directory = git_fixture();
+        let replacement = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(replacement.path().join("tracked.txt"), "replacement\n").unwrap();
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, None);
+        open_real_change(&mut app, id, "tracked.txt", cagents::repository::ChangeArea::Unstaged);
+        let action = app.tab(id).unwrap().runtime.diff_hunk_mutation_action(id, cagents::git_patch::Kind::Stage).unwrap();
+        let preparation = app.update(Message::Repository(action));
+        let prepared = task_messages(preparation).into_iter().find(|message| matches!(message, Message::DiffPatchPrepared { .. })).unwrap();
+        let parked = root.with_extension("prepared-original");
+        std::fs::rename(root, &parked).unwrap();
+        std::fs::rename(replacement.path(), root).unwrap();
+        let task = app.update(prepared);
+        run_tasks(&mut app, task);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "replacement\n");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::rename(parked, root).unwrap();
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
     }
 
     #[test]
