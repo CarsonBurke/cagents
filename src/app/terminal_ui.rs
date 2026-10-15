@@ -558,13 +558,19 @@ impl Cagents {
             Action::Next(_, backwards) => {
                 find.focused = true;
                 let origin = handle.snapshot().scroll.history;
-                let previous = find.matches.get(find.selected).and_then(|found| found.rebase(origin));
-                let matches: Vec<_> = find.matches.iter().filter_map(|found| found.rebase(origin)).collect();
-                find.selected = previous.and_then(|previous| matches.iter().position(|found| *found == previous))
-                    .unwrap_or(0);
-                find.matches = matches.into();
+                let mut selected_survived = true;
+                if find.matches.first().is_some_and(|found| found.history != origin) {
+                    let previous = find.matches.get(find.selected).and_then(|found| found.rebase(origin));
+                    let matches: Vec<_> = find.matches.iter().filter_map(|found| found.rebase(origin)).collect();
+                    let selected = previous.and_then(|previous| matches.iter().position(|found| *found == previous));
+                    selected_survived = selected.is_some();
+                    find.selected = selected.unwrap_or(0);
+                    find.matches = matches.into();
+                }
                 if !find.matches.is_empty() {
-                    find.selected = if backwards {
+                    find.selected = if !selected_survived {
+                        if backwards { find.matches.len() - 1 } else { 0 }
+                    } else if backwards {
                         (find.selected + find.matches.len() - 1) % find.matches.len()
                     } else {
                         (find.selected + 1) % find.matches.len()
