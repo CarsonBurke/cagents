@@ -31,13 +31,6 @@ while IFS= read -r frame; do"#, 1);
         let exit_anchor = "      ;;\n  esac\ndone\n";
         assert_eq!(script.matches(exit_anchor).count(), 1);
         script = script.replacen(exit_anchor, "      if [ \"$(wc -l < \"$HOME/../spawns\")\" -eq 1 ]; then exit 0; fi\n      ;;\n  esac\ndone\n", 1);
-        let hold_anchor = "        *ASK_PERMISSION*)";
-        assert_eq!(script.matches(hold_anchor).count(), 1);
-        script = script.replacen(hold_anchor, r#"        *HOLD_RECONCILIATION*)
-          printf 'held\n' > "$HOME/../reconciliation-turn-held"
-          continue
-          ;;
-        *ASK_PERMISSION*)"#, 1);
         std::fs::write(&program, script).unwrap();
         let proof = host.lock().unwrap().proof().clone();
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
@@ -209,8 +202,8 @@ fn combined_close_retained_lifecycle_ordinary_receipt_lookup_keeps_host_census_r
 
 
 #[test]
-fn combined_close_retained_lifecycle_reconciliation_captures_busy_restart_after_claim() {
-    if owning_close_isolated("combined_close_retained_lifecycle_reconciliation_captures_busy_restart_after_claim").is_some() { return; }
+fn combined_close_retained_lifecycle_reconciliation_defers_to_initializing_restart() {
+    if owning_close_isolated("combined_close_retained_lifecycle_reconciliation_defers_to_initializing_restart").is_some() { return; }
     let fixture = RetainedCloseRaceFixture::scheduled();
     assert!(matches!(fixture.agent.origin, Origin::Automation {..}));
     let store = registry(&fixture.host).unwrap();
@@ -223,47 +216,41 @@ fn combined_close_retained_lifecycle_reconciliation_captures_busy_restart_after_
     let host = fixture.host.clone(); let run = fixture.run.clone();
     let reconciling = std::thread::spawn(move || reconcile_agent_run(&host, &run, true));
     let reached = entering.recv_timeout(Duration::from_secs(2));
-    // A->B is a real public attach/restart in the SAME retained helper. Allow
-    // initialization, then send a real nonfinishing turn so B is positively
-    // working rather than assuming any backend change must always refuse.
-    fixture.release_restart();
-    let restarted = crate::host::client::process_request(&fixture.host, EXECUTION_CLIENT,
-        ClientRequest::ChatAttach {session:fixture.source.clone()});
-    let prompt = if restarted.is_ok() {
-        crate::host::client::process_request(&fixture.host, EXECUTION_CLIENT,
-            ClientRequest::ChatCommand {chat_id:fixture.source.id, command:Command::Prompt {
-                text:"HOLD_RECONCILIATION".into(), attachments:vec![], mode:PromptMode::Send}})
-    } else { Err(crate::terminal_ipc::ProtocolError::new(crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
-        "actual restart failed before test prompt", true)) };
-    let marker = fixture.path.parent().unwrap().join("reconciliation-turn-held");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut busy = false;
-    while Instant::now() < deadline {
-        if fixture.handle.refresh_retained_state().is_ok()
-            && fixture.handle.snapshot(None).is_some_and(|snapshot| snapshot.busy) {
-            busy = marker.exists();
-            if busy {break;}
-        }
-        if Instant::now() >= deadline {break;}
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    // Actual public ChatAttach creates B in the same helper. Its private
+    // protocol initialization is held before readiness, with the production
+    // lifecycle claim still retained. No untracked Prompt bypasses Agent gate.
+    let host = fixture.host.clone(); let source = fixture.source.clone();
+    let attaching = std::thread::spawn(move || crate::host::client::process_request(&host, EXECUTION_CLIENT,
+        ClientRequest::ChatAttach {session:source}));
+    let marker = fixture.path.parent().unwrap().join("retained-restart-waiting");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() && Instant::now() < deadline {std::thread::sleep(Duration::from_millis(5));}
+    let initializing = marker.exists();
     let before_refusal = store.lock().unwrap().agent(fixture.agent.id).unwrap();
-    let successor = fixture.handle.provider_process();
     let _ = release.send(());
     let result = reconciling.join().unwrap();
-    assert!(reached.is_ok()); restarted.unwrap(); prompt.unwrap();
-    assert!(busy, "actual restarted B must have received its held working turn before eligibility is captured");
+    let after_refusal = store.lock().unwrap().agent(fixture.agent.id).unwrap();
+    fixture.release_restart();
+    let restarted = attaching.join().unwrap();
+    assert!(reached.is_ok()); assert!(initializing, "real restarted B must be held before readiness");
     let error = result.unwrap_err();
-    assert!(error.contains("not idle"), "fresh B eligibility must be checked after the lifecycle claim: {error}");
-    let successor = successor.expect("real current backend");
+    assert!(error.contains("lifecycle transition"), "automatic cleanup must defer to initializing B: {error}");
+    assert_eq!(before_refusal, after_refusal);
+    let (response, _, _) = restarted.unwrap();
+    assert!(matches!(response, ServerResponse::ChatAttached {..}));
+    fixture.handle.refresh_retained_state().unwrap();
+    let successor = fixture.handle.provider_process().expect("real initialized backend B");
     assert_ne!(successor, fixture.original); assert!(successor.is_current());
     assert_eq!(fixture.handle.actor_identity().unwrap(), fixture.identity);
     assert!(fixture.identity.record.holder.is_current());
     assert_eq!(fixture.spawns(), 2);
-    assert_eq!(store.lock().unwrap().agent(fixture.agent.id).unwrap(), before_refusal);
-    assert_eq!(before_refusal.origin, fixture.agent.origin); assert!(!before_refusal.closed);
+    let current = store.lock().unwrap().agent(fixture.agent.id).unwrap();
+    assert_eq!(current.origin, fixture.agent.origin); assert!(!current.closed);
+    assert_eq!(current.spec, fixture.agent.spec);
     assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
     assert!(!fixture.host.lock().unwrap().native_closing.contains_key(&fixture.source.id));
+    // Once a later B is fully ready and idle, a NEW eligibility observation
+    // may qualify. Backend replacement alone is never a blanket refusal token.
 }
 
 #[test]
