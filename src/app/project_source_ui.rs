@@ -153,3 +153,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "project_source_contracts.rs"]
+mod contracts;
