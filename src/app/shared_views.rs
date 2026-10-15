@@ -17,8 +17,11 @@ struct LocalViews {
 /// Whole descriptors can contain concurrently changed metadata even for the
 /// same process. Retry only while the complete base is still authoritative;
 /// the daemon must also enforce this fence when it applies the operation.
-fn can_retry_pane_kind(before: &CardKind, current: &CardKind) -> bool {
-    before == current && match before {
+fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
+    before.kind == current.kind
+        && before.pending_terminal_start == current.pending_terminal_start
+        && before.scope == current.scope
+        && match &before.kind {
         CardKind::Terminal(session) => session.continuity.live_proof()
             .is_some_and(|proof| proof.is_complete()),
         CardKind::Chat(session) => session.proof.as_ref()
@@ -110,6 +113,81 @@ impl State {
 }
 
 impl Cagents {
+    pub(super) fn refuse_conflicting_view_update(
+        &mut self,
+        scope: Scope,
+        operation: uuid::Uuid,
+        change: Change,
+        model: crate::workspace_model::WorkspaceModel,
+        error: String,
+    ) -> Task<Message> {
+        if self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
+            && model.identity != self.workspace_model.identity
+        { return Task::none(); }
+        let repository = |model: &crate::workspace_model::WorkspaceModel, scope: &Scope| {
+            match scope {
+                Scope::Channel(channel) => model.channel(*channel).map(|channel| channel.repository.clone()),
+                Scope::Worktree { repository, .. } => Some(repository.clone()),
+            }
+        };
+        let captured_repository = repository(&self.workspace_model, &scope);
+        if model.sequence >= self.workspace_model.sequence { self.workspace_model = model; }
+        let Some(index) = self.shared_views.pending.iter().position(|(id, pending_scope, pending)|
+            *id == operation && *pending_scope == scope && *pending == change)
+        else {
+            // An old-scope receipt cannot retire an already retargeted retry.
+            return self.reconcile_workspace_model();
+        };
+        let mut retry = None;
+        if let Change::Update { before, pane } = &change
+            && before.id == pane.id
+            && self.card_state(pane.id).is_some_and(|card| card.existence.is_open())
+        {
+            let mut owners = self.workspace_model.views.iter()
+                .filter(|view| view.panes.iter().any(|current| current.id == pane.id));
+            if let Some(owner) = owners.next()
+                && owners.next().is_none()
+                && !owner.retired.contains(&pane.id)
+                && !self.shared_views.blocked.contains(&owner.scope)
+                && captured_repository.is_some()
+                && captured_repository == repository(&self.workspace_model, &scope)
+                && captured_repository == repository(&self.workspace_model, &owner.scope)
+            {
+                let current = owner.panes.iter().find(|current| current.id == pane.id).unwrap();
+                let mut presentation = current.clone();
+                let later = &self.shared_views.pending[index + 1..];
+                let superseded = |field: fn(&Pane, &Pane) -> bool| later.iter().any(|(_, _, change)|
+                    matches!(change, Change::Update { before, pane: after }
+                        if after.id == pane.id && field(before, after)));
+                if before.title != pane.title && !superseded(|a, b| a.title != b.title) {
+                    presentation.title = pane.title.clone();
+                }
+                if before.user_title != pane.user_title && !superseded(|a, b| a.user_title != b.user_title) {
+                    presentation.user_title = pane.user_title.clone();
+                }
+                if before.width_fraction != pane.width_fraction && !superseded(|a, b| a.width_fraction != b.width_fraction) {
+                    presentation.width_fraction = pane.width_fraction;
+                }
+                if presentation != *current {
+                    retry = Some((uuid::Uuid::new_v4(), owner.scope.clone(), owner.revision,
+                        Change::Update { before: current.clone(), pane: presentation }));
+                }
+            }
+        }
+        tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
+        self.shared_views.pending.remove(index);
+        if let Some((operation, scope, revision, change)) = retry {
+            self.shared_views.pending.insert(index, (operation, scope.clone(), change.clone()));
+            self.publish_model_edit(ModelEdit::ChangeView {
+                scope, expected_revision: revision, operation, change,
+            });
+        }
+        self.notices.record(TransientNotice::warning(
+            "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
+        ));
+        self.reconcile_workspace_model()
+    }
+
     pub(super) fn retain_local_pane(&mut self, id: CardId) {
         self.shared_views.retained.insert(id);
         Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
@@ -699,9 +777,16 @@ impl Cagents {
             let Some(owner) = owners.next() else { continue; };
             if owners.next().is_some() || owner.scope == *scope { continue; }
             let current = owner.panes.iter().find(|pane| pane.id == card).unwrap();
-            if before.kind != pane.kind && !can_retry_pane_kind(&before.kind, &current.kind) {
+            let source_changed = before.kind != pane.kind
+                || before.pending_terminal_start != pane.pending_terminal_start
+                || before.scope != pane.scope;
+            if source_changed && !can_retry_source_fields(before, current) {
                 before.kind = current.kind.clone();
                 pane.kind = current.kind.clone();
+                before.pending_terminal_start = current.pending_terminal_start;
+                pane.pending_terminal_start = current.pending_terminal_start;
+                before.scope = current.scope.clone();
+                pane.scope = current.scope.clone();
                 stale_actor = true;
             }
             if before == pane {
@@ -1706,6 +1791,140 @@ mod tests {
                 assert_moving_metadata(&app, &expected);
             }
             assert!(app.shared_views.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn channel_move_refuses_stale_start_and_scope_fields_without_a_kind_delta() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let (mut app, source, destination, pane) =
+            channel_move_fixture_with_kind(Some(moving_terminal_kind()));
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.move_pane_to_channel(pane.id, destination));
+        let ModelEdit::ChangeView { operation: transfer, .. } = rx.try_recv().unwrap() else {
+            panic!("transfer");
+        };
+        // Exercise the pending Update boundary independently of whether a
+        // particular producer currently emits both source-sensitive deltas.
+        let mut before = pane.clone();
+        before.pending_terminal_start = true;
+        before.scope = Some("/previous-scope".into());
+        let mut desired = before.clone();
+        desired.pending_terminal_start = false;
+        desired.scope = Some("/stale-scope".into());
+        desired.title = "Preserved presentation edit".into();
+        app.shared_views.pending.push((uuid::Uuid::new_v4(), Scope::Channel(source),
+            Change::Update { before, pane: desired.clone() }));
+        let mut model = app.workspace_model.clone();
+        views::transfer(&mut model.views, &Scope::Channel(source), pane.id,
+            &Scope::Channel(destination), None).unwrap();
+        let current = &mut model.views.iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination)).unwrap().panes[0];
+        let CardKind::Terminal(session) = &mut current.kind else { panic!("terminal"); };
+        session.id = TerminalId::new();
+        current.pending_terminal_start = true;
+        current.scope = Some("/authoritative-scope".into());
+        let expected = current.clone();
+        model.sequence += 1;
+        drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+            scope: Scope::Channel(source), operation: Some(transfer), model: model.clone(),
+        }));
+        let ModelEdit::ChangeView { scope, change, .. } = rx.try_recv().unwrap() else {
+            panic!("presentation retry");
+        };
+        assert_eq!(scope, Scope::Channel(destination));
+        let Change::Update { before, pane: after } = &change else { panic!("update"); };
+        assert_eq!(before.kind, after.kind);
+        assert_eq!(before.pending_terminal_start, after.pending_terminal_start);
+        assert_eq!(before.scope, after.scope);
+        let destination = model.views.iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination)).unwrap();
+        destination.apply(&change).unwrap();
+        assert_eq!(destination.panes[0].title, desired.title);
+        assert_eq!(destination.panes[0].kind, expected.kind);
+        assert_eq!(destination.panes[0].pending_terminal_start, expected.pending_terminal_start);
+        assert_eq!(destination.panes[0].scope, expected.scope);
+        assert!(app.notices.recent().any(|entry|
+            entry.notice.message.contains("incoming session update could not be verified")));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_source_conflict_refuses_session_intent_and_reissues_only_safe_presentation() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for control in ["current", "missing", "foreign-project", "later-title"] {
+            let (mut app, source, _, before) = channel_move_fixture();
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            let operation = uuid::Uuid::new_v4();
+            let mut desired = before.clone();
+            desired.title = "Earlier captured title".into();
+            desired.user_title = Some("User title".into());
+            desired.width_fraction = 0.8;
+            desired.pending_terminal_start = true;
+            desired.scope = Some("/stale-source".into());
+            let change = Change::Update { before: before.clone(), pane: desired.clone() };
+            app.shared_views.pending.push((operation, Scope::Channel(source), change.clone()));
+            let later_operation = uuid::Uuid::new_v4();
+            if control == "later-title" {
+                let mut later = before.clone();
+                later.title = "Later user title".into();
+                app.shared_views.pending.push((later_operation, Scope::Channel(source),
+                    Change::Update { before: before.clone(), pane: later }));
+            }
+            let mut model = app.workspace_model.clone();
+            let current = &mut model.views[0].panes[0];
+            let CardKind::Browser(browser) = &mut current.kind else { panic!("browser"); };
+            browser.current_url = "https://authoritative.example".parse().unwrap();
+            current.scope = Some("/authoritative-source".into());
+            let expected = current.clone();
+            if control == "missing" { model.views[0].panes.clear(); }
+            if control == "foreign-project" {
+                model.channels.iter_mut().find(|channel| channel.id == source).unwrap()
+                    .repository = "/foreign/.git".into();
+            }
+            model.sequence += 1;
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewConflicted {
+                scope: Scope::Channel(source), operation, change, model: model.clone(),
+                error: "The pane source changed".into(),
+            }));
+            assert!(!app.shared_views.pending.iter().any(|(id, _, _)| *id == operation));
+            assert!(app.notices.recent().any(|entry|
+                entry.notice.message.contains("session update was refused")));
+            if matches!(control, "missing" | "foreign-project") {
+                assert!(rx.try_recv().is_err(), "refusal cannot rename a missing or foreign source");
+                continue;
+            }
+            let ModelEdit::ChangeView { operation: retry, change, .. } = rx.try_recv().unwrap() else {
+                panic!("presentation retry");
+            };
+            assert_ne!(retry, operation);
+            let Change::Update { before, pane } = &change else { panic!("update"); };
+            assert_eq!(before.kind, expected.kind);
+            assert_eq!(pane.kind, expected.kind);
+            assert_eq!(before.pending_terminal_start, pane.pending_terminal_start);
+            assert_eq!(before.scope, pane.scope);
+            assert_eq!(pane.user_title, desired.user_title);
+            assert_eq!(pane.width_fraction, desired.width_fraction);
+            let expected_title = if control == "later-title" { &expected.title } else { &desired.title };
+            assert_eq!(&pane.title, expected_title);
+            // A delayed old receipt cannot retire the independent new intent.
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: Scope::Channel(source), operation: Some(operation), model: model.clone(),
+            }));
+            assert!(app.shared_views.pending.iter().any(|(id, _, _)| *id == retry));
+            if control == "later-title" {
+                assert!(app.shared_views.pending.iter().any(|(id, _, _)| *id == later_operation));
+                assert_eq!(app.card_state(pane.id).unwrap().title, "Later user title");
+            }
+            model.views[0].apply(&change).unwrap();
+            model.sequence += 1;
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: Scope::Channel(source), operation: Some(retry), model,
+            }));
+            assert!(!app.shared_views.pending.iter().any(|(id, _, _)| *id == retry));
+            assert!(rx.try_recv().is_err());
         }
     }
 
