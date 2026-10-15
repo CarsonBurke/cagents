@@ -5465,6 +5465,7 @@ impl Cagents {
             .any(|pane| pane.id == card && pane.pending_terminal_start);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                if setup_run.is_some() { worktree_setup_ui::verify_setup_launch(&session.launch)?; }
                 let mut created = false;
                 let (recovered, mode) = if shared && !explicit_retry {
                     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;

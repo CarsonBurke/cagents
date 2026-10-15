@@ -378,6 +378,30 @@ pub fn prepare(
     skip: bool,
     cancel: &CancellationToken,
 ) -> Result<SetupPreparation, SetupError> {
+    prepare_inner(primary, destination, plan, skip, None, cancel)
+}
+
+/// Prepare only the exact checkout created by a durable operation. A delayed
+/// callback must not copy into a replacement at the same filesystem path.
+pub fn prepare_for_creation(
+    primary: &Path,
+    destination: &Path,
+    plan: &SetupPlan,
+    skip: bool,
+    creation: crate::model::OperationId,
+    cancel: &CancellationToken,
+) -> Result<SetupPreparation, SetupError> {
+    prepare_inner(primary, destination, plan, skip, Some(creation), cancel)
+}
+
+fn prepare_inner(
+    primary: &Path,
+    destination: &Path,
+    plan: &SetupPlan,
+    skip: bool,
+    creation: Option<crate::model::OperationId>,
+    cancel: &CancellationToken,
+) -> Result<SetupPreparation, SetupError> {
     if skip {
         return Ok(SetupPreparation {
             skipped: true,
@@ -402,6 +426,19 @@ pub fn prepare(
     }
     let source = fs_safety::Root::open(primary).map_err(error)?;
     let target = fs_safety::Root::open(destination).map_err(error)?;
+    let verify_generation = || -> Result<(), SetupError> {
+        let Some(creation) = creation else { return Ok(()); };
+        use std::os::unix::fs::MetadataExt;
+        let held = target.metadata().map_err(error)?;
+        let named = fs::symlink_metadata(destination).map_err(error)?;
+        let admin = service.git_dir(destination, cancel).map_err(error)?;
+        if !named.is_dir() || held.dev() != named.dev() || held.ino() != named.ino()
+            || !crate::repository::worktree_setup_marker_matches(&admin, creation).map_err(error)? {
+            return Err(error("The setup checkout creation generation changed; review the current checkout explicitly"));
+        }
+        Ok(())
+    };
+    verify_generation()?;
     let mut result = SetupPreparation::default();
     let mut found = BTreeSet::new();
     let mut scanned = 0;
@@ -456,6 +493,7 @@ pub fn prepare(
                 .map(|b| PathBuf::from(OsString::from_vec(b.to_vec()))),
         );
     }
+    verify_generation()?;
     for path in found {
         check_cancel(cancel)?;
         index_lock.check().map_err(error)?;
@@ -551,6 +589,7 @@ pub fn prepare(
     if !is_trusted(primary, plan, cancel)? {
         return Err(SetupError::TrustRequired);
     }
+    verify_generation()?;
     result.command = (!plan.commands.is_empty()).then(|| {
         plan.commands
             .iter()

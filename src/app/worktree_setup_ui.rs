@@ -96,14 +96,27 @@ fn terminal_status(session: &TerminalSession, open: bool, starting: bool) -> Wor
     }
 }
 
-fn preparation(intent: SetupIntent, destination: &Path, token: &CancellationToken) -> Result<SetupPreparation, String> {
+/// Runs on the terminal start worker, immediately before asking the daemon to
+/// start a deliberately reviewed setup. The daemon repeats this at child start.
+pub(super) fn verify_setup_launch(launch: &LaunchRecipe) -> Result<(), String> {
+    let creation = launch.environment.get("CAGENTS_WORKTREE_SETUP_CREATION_ID")
+        .ok_or("The setup launch has no recorded creation generation")?.parse::<OperationId>().map_err(|error| error.to_string())?;
+    let service = RepositoryService::system("git"); let token = CancellationToken::new();
+    let admin = service.git_dir(&launch.working_directory, &token).map_err(|error| error.to_string())?;
+    if !crate::repository::worktree_setup_marker_matches(&admin, creation).map_err(|error| error.to_string())? {
+        return Err("The setup destination was replaced after preparation; review its current checkout explicitly".into());
+    }
+    Ok(())
+}
+
+fn preparation(intent: SetupIntent, destination: &Path, creation: OperationId, token: &CancellationToken) -> Result<SetupPreparation, String> {
     if intent.skip { return Ok(SetupPreparation { skipped: true, ..Default::default() }); }
     // Keep automatic cleanup fenced if the user selects another scope while
     // the background copy is still preparing this new checkout.
     let _protection = crate::worktree_cleanup::protect(destination).map_err(|error| error.to_string())?;
     let primary = intent.primary.ok_or("The primary checkout is unavailable for setup")?;
     let plan = intent.plan.ok_or("The project's setup configuration is unavailable")?;
-    crate::worktree_setup::prepare(&primary, destination, &plan, false, token).map_err(|error| error.to_string())
+    crate::worktree_setup::prepare_for_creation(&primary, destination, &plan, false, creation, token).map_err(|error| error.to_string())
 }
 
 impl Cagents {
@@ -118,7 +131,7 @@ impl Cagents {
         cosmic::task::future(async move {
             let worktree = destination.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let result = preparation(intent.clone(), &destination, &token)?;
+                let result = preparation(intent.clone(), &destination, operation, &token)?;
                 // Copy-only completion is durable before the UI can report it.
                 // Shell completion is evidenced by its exact marked terminal.
                 if result.command.is_none() && !result.skipped {
@@ -173,9 +186,12 @@ impl Cagents {
         // pane publication. The selection lifecycle callback retires this entry.
         self.setup_ui.pending.insert(worktree.clone(), (operation, CancellationToken::new()));
         self.setup_ui.authorized_runs.lock().expect("setup launch authorization lock").insert(operation);
+        let Some(creation) = self.setup_ui.recovered.get(&worktree).map(|(creation, _)| *creation) else {
+            return self.worktree_setup_selection_finished(operation, worktree, false);
+        };
         let launch = LaunchRecipe {
             program: "/bin/sh".into(), arguments: vec!["-c".into(), command], working_directory: worktree.clone(),
-            environment: [("CAGENTS_WORKTREE_SETUP".into(), "1".into()), ("CAGENTS_WORKTREE_SETUP_ID".into(), operation.to_string()), ("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), started_at.to_string())].into(),
+            environment: [("CAGENTS_WORKTREE_SETUP".into(), "1".into()), ("CAGENTS_WORKTREE_SETUP_ID".into(), operation.to_string()), ("CAGENTS_WORKTREE_SETUP_CREATION_ID".into(), creation.to_string()), ("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), started_at.to_string())].into(),
             unset_environment: Default::default(),
         };
         let session = fresh_terminal_session(launch);
@@ -902,7 +918,7 @@ mod tests {
 
     #[test]
     fn skipped_setup_needs_no_filesystem_or_project_configuration() {
-        let result = preparation(SetupIntent { primary: None, plan: None, skip: true, ..Default::default() }, Path::new("/missing/worktree"), &CancellationToken::new()).unwrap();
+        let result = preparation(SetupIntent { primary: None, plan: None, skip: true, ..Default::default() }, Path::new("/missing/worktree"), OperationId::new(), &CancellationToken::new()).unwrap();
         assert!(result.skipped);
         assert!(result.command.is_none());
     }
