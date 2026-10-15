@@ -36,7 +36,7 @@ impl Server {
         }
         let context=self.actor.pinned_execution_directory(&request.working_directory)?;
         self.actor.close()?;reap_orphans()?;
-        if self.journal.lock().unwrap_or_else(|p|p.into_inner()).loss()?.is_some() {return Err("Retained outcome continuity is unconfirmed; restart cannot conceal it".into());}
+        self.journal.lock().unwrap_or_else(|p|p.into_inner()).clear_acknowledged_loss_for_restart()?;
         let id=request.id;
         let mut lineage=self.published_sources();if !lineage.contains(&self.source) {lineage.push(self.source.clone());}
         if lineage.len()>1024 || serde_json::to_vec(&lineage).map_err(|error|error.to_string())?.len()>4*1024*1024 {return Err("Retained source lineage capacity reached".into());}
