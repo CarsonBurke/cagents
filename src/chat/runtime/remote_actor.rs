@@ -38,6 +38,7 @@ pub(crate) struct Resident {
     pub requests:Vec<chat::Request>,
     pub completed:bool,
     pub owns_work:bool,
+    pub installed:bool,
     pub idle:bool,
     pub failure:Option<String>,
     pub confirmed_session:Option<String>,
@@ -129,7 +130,7 @@ impl RemoteActor {
         use crate::model::{BootId,HostSessionId,HostIncarnation,TerminalId};
         let process=Process::read(std::process::id() as i32).unwrap();
         let boot=BootId::new("fixture-boot");
-        let resident=Resident {generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,outbox_ack:0,changed:1};
+        let resident=Resident {generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,installed:true,idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,outbox_ack:0,changed:1};
         Self(Arc::new(Remote {identity:ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(registry::BuildIdentity::current(Kind::Native)),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:boot.clone(),terminal:TerminalId::new(),holder:process.clone(),root:process}},epoch:uuid::Uuid::new_v4(),proof:HostSessionProof {boot_id:boot,host_session_id:HostSessionId::new("fixture"),host_incarnation:HostIncarnation::new("fixture")},socket:PathBuf::from("/nonexistent/cagents-actor-fixture"),state:Mutex::new(Arc::new(resident)),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:Default::default(),input_sequence:Mutex::new(1),uncertain_input:Mutex::new(None),pending:Mutex::new(Vec::new()),notify:Arc::new(|_|{}),stop:AtomicBool::new(false),installed:AtomicBool::new(true),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(None)}))
     }
     #[cfg(test)]
@@ -336,7 +337,13 @@ impl RemoteActor {
         receiver.recv_timeout(Duration::from_secs(10)).map_err(|_|"Retained interrupt acknowledgement remains unknown; never resend automatically".to_owned())?
     }
 
-    pub fn commit_installation(&self) {if self.call::<()>("commit",Value::Null).is_ok() {self.0.installed.store(true,Ordering::Release);self.0.startup.lock().unwrap_or_else(|p|p.into_inner()).take();}}
+    pub fn commit_installation(&self)->Result<(),String> {
+        self.call::<()>("commit",Value::Null)?;
+        self.0.installed.store(true,Ordering::Release);
+        {let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());let state=Arc::make_mut(&mut state);state.installed=true;state.native_continuity=chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()};}
+        self.0.startup.lock().unwrap_or_else(|p|p.into_inner()).take();
+        Ok(())
+    }
     pub fn preserve(&self)->Result<(),String> {self.call::<()>("preserve",Value::Null)?;self.0.preserved.store(true,Ordering::Release);self.0.stop.store(true,Ordering::Release);Ok(())}
     pub fn close(&self)->Result<(),String> {self.call::<()>("close",Value::Null)?;self.0.stop.store(true,Ordering::Release);Ok(())}
 }
@@ -425,7 +432,7 @@ impl Server {
         drop(state);
         let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
         let failure=journal.loss()?.or_else(||self.actor.failure());
-        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()},owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,outbox_ack:journal.acknowledged()?,changed:self.changed.load(Ordering::Acquire)})
+        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,outbox_ack:journal.acknowledged()?,changed:self.changed.load(Ordering::Acquire)})
     }
 
     fn attached(&self)->Result<Attached,String> {Ok(Attached {protocol:PROTOCOL,identity:self.identity.clone(),epoch:self.epoch,resident:self.resident()?,source:self.source.clone(),execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()})}
@@ -459,6 +466,7 @@ impl Server {
             "input_receipts"=>{let (identities,)=decode!((Vec<InputIdentity>,));if identities.len()>65 {return Err("Input receipt batch exceeds capacity".into());}let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());let mut receipts=Vec::new();for identity in identities {if let Some(receipt)=journal.input(&identity)? {receipts.push(receipt);}}value!(receipts)},
             "ack_inputs"=>{let (through,)=decode!((u64,));self.journal.lock().unwrap_or_else(|p|p.into_inner()).retire_inputs(through)?;Ok(Value::Null)},
             "input"=>{
+                if !self.installed {return Err("Retained actor installation is not confirmed; provider input is refused".into());}
                 let (identity,payload)=decode!((InputIdentity,Value));
                 if *blake3::hash(&serde_json::to_vec(&payload).map_err(|error|error.to_string())?).as_bytes()!=identity.hash {return Err("Retained input hash differs from its envelope".into());}
                 let mut journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
@@ -476,7 +484,7 @@ impl Server {
             "visible"=>{let (visible,)=decode!((bool,));self.actor.set_visible(visible);Ok(Value::Null)},
             "observe"=>{self.actor.observe_next_update();Ok(Value::Null)},
             "readiness"=>value!(self.actor.check_update_readiness()?),
-            "commit"=>{self.installed=true;Ok(Value::Null)},
+            "commit"=>{self.installed=true;self.changed.fetch_add(1,Ordering::Release);Ok(Value::Null)},
             "preserve"=>{if !self.installed {return Err("Cannot preserve an uninstalled actor".into());}Ok(Value::Null)},
             "update_source"=>{
                 let (source,console,pair)=decode!((chat::Session,Option<crate::model::LaunchRecipe>,Option<crate::terminal::holder::Record>));
@@ -604,6 +612,15 @@ fn terminal_endpoint_error(error:&str,holder_current:bool)->bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_install_commit_cannot_advertise_durable_continuity() {
+        let actor=RemoteActor::fixture();
+        actor.0.installed.store(false,Ordering::Release);
+        {let mut state=actor.0.state.lock().unwrap();let state=Arc::make_mut(&mut state);state.installed=false;state.native_continuity=chat::NativeContinuity::ReconnectOnly;}
+        assert!(actor.commit_installation().is_err());
+        assert!(!actor.state().installed);
+        assert_eq!(actor.state().native_continuity,chat::NativeContinuity::ReconnectOnly);
+    }
     #[test]
     fn lost_input_reply_keeps_the_original_envelope_and_fences_new_input() {
         let actor=RemoteActor::fixture();
