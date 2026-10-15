@@ -104,6 +104,8 @@ pub trait EditBuffer {
 #[derive(Debug, Clone)]
 struct Transaction {
     changes: Vec<TextChange>,
+    /// File existence changes independently of text (an empty file is not absent).
+    presence: Option<(bool, bool)>,
     /// The caret before the first change, restored by undo.
     before: Cursor,
     /// The caret after the last change, restored by redo.
@@ -220,6 +222,7 @@ impl History {
             Transaction {
                 before,
                 changes: vec![change],
+                presence: None,
                 after,
                 kind,
                 last_edit: now,
@@ -241,13 +244,28 @@ impl History {
         after: Cursor,
         now: Instant,
     ) {
-        if changes.is_empty() {
+        self.record_group_with_presence(changes, before, after, now, None);
+    }
+
+    /// Records text and file existence as a single native Undo step. A pure
+    /// existence change still earns a transaction when the text is unchanged.
+    pub fn record_group_with_presence(
+        &mut self,
+        changes: Vec<TextChange>,
+        before: Cursor,
+        after: Cursor,
+        now: Instant,
+        presence: Option<(bool, bool)>,
+    ) {
+        let presence = presence.filter(|(before, after)| before != after);
+        if changes.is_empty() && presence.is_none() {
             return;
         }
         self.drop_redo();
         self.push(
             Transaction {
                 changes,
+                presence,
                 before,
                 after,
                 kind: EditKind::Other,
@@ -255,6 +273,22 @@ impl History {
             },
             false,
         );
+    }
+
+    /// Attach existence to an edit which recreates an intentionally absent
+    /// document. Subsequent typing can still coalesce into that same gesture.
+    pub fn record_latest_presence(&mut self, before: bool, after: bool) {
+        if let Some(transaction) = self.undo.back_mut() {
+            let original = transaction.presence.map_or(before, |(before, _)| before);
+            transaction.presence = (original != after).then_some((original, after));
+        }
+    }
+
+    /// Expected and resulting existence for the next replay. The caller must
+    /// install the result only after replay answers Applied.
+    pub fn replay_presence(&self, redo: bool) -> Option<(bool, bool)> {
+        let presence = if redo { self.redo.last() } else { self.undo.back() }?.presence?;
+        Some(if redo { presence } else { (presence.1, presence.0) })
     }
 
     /// Reverts the newest step and restores the caret it started from.
@@ -819,6 +853,21 @@ mod tests {
             steps += 1;
         }
         steps
+    }
+
+    #[test]
+    fn file_presence_only_revert_is_one_transaction_without_a_text_edit() {
+        let now = Instant::now();
+        let mut history = History::default();
+        let mut model = Model::new("");
+        history.record_group_with_presence(vec![], model.cursor, model.cursor, now, Some((true, false)));
+        assert_eq!(history.replay_presence(false), Some((false, true)));
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert!(model.text.is_empty());
+        assert!(!history.can_undo());
+        assert_eq!(history.replay_presence(true), Some((true, false)));
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert!(model.text.is_empty());
     }
 
     #[test]

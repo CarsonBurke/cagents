@@ -16712,6 +16712,12 @@ impl Application for Cagents {
                     use repository_widget::ClipboardOp;
                     let action = match key {
                         keyboard::Key::Character(character)
+                            if modifiers.command() && !modifiers.alt()
+                                && character.eq_ignore_ascii_case("z")
+                                && runtime.can_step_editor_history(modifiers.shift()) => {
+                            Some(if modifiers.shift() { RepositoryAction::Redo { card } } else { RepositoryAction::Undo { card } })
+                        }
+                        keyboard::Key::Character(character)
                             if modifiers.command()
                                 && !modifiers.alt()
                                 && character.eq_ignore_ascii_case("c") =>
