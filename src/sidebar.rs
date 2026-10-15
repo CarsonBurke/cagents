@@ -6681,9 +6681,13 @@ fn menu_bindings<A: widget::menu::Action<Message = SidebarAction>>(
     editors: &[SidebarEditor],
 ) -> std::collections::HashMap<widget::menu::KeyBind, A> {
     actions.into_iter().filter_map(|action| {
-        let SidebarAction::RunCommand { command, action: target } = action.message() else { return None; };
+        let (command, target) = match action.message() {
+            SidebarAction::RunCommand { command, action: target } => (command, Some(target)),
+            SidebarAction::RunChangeCommand { command, .. } => (command, None),
+            _ => return None,
+        };
         if command == crate::workspace_widget::GlobalShortcut::OpenInExternalEditor {
-            let editor_id = match &*target {
+            let editor_id = match target.as_deref()? {
                 SidebarAction::ProjectCommand { command: ProjectCommand::OpenEditor(id), .. }
                 | SidebarAction::OpenFileInEditor { editor_id: id, .. } => id,
                 _ => return None,
@@ -7356,22 +7360,29 @@ impl widget::menu::Action for ChangeContextCommand<'_> {
             selection_revision: self.selection_revision, command: self.action.command() }
     }
 }
-fn change_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a ChangeRow, selection_revision: u64, blocked: bool) -> Element<'a, SidebarAction> {
+fn change_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a ChangeRow, selection_revision: u64, blocked: bool, shortcuts: &crate::settings::KeyboardShortcuts) -> Element<'a, SidebarAction> {
     if blocked { return content; }
     let open = if row.entry.kind == ChangeKind::Deleted { widget::menu::Item::ButtonDisabled } else { widget::menu::Item::Button };
+    let command = if row.entry.area == ChangeArea::Staged { ChangeGroupCommand::Unstage } else { ChangeGroupCommand::Stage };
     let mut entries = vec![
-        open(commands::label(ChangeContextAction::Open.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Open }),
-        open(commands::label(ChangeContextAction::Reveal.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Reveal }),
-        widget::menu::Item::Button(commands::label(ChangeContextAction::CopyPath.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::CopyPath }),
+        widget::menu::Item::Button(commands::label(commands::change_command_id(command)).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Mutate(command) }),
     ];
     let ignore = if row.entry.area == ChangeArea::Untracked { widget::menu::Item::Button } else { widget::menu::Item::ButtonDisabled };
     entries.push(ignore(commands::label(ChangeContextAction::Ignore.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Ignore }));
-    let command = if row.entry.area == ChangeArea::Staged { ChangeGroupCommand::Unstage } else { ChangeGroupCommand::Stage };
-    entries.push(widget::menu::Item::Button(commands::label(commands::change_command_id(command)).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Mutate(command) }));
+    entries.push(widget::menu::Item::Divider);
+    entries.push(widget::menu::Item::Button(commands::label(ChangeContextAction::CopyPath.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::CopyPath }));
+    entries.push(widget::menu::Item::Divider);
+    entries.push(open(commands::label(ChangeContextAction::Open.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Open }));
+    entries.push(open(commands::label(ChangeContextAction::Reveal.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Reveal }));
     if matches!(row.entry.area, ChangeArea::Unstaged | ChangeArea::Untracked) {
+        entries.push(widget::menu::Item::Divider);
         entries.push(widget::menu::Item::Button(commands::label(commands::change_command_id(ChangeGroupCommand::Discard)).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Mutate(ChangeGroupCommand::Discard) }));
     }
-    crate::interaction::context_menu(content, widget::menu::items(&std::collections::HashMap::new(), entries))
+    let bindings = menu_bindings(entries.iter().filter_map(|entry| match entry {
+        widget::menu::Item::Button(_, _, action) | widget::menu::Item::ButtonDisabled(_, _, action) => Some(*action),
+        _ => None,
+    }), shortcuts, &[]);
+    crate::interaction::context_menu(content, widget::menu::items(&bindings, entries))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8330,7 +8341,7 @@ fn source_control_panel<'a>(
     };
 
     let body = match tab {
-        ChangesTab::Changes => widget::container(changes_section(state, source, modal_open)).id(change_panel_focus_id()).into(),
+        ChangesTab::Changes => widget::container(changes_section(state, source, modal_open, shortcuts)).id(change_panel_focus_id()).into(),
         ChangesTab::Branch => branch_changes_section(state, source, modal_open),
         ChangesTab::History => history_section(state, source, modal_open),
     };
@@ -9061,6 +9072,7 @@ fn changes_section<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
     modal_open: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
     let mut column = widget::column::with_capacity(source.groups().len() + 1).spacing(space::XS);
     if !state.change_rows.is_empty() {
@@ -9131,7 +9143,7 @@ fn changes_section<'a>(
                     };
                     design::caption(format!("No {noun}.")).into()
                 } else {
-                    change_group_view(state, source, group, modal_open)
+                    change_group_view(state, source, group, modal_open, shortcuts)
                 }
             },
         ));
@@ -9289,6 +9301,7 @@ fn change_group_view<'a>(
     source: &'a SourceControlModel,
     group: &'a ChangeGroup,
     modal_open: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
     let flat = state.change_list_mode == FileListMode::Flat;
     let scope = ChangeTreeScope::Area(group.area);
@@ -9344,6 +9357,7 @@ fn change_group_view<'a>(
                     modal_open,
                     if flat { 0 } else { file.depth },
                     !flat,
+                    shortcuts,
                 ),
             });
         }
@@ -9359,6 +9373,7 @@ fn change_row_view<'a>(
     modal_open: bool,
     depth: usize,
     tree: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
     let chrome = &row.chrome;
     let selected = matches!(
@@ -9447,7 +9462,7 @@ fn change_row_view<'a>(
     );
     let identity = crate::interaction::tooltip(identity, row.entry.path.display().into_owned());
     let identity = RowInteraction::change_row(identity, &source.key, ChangeSelectionRow { area, path: row.entry.path.clone() }, state, !modal_open);
-    let identity = change_context_controls(identity, &source.key, row, state.change_selection_revision(), modal_open);
+    let identity = change_context_controls(identity, &source.key, row, state.change_selection_revision(), modal_open, shortcuts);
     let commands = row_commands(source, area, row, modal_open).into_iter().map(|mut control| {
         let command = match control.action.as_ref() {
             Some(SidebarAction::Stage { .. }) => Some(ChangeGroupCommand::Stage),
@@ -12815,12 +12830,26 @@ pub(crate) mod tests {
         settings.new_native_thread = vec!["Ctrl+Alt+F8".into()];
         settings.rename_channel = vec!["Ctrl+Alt+F9".into()];
         settings.copy_relative_path = vec!["Ctrl+Alt+F10".into()];
+        settings.open_file = vec!["Ctrl+Alt+F1".into()];
+        settings.reveal_in_files = vec!["Ctrl+Alt+F2".into()];
+        settings.ignore_change_path = vec!["Ctrl+Alt+F3".into()];
+        settings.stage_selected_changes = vec!["Ctrl+Alt+F5".into()];
+        settings.unstage_selected_changes = vec!["Ctrl+Alt+F6".into()];
+        settings.discard_selected_changes = vec!["Ctrl+Alt+F7".into()];
         let command = ProjectCommand::NewChannel;
         assert_hint(ContextCommand(project_id(1), Some(WorktreeId::new()), &command, None), &settings);
         assert_hint(ChannelContextCommand(ChannelId::new(), None, ChannelMenuCommand::Rename), &settings);
         let key = main_key();
         let path = repo_path("src/main.rs");
         assert_hint(FileContextCommand::Manage { key: &key, path: &path, command: FileCommand::CopyRelativePath }, &settings);
+        let model = panel_model();
+        let source = model.source_control.as_ref().unwrap();
+        let row = source.groups().iter().flat_map(|group| group.rows()).next().unwrap();
+        for action in [ChangeContextAction::Open, ChangeContextAction::Reveal, ChangeContextAction::CopyPath,
+            ChangeContextAction::Ignore, ChangeContextAction::Mutate(ChangeGroupCommand::Stage),
+            ChangeContextAction::Mutate(ChangeGroupCommand::Unstage), ChangeContextAction::Mutate(ChangeGroupCommand::Discard)] {
+            assert_hint(ChangeContextCommand { key: &source.key, row, selection_revision: 71, action }, &settings);
+        }
     }
 
     #[test]
