@@ -281,6 +281,12 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
 /// and final semantic journal until every required daemon write is committed.
 pub(in crate::host) fn finish_close(host: &SharedHost, handle: &Handle, requested: &Session) -> Result<(), String> {
     let Some(identity) = handle.actor_identity() else { return Ok(()); };
+    if !identity.record.holder.is_current() {
+        // A failed terminal spawn may retry after the previous close already
+        // committed every outcome and retired the helper. Only its separate
+        // exact semantic-retirement receipt can authorize this fast path.
+        return handle.finish_retained_close();
+    }
     let (proof, notifications) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (state.proof().clone(), state.notifications.clone())
