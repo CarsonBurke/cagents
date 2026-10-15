@@ -33,6 +33,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import time
 
@@ -58,7 +59,8 @@ def fixture_environment(root):
                 "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "OPENAI_API_KEY",
                 "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_FEDERATION_RULE_ID",
                 "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT", "OMP_PROFILE", "PI_PROFILE",
-                "WAYLAND_SOCKET", "DBUS_SESSION_BUS_ADDRESS", "DBUS_STARTER_ADDRESS", "DBUS_STARTER_BUS_TYPE"):
+                "WAYLAND_SOCKET", "DISPLAY", "XAUTHORITY", "AT_SPI_BUS_ADDRESS",
+                "DBUS_SESSION_BUS_ADDRESS", "DBUS_STARTER_ADDRESS", "DBUS_STARTER_BUS_TYPE"):
         env.pop(key, None)
     # A nested compositor's relative socket lives in the caller's runtime.
     display = env.get("WAYLAND_DISPLAY")
@@ -83,6 +85,43 @@ def fixture_environment(root):
         PATH=str(root / "bin") + ":" + env["PATH"],
     )
     return env
+
+
+def validate_compositor(root, env, receipt):
+    """Require a pinned private compositor, rather than trusting a shell display."""
+    if receipt is None:
+        raise SystemExit("run requires --compositor-receipt for the owned test compositor")
+    value = json.loads(receipt.read_text())
+    directory = Path(value["root"]).resolve(strict=True)
+    if not directory.is_relative_to(root) or directory.stat().st_uid != os.getuid():
+        raise SystemExit("compositor configuration must belong to this fixture root")
+    proc = Path("/proc") / str(int(value["pid"]))
+    if proc.stat().st_uid != os.getuid():
+        raise SystemExit("compositor has another owner")
+    ticks = (proc / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    if ticks != str(value["start_ticks"]):
+        raise SystemExit("compositor PID was reused")
+    command = (proc / "cmdline").read_bytes().split(b"\0")
+    if not any(part.startswith(os.fsencode(str(directory) + "/")) for part in command):
+        raise SystemExit("compositor does not use its declared private configuration")
+    display = Path(value["display"]).resolve(strict=True)
+    if env.get("WAYLAND_DISPLAY") != str(display) or not stat.S_ISSOCK(display.stat().st_mode):
+        raise SystemExit("display does not match pinned compositor receipt")
+    inodes = {line.split()[6] for line in Path("/proc/net/unix").read_text().splitlines()[1:]
+              if len(line.split()) >= 8 and line.split()[7] == str(display)}
+    owned = set()
+    for descriptor in (proc / "fd").iterdir():
+        try:
+            target = os.readlink(descriptor)
+            if target.startswith("socket:["):
+                owned.add(target[8:-1])
+        except FileNotFoundError:
+            continue
+    if not inodes & owned:
+        raise SystemExit("pinned compositor does not own the display socket")
+    with (root / "compositor-validation.jsonl").open("a") as output:
+        output.write(json.dumps({"pid": int(value["pid"]), "start_ticks": ticks,
+            "display": str(display), "root": str(directory), "monotonic_ns": time.monotonic_ns()}) + "\n")
 
 
 def cli_call(cli, env, arguments, root):
@@ -174,6 +213,8 @@ def main():
     parser.add_argument("--stage", help="stage name, e.g. restore100-cycle1")
     parser.add_argument("--seconds", type=float, default=10)
     parser.add_argument("--fresh-daemon", action="store_true", help="stop ONLY this fixture's hosted jobs after builds")
+    parser.add_argument("--compositor-receipt", type=Path,
+                        help="run needs JSON with pid/start_ticks/absolute display/private root under --root")
     parser.add_argument("--build-lock", type=Path, default=Path.home() / ".cache/cagents-issue-build.lock")
     args = parser.parse_args()
     root = args.root.resolve()
@@ -223,6 +264,7 @@ def main():
         with native_lock.open("a") as native, args.build_lock.open("a") as build:
             fcntl.flock(native, fcntl.LOCK_EX)
             fcntl.flock(build, fcntl.LOCK_EX)
+            validate_compositor(root, env, args.compositor_receipt)
             # Bind the fixture bus to its private0700 runtime, rather than
             # inheriting a user bus or a compositor's session bus. dbus-run-session
             # owns the daemon lifetime and terminates it with this runner.
