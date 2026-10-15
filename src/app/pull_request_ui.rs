@@ -1759,9 +1759,13 @@ mod tests {
             let skipped = serde_json::from_value(serde_json::json!({
                 "name": "skipped-rollup", "bucket": "pass", "state": conclusion,
                 "link": "https://github.com/owner/repo/actions/runs/123"
-            })).unwrap();
+            }))
+            .unwrap();
             assert_eq!(check_rank(&skipped), 3);
-            assert_eq!(checks_summary(&[skipped]), "Checks · 0 failed, 0 running, 0 passed, 1 skipped");
+            assert_eq!(
+                checks_summary(&[skipped]),
+                "Checks · 0 failed, 0 running, 0 passed, 1 skipped"
+            );
         }
     }
 

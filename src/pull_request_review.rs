@@ -3953,7 +3953,8 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(refreshed.entries, previous.entries);
         let mut expected_range = previous.range.clone();
-        expected_range.base_branch = crate::repository::ValidatedBranchName::parse("release").unwrap();
+        expected_range.base_branch =
+            crate::repository::ValidatedBranchName::parse("release").unwrap();
         assert_eq!(refreshed.range, expected_range);
         assert_eq!(refreshed.range.base_branch.as_str(), "release");
         let (mut state, _) = state();
