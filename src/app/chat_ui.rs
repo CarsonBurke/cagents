@@ -16120,6 +16120,14 @@ mod tests {
                 "Retain this unsent follow-up",
             ));
         let draft = chat_runtime(&app, card).unsent_text();
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        app.persist();
         app.chat_forget(card);
         app.cards.insert(card, CardRuntime::Loading);
         let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
@@ -16134,8 +16142,17 @@ mod tests {
             app.card_state(card).unwrap().kind,
             CardKind::Chat(session.clone())
         );
+        app.persist();
+        let writer = app.session.as_ref().unwrap();
+        writer.flush(Duration::from_secs(10)).unwrap();
+        assert_eq!(writer.last_error(), None);
         assert_eq!(
-            saved(&app),
+            writer
+                .operation_store()
+                .load_card(card, None)
+                .unwrap()
+                .unwrap()
+                .kind,
             CardKind::Chat(session.clone()),
             "ordinary persistence must retain the issued proof and recipe"
         );
