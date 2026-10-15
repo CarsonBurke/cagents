@@ -2,35 +2,38 @@
 //! parent and exact file witness; diagnostic paths never authorize effects.
 use super::*;
 
-struct AuthenticatedLeaf {
-    file: File,
+struct LeafWitness {
     metadata: fs::Metadata,
     attributes: std::collections::BTreeMap<OsString, Vec<u8>>,
     hash: blake3::Hash,
 }
+struct AuthenticatedLeaf {
+    file: File,
+    witness: Option<LeafWitness>,
+}
 impl AuthenticatedLeaf {
-    fn capture(root: &Root, name: &std::ffi::OsStr) -> Result<Self, FileIoError> {
-        let mut file = fs_safety::open_beneath(root, Path::new(name)).map_err(resolve_error)?;
-        let metadata = file.metadata().map_err(io_error)?;
-        let attributes = fs_safety::content_attributes(&file).map_err(io_error)?;
-        let bytes = fs_safety::read_bounded(&mut file, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
-        if !metadata.is_file() || version(&metadata) != version(&file.metadata().map_err(io_error)?) {
+    fn capture(&mut self, root: &Root, name: &std::ffi::OsStr) -> Result<(), FileIoError> {
+        let metadata = self.file.metadata().map_err(io_error)?;
+        let attributes = fs_safety::content_attributes(&self.file).map_err(io_error)?;
+        let bytes = fs_safety::read_bounded(&mut self.file, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
+        if !metadata.is_file() || version(&metadata) != version(&self.file.metadata().map_err(io_error)?) {
             return Err(FileIoError::Io("The acquired file changed while retaining its recovery witness.".into()));
         }
-        let leaf = Self { file, metadata, attributes, hash: blake3::hash(&bytes) };
-        leaf.verify(root, name)?;
-        Ok(leaf)
+        self.witness = Some(LeafWitness { metadata, attributes, hash: blake3::hash(&bytes) });
+        if let Err(error) = self.verify(root, name) { self.witness = None; return Err(error); }
+        Ok(())
     }
     fn verify(&self, root: &Root, name: &std::ffi::OsStr) -> Result<(), FileIoError> {
+        let witness = self.witness.as_ref().ok_or_else(|| FileIoError::Io("The acquired file could not be authenticated. Its original descriptor and directory were retained; recovery cannot adopt a fresh file witness.".into()))?;
         let mut named = fs_safety::open_beneath(root, Path::new(name)).map_err(resolve_error)?;
         let before = named.metadata().map_err(io_error)?;
         let bytes = fs_safety::read_bounded(&mut named, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
         let after = named.metadata().map_err(io_error)?;
-        if !same_inode(&self.metadata, &before) || version(&self.metadata) != version(&before)
+        if !same_inode(&witness.metadata, &before) || version(&witness.metadata) != version(&before)
             || version(&before) != version(&after)
-            || version(&self.metadata) != version(&self.file.metadata().map_err(io_error)?)
-            || blake3::hash(&bytes) != self.hash
-            || fs_safety::content_attributes(&named).map_err(io_error)? != self.attributes
+            || version(&witness.metadata) != version(&self.file.metadata().map_err(io_error)?)
+            || blake3::hash(&bytes) != witness.hash
+            || fs_safety::content_attributes(&named).map_err(io_error)? != witness.attributes
         {
             return Err(FileIoError::Io("The retained file changed; its contents and replacement names were preserved for recovery.".into()));
         }
@@ -72,8 +75,15 @@ impl PresenceHolding {
     }
     pub(super) fn directory(&self) -> &Root { self.publication.directory() }
     pub(super) fn capture_original(&mut self) -> Result<(), FileIoError> {
-        self.original = Some(AuthenticatedLeaf::capture(self.directory(), std::ffi::OsStr::new("file"))?);
-        Ok(())
+        self.capture_original_with_hook(|_| Ok(()))
+    }
+    fn capture_original_with_hook(&mut self, after_pin: impl FnOnce(&File) -> Result<(), FileIoError>) -> Result<(), FileIoError> {
+        let file = fs_safety::open_beneath(self.directory(), Path::new("file")).map_err(resolve_error)?;
+        // Pin first: metadata/read/coherence failure must never drop the
+        // acquired descriptor or retry by adopting a newly opened witness.
+        self.original = Some(AuthenticatedLeaf { file, witness: None });
+        after_pin(&self.original.as_ref().unwrap().file)?;
+        self.original.as_mut().unwrap().capture(self.publication.directory(), std::ffi::OsStr::new("file"))
     }
     pub(super) fn remove_original(&mut self) -> Result<(), FileIoError> {
         if let Some(original) = &self.original {
@@ -93,8 +103,12 @@ impl PresenceHolding {
         } else {
             self.remove_original().map_err(|error| error.to_string())?;
         }
+        fs_safety::sync_directory(self.directory()).map_err(|error| error.to_string())?;
         self.publication.resolve_recovery().map_err(|error| error.to_string())?;
-        self.publication.cleanup_empty().map_err(|error| error.to_string())
+        self.publication.cleanup_empty().map_err(|error| error.to_string())?;
+        // Explicit retries bypass the caller's original sync_durability path.
+        // A sync failure keeps this same authority unresolved for another try.
+        fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string())
     }
     pub(super) fn finish(mut self) -> Result<(), FileIoError> {
         match self.retry_cleanup() { Ok(()) => Ok(()), Err(error) => Err(self.retain(error)) }
@@ -112,5 +126,36 @@ impl PresenceHolding {
         // closure captures the WHOLE owner (not disjoint fields), below16 FDs.
         let authority = slot.retain(description.clone(), move || self.retry_cleanup());
         FileIoError::Recovery { message: description, authority }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    #[test]
+    fn presence_recovery_pins_acquired_descriptor_before_fallible_witness_capture() {
+        let directory = tempfile::tempdir().unwrap(); let parent = Root::open(directory.path()).unwrap();
+        fs::write(directory.path().join("file"), b"original").unwrap();
+        let mut holding = PresenceHolding::create(&parent, std::ffi::OsStr::new("file")).unwrap();
+        fs_safety::rename_new_between(&parent, std::ffi::OsStr::new("file"), holding.directory(), std::ffi::OsStr::new("file")).unwrap();
+        let mut descriptor = -1;
+        let failure = holding.capture_original_with_hook(|file| {
+            descriptor = file.as_raw_fd();
+            Err(FileIoError::Io("injected witness read failure".into()))
+        }).unwrap_err();
+        assert!(holding.original.as_ref().unwrap().witness.is_none());
+        let acquired = holding.original.as_ref().unwrap().file.metadata().unwrap();
+        let error = holding.finish_error(failure);
+        let authority = error.recovery_authority().unwrap();
+        // SAFETY: F_GETFD only inspects this descriptor number. The retained
+        // authority must keep the original file, including after failed retry.
+        assert!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0);
+        assert!(authority.retry().is_err());
+        assert!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0);
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(descriptor, &mut metadata) }, 0);
+        assert_eq!((metadata.st_dev as u64, metadata.st_ino as u64), (acquired.dev(), acquired.ino()));
+        assert!(!directory.path().join("file").exists());
     }
 }
