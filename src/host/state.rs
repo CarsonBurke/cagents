@@ -3339,6 +3339,7 @@ pub(super) fn spawn_pending_terminal(
         None,
         None,
         Some(pane),
+        None,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3400,6 +3401,43 @@ pub(super) fn spawn_terminal_view_owned(
         None,
         None,
         None,
+        None,
+    )
+}
+
+/// Start a new terminal only in the independently verified operational
+/// directory captured before its native predecessor is stopped. The FD stays
+/// execution-only; it must never replace the original actor's issued recipe.
+pub(super) fn spawn_terminal_view_owned_at_directory(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+    context: Arc<crate::chat::protocol::ExecutionContext>,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    use std::os::unix::fs::MetadataExt;
+    let directory = context.directory_descriptor().ok_or_else(|| ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        "The native handoff has no verified working-directory descriptor".into(),
+        false,
+    ))?;
+    let metadata = directory.metadata().map_err(|error| ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        format!("Inspect the native handoff directory: {error}"),
+        false,
+    ))?;
+    if !metadata.is_dir() || metadata.nlink() == 0 {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "The native handoff directory is no longer available".into(),
+            false,
+        ));
+    }
+    start_terminal_view_owned(
+        shared, client_id, session, options, execution_environment, paired,
+        None, None, None, Some(directory),
     )
 }
 
@@ -3425,6 +3463,7 @@ fn start_terminal_view(
         adoption,
         previous,
         None,
+        None,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3441,6 +3480,7 @@ fn start_terminal_view_owned(
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
     pending_pane: Option<crate::model::CardId>,
+    execution_directory: Option<Arc<std::fs::File>>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
@@ -3592,6 +3632,7 @@ fn start_terminal_view_owned(
         initially_visible: options.initially_visible,
         theme: options.theme,
         execution_environment,
+        execution_directory,
         adoption,
         holder_recovery,
         ..TerminalConfig::default()

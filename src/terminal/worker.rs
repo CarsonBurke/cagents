@@ -1604,6 +1604,12 @@ impl Worker {
             "CAGENTS_RECOVERY_ORIGIN",
             session.recovery_origin.unwrap_or(session.id).to_string(),
         );
+        let operational_directory = config.execution_directory.as_ref().map(|directory| {
+            PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        });
+        if let Some(directory) = &operational_directory {
+            command.cwd(directory);
+        }
         let executable = interactive_shell_launch(&session.launch)
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
@@ -1648,7 +1654,7 @@ impl Worker {
                 crate::agent_execution::bundled::install(
                     crate::agent::Provider::from_program(&session.launch.program),
                     &skill_environment,
-                    &session.launch.working_directory,
+                    operational_directory.as_deref().unwrap_or(&session.launch.working_directory),
                 );
                 if let Some(path) = crate::agent_execution::bundled::matched_path(
                     command.get_env("PATH").and_then(|value| value.to_str()),
@@ -1656,11 +1662,12 @@ impl Worker {
                     command.env("PATH", path);
                 }
                 (
-                    holder::spawn_recoverable(
+                    holder::spawn_recoverable_at_directory(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
+                        config.execution_directory.clone(),
                     )?,
                     Vec::new(),
                 )
