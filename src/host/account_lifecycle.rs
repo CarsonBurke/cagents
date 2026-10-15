@@ -1063,10 +1063,11 @@ exit 0
         let system = root.join("home/.claude"); std::fs::create_dir(&system).unwrap();
         let cli = root.join("bin/claude");
         std::fs::write(&cli, r#"#!/bin/sh
-if [ "$CLAUDE_CONFIG_DIR" = "$HOME/.claude" ]; then : > "$HOME/system-probe-started"; fi
+fixture_home=${CLAUDE_CONFIG_DIR:-"$HOME/.claude"}
+if [ "$fixture_home" = "$HOME/.claude" ]; then : > "$HOME/system-probe-started"; fi
 if [ "$1" = auth ]; then
- : > "$CLAUDE_CONFIG_DIR/probe-started"
- while [ -f "$CLAUDE_CONFIG_DIR/probe-hold" ]; do /bin/sleep 0.01; done
+ : > "$fixture_home/probe-started"
+ while [ -f "$fixture_home/probe-hold" ]; do /bin/sleep 0.01; done
  printf '%s\n' '{"loggedIn":true,"email":"pending@fixture.invalid","subscriptionType":"max"}'
  exit 0
 fi
@@ -1081,6 +1082,13 @@ printf '%s\n' '{"type":"control_response","response":{"subtype":"success","reque
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let search = runtime.block_on(crate::account::probe::search_path());
         assert_eq!(crate::account::probe::find_executable("claude", search.as_deref()), Some(cli), "Never invoke an installed provider");
+        // System deliberately leaves CLAUDE_CONFIG_DIR unset. Exercise that
+        // actual invocation before the negative so an inert marker cannot pass.
+        let positive = runtime.block_on(crate::account::probe::run(Account::system(Provider::Claude), None, true));
+        assert!(matches!(positive, crate::account::probe::Outcome::Answered { identity: Some(_), snapshot, .. } if snapshot.status == crate::account::UsageStatus::Ok));
+        let marker = root.join("home/system-probe-started");
+        assert!(marker.is_file(), "actual System fallback must trigger the no-read oracle");
+        std::fs::remove_file(&marker).unwrap();
         let homes = crate::account::home::Homes::installation().unwrap(); let store = Store::installation().unwrap();
         let (key, home) = store.create_pending(&homes, Provider::Claude, 1, || homes.create(Provider::Claude, None)).unwrap();
         let hold = home.join("probe-hold"); std::fs::write(&hold, "").unwrap();
