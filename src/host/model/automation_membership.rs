@@ -35,9 +35,11 @@ pub(super) fn archived_owner_in(
         return Ok(None);
     };
     let agent: crate::agent_execution::Agent =
-        decode(&agent.ok_or("The archived owner exceeds its descriptor limit")?)?;
+        serde_json::from_str(&agent.ok_or("The archived owner exceeds its descriptor limit")?)
+            .map_err(|error| error.to_string())?;
     let snapshot: crate::chat::Snapshot =
-        decode(&snapshot.ok_or("The archived result exceeds its presentation limit")?)?;
+        serde_json::from_str(&snapshot.ok_or("The archived result exceeds its presentation limit")?)
+            .map_err(|error| error.to_string())?;
     let archive = crate::automations::ArchivedConversation { agent, snapshot };
     crate::automations::archive::ArchivedPaneReadiness::qualify_kind(id, &before.kind, &archive)?;
     Ok(Some(archive.agent))

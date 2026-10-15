@@ -1504,6 +1504,11 @@ impl HostState {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn execution_inventory_count_for_test(&mut self) -> u64 {
+        self.inventory_count()
+    }
+
     fn inventory_count(&mut self) -> u64 {
         let mut count = (self.spawning.len() + self.chat_spawning.len()) as u64;
         for record in self.chats.values_mut() {

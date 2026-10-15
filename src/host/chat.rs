@@ -3375,11 +3375,11 @@ mod tests {
                 .unwrap_err()
                 .contains("report")
         );
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         assert!(
             state.chats.is_empty()
                 && state.chat_spawning.is_empty()
-                && state.spawning.is_empty()
+                && state.execution_inventory_count_for_test() == 0
                 && state.terminals.is_empty()
         );
     }
@@ -5387,6 +5387,7 @@ done
         let session = Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,
+            archive_report: None,
             id: chat_id,
             launch: chat::Launch {
                 provider: if return_terminal {

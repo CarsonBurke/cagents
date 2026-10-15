@@ -5582,7 +5582,7 @@ mod tests {
 
     #[test]
     fn archived_membership_owner_requires_closed_private_receipt_and_exact_original_pair() {
-        let (mut registry, _directory, pane, _scope, agent) = archived_membership_fixture();
+        let (registry, _directory, pane, _scope, agent) = archived_membership_fixture();
         assert_eq!(
             registry
                 .archived_automation_pane_owner(&pane)
@@ -5798,7 +5798,7 @@ mod tests {
             },
             "unrelated retained source",
         );
-        assert_eq!(host.inventory_count(), 0);
+        assert_eq!(host.execution_inventory_count_for_test(), 0);
         let after = host.edit_model(1, edit).unwrap();
         assert!(
             !host.native_adoption_failures.is_empty(),
@@ -5814,7 +5814,7 @@ mod tests {
                 .is_empty(),
             "membership-only authority needs no missing/nil/borrowed execution UUID"
         );
-        assert_eq!(host.inventory_count(), 0);
+        assert_eq!(host.execution_inventory_count_for_test(), 0);
     }
 
     #[test]
