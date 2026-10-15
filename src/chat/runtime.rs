@@ -1889,8 +1889,14 @@ impl TurnAttention {
                     kind: *outcome,
                 });
             }
-            Event::PastTurnFinished { key: Some(key), outcome } => {
-                return Some(crate::notifications::Evidence { key: key.clone(), kind: *outcome });
+            Event::PastTurnFinished {
+                key: Some(key),
+                outcome,
+            } => {
+                return Some(crate::notifications::Evidence {
+                    key: key.clone(),
+                    kind: *outcome,
+                });
             }
             Event::PastTurnFinished { key: None, .. } => {
                 // Never borrow the current attention key for an uncorrelated
@@ -4103,15 +4109,25 @@ mod tests {
         let mut attention = TurnAttention::default();
         attention.apply(&Event::TurnStarted);
         let current = attention.key.clone();
-        assert!(attention.apply(&Event::PastTurnFinished {
-            key: None,
-            outcome: crate::notifications::Kind::Cancelled,
-        }).is_none());
+        assert!(
+            attention
+                .apply(&Event::PastTurnFinished {
+                    key: None,
+                    outcome: crate::notifications::Kind::Cancelled,
+                })
+                .is_none()
+        );
         assert_eq!(attention.key, current);
-        assert_eq!(attention.apply(&Event::TurnFinished {
-            key: None,
-            outcome: crate::notifications::Kind::Succeeded,
-        }).unwrap().key, current);
+        assert_eq!(
+            attention
+                .apply(&Event::TurnFinished {
+                    key: None,
+                    outcome: crate::notifications::Kind::Succeeded,
+                })
+                .unwrap()
+                .key,
+            current
+        );
     }
 
     #[test]

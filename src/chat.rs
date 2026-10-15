@@ -2105,7 +2105,10 @@ pub enum Event {
     Forked(String),
     /// A delayed result for an already superseded turn: notifications only.
     /// It must not settle current activity, requests, tools or completion time.
-    PastTurnFinished {key:Option<String>,outcome:crate::notifications::Kind},
+    PastTurnFinished {
+        key: Option<String>,
+        outcome: crate::notifications::Kind,
+    },
 }
 
 #[cfg(test)]
