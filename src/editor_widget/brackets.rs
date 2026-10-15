@@ -17,7 +17,9 @@ fn lifetime(text: &str, index: usize, budget: &mut usize) -> Result<bool, ()> {
     let mut length = 0;
     for byte in tail {
         charge(budget, 1)?;
-        if !byte.is_ascii_alphanumeric() && *byte != b'_' { break; }
+        if !byte.is_ascii_alphanumeric() && *byte != b'_' {
+            break;
+        }
         length += 1;
     }
     Ok(length > 0 && tail.get(length) != Some(&b'\''))
@@ -84,10 +86,9 @@ pub(super) fn scan_line<B>(
             b'#' if {
                 charge(budget, index)?;
                 text[..index].trim().is_empty()
-            }
-                && !bytes
-                    .get(index + 1)
-                    .is_some_and(|next| matches!(next, b'[' | b'!')) =>
+            } && !bytes
+                .get(index + 1)
+                .is_some_and(|next| matches!(next, b'[' | b'!')) =>
             {
                 break;
             }
@@ -138,8 +139,11 @@ mod tests {
         let result = scan_line(text, state, &mut usize::MAX, |at, bracket| {
             tokens.push((at, bracket));
             ControlFlow::<()>::Continue(())
-        }).unwrap();
-        let ControlFlow::Continue(state) = result else { unreachable!() };
+        })
+        .unwrap();
+        let ControlFlow::Continue(state) = result else {
+            unreachable!()
+        };
         (tokens, state)
     }
 
@@ -148,12 +152,25 @@ mod tests {
         let text = "()".repeat(4 * 1024 * 1024);
         let mut budget = 8;
         let result = scan_line(&text, State::default(), &mut budget, |at, _| {
-            if at == 1 { ControlFlow::Break(at) } else { ControlFlow::Continue(()) }
+            if at == 1 {
+                ControlFlow::Break(at)
+            } else {
+                ControlFlow::Continue(())
+            }
         });
         assert_eq!(result, Ok(ControlFlow::Break(1)));
         assert_eq!(budget, 6, "the rest of the 8MiB line must not be scanned");
-        for text in ["x".repeat(1024), format!("r{}\"()\"", "#".repeat(1024)), format!("'{}", "x".repeat(1024))] {
-            assert!(scan_line(&text, State::default(), &mut 16, |_, _| ControlFlow::<()>::Continue(())).is_err());
+        for text in [
+            "x".repeat(1024),
+            format!("r{}\"()\"", "#".repeat(1024)),
+            format!("'{}", "x".repeat(1024)),
+        ] {
+            assert!(
+                scan_line(&text, State::default(), &mut 16, |_, _| {
+                    ControlFlow::<()>::Continue(())
+                })
+                .is_err()
+            );
         }
     }
     #[test]

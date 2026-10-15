@@ -1207,28 +1207,56 @@ where
             let mut reached = false;
             for (line_index, line) in lines.iter().enumerate() {
                 budget = budget.checked_sub(1)?;
-                let result = brackets::scan_line(line.text(), block, &mut budget, |column, token| {
-                    use std::ops::ControlFlow;
-                    let position = Position { line: line_index, column };
-                    if position == first { reached = true; }
-                    if forward && !reached { return ControlFlow::Continue(()); }
-                    if matches!(token, '(' | '[' | '{') {
-                        if stack.len() >= 4096 { return ControlFlow::Break(None); }
-                        stack.push((token, position));
-                    } else {
-                        let expected = match token { ')' => '(', ']' => '[', '}' => '{', _ => unreachable!() };
-                        let Some((opening, opening_position)) = stack.pop() else {
-                            return if position == first { ControlFlow::Break(None) } else { ControlFlow::Continue(()) };
+                let result =
+                    brackets::scan_line(line.text(), block, &mut budget, |column, token| {
+                        use std::ops::ControlFlow;
+                        let position = Position {
+                            line: line_index,
+                            column,
                         };
-                        if opening != expected {
-                            stack.clear();
-                            return if reached { ControlFlow::Break(None) } else { ControlFlow::Continue(()) };
+                        if position == first {
+                            reached = true;
                         }
-                        if !forward && position == first { return ControlFlow::Break(Some((opening_position, first))); }
-                        if forward && reached && stack.is_empty() { return ControlFlow::Break(Some((first, position))); }
-                    }
-                    ControlFlow::Continue(())
-                }).ok()?;
+                        if forward && !reached {
+                            return ControlFlow::Continue(());
+                        }
+                        if matches!(token, '(' | '[' | '{') {
+                            if stack.len() >= 4096 {
+                                return ControlFlow::Break(None);
+                            }
+                            stack.push((token, position));
+                        } else {
+                            let expected = match token {
+                                ')' => '(',
+                                ']' => '[',
+                                '}' => '{',
+                                _ => unreachable!(),
+                            };
+                            let Some((opening, opening_position)) = stack.pop() else {
+                                return if position == first {
+                                    ControlFlow::Break(None)
+                                } else {
+                                    ControlFlow::Continue(())
+                                };
+                            };
+                            if opening != expected {
+                                stack.clear();
+                                return if reached {
+                                    ControlFlow::Break(None)
+                                } else {
+                                    ControlFlow::Continue(())
+                                };
+                            }
+                            if !forward && position == first {
+                                return ControlFlow::Break(Some((opening_position, first)));
+                            }
+                            if forward && reached && stack.is_empty() {
+                                return ControlFlow::Break(Some((first, position)));
+                            }
+                        }
+                        ControlFlow::Continue(())
+                    })
+                    .ok()?;
                 match result {
                     std::ops::ControlFlow::Break(pair) => return pair,
                     std::ops::ControlFlow::Continue(state) => block = state,
@@ -5705,9 +5733,25 @@ mod tests {
     #[test]
     fn bracket_matching_streams_large_lines_and_caps_distant_draw_work() {
         let mut content: Content = Content::with_text(&"()".repeat(4 * 1024 * 1024));
-        assert_eq!(content.matching_brackets(), Some((Position { line: 0, column: 0 }, Position { line: 0, column: 1 })));
-        content.set_cursor(Cursor { position: Position { line: 0, column: 8 * 1024 * 1024 - 1 }, selection: None });
-        assert_eq!(content.matching_brackets(), None, "optional drawing must stop at its shared work bound");
+        assert_eq!(
+            content.matching_brackets(),
+            Some((
+                Position { line: 0, column: 0 },
+                Position { line: 0, column: 1 }
+            ))
+        );
+        content.set_cursor(Cursor {
+            position: Position {
+                line: 0,
+                column: 8 * 1024 * 1024 - 1,
+            },
+            selection: None,
+        });
+        assert_eq!(
+            content.matching_brackets(),
+            None,
+            "optional drawing must stop at its shared work bound"
+        );
     }
 
     #[test]
