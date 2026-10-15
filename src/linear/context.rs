@@ -235,6 +235,34 @@ pub fn ensure_link_at(
     Ok(issue)
 }
 
+/// Creator authority belongs to the administrative directory retained during
+/// ownership verification, not whichever checkout a path later resolves to.
+#[cfg(any(feature = "ui", test))]
+pub(crate) fn ensure_link_for_creation(
+    worktree: &Path,
+    expected: &Root,
+    issue_id: &str,
+    workspace: Option<&str>,
+) -> Result<LinkedIssue, Error> {
+    let issue = linked_issue(issue_id, workspace)?;
+    let _guard = lock_link(expected)?;
+    let actual = git_directory(worktree)?;
+    let expected_identity = expected.metadata().map_err(storage)?;
+    let actual_identity = actual.metadata().map_err(storage)?;
+    if (expected_identity.dev(), expected_identity.ino())
+        != (actual_identity.dev(), actual_identity.ino())
+    {
+        return Err(Error::new(
+            "linear_link_context_changed",
+            "The checkout's Git administrative identity changed during creation. Its Linear link was preserved; inspect the checkout before reconciling.",
+        ));
+    }
+    // Every read/write remains relative to the proven descriptor, including
+    // if an external Git edit retargets the checkout after the comparison.
+    ensure_link(expected, &issue)?;
+    Ok(issue)
+}
+
 fn ensure_link(root: &Root, issue: &LinkedIssue) -> Result<(), Error> {
     match read_stored_link(root)? {
         None => write_link(root, issue),
@@ -397,6 +425,32 @@ mod tests {
         .unwrap();
         assert_eq!(std::fs::read_to_string(target).unwrap(), "untouched");
         assert_eq!(read_link(&root).unwrap().issue_id, "ENG-1");
+    }
+
+    #[test]
+    fn creator_link_refuses_a_retargeted_checkout_without_touching_either_link() {
+        let checkout = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        git(checkout.path(), &["init", "-q"]);
+        git(unrelated.path(), &["init", "-q"]);
+        let expected = git_directory(checkout.path()).unwrap();
+        let other = git_directory(unrelated.path()).unwrap();
+        let original = checkout.path().join("original-admin");
+        std::fs::rename(checkout.path().join(".git"), &original).unwrap();
+        std::fs::write(
+            checkout.path().join(".git"),
+            format!("gitdir: {}\n", other.path().display()),
+        ).unwrap();
+        let error = ensure_link_for_creation(checkout.path(), &expected, "ENG-123", None)
+            .unwrap_err();
+        assert_eq!(error.kind, "linear_link_context_changed");
+        assert!(read_stored_link(&expected).unwrap().is_none());
+        assert!(read_stored_link(&other).unwrap().is_none());
+        std::fs::remove_file(checkout.path().join(".git")).unwrap();
+        std::fs::rename(original, checkout.path().join(".git")).unwrap();
+        ensure_link_for_creation(checkout.path(), &expected, "ENG-123", None).unwrap();
+        assert_eq!(resolve_at(checkout.path()).unwrap().issue_id, "ENG-123");
+        assert!(read_stored_link(&other).unwrap().is_none());
     }
 
     #[test]
