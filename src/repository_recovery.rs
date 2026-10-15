@@ -18,8 +18,55 @@ pub enum SavedEntry {
     Absent,
     Trashed,
     Unavailable { reason: String },
-    Blob { oid: Oid, mode: u32, bytes: u64 },
+    Blob { oid: Oid, mode: u32, bytes: u64, access: SavedFileAccess },
     Symlink { target: PathBuf },
+}
+
+// Opaque, inert metadata authenticated on the original backup FD. Keeping
+// bytes rather than a metadata-template FD preserves bounded descriptor use.
+const MAX_ACCESS_ACL_BYTES: usize = 64 * 1024;
+const MAX_CAPTURE_ACL_BYTES: usize = 16 * 1024 * 1024;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedFileAccess {
+    uid: u32,
+    gid: u32,
+    acl: Option<Arc<[u8]>>,
+}
+fn access_version(metadata: &fs::Metadata) -> ((u64, u64, u64, i64, i64, i64, i64), u32, u32, u32) {
+    (metadata_version(metadata), metadata.mode(), metadata.uid(), metadata.gid())
+}
+impl SavedFileAccess {
+    fn capture(file: &fs::File) -> Result<Self, String> {
+        let before = file.metadata().map_err(|error| error.to_string())?;
+        let acl = fs_safety::capture_access_acl(file).map_err(|error| error.to_string())?;
+        if acl.as_ref().is_some_and(|bytes| bytes.len() > MAX_ACCESS_ACL_BYTES) {
+            return Err("The original access ACL exceeds the bounded recovery metadata limit".into());
+        }
+        let after = file.metadata().map_err(|error| error.to_string())?;
+        if !before.is_file() || access_version(&before) != access_version(&after) {
+            return Err("The original file access policy changed while being backed up".into());
+        }
+        Ok(Self { uid: before.uid(), gid: before.gid(), acl: acl.map(Arc::from) })
+    }
+    fn verify(&self, file: &fs::File) -> Result<(), String> {
+        let before = file.metadata().map_err(|error| error.to_string())?;
+        if (before.uid(), before.gid()) != (self.uid, self.gid)
+            || fs_safety::capture_access_acl(file).map_err(|error| error.to_string())?.as_deref() != self.acl.as_deref()
+            || access_version(&before) != access_version(&file.metadata().map_err(|error| error.to_string())?) {
+            return Err("The recovery file's original ownership or access ACL could not be preserved".into());
+        }
+        Ok(())
+    }
+    fn install(&self, file: &fs::File, mode: u32) -> Result<(), String> {
+        fs_safety::restore_ownership(file, self.uid, self.gid).map_err(|error| error.to_string())?;
+        file.set_permissions(fs::Permissions::from_mode(mode)).map_err(|error| error.to_string())?;
+        fs_safety::restore_access_acl(file, self.acl.as_deref()).map_err(|error| error.to_string())?;
+        self.verify(file)?;
+        if file.metadata().map_err(|error| error.to_string())?.mode() & 0o7777 != mode & 0o7777 {
+            return Err("The kernel did not preserve the original recovery mode after ownership/access restoration".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,6 +467,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) {
         let mut result = BTreeMap::new();
         let mut versions = BTreeMap::new();
+        let mut remaining_acl_bytes = MAX_CAPTURE_ACL_BYTES;
         for batch in paths.chunks(256) {
             let mut files = Vec::new();
             for path in batch {
@@ -498,8 +546,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     if hashes.len() != files.len() {
                         return Err("Git did not return a hash for every backup".into());
                     }
+                    let access = SavedFileAccess::capture(file)?;
+                    let acl_bytes = access.acl.as_ref().map_or(0, |bytes| bytes.len());
+                    if acl_bytes > remaining_acl_bytes {
+                        return Err("Recovery access metadata capacity is exhausted; the file access policy could not be retained".into());
+                    }
+                    remaining_acl_bytes -= acl_bytes;
                     let after = file.metadata().map_err(|error| error.to_string())?;
-                    if metadata_version(opened) != metadata_version(&after) {
+                    if access_version(opened) != access_version(&after) {
                         return Err("file changed while making its backup".into());
                     }
                     let oid =
@@ -509,6 +563,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         oid,
                         mode: opened.mode() & 0o7777,
                         bytes: opened.len(),
+                        access,
                     })
                 })();
                 if saved.is_ok() {
@@ -566,8 +621,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let output = self
             .run_checked(&command.arg("--").arg(descriptor_path), cancellation)
             .map_err(|error| error.to_string())?;
+        let access = SavedFileAccess::capture(&file)?;
         let after = file.metadata().map_err(|error| error.to_string())?;
-        if metadata_version(&opened) != metadata_version(&after) {
+        if access_version(&opened) != access_version(&after) {
             return Err("file changed while making its backup".into());
         }
         let oid = Oid::parse_object(String::from_utf8_lossy(&output.stdout).trim())
@@ -576,6 +632,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             oid,
             mode: opened.mode() & 0o7777,
             bytes: opened.len(),
+            access,
         })
     }
 

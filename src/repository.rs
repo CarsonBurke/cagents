@@ -61,7 +61,7 @@ mod stash_mutations;
 mod recovery;
 pub use recovery::{
     DiscardRecovery, DiscardRecoveryEntry, DiscardRecoveryResolution, LiveDiscardRecovery,
-    RecoverableDiscard, SavedEntry, TrashReceipt,
+    RecoverableDiscard, SavedEntry, SavedFileAccess, TrashReceipt,
 };
 
 const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";

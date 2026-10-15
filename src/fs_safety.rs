@@ -837,13 +837,20 @@ pub fn content_attributes(
 pub fn copy_ownership(source: &File, destination: &File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let source = source.metadata()?;
+    restore_ownership(destination, source.uid(), source.gid())
+}
+
+/// Restores an authenticated owner's scalar identity on the SAME created FD.
+/// Failure forbids publication; a later chmod restores bits cleared by chown.
+pub(crate) fn restore_ownership(destination: &File, uid: u32, gid: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let target = destination.metadata()?;
-    if source.uid() == target.uid() && source.gid() == target.gid() {
+    if uid == target.uid() && gid == target.gid() {
         return Ok(());
     }
     // SAFETY: destination is a live descriptor; uid and gid come from the
-    // source descriptor. No pathname is resolved again by this operation.
-    let status = unsafe { libc::fchown(destination.as_raw_fd(), source.uid(), source.gid()) };
+    // authenticated source policy. No pathname is resolved again here.
+    let status = unsafe { libc::fchown(destination.as_raw_fd(), uid, gid) };
     if status < 0 {
         let error = io::Error::last_os_error();
         return Err(io::Error::new(
@@ -852,7 +859,7 @@ pub fn copy_ownership(source: &File, destination: &File) -> io::Result<()> {
         ));
     }
     let installed = destination.metadata()?;
-    if installed.uid() != source.uid() || installed.gid() != source.gid() {
+    if installed.uid() != uid || installed.gid() != gid {
         return Err(io::Error::other(
             "the filesystem did not preserve file ownership",
         ));
@@ -865,14 +872,25 @@ pub fn copy_ownership(source: &File, destination: &File) -> io::Result<()> {
 /// access, so every failure prevents publication. An absent source ACL removes
 /// any access ACL inherited by the destination from its parent.
 pub fn copy_access_acl(source: &File, destination: &File) -> io::Result<()> {
-    let name = c"system.posix_acl_access";
-    let value = match read_attribute(source, name) {
+    let value = match capture_access_acl(source) {
         Ok(value) => value,
+        // Preserve this existing copy helper's no-ACL-filesystem behavior.
         Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
         Err(error) => return Err(error),
     };
+    restore_access_acl(destination, value.as_deref())
+}
+
+pub(crate) fn capture_access_acl(source: &File) -> io::Result<Option<Vec<u8>>> {
+    // Recovery requires an observable policy: unsupported is not absence.
+    read_attribute(source, c"system.posix_acl_access")
+}
+
+/// None is a positive absence witness, so clear inherited access ACLs too.
+pub(crate) fn restore_access_acl(destination: &File, value: Option<&[u8]>) -> io::Result<()> {
+    let name = c"system.posix_acl_access";
     if let Some(value) = value {
-        return write_attribute(destination, name, &value);
+        return write_attribute(destination, name, value);
     }
     // SAFETY: the descriptor is live and the attribute name is static.
     let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };

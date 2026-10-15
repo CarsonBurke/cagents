@@ -241,6 +241,7 @@ struct Proof {
     identity_pin: Arc<fs::File>,
     digest: Option<[u8; 32]>,
     target: Option<PathBuf>,
+    access: Option<SavedFileAccess>,
 }
 
 impl Proof {
@@ -274,20 +275,23 @@ impl Proof {
         } else {
             return Err("Undo entry is not a regular file or symlink".into());
         };
+        let access = file.as_ref().map(|file| SavedFileAccess::capture(file)).transpose()?;
         let proof = Self {
             metadata,
             file,
             identity_pin,
             digest,
             target,
+            access,
         };
         proof.verify(holding, name, cancellation)?;
         Ok(proof)
     }
 
-    fn after_blob_mode_change(
+    fn after_blob_access_change(
         holding: &Holding,
         name: &Path,
+        access: SavedFileAccess,
         file: Arc<fs::File>,
         authenticated: fs::Metadata,
         digest: [u8; 32],
@@ -295,8 +299,10 @@ impl Proof {
         cancellation: &CancellationToken,
         after_mode: impl FnOnce(&Arc<fs::File>) -> Result<(), String>,
     ) -> Result<Self, String> {
-        file.set_permissions(fs::Permissions::from_mode(mode))
-            .map_err(|error| error.to_string())?;
+        if full_version(&authenticated) != full_version(&file.metadata().map_err(|error| error.to_string())?) {
+            return Err("Recovery blob changed before original access restoration".into());
+        }
+        access.install(&file, mode)?;
         file.sync_all().map_err(|error| error.to_string())?;
         after_mode(&file)?;
         let metadata = file.metadata().map_err(|error| error.to_string())?;
@@ -304,23 +310,21 @@ impl Proof {
             metadata.dev(),
             metadata.ino(),
             metadata.len(),
-            metadata.uid(),
-            metadata.gid(),
             metadata.mtime(),
             metadata.mtime_nsec(),
         ) != (
             authenticated.dev(),
             authenticated.ino(),
             authenticated.len(),
-            authenticated.uid(),
-            authenticated.gid(),
             authenticated.mtime(),
             authenticated.mtime_nsec(),
         ) || metadata.mode() & 0o7777 != mode & 0o7777
+            || (metadata.uid(), metadata.gid()) != (access.uid, access.gid)
         {
             return Err("Recovery blob changed during permission restoration".into());
         }
-        // chmod changes ctime. Normalize only that known metadata transition;
+        // Ownership, mode and ACL restoration change ctime. Normalize only
+        // those known authenticated policy transitions;
         // the original expected-object digest is NEVER replaced by fresh data.
         let proof = Self {
             metadata,
@@ -328,6 +332,7 @@ impl Proof {
             identity_pin: file,
             digest: Some(digest),
             target: None,
+            access: Some(access),
         };
         proof.verify(holding, name, cancellation)?;
         Ok(proof)
@@ -373,6 +378,7 @@ impl Proof {
             return Err("Undo entry changed after verification".into());
         }
         if let Some(file) = &self.file {
+            self.access.as_ref().ok_or("The original access policy is unavailable")?.verify(file)?;
             if full_version(&file.metadata().map_err(|error| error.to_string())?)
                 != full_version(&self.metadata)
                 || self.digest != Some(digest_file(file, self.metadata.len(), cancellation)?)
@@ -438,7 +444,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 }
                 Some((generated, proof))
             }
-            SavedEntry::Blob { oid, mode, bytes } => {
+            SavedEntry::Blob { oid, mode, bytes, access } => {
                 let generated = PathBuf::from("restored-blob");
                 let file = holding.create_private_blob()?;
                 // The creator's exact FD survives every error, including a
@@ -472,9 +478,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 if full_version(&named) != full_version(&before) {
                     return Err("Recovery temporary name changed; it was preserved".into());
                 }
-                let proof = Proof::after_blob_mode_change(
+                let proof = Proof::after_blob_access_change(
                     holding,
                     &generated,
+                    access.clone(),
                     file,
                     before,
                     digest,
@@ -526,7 +533,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     return Err("The actual acquired destination changed; it was preserved".into());
                 }
                 match (&entry.after, &proof.file, &proof.target) {
-                    (SavedEntry::Blob { oid, mode, bytes }, Some(file), _) => {
+                    (SavedEntry::Blob { oid, mode, bytes, access }, Some(file), _) => {
+                        access.verify(file)?;
                         if proof.metadata.len() != *bytes
                             || proof.metadata.mode() & 0o7777 != *mode & 0o7777
                             || self
@@ -900,6 +908,116 @@ mod tests {
         drop(exclusive);
     }
 
+    fn named_access_acl(named_uid: u32) -> Vec<u8> {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01u16, 6u16, u32::MAX), (0x02, 4, named_uid),
+            (0x04, 0, u32::MAX), (0x10, 4, u32::MAX), (0x20, 0, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        acl
+    }
+
+    #[test]
+    fn undo_blob_preserves_original_acl_and_removes_inherited_named_access() {
+        for original_has_acl in [false, true] {
+            let (directory, _recovery, mut holding) = fixture();
+            fs::write(directory.path().join("original"), b"work").unwrap();
+            let original = fs::File::open(directory.path().join("original")).unwrap();
+            original.set_permissions(fs::Permissions::from_mode(0o640)).unwrap();
+            let original_acl = named_access_acl(12_345);
+            fs_safety::restore_access_acl(&original, original_has_acl.then_some(original_acl.as_slice())).unwrap();
+            let access = SavedFileAccess::capture(&original).unwrap();
+            assert_eq!(access.acl.is_some(), original_has_acl);
+            // A default ACL in the outside staging parent can carry another
+            // named reader even while a fresh0600 child masks it out. chmod640
+            // would activate that reader unless original absence is restored.
+            let parent = open_directory_sync_handle(holding.root()).unwrap();
+            let inherited = named_access_acl(23_456);
+            let result = unsafe { libc::fsetxattr(parent.as_raw_fd(), c"system.posix_acl_default".as_ptr(),
+                inherited.as_ptr().cast(), inherited.len(), 0) };
+            assert_eq!(result, 0, "{}", io::Error::last_os_error());
+            let file = holding.create_private_blob().unwrap();
+            file.write_at(b"work", 0).unwrap();
+            assert!(fs_safety::capture_access_acl(&file).unwrap().is_some());
+            let before = file.metadata().unwrap();
+            let digest = digest_file(&file, before.len(), &CancellationToken::new()).unwrap();
+            let proof = Proof::after_blob_access_change(&holding, Path::new("restored-blob"),
+                access.clone(), file.clone(), before, digest, 0o640,
+                &CancellationToken::new(), |_| Ok(())).unwrap();
+            proof.verify(&holding, Path::new("restored-blob"), &CancellationToken::new()).unwrap();
+            assert_eq!(fs_safety::capture_access_acl(&file).unwrap().as_deref(), access.acl.as_deref());
+            assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o640);
+            assert_eq!((file.metadata().unwrap().uid(), file.metadata().unwrap().gid()), (access.uid, access.gid));
+        }
+    }
+
+    #[test]
+    fn undo_blob_original_policy_refuses_after_restoration_acl_replacement() {
+        let (_directory, _recovery, mut holding) = fixture();
+        let file = holding.create_private_blob().unwrap();
+        file.write_at(b"work", 0).unwrap();
+        let access = SavedFileAccess::capture(&file).unwrap();
+        assert!(access.acl.is_none());
+        let before = file.metadata().unwrap();
+        let digest = digest_file(&file, before.len(), &CancellationToken::new()).unwrap();
+        let result = Proof::after_blob_access_change(&holding, Path::new("restored-blob"),
+            access, file, before, digest, 0o640, &CancellationToken::new(),
+            |file| fs_safety::restore_access_acl(file, Some(&named_access_acl(12_345))).map_err(|error| error.to_string()));
+        assert!(result.is_err(), "a fresh post-restoration ACL must not replace the archived policy");
+    }
+
+    #[test]
+    fn undo_blob_preserves_recorded_group_or_refuses_unavailable_ownership() {
+        let (directory, recovery, mut holding) = fixture();
+        fs::write(directory.path().join("original"), b"work").unwrap();
+        let original = fs::File::open(directory.path().join("original")).unwrap();
+        original.set_permissions(fs::Permissions::from_mode(0o640)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let primary = unsafe { libc::getegid() };
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0);
+        let mut groups = vec![0; count as usize];
+        assert_eq!(unsafe { libc::getgroups(count, groups.as_mut_ptr()) }, count);
+        let alternate = groups.into_iter().find(|gid| *gid != primary)
+            .or_else(|| (uid == 0).then_some(if primary == 23_456 { 23_457 } else { 23_456 }));
+        if let Some(gid) = alternate {
+            fs_safety::restore_ownership(&original, uid, gid).unwrap();
+        } else {
+            // No secondary group is available in this runner. Exercise a real
+            // post-fchown verification refusal instead; report this branch,
+            // never a cross-GID restoration pass.
+            eprintln!("NO_SECONDARY_GID: testing unavailable ownership refusal, not cross-GID restoration");
+        }
+        let mut access = SavedFileAccess::capture(&original).unwrap();
+        let file = holding.create_private_blob().unwrap();
+        file.write_at(b"work", 0).unwrap();
+        let before = file.metadata().unwrap();
+        let digest = digest_file(&file, before.len(), &CancellationToken::new()).unwrap();
+        // uid_t::MAX is fchown's no-change sentinel, never an installable
+        // owner. The helper must reject its actual post-syscall mismatch even
+        // when the runner has CAP_CHOWN; no euid-only capability assumption.
+        if alternate.is_none() { access.uid = u32::MAX; }
+        let result = Proof::after_blob_access_change(&holding, Path::new("restored-blob"),
+            access.clone(), file.clone(), before, digest, 0o640, &CancellationToken::new(), |_| Ok(()));
+        if alternate.is_some() {
+            result.unwrap();
+            assert_ne!(access.gid, primary);
+            assert_eq!(file.metadata().unwrap().gid(), access.gid);
+            assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o640);
+        } else {
+            assert!(result.is_err());
+            let expected = file.metadata().unwrap();
+            holding.retain(&recovery);
+            assert!(recovery.live_recovery.needs_resolution());
+            assert_eq!(file.metadata().unwrap().ino(), expected.ino());
+            assert_eq!(fs::read(directory.path().join("original")).unwrap(), b"work");
+        }
+    }
+
     #[test]
     fn undo_blob_authenticated_proof_refuses_existing_fd_write_during_own_chmod_window() {
         let (_directory, _recovery, mut holding) = fixture();
@@ -915,9 +1033,10 @@ mod tests {
             .write(true)
             .open(holding.root().path().join(path))
             .unwrap();
-        let result = Proof::after_blob_mode_change(
+        let result = Proof::after_blob_access_change(
             &holding,
             path,
+            SavedFileAccess::capture(&file).unwrap(),
             file,
             metadata,
             digest,
@@ -946,9 +1065,10 @@ mod tests {
         let original = file.clone();
         let metadata = file.metadata().unwrap();
         let digest = digest_file(&file, metadata.len(), &CancellationToken::new()).unwrap();
-        let result = Proof::after_blob_mode_change(
+        let result = Proof::after_blob_access_change(
             &holding,
             path,
+            SavedFileAccess::capture(&file).unwrap(),
             file,
             metadata,
             digest,
