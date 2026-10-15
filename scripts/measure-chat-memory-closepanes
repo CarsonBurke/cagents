@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Close only minted memory-fixture panes, proving adoption and durable removal.
+
+Run while measure-chat-memory run owns the campaign locks. The small control
+pane must be supplied explicitly and is preserved. Each actor must first have
+an exact durable UI card (AgentId == CardId). Provider close is followed by a
+real native pane close if necessary; an exited provider alone is not success.
+Both baseline existence tombstones and newer closed_cards guards are supported.
+Before each close the parent transcript's final exact actor marker must be
+visible to native OCR, independently confirming the durable focused card.
+This helper records ownership/close proof, not memory or presentation latency.
+"""
+import argparse
+from contextlib import closing
+import json
+import os
+from pathlib import Path
+import runpy
+import sqlite3
+import stat
+import subprocess
+import time
+import uuid
+
+
+FIXTURE = runpy.run_path(str(Path(__file__).with_name("measure-chat-memory")))
+
+
+def connect(path):
+    return sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)
+
+
+def snapshot(ui_path, model_path):
+    with closing(connect(ui_path)) as db:
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        cards = {card: {"workspace": workspace, "closed": isinstance((value := json.loads(existence)), dict) and "closed" in value}
+                 for card, workspace, existence in db.execute("SELECT card_id,workspace_id,existence_json FROM cards")}
+        focused = {workspace: card for workspace, card in db.execute("SELECT workspace_id,focused_card_id FROM workspaces")}
+        guards = {row[0] for row in db.execute("SELECT card_id FROM closed_cards")} if "closed_cards" in tables else set()
+    with closing(connect(model_path)) as db:
+        owners = {row[0] for row in db.execute("SELECT id FROM shared_view_panes")}
+        members = {pane["id"] for row in db.execute("SELECT panes FROM shared_views") for pane in json.loads(row[0])}
+    return cards, focused, guards, owners, members
+
+
+def closed(card, state):
+    cards, _, guards, owners, members = state
+    committed = card in guards or card in cards and cards[card]["closed"]
+    return committed and card not in owners and card not in members
+
+
+def wait_for(description, predicate, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(.1)
+    raise SystemExit("timed out waiting for " + description)
+
+
+def private_database(root, path):
+    path = path.resolve(strict=True)
+    if not path.is_relative_to(root / "data") or not path.is_file():
+        raise SystemExit("databases must belong to this private fixture data directory")
+    return path
+
+
+def compositor_socket(path, compositor_pid):
+    path = Path(path).resolve(strict=True)
+    if path.stat().st_uid != os.getuid() or not stat.S_ISSOCK(path.stat().st_mode):
+        raise SystemExit("unsafe compositor IPC socket")
+    inodes = {line.split()[6] for line in Path("/proc/net/unix").read_text().splitlines()[1:]
+              if len(line.split()) >= 8 and line.split()[7] == str(path)}
+    owned = set()
+    for descriptor in (Path("/proc") / str(compositor_pid) / "fd").iterdir():
+        try:
+            target = os.readlink(descriptor)
+            if target.startswith("socket:["):
+                owned.add(target[8:-1])
+        except FileNotFoundError:
+            pass
+    if not inodes & owned:
+        raise SystemExit("compositor IPC socket is not owned by the pinned private process")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--cli", type=Path, required=True)
+    parser.add_argument("--pid", type=int, required=True)
+    parser.add_argument("--cycle", type=int, default=1)
+    parser.add_argument("--keep-card", required=True)
+    parser.add_argument("--ui-database", type=Path, required=True)
+    parser.add_argument("--model-database", type=Path, required=True)
+    parser.add_argument("--compositor-receipt", type=Path, required=True)
+    parser.add_argument("--session-state", type=Path, required=True, help="private niri-harness SESSION.json")
+    parser.add_argument("--harness", type=Path, default=Path.home() / ".local/bin/niri-harness")
+    args = parser.parse_args()
+    root = args.root.resolve(strict=True)
+    env = FIXTURE["fixture_environment"](root)
+    FIXTURE["validate_compositor"](root, env, args.compositor_receipt)
+    keep = str(uuid.UUID(args.keep_card))
+    ui_path = private_database(root, args.ui_database)
+    model_path = private_database(root, args.model_database)
+    process = Path("/proc") / str(args.pid)
+    process_env = dict(part.split(b"=", 1) for part in (process / "environ").read_bytes().split(b"\0") if b"=" in part)
+    if process.stat().st_uid != os.getuid() or process_env.get(b"XDG_DATA_HOME") != os.fsencode(root / "data") or (process / "exe").resolve().name != "cagents-ui":
+        raise SystemExit("supply the actual private UI process")
+    ticks = (process / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    session_path = args.session_state.resolve(strict=True)
+    session = json.loads(session_path.read_text())
+    compositor = json.loads(args.compositor_receipt.read_text())
+    display = Path(session["display"])
+    if not display.is_absolute():
+        display = Path(compositor["display"]).parent / display
+    if not session_path.is_relative_to(root) or not Path(session["root"]).resolve().is_relative_to(root) or str(session["pid"]) != str(compositor["pid"]) or str(display.resolve(strict=True)) != env["WAYLAND_DISPLAY"] or session_path.stem != session["name"]:
+        raise SystemExit("harness session must match the pinned private compositor")
+    compositor_socket(session["socket"], compositor["pid"])
+    # The installed harness ordinarily stores a relative wayland-N display.
+    # Our child changes XDG_RUNTIME_DIR; use an owned normalized copy so that
+    # harness input still reaches the exact socket verified above.
+    session["display"] = env["WAYLAND_DISPLAY"]
+    private_state = root / "close-harness-state"
+    private_state.mkdir(mode=0o700, exist_ok=True)
+    private_session = private_state / session_path.name
+    if private_session.exists() and json.loads(private_session.read_text()) != session:
+        raise SystemExit("refusing to replace a different private harness session")
+    private_session.write_text(json.dumps(session, indent=2) + "\n")
+    private_session.chmod(0o600)
+    env["NIRI_HARNESS_STATE"] = str(private_state)
+    actors = json.loads((root / ("actors-cycle" + str(args.cycle) + ".json")).read_text())
+    targets = {str(uuid.UUID(actor["agent"]["id"])) for actor in actors}
+    names = {str(uuid.UUID(actor["agent"]["id"])): actor["agent"].get("name") for actor in actors}
+    if keep in targets or len(targets) != len(actors) or not targets:
+        raise SystemExit("need distinct minted actors and a separate control pane")
+    if any(not name or not name.startswith("memory-") for name in names.values()) or len(set(names.values())) != len(names):
+        raise SystemExit("need unique exact actor footer markers from this fixture")
+    state = snapshot(ui_path, model_path)
+    cards, _, _, owners, members = state
+    if keep not in cards or cards[keep]["closed"]:
+        raise SystemExit("control pane must be durably open")
+    workspace = cards[keep]["workspace"]
+    if any(card not in cards or cards[card]["closed"] or cards[card]["workspace"] != workspace or card not in owners or card not in members for card in targets):
+        raise SystemExit("every minted actor must first have a live adopted UI pane in the control workspace")
+    receipt_path = root / ("pane-closes-cycle" + str(args.cycle) + ".jsonl")
+    if receipt_path.exists():
+        raise SystemExit("refusing to overwrite a close experiment")
+
+    def census():
+        if (process / "stat").read_text().rsplit(")", 1)[1].split()[19] != ticks:
+            raise SystemExit("private UI was replaced during the close experiment")
+        value = snapshot(ui_path, model_path)
+        if keep not in value[0] or value[0][keep]["closed"]:
+            raise SystemExit("control pane unexpectedly closed")
+        return value
+
+    def action(*command):
+        result = subprocess.run([str(args.harness.resolve(strict=True)), "--session", session["name"], "--json", *command],
+                                env=env, capture_output=True, text=True, timeout=60)
+        value = json.loads(result.stdout) if result.returncode == 0 else None
+        with receipt_path.open("a") as output:
+            output.write(json.dumps({"action": list(command), "monotonic_ns": time.monotonic_ns(),
+                                     "exit": result.returncode, "result": value, "stderr": result.stderr}) + "\n")
+        result.check_returncode()
+        return value
+
+    # Prove the compositor's focused window belongs to the exact private UI,
+    # rather than accepting a matching title in a different application.
+    def focused_ui(expected_actor=None):
+        observation = action("observe", *([] if expected_actor else ["--no-text"]))
+        window = observation["window"]
+        windows = subprocess.run(["niri", "msg", "-j", "windows"], env={**env, "NIRI_SOCKET": session["socket"]},
+                                 capture_output=True, text=True, check=True, timeout=10)
+        owned = [row for row in json.loads(windows.stdout) if row["id"] == window["id"] and row.get("pid") == args.pid and row.get("is_focused")]
+        if len(owned) != 1 or not window["focused"] or observation["display"] != env["WAYLAND_DISPLAY"]:
+            raise SystemExit("native focus does not belong to the exact private UI")
+        if expected_actor:
+            visible = "".join(str(run["text"]) for run in observation.get("runs", []))
+            compact = "".join(visible.split())
+            if ("Exactactor" + expected_actor + ";") not in compact:
+                raise SystemExit("selected parent's exact actor footer is not visible; refusing pane-close dispatch")
+
+    focused_ui()
+    with receipt_path.open("a") as output:
+        output.write(json.dumps({"adopted_cards": sorted(targets), "preserved_card": keep,
+                                 "pid": args.pid, "start_ticks": ticks}) + "\n")
+    for actor in actors:
+        FIXTURE["cli_call"](args.cli, env, ["agent", "close", actor["agent"]["id"]], root)
+    for _ in range(3 * len(targets) + 3):
+        state = census()
+        remaining = {card for card in targets if not closed(card, state)}
+        if not remaining:
+            print(json.dumps({"adopted": len(targets), "durably_closed_and_unshared": len(targets), "control_preserved": True}))
+            return
+        selected = state[1].get(workspace)
+        if selected in remaining:
+            focused_ui(names[selected])
+            # A fresh durable focus read immediately before dispatch fences
+            # the exact card; key traversal never closes an unverified pane.
+            if census()[1].get(workspace) != selected:
+                raise SystemExit("pane focus changed before close dispatch")
+            action("key", "ctrl+w")
+            wait_for("selected minted pane's durable close and shared removal", lambda: closed(selected, census()))
+        else:
+            if selected != keep and selected not in targets:
+                raise SystemExit("unrelated focused pane; refusing keyboard dispatch")
+            action("key", "ctrl+PageDown")
+            wait_for("durable pane focus movement", lambda: census()[1].get(workspace) != selected)
+    raise SystemExit("bounded pane traversal exhausted before all closes committed")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Read-only baseline/retired schema proofs for the native pane-close fixture."""
+from contextlib import closing
+from pathlib import Path
+import runpy
+import sqlite3
+import tempfile
+import unittest
+
+
+HELPER = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/measure-chat-memory-closepanes"))
+
+
+class CloseProof(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.ui = Path(self.directory.name) / "sessions.sqlite3"
+        self.model = Path(self.directory.name) / "model.sqlite3"
+        with closing(sqlite3.connect(self.ui)) as db, db:
+            db.executescript('''CREATE TABLE cards(card_id,workspace_id,existence_json);
+                CREATE TABLE workspaces(workspace_id,focused_card_id);
+                INSERT INTO workspaces VALUES ('workspace','minted');
+                INSERT INTO cards VALUES ('minted','workspace','"open"');''')
+        with closing(sqlite3.connect(self.model)) as db, db:
+            db.executescript('''CREATE TABLE shared_view_panes(id);
+                CREATE TABLE shared_views(panes);
+                INSERT INTO shared_view_panes VALUES ('minted');
+                INSERT INTO shared_views VALUES ('[{"id":"minted"}]');''')
+
+    def snapshot(self):
+        return HELPER["snapshot"](self.ui, self.model)
+
+    def unshare(self):
+        with closing(sqlite3.connect(self.model)) as db, db:
+            db.execute("DELETE FROM shared_view_panes")
+            db.execute("UPDATE shared_views SET panes='[]'")
+
+    def test_baseline_tombstone_requires_both_membership_and_owner_removal(self):
+        with closing(sqlite3.connect(self.ui)) as db, db:
+            db.execute('UPDATE cards SET existence_json=?', ('{"closed":{"tombstone":{}}}',))
+        self.assertFalse(HELPER["closed"]("minted", self.snapshot()))
+        with closing(sqlite3.connect(self.model)) as db, db:
+            db.execute("DELETE FROM shared_view_panes")
+        self.assertFalse(HELPER["closed"]("minted", self.snapshot()))
+        self.unshare()
+        self.assertTrue(HELPER["closed"]("minted", self.snapshot()))
+
+    def test_retired_missing_card_requires_guard(self):
+        self.unshare()
+        with closing(sqlite3.connect(self.ui)) as db, db:
+            db.execute("DELETE FROM cards")
+        self.assertFalse(HELPER["closed"]("minted", self.snapshot()))
+        with closing(sqlite3.connect(self.ui)) as db, db:
+            db.executescript("CREATE TABLE closed_cards(card_id); INSERT INTO closed_cards VALUES('minted');")
+        self.assertTrue(HELPER["closed"]("minted", self.snapshot()))
+
+    def test_open_or_unknown_card_never_counts_as_closed(self):
+        self.unshare()
+        self.assertFalse(HELPER["closed"]("minted", self.snapshot()))
+        self.assertFalse(HELPER["closed"]("unknown", self.snapshot()))
+        self.assertEqual(self.snapshot()[1], {"workspace": "minted"})
+
+
+if __name__ == "__main__":
+    unittest.main()
