@@ -7,9 +7,9 @@ pub(super) fn apply(tx: &rusqlite::Transaction<'_>, relocation: &Relocation, mov
     relocation.validate()?;
     let old = repository_key(&relocation.repository)?;
     let new = repository_key(&relocation.destination)?;
-    if old == new { return Ok(false); }
     let existing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)", [old], |row| row.get(0)).map_err(|error| error.to_string())?;
     if !existing { return Ok(false); }
+    if old == new { return relocate_agents(tx, relocation, moves); }
     let destination_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)", [new], |row| row.get(0)).map_err(|error| error.to_string())?;
     if destination_exists { return Err("The located folder is already open as another project".into()); }
     tx.execute("INSERT INTO projects(repository,name,ordinal,kind) SELECT ?2,name,ordinal,kind FROM projects WHERE repository=?1", params![old,new]).map_err(|error| error.to_string())?;
@@ -21,16 +21,7 @@ pub(super) fn apply(tx: &rusqlite::Transaction<'_>, relocation: &Relocation, mov
         for item in &mut items { if let crate::workspace_model::NavigationItem::Worktree(path) = item { relocation.path(path); } }
         tx.execute("UPDATE navigation_orders SET repository=?2,items=?3 WHERE repository=?1", params![old,new,serde_json::to_string(&items).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
     }
-    let agents = tx.prepare("SELECT id,record FROM agents").map_err(|error| error.to_string())?.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|error| error.to_string())?;
-    for (id, record) in agents {
-        let mut agent: crate::agent_execution::Agent = serde_json::from_str(&record).map_err(|error| error.to_string())?;
-        if !super::agent_locations::relocate(tx, &agent, relocation, moves)? { continue; }
-        relocation.agent(&mut agent);
-        tx.execute("UPDATE agents SET record=?2 WHERE id=?1", params![id,serde_json::to_string(&agent).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
-        // agent_policies.directory stores the approved device/inode proof,
-        // not a path. A same-filesystem move preserves that proof; locating a
-        // replacement directory must never grant existing agents new authority.
-    }
+    relocate_agents(tx, relocation, moves)?;
     // Automation definitions are immutable revisions with target leases. A
     // changed path needs a fresh user-approved revision, so pause their existing
     // definitions while retaining their history rather than executing old paths.
@@ -39,6 +30,22 @@ pub(super) fn apply(tx: &rusqlite::Transaction<'_>, relocation: &Relocation, mov
     tx.execute("INSERT OR IGNORE INTO closed_projects(repository) VALUES (?1)", [old]).map_err(|error| error.to_string())?;
     tx.execute("DELETE FROM closed_projects WHERE repository=?1", [new]).map_err(|error| error.to_string())?;
     Ok(true)
+}
+
+fn relocate_agents(tx: &rusqlite::Transaction<'_>, relocation: &Relocation, moves: &[super::agent_locations::AgentMove]) -> Result<bool, String> {
+    let agents = tx.prepare("SELECT id,record FROM agents").map_err(|error| error.to_string())?.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|error| error.to_string())?;
+    let mut changed = false;
+    for (id, record) in agents {
+        let mut agent: crate::agent_execution::Agent = serde_json::from_str(&record).map_err(|error| error.to_string())?;
+        if !super::agent_locations::relocate(tx, &agent, relocation, moves)? { continue; }
+        changed = true;
+        relocation.agent(&mut agent);
+        tx.execute("UPDATE agents SET record=?2 WHERE id=?1", params![id,serde_json::to_string(&agent).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
+        // agent_policies.directory stores the approved device/inode proof,
+        // not a path. A same-filesystem move preserves that proof; locating a
+        // replacement directory must never grant existing agents new authority.
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
