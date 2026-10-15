@@ -97,6 +97,7 @@ pub(super) struct State {
 }
 struct Entry {
     revision:u64,
+    render_revision:u64,
     copy_all:bool,
     copy_error:Option<String>,
     part:chat::cache::changes::Part,
@@ -137,7 +138,7 @@ static NEXT:AtomicU64=AtomicU64::new(1);
 fn attempt()->u64 {NEXT.fetch_add(1,Ordering::Relaxed)}
 impl Entry {
     fn new(part:chat::cache::changes::Part)->Self {
-        Self {revision:attempt(),copy_all:false,copy_error:None,part,pages:Default::default(),requested:Default::default(),page_errors:Default::default(),
+        Self {revision:attempt(),render_revision:0,copy_all:false,copy_error:None,part,pages:Default::default(),requested:Default::default(),page_errors:Default::default(),
             wanted_pages:Default::default(),manual_pages:Default::default(),opened:Default::default(),patches:Default::default(),restored:Default::default(),
             patch_requests:Default::default(),patch_errors:Default::default()}
     }
@@ -191,7 +192,17 @@ impl State {
     }
     pub(super) fn revision(&self)->u64 {self.revision}
     pub(super) fn context_token(&self)->u64 {self.context}
-    pub(super) fn item_revision(&self,item:&str)->u64 {self.aliases.get(item).and_then(|key|self.entries.get(key)).map_or(0,|entry|entry.revision)}
+    pub(super) fn item_revision(&self,item:&str)->u64 {self.aliases.get(item).and_then(|key|self.entries.get(key)).map_or(0,|entry|entry.revision.max(entry.render_revision))}
+    /// Geometry readiness invalidates containing retained rows without
+    /// pretending the immutable file source or Find document changed.
+    pub(super) fn render_ready(&mut self,ready:impl Fn(&tool_text::ToolText)->bool)->bool {
+        let mut changed=false;
+        for entry in self.entries.values_mut() {
+            let owns=entry.patches.keys().filter_map(|index|entry.current(*index)).any(|patch|ready(&patch.view));
+            if owns {entry.render_revision=attempt();changed=true;}
+        }
+        changed
+    }
     pub(super) fn root(&self,item:&str)->Option<&str> {self.aliases.get(item).map(|key|key.source_id.as_str())}
     pub(super) fn metadata(&self,item:&str)->Option<&chat::cache::changes::Metadata> {
         let key=self.aliases.get(item)?;Some(&self.entries.get(key)?.part.metadata)
@@ -862,6 +873,16 @@ mod tests {
         let entry=&state.entries[&page.source];assert!(entry.current(0).is_some());assert!(weak.upgrade().is_some());
         assert_eq!(entry.patch_requests[&1],pending,"unrelated pending file remains scheduled during active Find");
         assert_eq!(state.find_patches().len(),1);assert!(!state.complete_for_find());
+    }
+
+    #[tokio::test]
+    async fn nested_reader_readiness_invalidates_retained_rows_without_reindexing_semantic_sources() {
+        let text="@@ -1 +1 @@\n-before\n+after\n";let page=fixture(text);let(mut state,_raw,_expanded)=open(&page,"part");
+        let request=state.entries[&page.source].patch_requests[&0];assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));
+        let semantic=state.revision();let before=state.item_revision(&page.source.source_id);let file_revision=state.find_sources()[0].revision;
+        assert!(state.render_ready(|view|view.text.as_ref()==text));assert!(state.item_revision(&page.source.source_id)>before);
+        assert_eq!(state.revision(),semantic);assert_eq!(state.find_sources()[0].revision,file_revision);
+        assert!(!state.render_ready(|_|false));
     }
 
 }
