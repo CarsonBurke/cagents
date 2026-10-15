@@ -2227,6 +2227,7 @@ impl Cagents {
                     if let Some(deletion) = target.worktree.and_then(|id| self.project_ui.deletions.get_mut(&id)) {
                         deletion.failure = Some(detail);
                     }
+                    self.sync_worktree_operation_rows();
                 }
                 return task;
             }
@@ -4467,6 +4468,27 @@ mod tests {
             }
             drop(inspection); server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn lost_removal_reply_remains_unconfirmed_on_the_loaded_row_after_a_new_blocker() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+        let mut linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        linked.locked = true;
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let target = app.project_target(project, Some(linked.id)).unwrap();
+        assert!(app.worktree_deletion_blocker(&target).is_some());
+        let started_at = Instant::now();
+        app.project_ui.deletions.insert(linked.id, Deletion {target: target.clone(), started_at, failure: None});
+        let detail = "Removal completion could not be confirmed: original connection closed";
+        drop(app.handle_project_action(Action::RemovalCompleted { target, started_at, result: Err(detail.into()) }));
+        assert_eq!(app.project_ui.deletions[&linked.id].failure.as_deref(), Some(detail));
+        assert!(matches!(&row(&app, linked.id).unwrap().deletion,
+            Some(crate::sidebar::RowDeletion::Failed(reason)) if reason.as_ref() == detail));
+        assert!(app.status.as_ref().unwrap().message.contains(detail));
+        assert!(app.project_ui.branch_requests.is_empty());
+        assert!(app.project_ui.force_branches.is_empty());
     }
 
     #[test]
