@@ -23059,8 +23059,26 @@ fn load_project(
     cancellation: CancellationToken,
     kind: Option<ProjectKind>,
 ) -> Result<LoadedRepository, String> {
+    load_project_with_source(path, project_id, cancellation, kind, None)
+}
+
+fn load_project_with_source(
+    path: &Path,
+    project_id: Option<ProjectId>,
+    cancellation: CancellationToken,
+    kind: Option<ProjectKind>,
+    creation_source: Option<worktree_dialog::WorktreeCreationSource>,
+) -> Result<LoadedRepository, String> {
     if crate::device::is_remote() {
         return Err("Use Device files for remote browsing and Git operations".into());
+    }
+    if let Some(source) = creation_source {
+        // A routine refresh keeps the original physical consent and never
+        // rediscovers a replacement through this request's pathname.
+        let service = source.service().map_err(|error| error.to_string())?;
+        let repository = service.discover(source.repository(), &cancellation)
+            .map_err(|error| error.to_string())?;
+        return read_loaded_repository(&service, repository, Some(source), project_id, &cancellation);
     }
     let directory = path
         .canonicalize()
@@ -23122,18 +23140,11 @@ fn load_repository(
     let scoped = source.service().map_err(|error| error.to_string())?;
     // Redo discovery through the original retained root/private/common handles.
     // Descriptor spellings are active IO operands, not durable project keys.
-    let mut repository = scoped.discover(&root, &cancellation)
-        .map_err(|error| error.to_string())?;
-    repository.common_dir = scoped.common_dir(&root, &cancellation)
+    let repository = scoped.discover(&root, &cancellation)
         .map_err(|error| error.to_string())?;
     if repository.common_dir != candidate.common_dir {
         return Err("The selected repository changed during discovery; reload it before creating a worktree".into());
     }
-    repository.id = candidate.id;
-    repository.git_dir = scoped.git_dir(&root, &cancellation)
-        .map_err(|error| error.to_string())?;
-    repository.selected_path = root.clone();
-    repository.worktree_root = Some(root);
     read_loaded_repository(&scoped, repository, Some(source), project_id, &cancellation)
 }
 
@@ -33173,6 +33184,14 @@ mod tests {
             assert_eq!(loaded.project.repository, root.join(".git"));
             assert!(loaded.worktrees.iter().any(|(row, _)| row.path == linked));
             assert!(!loaded.project.repository.to_string_lossy().contains("/proc/"));
+            let active_creation = CancellationToken::new();
+            let _lease = source.link_token(&active_creation).unwrap();
+            let refreshed = load_project_with_source(selected, Some(loaded.project.id),
+                CancellationToken::new(), Some(ProjectKind::Git), Some(source.clone())).unwrap();
+            assert_eq!(refreshed.creation_source.as_ref().unwrap().id(), source.id(),
+                "routine project reads retain the original creation consent");
+            assert!(!active_creation.is_cancelled(), "a normal refresh cannot cancel active creation");
+            assert_eq!(refreshed.repository.as_ref().unwrap(), loaded.repository.as_ref().unwrap());
         }
         let loaded = load_repository(&linked, None, CancellationToken::new()).unwrap();
         let retained = loaded.creation_source.unwrap();
@@ -33180,11 +33199,15 @@ mod tests {
         std::fs::rename(&linked, &moved).unwrap();
         git(files.path(), &["init", "--template=", "-b", "replacement", "linked"]);
         assert!(retained.service().is_err(), "a displayed binding cannot adopt a replacement root");
+        assert!(load_project_with_source(&linked, None, CancellationToken::new(), Some(ProjectKind::Git),
+            Some(retained.clone())).is_err(), "refresh cannot recapture a replacement root");
         let loaded = load_repository(&root, None, CancellationToken::new()).unwrap();
         let retained = loaded.creation_source.unwrap();
         std::fs::rename(root.join(".git"), root.join("saved-metadata")).unwrap();
         git(&root, &["init", "--template=", "-b", "replacement"]);
         assert!(retained.service().is_err(), "same worktree inode cannot authorize replacement Git metadata");
+        assert!(load_project_with_source(&root, None, CancellationToken::new(), Some(ProjectKind::Git),
+            Some(retained)).is_err(), "refresh cannot recapture replacement metadata");
     }
 
     #[test]

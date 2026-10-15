@@ -361,7 +361,7 @@ impl Cagents {
         open_cards: bool,
         kind: Option<ProjectKind>,
     ) -> Task<Message> {
-        self.retire_project_creation_source(project_id);
+        let creation_source = self.retained_project_creation_source(project_id);
         if crate::device::is_remote() {
             return self.device_project_read_task(path, project_id, generation, kind);
         }
@@ -391,7 +391,7 @@ impl Cagents {
             });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                load_project(&path, Some(project_id), cancellation, kind)
+                load_project_with_source(&path, Some(project_id), cancellation, kind, creation_source)
             })
             .await
             .map_err(|error| format!("repository loader join failed: {error}"))
