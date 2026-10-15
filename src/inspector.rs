@@ -373,6 +373,8 @@ pub enum InspectorAction {
     },
     FocusProjectSearch,
     CloseCard(CardId),
+    /// Copy the complete original protocol diagnostic on explicit request.
+    CopyLspDiagnostic(LspDiagnostic),
     /// Move the caret of `card`'s open document. Self-contained: a language
     /// server replaces a document's diagnostics without being asked, so a row
     /// that carried a position in a list the application holds could resolve
@@ -426,6 +428,8 @@ pub struct Fact {
     pub markdown: bool,
     /// Pressing the fact's row emits this message.
     pub action: Option<InspectorAction>,
+    /// Shared full payload; serialization happens only on explicit copy.
+    pub copy_diagnostic: Option<LspDiagnostic>,
 }
 
 impl Fact {
@@ -436,6 +440,7 @@ impl Fact {
             value: value.into(),
             markdown: false,
             action: None,
+            copy_diagnostic: None,
         }
     }
 
@@ -934,7 +939,8 @@ pub const LSP_ROW_LIMIT: usize = 24;
 pub struct DiagnosticRow<'a> {
     /// `Error · line 42 · rustc E0308`, already assembled.
     pub label: String,
-    pub message: &'a str,
+    pub message: Cow<'a, str>,
+    pub diagnostic: &'a LspDiagnostic,
     /// Where activating the row should place the caret.
     pub at: LspPosition,
     pub severity: LspSeverity,
@@ -958,7 +964,8 @@ pub fn diagnostic_rows(diagnostics: &[LspDiagnostic], limit: usize) -> Diagnosti
         .take(limit)
         .map(|diagnostic| DiagnosticRow {
             label: diagnostic_label(diagnostic),
-            message: diagnostic.message.as_str(),
+            message: diagnostic.message_preview(),
+            diagnostic,
             at: diagnostic.range.start,
             severity: diagnostic.severity,
         })
@@ -1066,8 +1073,10 @@ fn diagnostics_section(card: CardId, diagnostics: &[LspDiagnostic]) -> Option<Se
         .rows
         .into_iter()
         .map(|row| {
-            Fact::new(row.label, row.message)
-                .activated(InspectorAction::JumpToLspDiagnostic { card, at: row.at })
+            let mut fact = Fact::new(row.label, row.message.into_owned())
+                .activated(InspectorAction::JumpToLspDiagnostic { card, at: row.at });
+            fact.copy_diagnostic = Some(row.diagnostic.clone());
+            fact
         })
         .collect();
     if presented.withheld > 0 {
@@ -1217,16 +1226,18 @@ fn withheld_label(withheld: usize, singular: &str, plural: &str) -> String {
 }
 
 fn diagnostic_label(diagnostic: &LspDiagnostic) -> String {
-    let origin = match (&diagnostic.source, &diagnostic.code) {
-        (Some(source), Some(code)) => format!(" · {source} {code}"),
-        (Some(text), None) | (None, Some(text)) => format!(" · {text}"),
-        (None, None) => String::new(),
+    let origin = diagnostic.origin_preview();
+    let origin = if origin.is_empty() {
+        String::new()
+    } else {
+        format!(" · {origin}")
     };
-    format!(
+    crate::lsp::diagnostic_preview(&format!(
         "{} · line {}{origin}",
         severity_label(diagnostic.severity),
         diagnostic.range.start.line.saturating_add(1)
-    )
+    ))
+    .into_owned()
 }
 
 fn location_fact(card: CardId, location: &LspLocation) -> Fact {
@@ -1551,9 +1562,15 @@ impl SegmentedActions {
 /// because the editor offers no gutter or overlay to host a language server's
 /// results.
 fn fact_element(fact: Fact) -> Element<'static, InspectorAction> {
-    match fact.action {
+    let copy = fact.copy_diagnostic;
+    let body = match fact.action {
         Some(action) => {
             let name = format!("{}: {}", fact.label, fact.value);
+            let name = if copy.is_some() {
+                crate::lsp::diagnostic_preview(&name).into_owned()
+            } else {
+                name
+            };
             widget::button::custom(
                 widget::column::with_children(vec![
                     design::caption(fact.label).into(),
@@ -1574,6 +1591,18 @@ fn fact_element(fact: Fact) -> Element<'static, InspectorAction> {
         ])
         .width(Length::Fill)
         .into(),
+    };
+    if let Some(diagnostic) = copy {
+        widget::column::with_children(vec![
+            body,
+            widget::button::text("Copy full diagnostic")
+                .on_press(InspectorAction::CopyLspDiagnostic(diagnostic))
+                .into(),
+        ])
+        .width(Length::Fill)
+        .into()
+    } else {
+        body
     }
 }
 
@@ -2459,13 +2488,13 @@ mod tests {
     }
 
     fn diagnostic(line: u32, severity: LspSeverity, message: &str) -> LspDiagnostic {
-        LspDiagnostic {
-            range: LspRange::new(LspPosition::new(line, 0), LspPosition::new(line, 4)),
+        LspDiagnostic::new(
+            LspRange::new(LspPosition::new(line, 0), LspPosition::new(line, 4)),
             severity,
-            message: message.to_owned(),
-            source: None,
-            code: None,
-        }
+            message.to_owned(),
+            None,
+            None,
+        )
     }
 
     fn location(target: LspTarget, coordinates: LspCoordinates) -> LspLocation {
@@ -2601,6 +2630,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn diagnostic_inspector_bounds_previews_and_retains_shared_full_copy() {
+        let card = repository_card();
+        let message = "😀".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES) + " FULL MESSAGE END";
+        let item = LspDiagnostic::new(
+            LspRange::default(),
+            LspSeverity::Error,
+            message.clone(),
+            Some("λ".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES)),
+            Some("κ".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES)),
+        );
+        let lsp = LspInspectorContext {
+            diagnostics: vec![item.clone()],
+            ..Default::default()
+        };
+        let model = lsp_model(&card, &lsp);
+        let fact = &section(&model, "Diagnostics").facts[0];
+        assert!(fact.value.len() <= crate::lsp::DIAGNOSTIC_PREVIEW_BYTES);
+        assert!(fact.label.len() <= crate::lsp::DIAGNOSTIC_PREVIEW_BYTES);
+        assert!(fact.value.contains("preview truncated"));
+        assert!(!fact.value.contains("FULL MESSAGE END"));
+        let copy = fact
+            .copy_diagnostic
+            .as_ref()
+            .expect("explicit full-copy control");
+        assert!(std::sync::Arc::ptr_eq(&copy.protocol, &item.protocol));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&copy.copy_text()).unwrap()["message"],
+            message
+        );
+        let _view = fact_element(fact.clone());
     }
 
     #[test]

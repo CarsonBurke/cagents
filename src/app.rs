@@ -11549,6 +11549,9 @@ impl Cagents {
                 Task::none()
             }
             InspectorAction::ResizeFinished => self.save_settings_task(false),
+            InspectorAction::CopyLspDiagnostic(diagnostic) => {
+                iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
+            }
             // A request's answer is rendered by this very panel, so dismissing
             // an overlay inspector on the way to asking for it would show the
             // user nothing at all. These five stay put; the four below move the
@@ -11691,6 +11694,7 @@ impl Cagents {
                         | InspectorAction::ToggleDiagnostics(_)
                         | InspectorAction::Resize { .. }
                         | InspectorAction::ResizeFinished
+                        | InspectorAction::CopyLspDiagnostic(_)
                         | InspectorAction::JumpToLspDiagnostic { .. }
                         | InspectorAction::JumpToLspLocation { .. }
                         | InspectorAction::ApplyLspCompletion { .. }
@@ -23966,13 +23970,13 @@ mod tests {
     }
 
     fn diagnostic(message: &str) -> crate::lsp::LspDiagnostic {
-        crate::lsp::LspDiagnostic {
-            range: crate::lsp::LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 1)),
-            severity: crate::lsp::LspSeverity::Error,
-            message: message.into(),
-            source: None,
-            code: None,
-        }
+        crate::lsp::LspDiagnostic::new(
+            crate::lsp::LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 1)),
+            crate::lsp::LspSeverity::Error,
+            message.into(),
+            None,
+            None,
+        )
     }
 
     fn completion_item(label: &str) -> crate::lsp::LspCompletionItem {

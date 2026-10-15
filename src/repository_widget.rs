@@ -363,6 +363,7 @@ pub enum EditorLspAction {
 struct EditorLanguageState {
     diagnostics: Vec<crate::lsp::LspDiagnostic>,
     selected_diagnostic: Option<usize>,
+    hover_diagnostic: Option<crate::lsp::LspDiagnostic>,
     marks: Vec<text_editor::Diagnostic>,
     completions: Vec<LspCompletionItem>,
     selected: usize,
@@ -629,6 +630,10 @@ pub enum RepositoryAction {
         run: Range<usize>,
         expansion: FoldExpansion,
     },
+    CopyDiagnostic {
+        card: CardId,
+        diagnostic: crate::lsp::LspDiagnostic,
+    },
     MarkdownLink {
         card: CardId,
         uri: markdown::Uri,
@@ -748,6 +753,7 @@ impl RepositoryAction {
             | Self::RevealDiffTop { card }
             | Self::WorkingDiffDue { card, .. }
             | Self::MarkdownDue { card, .. }
+            | Self::CopyDiagnostic { card, .. }
             | Self::MarkdownLink { card, .. }
             | Self::OpenFind { card }
             | Self::CloseFind { card }
@@ -3163,6 +3169,9 @@ impl RepositoryRuntime {
         } else {
             vec![]
         };
+        if self.language.hover_diagnostic.is_some() {
+            self.dismiss_editor_results();
+        }
         self.language.diagnostics = diagnostics;
         self.language.selected_diagnostic = None;
     }
@@ -3205,10 +3214,11 @@ impl RepositoryRuntime {
                 .unwrap_or(order.len() - 1)
         };
         let (position, index) = order[next];
-        let message = self.language.diagnostics[index].message.clone();
+        let diagnostic = self.language.diagnostics[index].clone();
         if self.move_cursor_to(position) {
             self.dismiss_editor_results();
-            self.set_editor_hover(Some(&message), Some(position));
+            self.set_editor_hover(Some(&diagnostic.message_preview()), Some(position));
+            self.language.hover_diagnostic = Some(diagnostic);
             self.language.selected_diagnostic = Some(index);
         }
     }
@@ -3217,9 +3227,11 @@ impl RepositoryRuntime {
         self.language.selected = items.iter().position(|item| item.preselect).unwrap_or(0);
         self.language.completions = items;
         self.language.hover.clear();
+        self.language.hover_diagnostic = None;
     }
 
     pub fn set_editor_hover(&mut self, markdown: Option<&str>, at: Option<LspPosition>) {
+        self.language.hover_diagnostic = None;
         self.language.hover = markdown.map_or_else(Vec::new, |raw| markdown::parse(raw).collect());
         self.language.hover_at = at.and_then(|at| match &self.document {
             DocumentState::Editable(document) => caret_for_position(&document.content, at),
@@ -3230,6 +3242,7 @@ impl RepositoryRuntime {
     pub fn dismiss_editor_results(&mut self) {
         self.language.completions.clear();
         self.language.hover.clear();
+        self.language.hover_diagnostic = None;
         self.language.hover_at = None;
     }
 
@@ -6362,6 +6375,9 @@ impl RepositoryRuntime {
                 }
                 self.expand_diff_fold(fold, expansion)
             }
+            RepositoryAction::CopyDiagnostic { diagnostic, .. } => {
+                iced::clipboard::write(diagnostic.copy_text())
+            }
             RepositoryAction::MarkdownLink { .. } | RepositoryAction::OpenExternal { .. } => {
                 Task::none()
             }
@@ -9098,6 +9114,18 @@ fn editable_document_view<'a>(
                 &cosmic::theme::active(),
                 crate::design::TEXT_BODY,
             );
+            let copy = runtime
+                .language
+                .hover_diagnostic
+                .as_ref()
+                .map(|diagnostic| {
+                    widget::button::text("Copy full diagnostic")
+                        .on_press(RepositoryAction::CopyDiagnostic {
+                            card,
+                            diagnostic: diagnostic.clone(),
+                        })
+                        .into()
+                });
             Some(
                 widget::container(
                     widget::scrollable(
@@ -9118,6 +9146,7 @@ fn editable_document_view<'a>(
                                 })
                                 .collect::<Vec<_>>(),
                         )
+                        .push_maybe(copy)
                         .spacing(space::M),
                     )
                     .height(Length::Shrink),
@@ -15324,13 +15353,13 @@ mod tests {
     fn editor_diagnostic_marks_map_unicode_and_bare_carriage_return_positions() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "α\rbeta\nsecond\n");
-        runtime.set_editor_diagnostics(vec![crate::lsp::LspDiagnostic {
-            range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 6)),
-            severity: crate::lsp::LspSeverity::Error,
-            message: "bad beta".into(),
-            source: None,
-            code: None,
-        }]);
+        runtime.set_editor_diagnostics(vec![crate::lsp::LspDiagnostic::new(
+            LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 6)),
+            crate::lsp::LspSeverity::Error,
+            "bad beta".into(),
+            None,
+            None,
+        )]);
         assert_eq!(runtime.language.marks.len(), 1);
         assert_eq!(
             runtime.language.marks[0].start,
@@ -16611,24 +16640,50 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_navigation_uses_bounded_markdown_and_shared_explicit_copy() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "first\nsecond\n");
+        let item = crate::lsp::LspDiagnostic::new(
+            LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 1)),
+            crate::lsp::LspSeverity::Error,
+            "λ".repeat(crate::lsp::DIAGNOSTIC_PREVIEW_BYTES) + " FULL MESSAGE END",
+            None,
+            None,
+        );
+        runtime.set_editor_diagnostics(vec![item.clone()]);
+        runtime.navigate_diagnostic(true);
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 0)));
+        let hover_debug = format!("{:?}", runtime.language.hover);
+        assert!(hover_debug.len() < crate::lsp::DIAGNOSTIC_PREVIEW_BYTES * 2);
+        assert!(hover_debug.contains("preview truncated"));
+        assert!(!hover_debug.contains("FULL MESSAGE END"));
+        let copy = runtime.language.hover_diagnostic.as_ref().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&copy.protocol, &item.protocol));
+        assert!(copy.copy_text().contains("FULL MESSAGE END"));
+        runtime.set_editor_diagnostics(vec![]);
+        assert!(runtime.language.hover_diagnostic.is_none());
+        assert!(runtime.language.hover.is_empty());
+    }
+
+    #[test]
     fn diagnostic_navigation_wraps_and_displays_the_message() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "first\nsecond\nthird\n");
         runtime.set_editor_diagnostics(vec![
-            crate::lsp::LspDiagnostic {
-                range: LspRange::new(LspPosition::new(2, 0), LspPosition::new(2, 3)),
-                severity: crate::lsp::LspSeverity::Error,
-                message: "third error".into(),
-                source: None,
-                code: None,
-            },
-            crate::lsp::LspDiagnostic {
-                range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 3)),
-                severity: crate::lsp::LspSeverity::Warning,
-                message: "second warning".into(),
-                source: None,
-                code: None,
-            },
+            crate::lsp::LspDiagnostic::new(
+                LspRange::new(LspPosition::new(2, 0), LspPosition::new(2, 3)),
+                crate::lsp::LspSeverity::Error,
+                "third error".into(),
+                None,
+                None,
+            ),
+            crate::lsp::LspDiagnostic::new(
+                LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 3)),
+                crate::lsp::LspSeverity::Warning,
+                "second warning".into(),
+                None,
+                None,
+            ),
         ]);
         runtime.move_cursor_to(LspPosition::new(0, 0));
         runtime.navigate_diagnostic(true);

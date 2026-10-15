@@ -224,14 +224,130 @@ pub enum LspSeverity {
     Hint,
 }
 
-/// One diagnostic, already converted to editor-native coordinates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Routine diagnostic previews are bounded independently of the wire frame.
+pub const DIAGNOSTIC_PREVIEW_BYTES: usize = 16 * 1024;
+const DIAGNOSTIC_TRUNCATED: &str =
+    "\n… [preview truncated; copy full diagnostic for complete text]";
+
+/// A UTF-8-safe, visibly truncated prefix. No allocation or full-text scan is
+/// needed for a short value; a long value allocates at most the preview budget.
+pub fn diagnostic_preview(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= DIAGNOSTIC_PREVIEW_BYTES {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = DIAGNOSTIC_PREVIEW_BYTES - DIAGNOSTIC_TRUNCATED.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}{DIAGNOSTIC_TRUNCATED}", &text[..end]))
+}
+
+/// One diagnostic with editor-native coordinates and its complete, immutable
+/// protocol payload. Mirrors and shifted ranges share the original strings,
+/// related information and opaque server data rather than copying them.
+#[derive(Clone)]
 pub struct LspDiagnostic {
     pub range: LspRange,
     pub severity: LspSeverity,
-    pub message: String,
-    pub source: Option<String>,
-    pub code: Option<String>,
+    pub protocol: Arc<lsp_types::Diagnostic>,
+}
+
+impl std::ops::Deref for LspDiagnostic {
+    type Target = lsp_types::Diagnostic;
+
+    fn deref(&self) -> &Self::Target {
+        &self.protocol
+    }
+}
+
+impl PartialEq for LspDiagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        self.range == other.range
+            && self.severity == other.severity
+            && (Arc::ptr_eq(&self.protocol, &other.protocol) || self.protocol == other.protocol)
+    }
+}
+impl Eq for LspDiagnostic {}
+
+impl std::fmt::Debug for LspDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LspDiagnostic")
+            .field("range", &self.range)
+            .field("severity", &self.severity)
+            .field("message", &diagnostic_preview(&self.message))
+            .finish_non_exhaustive()
+    }
+}
+
+impl LspDiagnostic {
+    /// Construct a local diagnostic; server diagnostics retain the actual wire
+    /// object instead, including its original UTF-16 range and opaque data.
+    pub fn new(
+        range: LspRange,
+        severity: LspSeverity,
+        message: String,
+        source: Option<String>,
+        code: Option<String>,
+    ) -> Self {
+        Self {
+            range,
+            severity,
+            protocol: Arc::new(lsp_types::Diagnostic {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(range.start.line, range.start.character),
+                    lsp_types::Position::new(range.end.line, range.end.character),
+                ),
+                severity: Some(match severity {
+                    LspSeverity::Error => lsp_types::DiagnosticSeverity::ERROR,
+                    LspSeverity::Warning => lsp_types::DiagnosticSeverity::WARNING,
+                    LspSeverity::Information => lsp_types::DiagnosticSeverity::INFORMATION,
+                    LspSeverity::Hint => lsp_types::DiagnosticSeverity::HINT,
+                }),
+                message,
+                source,
+                code: code.map(lsp_types::NumberOrString::String),
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub fn message_preview(&self) -> std::borrow::Cow<'_, str> {
+        diagnostic_preview(&self.message)
+    }
+
+    /// Bounded origin text; combine only bounded pieces before formatting so a
+    /// pathological source/code cannot allocate its complete value in a view.
+    pub fn origin_preview(&self) -> String {
+        let source = self.source.as_deref().unwrap_or("");
+        let code = match &self.code {
+            Some(lsp_types::NumberOrString::String(code)) => {
+                std::borrow::Cow::Borrowed(code.as_str())
+            }
+            Some(lsp_types::NumberOrString::Number(code)) => {
+                std::borrow::Cow::Owned(code.to_string())
+            }
+            None => std::borrow::Cow::Borrowed(""),
+        };
+        if source.is_empty() {
+            return diagnostic_preview(&code).into_owned();
+        }
+        if code.is_empty() {
+            return diagnostic_preview(source).into_owned();
+        }
+        diagnostic_preview(&format!(
+            "{} {}",
+            diagnostic_preview(source),
+            diagnostic_preview(&code)
+        ))
+        .into_owned()
+    }
+
+    /// Full protocol JSON is materialized only after an explicit copy action.
+    /// It preserves message, source, numeric/string code, related info and data.
+    pub fn copy_text(&self) -> String {
+        serde_json::to_string_pretty(self.protocol.as_ref())
+            .expect("diagnostic JSON is serializable")
+    }
 }
 
 /// Retains standing diagnostics through a sequence of exact editor changes.
@@ -2261,7 +2377,7 @@ fn publish_diagnostics(state: &mut RouterState, params: lsp_types::PublishDiagno
     }
     let items: Vec<LspDiagnostic> = params
         .diagnostics
-        .iter()
+        .into_iter()
         .filter_map(|diagnostic| convert_diagnostic(&snapshot, diagnostic))
         .collect();
     for doc in docs {
@@ -2275,7 +2391,7 @@ fn publish_diagnostics(state: &mut RouterState, params: lsp_types::PublishDiagno
 
 fn convert_diagnostic(
     snapshot: &Snapshot,
-    diagnostic: &lsp_types::Diagnostic,
+    diagnostic: lsp_types::Diagnostic,
 ) -> Option<LspDiagnostic> {
     // One unconvertible range must not discard the whole batch.
     let range = snapshot.range_from_utf16(diagnostic.range).ok()?;
@@ -2287,12 +2403,7 @@ fn convert_diagnostic(
             Some(lsp_types::DiagnosticSeverity::HINT) => LspSeverity::Hint,
             _ => LspSeverity::Error,
         },
-        message: diagnostic.message.clone(),
-        source: diagnostic.source.clone(),
-        code: diagnostic.code.as_ref().map(|code| match code {
-            lsp_types::NumberOrString::Number(value) => value.to_string(),
-            lsp_types::NumberOrString::String(value) => value.clone(),
-        }),
+        protocol: Arc::new(diagnostic),
     })
 }
 
@@ -6383,18 +6494,148 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_previews_bound_unicode_bytes_and_copy_preserves_complete_protocol() {
+        let budget = DIAGNOSTIC_PREVIEW_BYTES;
+        for text in ["x".repeat(budget), "λ".repeat(budget), "😀".repeat(budget)] {
+            let preview = diagnostic_preview(&text);
+            assert!(preview.len() <= budget);
+            if text.len() <= budget {
+                assert!(matches!(preview, std::borrow::Cow::Borrowed(_)));
+                assert_eq!(preview, text);
+            } else {
+                assert!(preview.ends_with(DIAGNOSTIC_TRUNCATED));
+                assert!(text.starts_with(preview.strip_suffix(DIAGNOSTIC_TRUNCATED).unwrap()));
+            }
+        }
+        let protocol: lsp_types::Diagnostic = serde_json::from_value(json!({
+            "range": {"start":{"line":0,"character":1},"end":{"line":0,"character":3}},
+            "severity": 2, "message": "λ".repeat(budget) + " ORIGINAL MESSAGE END",
+            "source": "s".repeat(budget + 1), "code": "κ".repeat(budget),
+            "codeDescription": {"href":"https://example.invalid/code"}, "tags":[1],
+            "relatedInformation":[{"location":{"uri":"file:///tmp/other.rs", "range":{
+                "start":{"line":1,"character":0},"end":{"line":1,"character":1}}},"message":"related"}],
+            "data": {"opaque": [7, "unchanged"]}
+        })).unwrap();
+        let expected = serde_json::to_value(&protocol).unwrap();
+        let diagnostic =
+            convert_diagnostic(&Snapshot::new(1, Arc::from("a😀b")), protocol).unwrap();
+        assert_eq!(diagnostic.range.end.character, 2);
+        assert!(diagnostic.message_preview().len() <= budget);
+        assert!(diagnostic.origin_preview().len() <= budget);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&diagnostic.copy_text()).unwrap(),
+            expected
+        );
+        assert!(!format!("{diagnostic:?}").contains("ORIGINAL MESSAGE END"));
+        // Both optional code representations survive explicit inspection.
+        let mut numeric = diagnostic.protocol.as_ref().clone();
+        numeric.code = Some(lsp_types::NumberOrString::Number(2304));
+        let numeric = convert_diagnostic(&Snapshot::new(1, Arc::from("a😀b")), numeric).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&numeric.copy_text()).unwrap()["code"],
+            2304
+        );
+    }
+
+    #[test]
+    fn diagnostic_publication_and_shift_share_one_original_payload_across_mirrors() {
+        let snapshots = Arc::new(SnapshotStore::default());
+        let uri = Arc::new(Url::parse("file:///tmp/mirrored.rs").unwrap());
+        let key = SessionKey {
+            server_id: Arc::from("test"),
+            root: Arc::from(Path::new("/tmp")),
+        };
+        for doc in 1..=3 {
+            snapshots
+                .register(LspDocumentId(doc), &uri, &key, 1, Arc::from("a😀b"))
+                .unwrap();
+        }
+        let version = snapshots.latest(&uri).unwrap().version;
+        let (tx, rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
+        let mut state = RouterState {
+            key,
+            snapshots,
+            events: EventSink {
+                tx,
+                pending: Arc::new(PendingEvents::default()),
+            },
+            retired: Arc::new(AtomicBool::new(false)),
+        };
+        let message = "λ".repeat(DIAGNOSTIC_PREVIEW_BYTES + 1);
+        let message_ptr = message.as_ptr();
+        let original = lsp_types::Diagnostic {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(0, 1),
+                lsp_types::Position::new(0, 3),
+            ),
+            message,
+            source: Some("test".into()),
+            data: Some(json!({"fix":7})),
+            ..Default::default()
+        };
+        publish_diagnostics(
+            &mut state,
+            lsp_types::PublishDiagnosticsParams {
+                uri: uri.as_ref().clone(),
+                version: Some(version),
+                diagnostics: vec![original],
+            },
+        );
+        let mut batches = Vec::new();
+        for doc in 1..=3 {
+            let LspEvent::Diagnostics {
+                doc: actual, items, ..
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("diagnostics event")
+            };
+            assert_eq!(actual, LspDocumentId(doc));
+            assert_eq!(
+                items[0].message.as_ptr(),
+                message_ptr,
+                "conversion moves the original strings"
+            );
+            batches.push(items);
+        }
+        for batch in &batches[1..] {
+            assert!(Arc::ptr_eq(&batches[0][0].protocol, &batch[0].protocol));
+        }
+        let old_range = batches[0][0].range;
+        shift_diagnostics(
+            &mut batches[1],
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 0)),
+                new_text: "x".into(),
+            }],
+        );
+        assert_eq!(batches[0][0].range, old_range);
+        assert_eq!(
+            batches[1][0].range.start.character,
+            old_range.start.character + 1
+        );
+        assert!(Arc::ptr_eq(
+            &batches[0][0].protocol,
+            &batches[1][0].protocol
+        ));
+        assert_eq!(
+            batches[1][0].protocol.range.start.character, 1,
+            "protocol coordinates remain original"
+        );
+    }
+
+    #[test]
     fn diagnostic_ranges_follow_insert_delete_and_multiline_replacements() {
         fn diagnostic(start: (u32, u32), end: (u32, u32)) -> LspDiagnostic {
-            LspDiagnostic {
-                range: LspRange::new(
+            LspDiagnostic::new(
+                LspRange::new(
                     LspPosition::new(start.0, start.1),
                     LspPosition::new(end.0, end.1),
                 ),
-                severity: LspSeverity::Error,
-                message: "error".into(),
-                source: None,
-                code: None,
-            }
+                LspSeverity::Error,
+                "error".into(),
+                None,
+                None,
+            )
         }
         let mut items = vec![diagnostic((2, 3), (2, 8)), diagnostic((0, 0), (0, 2))];
         shift_diagnostics(
@@ -6438,13 +6679,13 @@ mod tests {
 
     #[test]
     fn diagnostic_insert_affinity_and_complete_deletion_remain_valid() {
-        let mut item = LspDiagnostic {
-            range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 5)),
-            severity: LspSeverity::Error,
-            message: "error".into(),
-            source: None,
-            code: None,
-        };
+        let mut item = LspDiagnostic::new(
+            LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 5)),
+            LspSeverity::Error,
+            "error".into(),
+            None,
+            None,
+        );
         shift_diagnostics(
             std::slice::from_mut(&mut item),
             &[LspTextEdit {
@@ -7326,7 +7567,10 @@ mod tests {
                 "UTF-16 offsets convert back to scalar offsets"
             );
             assert_eq!(items[0].severity, LspSeverity::Warning);
-            assert_eq!(items[0].code.as_deref(), Some("E0001"));
+            assert_eq!(
+                items[0].code,
+                Some(lsp_types::NumberOrString::String("E0001".into()))
+            );
             assert_eq!(items[0].source.as_deref(), Some("fake"));
             manager.shutdown();
         });

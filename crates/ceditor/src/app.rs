@@ -4759,7 +4759,7 @@ impl Application for Editor {
                         widget::button::custom(
                             widget::column::with_children(vec![
                                 design::caption(row.label).into(),
-                                design::body(row.message)
+                                design::body(row.message.into_owned())
                                     .wrapping(iced::widget::text::Wrapping::Word)
                                     .into(),
                             ])
@@ -4769,6 +4769,14 @@ impl Application for Editor {
                         .width(Length::Fill)
                         .on_press(Message::Jump(tab.id, row.at))
                         .into(),
+                    );
+                    results.push(
+                        widget::button::text("Copy full diagnostic")
+                            .on_press(Message::Repository(RepositoryAction::CopyDiagnostic {
+                                card: tab.id,
+                                diagnostic: row.diagnostic.clone(),
+                            }))
+                            .into(),
                     );
                 }
                 if withheld > 0 {
@@ -6652,12 +6660,14 @@ mod tests {
         // protocol version fences without launching any language server.
         assert_eq!(app.lsp.document_version(doc), Some(1));
         let generation = app.lsp.generation();
-        let diagnostic = |line| LspDiagnostic {
-            range: LspRange::new(LspPosition::new(line, 0), LspPosition::new(line, 3)),
-            severity: LspSeverity::Error,
-            message: "standing error".into(),
-            source: None,
-            code: None,
+        let diagnostic = |line| {
+            LspDiagnostic::new(
+                LspRange::new(LspPosition::new(line, 0), LspPosition::new(line, 3)),
+                LspSeverity::Error,
+                "standing error".into(),
+                None,
+                None,
+            )
         };
         let publish = |version, line| {
             Message::Lsp(
