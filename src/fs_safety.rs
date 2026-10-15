@@ -182,7 +182,13 @@ pub enum ResolveError {
 
 impl ResolveError {
     pub fn is_already_exists(&self) -> bool {
-        matches!(self, Self::Io { already_exists: true, .. })
+        matches!(
+            self,
+            Self::Io {
+                already_exists: true,
+                ..
+            }
+        )
     }
     /// The path the failure is about.
     #[must_use]
@@ -415,7 +421,8 @@ pub fn directory_entries_beneath(
     limit: usize,
 ) -> Result<Vec<OsString>, ResolveError> {
     let directory = if relative.as_os_str().is_empty() {
-        root.try_clone().map_err(|error| ResolveError::io(root.path(), &error))?
+        root.try_clone()
+            .map_err(|error| ResolveError::io(root.path(), &error))?
     } else {
         resolve_directory(root, relative)?
     };
@@ -426,9 +433,16 @@ pub fn directory_entries_beneath(
     let mut names = Vec::new();
     for entry in entries {
         if names.len() == limit {
-            return Err(ResolveError::message(directory.path(), "directory entry limit exceeded"));
+            return Err(ResolveError::message(
+                directory.path(),
+                "directory entry limit exceeded",
+            ));
         }
-        names.push(entry.map_err(|error| ResolveError::io(directory.path(), &error))?.file_name());
+        names.push(
+            entry
+                .map_err(|error| ResolveError::io(directory.path(), &error))?
+                .file_name(),
+        );
     }
     Ok(names)
 }
