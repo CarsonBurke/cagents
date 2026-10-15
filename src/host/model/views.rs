@@ -447,8 +447,7 @@ pub(super) fn apply(
 }
 
 impl Registry {
-    pub(crate) const VIEW_SOURCE_CONFLICT: &'static str =
-        "The pane source changed; refuse stale source intent and rebase presentation on the current pane";
+    pub(crate) const VIEW_SOURCE_CONFLICT: &'static str = "The pane source changed; refuse stale source intent and rebase presentation on the current pane";
 
     pub(crate) fn view_change_refusal(
         &self,
@@ -718,7 +717,10 @@ mod tests {
                 host_incarnation: crate::model::HostIncarnation::new("host"),
             },
         };
-        Pane { kind: CardKind::Terminal(terminal), ..pane() }
+        Pane {
+            kind: CardKind::Terminal(terminal),
+            ..pane()
+        }
     }
 
     #[test]
@@ -733,9 +735,14 @@ mod tests {
             }
             requested.title = "independent title".into();
             requested.width_fraction = 0.7;
-            let mut delayed = edit(&mut registry, channel, Change::Update {
-                before: original.clone(), pane: requested,
-            });
+            let mut delayed = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original.clone(),
+                    pane: requested,
+                },
+            );
             let operation = match &delayed {
                 ModelEdit::ChangeView { operation, .. } => *operation,
                 _ => unreachable!(),
@@ -744,26 +751,41 @@ mod tests {
             let mut writer = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
             let mut current = original.clone();
             match advance {
-                0 => if let CardKind::Terminal(terminal) = &mut current.kind {
-                    terminal.id = crate::model::TerminalId::new();
-                },
-                1 => if let CardKind::Terminal(terminal) = &mut current.kind {
-                    terminal.transcript_path = Some("/repo/new-transcript".into());
-                },
+                0 => {
+                    if let CardKind::Terminal(terminal) = &mut current.kind {
+                        terminal.id = crate::model::TerminalId::new();
+                    }
+                }
+                1 => {
+                    if let CardKind::Terminal(terminal) = &mut current.kind {
+                        terminal.transcript_path = Some("/repo/new-transcript".into());
+                    }
+                }
                 2 => current.pending_terminal_start = true,
                 3 => current.scope = Some("/repo/new-location".into()),
                 _ => unreachable!(),
             }
-            let advance = edit(&mut writer, channel, Change::Update {
-                before: original.clone(), pane: current.clone(),
-            });
+            let advance = edit(
+                &mut writer,
+                channel,
+                Change::Update {
+                    before: original.clone(),
+                    pane: current.clone(),
+                },
+            );
             writer.apply(&advance).unwrap();
             // An otherwise valid revision refresh cannot authorize stale source intent.
-            if let ModelEdit::ChangeView { expected_revision, .. } = &mut delayed {
+            if let ModelEdit::ChangeView {
+                expected_revision, ..
+            } = &mut delayed
+            {
                 *expected_revision = registry.view_revision(&Scope::Channel(channel)).unwrap();
             }
             let before = registry.model().unwrap();
-            assert_eq!(registry.apply(&delayed).unwrap_err(), Registry::VIEW_SOURCE_CONFLICT);
+            assert_eq!(
+                registry.apply(&delayed).unwrap_err(),
+                Registry::VIEW_SOURCE_CONFLICT
+            );
             assert_eq!(registry.model().unwrap(), before);
             assert!(!registry.view_operation_seen(operation).unwrap());
             drop(registry);
@@ -773,13 +795,21 @@ mod tests {
             let mut presentation = original.clone();
             presentation.title = "independent title".into();
             presentation.width_fraction = 0.7;
-            let presentation = edit(&mut registry, channel, Change::Update {
-                before: original, pane: presentation,
-            });
+            let presentation = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original,
+                    pane: presentation,
+                },
+            );
             registry.apply(&presentation).unwrap();
             current.title = "independent title".into();
             current.width_fraction = 0.7;
-            assert_eq!(read(&registry.db, &Scope::Channel(channel)).unwrap().panes, vec![current]);
+            assert_eq!(
+                read(&registry.db, &Scope::Channel(channel)).unwrap().panes,
+                vec![current]
+            );
         }
     }
 
@@ -787,34 +817,57 @@ mod tests {
     fn source_update_fence_preserves_new_confirmed_chat_thread() {
         let (mut registry, _, channel, _) = setup();
         let mut original = live_source_pane();
-        let CardKind::Terminal(terminal) = original.kind else { unreachable!() };
+        let CardKind::Terminal(terminal) = original.kind else {
+            unreachable!()
+        };
         original.kind = CardKind::Chat(crate::chat::Session {
             id: terminal.id,
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,
-                recipe: terminal.launch.clone(), session_id: Some("thread-one".into()),
+                recipe: terminal.launch.clone(),
+                session_id: Some("thread-one".into()),
             },
-            proof: terminal.continuity.live_proof(), terminal: None,
-            owned_codex_listener: None, native_continuity: Default::default(),
+            proof: terminal.continuity.live_proof(),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
         });
         seed(&mut registry, channel, vec![original.clone()]);
         let mut delayed = original.clone();
-        if let CardKind::Chat(chat) = &mut delayed.kind { chat.terminal = Some(terminal); }
+        if let CardKind::Chat(chat) = &mut delayed.kind {
+            chat.terminal = Some(terminal);
+        }
         let mut current = original.clone();
         if let CardKind::Chat(chat) = &mut current.kind {
             chat.launch.session_id = Some("thread-two".into());
         }
-        let confirmed = edit(&mut registry, channel, Change::Update {
-            before: original.clone(), pane: current.clone(),
-        });
+        let confirmed = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original.clone(),
+                pane: current.clone(),
+            },
+        );
         registry.apply(&confirmed).unwrap();
-        let delayed = edit(&mut registry, channel, Change::Update {
-            before: original, pane: delayed,
-        });
+        let delayed = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original,
+                pane: delayed,
+            },
+        );
         let before = registry.model().unwrap();
-        assert_eq!(registry.apply(&delayed).unwrap_err(), Registry::VIEW_SOURCE_CONFLICT);
+        assert_eq!(
+            registry.apply(&delayed).unwrap_err(),
+            Registry::VIEW_SOURCE_CONFLICT
+        );
         assert_eq!(registry.model().unwrap(), before);
-        assert_eq!(read(&registry.db, &Scope::Channel(channel)).unwrap().panes, vec![current]);
+        assert_eq!(
+            read(&registry.db, &Scope::Channel(channel)).unwrap().panes,
+            vec![current]
+        );
     }
 
     #[test]
@@ -827,16 +880,34 @@ mod tests {
             if let CardKind::Terminal(terminal) = &mut successor.kind {
                 terminal.id = crate::model::TerminalId::new();
             }
-            let replace = edit(&mut registry, channel, Change::Update {
-                before: original.clone(), pane: successor,
-            });
+            let replace = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original.clone(),
+                    pane: successor,
+                },
+            );
             registry.apply(&replace).unwrap();
             let mut stale = original.clone();
-            if pending { stale.pending_terminal_start = true; }
-            else { stale.scope = Some("/repo/old-location".into()); }
-            let stale = edit(&mut registry, channel, Change::Update { before: original, pane: stale });
+            if pending {
+                stale.pending_terminal_start = true;
+            } else {
+                stale.scope = Some("/repo/old-location".into());
+            }
+            let stale = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original,
+                    pane: stale,
+                },
+            );
             let before = registry.model().unwrap();
-            assert_eq!(registry.apply(&stale).unwrap_err(), Registry::VIEW_SOURCE_CONFLICT);
+            assert_eq!(
+                registry.apply(&stale).unwrap_err(),
+                Registry::VIEW_SOURCE_CONFLICT
+            );
             assert_eq!(registry.model().unwrap(), before);
         }
     }
@@ -849,14 +920,23 @@ mod tests {
         let mut ended = original.clone();
         if let CardKind::Terminal(terminal) = &mut ended.kind {
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
-                recipe: terminal.launch.clone(), last_exit: None,
+                recipe: terminal.launch.clone(),
+                last_exit: None,
             };
         }
-        let change = edit(&mut registry, channel, Change::Update {
-            before: original, pane: ended.clone(),
-        });
+        let change = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original,
+                pane: ended.clone(),
+            },
+        );
         registry.apply(&change).unwrap();
-        assert_eq!(read(&registry.db, &Scope::Channel(channel)).unwrap().panes, vec![ended]);
+        assert_eq!(
+            read(&registry.db, &Scope::Channel(channel)).unwrap().panes,
+            vec![ended]
+        );
         let committed = registry.model().unwrap();
         drop(registry);
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
