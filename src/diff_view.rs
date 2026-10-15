@@ -54,6 +54,8 @@ pub struct DiffModel {
     pub line_counts: [usize; 2],
     /// Exact source baseline, including original line endings and final newline.
     pub before: Arc<str>,
+    /// Exact new-side source, retained for patch and selection operations.
+    pub after: Arc<str>,
     pub inline_rows: Vec<InlineDiffRow>,
     pub split_rows: Vec<SplitDiffRow>,
     pub inline_change_starts: Vec<usize>,
@@ -523,8 +525,23 @@ pub fn build_document_diff(
     cancellation: &CancellationToken,
 ) -> Option<DiffModel> {
     check_cancelled(cancellation).ok()?;
+    build_document_diff_with_options(before, after, path, theme, false, cancellation)
+}
+
+/// Compare original source lines while optionally ignoring horizontal whitespace.
+/// Normalization changes line identities only; rendered text and line numbers
+/// always refer to the original sources.
+pub fn build_document_diff_with_options(
+    before: impl Into<Arc<str>>,
+    after: &str,
+    path: &Path,
+    theme: crate::settings::EditorSyntaxTheme,
+    ignore_whitespace: bool,
+    cancellation: &CancellationToken,
+) -> Option<DiffModel> {
+    check_cancelled(cancellation).ok()?;
     let before = before.into();
-    let mut model = build_diff_rows(&before, after, cancellation).ok()?;
+    let mut model = build_diff_rows_with_options(&before, after, ignore_whitespace, cancellation).ok()?;
     model.syntax = highlight_comparison(&before, after, path, theme, cancellation).ok()?;
     measure_diff(&mut model, cancellation).ok()?;
     check_cancelled(cancellation).ok()?;
@@ -728,6 +745,25 @@ impl DiffModel {
         }
     }
 
+    /// New-side source line nearest a logical row, including deleted rows.
+    pub fn new_line_at_row(&self, mode: DiffMode, row: usize) -> Option<u32> {
+        fn nearest(lines: impl DoubleEndedIterator<Item = Option<u32>> + Clone, row: usize) -> Option<u32> {
+            lines.clone().skip(row).flatten().next()
+                .or_else(|| lines.take(row.saturating_add(1)).flatten().last())
+        }
+        match mode {
+            DiffMode::Inline => nearest(self.inline_rows.iter().map(|row| row.new_line), row),
+            DiffMode::Split => nearest(self.split_rows.iter().map(|row| row.new_line), row),
+        }
+    }
+
+    pub fn row_at_new_line(&self, mode: DiffMode, line: u32) -> Option<usize> {
+        match mode {
+            DiffMode::Inline => self.inline_rows.iter().position(|row| row.new_line.is_some_and(|n| n >= line)),
+            DiffMode::Split => self.split_rows.iter().position(|row| row.new_line.is_some_and(|n| n >= line)),
+        }.or_else(|| self.row_count(mode).checked_sub(1))
+    }
+
     /// The syntax theme this model's spans were coloured with, so a cached
     /// model can be rebuilt when the user changes the setting.
     #[must_use]
@@ -780,6 +816,16 @@ impl RenderedDiff {
         theme: crate::settings::EditorSyntaxTheme,
         cancellation: &CancellationToken,
     ) -> Self {
+        Self::from_content_with_options(content, path, theme, false, cancellation)
+    }
+
+    pub fn from_content_with_options(
+        content: DiffContent,
+        path: &Path,
+        theme: crate::settings::EditorSyntaxTheme,
+        ignore_whitespace: bool,
+        cancellation: &CancellationToken,
+    ) -> Self {
         if cancellation.is_cancelled() {
             return Self::Error("repository operation cancelled".into());
         }
@@ -798,11 +844,12 @@ impl RenderedDiff {
                         new_label,
                     });
                 }
-                let model = match build_document_diff(
+                let model = match build_document_diff_with_options(
                     old.text().unwrap_or_default(),
                     new.text().unwrap_or_default(),
                     path,
                     theme,
+                    ignore_whitespace,
                     cancellation,
                 ) {
                     Some(model) => model,
@@ -838,6 +885,18 @@ pub fn load_repository_diff(
     theme: crate::settings::EditorSyntaxTheme,
     cancellation: &CancellationToken,
 ) -> RenderedDiff {
+    load_repository_diff_with_options(worktree, relative_path, basis, previous_path, theme, false, cancellation)
+}
+
+pub fn load_repository_diff_with_options(
+    worktree: &Path,
+    relative_path: &Path,
+    basis: &DiffBasis,
+    previous_path: Option<&Path>,
+    theme: crate::settings::EditorSyntaxTheme,
+    ignore_whitespace: bool,
+    cancellation: &CancellationToken,
+) -> RenderedDiff {
     // `RepoPath` *is* the path validation: it rejects an absolute path, `.`,
     // `..`, an empty component and an interior NUL, which is what makes the
     // pathspec safe to hand to Git.
@@ -856,7 +915,7 @@ pub fn load_repository_diff(
         old_path,
     };
     match RepositoryService::system("git").diff(&request, cancellation) {
-        Ok(content) => RenderedDiff::from_content(content, relative_path, theme, cancellation),
+        Ok(content) => RenderedDiff::from_content_with_options(content, relative_path, theme, ignore_whitespace, cancellation),
         Err(error) => RenderedDiff::Error(error.to_string()),
     }
 }
@@ -875,6 +934,15 @@ fn build_diff_rows(
     after: &str,
     cancellation: &CancellationToken,
 ) -> Result<DiffModel, Cancelled> {
+    build_diff_rows_with_options(before, after, false, cancellation)
+}
+
+fn build_diff_rows_with_options(
+    before: &Arc<str>,
+    after: &str,
+    ignore_whitespace: bool,
+    cancellation: &CancellationToken,
+) -> Result<DiffModel, Cancelled> {
     check_cancelled(cancellation)?;
     if before.as_ref() == after {
         // Keep every context row, but skip interning and line diffing entirely.
@@ -889,6 +957,7 @@ fn build_diff_rows(
         let mut model = DiffModel {
             line_counts: [lines.len(); 2],
             before: Arc::clone(before),
+            after: Arc::from(after),
             inline_rows: Vec::with_capacity(lines.len()),
             split_rows: Vec::with_capacity(lines.len()),
             inline_change_starts: Vec::new(),
@@ -916,29 +985,24 @@ fn build_diff_rows(
         check_cancelled(cancellation)?;
         return Ok(model);
     }
-    let input = InternedInput::new(before.as_ref(), after);
+    let normalized;
+    let (old_tokens, new_tokens) = if ignore_whitespace {
+        // Retain line separators and final-newline identity. Do not join lines.
+        let normalize = |text: &str| text.chars().filter(|ch| *ch == '\n' || !ch.is_whitespace()).collect::<String>();
+        normalized = (normalize(before), normalize(after));
+        (normalized.0.as_str(), normalized.1.as_str())
+    } else {
+        (before.as_ref(), after)
+    };
+    let input = InternedInput::new(old_tokens, new_tokens);
     check_cancelled(cancellation)?;
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     check_cancelled(cancellation)?;
     diff.postprocess_lines(&input);
     check_cancelled(cancellation)?;
 
-    let before_lines = input
-        .before
-        .iter()
-        .map(|token| {
-            check_cancelled(cancellation)?;
-            Ok(display_line(input.interner[*token]))
-        })
-        .collect::<Result<Vec<_>, Cancelled>>()?;
-    let after_lines = input
-        .after
-        .iter()
-        .map(|token| {
-            check_cancelled(cancellation)?;
-            Ok(display_line(input.interner[*token]))
-        })
-        .collect::<Result<Vec<_>, Cancelled>>()?;
+    let before_lines = before.split_inclusive('\n').map(display_line).collect::<Vec<_>>();
+    let after_lines = after.split_inclusive('\n').map(display_line).collect::<Vec<_>>();
     let mut inline_rows = Vec::new();
     let mut split_rows = Vec::new();
     let mut inline_change_starts = Vec::new();
@@ -1092,6 +1156,7 @@ fn build_diff_rows(
     Ok(DiffModel {
         line_counts: [before_lines.len(), after_lines.len()],
         before: Arc::clone(before),
+        after: Arc::from(after),
         inline_rows,
         split_rows,
         inline_change_starts,
@@ -1104,8 +1169,8 @@ fn build_diff_rows(
     })
 }
 
-pub(crate) const DIFF_FONT_SIZE: f32 = 13.0;
-pub(crate) const DIFF_LINE_HEIGHT: f32 = 24.0;
+pub(crate) const DIFF_FONT_SIZE: f32 = 14.0;
+pub(crate) const DIFF_LINE_HEIGHT: f32 = 21.0;
 
 /// Use the same native paragraph, advanced shaping, font and no-wrap policy as
 /// Rich text. Character counts are not pixel advances: combining marks, tabs,
@@ -1209,6 +1274,43 @@ pub(crate) fn line_spans<'a>(
 /// allowing leading insertions/deletions without shifting every intraline pair.
 /// Oversized or exhausted hunks conservatively remain whole-line changes.
 fn replacement_matches(
+    before: &[DisplayLine<'_>],
+    after: &[DisplayLine<'_>],
+    budget: &mut usize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<(usize, usize)>, Cancelled> {
+    // Stable trim-equal anchors partition a reindent into tiny replacement
+    // windows. This retains the matrix bound without dropping word highlights
+    // on the one substantive edit in a very large reindented block.
+    let mut anchors = InternedInput::default();
+    anchors.update_before(before.iter().map(|line| line.text.trim()));
+    anchors.update_after(after.iter().map(|line| line.text.trim()));
+    let alignment = Diff::compute(Algorithm::Histogram, &anchors);
+    let mut matches = Vec::new();
+    let (mut old, mut new) = (0usize, 0usize);
+    for hunk in alignment.hunks() {
+        check_cancelled(cancellation)?;
+        while old < hunk.before.start as usize && new < hunk.after.start as usize {
+            matches.push((old, new));
+            old += 1;
+            new += 1;
+        }
+        let old_end = hunk.before.end as usize;
+        let new_end = hunk.after.end as usize;
+        matches.extend(weighted_replacement_matches(&before[old..old_end], &after[new..new_end], budget, cancellation)?.into_iter().map(|(a,b)| (old+a,new+b)));
+        old = old_end;
+        new = new_end;
+    }
+    while old < before.len() && new < after.len() {
+        check_cancelled(cancellation)?;
+        matches.push((old, new));
+        old += 1;
+        new += 1;
+    }
+    Ok(matches)
+}
+
+fn weighted_replacement_matches(
     before: &[DisplayLine<'_>],
     after: &[DisplayLine<'_>],
     budget: &mut usize,
@@ -1419,7 +1521,7 @@ fn append_context(
         inline.push(InlineDiffRow {
             old_line: Some(old_line as u32),
             new_line: Some(new_line as u32),
-            text: text.clone(),
+            text: after[*new_cursor].text.to_owned(),
             kind: DiffRowKind::Context,
             changed: Vec::new(),
         });
@@ -1503,6 +1605,46 @@ fn display_line(line: &str) -> DisplayLine<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whitespace_normalization_keeps_source_text_and_real_changes() {
+        let token = super::CancellationToken::new();
+        let before = std::sync::Arc::from("fn main() {\n    let answer = 42;\n}\n");
+        let after = "fn main() {\n\tlet answer = 42;  \n}\n";
+        let plain = super::build_diff_rows_with_options(&before, after, false, &token).unwrap();
+        let ignored = super::build_diff_rows_with_options(&before, after, true, &token).unwrap();
+        assert!(!plain.is_empty());
+        assert!(ignored.is_empty());
+        assert_eq!(ignored.before.as_ref(), before.as_ref());
+        assert_eq!(ignored.after.as_ref(), after);
+        assert_eq!(ignored.split_rows[1].new_text.as_deref(), Some("\tlet answer = 42;  "));
+        let real = super::build_diff_rows_with_options(&before, &after.replace("42", "43"), true, &token).unwrap();
+        assert_eq!((real.additions, real.deletions), (1, 1));
+        let new_line = super::build_diff_rows_with_options(&before, &format!("{after}\n"), true, &token).unwrap();
+        assert_eq!(new_line.additions, 1, "normalization preserves line separators");
+    }
+
+    #[test]
+    fn large_reindent_keeps_word_pairing_for_the_real_edit() {
+        let before = (0..180).map(|i| format!("    let value_{i} = {i};\n")).collect::<String>();
+        let after = before.replace("    ", "\t").replace("value_90 = 90", "value_90 = 900");
+        let model = super::build_diff_rows(&std::sync::Arc::from(before), &after, &super::CancellationToken::new()).unwrap();
+        let row = model.split_rows.iter().find(|row| row.new_line == Some(91)).unwrap();
+        let changed = row.new_changed.iter().map(|range| &row.new_text.as_ref().unwrap()[range.clone()]).collect::<Vec<_>>();
+        assert!(changed.contains(&"900"), "substantive edit must have a word highlight: {changed:?}");
+        assert!(!row.new_changed.contains(&(0..row.new_text.as_ref().unwrap().len())));
+    }
+
+    #[test]
+    fn diff_source_mapping_survives_deleted_rows_and_both_layouts() {
+        let model = super::build_diff("one\ndeleted\ntwo\n", "one\ntwo\n");
+        for mode in [super::DiffMode::Inline, super::DiffMode::Split] {
+            let second = model.row_at_new_line(mode, 2).unwrap();
+            assert_eq!(model.new_line_at_row(mode, second), Some(2));
+            assert_eq!(model.new_line_at_row(mode, 1), Some(2));
+            assert_eq!(model.new_line_at_row(mode, usize::MAX), Some(2));
+        }
+    }
+
     use std::{fs, path::PathBuf, process::Command};
 
     use tempfile::tempdir;

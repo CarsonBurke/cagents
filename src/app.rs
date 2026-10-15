@@ -6047,6 +6047,7 @@ impl Cagents {
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
+        runtime.set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
         PullRequestPane {
             repository: view.repository.clone(),
             review: pull_request_review::State::new(
@@ -6771,6 +6772,7 @@ impl Cagents {
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
+        runtime.set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
         if let Some(navigation) = self.durable.repository_navigation.get(&card) {
             runtime.restore_navigation(navigation);
@@ -13853,6 +13855,13 @@ impl Application for Cagents {
                 };
                 path.map_or_else(Task::none, |path| self.open_file_in_editor(path, editor_id))
             }
+            Message::Repository(RepositoryAction::RevertFile { card }) => {
+                if self.modal_is_open() { return Task::none(); }
+                let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return Task::none(); };
+                let Some(source) = self.sidebar_model.source_control.as_ref().filter(|source| source.key.canonical_path == runtime.descriptor.worktree) else { return Task::none(); };
+                let Some(request) = runtime.selected_discard_request() else { return Task::none(); };
+                self.update(Message::Sidebar(SidebarAction::RequestDiscard { key: source.key.clone(), request }))
+            }
             Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
                 if self.modal_is_open() {
                     return Task::none();
@@ -13895,6 +13904,22 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::Review { card, action }) => {
                 self.handle_pull_request_review(card, action)
+            }
+            Message::Repository(RepositoryAction::ToggleDiffWhitespace { .. }) => {
+                self.settings.diff_ignore_whitespace = !self.settings.diff_ignore_whitespace;
+                let enabled = self.settings.diff_ignore_whitespace;
+                let mut tasks = Vec::new();
+                for (&card, runtime) in self.cards.iter_mut() {
+                    let runtime = match runtime {
+                        CardRuntime::Repository(runtime) => runtime,
+                        CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                        _ => continue,
+                    };
+                    runtime.set_diff_ignore_whitespace(enabled);
+                    tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
+                }
+                tasks.push(self.save_settings_task(false));
+                Task::batch(tasks)
             }
             Message::Repository(RepositoryAction::ZoomFont { card, delta }) => {
                 self.update(Message::ZoomFont {
@@ -15957,6 +15982,18 @@ impl Application for Cagents {
                 }
                 if !captured && let Some(task) = self.chat_scroll_key(&event) {
                     return task;
+                }
+                if !captured
+                    && let keyboard::Event::KeyPressed { key, physical_key, modifiers, .. } = &event
+                    && let Some(card) = self.workspace.focused()
+                    && match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => runtime.shows_diff(),
+                        Some(CardRuntime::PullRequests(pane)) => pane.runtime.shows_diff(),
+                        _ => false,
+                    }
+                    && let Some(delta) = crate::interaction::font_zoom_chord(key, *physical_key, *modifiers)
+                {
+                    return self.update(Message::ZoomFont { card, delta, editor: true });
                 }
                 if is_save_press(&event)
                     && let Some(card) = self.workspace.focused()
