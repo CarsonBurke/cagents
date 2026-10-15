@@ -266,7 +266,9 @@ impl Holding {
     }
 }
 
-pub(super) fn full_version(metadata: &fs::Metadata) -> ((u64, u64, u64, i64, i64, i64, i64), u32, u32, u32) {
+pub(super) fn full_version(
+    metadata: &fs::Metadata,
+) -> ((u64, u64, u64, i64, i64, i64, i64), u32, u32, u32) {
     (
         metadata_version(metadata),
         metadata.mode(),
