@@ -150,6 +150,34 @@ fn panel_invalidation(
     })
 }
 
+/// Index changes from an active queue wait for its final refresh. Sibling
+/// worktrees continue to update while a hook or network command is running.
+fn defer_mutating_worktrees(
+    change: &mut git_watch::Change,
+    blocked: &HashSet<WorktreeId>,
+) -> git_watch::Change {
+    let paths = change
+        .worktrees
+        .intersection(blocked)
+        .copied()
+        .collect::<HashSet<_>>();
+    if !blocked.is_empty()
+        && (change.topology || (!paths.is_empty() && paths.len() == change.worktrees.len()))
+    {
+        return std::mem::take(change);
+    }
+    if paths.is_empty() {
+        return git_watch::Change::default();
+    }
+    change.worktrees.retain(|path| !paths.contains(path));
+    git_watch::Change {
+        worktrees: paths,
+        metadata: change.metadata,
+        membership: change.membership,
+        ..git_watch::Change::default()
+    }
+}
+
 impl Cagents {
     pub(super) fn observe_git_repository(
         &mut self,
@@ -569,8 +597,13 @@ impl Cagents {
         }
     }
 
-    fn start_git_reads(&mut self) -> Task<Message> {
+    pub(super) fn start_git_reads(&mut self) -> Task<Message> {
         self.prioritize_git_watches();
+        let mutating = self
+            .source_control_mutations
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         let state = &mut self.refresh_ui.git;
         let mut running = state
             .entries
@@ -591,7 +624,22 @@ impl Cagents {
                 state.queue.push_back(project);
                 continue;
             }
-            let change = std::mem::take(&mut entry.pending);
+            let mut change = std::mem::take(&mut entry.pending);
+            let blocked = entry
+                .snapshot
+                .worktrees
+                .iter()
+                .filter(|(record, _)| mutating.contains(&record.path))
+                .map(|(record, _)| record.id)
+                .collect::<HashSet<_>>();
+            let deferred = defer_mutating_worktrees(&mut change, &blocked);
+            if deferred.topology || deferred.membership || !deferred.worktrees.is_empty() {
+                entry.pending.merge(deferred);
+                state.queue.push_back(project);
+            }
+            if !change.topology && !change.membership && change.worktrees.is_empty() {
+                continue;
+            }
             entry.read_full_scan = change.topology;
             let snapshot = entry.snapshot.clone();
             let plan = entry.plan.clone();
@@ -1611,5 +1659,36 @@ mod tests {
             state.entries[&project].read_failure.is_some(),
             "another project reconfiguring watches cannot settle a failed Git read"
         );
+    }
+    #[test]
+    fn mutation_deferral_preserves_sibling_reads_and_the_final_pending_change() {
+        let active = WorktreeId(Uuid::from_u128(501));
+        let sibling = WorktreeId(Uuid::from_u128(502));
+        let mut change = git_watch::Change {
+            worktrees: HashSet::from([active, sibling]),
+            metadata: true,
+            membership: true,
+            ..Default::default()
+        };
+        let deferred = defer_mutating_worktrees(&mut change, &HashSet::from([active]));
+        assert_eq!(change.worktrees, HashSet::from([sibling]));
+        assert_eq!(deferred.worktrees, HashSet::from([active]));
+        assert!(deferred.metadata && deferred.membership);
+        let mut pending = deferred;
+        let again = defer_mutating_worktrees(&mut pending, &HashSet::from([active]));
+        assert!(pending.worktrees.is_empty() && !pending.membership);
+        pending.merge(again);
+        assert!(
+            defer_mutating_worktrees(&mut pending, &HashSet::new())
+                .worktrees
+                .is_empty()
+        );
+        assert_eq!(pending.worktrees, HashSet::from([active]));
+        let mut topology = git_watch::Change {
+            topology: true,
+            ..Default::default()
+        };
+        assert!(defer_mutating_worktrees(&mut topology, &HashSet::from([active])).topology);
+        assert!(!topology.topology);
     }
 }
