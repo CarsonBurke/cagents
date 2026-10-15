@@ -327,7 +327,7 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     let id=launch.id;
     start_execution(&host,0,launch,Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap())).unwrap();
     let handle=host.lock().unwrap().chats[&id].handle.clone();
-    wait_until(||handle.wait_ready(Instant::now()+Duration::from_millis(50),||false).is_ok(),"actor never initialized");
+    wait_until(||handle.attachment_snapshot().ready,"actor never initialized");
     let identity=handle.actor_identity().unwrap();
     struct Cleanup(crate::daemon::holder_registry::Record);
     impl Drop for Cleanup {fn drop(&mut self) {for process in [&self.0.root,&self.0.holder] {if process.is_current() {unsafe {libc::kill(process.pid,libc::SIGKILL);}}}}}
@@ -348,15 +348,14 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     restore_orphaned_native(&successor,&[]).unwrap();
     let handle=successor.lock().unwrap().chats[&id].handle.clone();
     assert_eq!(handle.actor_identity(),Some(identity.clone()));
-    let ServerResponse::ChatAttached {session:replacement,snapshot}=session_snapshot(&successor.lock().unwrap().chats[&id]) else {unreachable!()};
+    let ServerResponse::ChatAttached {session:replacement,..}=session_snapshot(&successor.lock().unwrap().chats[&id]) else {unreachable!()};
     assert!(replacement.launch.session_id.is_none());
     assert_ne!(source.proof,replacement.proof);
-    // The real client socket contract is tested separately; this receipt is
-    // backed here by actual authenticated execed-helper adoption above.
-    let client=chat::client::ClientHandle::fixture_upgrade(source.clone(),replacement.clone(),snapshot);
-    let (issued,confirmed)=client.upgrade_recovery().unwrap();
-    storage.rebind_chat_upgrade(pane,issued,confirmed).unwrap();
-    drop(client);drop(storage);
+    // The UI-only real client socket contract is tested separately. This
+    // writer receipt is backed by authenticated execed-helper adoption above.
+    assert!(chat::is_unnamed_retained_claude_recovery(&source,&replacement));
+    storage.rebind_chat_upgrade(pane,&source,&replacement).unwrap();
+    drop(storage);
     let reopened=crate::persistence::StateStore::open(&storage_path,replacement.proof.as_ref().unwrap().boot_id.clone()).unwrap();
     assert_eq!(reopened.load_card(pane,None).unwrap().unwrap().kind,crate::model::CardKind::Chat(replacement.clone()));
     assert!(!root.join("prompts").exists(),"no accepted input may be replayed or synthesized");
