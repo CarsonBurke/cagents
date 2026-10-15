@@ -170,7 +170,7 @@ impl HostState {
             .flat_map(|clients| clients.iter())
             .filter(|(client, visibility)| {
                 **visibility == TerminalVisibility::Visible
-                    && self.subscription_current(**client,id)
+                    && self.subscription_current(**client, id)
                     && self
                         .subscriptions
                         .viewports
@@ -187,18 +187,23 @@ impl HostState {
         let owner = owner
             .or_else(|| {
                 previous.filter(|client| {
-                    self.subscription_current(*client,id) && self.subscriptions
-                        .by_client
-                        .get(client)
-                        .and_then(|terminals| terminals.get(&id))
-                        == Some(&TerminalVisibility::Visible)
+                    self.subscription_current(*client, id)
+                        && self
+                            .subscriptions
+                            .by_client
+                            .get(client)
+                            .and_then(|terminals| terminals.get(&id))
+                            == Some(&TerminalVisibility::Visible)
                 })
             })
             .or_else(|| {
                 self.subscriptions.by_terminal.get(&id).and_then(|clients| {
                     clients
                         .iter()
-                        .find(|(client, visible)| **visible == TerminalVisibility::Visible && self.subscription_current(**client,id))
+                        .find(|(client, visible)| {
+                            **visible == TerminalVisibility::Visible
+                                && self.subscription_current(**client, id)
+                        })
                         .map(|(client, _)| *client)
                 })
             });
@@ -281,10 +286,13 @@ pub(in crate::host) fn snapshot(
                 ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
             })?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let current=state.attached_terminal(client,id)?;
+        let current = state.attached_terminal(client, id)?;
         if !current.handle.same_worker(&handle) {
-            return Err(ProtocolError::new(ProtocolErrorCode::ProofMismatch,
-                "The terminal worker changed during capture; rediscover its attachment",false));
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ProofMismatch,
+                "The terminal worker changed during capture; rediscover its attachment",
+                false,
+            ));
         }
         let source = capture.generation;
         let revision = state.presentation_observed(client, id, source);

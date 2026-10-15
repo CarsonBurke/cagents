@@ -98,7 +98,7 @@ enum Request {
         #[serde(default)]
         anchored_directory: bool,
         #[serde(default)]
-        setup_lease_identity: Option<(u64,u64)>,
+        setup_lease_identity: Option<(u64, u64)>,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -187,7 +187,9 @@ pub(super) fn spawn(
 }
 
 fn validate_execution_directory(directory: &File) -> Result<(), String> {
-    let metadata = directory.metadata().map_err(|error| format!("inspect terminal working directory: {error}"))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| format!("inspect terminal working directory: {error}"))?;
     if !metadata.is_dir() || metadata.nlink() == 0 {
         return Err("The terminal's verified working directory is no longer available".into());
     }
@@ -204,9 +206,12 @@ pub(super) fn spawn_recoverable(
 }
 
 pub(super) fn spawn_recoverable_with_setup_lease(
-    command: CommandBuilder, size: PtySize, exits: Sender<ChildExit>, recovery: Option<Recovery>,
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
     setup_lease: Option<std::sync::Arc<File>>,
-) -> Result<Held,String> {
+) -> Result<Held, String> {
     spawn_recoverable_with_authority(command, size, exits, recovery, None, setup_lease)
 }
 
@@ -220,25 +225,39 @@ pub(super) fn spawn_recoverable_at_directory(
     spawn_recoverable_with_authority(command, size, exits, recovery, directory, None)
 }
 
-fn setup_lease_identity(file: &File) -> Result<(u64,u64), String> {
+fn setup_lease_identity(file: &File) -> Result<(u64, u64), String> {
     let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_file() || metadata.uid() != unsafe {libc::geteuid()} || metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+    {
         return Err("Invalid setup execution lease descriptor".into());
     }
-    if unsafe {libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)} != 0 {
-        return Err(format!("Setup execution lease is unavailable: {}", io::Error::last_os_error()));
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "Setup execution lease is unavailable: {}",
+            io::Error::last_os_error()
+        ));
     }
     Ok((metadata.dev(), metadata.ino()))
 }
 
 pub(super) fn spawn_recoverable_with_authority(
-    command: CommandBuilder, size: PtySize, exits: Sender<ChildExit>, recovery: Option<Recovery>,
-    directory: Option<std::sync::Arc<File>>, setup_lease: Option<std::sync::Arc<File>>,
-) -> Result<Held,String> {
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    directory: Option<std::sync::Arc<File>>,
+    setup_lease: Option<std::sync::Arc<File>>,
+) -> Result<Held, String> {
     if let Some(directory) = &directory {
         validate_execution_directory(directory)?;
     }
-    let setup_lease_identity = setup_lease.as_ref().map(|file| setup_lease_identity(file)).transpose()?;
+    let setup_lease_identity = setup_lease
+        .as_ref()
+        .map(|file| setup_lease_identity(file))
+        .transpose()?;
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
     std::hint::black_box(&SERVE);
@@ -277,10 +296,14 @@ pub(super) fn spawn_recoverable_with_authority(
             // Explicit new-helper admission can retry only original children
             // whose existing descriptors still validate. Unknown owners stay
             // suspended; no replacement pidfd is opened by a remembered PID.
-            let recovered = crate::daemon::child_reaper::retry_preserved()
-                .map_err(|reason| format!("Terminal helper cleanup remains unavailable: {reason}"))?;
+            let recovered = crate::daemon::child_reaper::retry_preserved().map_err(|reason| {
+                format!("Terminal helper cleanup remains unavailable: {reason}")
+            })?;
             if recovered.retained != 0 {
-                return Err(format!("{} original terminal helper owner(s) remain unconfirmed; retain their state and restart the daemon to recover", recovered.retained));
+                return Err(format!(
+                    "{} original terminal helper owner(s) remain unconfirmed; retain their state and restart the daemon to recover",
+                    recovered.retained
+                ));
             }
             crate::daemon::child_reaper::reserve()
                 .map_err(|reason| format!("Reserve terminal holder cleanup: {reason}"))?
@@ -293,7 +316,13 @@ pub(super) fn spawn_recoverable_with_authority(
     drop(remote);
     // The holder is this daemon's unreaped child until `Holder` reaps it.
     let pidfd = open_pidfd(process.id() as libc::pid_t);
-    let mut holder = Holder::new(control, Some(OwnedChild { child: process, reservation: child_reaping }));
+    let mut holder = Holder::new(
+        control,
+        Some(OwnedChild {
+            child: process,
+            reservation: child_reaping,
+        }),
+    );
     let registered_id = recovery.as_ref().map(|recovery| recovery.source.id);
     holder.registered = recovery.is_some();
     holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
@@ -304,7 +333,11 @@ pub(super) fn spawn_recoverable_with_authority(
         .map(|command| STANDARD.encode(command))
         .map_err(|error| format!("encode terminal command: {error}"))?;
     // Typed wire order: directory first, setup lease second.
-    let directory_descriptors: Vec<RawFd> = directory.iter().chain(setup_lease.iter()).map(|file| file.as_raw_fd()).collect();
+    let directory_descriptors: Vec<RawFd> = directory
+        .iter()
+        .chain(setup_lease.iter())
+        .map(|file| file.as_raw_fd())
+        .collect();
     let started = holder
         .control
         .set_read_timeout(Some(START_TIMEOUT))
@@ -651,9 +684,9 @@ async fn receive_exact_shared(
 }
 
 /// Initialize fixed cleanup services before measuring daemon readiness.
-pub(super) fn initialize_cleanup() -> Result<(),String> {
+pub(super) fn initialize_cleanup() -> Result<(), String> {
     // Warm the fixed original-child reaper without starting any child.
-    drop(crate::daemon::child_reaper::reserve().map_err(|error|error.to_string())?);
+    drop(crate::daemon::child_reaper::reserve().map_err(|error| error.to_string())?);
     release::initialize()
 }
 
@@ -689,17 +722,25 @@ pub(super) struct Holder {
 }
 
 impl Holder {
-    pub(super) fn proves_family_on_exit(&self) -> bool {self.protocol >= 5}
+    pub(super) fn proves_family_on_exit(&self) -> bool {
+        self.protocol >= 5
+    }
     pub(super) fn record(&self) -> Option<&Record> {
         self.record.as_ref()
     }
     pub(super) fn prove_cleanup(&mut self) {
         self.cleanup_proved = true;
     }
-    pub(super) fn close_until(&mut self, deadline: Instant) -> Result<(),String> {
+    pub(super) fn close_until(&mut self, deadline: Instant) -> Result<(), String> {
         if self.detached || self.adoption_pending {
-            if !self.adoption_pending && self.release_requested && self.cleanup_acknowledged
-                && self.pidfd.as_ref().is_some_and(|fd| exits_within(fd, Duration::ZERO).unwrap_or(false)) {
+            if !self.adoption_pending
+                && self.release_requested
+                && self.cleanup_acknowledged
+                && self
+                    .pidfd
+                    .as_ref()
+                    .is_some_and(|fd| exits_within(fd, Duration::ZERO).unwrap_or(false))
+            {
                 // A previous call may have completed cleanup before its caller
                 // could publish metadata. Its exact positive receipt is stable.
                 return Ok(());
@@ -710,23 +751,44 @@ impl Holder {
             return Err("This terminal holder predates verified descendant cleanup; retain it for upgrade recovery".into());
         }
         if !self.release_requested {
-            let remaining = deadline.checked_duration_since(Instant::now()).ok_or("Terminal cleanup deadline expired")?;
-            self.control.set_write_timeout(Some(remaining)).map_err(|error| error.to_string())?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or("Terminal cleanup deadline expired")?;
+            self.control
+                .set_write_timeout(Some(remaining))
+                .map_err(|error| error.to_string())?;
             send(&self.control, &Request::ReleaseProved, &[]).map_err(|error| error.to_string())?;
             self.release_requested = true;
         }
         if !self.cleanup_acknowledged {
-            let remaining = deadline.checked_duration_since(Instant::now()).ok_or("Terminal family cleanup remains pending")?;
-            self.cleanup.as_ref().ok_or("Terminal cleanup acknowledgement is unavailable")?
-                .recv_timeout(remaining).map_err(|_| "Terminal family cleanup remains pending; its exact holder is retained".to_owned())?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or("Terminal family cleanup remains pending")?;
+            self.cleanup
+                .as_ref()
+                .ok_or("Terminal cleanup acknowledgement is unavailable")?
+                .recv_timeout(remaining)
+                .map_err(|_| {
+                    "Terminal family cleanup remains pending; its exact holder is retained"
+                        .to_owned()
+                })?;
             self.cleanup_acknowledged = true;
         }
-        let remaining = deadline.checked_duration_since(Instant::now()).ok_or("Terminal cleanup receipt is pending")?;
-        if !self.pidfd.as_ref().is_some_and(|fd| exits_within(fd, remaining).unwrap_or(false)) {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("Terminal cleanup receipt is pending")?;
+        if !self
+            .pidfd
+            .as_ref()
+            .is_some_and(|fd| exits_within(fd, remaining).unwrap_or(false))
+        {
             return Err("Terminal cleanup receipt is pending; its exact holder is retained".into());
         }
         if let Some(process) = self.process.as_mut() {
-            process.child.try_wait().map_err(|error| error.to_string())?;
+            process
+                .child
+                .try_wait()
+                .map_err(|error| error.to_string())?;
         }
         self.detached = true;
         drop(self.release.take());
@@ -734,21 +796,39 @@ impl Holder {
     }
 
     fn retain_original_child(&mut self) {
-        let Some(OwnedChild { mut child, reservation }) = self.process.take() else {return;};
+        let Some(OwnedChild {
+            mut child,
+            reservation,
+        }) = self.process.take()
+        else {
+            return;
+        };
         match child.try_wait() {
             Ok(Some(_)) => return, // Exact original status consumed; credit can return.
-            Ok(None) => {},
+            Ok(None) => {}
             Err(error) => {
-                reservation.preserve_suspended(child, self.pidfd.take(), &format!("Original holder status is unavailable: {error}"));
+                reservation.preserve_suspended(
+                    child,
+                    self.pidfd.take(),
+                    &format!("Original holder status is unavailable: {error}"),
+                );
                 return;
             }
         }
         let Some(pidfd) = self.pidfd.take() else {
-            reservation.preserve_suspended(child, None, "The original helper pidfd was not captured");
+            reservation.preserve_suspended(
+                child,
+                None,
+                "The original helper pidfd was not captured",
+            );
             return;
         };
         if let Err((error, child, pidfd, reservation)) = reservation.retain(child, pidfd) {
-            reservation.preserve_suspended(child, Some(pidfd), &format!("The exact helper reaper could not accept its owner: {error}"));
+            reservation.preserve_suspended(
+                child,
+                Some(pidfd),
+                &format!("The exact helper reaper could not accept its owner: {error}"),
+            );
         }
     }
 
@@ -876,7 +956,9 @@ impl Holder {
 
 impl Drop for Holder {
     fn drop(&mut self) {
-        if self.adoption_pending {self.leave_for_successor();}
+        if self.adoption_pending {
+            self.leave_for_successor();
+        }
         if !self.detached {
             // Destruction never performs RPC, waits for a process, or joins a
             // watch thread. Transfer exact resources to a fixed bounded owner.
@@ -884,11 +966,22 @@ impl Drop for Holder {
                 Ok(control) => {
                     self.detached = true;
                     let task = Holder {
-                        control, process:self.process.take(), pidfd:self.pidfd.take(), protocol:self.protocol,
-                        watch:self.watch.take(), release:self.release.take(), acknowledged:self.acknowledged.take(), cleanup:self.cleanup.take(),
-                        detached:false, adoption_pending:false, registered:self.registered, screen_lost:self.screen_lost,
-                        cleanup_proved:self.cleanup_proved, release_requested:self.release_requested,
-                        cleanup_acknowledged:self.cleanup_acknowledged, record:self.record.take(),
+                        control,
+                        process: self.process.take(),
+                        pidfd: self.pidfd.take(),
+                        protocol: self.protocol,
+                        watch: self.watch.take(),
+                        release: self.release.take(),
+                        acknowledged: self.acknowledged.take(),
+                        cleanup: self.cleanup.take(),
+                        detached: false,
+                        adoption_pending: false,
+                        registered: self.registered,
+                        screen_lost: self.screen_lost,
+                        cleanup_proved: self.cleanup_proved,
+                        release_requested: self.release_requested,
+                        cleanup_acknowledged: self.cleanup_acknowledged,
+                        record: self.record.take(),
                     };
                     release::request(task);
                 }
@@ -1204,28 +1297,40 @@ fn serve(control: UnixStream) -> i32 {
     };
     // This process exclusively owns/reaps the terminal tree, including tools
     // which create another session or outlive the original PTY root.
-    if unsafe {libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)} != 0 {
-        return fail(format!("Cannot own terminal descendants: {}", io::Error::last_os_error()));
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        return fail(format!(
+            "Cannot own terminal descendants: {}",
+            io::Error::last_os_error()
+        ));
     }
-    let (command, size, mut recovery, anchored_directory, setup_identity, descriptors) = match receive::<Request>(&control) {
-        Ok(Some((
-            Request::Spawn {
+    let (command, size, mut recovery, anchored_directory, setup_identity, descriptors) =
+        match receive::<Request>(&control) {
+            Ok(Some((
+                Request::Spawn {
+                    command,
+                    size,
+                    recovery,
+                    anchored_directory,
+                    setup_lease_identity,
+                },
+                descriptors,
+            ))) => (
                 command,
                 size,
                 recovery,
                 anchored_directory,
                 setup_lease_identity,
-            },
-            descriptors,
-        ))) => (command, size, recovery, anchored_directory, setup_lease_identity, descriptors),
-        _ => return 1,
-    };
+                descriptors,
+            ),
+            _ => return 1,
+        };
     let expected = usize::from(anchored_directory) + usize::from(setup_identity.is_some());
     if descriptors.len() != expected {
         return fail("terminal spawn sent the wrong authority descriptors".into());
     }
     let mut descriptors = descriptors.into_iter();
-    let directory = anchored_directory.then(|| File::from(descriptors.next().expect("checked directory slot")));
+    let directory =
+        anchored_directory.then(|| File::from(descriptors.next().expect("checked directory slot")));
     // This exact open-file description carries the original flock. Keep it
     // through daemon loss, adoption and verified family cleanup.
     let _setup_execution_lease = match setup_identity {
@@ -1280,7 +1385,11 @@ fn serve(control: UnixStream) -> i32 {
         // extra child descriptors in pre_exec. Reference the holder's pinned
         // descriptor so both cwd and relative executable resolution survive
         // that close; spawn keeps this descriptor alive through exec success.
-        command.cwd(format!("/proc/{}/fd/{}", std::process::id(), directory.as_raw_fd()));
+        command.cwd(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            directory.as_raw_fd()
+        ));
     }
     let program = command
         .get_argv()
@@ -1361,7 +1470,7 @@ fn serve(control: UnixStream) -> i32 {
                 cleanup_proved = true;
                 release_control = control.try_clone().ok();
                 break;
-            },
+            }
             Attendance::ReleaseProved => {
                 cleanup_proved = true;
                 release_control = control.try_clone().ok();
@@ -1451,11 +1560,16 @@ fn serve(control: UnixStream) -> i32 {
     if cleanup_proved && let (Some(residence), Some(recovery)) = (&residence, &recovery) {
         loop {
             if registry::cleanup::publish(&residence.record, recovery, &family).is_ok()
-                && residence.retire().is_ok() {break;}
+                && residence.retire().is_ok()
+            {
+                break;
+            }
             thread::sleep(Duration::from_millis(100));
         }
     }
-    if let Some(control) = release_control {let _ = send(&control, &Report::CleanupProved, &[]);}
+    if let Some(control) = release_control {
+        let _ = send(&control, &Report::CleanupProved, &[]);
+    }
     drop(pair.master);
     0
 }
@@ -1463,9 +1577,11 @@ fn serve(control: UnixStream) -> i32 {
 /// Uncertain cleanup retains this dedicated owner and all of its authority.
 fn reap_terminal_family() -> crate::daemon::owned_children::ReapedFamily {
     loop {
-        match crate::daemon::owned_children::terminate_owned_family(Instant::now() + Duration::from_millis(250)) {
+        match crate::daemon::owned_children::terminate_owned_family(
+            Instant::now() + Duration::from_millis(250),
+        ) {
             Ok(Some(proof)) => return proof,
-            Ok(None) => {},
+            Ok(None) => {}
             Err(error) => {
                 tracing::warn!(%error, "Terminal family cleanup remains unconfirmed");
                 thread::sleep(Duration::from_millis(100));
@@ -2219,28 +2335,52 @@ mod tests {
         // before opening the anchored script. This makes an early FD drop a
         // deterministic failure instead of relying on interpreter scheduling.
         let interpreter = root.path().join("delayed-interpreter");
-        std::fs::write(&interpreter,
-            "#!/bin/sh\nprintf 'INTERPRETER_READY\\n'\nread latch\nexec /bin/sh \"$@\"\n").unwrap();
+        std::fs::write(
+            &interpreter,
+            "#!/bin/sh\nprintf 'INTERPRETER_READY\\n'\nread latch\nexec /bin/sh \"$@\"\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(old.join("probe"), format!("#!{}\npwd -P\ncat marker\nprintf 'PINNED_DONE\\n'\n", interpreter.display())).unwrap();
-        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            old.join("probe"),
+            format!(
+                "#!{}\npwd -P\ncat marker\nprintf 'PINNED_DONE\\n'\n",
+                interpreter.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         let directory = std::sync::Arc::new(File::open(&old).unwrap());
         std::fs::rename(&old, &moved).unwrap();
         std::fs::create_dir(&old).unwrap();
         std::fs::write(old.join("marker"), "WRONG_DIRECTORY\n").unwrap();
-        std::fs::write(old.join("probe"), "#!/bin/sh\nprintf 'WRONG_EXECUTABLE\\n'\nexit 43\n").unwrap();
-        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            old.join("probe"),
+            "#!/bin/sh\nprintf 'WRONG_EXECUTABLE\\n'\nexit 43\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         let mut command = CommandBuilder::new("./probe");
         command.cwd(&old);
         let (exits, exited) = crossbeam_channel::bounded(1);
-        let held = spawn_recoverable_at_directory(command, size(), exits, None, Some(directory)).unwrap();
+        let held =
+            spawn_recoverable_at_directory(command, size(), exits, None, Some(directory)).unwrap();
         read_until(&held.master, "INTERPRETER_READY");
-        std::io::Write::write_all(&mut File::from(held.master.duplicate().unwrap()), b"\n").unwrap();
+        std::io::Write::write_all(&mut File::from(held.master.duplicate().unwrap()), b"\n")
+            .unwrap();
         let output = read_until(&held.master, "PINNED_DONE");
         assert!(output.contains(moved.to_str().unwrap()), "{output}");
         assert!(output.contains("ORIGINAL_DIRECTORY"), "{output}");
         assert!(!output.contains("WRONG_"), "{output}");
-        assert!(exited.recv_timeout(Duration::from_secs(5)).unwrap().unwrap().success());
+        assert!(
+            exited
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .success()
+        );
         drop(held);
     }
 
@@ -2252,10 +2392,17 @@ mod tests {
         let directory = std::sync::Arc::new(File::open(&removed).unwrap());
         std::fs::remove_dir(&removed).unwrap();
         let marker = root.path().join("must-not-execute");
-        for directory in [directory, std::sync::Arc::new(tempfile::tempfile().unwrap())] {
+        for directory in [
+            directory,
+            std::sync::Arc::new(tempfile::tempfile().unwrap()),
+        ] {
             let (exits, _) = crossbeam_channel::bounded(1);
             let result = spawn_recoverable_at_directory(
-                command(&format!("touch '{}'", marker.display())), size(), exits, None, Some(directory),
+                command(&format!("touch '{}'", marker.display())),
+                size(),
+                exits,
+                None,
+                Some(directory),
             );
             assert!(result.is_err());
             assert!(!marker.exists());
@@ -2527,7 +2674,10 @@ mod tests {
             "discovery must exist before startup is acknowledged"
         );
         let record = records[0].clone();
-        assert_eq!(record.version,5,"fresh registered holder evidence must use the family-cleanup protocol");
+        assert_eq!(
+            record.version, 5,
+            "fresh registered holder evidence must use the family-cleanup protocol"
+        );
         cleanup.holder = Some(open_pidfd(record.holder.pid).unwrap());
         cleanup.daemon.kill().unwrap();
         cleanup.daemon.wait().unwrap();
@@ -2696,15 +2846,21 @@ mod tests {
         );
         assert!(!socket.exists(), "explicit release removes its endpoint");
         assert!(registry::cleanup::confirmed(&original, &record, &final_proof).unwrap());
-        let receipt = holders.join(format!("{}-{}-{}.closed",record.terminal,record.holder.pid,record.holder.start));
+        let receipt = holders.join(format!(
+            "{}-{}-{}.closed",
+            record.terminal, record.holder.pid, record.holder.start
+        ));
         let positive = std::fs::read(&receipt).unwrap();
-        let mut legacy:serde_json::Value=serde_json::from_slice(&positive).unwrap();
-        assert_eq!(legacy["family_reaped"],true);
+        let mut legacy: serde_json::Value = serde_json::from_slice(&positive).unwrap();
+        assert_eq!(legacy["family_reaped"], true);
         legacy.as_object_mut().unwrap().remove("family_reaped");
-        std::fs::write(&receipt,serde_json::to_vec(&legacy).unwrap()).unwrap();
-        assert!(!registry::cleanup::confirmed(&original,&record,&final_proof).unwrap(),"root-only legacy receipt cannot authorize family cleanup");
-        std::fs::write(&receipt,positive).unwrap();
-        assert!(registry::cleanup::confirmed(&original,&record,&final_proof).unwrap());
+        std::fs::write(&receipt, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            !registry::cleanup::confirmed(&original, &record, &final_proof).unwrap(),
+            "root-only legacy receipt cannot authorize family cleanup"
+        );
+        std::fs::write(&receipt, positive).unwrap();
+        assert!(registry::cleanup::confirmed(&original, &record, &final_proof).unwrap());
         let mut replacement = record.clone();
         replacement.holder.start += 1;
         assert!(
@@ -2928,11 +3084,22 @@ mod tests {
             "{error}"
         );
     }
-    fn setup_family_fixture(directory: &Path) -> (Held, Receiver<ChildExit>, File, registry::Process) {
+    fn setup_family_fixture(
+        directory: &Path,
+    ) -> (Held, Receiver<ChildExit>, File, registry::Process) {
         use std::os::unix::fs::OpenOptionsExt;
         let lease_path = directory.join("setup.lease");
-        let lease = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&lease_path).unwrap();
-        assert_eq!(unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lease_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
         let lease = std::sync::Arc::new(lease);
         let mut command = CommandBuilder::new("/usr/bin/python3");
         command.arg("-c");
@@ -2946,49 +3113,99 @@ while not (root/'exit-root').exists(): time.sleep(.005)
 "#);
         command.arg(directory);
         command.cwd(directory);
-        let (exits,exited)=crossbeam_channel::bounded(1);
-        let held=spawn_recoverable_with_authority(command,size(),exits,None,Some(std::sync::Arc::new(File::open(directory).unwrap())),Some(lease.clone())).unwrap();
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held = spawn_recoverable_with_authority(
+            command,
+            size(),
+            exits,
+            None,
+            Some(std::sync::Arc::new(File::open(directory).unwrap())),
+            Some(lease.clone()),
+        )
+        .unwrap();
         drop(lease);
-        read_until(&held.master,"family-ready");
-        let pid=std::fs::read_to_string(directory.join("child")).unwrap().parse().unwrap();
-        let child=registry::Process::read(pid).unwrap();
+        read_until(&held.master, "family-ready");
+        let pid = std::fs::read_to_string(directory.join("child"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let child = registry::Process::read(pid).unwrap();
         assert!(child.is_current());
-        let contender=std::fs::OpenOptions::new().read(true).write(true).open(lease_path).unwrap();
-        (held,exited,contender,child)
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lease_path)
+            .unwrap();
+        (held, exited, contender, child)
     }
 
     #[test]
-    fn root_exit_reaps_hup_ignoring_detached_child_before_completion_but_retains_setup_lease_until_close() {
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let (mut held,exited,lease,child)=setup_family_fixture(directory.path());
-        std::fs::write(directory.path().join("exit-root"),b"exit").unwrap();
+    fn root_exit_reaps_hup_ignoring_detached_child_before_completion_but_retains_setup_lease_until_close()
+     {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (mut held, exited, lease, child) = setup_family_fixture(directory.path());
+        std::fs::write(directory.path().join("exit-root"), b"exit").unwrap();
         assert!(exited.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
-        assert!(!child.is_current(),"root completion must follow reaping the escaped HUP-ignoring child");
-        assert_eq!(unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},-1,"the actual holder retains setup authority until explicit cleanup");
-        assert_eq!(io::Error::last_os_error().kind(),io::ErrorKind::WouldBlock);
-        held.holder.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
-        held.holder.close_until(Instant::now()+Duration::from_millis(50)).unwrap();
-        assert_eq!(unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        assert!(
+            !child.is_current(),
+            "root completion must follow reaping the escaped HUP-ignoring child"
+        );
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1,
+            "the actual holder retains setup authority until explicit cleanup"
+        );
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+        held.holder
+            .close_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        held.holder
+            .close_until(Instant::now() + Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
     }
 
     #[test]
     fn cleanup_timeout_retains_exact_holder_child_and_setup_lease_until_later_retry() {
         struct Resume(File);
-        impl Drop for Resume {fn drop(&mut self){let _=signal(&self.0,libc::SIGCONT);}}
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let (mut held,_exited,lease,child)=setup_family_fixture(directory.path());
-        let resume=Resume(held.holder.pidfd.as_ref().unwrap().try_clone().unwrap());
-        signal(&resume.0,libc::SIGSTOP).unwrap();
-        let started=Instant::now();
-        assert!(held.holder.close_until(Instant::now()+Duration::from_millis(50)).is_err());
-        assert!(started.elapsed()<Duration::from_secs(1));
-        assert!(child.is_current(),"timeout must not claim or discard the exact surviving family");
-        assert_eq!(unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},-1);
-        assert_eq!(io::Error::last_os_error().kind(),io::ErrorKind::WouldBlock);
+        impl Drop for Resume {
+            fn drop(&mut self) {
+                let _ = signal(&self.0, libc::SIGCONT);
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (mut held, _exited, lease, child) = setup_family_fixture(directory.path());
+        let resume = Resume(held.holder.pidfd.as_ref().unwrap().try_clone().unwrap());
+        signal(&resume.0, libc::SIGSTOP).unwrap();
+        let started = Instant::now();
+        assert!(
+            held.holder
+                .close_until(Instant::now() + Duration::from_millis(50))
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            child.is_current(),
+            "timeout must not claim or discard the exact surviving family"
+        );
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1
+        );
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
         drop(resume);
-        held.holder.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        held.holder
+            .close_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
         assert!(!child.is_current());
-        assert_eq!(unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0,"only the positive later retry releases setup authority");
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "only the positive later retry releases setup authority"
+        );
     }
 
     #[test]
@@ -3000,58 +3217,109 @@ while not (root/'exit-root').exists(): time.sleep(.005)
         let (acknowledge, acknowledged) = crossbeam_channel::bounded(1);
         let (cleanup, cleaned) = crossbeam_channel::bounded(1);
         let runtime = crate::terminal::reactor::runtime().unwrap();
-        let watcher = runtime.spawn(watch_shared(control, root, released, exits, acknowledge, cleanup, false));
+        let watcher = runtime.spawn(watch_shared(
+            control,
+            root,
+            released,
+            exits,
+            acknowledge,
+            cleanup,
+            false,
+        ));
         send(&peer, &Report::ScreenCached, &[]).unwrap();
-        assert!(acknowledged.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
-        assert!(matches!(cleaned.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+        assert!(
+            acknowledged
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(matches!(
+            cleaned.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
         send(&peer, &Report::CleanupProved, &[]).unwrap();
         cleaned.recv_timeout(Duration::from_secs(2)).unwrap();
-        runtime.block_on(async { tokio::time::timeout(Duration::from_secs(2), watcher).await.unwrap().unwrap(); });
-        assert!(acknowledged.try_recv().is_err(), "cleanup must never reuse the generic screen/adoption ACK");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), watcher)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        assert!(
+            acknowledged.try_recv().is_err(),
+            "cleanup must never reuse the generic screen/adoption ACK"
+        );
     }
 
     #[test]
     fn stale_screen_ack_and_holder_exit_do_not_prove_descendant_cleanup() {
         struct Kill(File);
-        impl Drop for Kill {fn drop(&mut self){let _=signal(&self.0,libc::SIGKILL);}}
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let (mut held,_exited,_lease,child)=setup_family_fixture(directory.path());
-        let _root_cleanup=Kill(open_pidfd(held.child.pid()).unwrap());
-        let _child_cleanup=Kill(open_pidfd(child.pid).unwrap());
-        let helper=held.holder.pidfd.as_ref().unwrap().try_clone().unwrap();
-        signal(&helper,libc::SIGSTOP).unwrap();
-        assert!(held.holder.close_until(Instant::now()+Duration::from_millis(50)).is_err());
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = signal(&self.0, libc::SIGKILL);
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (mut held, _exited, _lease, child) = setup_family_fixture(directory.path());
+        let _root_cleanup = Kill(open_pidfd(held.child.pid()).unwrap());
+        let _child_cleanup = Kill(open_pidfd(child.pid).unwrap());
+        let helper = held.holder.pidfd.as_ref().unwrap().try_clone().unwrap();
+        signal(&helper, libc::SIGSTOP).unwrap();
+        assert!(
+            held.holder
+                .close_until(Instant::now() + Duration::from_millis(50))
+                .is_err()
+        );
         assert!(held.holder.release_requested);
         // Simulate a CacheScreen acknowledgement arriving after that method's
         // deadline. It is not a cleanup response, even if the helper exits.
-        let (screen,screen_ack)=crossbeam_channel::bounded(1);
-        screen.send(Ok(())).unwrap();held.holder.acknowledged=Some(screen_ack);
-        signal(&helper,libc::SIGKILL).unwrap();
-        assert!(exits_within(&helper,Duration::from_secs(1)).unwrap());
-        assert!(child.is_current(),"the escaped child must demonstrate why holder death is insufficient");
-        assert!(held.holder.close_until(Instant::now()+Duration::from_millis(50)).is_err(),"only CleanupProved may satisfy the cleanup barrier");
+        let (screen, screen_ack) = crossbeam_channel::bounded(1);
+        screen.send(Ok(())).unwrap();
+        held.holder.acknowledged = Some(screen_ack);
+        signal(&helper, libc::SIGKILL).unwrap();
+        assert!(exits_within(&helper, Duration::from_secs(1)).unwrap());
+        assert!(
+            child.is_current(),
+            "the escaped child must demonstrate why holder death is insufficient"
+        );
+        assert!(
+            held.holder
+                .close_until(Instant::now() + Duration::from_millis(50))
+                .is_err(),
+            "only CleanupProved may satisfy the cleanup barrier"
+        );
         held.holder.leave_for_successor();
     }
 
     #[test]
     fn preserved_original_helper_is_reaped_without_waiting_on_final_frontend_drop() {
         struct Resume(File);
-        impl Drop for Resume {fn drop(&mut self){let _=signal(&self.0,libc::SIGCONT);}}
-        let (exits,_exited)=crossbeam_channel::bounded(1);
-        let Held {master,child,mut holder}=spawn(command("while :; do sleep 1; done"),size(),exits).unwrap();
-        let helper_pid=holder.process.as_ref().unwrap().child.id() as i32;
-        let root_pid=child.pid();
-        let resume=Resume(holder.pidfd.as_ref().unwrap().try_clone().unwrap());
-        signal(&resume.0,libc::SIGSTOP).unwrap();
+        impl Drop for Resume {
+            fn drop(&mut self) {
+                let _ = signal(&self.0, libc::SIGCONT);
+            }
+        }
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let Held {
+            master,
+            child,
+            mut holder,
+        } = spawn(command("while :; do sleep 1; done"), size(), exits).unwrap();
+        let helper_pid = holder.process.as_ref().unwrap().child.id() as i32;
+        let root_pid = child.pid();
+        let resume = Resume(holder.pidfd.as_ref().unwrap().try_clone().unwrap());
+        signal(&resume.0, libc::SIGSTOP).unwrap();
         holder.leave_for_successor();
-        let started=Instant::now();
+        let started = Instant::now();
         drop(holder);
-        assert!(started.elapsed()<Duration::from_secs(1),"final frontend drop cannot wait for this stopped exact helper");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "final frontend drop cannot wait for this stopped exact helper"
+        );
         assert!(alive(helper_pid));
         drop(resume);
         wait_gone(helper_pid);
         wait_gone(root_pid);
-        drop((master,child));
+        drop((master, child));
     }
-
 }

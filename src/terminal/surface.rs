@@ -110,12 +110,19 @@ impl TerminalSurface {
         self.handle.paste(text, origin)
     }
 
-    pub fn key_with_receipt(&self,key:KeyInput)->Result<super::hosted::HostedKeyReceipt,TerminalSendError> {
+    pub fn key_with_receipt(
+        &self,
+        key: KeyInput,
+    ) -> Result<super::hosted::HostedKeyReceipt, TerminalSendError> {
         self.handle.key_with_receipt(key)
     }
 
-    pub fn key_after_receipt(&self,key:KeyInput,after:&super::hosted::HostedKeyReceipt)->Result<super::hosted::HostedKeyReceipt,TerminalSendError> {
-        self.handle.key_after_receipt(key,after)
+    pub fn key_after_receipt(
+        &self,
+        key: KeyInput,
+        after: &super::hosted::HostedKeyReceipt,
+    ) -> Result<super::hosted::HostedKeyReceipt, TerminalSendError> {
+        self.handle.key_after_receipt(key, after)
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {

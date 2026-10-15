@@ -43,7 +43,11 @@ fn digest(source: &TerminalSession) -> Result<[u8; 32], String> {
     Ok(Sha256::digest(serde_json::to_vec(&source).map_err(|e| e.to_string())?).into())
 }
 
-pub(crate) fn publish(record: &Record, recovery: &Recovery, _family: &crate::daemon::owned_children::ReapedFamily) -> Result<(), String> {
+pub(crate) fn publish(
+    record: &Record,
+    recovery: &Recovery,
+    _family: &crate::daemon::owned_children::ReapedFamily,
+) -> Result<(), String> {
     if record.root.is_current() {
         return Err("Terminal root has not been reaped".into());
     }
@@ -143,7 +147,8 @@ fn confirmed_receipt(
         return Err("Terminal close receipt is oversized".into());
     }
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    Ok(receipt.family_reaped && receipt.record == *expected
+    Ok(receipt.family_reaped
+        && receipt.record == *expected
         && receipt.record.kind == Kind::Terminal
         && receipt.record.version == 5
         && receipt.record.application == crate::instance::APPLICATION_ID

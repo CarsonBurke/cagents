@@ -1,6 +1,6 @@
 //! Bounded ownership transfer for final frontend drops. Never inline RPC or
 //! joins on the caller, and never kill an owner whose family is unconfirmed.
-use super::{Holder, Duration, Instant};
+use super::{Duration, Holder, Instant};
 use std::sync::OnceLock;
 enum Task {
     Final(Holder),
@@ -16,7 +16,9 @@ static SERVICE: OnceLock<Result<crossbeam_channel::Sender<Task>, String>> = Once
 // after unwinding must wake it just as a normal result or freed queue slot does.
 struct CompletionWake;
 impl Drop for CompletionWake {
-    fn drop(&mut self) { crate::daemon::wake(); }
+    fn drop(&mut self) {
+        crate::daemon::wake();
+    }
 }
 
 fn service() -> Result<&'static crossbeam_channel::Sender<Task>, String> {
@@ -52,19 +54,25 @@ fn service() -> Result<&'static crossbeam_channel::Sender<Task>, String> {
     }).as_ref().map_err(Clone::clone)
 }
 
-pub(super) fn initialize() -> Result<(),String> {service().map(|_|())}
+pub(super) fn initialize() -> Result<(), String> {
+    service().map(|_| ())
+}
 
-pub(crate) fn completed(handle: &super::super::TerminalHandle) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+pub(crate) fn completed(
+    handle: &super::super::TerminalHandle,
+) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
     if !handle.is_completed() {
         return Err("Terminal is still running; completed cleanup cannot retire it".into());
     }
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let task = Task::Completed {
         handle: handle.clone(),
-        deadline: Instant::now()+Duration::from_secs(3),
+        deadline: Instant::now() + Duration::from_secs(3),
         reply,
     };
-    service()?.try_send(task).map_err(|_| "Terminal cleanup capacity is busy; its exact record remains retained".to_owned())?;
+    service()?.try_send(task).map_err(|_| {
+        "Terminal cleanup capacity is busy; its exact record remains retained".to_owned()
+    })?;
     Ok(result)
 }
 
@@ -74,7 +82,9 @@ pub(super) fn request(mut holder: Holder) {
             Ok(()) => return,
             Err(error) => match error.into_inner() {
                 Task::Final(returned) => holder = returned,
-                Task::Completed { .. } => unreachable!("only the submitted final holder can be returned"),
+                Task::Completed { .. } => {
+                    unreachable!("only the submitted final holder can be returned")
+                }
             },
         },
         Err(error) => tracing::warn!(%error,"Terminal cleanup service unavailable"),

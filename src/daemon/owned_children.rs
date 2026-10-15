@@ -185,31 +185,54 @@ pub(crate) struct ReapedFamily(());
 pub(crate) fn terminate_owned_family(deadline: Instant) -> io::Result<Option<ReapedFamily>> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let mut subreaper = 0i32;
-    if unsafe {libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &raw mut subreaper, 0, 0, 0)} != 0 {
+    if unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &raw mut subreaper, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    if subreaper != 1 || std::fs::read_dir("/proc/self/task")?.collect::<io::Result<Vec<_>>>()?.len() != 1 {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied,"Family cleanup requires its dedicated single-threaded subreaper"));
+    if subreaper != 1
+        || std::fs::read_dir("/proc/self/task")?
+            .collect::<io::Result<Vec<_>>>()?
+            .len()
+            != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Family cleanup requires its dedicated single-threaded subreaper",
+        ));
     }
     loop {
         for pid in direct_children()? {
-            if Instant::now() >= deadline { return Ok(None); }
-            let descriptor = unsafe {libc::syscall(libc::SYS_pidfd_open, pid, 0)};
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
             if descriptor < 0 {
                 let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {continue;}
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    continue;
+                }
                 return Err(error);
             }
-            let descriptor = unsafe {std::fs::File::from_raw_fd(descriptor as i32)};
+            let descriptor = unsafe { std::fs::File::from_raw_fd(descriptor as i32) };
             // This helper is the only reaper. The child cannot recycle its PID
             // between the kernel's children snapshot and opening its pidfd.
-            if unsafe {libc::syscall(libc::SYS_pidfd_send_signal, descriptor.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0)} < 0 {
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    descriptor.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            } < 0
+            {
                 let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {return Err(error);}
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
             }
         }
         loop {
-            match unsafe {libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG)} {
+            match unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } {
                 pid if pid > 0 => continue,
                 0 => break,
                 _ => {
@@ -222,7 +245,9 @@ pub(crate) fn terminate_owned_family(deadline: Instant) -> io::Result<Option<Rea
                 }
             }
         }
-        if Instant::now() >= deadline {return Ok(None);}
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
