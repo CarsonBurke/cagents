@@ -107,6 +107,11 @@ fn execute_clone(
         .map_err(|error| clone_failure_detail(&error))
 }
 
+fn onboarding_shortcut_detail(command: workspace_widget::GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
+    let chords = workspace_widget::shortcut_chords(command, shortcuts);
+    if chords.is_empty() { "Enter to open the focused action".into() } else { chords }
+}
+
 impl Cagents {
     fn onboarding_workspace_rows(&self) -> Vec<WorkspaceSwitcherRow> {
         let actions = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
@@ -212,14 +217,14 @@ impl Cagents {
             for (label, detail, icon, id, message) in [
                 (
                     "Open folder",
-                    "Enter to open the focused action".to_owned(),
+                    onboarding_shortcut_detail(workspace_widget::GlobalShortcut::OpenFolder, &self.settings.keyboard_shortcuts),
                     Icon::OpenFolder,
                     "onboarding.open-folder",
                     Message::OpenRepository,
                 ),
                 (
                     "Clone repository",
-                    "Enter to open the focused action".to_owned(),
+                    onboarding_shortcut_detail(workspace_widget::GlobalShortcut::CloneRepository, &self.settings.keyboard_shortcuts),
                     Icon::Tree,
                     "onboarding.clone",
                     Message::Onboarding(Action::Clone),
@@ -588,6 +593,23 @@ mod tests {
             .chain(nodes.children())
             .filter_map(|node| node.node().label().map(str::to_owned))
             .collect()
+    }
+
+    #[test]
+    fn first_run_open_and_clone_hints_follow_registered_bindings() {
+        use workspace_widget::GlobalShortcut as Command;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        for command in [Command::OpenFolder, Command::CloneRepository] {
+            assert_eq!(onboarding_shortcut_detail(command, &app.settings.keyboard_shortcuts), "Enter to open the focused action");
+        }
+        app.settings.keyboard_shortcuts.open_folder = vec!["Ctrl+Alt+O".into()];
+        app.settings.keyboard_shortcuts.clone_repository = vec!["Ctrl+Alt+L".into()];
+        let rendered = labels(app.empty_workspace_view());
+        for chord in ["Ctrl+Alt+O", "Ctrl+Alt+L"] {
+            assert!(rendered.iter().any(|label| label == chord), "configured first-run hint is visible: {chord}");
+        }
+        app.settings.keyboard_shortcuts.open_folder.clear();
+        assert_eq!(onboarding_shortcut_detail(Command::OpenFolder, &app.settings.keyboard_shortcuts), "Enter to open the focused action");
     }
 
     #[test]
