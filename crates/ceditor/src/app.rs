@@ -2362,10 +2362,11 @@ impl Editor {
 
     fn refresh_snapshot(&mut self, id: CardId, force: bool) -> Task<Message> {
         let status_limit = self.settings.git_status_limit;
+        let queued = self.tab(id).is_some_and(|tab| self.git_groups.contains_key(&tab.runtime.descriptor.worktree));
         let Some(tab) = self.tab_mut(id).filter(|tab| tab.git) else {
             return Task::none();
         };
-        if tab.mutation.is_some() {
+        if tab.mutation.is_some() || queued {
             tab.snapshot_refresh_pending = true;
             return Task::none();
         }
@@ -2747,18 +2748,23 @@ impl Editor {
     /// A worktree may have several file tabs. Guard and refresh all of them,
     /// including unsaved buffers that are not currently visible.
     fn begin_mutation(&mut self, id: CardId, kind: MutationKind) -> Option<PathBuf> {
-        self.begin_mutation_with_buffer_policy(id, kind, false)
+        self.begin_mutation_with_buffer_policy(id, kind, false, None)
     }
 
-    fn begin_mutation_with_buffer_policy(&mut self, id: CardId, kind: MutationKind, index_only_stage: bool) -> Option<PathBuf> {
+    fn begin_mutation_with_buffer_policy(&mut self, id: CardId, kind: MutationKind, index_only_stage: bool, queue_turn: Option<u64>) -> Option<PathBuf> {
         let tab = self.tab(id)?;
         if !tab.git {
             return None;
         }
         let root = tab.runtime.descriptor.worktree.clone();
+        if self.git_groups.get(&root).is_some_and(|queue| (queue.active.is_some() || !queue.pending.is_empty())
+            && !queue_turn.is_some_and(|operation| queue.active == Some(operation))) {
+            self.notice = Some("An earlier Git action is still being prepared. Wait for its result before submitting another mutation.".into());
+            return None;
+        }
         if self.tabs.iter().any(|tab| {
             tab.runtime.descriptor.worktree == root
-                && (tab.mutation.is_some() || if index_only_stage { tab.runtime.is_saving() || tab.runtime.has_durability_warning() } else { tab.runtime.blocks_navigation() }
+                && (tab.mutation.is_some() || (if index_only_stage { tab.runtime.is_saving() || tab.runtime.has_durability_warning() } else { tab.runtime.blocks_navigation() })
                     || tab.sidebar.source_control.as_ref().is_some_and(|source| source.pending_marker_stage.is_some()))
         }) {
             self.notice = Some("Save open files and wait for pending Git operations before changing this worktree.".into());
@@ -2788,6 +2794,7 @@ impl Editor {
 
     fn finish_mutation_root(&mut self, root: PathBuf, notice: Option<String>) -> Task<Message> {
         self.notice = notice.clone();
+        if let Some(queue) = self.git_groups.get_mut(&root) { queue.active = None; }
         let mut affected = Vec::new();
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
@@ -2827,7 +2834,7 @@ impl Editor {
         stage: bool,
         selection: Vec<PathSelection>,
     ) -> Task<Message> {
-        self.stage_selection_with_approval(id, stage, selection, BTreeMap::new())
+        self.enqueue_explicit_stage(id, stage, selection)
     }
 
     fn stage_selection_with_approval(
@@ -2836,6 +2843,7 @@ impl Editor {
         stage: bool,
         selection: Vec<PathSelection>,
         approved: BTreeMap<RepoPath, cagents::repository::ConflictMarkerVersion>,
+        queue_turn: Option<u64>,
     ) -> Task<Message> {
         if selection.is_empty() {
             return Task::none();
@@ -2849,7 +2857,13 @@ impl Editor {
         } else {
             MutationKind::Unstage
         };
-        let Some(root) = self.begin_mutation(id, kind) else {
+        let Some(root) = self.begin_mutation_with_buffer_policy(id, kind, false, queue_turn) else {
+            if queue_turn.is_some() {
+                if let Some(root) = self.tab(id).map(|tab| tab.runtime.descriptor.worktree.clone()) {
+                    if let Some(queue) = self.git_groups.get_mut(&root) { queue.active = None; }
+                    return self.resume_change_groups();
+                }
+            }
             return Task::none();
         };
         let operation = self.tab(id).unwrap().mutation_operation;
@@ -3807,7 +3821,7 @@ impl Application for Editor {
                             let resolved = self.current().and_then(|tab| {
                                 (tab.navigation.active_worktree() == Some(&key)).then_some(())?;
                                 let source = tab.sidebar.source_control.as_ref()?;
-                                if source.is_reloading() || source.busy() {
+                                if source.is_reloading() || source.busy() && command == sidebar::ChangeGroupCommand::Discard {
                                     return None;
                                 }
                                 sidebar::resolve_change_command(
@@ -4049,7 +4063,8 @@ impl Application for Editor {
                                 return self.resume_change_groups();
                             }
                             let Some(selection) = selection else { return Task::none(); };
-                            self.stage_selection_with_approval(id, true, selection, approved)
+                            let Some(turn) = self.reserve_marker_turn(id) else { return Task::none(); };
+                            self.stage_selection_with_approval(id, true, selection, approved, Some(turn))
                         }
                         SidebarAction::RequestDiscard { .. } => {
                             tab.discard_authority = tab.worktree_authority.clone();
@@ -8118,6 +8133,41 @@ mod tests {
         let task = app.update(Message::Repository(selected));
         run_tasks(&mut app, task);
         assert_eq!(git(root, &["show", ":tracked.txt"]), "changed");
+    }
+
+    #[test]
+    fn standalone_preparing_patch_blocks_later_commit_and_preserves_selected_queue_order() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "already staged\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        std::fs::write(root.join("tracked.txt"), "later working hunk\n").unwrap();
+        let original_head = git(root, &["rev-parse", "HEAD"]);
+        let mut app = editor();
+        app.settings.editor_auto_save = false;
+        let id = open_real_git(&mut app, root, None);
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: key.clone(), message: "later commit".into() });
+        open_real_change(&mut app, id, "tracked.txt", cagents::repository::ChangeArea::Unstaged);
+        let action = app.tab(id).unwrap().runtime.diff_hunk_mutation_action(id, cagents::git_patch::Kind::Stage).unwrap();
+        let parked_preparation = app.update(Message::Repository(action));
+        assert!(app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap().busy(), "composer sees the preparation reservation");
+        let commit = app.update(Message::Sidebar(SidebarAction::Commit { key: key.clone(), message: "later commit".into(), amend: false }));
+        run_tasks(&mut app, commit);
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), original_head);
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "already staged");
+        assert_eq!(app.tab(id).unwrap().navigation.commit_message(), "later commit");
+        // A later selected Unstage is queueable and must read the index after
+        // the earlier hunk Stage, rather than overtaking its preparation.
+        let later = app.update(Message::Sidebar(SidebarAction::Unstage { key, selection: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())] }));
+        run_tasks(&mut app, later);
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "already staged");
+        run_tasks(&mut app, parked_preparation);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), original_head);
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "later working hunk\n");
+        assert!(app.git_groups.is_empty());
+        assert!(!app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap().busy());
     }
 
     #[test]
