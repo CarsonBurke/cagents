@@ -532,4 +532,44 @@ mod tests {
         drop(client); server.join().unwrap();
     }
 
+
+    #[test]
+    fn normal_read_only_or_reused_root_completion_settles_only_the_unused_ticket() {
+        let mut custody = EditedRootAdmissions::default();
+        let ticket = custody.reserve().unwrap();
+        let work = ticket.begin_preparation().unwrap();
+        let diagnostic = work.finish_read_only();
+        assert_eq!(diagnostic.id(), ticket.id());
+        assert_eq!(ticket.phase(), AdmissionPhase::Settled);
+        assert!(ticket.notice().is_none());
+        assert!(custody.is_settled());
+        custody.collect_settled();
+        assert!(custody.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn automatic_first_retirement_waits_for_the_actual_phase_one_payload() {
+        use crate::fs_safety::Root;
+        use std::time::Duration;
+        let (_runtime, client, server) = private_catalog_client();
+        let files = tempfile::tempdir().unwrap();
+        let root = Arc::new(Root::open(files.path()).unwrap());
+        let mut custody = EditedRootAdmissions::default();
+        let ticket = custody.reserve().unwrap();
+        let payload = ticket.begin_preparation().unwrap().prepared(client.prepare_edited_root_owner(root).unwrap());
+        let delayed_copy = payload.clone();
+        custody.request_unowned_retirements();
+        assert_eq!(ticket.phase(), AdmissionPhase::Prepared, "queued payload is a real passive original owner");
+        drop(payload);
+        custody.request_unowned_retirements();
+        assert_eq!(ticket.phase(), AdmissionPhase::Prepared, "every queued clone must drain");
+        drop(delayed_copy);
+        custody.request_unowned_retirements();
+        assert_eq!(ticket.phase(), AdmissionPhase::RetirementRequested);
+        custody.next_retirement().unwrap().unwrap().run(Instant::now() + Duration::from_secs(2)).unwrap();
+        assert!(custody.is_settled());
+        drop(client); server.join().unwrap();
+    }
+
 }
