@@ -83,10 +83,10 @@ impl State {
     pub(super) fn evict(&mut self) {
         let mut changed=false;
         for entry in self.entries.values_mut() {
-            changed |=entry.attempt.take().is_some();
-            if let Some(loaded)=entry.loaded.take() {entry.rehydrating=entry.opened;retire_loaded(loaded);changed=true;}
-            if let Some(text)=entry.restored.take() {entry.rehydrating=entry.opened;retire(text);changed=true;}
-            if changed {entry.revision=next_revision();}
+            let mut entry_changed=entry.attempt.take().is_some();
+            if let Some(loaded)=entry.loaded.take() {entry.rehydrating=entry.opened;retire_loaded(loaded);entry_changed=true;}
+            if let Some(text)=entry.restored.take() {entry.rehydrating=entry.opened;retire(text);entry_changed=true;}
+            if entry_changed {entry.revision=next_revision();}changed |=entry_changed;
         }
         if changed {self.context=self.context.wrapping_add(1);self.revision=self.revision.wrapping_add(1);}
     }
