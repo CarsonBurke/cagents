@@ -23,7 +23,10 @@ pub use authority::{WorktreeAuthority, WorktreeExecutor};
 mod creation_authority;
 mod creation_retention;
 pub(crate) use creation_retention::SettledCreationRoots;
-pub use creation_retention::{CreationRetention, RetainedWorktreeCreation, SettledCreatedWorktree};
+pub use creation_retention::{
+    CreationPrivateRecoverySummary, CreationPrivateRetry, CreationRetention, RetainedWorktreeCreation,
+    SettledCreatedWorktree,
+};
 mod branch_transaction;
 // The same source owns the landed deletion and journal branch fences.
 mod browse_reveal;
@@ -15019,6 +15022,7 @@ mod worktree_journal_tests {
                 .created
                 .as_ref()
                 .expect("original pre-unlock authority must settle");
+            assert!(retained.retention().unwrap().recovery_summary().is_clear());
             assert_eq!(created.operation(), fixture.request.operation_id);
             assert_eq!(created.generation(), 7);
             assert!(created.matches_outcome(report.outcome.as_ref().unwrap()));
@@ -15149,6 +15153,83 @@ mod worktree_journal_tests {
             session.upgrade().is_none(),
             "only explicit live owners retain this in-process session"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_preparation_failures_at_both_creation_sites_keep_original_retry_owner() {
+        if isolated_creation_fixture(concat!(module_path!(), "::retained_preparation_failures_at_both_creation_sites_keep_original_retry_owner")) { return; }
+        for final_checkout in [false, true] {
+            let fixture = Fixture::new();
+            if final_checkout { fs::create_dir(&fixture.request.managed_root).unwrap(); }
+            let failing_leaf = if final_checkout { fixture.request.destination.file_name().unwrap() }
+                else { fixture.request.managed_root.file_name().unwrap() };
+            creation_authority::FAILED_PREPARATION_AT.with(|slot| *slot.borrow_mut() = Some(PathBuf::from(failing_leaf)));
+            let scoped = fixture.service.with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let retained = scoped.create_worktree_journaled_retained(&fixture.store,
+                &fixture.request, 7, &CancellationToken::new(), &sender);
+            assert!(creation_authority::FAILED_PREPARATION_AT.with(|slot| slot.borrow().is_none()),
+                "the actual requested creation site must reach the real producer failure");
+            assert_ne!(retained.report.state, WorktreeOperationState::Created, "{:?}", retained.report);
+            assert!(retained.created.is_none());
+            assert!(!fixture.request.destination.exists(), "no public checkout was published");
+            let retention = retained.retention().expect("postcapture failure keeps original scope").clone();
+            let original_state = retained.report.state;
+            let original_outcome = retained.report.outcome.clone();
+            let (payload, leaf) = creation_authority::FAILED_PREPARATION_PAYLOAD.with(|slot| slot.borrow_mut().take()).unwrap();
+            assert_eq!(retention.recovery_summary(), CreationPrivateRecoverySummary {
+                pending_preparations: 1, pending_publications: 0,
+            });
+            drop(scoped);
+            let failed = retention.retry_private_steps().unwrap();
+            assert_eq!(failed.pending.pending_preparations, 1);
+            assert!(!failed.failures.is_empty(), "nonempty original private payload must be preserved");
+            let mut contents = String::new();
+            fs_safety::open_beneath(&payload, Path::new(&leaf)).unwrap().read_to_string(&mut contents).unwrap();
+            assert_eq!(contents, "original pending payload");
+            fs_safety::unlink_within(&payload, &leaf).unwrap();
+            let completed = retention.retry_private_steps().unwrap();
+            assert!(completed.pending.is_clear());
+            assert!(completed.failures.is_empty());
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(payload.metadata().unwrap().nlink(), 0, "only the exact empty private payload was removed");
+            assert_eq!(retained.report.state, original_state, "private cleanup is not journal reconciliation");
+            assert_eq!(retained.report.outcome, original_outcome);
+            assert!(retained.created.is_none(), "retry never grants a new settled capability");
+            assert_eq!(fixture.git(&["branch", "--list", "feature"]), "");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_preparation_retry_refuses_replacement_source_without_touching_original_or_foreign_data() {
+        if isolated_creation_fixture(concat!(module_path!(), "::private_preparation_retry_refuses_replacement_source_without_touching_original_or_foreign_data")) { return; }
+        let fixture = Fixture::new();
+        fs::create_dir(&fixture.request.managed_root).unwrap();
+        creation_authority::FAILED_PREPARATION_AT.with(|slot| *slot.borrow_mut() = Some(PathBuf::from(fixture.request.destination.file_name().unwrap())));
+        let scoped = fixture.service.with_worktree_authority(
+            WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+        let (sender, _) = async_channel::bounded(8);
+        let retained = scoped.create_worktree_journaled_retained(&fixture.store,
+            &fixture.request, 7, &CancellationToken::new(), &sender);
+        let retention = retained.retention().unwrap();
+        assert_eq!(retention.recovery_summary().pending_preparations, 1);
+        let (payload, leaf) = creation_authority::FAILED_PREPARATION_PAYLOAD.with(|slot| slot.borrow_mut().take()).unwrap();
+        let parked = fixture.directory.path().join("original-source");
+        fs::rename(&fixture.request.repository, &parked).unwrap();
+        fs::create_dir(&fixture.request.repository).unwrap();
+        fs::write(fixture.request.repository.join("foreign"), b"replacement source").unwrap();
+        assert!(retention.retry_private_steps().is_err());
+        assert_eq!(retention.recovery_summary().pending_preparations, 1);
+        assert_eq!(fs::read(fixture.request.repository.join("foreign")).unwrap(), b"replacement source");
+        assert!(fs_safety::metadata_beneath(&payload, Path::new(&leaf)).unwrap().is_file());
+        fs::rename(&fixture.request.repository, fixture.directory.path().join("preserved-foreign-source")).unwrap();
+        fs::rename(&parked, &fixture.request.repository).unwrap();
+        fs_safety::unlink_within(&payload, &leaf).unwrap();
+        assert!(retention.retry_private_steps().unwrap().pending.is_clear());
+        assert!(retained.created.is_none());
     }
 
     #[cfg(target_os = "linux")]

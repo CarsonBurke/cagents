@@ -66,8 +66,7 @@ fn durable_parent(
                         "The managed parent cannot prove creation ownership: {error}"
                     ))
                 })?;
-                fs_safety::create_directory_in_namespace(&namespace, &held, Path::new(name), 0o777)
-                    .map_err(filesystem)?
+                plan.create_directory(&namespace, &held, Path::new(name), 0o777)?
             }
             Err(error) => return Err(filesystem(error)),
         };
@@ -164,6 +163,8 @@ impl CreationEvidence {
 thread_local! {
     pub(super) static FAIL_AFTER_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AFTER_DIRECTORY_PUBLICATION: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+    pub(super) static FAILED_PREPARATION_AT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    pub(super) static FAILED_PREPARATION_PAYLOAD: std::cell::RefCell<Option<(fs_safety::Root, OsString)>> = const { std::cell::RefCell::new(None) };
 }
 
 struct Publication {
@@ -318,6 +319,15 @@ impl CreationSession {
             destination.validate()?;
         }
         Ok(())
+    }
+
+    pub(super) fn recovery_summary(&self) -> super::CreationPrivateRecoverySummary {
+        self.plan.recovery_summary()
+    }
+
+    pub(super) fn retry_private_steps(&self) -> Result<super::CreationPrivateRetry, RepositoryError> {
+        self.validate()?;
+        Ok(self.plan.retry_private_steps())
     }
 
     pub(super) fn has_destination(&self) -> bool {
@@ -641,6 +651,9 @@ pub(super) struct DestinationPlan {
     destination_relative: PathBuf,
     destination: PathBuf,
     publications: Mutex<Vec<fs_safety::DirectoryPublication>>,
+    preparations: Mutex<Vec<fs_safety::DirectoryPreparation>>,
+    pending_publications: std::sync::atomic::AtomicUsize,
+    pending_preparations: std::sync::atomic::AtomicUsize,
 }
 
 impl DestinationPlan {
@@ -689,7 +702,75 @@ impl DestinationPlan {
             ancestor: held,
             witness,
             publications: Mutex::new(Vec::new()),
+            preparations: Mutex::new(Vec::new()),
+            pending_publications: std::sync::atomic::AtomicUsize::new(0),
+            pending_preparations: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    fn create_directory(
+        &self,
+        namespace: &fs_safety::DirectoryNamespace,
+        parent: &fs_safety::Root,
+        relative: &Path,
+        mode: u32,
+    ) -> Result<fs_safety::DirectoryCreation, RepositoryError> {
+        #[cfg(test)]
+        let injected = FAILED_PREPARATION_AT.with(|target| {
+            if target.borrow().as_deref() != Some(relative) { return None; }
+            target.borrow_mut().take();
+            let stage = fs_safety::stage_directory_in_namespace(namespace, mode).unwrap();
+            let payload = stage.directory().try_clone().unwrap();
+            let (mut file, name) = fs_safety::create_temporary_in(&payload, 0o600).unwrap();
+            std::io::Write::write_all(&mut file, b"original pending payload").unwrap();
+            FAILED_PREPARATION_PAYLOAD.with(|slot| *slot.borrow_mut() = Some((payload, name)));
+            Some(stage.publish_new(parent, Path::new("../invalid-target")).map(fs_safety::DirectoryCreation::Published))
+        });
+        #[cfg(not(test))]
+        let injected: Option<Result<fs_safety::DirectoryCreation, fs_safety::DirectoryCreateError>> = None;
+        injected.unwrap_or_else(|| fs_safety::create_directory_in_namespace(namespace, parent, relative, mode))
+            .map_err(|mut error| {
+                if let Some(preparation) = error.take_recovery() {
+                    let mut retained = self.preparations.lock().unwrap_or_else(|p| p.into_inner());
+                    retained.push(preparation);
+                    self.pending_preparations.store(retained.iter().filter(|item| !item.is_resolved()).count(), std::sync::atomic::Ordering::Release);
+                }
+                // The typed preparation is retained BEFORE this diagnostic
+                // conversion, including producer errors before publication.
+                filesystem(error)
+            })
+    }
+
+    pub(super) fn recovery_summary(&self) -> super::CreationPrivateRecoverySummary {
+        super::CreationPrivateRecoverySummary {
+            pending_preparations: self.pending_preparations.load(std::sync::atomic::Ordering::Acquire),
+            pending_publications: self.pending_publications.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    fn publication_pending(receipt: &fs_safety::DirectoryPublication) -> bool {
+        receipt.publication_error().is_some() || receipt.pending_staging_path().is_some()
+            || receipt.recovery_path().is_some()
+    }
+
+    fn retry_private_steps(&self) -> super::CreationPrivateRetry {
+        let mut failures = Vec::new();
+        {
+            let mut preparations = self.preparations.lock().unwrap_or_else(|p| p.into_inner());
+            for receipt in preparations.iter_mut().filter(|receipt| !receipt.is_resolved()) {
+                if let Err(error) = receipt.retry_cleanup() { failures.push(error.to_string()); }
+            }
+            self.pending_preparations.store(preparations.iter().filter(|item| !item.is_resolved()).count(), std::sync::atomic::Ordering::Release);
+        }
+        {
+            let mut publications = self.publications.lock().unwrap_or_else(|p| p.into_inner());
+            for receipt in publications.iter_mut().filter(|receipt| Self::publication_pending(receipt)) {
+                // No public checkout removal or quarantine resolution here.
+                if let Err(error) = receipt.retry_publication_steps() { failures.push(error.to_string()); }
+            }
+            self.pending_publications.store(publications.iter().filter(|item| Self::publication_pending(item)).count(), std::sync::atomic::Ordering::Release);
+        }
+        super::CreationPrivateRetry { pending: self.recovery_summary(), failures }
     }
 
     /// Keep the exact producer receipt before any later fallible operation.
@@ -704,6 +785,7 @@ impl DestinationPlan {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         retained.push(publication);
+        self.pending_publications.store(retained.iter().filter(|item| Self::publication_pending(item)).count(), std::sync::atomic::Ordering::Release);
         let publication = retained.last().expect("just retained publication");
         if let Some(error) = publication.publication_error() {
             return Err(invalid(format!(
@@ -743,13 +825,7 @@ impl DestinationPlan {
         // unverified checkout that the journal could mistake for its own.
         let namespace = fs_safety::DirectoryNamespace::acquire(&parent)
             .map_err(|error| invalid(format!("The destination parent cannot prove creation ownership; no checkout was created: {error}")))?;
-        let publication = match fs_safety::create_directory_in_namespace(
-            &namespace,
-            &parent,
-            Path::new(&leaf),
-            0o777,
-        )
-        .map_err(filesystem)?
+        let publication = match self.create_directory(&namespace, &parent, Path::new(&leaf), 0o777)?
         {
             fs_safety::DirectoryCreation::Published(publication) => publication,
             fs_safety::DirectoryCreation::Existing(_)

@@ -14,6 +14,27 @@ pub struct RetainedWorktreeCreation {
     retention: Option<CreationRetention>,
 }
 
+/// A cheap in-process snapshot of private receipt obligations. Zero counts
+/// never mean the journal/outcome is reconciled, nor grant release or opening.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CreationPrivateRecoverySummary {
+    pub pending_preparations: usize,
+    pub pending_publications: usize,
+}
+impl CreationPrivateRecoverySummary {
+    pub fn is_clear(self) -> bool {
+        self.pending_preparations == 0 && self.pending_publications == 0
+    }
+}
+
+/// Result of original private steps only. This does not mutate a public
+/// checkout, settle an Unknown report, or create a new opening capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreationPrivateRetry {
+    pub pending: CreationPrivateRecoverySummary,
+    pub failures: Vec<String>,
+}
+
 /// Keeps original roots and unresolved private publication receipts alive.
 /// This is not a serialized recovery description and has no filesystem Drop.
 #[derive(Clone, Debug)]
@@ -34,12 +55,25 @@ impl CreationRetention {
     pub fn source(&self) -> &WorktreeAuthority {
         &self.source
     }
+    /// Nonblocking: reads only original-session atomic counters, with no
+    /// filesystem calls or worker-held recovery mutex acquisition.
+    pub fn recovery_summary(&self) -> CreationPrivateRecoverySummary {
+        self._session.recovery_summary()
+    }
+    /// Blocking-worker only. Retry original private preparation/mode/staging
+    /// steps; retain the SAME owner on failure. No public/quarantine removal.
+    pub fn retry_private_steps(&self) -> Result<CreationPrivateRetry, RepositoryError> {
+        self._session.retry_private_steps()
+    }
     #[cfg(test)]
     pub(super) fn session_weak(&self) -> std::sync::Weak<creation_authority::CreationSession> {
         Arc::downgrade(&self._session)
     }
 }
 
+/// Original scopes settled before unlock publication, with no known private
+/// preparation/staging obligation. Transfer the SAME carrier to the mounted
+/// card/acknowledged host owner; a path/record projection is not that transfer.
 #[derive(Clone, Debug)]
 pub struct SettledCreatedWorktree {
     operation: OperationId,
@@ -151,6 +185,9 @@ impl ActiveCreated {
             || worktree.lock.locked
         {
             return Err(invalid().into());
+        }
+        if !retention.recovery_summary().is_clear() {
+            return Err(ValidationError::Io("Private creation recovery is still pending; no settled opening authority was granted".into()).into());
         }
         self.source.validate()?;
         self.destination.validate()?;
