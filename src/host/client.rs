@@ -1492,6 +1492,7 @@ mod tests {
         let replacement = crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {}).unwrap();
         let current = {
             let mut state = host.lock().unwrap();
+            state.retire_terminal(session.id).expect("original terminal result");
             state.reserve_spawn(session.id).unwrap();
             state.finish_spawn(1, session.clone(), replacement.clone(), true).unwrap()
         };
