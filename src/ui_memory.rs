@@ -55,6 +55,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Gate<'_, Message> {
         self.0.as_widget().size()
     }
 
+    fn size_hint(&self) -> Size<Length> {
+        self.0.as_widget().size_hint()
+    }
+
     fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
         self.0.as_widget_mut().layout(&mut tree.children[0], renderer, limits)
     }
