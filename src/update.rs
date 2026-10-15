@@ -425,9 +425,16 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     }
     // A newly opened UI may already be current while an older daemon still
     // owns the sessions. Its own CLI must perform the preview and checkpoint.
-    installation.version =
-        installation_worker_version(&layout, &served, installed_daemon_owner(&layout)?.as_ref());
-    if served
+    let (source_protocol, source_proof) = source::inspect_identity(None)?;
+    let daemon_owner = installed_daemon_owner(&layout)?;
+    let new_coordinator_for_legacy_source = source_proof.is_some()
+        && source_protocol == 77 && crate::terminal_ipc::PROTOCOL_VERSION > 77;
+    // An unpatched77 owner CLI cannot run the newly installed pane inspector
+    // or source adapter. The new matched set owns this explicit migration.
+    installation.version = installation_worker_version(
+        &layout, &served, daemon_owner.as_ref(), new_coordinator_for_legacy_source,
+    );
+    if !new_coordinator_for_legacy_source && served
         == installation
             .prefix
             .join("versions")
@@ -451,7 +458,9 @@ fn installation_worker_version(
     window: &InstallLayout,
     served: &Path,
     daemon: Option<&InstallLayout>,
+    new_coordinator_for_legacy_source: bool,
 ) -> String {
+    if new_coordinator_for_legacy_source { return window.version.clone(); }
     // Once the candidate already owns the daemon, the old window's worker
     // must perform the remaining UI-only replacement. A current worker would
     // correctly reject replacing its own installation with itself.
@@ -982,7 +991,8 @@ fn perform_update(
     )?;
     verify_digest(&mut archive, &archive_hash)?;
     let staged = candidate::Staged::from_archive(&release, &archive, &archive_hash, &cancellation)?;
-    if staged.identity.protocol == crate::terminal_ipc::PROTOCOL_VERSION {
+    let (source_protocol, _) = source::inspect_identity(None)?;
+    if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
     let confirmed = confirmation::wait(state, job, |policy| {
@@ -1037,7 +1047,7 @@ fn perform_update(
         if let Some(daemon) = current.daemon {
             crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
             let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client = crate::control::ControlClient::connect(&socket)
+            let mut client = source::Client::connect(&socket)
                 .map_err(|error| invalid(error.to_string()))?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
@@ -1219,7 +1229,7 @@ fn observe_impact(
     policy: impact::Policy,
 ) -> Result<impact::Preview, UpdateError> {
     let socket = crate::terminal_ipc::daemon_socket_path()?;
-    let mut client = match crate::control::ControlClient::connect(&socket) {
+    let mut client = match source::Client::connect(&socket) {
         Ok(client) => Some(client),
         Err(crate::control::ControlError::Connect(error))
             if matches!(
@@ -1240,8 +1250,7 @@ fn observe_impact(
         }
         Err(error) => return Err(invalid(error.to_string())),
     };
-    let replaces_daemon =
-        client.is_some() && candidate.protocol != crate::terminal_ipc::PROTOCOL_VERSION;
+    let replaces_daemon = client.as_ref().is_some_and(|client| candidate.protocol != client.protocol());
     let daemon = if replaces_daemon {
         Some(
             client
@@ -2318,24 +2327,30 @@ sys.exit(7)
         let new = layout("new");
         // A newer UI cannot speak the old service's protocol.
         assert_eq!(
-            installation_worker_version(&new, &new.version_root, Some(&old)),
+            installation_worker_version(&new, &new.version_root, Some(&old), false),
             "old"
+        );
+        // The explicit protocol-77 adapter and pane inspector live in the new
+        // coordinator; delegating back to the unpatched source loses both.
+        assert_eq!(
+            installation_worker_version(&new, &new.version_root, Some(&old), true),
+            "new"
         );
         // Once that service is already new, the old UI still needs replacement:
         // selecting the new worker would reject its candidate as itself.
         assert_eq!(
-            installation_worker_version(&old, &new.version_root, Some(&new)),
+            installation_worker_version(&old, &new.version_root, Some(&new), false),
             "old"
         );
         // Repeated staging must use the actual owner, not the window or current.
         let staged = layout("third");
         assert_eq!(
-            installation_worker_version(&old, &staged.version_root, Some(&new)),
+            installation_worker_version(&old, &staged.version_root, Some(&new), false),
             "new"
         );
         // Without a service, the old window's worker can start the candidate.
         assert_eq!(
-            installation_worker_version(&old, &new.version_root, None),
+            installation_worker_version(&old, &new.version_root, None, false),
             "old"
         );
     }

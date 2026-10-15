@@ -73,7 +73,12 @@ pub(super) fn perform(
     root: &Path,
 ) -> Result<(), UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
-    if served_version_root(&layout)? != root || root == layout.version_root {
+    let (source_protocol, source_proof) = source::inspect_identity(None)?;
+    // Never move a same-namespace service owned by another installation.
+    let _source_owner = installed_daemon_owner(&layout)?;
+    let legacy_source = source_proof.is_some() && source_protocol == 77
+        && crate::terminal_ipc::PROTOCOL_VERSION > 77;
+    if served_version_root(&layout)? != root || (root == layout.version_root && !legacy_source) {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
@@ -110,7 +115,7 @@ pub(super) fn perform(
         }
         staged.preview(policy)
     };
-    if staged.identity.protocol == crate::terminal_ipc::PROTOCOL_VERSION {
+    if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
     let confirmed = confirmation::wait(state, job, observe)?;
@@ -157,7 +162,7 @@ pub(super) fn perform(
         if let Some(daemon) = current.daemon {
             crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
             let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client = crate::control::ControlClient::connect(&socket)
+            let mut client = source::Client::connect(&socket)
                 .map_err(|error| invalid(error.to_string()))?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
