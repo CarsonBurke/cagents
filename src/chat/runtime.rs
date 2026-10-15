@@ -21,9 +21,11 @@ use std::{
     time::{Duration, Instant},
 };
 mod execution;
+mod directory;
 mod store;
 mod websocket;
 use store::Store;
+pub(crate) use directory::DirectoryProof;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
@@ -37,6 +39,10 @@ const FRAMES_PER_POLL: usize = 256;
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
     RelocateExecutionDirectory(std::path::PathBuf),
+    CaptureExecutionDirectory {
+        directory: std::path::PathBuf,
+        proof: crossbeam_channel::Sender<Result<DirectoryProof, String>>,
+    },
     UpdateSource(
         super::Session,
         Option<crate::model::LaunchRecipe>,
@@ -1917,6 +1923,12 @@ impl Actor {
                 continue;
             }
             let (run, command) = match command {
+                ActorCommand::CaptureExecutionDirectory { directory, proof } => {
+                    let result = directory::capture(self, &directory);
+                    let _ = proof.send(result);
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
                 ActorCommand::Provider { run, command } => (run, command),
                 ActorCommand::RelocateExecutionDirectory(directory) => {
                     let result: Result<(), String> = (|| {
