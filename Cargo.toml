@@ -183,6 +183,8 @@ portable-pty = { version = "0.9", features = ["serde_support"], optional = true 
 # resolved dependency graph, needs no additional crates, and its externally
 # tagged enum encoding is why the wire enums below carry no `serde(tag)`.
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# Shared bounded notification excerpts use the UI CommonMark parser.
+pulldown-cmark = { version = "0.12.2", default-features = false }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false, optional = true }
 resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
 roxmltree = { version = "0.20", optional = true }

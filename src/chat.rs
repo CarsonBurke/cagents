@@ -5,6 +5,7 @@ use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
+pub mod notification;
 pub mod presentation;
 pub mod pricing;
 mod restart;
@@ -937,6 +938,10 @@ impl PromptSuggestion {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Bounded live-turn metadata; excluded from transcript and wire snapshots.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub notification_preview: std::sync::Arc<notification::Preview>,
     /// Daemon wall-clock milliseconds sampled for this publication. Clients
     /// advance this with their monotonic clock instead of comparing timestamps
     /// from two machines. Absent only in older data and synthetic snapshots.
