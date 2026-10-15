@@ -32,7 +32,7 @@ pub(crate) use provider_exit::Output as ProviderExitOutput;
 mod diagnostic_read;
 pub(crate) use diagnostic_read::{
     DiagnosticAuthority, DiagnosticCompletion, DiagnosticCopyCompletion, DiagnosticCopyInterest,
-    DiagnosticCopyReceipt, DiagnosticOutput, DiagnosticReadRequest, DiagnosticSource,
+    DiagnosticCopyReceipt, DiagnosticCopySummary, DiagnosticOutput, DiagnosticReadRequest, DiagnosticSource,
 };
 
 // Keep ordinary request IDs below the local-query namespace. This prevents
@@ -1063,14 +1063,21 @@ impl ClientHandle {
                     wake(Wake::Changed);
                     return;
                 }
-                if let Some(reply) = envelope.request_id.and_then(|request| diagnostic_pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&request)) {
+                if let Some(mut pending) = envelope.request_id.and_then(|request| diagnostic_pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&request)) {
+                    let ownership = pending.ownership.take();
                     let result = match envelope.message {
                         ServerMessage::Response { response: ServerResponse::ChatProviderExitOutput { chat_id, log_id, offset, bytes, next_offset, omitted } } if chat_id == id =>
-                            Ok(provider_exit::Page { log_id, offset, bytes, next_offset, omitted }),
-                        ServerMessage::Error(error) => Err(error.message),
-                        _ => Err("Unexpected provider output reply".into()),
+                            Ok(provider_exit::Page { log_id, offset, bytes, next_offset, omitted, _ownership: ownership }),
+                        ServerMessage::Error(error) => {
+                            let compact = provider_exit::compact_error(error.message);
+                            drop(ownership); // Original error allocation is gone; only <=512-byte metadata remains.
+                            Err(compact)
+                        }
+                        _ => { drop(ownership); Err("Unexpected provider output reply".into()) },
                     };
-                    let _ = reply.try_send(result);
+                    if let Some(reply) = pending.reply { let _ = reply.try_send(result); }
+                    // With no waiter, result drops here on the reader. Its
+                    // decoded Page Vec is destroyed before the attached lease.
                     continue;
                 }
                 // Timed-out/cancelled local queries retain their namespace even
@@ -2074,7 +2081,7 @@ mod tests {
         assert_eq!(activity.take(), ActivityState::Working);
     }
 
-    fn host_proof(incarnation: &str) -> HostSessionProof {
+    pub(super) fn host_proof(incarnation: &str) -> HostSessionProof {
         use crate::model::{BootId, HostIncarnation, HostSessionId};
         HostSessionProof {
             host_session_id: HostSessionId::new("session"),
@@ -2085,7 +2092,7 @@ mod tests {
 
     /// The live installation's own card: a native OMP conversation whose
     /// persisted launch names its session directory and nothing else.
-    fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
+    pub(super) fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
         Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,
