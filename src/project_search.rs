@@ -221,8 +221,7 @@ pub fn search(
             };
             bytes.truncate(read);
             let mut invalid_file = false;
-            let tail_start =
-                memchr::memrchr2(b'\r', b'\n', &bytes).map_or(0, |index| index + 1);
+            let tail_start = memchr::memrchr2(b'\r', b'\n', &bytes).map_or(0, |index| index + 1);
             if tail_start != bytes.len() {
                 match complete_native_line(&mut reader, &mut bytes, tail_start, cancellation) {
                     Ok(eof) => finished = eof,
@@ -236,9 +235,7 @@ pub fn search(
             // CRLF and LFCR are one native editor line ending, including when
             // their two bytes straddle this block. Consume only the paired
             // second byte; a repeated terminator starts another empty line.
-            if !finished
-                && let Some(ending) = unpaired_ending(&bytes)
-            {
+            if !finished && let Some(ending) = unpaired_ending(&bytes) {
                 loop {
                     if cancellation.is_cancelled() {
                         return;
