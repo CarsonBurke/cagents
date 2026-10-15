@@ -613,7 +613,12 @@ impl Journal {
     /// Called with the journal mutex held after the provider has joined and
     /// final input completions have drained. No later semantic append is valid.
     pub fn seal_for_retirement(&mut self) -> Result<(), String> {
-        if self.acknowledged()? != self.latest()?
+        // Retirement is infrequent and already outside the live reducer.
+        // Confirm the actual durable queue is empty as well as its cached
+        // clocks; storage faults may make a cache an insufficient disposition.
+        let queued: u64 = self.db.query_row("SELECT COUNT(*) FROM outcomes", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if queued != 0 || self.acknowledged()? != self.latest()?
             || self.last_loss.as_ref().is_some_and(|loss| !loss.acknowledged)
         {
             return Err("Unacknowledged semantic evidence cannot become disposable cache".into());
@@ -730,6 +735,22 @@ mod tests {
         assert!(directory.join("actor-journal.sqlite").exists());
         assert_eq!(journal.page(0).unwrap().len(), 1);
         assert!(!crate::transcript_cache::remove_if_reclaimable(&directory).unwrap());
+    }
+
+    #[test]
+    fn cache_clocks_cannot_hide_a_durable_semantic_row_from_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        let update = Update::Attention(crate::notifications::Evidence {
+            key: "durable-row-without-cache-publication".into(), kind: crate::notifications::Kind::Succeeded,
+        });
+        // Deterministically model durable commit/cache-publication divergence;
+        // this is not an asserted reproduction of a particular SQLite failure.
+        journal.db.execute("INSERT INTO outcomes(payload) VALUES(?1)",
+            [serde_json::to_vec(&update).unwrap()]).unwrap();
+        assert_eq!(journal.acknowledged().unwrap(), journal.latest().unwrap());
+        assert!(journal.seal_for_retirement().is_err());
+        assert!(journal.allow_retired_cache_removal().is_err());
     }
 
     #[test]
