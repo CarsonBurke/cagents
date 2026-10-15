@@ -918,7 +918,7 @@ mod tests {
                 &mut messages,
             );
             let decisions = messages.iter().filter(|message| matches!(message,
-                cosmic::Action::App(Message::ModalSurface { message, .. }) if matches!(&**message, Message::Sidebar(SidebarAction::ConfirmDiscard { .. })))).count();
+                cosmic::Action::App(Message::ModalSurface { message, .. }) if matches!(&**message, Message::Sidebar(action) if answers_discard_confirmation(action)))).count();
             assert_eq!(
                 decisions,
                 usize::from(!replace),
@@ -941,7 +941,7 @@ mod tests {
                     &mut messages,
                 );
                 assert!(messages.iter().any(|message| matches!(message,
-                    cosmic::Action::App(Message::ModalSurface { target, message }) if *target == current && matches!(&**message, Message::Sidebar(SidebarAction::ConfirmDiscard { .. })))),
+                    cosmic::Action::App(Message::ModalSurface { target, message }) if *target == current && matches!(&**message, Message::Sidebar(action) if answers_discard_confirmation(action)))),
                     "a fresh intentional click still reaches the replacement control");
             }
         }
