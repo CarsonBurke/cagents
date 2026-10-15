@@ -175,6 +175,34 @@ pub(super) struct State {
     slots: Vec<Slot>,
 }
 impl State {
+    pub fn has_inflight(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.0.lock().unwrap_or_else(|e| e.into_inner()).running)
+    }
+    pub fn unresolved_authorities(&self) -> Vec<crate::recovery_authority::RecoveryAuthority> {
+        self.slots
+            .iter()
+            .filter_map(|slot| {
+                slot.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .receipt
+                    .as_ref()
+                    .and_then(|receipt| receipt.live_recovery.authority())
+            })
+            .filter(|authority| !authority.is_resolved())
+            .collect()
+    }
+    pub fn close_block_reason(&self) -> Option<&'static str> {
+        if self.has_inflight() {
+            Some("Wait for discard or Undo to finish before closing.")
+        } else if !self.unresolved_authorities().is_empty() {
+            Some("Resolve the pending discard recovery before closing.")
+        } else {
+            None
+        }
+    }
     pub fn source(&self) -> Option<&ReadSource> {
         self.active.as_ref()
     }
@@ -407,6 +435,7 @@ mod tests {
             .unwrap();
         assert_eq!(slot.source_id(), source.id);
         assert_eq!(state.slots.len(), 1);
+        assert!(state.close_block_reason().is_some());
         state.select(None);
         assert_eq!(
             state.slots.len(),
@@ -416,6 +445,7 @@ mod tests {
         slot.cancel_before_start();
         state.prune();
         assert!(state.slots.is_empty());
+        assert!(state.close_block_reason().is_none());
     }
     #[test]
     fn discard_original_snapshot_source_never_recaptures_replacement_on_refresh() {

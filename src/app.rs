@@ -11740,6 +11740,10 @@ impl Cagents {
     /// application that spawned it. The wait is bounded by the module's own
     /// reap timeout, so a server that refuses to die cannot hold the exit.
     fn exit_after_language_servers(&mut self) -> Task<Message> {
+        if let Some(reason) = self.discard_ui.close_block_reason() {
+            self.status = Some(TransientNotice::error(reason));
+            return Task::none();
+        }
         if self.exit.is_some() {
             return Task::none();
         }
