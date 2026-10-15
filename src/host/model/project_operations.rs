@@ -176,6 +176,8 @@ impl Registry {
         }
         let scope_json=bounded_scope(scope)?;
         let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|error|error.to_string())?;
+        // Actual cumulative19 guard (Automation c413), inside this writer TX.
+        schema::require_current_write(&tx)?;
         if let Some(existing)=read(&tx,operation)? {
             if existing.request_digest!=request_digest || existing.commit_digest!=commit_digest
                 || existing.scope.as_ref().is_some_and(|original|original!=scope) {
@@ -200,10 +202,12 @@ impl Registry {
             | (Phase::Repairing|Phase::Closing,Phase::PendingCommit)
             | (Phase::ModelCommitted,Phase::Resolved));
         if !allowed {return Err("Invalid project operation phase transition".into());}
-        let changed=self.db.execute("UPDATE project_operation_obligations SET phase=?4,scope=CASE WHEN ?4 IN ('resolved','aborted') THEN NULL ELSE scope END WHERE operation=?1 AND request_digest=?2 AND phase=?3",
+        let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|error|error.to_string())?;
+        schema::require_current_write(&tx)?;
+        let changed=tx.execute("UPDATE project_operation_obligations SET phase=?4,scope=CASE WHEN ?4 IN ('resolved','aborted') THEN NULL ELSE scope END WHERE operation=?1 AND request_digest=?2 AND phase=?3",
             params![operation.to_string(),request_digest,expected.text(),next.text()]).map_err(|error|error.to_string())?;
         if changed!=1 {return Err("The original project operation custody phase changed".into());}
-        Ok(())
+        tx.commit().map_err(|error|error.to_string())
     }
     /// Startup uses these as negative scopes only. No factory or path-based
     /// recreation of the original in-memory prepared phase is permitted.
@@ -220,6 +224,7 @@ impl Registry {
 /// not a second check-then-write boundary and cannot accept a different edit.
 pub(super) fn model_committed(tx:&rusqlite::Transaction<'_>,operation:Uuid,
     request_digest:&str,edit:&ModelEdit)->Result<(),String> {
+    schema::require_current_write(tx)?;
     let row=read(tx,operation)?.ok_or("The original project operation obligation is missing")?;
     if row.phase!=Phase::PendingCommit || row.request_digest!=request_digest || row.commit_digest!=digest(edit)? {
         return Err("The guarded model edit does not match its prepared project operation".into());
@@ -295,6 +300,31 @@ mod tests {
         assert!(settled.committed_sequence.is_some());assert!(registry.pending_project_operations().unwrap().is_empty());
         let replay=registry.begin_project_operation(operation,&request,&digest(&edit).unwrap(),&scope).unwrap();
         assert_eq!(replay.phase,Phase::Resolved,"settled replay must never recreate a lease or repeat effects");
+    }
+    #[test]
+    fn retained_registry_rechecks_schema_inside_every_custody_write_transaction() {
+        for future in [false,true] {
+            let (mut registry,dir,scope)=setup();
+            let operation=Uuid::new_v4();let request=digest(&scope.project).unwrap();
+            let edit=ModelEdit::CloseProjectInstance{project:scope.project.clone()};
+            registry.begin_project_operation(operation,&request,&digest(&edit).unwrap(),&scope).unwrap();
+            registry.advance_project_operation(operation,&request,Phase::Admitted,Phase::PendingCommit).unwrap();
+            let advancing=Uuid::new_v4();registry.begin_project_operation(advancing,&request,&digest(&edit).unwrap(),&scope).unwrap();
+            let other=Connection::open(dir.path().join("registry.sqlite3")).unwrap();
+            if future {other.pragma_update(None,"user_version",20).unwrap();}
+            else {other.execute_batch("ALTER TABLE projects ADD COLUMN foreign_layout TEXT").unwrap();}
+            let before:Vec<String>=registry.db.prepare("SELECT operation||':'||phase||':'||scope FROM project_operation_obligations ORDER BY operation").unwrap()
+                .query_map([],|row|row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert!(registry.begin_project_operation(Uuid::new_v4(),&request,&digest(&edit).unwrap(),&scope).is_err());
+            assert!(registry.advance_project_operation(advancing,&request,Phase::Admitted,Phase::Closing).is_err());
+            // This separately exercises a valid transition, not only its phase validator.
+            let tx=registry.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            assert!(model_committed(&tx,operation,&request,&edit).is_err());
+            tx.rollback().unwrap();
+            let after:Vec<String>=registry.db.prepare("SELECT operation||':'||phase||':'||scope FROM project_operation_obligations ORDER BY operation").unwrap()
+                .query_map([],|row|row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert_eq!(after,before,"a stale connection cannot publish a custody mutation");
+        }
     }
     #[test]
     fn negative_scope_size_and_pending_capacity_refuse_without_evicting_originals() {
