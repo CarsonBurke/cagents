@@ -3966,6 +3966,12 @@ pub enum Message {
         query: String,
         result: Result<Vec<repository_widget::RepositoryFile>, String>,
     },
+    SourceControlAmendMessage {
+        key: ActiveWorktreeKey,
+        revision: u64,
+        head: crate::repository::Oid,
+        result: Result<String, String>,
+    },
     /// One page of the bound worktree's history.
     SourceControlHistory {
         generation: u64,
@@ -14419,13 +14425,33 @@ impl Application for Cagents {
                     | SidebarAction::CommitEditorCursor { .. }
                     | SidebarAction::CommitSubjectEditorAction { .. }
                     | SidebarAction::CommitEditorAction { .. }
-                    | SidebarAction::AmendChanged { .. }
                     | SidebarAction::PublishRemoteChanged { .. }
                     | SidebarAction::PublishBranchChanged { .. }
                     | SidebarAction::CancelPublish
                     // `apply` already cleared the pending discard, and the
                     // dialog it was driving is gone with it.
                     | SidebarAction::CancelDiscard => Task::none(),
+                    SidebarAction::AmendChanged { key, amend } => {
+                        let Some(revision) = self.sidebar_state.amend_request_revision().filter(|_| amend) else {
+                            return Task::none();
+                        };
+                        let Some(head) = self.sidebar_model.source_control.as_ref()
+                            .and_then(|source| source.head_oid.as_deref())
+                            .and_then(|oid| crate::repository::Oid::parse_object(oid).ok()) else {
+                            self.sidebar_state.finish_amend_read(&key, revision);
+                            return Task::none();
+                        };
+                        cosmic::task::future(async move {
+                            let worktree = key.canonical_path.clone();
+                            let pinned = head.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                RepositoryService::system("git").commit_message(&worktree, &pinned, &CancellationToken::default())
+                                    .map_err(|error| error.to_string())
+                            }).await.map_err(|error| format!("amend reader join failed: {error}"))
+                                .and_then(|result| result);
+                            Message::SourceControlAmendMessage { key, revision, head, result }
+                        })
+                    }
                     SidebarAction::RequestDiscard { .. } => {
                         if self.sidebar_state.pending_discard().is_some() {
                             iced::widget::operation::focus(sidebar::discard_confirm_id())
@@ -16339,6 +16365,41 @@ impl Application for Cagents {
                         Task::none()
                     }
                 }
+            }
+            Message::SourceControlAmendMessage {
+                key,
+                revision,
+                head,
+                result,
+            } => {
+                let bound = self.source_control_is_bound(&key);
+                let same_head = !bound
+                    || self
+                        .sidebar_model
+                        .source_control
+                        .as_ref()
+                        .is_some_and(|source| source.head_oid.as_deref() == Some(head.as_str()));
+                if same_head {
+                    match result {
+                        Ok(message) => {
+                            self.sidebar_state
+                                .load_amend_message(&key, revision, &message);
+                        }
+                        Err(error) => {
+                            self.sidebar_state.finish_amend_read(&key, revision);
+                            if let Some(source) =
+                                self.sidebar_model.source_control.as_mut().filter(|_| bound)
+                            {
+                                source.set_error(Some(format!(
+                                    "Could not load HEAD’s message: {error}"
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    self.sidebar_state.finish_amend_read(&key, revision);
+                }
+                Task::none()
             }
             Message::SourceControlHistory {
                 generation,

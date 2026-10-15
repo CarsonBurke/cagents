@@ -2721,7 +2721,28 @@ struct CommitDraft {
     subject_composer: CommitComposer,
     composer: CommitComposer,
     amend: bool,
+    amend_stash: Option<Box<CommitDraft>>,
+    amend_loaded_message: Option<String>,
+    amend_loading: bool,
     revision: u64,
+}
+
+impl CommitDraft {
+    fn set_message(&mut self, message: &str) {
+        self.message = message.to_owned();
+        let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
+        self.subject = subject.to_owned();
+        self.subject_composer = CommitComposer(
+            cosmic::iced::widget::text_editor::Content::with_text(subject),
+        );
+        self.composer = CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
+            description.trim_start_matches('\n'),
+        ));
+    }
+}
+
+fn head_is_pushed(tracking: &TrackingState) -> bool {
+    matches!(tracking, TrackingState::Compared { ahead: 0, .. })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -3075,6 +3096,44 @@ impl SidebarState {
         }
     }
 
+    pub fn amend_request_revision(&self) -> Option<u64> {
+        self.commit_draft
+            .amend_loading
+            .then_some(self.commit_draft.revision)
+    }
+
+    /// A delayed read must never overwrite typing, a later toggle, or another tree.
+    pub fn load_amend_message(
+        &mut self,
+        key: &ActiveWorktreeKey,
+        revision: u64,
+        message: &str,
+    ) -> bool {
+        let draft = if self.active_worktree.as_ref() == Some(key) {
+            Some(&mut self.commit_draft)
+        } else {
+            self.parked_commit_drafts.get_mut(&key.canonical_path)
+        };
+        let Some(draft) = draft.filter(|draft| draft.amend && draft.revision == revision) else {
+            return false;
+        };
+        draft.set_message(message);
+        draft.amend_loaded_message = Some(message.to_owned());
+        draft.amend_loading = false;
+        true
+    }
+
+    pub fn finish_amend_read(&mut self, key: &ActiveWorktreeKey, revision: u64) {
+        let draft = if self.active_worktree.as_ref() == Some(key) {
+            Some(&mut self.commit_draft)
+        } else {
+            self.parked_commit_drafts.get_mut(&key.canonical_path)
+        };
+        if let Some(draft) = draft.filter(|draft| draft.revision == revision) {
+            draft.amend_loading = false;
+        }
+    }
+
     fn revise_commit_draft(&mut self) {
         self.commit_generation = self.commit_generation.wrapping_add(1);
         self.commit_draft.revision = self.commit_generation;
@@ -3255,16 +3314,8 @@ impl SidebarState {
             }
             SidebarAction::CommitMessageChanged { message, .. } => {
                 self.revise_commit_draft();
-                self.commit_draft.message.clone_from(message);
-                let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
-                self.commit_draft.subject = subject.to_owned();
-                self.commit_draft.subject_composer = CommitComposer(
-                    cosmic::iced::widget::text_editor::Content::with_text(subject),
-                );
-                self.commit_draft.composer =
-                    CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
-                        description.trim_start_matches('\n'),
-                    ));
+                self.commit_draft.amend_loading = false;
+                self.commit_draft.set_message(message);
             }
             SidebarAction::CommitSubjectEditorCursor { cursor, .. } => {
                 self.commit_draft.subject_composer.0.move_to(*cursor);
@@ -3275,6 +3326,7 @@ impl SidebarState {
             SidebarAction::CommitSubjectEditorAction { action, .. } => {
                 self.commit_draft.subject_composer.0.perform(action.clone());
                 if action.is_edit() {
+                    self.commit_draft.amend_loading = false;
                     self.revise_commit_draft();
                     let text = self.commit_draft.subject_composer.0.text();
                     self.commit_draft.subject = text.lines().collect::<Vec<_>>().join(" ");
@@ -3294,6 +3346,7 @@ impl SidebarState {
             SidebarAction::CommitEditorAction { action, .. } => {
                 self.commit_draft.composer.0.perform(action.clone());
                 if action.is_edit() {
+                    self.commit_draft.amend_loading = false;
                     self.revise_commit_draft();
                     self.commit_draft.message = compose_commit_message(
                         &self.commit_draft.subject,
@@ -3303,6 +3356,24 @@ impl SidebarState {
             }
             SidebarAction::AmendChanged { amend, .. } => {
                 if self.commit_draft.amend != *amend {
+                    if *amend {
+                        let stash = std::mem::take(&mut self.commit_draft);
+                        self.commit_draft.set_message(&stash.message);
+                        self.commit_draft.amend_stash = Some(Box::new(stash));
+                        self.commit_draft.amend_loaded_message = None;
+                        self.commit_draft.amend_loading = true;
+                    } else {
+                        let unchanged = self.commit_draft.amend_loaded_message.as_deref()
+                            == Some(self.commit_draft.message.as_str());
+                        let pending = self.commit_draft.amend_loading;
+                        if let Some(stash) = self.commit_draft.amend_stash.take()
+                            && (unchanged || pending)
+                        {
+                            self.commit_draft = *stash;
+                        }
+                        self.commit_draft.amend_loaded_message = None;
+                        self.commit_draft.amend_loading = false;
+                    }
                     self.revise_commit_draft();
                     self.commit_draft.amend = *amend;
                 }
@@ -8424,6 +8495,7 @@ fn changes_footer<'a>(
     let input_key = key.clone();
     let can_commit = !modal_open
         && !source.busy()
+        && !state.commit_draft.amend_loading
         && !state.commit_draft.subject.trim().is_empty()
         && (source.staged_count > 0 || (state.commit_draft.amend && source.head_oid.is_some()));
     let commit_action = SidebarAction::Commit {
@@ -8558,6 +8630,14 @@ fn changes_footer<'a>(
 
     if has_subject {
         column = column.push(commit_input);
+    }
+    if state.commit_draft.amend_loading {
+        column = column.push(design::caption("Loading HEAD’s commit message…"));
+    }
+    if state.commit_draft.amend && head_is_pushed(&source.tracking) {
+        column = column.push(design::caption(
+            "HEAD is already pushed; amending will require a force push.",
+        ));
     }
     let amend = crate::ui_controls::field::checkbox(state.commit_draft.amend)
         .label("Amend")
@@ -16109,6 +16189,115 @@ pub(crate) mod tests {
         assert!(state.sync_active_worktree(&emptied, &SidebarFocus::None));
         assert_eq!(state.active_worktree(), None);
         assert!(bound_source_control(&emptied, &state).is_none());
+    }
+
+    #[test]
+    fn amend_loads_head_and_restores_the_complete_draft_unless_edited() {
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let key = main_key();
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "My draft\n\nDraft body".into(),
+        });
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        assert!(state.load_amend_message(&key, revision, "HEAD subject\n\nHEAD body\n"));
+        assert_eq!(state.commit_draft.subject, "HEAD subject");
+        assert!(
+            state
+                .commit_draft
+                .composer
+                .0
+                .text()
+                .starts_with("HEAD body")
+        );
+        assert_eq!(state.commit_message(), "HEAD subject\n\nHEAD body\n");
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert_eq!(state.commit_message(), "My draft\n\nDraft body");
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        assert!(state.load_amend_message(&key, revision, "HEAD subject"));
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Edited amend message".into(),
+        });
+        state.apply(&SidebarAction::AmendChanged { key, amend: false });
+        assert_eq!(state.commit_message(), "Edited amend message");
+    }
+
+    #[test]
+    fn amend_reads_cannot_overwrite_typing_or_a_later_toggle_and_can_settle_parked_drafts() {
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let key = main_key();
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let old = state.amend_request_revision().unwrap();
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Typing".into(),
+        });
+        assert!(!state.load_amend_message(&key, old, "Stale"));
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert_eq!(state.commit_message(), "Typing");
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        state.sync_active_worktree(&model, &focus_on(&fix_key()));
+        assert!(state.load_amend_message(&key, revision, "Parked HEAD"));
+        state.sync_active_worktree(&model, &focus_on(&key));
+        assert_eq!(state.commit_message(), "Parked HEAD");
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert_eq!(state.commit_message(), "Typing");
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.amend_request_revision().unwrap();
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert!(!state.load_amend_message(&key, revision, "Too late"));
+        assert_eq!(state.commit_message(), "Typing");
+    }
+
+    #[test]
+    fn amend_pushed_head_warning_requires_a_measured_zero_ahead_count() {
+        assert!(head_is_pushed(&TrackingState::Compared {
+            upstream: "origin/main".into(),
+            ahead: 0,
+            behind: 3
+        }));
+        assert!(!head_is_pushed(&TrackingState::Compared {
+            upstream: "origin/main".into(),
+            ahead: 1,
+            behind: 0
+        }));
+        assert!(!head_is_pushed(&TrackingState::NoUpstream));
+        assert!(!head_is_pushed(&TrackingState::Unknown {
+            upstream: Some("origin/main".into())
+        }));
     }
 
     #[test]

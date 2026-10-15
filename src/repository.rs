@@ -3795,6 +3795,32 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
+    /// Read a pinned commit message for the amend composer without walking history.
+    pub fn commit_message(
+        &self,
+        worktree: &Path,
+        oid: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<String, RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            [
+                "show",
+                "--no-patch",
+                "--no-notes",
+                "--no-show-signature",
+                "--format=format:%B",
+                oid.as_str(),
+                "--",
+            ],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        String::from_utf8(output.stdout).map_err(|error| RepositoryError::InvalidOutput {
+            field: "commit_message",
+            reason: error.to_string(),
+        })
+    }
+
     /// The commit HEAD points at, or `None` on an unborn branch.
     pub fn resolve_head(
         &self,
@@ -6915,6 +6941,53 @@ mod tests {
                 command
                     .arguments
                     .contains(&OsString::from("--untracked-files=no"))
+            );
+        }
+
+        #[test]
+        fn amend_message_reader_preserves_the_original_message_and_pins_its_commit() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            git(root, &["config", "user.name", "Fixture"]);
+            git(root, &["config", "user.email", "fixture@example.invalid"]);
+            fs::write(root.join("file.txt"), "first\n").unwrap();
+            git(root, &["add", "file.txt"]);
+            git(
+                root,
+                &[
+                    "commit",
+                    "-m",
+                    "Original subject\n\nMultiline body\nSecond line",
+                ],
+            );
+            let cancel = CancellationToken::new();
+            let service = service();
+            let original = service.resolve_head(root, &cancel).unwrap().unwrap();
+            let message = service.commit_message(root, &original, &cancel).unwrap();
+            assert_eq!(message, "Original subject\n\nMultiline body\nSecond line\n");
+            fs::write(root.join("file.txt"), "second\n").unwrap();
+            git(root, &["add", "file.txt"]);
+            let outcome = service
+                .commit_with_amend(
+                    &CommitRequest {
+                        worktree: root.to_path_buf(),
+                        message: message.clone(),
+                    },
+                    true,
+                    &cancel,
+                )
+                .unwrap();
+            assert!(matches!(outcome, CommitOutcome::Created { .. }));
+            let amended = service.resolve_head(root, &cancel).unwrap().unwrap();
+            assert_ne!(amended, original);
+            assert_eq!(
+                service.commit_message(root, &amended, &cancel).unwrap(),
+                message
+            );
+            assert_eq!(
+                service.commit_message(root, &original, &cancel).unwrap(),
+                message
             );
         }
 
