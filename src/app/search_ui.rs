@@ -596,6 +596,7 @@ mod tests {
             .unwrap()
             .repository
             .clone();
+        let probed_root=app.project_root(app.sidebar_model.project(root.project_id).unwrap());
         app.search_ui.root = Some(root.clone());
         app.context_tab = ContextTab::Search;
         app.search_ui.options.query = "needle".into();
@@ -607,6 +608,7 @@ mod tests {
             app.update_project_recovery(super::project_recovery_ui::Action::Checked(vec![(
                 root.project_id,
                 repository.clone(),
+                probed_root.clone(),
                 Some("missing".into()),
             )])),
         );
@@ -638,6 +640,7 @@ mod tests {
             app.update_project_recovery(super::project_recovery_ui::Action::Checked(vec![(
                 root.project_id,
                 repository,
+                probed_root,
                 None,
             )])),
         );

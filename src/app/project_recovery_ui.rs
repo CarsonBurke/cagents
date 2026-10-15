@@ -16,8 +16,8 @@ pub(super) struct State {
 #[derive(Debug, Clone)]
 pub enum Action {
     Tick,
-    Checked(Vec<(ProjectId, PathBuf, Option<String>)>),
-    AvailabilityChecked(Vec<(ProjectId, PathBuf, Option<String>, bool)>),
+    Checked(Vec<(ProjectId, PathBuf, PathBuf, Option<String>)>),
+    AvailabilityChecked(Vec<(ProjectId, PathBuf, PathBuf, Option<String>, bool)>),
     Command(ProjectId, ProjectRecoveryAction),
     VerifyProject(ProjectId),
     SessionDetails(CardId),
@@ -315,8 +315,8 @@ impl Cagents {
         // Preserve the direct probe fixture/API while the live worker also
         // verifies alternative checkouts before declaring a whole Git project missing.
         let action=match action {
-            Action::Checked(projects)=>Action::AvailabilityChecked(projects.into_iter().map(|(id,path,reason)| {
-                let available=reason.is_none(); (id,path,reason,available)
+            Action::Checked(projects)=>Action::AvailabilityChecked(projects.into_iter().map(|(id,path,root,reason)| {
+                let available=reason.is_none(); (id,path,root,reason,available)
             }).collect()),
             action=>action,
         };
@@ -351,7 +351,7 @@ impl Cagents {
                                     crate::project_location::read_checkout(&path,checkout.as_deref(),Some(&root)).is_some()
                                     || worktrees.iter().any(|worktree|crate::project_location::read_checkout(&path,Some(worktree),None).is_some())
                                 );
-                                (id,path,reason,available)
+                                (id,path,root,reason,available)
                             })
                             .collect()
                     })
@@ -364,12 +364,18 @@ impl Cagents {
             Action::AvailabilityChecked(projects) => {
                 self.project_recovery_ui.checking = false;
                 let mut tasks = Vec::new();
-                for (id, path, reason, available) in projects {
+                for (id, path, probed_root, reason, available) in projects {
                     let missing = reason.is_some() && !available;
                     let known_root = self
                         .sidebar_model
                         .project(id)
                         .map(|project| self.project_root(project));
+                    if known_root.as_ref()!=Some(&probed_root) {
+                        // Same-key external-gitdir Locate can keep id/repository
+                        // while changing the root. Old probes cannot cancel its
+                        // replacement reads or apply a stale repair warning.
+                        continue;
+                    }
                     let Some(project) = self
                         .sidebar_model
                         .projects
@@ -1410,6 +1416,29 @@ mod tests {
     }
 
     #[test]
+    fn delayed_old_root_probe_cannot_override_same_key_locate() {
+        for direct in [false,true] {
+            let metadata=Path::new("/metadata/project.git");
+            let old=PathBuf::from("/old/primary");
+            let new=PathBuf::from("/new/primary");
+            let (mut app,id)=app(metadata);
+            Arc::make_mut(&mut app.durable).shared_project_bindings.insert(id,crate::model::SharedProjectBinding {ordinal:7,root:Some(old.clone())});
+            let relocation=Relocation {repository:metadata.into(),destination:metadata.into(),old_root:old.clone(),new_root:new.clone()};
+            let _=app.apply_project_relocation(&relocation);
+            let token=CancellationToken::default();
+            app.refresh_ui.projects.insert(id,token.clone());
+            let response=if direct {Action::Checked(vec![(id,metadata.into(),old,Some("old root disappeared".into()))])}
+                else {Action::AvailabilityChecked(vec![(id,metadata.into(),old,Some("old root disappeared".into()),true)])};
+            let _=app.update_project_recovery(response);
+            let project=app.sidebar_model.project(id).unwrap();
+            assert_eq!(app.project_root(project),new);
+            assert!(!project.missing);
+            assert!(project.location_repair.is_none());
+            assert!(!token.is_cancelled());
+        }
+    }
+
+    #[test]
     fn missing_primary_keeps_verified_linked_checkout_available_and_retains_repair() {
         let parent=tempfile::tempdir().unwrap();
         let primary=parent.path().join("primary");
@@ -1417,7 +1446,9 @@ mod tests {
         let linked=parent.path().join("linked");
         let foreign=parent.path().join("foreign");
         let git=|directory:&Path,args:&[&std::ffi::OsStr]| {
-            let result=std::process::Command::new("git").current_dir(directory).args(args)
+            let result=std::process::Command::new("git").current_dir(directory)
+                .args(["-c","core.fsmonitor=false","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null"]).args(args)
+                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_NOSYSTEM","1")
                 .env_remove("GIT_DIR").env_remove("GIT_COMMON_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").output().unwrap();
             assert!(result.status.success(),"{}",String::from_utf8_lossy(&result.stderr));
         };
@@ -1465,11 +1496,12 @@ mod tests {
         let root = parent.path().join("project");
         std::fs::create_dir(&root).unwrap();
         let (mut app, id) = app(&root);
-        drop(app.update_project_recovery(Action::Checked(vec![(id, root.clone(), None)])));
+        drop(app.update_project_recovery(Action::Checked(vec![(id, root.clone(), root.clone(), None)])));
         assert!(!app.project_missing(id));
         std::fs::remove_dir(&root).unwrap();
         drop(app.update_project_recovery(Action::Checked(vec![(
             id,
+            root.clone(),
             root.clone(),
             project_recovery::missing_reason(&root),
         )])));
@@ -1478,6 +1510,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         drop(app.update_project_recovery(Action::Checked(vec![(
             id,
+            root.clone(),
             root.clone(),
             project_recovery::missing_reason(&root),
         )])));
