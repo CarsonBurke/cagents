@@ -2828,12 +2828,19 @@ impl<'a> WorktreeAttention<'a> {
         }
     }
 
-    fn observe(&mut self, card: CardId, activity: Option<crate::agent::ActivityState>, unread: bool, outcome: Option<&'a crate::agent::ActivityOutcome>) {
+    fn observe(
+        &mut self,
+        card: CardId,
+        activity: Option<crate::agent::ActivityState>,
+        unread: bool,
+        outcome: Option<&'a crate::agent::ActivityOutcome>,
+    ) {
         self.state = self.state.max(attention_state(activity, unread, outcome));
         self.unread |= unread;
         if let Some(outcome) = outcome
             && self.outcome.is_none_or(|previous| {
-                (outcome_priority(outcome), Some(card)) > (outcome_priority(previous), self.outcome_card)
+                (outcome_priority(outcome), Some(card))
+                    > (outcome_priority(previous), self.outcome_card)
             })
         {
             self.outcome = Some(outcome);
@@ -3167,13 +3174,22 @@ impl SidebarState {
 
     /// One pass over activity and persisted unread ownership. Avoid scanning
     /// every pane separately for each worktree in a collapsed project hint.
-    pub fn worktree_attention_summaries(&self, project: ProjectId) -> HashMap<WorktreeId, WorktreeAttention<'_>> {
+    pub fn worktree_attention_summaries(
+        &self,
+        project: ProjectId,
+    ) -> HashMap<WorktreeId, WorktreeAttention<'_>> {
         let mut summaries = HashMap::<WorktreeId, WorktreeAttention<'_>>::new();
         for (card, entry) in &self.agent_activity {
-            let Some((owner, worktree)) = entry.owner else { continue; };
+            let Some((owner, worktree)) = entry.owner else {
+                continue;
+            };
             if owner == project {
                 summaries.entry(worktree).or_default().observe(
-                    *card, Some(entry.activity.state), self.has_card_update(*card), self.card_outcome(*card));
+                    *card,
+                    Some(entry.activity.state),
+                    self.has_card_update(*card),
+                    self.card_outcome(*card),
+                );
             }
         }
         // Unread ownership survives a restart before the live activity map is
@@ -3182,7 +3198,12 @@ impl SidebarState {
             if let Some((owner, worktree)) = owner
                 && *owner == project
             {
-                summaries.entry(*worktree).or_default().observe(*card, None, true, self.card_outcome(*card));
+                summaries.entry(*worktree).or_default().observe(
+                    *card,
+                    None,
+                    true,
+                    self.card_outcome(*card),
+                );
             }
         }
         summaries
@@ -3284,7 +3305,11 @@ impl SidebarState {
 
     /// Roots may be learned after an actor's first scalar activity report.
     /// Reattribute the cached state without inventing a new unread edge.
-    pub fn reattribute_card(&mut self, card: CardId, owner: Option<(ProjectId, WorktreeId)>) -> bool {
+    pub fn reattribute_card(
+        &mut self,
+        card: CardId,
+        owner: Option<(ProjectId, WorktreeId)>,
+    ) -> bool {
         let mut changed = false;
         if let Some(entry) = self.agent_activity.get_mut(&card) {
             changed |= entry.owner != owner;
@@ -5525,8 +5550,16 @@ fn project_view<'a>(
                 .worktrees
                 .iter()
                 .any(|worktree| project.worktree_attention(worktree.id).unread);
-        let outcome = entity.channels.iter().filter_map(|channel| channel.outcome.as_ref())
-            .chain(entity.worktrees.iter().filter_map(|worktree| project.worktree_attention(worktree.id).outcome))
+        let outcome = entity
+            .channels
+            .iter()
+            .filter_map(|channel| channel.outcome.as_ref())
+            .chain(
+                entity
+                    .worktrees
+                    .iter()
+                    .filter_map(|worktree| project.worktree_attention(worktree.id).outcome),
+            )
             .max_by_key(|outcome| outcome_priority(outcome));
         if let Some(indicator) = outcome_indicator(activity, unread, outcome) {
             identity = identity.push(indicator);
@@ -5613,7 +5646,9 @@ fn project_view<'a>(
                             .state
                             .attention_retained(SelectionRow::Worktree(project_id, worktree.id))
                             && !project.worktree_attention(worktree.id).unread
-                            && !project.worktree_attention(worktree.id).state
+                            && !project
+                                .worktree_attention(worktree.id)
+                                .state
                                 .is_some_and(AttentionState::needs_attention),
                         project.state.worktree_has_panes(project_id, worktree.id),
                         false,
@@ -5778,7 +5813,9 @@ fn compact_project<'a>(
                     .state
                     .attention_retained(SelectionRow::Worktree(entity.id, worktree.id))
                     && !project.worktree_attention(worktree.id).unread
-                    && !project.worktree_attention(worktree.id).state
+                    && !project
+                        .worktree_attention(worktree.id)
+                        .state
                         .is_some_and(AttentionState::needs_attention),
                 project.state.worktree_has_panes(entity.id, worktree.id),
                 true,
@@ -10114,8 +10151,12 @@ fn filtered_projects<'a>(
                             state
                                 .retained_attention
                                 .contains(&SelectionRow::Worktree(project.id, worktree.id))
-                                || attention.get(&worktree.id).is_some_and(|summary| summary.unread)
-                                || attention.get(&worktree.id).and_then(|summary| summary.state)
+                                || attention
+                                    .get(&worktree.id)
+                                    .is_some_and(|summary| summary.unread)
+                                || attention
+                                    .get(&worktree.id)
+                                    .and_then(|summary| summary.state)
                                     .is_some_and(AttentionState::needs_attention)
                         }
                     })
@@ -11634,15 +11675,35 @@ pub(crate) mod tests {
         let mut cards = [CardId::new(), CardId::new()];
         cards.sort();
         for (index, card) in cards.into_iter().enumerate() {
-            state.set_agent_activity(card, project, worktree, crate::agent::Activity { provider: crate::agent::Provider::Codex, state: crate::agent::ActivityState::Idle });
-            state.set_card_outcome(card, Some(crate::agent::ActivityOutcome::Failed { reason: format!("failure {index}") }));
+            state.set_agent_activity(
+                card,
+                project,
+                worktree,
+                crate::agent::Activity {
+                    provider: crate::agent::Provider::Codex,
+                    state: crate::agent::ActivityState::Idle,
+                },
+            );
+            state.set_card_outcome(
+                card,
+                Some(crate::agent::ActivityOutcome::Failed {
+                    reason: format!("failure {index}"),
+                }),
+            );
         }
         state.observe_agent_update(cards[0], project, worktree);
         let summaries = state.worktree_attention_summaries(project);
-        assert_eq!(summaries[&worktree].outcome, state.worktree_outcome(project, worktree));
-        assert_eq!(summaries[&worktree].outcome.and_then(|outcome| outcome.reason()), Some("failure 1"));
+        assert_eq!(
+            summaries[&worktree].outcome,
+            state.worktree_outcome(project, worktree)
+        );
+        assert_eq!(
+            summaries[&worktree]
+                .outcome
+                .and_then(|outcome| outcome.reason()),
+            Some("failure 1")
+        );
     }
-
 
     #[test]
     fn attention_summaries_match_owned_priority_and_restore_unread_without_activity() {
@@ -11653,20 +11714,46 @@ pub(crate) mod tests {
         let working = CardId::new();
         let failed = CardId::new();
         let waiting = CardId::new();
-        for (card, activity) in [(working, crate::agent::ActivityState::Working), (failed, crate::agent::ActivityState::Idle), (waiting, crate::agent::ActivityState::Waiting)] {
-            state.set_agent_activity(card, project, worktree, crate::agent::Activity { provider: crate::agent::Provider::Codex, state: activity });
+        for (card, activity) in [
+            (working, crate::agent::ActivityState::Working),
+            (failed, crate::agent::ActivityState::Idle),
+            (waiting, crate::agent::ActivityState::Waiting),
+        ] {
+            state.set_agent_activity(
+                card,
+                project,
+                worktree,
+                crate::agent::Activity {
+                    provider: crate::agent::Provider::Codex,
+                    state: activity,
+                },
+            );
         }
-        state.set_card_outcome(failed, Some(crate::agent::ActivityOutcome::Failed { reason: "fixture failure".into() }));
+        state.set_card_outcome(
+            failed,
+            Some(crate::agent::ActivityOutcome::Failed {
+                reason: "fixture failure".into(),
+            }),
+        );
         state.observe_agent_update(CardId::new(), project, restored);
         let summaries = state.worktree_attention_summaries(project);
-        assert_eq!(summaries[&worktree].state, state.worktree_attention(project, worktree));
-        assert_eq!(summaries[&worktree].outcome, state.worktree_outcome(project, worktree));
+        assert_eq!(
+            summaries[&worktree].state,
+            state.worktree_attention(project, worktree)
+        );
+        assert_eq!(
+            summaries[&worktree].outcome,
+            state.worktree_outcome(project, worktree)
+        );
         assert_eq!(summaries[&worktree].state, Some(AttentionState::Waiting));
         assert_eq!(summaries[&restored].state, Some(AttentionState::Unread));
         assert!(summaries[&restored].unread);
-        assert!(state.worktree_attention_summaries(ProjectId::new()).is_empty());
+        assert!(
+            state
+                .worktree_attention_summaries(ProjectId::new())
+                .is_empty()
+        );
     }
-
 
     #[test]
     fn required_review_policy_does_not_claim_the_viewer_was_requested() {

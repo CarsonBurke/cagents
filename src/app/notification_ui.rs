@@ -478,7 +478,11 @@ impl Cagents {
             } => {
                 if self.notification_ui.session_activation == Some(session)
                     && self.notification_ui.activation_generation == generation
-                    && !self.durable.cards.iter().any(|card| card.existence.is_open() && card_session(card) == Some(session))
+                    && !self
+                        .durable
+                        .cards
+                        .iter()
+                        .any(|card| card.existence.is_open() && card_session(card) == Some(session))
                 {
                     self.notification_ui.session_activation = None;
                     self.notification_ui.activation_attempt = None;
@@ -1056,8 +1060,15 @@ mod tests {
         assert_eq!(app.workspace.focused(), previous);
         assert_eq!(app.notification_ui.session_activation, Some(session));
         let generation = app.notification_ui.activation_generation;
-        drop(app.update_notifications(Action::SessionActivationExpired { session, generation }));
-        assert_eq!(app.notification_ui.session_activation, Some(session), "a long dialog must retain an existing actor's focus request");
+        drop(app.update_notifications(Action::SessionActivationExpired {
+            session,
+            generation,
+        }));
+        assert_eq!(
+            app.notification_ui.session_activation,
+            Some(session),
+            "a long dialog must retain an existing actor's focus request"
+        );
         app.settings_reset_confirm = false;
         drop(app.retry_notification_activation());
         assert_eq!(app.workspace.focused(), Some(id));
@@ -1080,17 +1091,35 @@ mod tests {
         let read_channel = ChannelId::new();
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards.push(already_read);
-        for (id, card, title) in [(channel, card, "Unread"), (read_channel, read_id, "Already read")] {
+        for (id, card, title) in [
+            (channel, card, "Unread"),
+            (read_channel, read_id, "Already read"),
+        ] {
             durable.channels.push(ProjectChannel {
-                title_source: Default::default(), id, project_id: ProjectId::new(), title: title.into(), ordinal: 0, shared: false, cards: vec![card], focused: Some(card),
+                title_source: Default::default(),
+                id,
+                project_id: ProjectId::new(),
+                title: title.into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
             });
         }
-        app.sidebar_state.apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
+        app.sidebar_state
+            .apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
         app.sidebar_state.observe_card_update(card);
         drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
         assert!(!app.sidebar_state.has_card_update(card));
-        assert!(app.sidebar_state.attention_retained(sidebar::SelectionRow::Channel(channel)));
-        assert!(!app.sidebar_state.attention_retained(sidebar::SelectionRow::Channel(read_channel)), "bulk read must not promote a previously hidden read channel");
+        assert!(
+            app.sidebar_state
+                .attention_retained(sidebar::SelectionRow::Channel(channel))
+        );
+        assert!(
+            !app.sidebar_state
+                .attention_retained(sidebar::SelectionRow::Channel(read_channel)),
+            "bulk read must not promote a previously hidden read channel"
+        );
     }
 
     #[test]

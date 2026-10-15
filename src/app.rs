@@ -47,7 +47,6 @@ mod workspace_model_sync;
 mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
-use worktree_ui::card_directory;
 pub use daemon_stop::run_daemon_stop_confirmation;
 use worktree_dialog::{
     WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
@@ -7266,27 +7265,51 @@ impl Cagents {
         let mut roots = HashMap::new();
         for project in &self.sidebar_model.projects {
             if let Some(key) = project.folder_key() {
-                roots.entry(project.repository.as_path()).or_insert((key.project_id, key.worktree_id));
+                roots
+                    .entry(project.repository.as_path())
+                    .or_insert((key.project_id, key.worktree_id));
             }
             for worktree in &project.worktrees {
                 // Match SidebarModel::worktree_at's first-known exact owner.
-                roots.entry(worktree.path.as_path()).or_insert((project.id, worktree.id));
+                roots
+                    .entry(worktree.path.as_path())
+                    .or_insert((project.id, worktree.id));
             }
         }
-        let resolve = |directory: &Path| directory.ancestors().find_map(|ancestor| roots.get(ancestor).copied());
-        let owners: Vec<_> = self.durable.cards.iter()
-            .filter(|card| card.existence.is_open() && (self.sidebar_state.card_activity(card.id).is_some() || self.sidebar_state.has_card_update(card.id)))
+        let resolve = |directory: &Path| {
+            directory
+                .ancestors()
+                .find_map(|ancestor| roots.get(ancestor).copied())
+        };
+        let owners: Vec<_> = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| {
+                card.existence.is_open()
+                    && (self.sidebar_state.card_activity(card.id).is_some()
+                        || self.sidebar_state.has_card_update(card.id))
+            })
             .map(|card| {
                 let owner = if let Some(scope) = self.durable.card_scopes.get(&card.id) {
                     resolve(scope)
                 } else {
-                    card_directory(card).and_then(resolve).or_else(|| self.worktree_owners.get(&card.id).and_then(|scope| resolve(scope)))
+                    card_directory(card).and_then(resolve).or_else(|| {
+                        self.worktree_owners
+                            .get(&card.id)
+                            .and_then(|scope| resolve(scope))
+                    })
                 };
                 (card.id, owner)
-            }).collect();
+            })
+            .collect();
         let mut changed = false;
-        for (card, owner) in owners { changed |= self.sidebar_state.reattribute_card(card, owner); }
-        if changed { self.persist(); }
+        for (card, owner) in owners {
+            changed |= self.sidebar_state.reattribute_card(card, owner);
+        }
+        if changed {
+            self.persist();
+        }
         changed
     }
 
@@ -7420,12 +7443,15 @@ impl Cagents {
             .into_iter()
             .map(|card| {
                 if (self.sidebar_state.has_card_update(card)
-                    || self.sidebar_state.card_attention(card).is_some_and(sidebar::AttentionState::needs_attention))
+                    || self
+                        .sidebar_state
+                        .card_attention(card)
+                        .is_some_and(sidebar::AttentionState::needs_attention))
                     && let Some(channel) = self
-                    .durable
-                    .channels
-                    .iter()
-                    .find(|channel| channel.cards.contains(&card))
+                        .durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.cards.contains(&card))
                 {
                     self.sidebar_state.retain_attention_channel(channel.id);
                 }
@@ -7447,7 +7473,10 @@ impl Cagents {
     }
 
     fn focus_attention_card(&mut self, id: CardId) -> Task<Message> {
-        if self.workspace_inputs_blocked() || self.focused_repository_is_saving() || self.update_prepared {
+        if self.workspace_inputs_blocked()
+            || self.focused_repository_is_saving()
+            || self.update_prepared
+        {
             return Task::none();
         }
         let Some(card) = self
@@ -13365,7 +13394,8 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        let reconcile_attention_roots = matches!(&message, Message::RepositoryLoaded { result: Ok(_), .. });
+        let reconcile_attention_roots =
+            matches!(&message, Message::RepositoryLoaded { result: Ok(_), .. });
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -16704,7 +16734,9 @@ impl Application for Cagents {
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
-        if reconcile_attention_roots { self.reconcile_agent_attention_owners(); }
+        if reconcile_attention_roots {
+            self.reconcile_agent_attention_owners();
+        }
         let activation = self.retry_notification_activation();
         let task = Task::batch([task, self.flush_settings_on_blur(), activation]);
         self.sync_notification_presence();
@@ -25665,17 +25697,44 @@ mod tests {
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
         let card = app.workspace.focused().unwrap();
-        let CardKind::Terminal(terminal) = &mut Arc::make_mut(&mut app.durable).cards[0].kind else { unreachable!() };
+        let CardKind::Terminal(terminal) = &mut Arc::make_mut(&mut app.durable).cards[0].kind
+        else {
+            unreachable!()
+        };
         terminal.launch.working_directory = "/folder/src".into();
-        let project = SidebarProject::new(ProjectId::new(), RepositoryId::new(), "Folder".into(), "/folder".into(), Vec::new(), Vec::new()).with_kind(ProjectKind::Folder);
+        let project = SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Folder".into(),
+            "/folder".into(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_kind(ProjectKind::Folder);
         let key = project.folder_key().unwrap();
         app.sidebar_model.projects.push(project);
-        app.sidebar_state.set_card_activity(card, crate::agent::Activity { provider: Provider::Omp, state: crate::agent::ActivityState::Working });
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: Provider::Omp,
+                state: crate::agent::ActivityState::Working,
+            },
+        );
         assert!(app.reconcile_agent_attention_owners());
-        assert_eq!(app.sidebar_state.agent_activity(key.project_id, key.worktree_id), Some(crate::agent::ActivityState::Working));
-        Arc::make_mut(&mut app.durable).card_scopes.insert(card, "/elsewhere".into());
+        assert_eq!(
+            app.sidebar_state
+                .agent_activity(key.project_id, key.worktree_id),
+            Some(crate::agent::ActivityState::Working)
+        );
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(card, "/elsewhere".into());
         assert!(app.reconcile_agent_attention_owners());
-        assert_eq!(app.sidebar_state.agent_activity(key.project_id, key.worktree_id), None);
+        assert_eq!(
+            app.sidebar_state
+                .agent_activity(key.project_id, key.worktree_id),
+            None
+        );
     }
 
     #[test]
@@ -25687,11 +25746,20 @@ mod tests {
         let project = ProjectId::new();
         let primary = WorktreeId::new();
         let linked = WorktreeId::new();
-        let roots = [(primary, "/repo", "main"), (linked, "/repo/.worktrees/login", "feature/login")];
+        let roots = [
+            (primary, "/repo", "main"),
+            (linked, "/repo/.worktrees/login", "feature/login"),
+        ];
         let mut cards = Vec::new();
-        for directory in ["/repo/.worktrees/login/src", "/repo/.worktrees/login/tests", "/repo/src"] {
+        for directory in [
+            "/repo/.worktrees/login/src",
+            "/repo/.worktrees/login/tests",
+            "/repo/src",
+        ] {
             let mut card = terminal_card_state();
-            let CardKind::Terminal(session) = &mut card.kind else { unreachable!() };
+            let CardKind::Terminal(session) = &mut card.kind else {
+                unreachable!()
+            };
             session.launch.working_directory = directory.into();
             app.cards.insert(card.id, CardRuntime::Loading);
             cards.push(card);
@@ -25700,30 +25768,85 @@ mod tests {
         let channel = ChannelId::new();
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards.extend(cards);
-        durable.channels.push(ProjectChannel { title_source: Default::default(), id: channel, project_id: project, title: "Login".into(), ordinal: 0, shared: false, cards: ids[..2].to_vec(), focused: Some(ids[0]) });
-        app.observe_agent_activity_for_card(ids[0], Some(Activity { provider: Provider::Omp, state: ActivityState::Working }));
-        app.observe_agent_activity_for_card(ids[1], Some(Activity { provider: Provider::Omp, state: ActivityState::Waiting }));
+        durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
+            id: channel,
+            project_id: project,
+            title: "Login".into(),
+            ordinal: 0,
+            shared: false,
+            cards: ids[..2].to_vec(),
+            focused: Some(ids[0]),
+        });
+        app.observe_agent_activity_for_card(
+            ids[0],
+            Some(Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Working,
+            }),
+        );
+        app.observe_agent_activity_for_card(
+            ids[1],
+            Some(Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Waiting,
+            }),
+        );
         assert!(app.agent_worktree(ids[0]).is_none());
         app.sidebar_model.projects.push(SidebarProject::new(
-            project, RepositoryId::new(), "Repository".into(), "/repo".into(),
-            roots.into_iter().map(|(id, path, branch)| SidebarWorktree::new(id, path.into(), Some(branch.into()), false, false, None, None, None)).collect(), Vec::new(),
+            project,
+            RepositoryId::new(),
+            "Repository".into(),
+            "/repo".into(),
+            roots
+                .into_iter()
+                .map(|(id, path, branch)| {
+                    SidebarWorktree::new(
+                        id,
+                        path.into(),
+                        Some(branch.into()),
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+            Vec::new(),
         ));
-        app.known_worktree_roots = roots.into_iter().map(|(_, path, _)| PathBuf::from(path)).collect();
+        app.known_worktree_roots = roots
+            .into_iter()
+            .map(|(_, path, _)| PathBuf::from(path))
+            .collect();
         assert!(app.reconcile_agent_attention_owners());
         app.refresh_sidebar_channels();
-        assert_eq!(app.sidebar_state.agent_activity(project, linked), Some(ActivityState::Waiting));
-        assert_eq!(app.sidebar_state.worktree_attention(project, linked), Some(sidebar::AttentionState::Waiting));
+        assert_eq!(
+            app.sidebar_state.agent_activity(project, linked),
+            Some(ActivityState::Waiting)
+        );
+        assert_eq!(
+            app.sidebar_state.worktree_attention(project, linked),
+            Some(sidebar::AttentionState::Waiting)
+        );
         let row = &app.sidebar_model.projects[0].channels[0];
         assert_eq!(row.worktree, Some((linked, "feature/login".into())));
         assert!(row.tooltip.contains("feature/login"));
-        for id in &ids { app.observe_agent_update_for_card(*id); }
-        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(project, linked))));
+        for id in &ids {
+            app.observe_agent_update_for_card(*id);
+        }
+        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+            project, linked,
+        ))));
         assert!(!app.sidebar_state.has_card_update(ids[0]));
         assert!(!app.sidebar_state.has_card_update(ids[1]));
         assert!(app.sidebar_state.has_card_update(ids[2]));
         drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
         assert!(!app.sidebar_state.has_card_update(ids[2]));
-        assert_eq!(app.sidebar_state.worktree_attention(project, linked), Some(sidebar::AttentionState::Waiting));
+        assert_eq!(
+            app.sidebar_state.worktree_attention(project, linked),
+            Some(sidebar::AttentionState::Waiting)
+        );
     }
 
     #[test]
@@ -25734,18 +25857,40 @@ mod tests {
         let other = terminal_card_state();
         let target = other.id;
         let project = ProjectId::new();
-        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "Attention".into(), "/tmp".into(), Vec::new(), Vec::new()));
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Attention".into(),
+            "/tmp".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
         let channels = [ChannelId::new(), ChannelId::new()];
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards.push(other);
         for (index, card) in [first, target].into_iter().enumerate() {
-            durable.channels.push(ProjectChannel { title_source: Default::default(), id: channels[index], project_id: project, title: format!("Channel{index}"), ordinal: index as u32, shared: false, cards: vec![card], focused: Some(card) });
+            durable.channels.push(ProjectChannel {
+                title_source: Default::default(),
+                id: channels[index],
+                project_id: project,
+                title: format!("Channel{index}"),
+                ordinal: index as u32,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
         }
         drop(app.select_channel(channels[0]));
         app.sidebar_state.observe_card_update(target);
-        drop(app.update(Message::Repository(RepositoryAction::Save { card: first, overwrite: false })));
+        drop(app.update(Message::Repository(RepositoryAction::Save {
+            card: first,
+            overwrite: false,
+        })));
         assert!(app.focused_repository_is_saving());
-        for command in [workspace_widget::GlobalShortcut::NextAttention, workspace_widget::GlobalShortcut::PreviousAttention] {
+        for command in [
+            workspace_widget::GlobalShortcut::NextAttention,
+            workspace_widget::GlobalShortcut::PreviousAttention,
+        ] {
             drop(app.update(Message::RunCommand(command)));
             assert_eq!(app.workspace.focused(), Some(first));
             assert_eq!(app.durable.active_channel, Some(channels[0]));
