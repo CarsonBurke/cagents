@@ -133,13 +133,30 @@ impl Cagents {
     pub(in crate::app) fn capture_conversation_end_target(&self, card: CardId) -> Option<Arc<sidebar::ConversationEndTarget>> {
         let source = self.chat_close_source(card)?;
         let (channel, channel_project, worktree, shared_scope, shared_repository) = self.conversation_end_placement(card)?;
+        if !self.conversation_end_shared_source_current(card, &source.descriptor, shared_scope.as_ref()) { return None; }
         Some(Arc::new(sidebar::ConversationEndTarget {
             card, registry: source.registry, issued: Arc::new(source.descriptor), observed: Arc::new(source.session),
             channel, channel_project, worktree, shared_scope, shared_repository,
         }))
     }
+    /// The registry can replace a pane before the local descriptor adopts it.
+    /// Consent must still refer to the original authoritative issued source.
+    pub(in crate::app) fn conversation_end_shared_source_current(&self, card: CardId, issued: &chat::Session, expected_scope: Option<&crate::workspace_model::views::Scope>) -> bool {
+        let mut matches = self.workspace_model.views.iter().flat_map(|view| {
+            view.panes.iter().filter(move |pane| pane.id == card).map(move |pane| (&view.scope, pane))
+        });
+        let first = matches.next();
+        if matches.next().is_some() { return false; }
+        match (expected_scope, first) {
+            (None, None) => true,
+            (Some(expected), Some((scope, pane))) => scope == expected && !pane.pending_terminal_start
+                && matches!(&pane.kind, CardKind::Chat(current) if terminal_close::same_chat_removal_source(issued, current)),
+            _ => false,
+        }
+    }
     pub(in crate::app) fn conversation_end_target_current(&self, target: &sidebar::ConversationEndTarget) -> bool {
         target.registry == self.workspace_model.identity
+            && self.conversation_end_shared_source_current(target.card, &target.issued, target.shared_scope.as_ref())
             && self.card_state(target.card).is_some_and(|card| card.existence.is_open()
                 && matches!(&card.kind, CardKind::Chat(issued) if terminal_close::same_chat_removal_source(&target.issued, issued)))
             && self.chat_return_session(target.card).as_ref().is_some_and(|observed| terminal_close::same_chat_removal_source(&target.observed, observed))
@@ -916,7 +933,7 @@ mod tests {
 
     #[test]
     fn sidebar_end_parameters_cannot_follow_replaced_identity_or_moved_scope() {
-        for change in 0..8 {
+        for change in 0..11 {
             let (mut app, card, directory) = fixture();
             write(&mut app, card, "keep sidebar conversation", true);
             retain_in_channel(&mut app, directory.path(), vec![card]);
@@ -936,10 +953,16 @@ mod tests {
                 4 => { Arc::make_mut(&mut app.durable).card_scopes.insert(card, directory.path().join("another-scope")); },
                 5 => Arc::make_mut(&mut app.durable).channels[0].project_id = ProjectId::new(),
                 6 => app.workspace_model.channels[0].repository = directory.path().join("another-owner"),
+                7 => {
+                    let CardKind::Chat(session) = &mut app.workspace_model.views[0].panes[0].kind else { panic!("shared chat"); };
+                    session.launch.session_id = Some("replaced-before-local-adoption".into());
+                }
+                8 => app.workspace_model.views[0].panes[0].pending_terminal_start = true,
+                9 => { let duplicate = app.workspace_model.views[0].panes[0].clone(); app.workspace_model.views[0].panes.push(duplicate); }
                 _ => {}
             }
             drop(app.request_conversation_end(target));
-            assert_eq!(app.chat_ui.close_dialog.is_some(), change == 7);
+            assert_eq!(app.chat_ui.close_dialog.is_some(), change == 10);
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert!(app.chat_ui.phases.is_empty());
         }
