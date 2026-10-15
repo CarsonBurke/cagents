@@ -46,3 +46,5 @@ fixture initializes the retained widget tree before dispatching native events.
 `src/widget/text_input/input.rs` captures the current toolkit interface font and UI-thread default text size when constructing a stock text input. Explicit `.font()` and `.size()` overrides remain authoritative. This lets standalone editor fields follow accepted interface preferences without relying on the renderer defaults fixed at startup. The application owns native layout regression coverage.
 
 Retained text inputs refresh their cached caret/selection/hit-test paragraph when the resolved font, text size or line height changes, matching the current drawing attributes.
+
+The retained input metric key compares line heights in resolved pixels. Native paragraphs report absolute line heights even when a widget requests a relative factor; equivalent relative/absolute requests reuse the same cached paragraph instead of reshaping unchanged inputs. The application regression retains the previous paragraph allocation while asserting reuse.
