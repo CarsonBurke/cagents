@@ -4917,6 +4917,11 @@ impl Cagents {
             _ => None,
         }
     }
+    /// Read retained attention without exposing the parked-runtime registry.
+    pub(super) fn parked_chat_runtime(&self, card: CardId) -> Option<&Runtime> {
+        self.chat_ui.parked.get(&card).map(Box::as_ref)
+    }
+
     pub(super) fn chat_has_parked_runtime(&self, card: CardId) -> bool {
         self.chat_ui.parked.contains_key(&card)
     }

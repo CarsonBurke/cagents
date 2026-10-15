@@ -8417,19 +8417,11 @@ impl Cagents {
         card: CardId,
         activity: Option<crate::agent::Activity>,
     ) {
-        let activity = self
-            .chat_ui
-            .parked
-            .get(&card)
-            .and_then(|runtime| runtime.native_activity())
-            .or(activity);
+        let parked = self.parked_chat_runtime(card);
+        let activity = parked.and_then(|runtime| runtime.native_activity()).or(activity);
         let outcome = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => runtime.activity_outcome(),
-            _ if self.chat_ui.parked.contains_key(&card) => self
-                .chat_ui
-                .parked
-                .get(&card)
-                .and_then(|runtime| runtime.activity_outcome()),
+            _ if parked.is_some() => parked.and_then(|runtime| runtime.activity_outcome()),
             _ if activity
                 .is_some_and(|activity| activity.state == crate::agent::ActivityState::Working) =>
             {
