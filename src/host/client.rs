@@ -716,24 +716,15 @@ pub(super) fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::WatchWorkspaceModel => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .watch_model(client_id)?;
+            let model = super::workspace::snapshot(host, Some(client_id))?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::ReadWorkspaceModel => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .read_model()?;
+            let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::EditWorkspaceModel { edit } => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .edit_model(client_id, edit)?;
+            let model = super::workspace::edit(host, client_id, edit)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::Spawn { session, options } => {

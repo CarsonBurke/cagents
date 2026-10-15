@@ -10,6 +10,7 @@ mod model;
 mod notifications;
 mod service;
 mod state;
+mod workspace;
 
 use std::{
     fs, io,
