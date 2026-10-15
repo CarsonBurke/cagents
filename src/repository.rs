@@ -10925,6 +10925,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         emit(WorktreeProgressStage::ResolvingBase);
         let mut journal_write_failed = false;
+        let mut remote_refresh_warning = None;
         let attempt = (|| -> Result<(), RepositoryError> {
             if cancellation.is_cancelled() {
                 return Err(process_failure(
@@ -11000,8 +11001,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     ],
                 );
                 fetch.inherited_lease = Some(lease.as_raw_fd());
-                fetch.timeout = Some(Duration::from_secs(10));
-                self.run_checked(&fetch, cancellation)?;
+                fetch.timeout = Some(Duration::from_secs(3));
+                if let Err(failure) = self.run_checked(&fetch, cancellation) {
+                    if cached.is_none() || cancellation.is_cancelled() { return Err(failure.into()); }
+                    remote_refresh_warning = Some(format!("Remote refresh failed; using cached {reference}: {}", failure.reported_detail()));
+                    journal.warnings.push(failure);
+                }
                 }
             }
             let resolve = self.git_read(
@@ -11148,7 +11153,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             Ok(())
         })();
         journal.detail = match attempt {
-            Ok(()) => "Git exited; reconciling durable outcome".into(),
+            Ok(()) => remote_refresh_warning.unwrap_or_else(|| "Git exited; reconciling durable outcome".into()),
             Err(error) => {
                 let detail = error.to_string();
                 journal.warnings.push(repository_warning(&self.git, error));
@@ -12165,6 +12170,21 @@ mod worktree_journal_tests {
         assert_ne!(fixture.git(&["rev-parse", "topic"]), old);
         assert_eq!(fixture.git(&["rev-parse", "topic"]), remote.git(&["rev-parse", "topic"]));
         assert_eq!(fixture.git(&["config", "branch.topic.remote"]), "origin");
+    }
+
+    #[test]
+    fn unavailable_remote_branch_refresh_falls_back_to_cached_ref_with_warning() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new(); remote.git(&["branch", "topic"]);
+        fixture.add_remote("origin", &remote); fixture.git(&["fetch", "origin"]);
+        let cached = fixture.git(&["rev-parse", "origin/topic"]);
+        fixture.git(&["remote", "set-url", "origin", "/nonexistent/cagents-offline-remote.git"]);
+        fixture.resolve(fixture.input("origin/topic"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert!(report.detail.contains("using cached refs/remotes/origin/topic"), "{report:?}");
+        assert_eq!(fixture.git(&["rev-parse", "topic"]), cached);
+        assert!(matches!(&report.outcome, Some(WorktreeCreationOutcome::Created {warnings, ..}) if !warnings.is_empty()));
     }
 
     #[test]
