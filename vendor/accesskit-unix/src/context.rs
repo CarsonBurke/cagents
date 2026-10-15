@@ -190,11 +190,11 @@ impl Retry {
     }
 }
 
-async fn retry_sleep(delay: std::time::Duration) {
+async fn retry_sleep_until(deadline: std::time::Instant) {
     #[cfg(feature = "tokio")]
-    tokio::time::sleep(delay).await;
+    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
     #[cfg(not(feature = "tokio"))]
-    async_io::Timer::after(delay).await;
+    async_io::Timer::at(deadline).await;
 }
 
 async fn wait_for_retry(
@@ -202,12 +202,18 @@ async fn wait_for_retry(
     adapters: &mut Vec<AdapterEntry>,
     delay: std::time::Duration,
 ) -> bool {
-    let deadline = std::time::Instant::now() + delay;
+    wait_for_retry_until(messages, adapters, std::time::Instant::now() + delay).await
+}
+
+async fn wait_for_retry_until(
+    messages: &mut (impl futures_lite::Stream<Item = Message> + Unpin),
+    adapters: &mut Vec<AdapterEntry>,
+    deadline: std::time::Instant,
+) -> bool {
     loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let next = futures_lite::future::race(
             async {
-                retry_sleep(remaining).await;
+                retry_sleep_until(deadline).await;
                 None
             },
             async { Some(messages.next().await) },
@@ -273,9 +279,7 @@ async fn run_event_loop(
         let next_message = next_message.fuse();
         pin!(next_message);
         // Adapter traffic must not postpone the status/transport probe.
-        let heartbeat = retry_sleep(
-            health_deadline.saturating_duration_since(std::time::Instant::now()),
-        );
+        let heartbeat = retry_sleep_until(health_deadline);
         #[cfg(not(feature = "tokio"))]
         let heartbeat = heartbeat.fuse();
         pin!(heartbeat);
@@ -417,6 +421,20 @@ mod retry_tests {
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+
+    #[test]
+    fn expired_retry_deadline_cannot_be_reset_by_continuous_adapter_messages() {
+        let executor = Executor::new();
+        block_on(executor.run(async {
+            let mut messages = futures_lite::stream::repeat_with(|| Message::RemoveAdapter {
+                id: usize::MAX,
+            }).take(10_000);
+            let mut adapters = Vec::new();
+            let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            assert!(wait_for_retry_until(&mut messages, &mut adapters, expired).await);
+            assert!(messages.next().await.is_some(), "traffic was drained instead of retrying");
+        }));
+    }
 
     #[test]
     fn refused_bus_connection_returns_an_error_and_schedules_retry() {
