@@ -989,6 +989,30 @@ struct CachedItem {
     /// What the step did to work with other agents, where it did.
     coordination: Option<Box<coordination::Coordinated>>,
 }
+/// Format a recorded message time once when its metadata changes. The
+/// current day only chooses the short label; it never supplies a missing time.
+fn recorded_message_stamp(
+    at: u64,
+    today: Option<&chat::LocalTime>,
+) -> Option<(u64, String, String)> {
+    let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
+    let full = format!(
+        "{:04}-{:02}-{:02} {}",
+        time.year + 1900,
+        time.month + 1,
+        time.day,
+        time.clock()
+    );
+    let label = if today
+        .is_some_and(|today| today.year == time.year && today.day_of_year == time.day_of_year)
+    {
+        time.clock()
+    } else {
+        full.clone()
+    };
+    Some((at, label, full))
+}
+
 impl CachedItem {
     fn next_revision() -> u64 {
         static REVISION: AtomicU64 = AtomicU64::new(1);
@@ -1011,6 +1035,7 @@ impl CachedItem {
         coordination: Option<chat::coordination::Coordination>,
     ) -> Self {
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
+        let stamp = previous.as_ref().and_then(|cached| cached.stamp.clone());
         let (
             image,
             image_source,
@@ -1092,7 +1117,7 @@ impl CachedItem {
             blocks: HashMap::new(),
             open: None,
             detail: None,
-            stamp: None,
+            stamp,
             image,
             image_source,
             image_item,
@@ -2426,33 +2451,18 @@ impl Runtime {
         }
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
-        for item in snapshot.items.iter() {
+        let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
+        for item in snapshot
+            .items
+            .iter()
+            .chain(snapshot.subagents.iter().flat_map(|agent| &agent.items))
+        {
             if let Some(cached) = self.cache.get_mut(&item.id)
-                && let Some(at) = item.at
-                && cached
-                    .stamp
-                    .as_ref()
-                    .is_none_or(|(cached_at, _, _)| *cached_at != at)
+                && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
             {
-                if let Some(time) = chat::local_time(i64::try_from(at / 1000).unwrap_or(i64::MAX)) {
-                    let full = format!(
-                        "{:04}-{:02}-{:02} {}",
-                        time.year + 1900,
-                        time.month + 1,
-                        time.day,
-                        time.clock()
-                    );
-                    let today =
-                        chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
-                    let label = if today.is_some_and(|today| {
-                        today.year == time.year && today.day_of_year == time.day_of_year
-                    }) {
-                        time.clock()
-                    } else {
-                        full.clone()
-                    };
-                    cached.stamp = Some((at, label, full));
-                }
+                cached.stamp = item
+                    .at
+                    .and_then(|at| recorded_message_stamp(at, today.as_ref()));
             }
         }
         for request in &snapshot.requests {
@@ -7319,7 +7329,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7414,7 +7425,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -11147,14 +11159,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11173,7 +11190,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
