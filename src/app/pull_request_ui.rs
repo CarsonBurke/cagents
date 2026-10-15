@@ -276,7 +276,7 @@ impl State {
                         let ids=threads.iter().map(|thread|thread.id.clone()).collect::<Vec<_>>();
                         let hunks=service.review_thread_hunks(&repo,&ids,&cancellation).map_err(|error|error.to_string())?;
                         let threads=threads.into_iter().zip(hunks).collect::<Vec<_>>();
-                        Ok(crate::github::agent_context::review_threads_prompt(&pr, &threads))
+                        crate::github::agent_context::review_threads_prompt(&pr, &threads)
                     }).await.unwrap_or_else(|error| Err(format!("Failed to prepare review context: {error}")));
                     Action::AgentContext(target, generation, result)
                 }, |action| action);

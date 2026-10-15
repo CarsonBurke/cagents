@@ -4,6 +4,7 @@ use super::*;
 pub const LOG_LINES_PER_STEP: usize = 200;
 const LOG_DOWNLOAD_BYTES: usize = 8 * 1024 * 1024;
 const PROMPT_LOG_BYTES: usize = 128 * 1024;
+const MAX_THREAD_PROMPT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Third-party CI links never become GitHub Actions commands.
 pub fn workflow_run(repository: &GitHubRepoKey, link: &Url) -> Option<u64> {
@@ -54,16 +55,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         Ok(result)
     }
 
-    /// Hunks belong to review comments, which the inspector's lightweight
-    /// discussion query does not otherwise need. Load them only on handoff.
-    pub fn review_thread_hunk(&self, repository: &GitHubRepoKey, thread: &str,
-        cancellation: &CancellationToken) -> Result<String, GitHubError> {
-        let data = self.graphql(repository,
-            "query($id:ID!){node(id:$id){... on PullRequestReviewThread{comments(first:1){nodes{diffHunk}}}}}",
-            vec![("id", thread.into())], cancellation)?;
-        Ok(data.pointer("/node/comments/nodes/0/diffHunk")
-            .and_then(serde_json::Value::as_str).unwrap_or("(diff hunk unavailable)").to_owned())
-    }
+
 }
 
 /// `gh run view` prefixes each line with job and step separated by tabs.
@@ -100,19 +92,21 @@ pub fn failed_check_prompt(pr: &PullRequest, check: &PullRequestCheck, logs: &st
         LOG_LINES_PER_STEP, logs)
 }
 
-pub fn review_threads_prompt(pr: &PullRequest, threads: &[(PullRequestReviewThread, String)]) -> String {
+pub fn review_threads_prompt(pr: &PullRequest, threads: &[(PullRequestReviewThread, String)]) -> Result<String,String> {
     let mut prompt = format!("Address the selected review threads on PR #{}: {}\n{}\nBranch: {}\nHead: {}\n", pr.number, pr.title, pr.url, pr.head_ref_name, pr.head_ref_oid);
     for (thread, hunk) in threads {
         prompt.push_str(&format!("\nFile: {}\nLines: {}..{} ({:?})\nThread: {}\nDiff hunk:\n{}\nComments:\n",
             thread.path, thread.start_line.or(thread.line).map_or("file".into(), |n| n.to_string()),
             thread.line.map_or("file".into(), |n| n.to_string()), thread.side, thread.id, hunk));
+        if prompt.len()>MAX_THREAD_PROMPT_BYTES{return Err("The selected review context exceeds 2 MiB. Select fewer threads to include their complete context.".into());}
         for comment in &thread.comments {
             prompt.push_str(&format!("\n{} ({}):\n{}\n", comment.author.as_ref().map_or("Deleted account", |a| a.login.as_str()), comment.url, comment.body));
+            if prompt.len()>MAX_THREAD_PROMPT_BYTES{return Err("The selected review context exceeds 2 MiB. Select fewer threads to include their complete context.".into());}
         }
         if thread.truncated { prompt.push_str("\n[More comments exist on GitHub; open the thread for full discussion.]\n"); }
     }
     prompt.push_str("\nMake the requested changes, verify them, and summarize how each thread was addressed. Leave thread resolution to the reviewer.\n");
-    prompt
+    Ok(prompt)
 }
 
 #[cfg(test)]
@@ -132,7 +126,7 @@ mod tests {
         let prompt = review_threads_prompt(&pull_request(), &[
             (thread("one", "src/one.rs", 10, "Keep the first guard"), "@@ -9,2 +9,2 @@ first hunk".into()),
             (thread("two", "src/two.rs", 20, "Fix the second branch"), "@@ -19,2 +19,2 @@ second hunk".into()),
-        ]);
+        ]).unwrap();
         for text in ["src/one.rs", "src/two.rs", "9..10", "19..20", "first hunk", "second hunk", "reviewer", "Keep the first guard", "Fix the second branch", "feature/x"] {
             assert!(prompt.contains(text), "missing {text}");
         }
@@ -170,5 +164,24 @@ mod tests {
         assert_eq!(workflow_run(&repo, &"https://github.com/owner/repo/actions/runs/123/job/456".parse().unwrap()), Some(123));
         assert_eq!(workflow_run(&repo, &"https://github.com/other/repo/actions/runs/123".parse().unwrap()), None);
         assert_eq!(workflow_run(&repo, &"https://ci.example/owner/repo/actions/runs/123".parse().unwrap()), None);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    #[test]
+    fn many_thread_hunks_are_batched_with_typed_id_variables() {
+        struct Fake(Mutex<Vec<CommandSpec>>);
+        impl ProcessExecutor for Fake {
+            fn execute(&self,command:&CommandSpec,_:&CancellationToken)->Result<ProcessOutput,ProcessFailure>{
+                self.0.lock().unwrap().push(command.clone());let mut data=serde_json::Map::new();
+                for index in 0..50{data.insert(format!("t{index}"),serde_json::json!({"comments":{"nodes":[{"diffHunk":format!("hunk-{index}")}]}}));}
+                Ok(ProcessOutput{success:true,exit_code:Some(0),signal:None,stdout:serde_json::json!({"data":data}).to_string().into_bytes(),stderr:Vec::new()})
+            }
+        }
+        let executor=Arc::new(Fake(Default::default()));let service=GitHubService::new("gh",executor.clone());let repo=GitHubRepoKey::new("batch-context.invalid",None,"owner","repo").unwrap();
+        let ids=(0..61).map(|index|format!("thread-id-{index}")).collect::<Vec<_>>();let result=service.review_thread_hunks(&repo,&ids,&CancellationToken::new()).unwrap();assert_eq!(result.len(),61);assert_eq!(result[50],"hunk-0");
+        let calls=executor.0.lock().unwrap();assert_eq!(calls.len(),2);assert!(calls[1].arguments.iter().any(|argument|argument=="thread0=thread-id-50"));assert!(!calls[0].arguments.iter().find(|argument|argument.to_string_lossy().starts_with("query=")).unwrap().to_string_lossy().contains("thread-id-0"));
     }
 }
