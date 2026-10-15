@@ -2584,7 +2584,7 @@ mod tests {
             for lines in palettes {
                 let colors = lines
                     .iter()
-                    .flatten()
+                    .flat_map(|spans| spans.iter())
                     .filter_map(|span| span.color)
                     .collect::<std::collections::BTreeSet<_>>();
                 assert!(
@@ -2620,7 +2620,7 @@ mod tests {
             )
             .unwrap()[1]
                 .iter()
-                .flatten()
+                .flat_map(|spans| spans.iter())
                 .all(|span| span.color.is_none())
         );
     }
@@ -4037,7 +4037,7 @@ mod snapshot_performance_receipt {
     #[test]
     #[ignore = "50,000-line owning-thread edit/snapshot measurement"]
     fn fifty_thousand_line_edit_and_capture() {
-        use crate::editor_widget::{Content, Cursor, Edit, Position};
+        use crate::repository_widget::text_editor::{Content, Cursor, Edit, Position};
         let source = (0..50_000).map(|line| format!("fn function_{line:05}() {{ let value = {line}; println!(\"value {{value}}\"); }}\n")).collect::<String>();
         let mut content: Content = Content::with_text(&source);
         content.set_cursor(Cursor {
