@@ -3086,7 +3086,7 @@ fn trim_subagent(agent: &mut Subagent) {
 #[cfg(test)]
 pub(crate) fn notification_frame_for_test(
     adapter: Box<dyn Adapter>,
-    frame: Value,
+    frame: serde_json::Value,
     fail_store: bool,
 ) -> (
     crate::notifications::Evidence,
@@ -3094,7 +3094,7 @@ pub(crate) fn notification_frame_for_test(
 ) {
     struct Frame {
         adapter: Box<dyn Adapter>,
-        frame: Option<Value>,
+        frame: Option<serde_json::Value>,
     }
     impl Adapter for Frame {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -3107,7 +3107,7 @@ pub(crate) fn notification_frame_for_test(
             self.adapter
                 .receive(self.frame.take().ok_or("fixture frame consumed")?)
         }
-        fn receive(&mut self, _: Value) -> Result<Step, String> {
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
             Ok(Step::default())
         }
     }
