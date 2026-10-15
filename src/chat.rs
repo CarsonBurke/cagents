@@ -2054,7 +2054,9 @@ pub enum Event {
     Forked(String),
     /// An explicit maintenance boundary, separate from prompt completion.
     /// A generic idle status cannot release accepted prompt admission.
-    Compaction { active: bool },
+    Compaction {
+        active: bool,
+    },
 }
 
 #[cfg(test)]

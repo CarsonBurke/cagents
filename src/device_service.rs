@@ -60,7 +60,9 @@ pub enum Operation {
         root: PathBuf,
         operation: GitOperation,
     },
-    Worktree { operation: crate::worktree_control::Operation },
+    Worktree {
+        operation: crate::worktree_control::Operation,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -204,7 +206,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
-        Operation::Worktree { .. } => Err("Worktree control requires the daemon lifecycle fence".into()),
+        Operation::Worktree { .. } => {
+            Err("Worktree control requires the daemon lifecycle fence".into())
+        }
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
         }
@@ -539,7 +543,11 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
                 .as_ref()
                 .ok_or("repository directory unavailable")?;
             crate::repository::RepositoryService::system("git")
-                .ensure_managed_directory_ignored(root, &root.join(".worktrees"), &CancellationToken::new())
+                .ensure_managed_directory_ignored(
+                    root,
+                    &root.join(".worktrees"),
+                    &CancellationToken::new(),
+                )
                 .map_err(|error| error.to_string())?;
             let directory = root.join(".worktrees");
             crate::secure_file::reject_symlink_components(&directory)

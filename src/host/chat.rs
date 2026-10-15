@@ -1,8 +1,8 @@
 use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
-mod native_cleanup;
 mod execution_directory;
+mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
 #[cfg(test)]
@@ -965,7 +965,8 @@ fn start_with_execution(
             "Native restart launch differs from its issued conversation",
         ));
     }
-    let prepared_directory = execution_directory::prepare(restart_launch.unwrap_or(&session.launch), execution)?;
+    let prepared_directory =
+        execution_directory::prepare(restart_launch.unwrap_or(&session.launch), execution)?;
     let execution = prepared_directory.context.clone();
     let process_launch = &prepared_directory.launch;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {

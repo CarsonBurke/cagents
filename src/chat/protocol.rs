@@ -257,13 +257,29 @@ impl ExecutionContext {
     /// updated the adapter before initialize. A process cwd alone is no proof
     /// of a resumed provider thread's operational directory.
     pub(crate) fn observe_provider_directory(&self, path: &std::path::Path) -> Result<(), String> {
-        if self.directory_descriptor().is_none() { return Err("Provider scope requires its admitted directory descriptor".into()); }
+        if self.directory_descriptor().is_none() {
+            return Err("Provider scope requires its admitted directory descriptor".into());
+        }
         self.verify_directory(path)?;
-        *self.provider_directory.lock().unwrap_or_else(|p|p.into_inner()) = Some(path.to_owned());
+        *self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(path.to_owned());
         Ok(())
     }
-    pub(crate) fn provider_directory_observed(&self, path: &std::path::Path) -> Result<bool, String> {
-        if self.provider_directory.lock().unwrap_or_else(|p|p.into_inner()).as_deref() != Some(path) { return Ok(false); }
+    pub(crate) fn provider_directory_observed(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<bool, String> {
+        if self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+            != Some(path)
+        {
+            return Ok(false);
+        }
         self.verify_directory(path)?;
         Ok(true)
     }
@@ -309,7 +325,9 @@ pub trait Adapter: Send {
     fn after_close_input_drained(&mut self) {}
     /// Update cached operational paths before initialization, after the caller
     /// pinned and verified the private execution directory.
-    fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> { Ok(()) }
+    fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
     fn command_for_run(

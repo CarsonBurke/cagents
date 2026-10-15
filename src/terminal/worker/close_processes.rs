@@ -58,12 +58,25 @@ impl RootIdentity {
     /// Read the kernel's physical cwd while the exact root identity is pinned.
     /// This is captured at installation, never reinterpreted through launch aliases.
     pub(super) fn current_directory(&self) -> io::Result<AdmittedDirectory> {
-        if !same_identity(&self.process, &read_process(self.process.pid)?) { return Err(changed()); }
-        let directory = Arc::new(fs::OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC).open(format!("/proc/{}/cwd", self.process.pid))?);
+        if !same_identity(&self.process, &read_process(self.process.pid)?) {
+            return Err(changed());
+        }
+        let directory = Arc::new(
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(format!("/proc/{}/cwd", self.process.pid))?,
+        );
         let path = fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))?;
-        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(&directory.metadata()?);
-        if !path.is_absolute() || !same_identity(&self.process, &read_process(self.process.pid)?) { return Err(changed()); }
-        Ok(AdmittedDirectory { identity, directory })
+        let identity =
+            crate::agent_execution::DirectoryIdentity::from_metadata(&directory.metadata()?);
+        if !path.is_absolute() || !same_identity(&self.process, &read_process(self.process.pid)?) {
+            return Err(changed());
+        }
+        Ok(AdmittedDirectory {
+            identity,
+            directory,
+        })
     }
 
     pub(super) fn original_executable(&self) -> bool {

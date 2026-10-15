@@ -122,15 +122,28 @@ impl IssuePreview {
 
     fn from_response(response: Value) -> Result<Self, Error> {
         let issue = &response["issue"];
-        let text = |field: &str| issue[field].as_str().filter(|value| !value.is_empty())
-            .map(str::to_owned).ok_or_else(|| Error::new("linear_issue_invalid", format!("Linear issue response omitted {field}")));
+        let text = |field: &str| {
+            issue[field]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    Error::new(
+                        "linear_issue_invalid",
+                        format!("Linear issue response omitted {field}"),
+                    )
+                })
+        };
         Ok(Self {
             id: text("id")?,
             identifier: text("identifier")?,
             title: text("title")?,
             branch_name: text("branchName")?,
             url: text("url")?,
-            state: issue["state"]["name"].as_str().unwrap_or("Unknown state").to_owned(),
+            state: issue["state"]["name"]
+                .as_str()
+                .unwrap_or("Unknown state")
+                .to_owned(),
         })
     }
 }
@@ -144,7 +157,8 @@ mod preview_tests {
             "id": "2b498c52-7dc7-4c76-ad59-dfc488c40111", "identifier":"ENG-123",
             "title":"Fix login redirect", "branchName":"user/eng-123-fix-login-redirect",
             "url":"https://linear.app/team/issue/ENG-123", "state":{"name":"Todo"}
-        }})).unwrap();
+        }}))
+        .unwrap();
         assert_eq!(issue.branch_name, "user/eng-123-fix-login-redirect");
         assert_eq!(issue.title, "Fix login redirect");
         assert_eq!(issue.state, "Todo");

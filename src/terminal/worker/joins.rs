@@ -2,7 +2,10 @@
 //! finished packet may be visible while a TLS destructor is still blocked.
 use super::{PublishedState, WORKER_JOIN_TIMEOUT, close_processes};
 use std::{
-    sync::{Arc, Mutex, OnceLock, atomic::{AtomicUsize, Ordering}},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -20,18 +23,30 @@ const CAPACITY: usize = 1024;
 static RESERVED: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
-pub(super) struct Reservation { _private: () }
+pub(super) struct Reservation {
+    _private: (),
+}
 impl Drop for Reservation {
-    fn drop(&mut self) { RESERVED.fetch_sub(1, Ordering::AcqRel); }
+    fn drop(&mut self) {
+        RESERVED.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 fn capacity() -> usize {
     #[cfg(test)]
     {
         static LIMIT: OnceLock<usize> = OnceLock::new();
-        return *LIMIT.get_or_init(|| std::env::var("CAGENTS_TERMINAL_JOIN_TEST_CAPACITY").ok().and_then(|value| value.parse().ok()).filter(|limit| (1..=CAPACITY).contains(limit)).unwrap_or(CAPACITY));
+        return *LIMIT.get_or_init(|| {
+            std::env::var("CAGENTS_TERMINAL_JOIN_TEST_CAPACITY")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|limit| (1..=CAPACITY).contains(limit))
+                .unwrap_or(CAPACITY)
+        });
     }
     #[cfg(not(test))]
-    { CAPACITY }
+    {
+        CAPACITY
+    }
 }
 pub(super) fn reserve() -> Result<Reservation, String> {
     // Service startup failure is refused before any terminal worker or child
@@ -104,28 +119,47 @@ fn service() -> Result<&'static Service, String> {
     }).as_ref().map_err(Clone::clone)
 }
 
-pub(super) fn initialize() -> Result<(), String> { service().map(|_| ()) }
+pub(super) fn initialize() -> Result<(), String> {
+    service().map(|_| ())
+}
 
 /// Queue refusal leaves the original JoinHandle in its original slot. A queued
 /// task retains that slot and pidfd beyond the caller's deadline. Concurrent
 /// callers report pending rather than waiting behind the first caller's join.
-pub(super) fn join_until(worker: &WorkerSlot, published: &Arc<PublishedState>, deadline: Instant, escalate: bool, wait: bool) -> bool {
+pub(super) fn join_until(
+    worker: &WorkerSlot,
+    published: &Arc<PublishedState>,
+    deadline: Instant,
+    escalate: bool,
+    wait: bool,
+) -> bool {
     if escalate {
         let _ = published.join_escalation_at.set(deadline);
         ownership_changed();
     }
-    match published.worker_join.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => {},
+    match published
+        .worker_join
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+    {
+        Ok(_) => {}
         Err(2) => return true,
         Err(_) => return false,
     }
     let queued = service().and_then(|service| {
-        service.joins.try_send(Job {
-            worker: Arc::clone(worker), published: Arc::clone(published),
-        }).map_err(|_| "Terminal join capacity is busy; its exact worker remains retained".to_owned())?;
+        service
+            .joins
+            .try_send(Job {
+                worker: Arc::clone(worker),
+                published: Arc::clone(published),
+            })
+            .map_err(|_| {
+                "Terminal join capacity is busy; its exact worker remains retained".to_owned()
+            })?;
         // Each reserved worker admits only one join job. Queue plus active
         // tickets cannot exceed reservations, so this has a reserved slot too.
-        service.deadlines.try_send(Arc::clone(published))
+        service
+            .deadlines
+            .try_send(Arc::clone(published))
             .expect("a reserved terminal join must retain its escalation owner");
         Ok(())
     });
@@ -134,16 +168,24 @@ pub(super) fn join_until(worker: &WorkerSlot, published: &Arc<PublishedState>, d
         tracing::warn!(%error);
         return false;
     }
-    if !wait { return false; }
+    if !wait {
+        return false;
+    }
     loop {
         match published.worker_join.load(Ordering::Acquire) {
             2 => return true,
             3 => return false,
-            _ => {},
+            _ => {}
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            if escalate { let _ = escalate_owned_root(published); }
-            tracing::error!(escalate, timeout_seconds = WORKER_JOIN_TIMEOUT.as_secs(), "Terminal worker join remains pending; its exact owner is retained");
+            if escalate {
+                let _ = escalate_owned_root(published);
+            }
+            tracing::error!(
+                escalate,
+                timeout_seconds = WORKER_JOIN_TIMEOUT.as_secs(),
+                "Terminal worker join remains pending; its exact owner is retained"
+            );
             return false;
         };
         thread::sleep(remaining.min(Duration::from_millis(5)));
@@ -152,10 +194,17 @@ pub(super) fn join_until(worker: &WorkerSlot, published: &Arc<PublishedState>, d
 
 /// Wake a parked join when a known failed handoff restores this owner.
 pub(super) fn ownership_changed() {
-    if let Some(Ok(service))=SERVICE.get() {let _=service.changed.try_send(());}
+    if let Some(Ok(service)) = SERVICE.get() {
+        let _ = service.changed.try_send(());
+    }
 }
 
-enum Escalation {Done,Contended,Handoff,SignalUnconfirmed}
+enum Escalation {
+    Done,
+    Contended,
+    Handoff,
+    SignalUnconfirmed,
+}
 // A contended fence or provisional handoff keeps its ticket until ownership
 // changes. Only an actual signal admission retires escalation responsibility.
 fn escalate_owned_root(published: &PublishedState) -> Escalation {
@@ -164,7 +213,9 @@ fn escalate_owned_root(published: &PublishedState) -> Escalation {
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return Escalation::Contended,
     };
-    if order.handoff {return Escalation::Handoff;}
+    if order.handoff {
+        return Escalation::Handoff;
+    }
     if let Some(pidfd) = published.shutdown_pidfd.get()
         && let Err(error) = close_processes::signal(pidfd, libc::SIGKILL)
         && error.raw_os_error() != Some(libc::ESRCH)
@@ -184,11 +235,24 @@ mod tests {
 
     #[test]
     fn uncertain_pidfd_signal_retains_escalation_responsibility() {
-        let owner=PublishedState::new(true,Arc::new(|_|{}));
-        owner.shutdown_pidfd.set(File::open("/dev/null").unwrap()).unwrap();
-        assert!(matches!(escalate_owned_root(&owner),Escalation::SignalUnconfirmed));
+        let owner = PublishedState::new(true, Arc::new(|_| {}));
+        owner
+            .shutdown_pidfd
+            .set(File::open("/dev/null").unwrap())
+            .unwrap();
+        assert!(matches!(
+            escalate_owned_root(&owner),
+            Escalation::SignalUnconfirmed
+        ));
         assert!(owner.join_signal_error.get().is_some());
-        assert!(matches!(escalate_owned_root(&owner),Escalation::SignalUnconfirmed));
-        assert_eq!(owner.worker_join.load(Ordering::Acquire),0,"signal uncertainty cannot invent actual join completion");
+        assert!(matches!(
+            escalate_owned_root(&owner),
+            Escalation::SignalUnconfirmed
+        ));
+        assert_eq!(
+            owner.worker_join.load(Ordering::Acquire),
+            0,
+            "signal uncertainty cannot invent actual join completion"
+        );
     }
 }

@@ -19,8 +19,8 @@ use thiserror::Error;
 
 mod worktrees;
 pub use worktrees::WorktreeCommand;
-pub(crate) mod format;
 mod accounts;
+pub(crate) mod format;
 pub use accounts::AccountCommand;
 mod agents;
 pub use agents::AgentCommand;
@@ -807,7 +807,9 @@ impl ControlClient {
     /// a subscribed connection issues no further requests.
     pub fn next_workspace_model_edit(&mut self) -> Result<(u64, ModelEdit), ControlError> {
         loop {
-            if let WorkspaceModelEvent::Edited { sequence, edit } = self.next_workspace_model_update()? {
+            if let WorkspaceModelEvent::Edited { sequence, edit } =
+                self.next_workspace_model_update()?
+            {
                 return Ok((sequence, edit));
             }
         }
@@ -818,7 +820,10 @@ impl ControlClient {
             return Ok(WorkspaceModelEvent::WorktreesChanged { repository });
         }
         if let Some(edge) = self.observed_model.pop_front() {
-            return Ok(WorkspaceModelEvent::Edited { sequence: edge.0, edit: edge.1 });
+            return Ok(WorkspaceModelEvent::Edited {
+                sequence: edge.0,
+                edit: edge.1,
+            });
         }
         self.stream
             .set_read_timeout(None)
@@ -830,7 +835,9 @@ impl ControlClient {
                 ServerMessage::WorkspaceModelEdited { sequence, edit } => {
                     return Ok(WorkspaceModelEvent::Edited { sequence, edit });
                 }
-                ServerMessage::WorktreesChanged { repository } => return Ok(WorkspaceModelEvent::WorktreesChanged { repository }),
+                ServerMessage::WorktreesChanged { repository } => {
+                    return Ok(WorkspaceModelEvent::WorktreesChanged { repository });
+                }
                 // The daemon is about to close this connection. Reporting it as
                 // a closed connection is what makes a watcher reconnect and
                 // resynchronize against the successor's registry.
@@ -978,23 +985,45 @@ impl ControlClient {
     }
 
     pub fn complete_pending_terminal(
-        &mut self, pane: crate::model::CardId, terminal_id:TerminalId, options:TerminalSpawnOptions,
-    ) -> Result<TerminalDescriptor,ControlError> {
-        self.complete_pending_terminal_request(ClientRequest::CompletePendingTerminal {pane,terminal_id,options},terminal_id)
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        options: TerminalSpawnOptions,
+    ) -> Result<TerminalDescriptor, ControlError> {
+        self.complete_pending_terminal_request(
+            ClientRequest::CompletePendingTerminal {
+                pane,
+                terminal_id,
+                options,
+            },
+            terminal_id,
+        )
     }
 
     pub fn start_worktree_setup(
-        &mut self, pane:crate::model::CardId, terminal_id:TerminalId,
-        run_id:crate::model::OperationId, options:TerminalSpawnOptions,
-    ) -> Result<TerminalDescriptor,ControlError> {
-        self.complete_pending_terminal_request(ClientRequest::StartWorktreeSetup {pane,terminal_id,run_id,options},terminal_id)
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        run_id: crate::model::OperationId,
+        options: TerminalSpawnOptions,
+    ) -> Result<TerminalDescriptor, ControlError> {
+        self.complete_pending_terminal_request(
+            ClientRequest::StartWorktreeSetup {
+                pane,
+                terminal_id,
+                run_id,
+                options,
+            },
+            terminal_id,
+        )
     }
 
-    fn complete_pending_terminal_request(&mut self,request:ClientRequest,terminal_id:TerminalId)->Result<TerminalDescriptor,ControlError> {
-        let response = self.request_attached(
-            request,
-            terminal_id,
-        )?;
+    fn complete_pending_terminal_request(
+        &mut self,
+        request: ClientRequest,
+        terminal_id: TerminalId,
+    ) -> Result<TerminalDescriptor, ControlError> {
+        let response = self.request_attached(request, terminal_id)?;
         let terminal = match response {
             ServerResponse::Spawned { terminal } if terminal.session.id == terminal_id => terminal,
             ServerResponse::Spawned { terminal } => {
@@ -1965,18 +1994,31 @@ fn control_daemon_socket() -> Result<PathBuf, AppError> {
     if !daemon_autostart_disabled() {
         return terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e));
     }
-    let socket = daemon_socket_path().map_err(|e| AppError::new(if daemon_missing(&e) { "daemon_not_running" } else { "socket_path" }, e))?;
+    let socket = daemon_socket_path().map_err(|e| {
+        AppError::new(
+            if daemon_missing(&e) {
+                "daemon_not_running"
+            } else {
+                "socket_path"
+            },
+            e,
+        )
+    })?;
     match UnixStream::connect(&socket) {
         Ok(_) => Ok(socket),
         Err(error) if daemon_missing(&error) => Err(AppError::new(
-            "daemon_not_running", "The daemon is not running; omit --no-start to start it",
+            "daemon_not_running",
+            "The daemon is not running; omit --no-start to start it",
         )),
         Err(error) => Err(AppError::new("daemon_connection", error)),
     }
 }
 
 fn daemon_missing(error: &io::Error) -> bool {
-    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn already_stopped() -> CommandOutput {
@@ -2013,8 +2055,9 @@ where
         }
     };
 
-    let no_start = cli.no_start || std::env::var("CAGENTS_NO_START")
-        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let no_start = cli.no_start
+        || std::env::var("CAGENTS_NO_START")
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
 
     // Local evidence must remain readable when a staged owner, backend, or
@@ -2642,7 +2685,9 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             };
             let mut client = match ControlClient::connect(&socket) {
                 Ok(client) => client,
-                Err(ControlError::Connect(error)) if daemon_missing(&error) => return Ok(already_stopped()),
+                Err(ControlError::Connect(error)) if daemon_missing(&error) => {
+                    return Ok(already_stopped());
+                }
                 Err(error) => return Err(protocol_error(error)),
             };
             let outcome = match confirm {
@@ -2950,9 +2995,19 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
     match command {
         TerminalCommand::List => {
             let terminals = client.list().map_err(protocol_error)?;
-            let human = format::table(&["ID", "ATTACHMENT", "PROGRAM", "DIRECTORY"],
-                terminals.iter().map(|terminal| descriptor_line(terminal).split('\t').map(str::to_owned).collect()).collect(),
-                "No terminals");
+            let human = format::table(
+                &["ID", "ATTACHMENT", "PROGRAM", "DIRECTORY"],
+                terminals
+                    .iter()
+                    .map(|terminal| {
+                        descriptor_line(terminal)
+                            .split('\t')
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .collect(),
+                "No terminals",
+            );
             Ok(CommandOutput {
                 command: "terminal.list",
                 data: json!({ "terminals": terminals }),
@@ -3543,7 +3598,13 @@ pub fn repository_key(directory: &Path) -> Result<PathBuf, String> {
         return Err(format!("`{}` is not a directory", directory.display()));
     }
     let output = Command::new("git")
-        .args(["-c", "core.fsmonitor=false", "rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")

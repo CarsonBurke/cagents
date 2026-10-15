@@ -1534,7 +1534,10 @@ impl Claude {
 }
 
 impl Adapter for Claude {
-    fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> { self.cwd = directory.to_path_buf(); Ok(()) }
+    fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
+        self.cwd = directory.to_path_buf();
+        Ok(())
+    }
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
@@ -8995,14 +8998,44 @@ mod tests {
     /// frame used to do with the raw JSON of the frame.
     #[test]
     fn explicit_compaction_uses_ordinary_prompt_turn_boundaries() {
-        let mut adapter=Claude {ready:true,commands:vec![chat::SlashCommand {name:"compact".into(),description:String::new()}],..Default::default()};
-        let requested=adapter.command(Command::Compact).unwrap();
+        let mut adapter = Claude {
+            ready: true,
+            commands: vec![chat::SlashCommand {
+                name: "compact".into(),
+                description: String::new(),
+            }],
+            ..Default::default()
+        };
+        let requested = adapter.command(Command::Compact).unwrap();
         assert!(requested.events.contains(&Event::TurnStarted));
-        assert!(requested.writes.iter().any(|frame|frame["message"]["content"][0]["text"]=="/compact"));
-        assert!(!requested.events.iter().any(|event|matches!(event,Event::Compaction{..})));
-        let completed=adapter.receive(json!({"type":"result","subtype":"success","is_error":false})).unwrap();
-        assert!(completed.events.iter().any(|event|matches!(event,Event::TurnFinished{outcome:crate::notifications::Kind::Succeeded,..})));
-        assert!(!completed.events.iter().any(|event|matches!(event,Event::Compaction{..})));
+        assert!(
+            requested
+                .writes
+                .iter()
+                .any(|frame| frame["message"]["content"][0]["text"] == "/compact")
+        );
+        assert!(
+            !requested
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Compaction { .. }))
+        );
+        let completed = adapter
+            .receive(json!({"type":"result","subtype":"success","is_error":false}))
+            .unwrap();
+        assert!(completed.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+        assert!(
+            !completed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Compaction { .. }))
+        );
         assert!(!adapter.busy);
     }
 

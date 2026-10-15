@@ -326,9 +326,13 @@ impl LinearCommand {
                 ("Updated ticket", ticket(&save.id))
             }
             Operation::Create(save) => ("Created ticket", save.title.clone().unwrap_or_default()),
-            Operation::Set { target, .. } | Operation::Label { command: LabelCommand::Add { target, .. } | LabelCommand::Remove { target, .. } | LabelCommand::Set { target, .. } } => {
-                ("Updated ticket", issue(target))
-            }
+            Operation::Set { target, .. }
+            | Operation::Label {
+                command:
+                    LabelCommand::Add { target, .. }
+                    | LabelCommand::Remove { target, .. }
+                    | LabelCommand::Set { target, .. },
+            } => ("Updated ticket", issue(target)),
             Operation::Status {
                 command: StatusCommand::Set { target, state },
             } => ("Moved ticket", format!("{} to {state}", issue(target))),
@@ -337,7 +341,10 @@ impl LinearCommand {
             } => ("Commented on", issue(target)),
             Operation::Attach { target, .. } => ("Attached a link to", issue(target)),
             Operation::Relation {
-                command: RelationCommand::Add { target, related, .. },
+                command:
+                    RelationCommand::Add {
+                        target, related, ..
+                    },
             } => ("Related", format!("{} to {related}", issue(target))),
             Operation::Relation {
                 command: RelationCommand::Remove { .. },
@@ -580,7 +587,8 @@ fn resolve_references(
     let mut matches = vec![Vec::new(); references.len()];
     let mut cursor = None;
     for _ in 0..10 {
-        let (query, variables) = metadata_query(field, selection, references, team, cursor.as_deref());
+        let (query, variables) =
+            metadata_query(field, selection, references, team, cursor.as_deref());
         let data = result_field(request(client, &query, variables, false)?, field)?;
         let nodes = data["nodes"]
             .as_array()
@@ -624,7 +632,13 @@ fn resolve_references(
     ))
 }
 
-fn metadata_query(field: &str, selection: &str, references: &[String], team: Option<&str>, after: Option<&str>) -> (String, Value) {
+fn metadata_query(
+    field: &str,
+    selection: &str,
+    references: &[String],
+    team: Option<&str>,
+    after: Option<&str>,
+) -> (String, Value) {
     let definition = match field {
         "teams" => Some(("TeamFilter", &["name", "key"][..])),
         "workflowStates" => Some(("WorkflowStateFilter", &["name"][..])),
@@ -635,18 +649,32 @@ fn metadata_query(field: &str, selection: &str, references: &[String], team: Opt
     };
     let mut variables = json!({"first":100,"after":after});
     let (declaration, argument) = if let Some((filter_type, fields)) = definition {
-        let alternatives: Vec<_> = references.iter()
+        let alternatives: Vec<_> = references
+            .iter()
             .filter(|reference| uuid::Uuid::parse_str(reference).is_err())
-            .flat_map(|reference| fields.iter().map(move |field| json!({(*field): {"eqIgnoreCase":reference}})))
+            .flat_map(|reference| {
+                fields
+                    .iter()
+                    .map(move |field| json!({(*field): {"eqIgnoreCase":reference}}))
+            })
             .collect();
         let mut filter = json!({"or":alternatives});
-        if field == "workflowStates" && let Some(team) = team {
+        if field == "workflowStates"
+            && let Some(team) = team
+        {
             filter["team"] = json!({"id":{"eq":team}});
         }
         variables["filter"] = filter;
         (format!(",$filter:{filter_type}!"), ",filter:$filter")
-    } else { (String::new(), "") };
-    (format!("query($first:Int!,$after:String{declaration}) {{ {field}(first:$first,after:$after{argument}) {{ nodes {{ {selection} }} {PAGE_INFO} }} }}"), variables)
+    } else {
+        (String::new(), "")
+    };
+    (
+        format!(
+            "query($first:Int!,$after:String{declaration}) {{ {field}(first:$first,after:$after{argument}) {{ nodes {{ {selection} }} {PAGE_INFO} }} }}"
+        ),
+        variables,
+    )
 }
 
 fn label_eligible(node: &Value, teams: &BTreeSet<String>) -> bool {
@@ -1302,13 +1330,28 @@ mod tests {
     use super::*;
     #[test]
     fn metadata_lookups_use_one_exact_filtered_query() {
-        for (field, kind) in [("teams", "TeamFilter"), ("workflowStates", "WorkflowStateFilter"), ("users", "UserFilter")] {
-            let (query, variables) = metadata_query(field, "id name", &["In Progress".into()], Some("team-id"), None);
+        for (field, kind) in [
+            ("teams", "TeamFilter"),
+            ("workflowStates", "WorkflowStateFilter"),
+            ("users", "UserFilter"),
+        ] {
+            let (query, variables) = metadata_query(
+                field,
+                "id name",
+                &["In Progress".into()],
+                Some("team-id"),
+                None,
+            );
             assert!(query.contains(&format!("$filter:{kind}!")));
             assert!(query.contains("filter:$filter"));
-            assert_eq!(variables["filter"]["or"][0]["name"]["eqIgnoreCase"], "In Progress");
+            assert_eq!(
+                variables["filter"]["or"][0]["name"]["eqIgnoreCase"],
+                "In Progress"
+            );
             assert!(variables["after"].is_null());
-            if field == "workflowStates" { assert_eq!(variables["filter"]["team"]["id"]["eq"], "team-id"); }
+            if field == "workflowStates" {
+                assert_eq!(variables["filter"]["team"]["id"]["eq"], "team-id");
+            }
         }
     }
 

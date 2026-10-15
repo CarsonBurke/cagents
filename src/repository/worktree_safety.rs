@@ -7,7 +7,11 @@ const DISPOSABLE_CONFIG: &str = "cagents.cleanupDisposableDirectories";
 fn require_complete_inventory(output: &ProcessOutput) -> Result<(), RepositoryError> {
     if output.stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let line = stderr.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("Git inventory warning");
+        let line = stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("Git inventory warning");
         let detail: String = line.chars().take(FAILURE_DETAIL_LIMIT).collect();
         return Err(RepositoryError::InvalidOutput {
             field: "worktree_safety",
@@ -497,9 +501,22 @@ mod tests {
             };
             fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
             let error = result.unwrap_err();
-            assert!(error.to_string().contains("Git could not inspect every file"), "{error}");
-            assert_eq!(fs::read_to_string(unreadable.join("secret")).unwrap(), "preserve");
-            fs::remove_dir_all(root.join(if name.starts_with("ignored") { "ignored" } else { "untracked" })).unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Git could not inspect every file"),
+                "{error}"
+            );
+            assert_eq!(
+                fs::read_to_string(unreadable.join("secret")).unwrap(),
+                "preserve"
+            );
+            fs::remove_dir_all(root.join(if name.starts_with("ignored") {
+                "ignored"
+            } else {
+                "untracked"
+            }))
+            .unwrap();
         }
         struct LocksAfterCollapsedInventory(PathBuf);
         impl ProcessExecutor for LocksAfterCollapsedInventory {
@@ -509,7 +526,11 @@ mod tests {
                 cancellation: &CancellationToken,
             ) -> Result<ProcessOutput, ProcessFailure> {
                 let output = SystemProcessExecutor.execute(command, cancellation)?;
-                if command.arguments.iter().any(|argument| argument == "--directory") {
+                if command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "--directory")
+                {
                     assert!(output.success && output.stderr.is_empty());
                     fs::set_permissions(&self.0, fs::Permissions::from_mode(0o300)).unwrap();
                 }
@@ -521,11 +542,22 @@ mod tests {
         let locked = root.join("ignored/locked");
         fs::create_dir_all(&locked).unwrap();
         fs::write(locked.join("secret"), "preserve").unwrap();
-        let service = RepositoryService::new("git", Arc::new(LocksAfterCollapsedInventory(locked.clone())));
+        let service = RepositoryService::new(
+            "git",
+            Arc::new(LocksAfterCollapsedInventory(locked.clone())),
+        );
         let result = service.notable_ignored_files(root, &cancel);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(result.unwrap_err().to_string().contains("Git could not inspect every file"));
-        assert_eq!(fs::read_to_string(locked.join("secret")).unwrap(), "preserve");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Git could not inspect every file")
+        );
+        assert_eq!(
+            fs::read_to_string(locked.join("secret")).unwrap(),
+            "preserve"
+        );
     }
 
     #[test]
@@ -547,7 +579,9 @@ mod tests {
                 fs::write(nested.join("data"), content).unwrap();
                 let error = service.worktree_safety(root, &cancel).unwrap_err();
                 assert!(
-                    error.to_string().contains("Cannot inspect all files inside"),
+                    error
+                        .to_string()
+                        .contains("Cannot inspect all files inside"),
                     "{error}"
                 );
                 assert_eq!(fs::read_to_string(nested.join("data")).unwrap(), content);

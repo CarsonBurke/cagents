@@ -34,10 +34,17 @@ fn keyring_error() -> Error {
 
 fn account(workspace: Option<&str>) -> Result<String, Error> {
     super::api::workspace_variable(workspace)?;
-    Ok(workspace.map_or_else(|| "default".into(), |name| format!("workspace:{}", name.to_ascii_uppercase())))
+    Ok(workspace.map_or_else(
+        || "default".into(),
+        |name| format!("workspace:{}", name.to_ascii_uppercase()),
+    ))
 }
 
-fn helper(operation: &[&str], workspace: Option<&str>, secret: Option<&str>) -> Result<Option<String>, Error> {
+fn helper(
+    operation: &[&str],
+    workspace: Option<&str>,
+    secret: Option<&str>,
+) -> Result<Option<String>, Error> {
     let account = account(workspace)?;
     let mut child = Command::new("secret-tool")
         .args(operation)
@@ -50,11 +57,16 @@ fn helper(operation: &[&str], workspace: Option<&str>, secret: Option<&str>) -> 
     let stdout = child.stdout.take().expect("piped output");
     let reader = thread::spawn(move || {
         let mut output = Vec::new();
-        stdout.take((MAX_KEY_BYTES + 2) as u64).read_to_end(&mut output).map(|_| output)
+        stdout
+            .take((MAX_KEY_BYTES + 2) as u64)
+            .read_to_end(&mut output)
+            .map(|_| output)
     });
     let mut input = child.stdin.take().expect("piped input");
     let written = match secret {
-        Some(secret) => input.write_all(secret.as_bytes()).and_then(|_| input.write_all(b"\n")),
+        Some(secret) => input
+            .write_all(secret.as_bytes())
+            .and_then(|_| input.write_all(b"\n")),
         None => Ok(()),
     };
     drop(input);
@@ -72,7 +84,10 @@ fn helper(operation: &[&str], workspace: Option<&str>, secret: Option<&str>) -> 
             }
         }
     };
-    let output = reader.join().map_err(|_| keyring_error())?.map_err(|_| keyring_error())?;
+    let output = reader
+        .join()
+        .map_err(|_| keyring_error())?
+        .map_err(|_| keyring_error())?;
     let status = status.ok_or_else(keyring_error)?;
     // A missing entry is the helper's documented exit 1 and has no output.
     if operation == ["lookup"] && status.code() == Some(1) && output.is_empty() {
@@ -83,7 +98,9 @@ fn helper(operation: &[&str], workspace: Option<&str>, secret: Option<&str>) -> 
     }
     if operation == ["lookup"] {
         let output = output.strip_suffix(b"\n").unwrap_or(&output);
-        return String::from_utf8(output.to_vec()).map(Some).map_err(|_| keyring_error());
+        return String::from_utf8(output.to_vec())
+            .map(Some)
+            .map_err(|_| keyring_error());
     }
     Ok(None)
 }
@@ -95,9 +112,17 @@ pub fn get(workspace: Option<&str>) -> Result<Option<String>, Error> {
 pub fn store(workspace: Option<&str>, secret: &Secret) -> Result<(), Error> {
     super::api::Client::validate_key(&secret.0)?;
     if secret.0.len() > MAX_KEY_BYTES {
-        return Err(Error::new("linear_auth_invalid", "Linear key exceeds the size limit"));
+        return Err(Error::new(
+            "linear_auth_invalid",
+            "Linear key exceeds the size limit",
+        ));
     }
-    helper(&["store", "--label=Cagents Linear API key"], workspace, Some(&secret.0)).map(|_| ())
+    helper(
+        &["store", "--label=Cagents Linear API key"],
+        workspace,
+        Some(&secret.0),
+    )
+    .map(|_| ())
 }
 
 pub fn remove(workspace: Option<&str>) -> Result<(), Error> {

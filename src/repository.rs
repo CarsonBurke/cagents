@@ -4630,7 +4630,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // operation must not enumerate an arbitrarily large repository index.
         let mut listed = HashSet::new();
         for batch in bounded_pathspec_batches(paths) {
-            let mut arguments = vec![OsString::from("ls-files"), OsString::from("-z"), OsString::from("--")];
+            let mut arguments = vec![
+                OsString::from("ls-files"),
+                OsString::from("-z"),
+                OsString::from("--"),
+            ];
             arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
             let command = self.git_literal_read(worktree, arguments);
             let output = self.run_checked(&command, cancellation)?;
@@ -4658,7 +4662,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let mut listed = HashSet::new();
         let paths: Vec<RepoPath> = paths.iter().map(|path| (*path).clone()).collect();
         for batch in bounded_pathspec_batches(&paths) {
-            let mut arguments = vec![OsString::from("ls-tree"), OsString::from("-r"), OsString::from("-z"), OsString::from(revision.as_str()), OsString::from("--")];
+            let mut arguments = vec![
+                OsString::from("ls-tree"),
+                OsString::from("-r"),
+                OsString::from("-z"),
+                OsString::from(revision.as_str()),
+                OsString::from("--"),
+            ];
             arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
             let command = self.git_literal_read(worktree, arguments);
             let output = self.run_checked(&command, cancellation)?;
@@ -5541,17 +5551,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<Option<Oid>, RepositoryError> {
         let _remote = self.checked_remote(worktree, remote, cancellation)?;
-        let command = self.git_read(
-            worktree,
-            [
-                OsString::from("ls-remote"),
-                OsString::from("--refs"),
-                OsString::from("--exit-code"),
-                OsString::from("--"),
-                OsString::from(remote),
-                OsString::from(remote_ref.as_str()),
-            ],
-        ).timeout(Duration::from_secs(3));
+        let command = self
+            .git_read(
+                worktree,
+                [
+                    OsString::from("ls-remote"),
+                    OsString::from("--refs"),
+                    OsString::from("--exit-code"),
+                    OsString::from("--"),
+                    OsString::from(remote),
+                    OsString::from(remote_ref.as_str()),
+                ],
+            )
+            .timeout(Duration::from_secs(3));
         let output = self.run(&command, cancellation)?;
         if !output.success {
             // 2 is `--exit-code`'s "no matching ref"; anything else is a
@@ -5630,15 +5642,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // A plain branch name is local intent. Cached remote-tracking refs
             // can identify an existing remote branch; unknown names create a
             // local branch without a speculative network lookup.
-            let mut candidates: Vec<_> = refs.remote.iter()
+            let mut candidates: Vec<_> = refs
+                .remote
+                .iter()
                 .filter(|reference| reference.branch == branch.as_str())
                 .map(|reference| (reference.remote.clone(), reference.branch.clone()))
                 .collect();
             if candidates.len() > 1 {
                 return Err(ValidationError::InvalidBranch(format!(
                     "{} exists on multiple remotes; enter one of: {}",
-                    branch.as_str(), candidates.iter().map(|(remote, branch)| format!("{remote}/{branch}")).collect::<Vec<_>>().join(", ")
-                )).into());
+                    branch.as_str(),
+                    candidates
+                        .iter()
+                        .map(|(remote, branch)| format!("{remote}/{branch}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .into());
             }
             candidates.pop()
         };
@@ -5756,9 +5776,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 local_name,
             )?));
         }
-        let tag = format!("refs/tags/{}", name.strip_prefix("refs/tags/").unwrap_or(name));
+        let tag = format!(
+            "refs/tags/{}",
+            name.strip_prefix("refs/tags/").unwrap_or(name)
+        );
         if ValidatedRefName::parse(tag.clone()).is_ok() {
-            if let Some(oid) = self.resolve_optional_revision(repository, &format!("{tag}^{{commit}}"), cancellation)? {
+            if let Some(oid) = self.resolve_optional_revision(
+                repository,
+                &format!("{tag}^{{commit}}"),
+                cancellation,
+            )? {
                 return Ok(BaseRevision::object_id(oid.to_string())?);
             }
         }
@@ -5778,9 +5805,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             ))?);
         }
         let branch = ValidatedBranchName::parse(name)?;
-        let mut candidates: Vec<_> = refs.remote.iter()
+        let mut candidates: Vec<_> = refs
+            .remote
+            .iter()
             .filter(|reference| reference.branch == branch.as_str())
-            .map(|reference| reference.name.as_str().to_owned()).collect();
+            .map(|reference| reference.name.as_str().to_owned())
+            .collect();
         if candidates.len() == 1 {
             return Ok(BaseRevision::remote_ref(candidates.remove(0))?);
         }
@@ -5802,13 +5832,25 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .find(|remote| remote.name == "origin")
             .or_else(|| (remotes.len() == 1).then(|| &remotes[0]));
         if let Some(remote) = remote {
-            if let Some(head) = refs.remote_heads.iter().find(|head| head.remote == remote.name) {
-                if refs.remote.iter().any(|reference| reference.name == head.target) {
+            if let Some(head) = refs
+                .remote_heads
+                .iter()
+                .find(|head| head.remote == remote.name)
+            {
+                if refs
+                    .remote
+                    .iter()
+                    .any(|reference| reference.name == head.target)
+                {
                     return Ok(BaseRevision::remote_ref(head.target.as_str())?);
                 }
             }
             for branch in ["main", "master"] {
-                if let Some(reference) = refs.remote.iter().find(|reference| reference.remote == remote.name && reference.branch == branch) {
+                if let Some(reference) = refs
+                    .remote
+                    .iter()
+                    .find(|reference| reference.remote == remote.name && reference.branch == branch)
+                {
                     return Ok(BaseRevision::remote_ref(reference.name.as_str())?);
                 }
             }
@@ -6136,14 +6178,21 @@ fn bounded_pathspec_batches(paths: &[RepoPath]) -> impl Iterator<Item = &[RepoPa
     const BUDGET: usize = 32 * 1024;
     let mut remaining = paths;
     std::iter::from_fn(move || {
-        if remaining.is_empty() { return None; }
+        if remaining.is_empty() {
+            return None;
+        }
         let mut bytes = 0usize;
-        let count = remaining.iter().take_while(|path| {
-            let next = path.as_os_str().as_bytes().len() + 1 + std::mem::size_of::<usize>();
-            if bytes != 0 && bytes.saturating_add(next) > BUDGET { return false; }
-            bytes = bytes.saturating_add(next);
-            true
-        }).count();
+        let count = remaining
+            .iter()
+            .take_while(|path| {
+                let next = path.as_os_str().as_bytes().len() + 1 + std::mem::size_of::<usize>();
+                if bytes != 0 && bytes.saturating_add(next) > BUDGET {
+                    return false;
+                }
+                bytes = bytes.saturating_add(next);
+                true
+            })
+            .count();
         let (batch, rest) = remaining.split_at(count);
         remaining = rest;
         Some(batch)
@@ -6804,7 +6853,8 @@ mod tests {
             git(root, &["init", "-b", "main"]);
             fs::write(root.join("selected.txt"), "base").unwrap();
             git(root, &["add", "selected.txt"]);
-            let blob = String::from_utf8(git_output(root, &["rev-parse", ":selected.txt"])).unwrap();
+            let blob =
+                String::from_utf8(git_output(root, &["rev-parse", ":selected.txt"])).unwrap();
             let mut input = Vec::new();
             // Over17MiB of index names, plus substantially larger ls-tree
             // records, reproduced the default16MiB process-output failure.
@@ -6813,14 +6863,49 @@ mod tests {
             }
             let service = service();
             let cancel = CancellationToken::new();
-            let command = service.git_mutation(root, ["update-index", "-z", "--index-info"]).stdin(input);
+            let command = service
+                .git_mutation(root, ["update-index", "-z", "--index-info"])
+                .stdin(input);
             service.run_checked(&command, &cancel).unwrap();
             git(root, &["commit", "--quiet", "-m", "large sparse fixture"]);
             fs::write(root.join("selected.txt"), "modified").unwrap();
-            assert!(matches!(service.stage(&StageRequest {worktree: root.into(), selection: vec![PathSelection {path: path("selected.txt"), old_path: None}]}, &cancel).unwrap(), MutationOutcome::Applied {..}));
-            assert!(matches!(service.unstage(&UnstageRequest {worktree: root.into(), selection: vec![PathSelection {path: path("selected.txt"), old_path: None}]}, &cancel).unwrap(), MutationOutcome::Applied {..}));
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: vec![PathSelection {
+                                path: path("selected.txt"),
+                                old_path: None
+                            }]
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .unstage(
+                        &UnstageRequest {
+                            worktree: root.into(),
+                            selection: vec![PathSelection {
+                                path: path("selected.txt"),
+                                old_path: None
+                            }]
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
             let head = service.resolve_head(root, &cancel).unwrap().unwrap();
-            assert_eq!(service.head_tree_paths(root, &head, &[&path("selected.txt")], &cancel).unwrap(), vec![path("selected.txt")]);
+            assert_eq!(
+                service
+                    .head_tree_paths(root, &head, &[&path("selected.txt")], &cancel)
+                    .unwrap(),
+                vec![path("selected.txt")]
+            );
         }
 
         #[test]
@@ -6908,7 +6993,9 @@ mod tests {
             // 40k names exceed Linux ARG_MAX even before argv pointer overhead.
             let mut selection = Vec::with_capacity(40_000);
             for index in 0..40_000 {
-                let name = format!("generated_component_file_with_an_extraordinarily_long_name_{index:05}.txt");
+                let name = format!(
+                    "generated_component_file_with_an_extraordinarily_long_name_{index:05}.txt"
+                );
                 fs::write(root.join(&name), "generated").unwrap();
                 selection.push(PathSelection {
                     path: path(&name),
@@ -6961,14 +7048,69 @@ mod tests {
             );
             // Exercise the >ARG_MAX tracked restore path as well as unlinking
             // untracked files: all three Git mutation operations use stdin.
-            for entry in &selection { fs::write(root.join(entry.path.as_os_str()), "generated").unwrap(); }
-            assert!(matches!(service.stage(&StageRequest {worktree: root.into(), selection: selection.clone()}, &cancel).unwrap(), MutationOutcome::Applied {..}));
+            for entry in &selection {
+                fs::write(root.join(entry.path.as_os_str()), "generated").unwrap();
+            }
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
             git(root, &["commit", "--quiet", "-m", "generated baseline"]);
-            for entry in &selection { fs::write(root.join(entry.path.as_os_str()), "modified").unwrap(); }
-            assert!(matches!(service.stage(&StageRequest {worktree: root.into(), selection: selection.clone()}, &cancel).unwrap(), MutationOutcome::Applied {..}));
-            assert!(matches!(service.unstage(&UnstageRequest {worktree: root.into(), selection: selection.clone()}, &cancel).unwrap(), MutationOutcome::Applied {..}));
-            assert!(matches!(service.discard(&DiscardRequest {worktree: root.into(), tracked: selection.clone(), untracked: vec![], confirmed: true}, &cancel).unwrap(), MutationOutcome::Applied {..}));
-            for entry in &selection { assert_eq!(fs::read(root.join(entry.path.as_os_str())).unwrap(), b"generated"); }
+            for entry in &selection {
+                fs::write(root.join(entry.path.as_os_str()), "modified").unwrap();
+            }
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .unstage(
+                        &UnstageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .discard(
+                        &DiscardRequest {
+                            worktree: root.into(),
+                            tracked: selection.clone(),
+                            untracked: vec![],
+                            confirmed: true
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            for entry in &selection {
+                assert_eq!(
+                    fs::read(root.join(entry.path.as_os_str())).unwrap(),
+                    b"generated"
+                );
+            }
         }
 
         #[test]
@@ -7579,7 +7721,16 @@ mod tests {
             ValidatedBranchName::parse("feature/safe").unwrap().as_str(),
             "feature/safe"
         );
-        for invalid in ["-force", "bad name", "a..b", "a.lock", "a@{b", "a//b", ".hidden", "feature/.hidden"] {
+        for invalid in [
+            "-force",
+            "bad name",
+            "a..b",
+            "a.lock",
+            "a@{b",
+            "a//b",
+            ".hidden",
+            "feature/.hidden",
+        ] {
             assert!(ValidatedBranchName::parse(invalid).is_err(), "{invalid}");
         }
     }
@@ -11201,41 +11352,50 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     ValidationError::Io(format!("journal write failed: {error}"))
                 })?;
             if let BaseRevision::RemoteRef(reference) = &journal.request.base {
-                let cached = self.resolve_optional_revision(&journal.request.repository, reference, cancellation)?;
-                if journal.request.track || cached.is_none() {
-                let remotes = self.remotes(&journal.request.repository, cancellation)?;
-                let (remote, branch) = remotes
-                    .iter()
-                    .filter_map(|remote| {
-                        reference
-                            .strip_prefix(&format!("refs/remotes/{}/", remote.name))
-                            .map(|branch| (&remote.name, branch))
-                    })
-                    .max_by_key(|(remote, _)| remote.len())
-                    .ok_or_else(|| {
-                        ValidationError::InvalidBase(format!(
-                            "No configured remote owns {reference}"
-                        ))
-                    })?;
-                let _remote =
-                    self.checked_remote(&journal.request.repository, remote, cancellation)?;
-                ValidatedBranchName::parse(branch)?;
-                let mut fetch = self.git_mutation(
+                let cached = self.resolve_optional_revision(
                     &journal.request.repository,
-                    [
-                        "fetch",
-                        "--no-tags",
-                        "--no-recurse-submodules",
-                        remote.as_str(),
-                        &format!("+refs/heads/{branch}:{reference}"),
-                    ],
-                );
-                fetch.inherited_lease = Some(lease.as_raw_fd());
-                if let Err(failure) = self.run_checked(&fetch, cancellation) {
-                    if cached.is_none() || cancellation.is_cancelled() { return Err(failure.into()); }
-                    remote_refresh_warning = Some(format!("Remote refresh failed; using cached {reference}: {}", failure.reported_detail()));
-                    journal.warnings.push(failure);
-                }
+                    reference,
+                    cancellation,
+                )?;
+                if journal.request.track || cached.is_none() {
+                    let remotes = self.remotes(&journal.request.repository, cancellation)?;
+                    let (remote, branch) = remotes
+                        .iter()
+                        .filter_map(|remote| {
+                            reference
+                                .strip_prefix(&format!("refs/remotes/{}/", remote.name))
+                                .map(|branch| (&remote.name, branch))
+                        })
+                        .max_by_key(|(remote, _)| remote.len())
+                        .ok_or_else(|| {
+                            ValidationError::InvalidBase(format!(
+                                "No configured remote owns {reference}"
+                            ))
+                        })?;
+                    let _remote =
+                        self.checked_remote(&journal.request.repository, remote, cancellation)?;
+                    ValidatedBranchName::parse(branch)?;
+                    let mut fetch = self.git_mutation(
+                        &journal.request.repository,
+                        [
+                            "fetch",
+                            "--no-tags",
+                            "--no-recurse-submodules",
+                            remote.as_str(),
+                            &format!("+refs/heads/{branch}:{reference}"),
+                        ],
+                    );
+                    fetch.inherited_lease = Some(lease.as_raw_fd());
+                    if let Err(failure) = self.run_checked(&fetch, cancellation) {
+                        if cached.is_none() || cancellation.is_cancelled() {
+                            return Err(failure.into());
+                        }
+                        remote_refresh_warning = Some(format!(
+                            "Remote refresh failed; using cached {reference}: {}",
+                            failure.reported_detail()
+                        ));
+                        journal.warnings.push(failure);
+                    }
                 }
             }
             let resolve = self.git_read(
@@ -11315,7 +11475,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
-            self.ensure_managed_directory_ignored(&journal.request.repository, &journal.request.managed_root, cancellation)?;
+            self.ensure_managed_directory_ignored(
+                &journal.request.repository,
+                &journal.request.managed_root,
+                cancellation,
+            )?;
             self.ignore_legacy_managed_worktrees(&journal.request.repository, cancellation)?;
             fs::create_dir_all(&journal.request.managed_root)
                 .map_err(|e| ValidationError::Io(e.to_string()))?;
@@ -11384,7 +11548,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             Ok(())
         })();
         journal.detail = match attempt {
-            Ok(()) => remote_refresh_warning.unwrap_or_else(|| "Git exited; reconciling durable outcome".into()),
+            Ok(()) => remote_refresh_warning
+                .unwrap_or_else(|| "Git exited; reconciling durable outcome".into()),
             Err(error) => {
                 let detail = error.to_string();
                 journal.warnings.push(repository_warning(&self.git, error));
@@ -11595,7 +11760,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
             {
                 journal.state = WorktreeOperationState::ReconcileRequired;
-                journal.detail = format!("Worktree created; Linear linking requires reconciliation: {error}");
+                journal.detail =
+                    format!("Worktree created; Linear linking requires reconciliation: {error}");
             }
         } else if (!residual.branch_exists
             || journal.existing_branch_oid.as_ref().is_some_and(|before| {
@@ -11733,16 +11899,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         &self,
         store: &StateStore,
     ) -> Result<Vec<WorktreeOperationReport>, StoreError> {
-        let pending = store.operations_requiring_reconciliation()?.into_iter()
-            .filter(|operation|operation.entity_kind == "worktree_creation").collect();
-        self.rehydrate_worktree_operation_rows(store,pending)
+        let pending = store
+            .operations_requiring_reconciliation()?
+            .into_iter()
+            .filter(|operation| operation.entity_kind == "worktree_creation")
+            .collect();
+        self.rehydrate_worktree_operation_rows(store, pending)
     }
 
     fn rehydrate_worktree_operation_rows(
         &self,
-        store:&StateStore,
-        operations:Vec<PendingOperation>,
-    )->Result<Vec<WorktreeOperationReport>,StoreError> {
+        store: &StateStore,
+        operations: Vec<PendingOperation>,
+    ) -> Result<Vec<WorktreeOperationReport>, StoreError> {
         let mut reports = Vec::new();
         for operation in operations {
             let parsed = serde_json::from_value::<WorktreeJournal>(operation.payload.clone());
@@ -12082,9 +12251,17 @@ mod worktree_journal_tests {
         journal.base_oid = Some(oid.clone());
         let payload = journal.persist(&fixture.store, &payload).unwrap();
         fs::create_dir(&fixture.request.managed_root).unwrap();
-        let mut command = fixture.service.create_worktree_command(&fixture.request, &oid).unwrap();
+        let mut command = fixture
+            .service
+            .create_worktree_command(&fixture.request, &oid)
+            .unwrap();
         command.inherited_lease = Some(lease.as_raw_fd());
-        assert!(SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap().success);
+        assert!(
+            SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap()
+                .success
+        );
         journal.checkout_completed = true;
         journal.persist(&fixture.store, &payload).unwrap();
         drop(lease);
@@ -12095,16 +12272,30 @@ mod worktree_journal_tests {
         for already_linked in [false, true] {
             let mut fixture = Fixture::new();
             fixture.request.linear_issue = Some(crate::linear::context::LinkedIssue {
-                issue_id: "ENG-123".into(), workspace: None,
+                issue_id: "ENG-123".into(),
+                workspace: None,
             });
             interrupted_linear_checkout(&fixture);
             if already_linked {
-                crate::linear::context::link_at(&fixture.request.destination, "ENG-123", None).unwrap();
+                crate::linear::context::link_at(&fixture.request.destination, "ENG-123", None)
+                    .unwrap();
             }
-            let report = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
+            let report = fixture
+                .service
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap()
+                .remove(0);
             assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-            assert_eq!(crate::linear::context::resolve_at(&fixture.request.destination).unwrap().issue_id, "ENG-123");
-            assert_eq!(fixture.journal(fixture.request.operation_id).state, WorktreeOperationState::Created);
+            assert_eq!(
+                crate::linear::context::resolve_at(&fixture.request.destination)
+                    .unwrap()
+                    .issue_id,
+                "ENG-123"
+            );
+            assert_eq!(
+                fixture.journal(fixture.request.operation_id).state,
+                WorktreeOperationState::Created
+            );
         }
     }
 
@@ -12112,22 +12303,63 @@ mod worktree_journal_tests {
     fn failed_linear_link_retains_ownership_for_recovery_retry() {
         let mut fixture = Fixture::new();
         fixture.request.linear_issue = Some(crate::linear::context::LinkedIssue {
-            issue_id: "ENG-123".into(), workspace: None,
+            issue_id: "ENG-123".into(),
+            workspace: None,
         });
         interrupted_linear_checkout(&fixture);
-        let admin = fixture.service.git_dir(&fixture.request.destination, &CancellationToken::new()).unwrap();
+        let admin = fixture
+            .service
+            .git_dir(&fixture.request.destination, &CancellationToken::new())
+            .unwrap();
         let obstruction = admin.join("cagents-linear.json");
         fs::create_dir(&obstruction).unwrap();
-        let report = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
-        assert_eq!(report.state, WorktreeOperationState::ReconcileRequired, "{report:?}");
-        assert!(report.detail.contains("Linear linking requires reconciliation"));
-        assert_eq!(fixture.journal(fixture.request.operation_id).state, WorktreeOperationState::ReconcileRequired);
-        let worktree = fixture.service.list_worktrees(&fixture.request.repository, &CancellationToken::new()).unwrap().into_iter().find(|worktree| worktree.path == fixture.request.destination).unwrap();
-        assert_eq!(worktree.lock.reason, Some(format!("cagents:{}", fixture.request.operation_id)));
+        let report = fixture
+            .service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::ReconcileRequired,
+            "{report:?}"
+        );
+        assert!(
+            report
+                .detail
+                .contains("Linear linking requires reconciliation")
+        );
+        assert_eq!(
+            fixture.journal(fixture.request.operation_id).state,
+            WorktreeOperationState::ReconcileRequired
+        );
+        let worktree = fixture
+            .service
+            .list_worktrees(&fixture.request.repository, &CancellationToken::new())
+            .unwrap()
+            .into_iter()
+            .find(|worktree| worktree.path == fixture.request.destination)
+            .unwrap();
+        assert_eq!(
+            worktree.lock.reason,
+            Some(format!("cagents:{}", fixture.request.operation_id))
+        );
         fs::remove_dir(obstruction).unwrap();
-        let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
-        assert_eq!(recovered.state, WorktreeOperationState::Created, "{recovered:?}");
-        assert_eq!(crate::linear::context::resolve_at(&fixture.request.destination).unwrap().issue_id, "ENG-123");
+        let recovered = fixture
+            .service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            recovered.state,
+            WorktreeOperationState::Created,
+            "{recovered:?}"
+        );
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.destination)
+                .unwrap()
+                .issue_id,
+            "ENG-123"
+        );
     }
 
     #[test]
@@ -12144,9 +12376,17 @@ mod worktree_journal_tests {
             crate::linear::context::resolve_at(&fixture.request.destination).unwrap(),
             issue,
         );
-        assert_eq!(fixture.journal(fixture.request.operation_id).request.linear_issue, Some(issue));
         assert_eq!(
-            crate::linear::context::resolve_at(&fixture.request.repository).unwrap_err().kind,
+            fixture
+                .journal(fixture.request.operation_id)
+                .request
+                .linear_issue,
+            Some(issue)
+        );
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.repository)
+                .unwrap_err()
+                .kind,
             "linear_issue_required",
         );
     }
@@ -12161,17 +12401,76 @@ mod worktree_journal_tests {
         fixture.git(&["worktree", "lock", "--reason", &label, destination]);
         let journal = fixture.journal(fixture.request.operation_id);
         let live = worktree_lease(&journal.lease_path, false).unwrap();
-        assert!(fixture.service.stale_worktree_lock(&fixture.store, &fixture.request.repository, &fixture.request.destination, &token).is_err());
-        assert!(fixture.service.unlock_stale_worktree(&fixture.store, &fixture.request.repository, &fixture.request.destination, &token).is_err());
+        assert!(
+            fixture
+                .service
+                .stale_worktree_lock(
+                    &fixture.store,
+                    &fixture.request.repository,
+                    &fixture.request.destination,
+                    &token
+                )
+                .is_err()
+        );
+        assert!(
+            fixture
+                .service
+                .unlock_stale_worktree(
+                    &fixture.store,
+                    &fixture.request.repository,
+                    &fixture.request.destination,
+                    &token
+                )
+                .is_err()
+        );
         drop(live);
-        fixture.service.stale_worktree_lock(&fixture.store, &fixture.request.repository, &fixture.request.destination, &token).unwrap();
-        fixture.service.unlock_stale_worktree(&fixture.store, &fixture.request.repository, &fixture.request.destination, &token).unwrap();
-        assert!(!fixture.service.list_worktrees(&fixture.request.repository, &token).unwrap().into_iter().find(|record| record.path == fixture.request.destination).unwrap().lock.locked);
+        fixture
+            .service
+            .stale_worktree_lock(
+                &fixture.store,
+                &fixture.request.repository,
+                &fixture.request.destination,
+                &token,
+            )
+            .unwrap();
+        fixture
+            .service
+            .unlock_stale_worktree(
+                &fixture.store,
+                &fixture.request.repository,
+                &fixture.request.destination,
+                &token,
+            )
+            .unwrap();
+        assert!(
+            !fixture
+                .service
+                .list_worktrees(&fixture.request.repository, &token)
+                .unwrap()
+                .into_iter()
+                .find(|record| record.path == fixture.request.destination)
+                .unwrap()
+                .lock
+                .locked
+        );
         // Foreign locks and plausible cagents labels without the matching
         // durable operation cannot be cleared by this action.
-        for reason in ["another tool".to_owned(), format!("cagents:{}", OperationId::new())] {
+        for reason in [
+            "another tool".to_owned(),
+            format!("cagents:{}", OperationId::new()),
+        ] {
             fixture.git(&["worktree", "lock", "--reason", &reason, destination]);
-            assert!(fixture.service.unlock_stale_worktree(&fixture.store, &fixture.request.repository, &fixture.request.destination, &token).is_err());
+            assert!(
+                fixture
+                    .service
+                    .unlock_stale_worktree(
+                        &fixture.store,
+                        &fixture.request.repository,
+                        &fixture.request.destination,
+                        &token
+                    )
+                    .is_err()
+            );
             fixture.git(&["worktree", "unlock", destination]);
         }
     }
@@ -12359,19 +12658,38 @@ mod worktree_journal_tests {
         let remote = Fixture::new();
         remote.git(&["commit", "--allow-empty", "-m", "remote advanced"]);
         let bare = fixture.directory.path().join("bare.git");
-        fixture.git(&["clone", "--bare", remote.request.repository.to_str().unwrap(), bare.to_str().unwrap()]);
+        fixture.git(&[
+            "clone",
+            "--bare",
+            remote.request.repository.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
         fixture.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
         fixture.git(&["fetch", "origin"]);
-        fixture.git(&["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+        fixture.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
         let cached = fixture.git(&["rev-parse", "origin/main"]);
         // An unreachable remote represents both offline and expired-credential
         // operation: creating local history must never try authentication.
-        fixture.git(&["remote", "set-url", "origin", "/nonexistent/cagents-offline-remote.git"]);
+        fixture.git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "/nonexistent/cagents-offline-remote.git",
+        ]);
         let mut input = fixture.input("offline/new");
         input.managed_directory.clear();
         fixture.resolve(input);
-        assert!(matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/origin/main"));
-        assert_eq!(fixture.request.managed_root, fixture.request.repository.join(".worktrees"));
+        assert!(
+            matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/origin/main")
+        );
+        assert_eq!(
+            fixture.request.managed_root,
+            fixture.request.repository.join(".worktrees")
+        );
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         assert_eq!(fixture.git(&["rev-parse", "offline/new"]), cached);
@@ -12386,7 +12704,12 @@ mod worktree_journal_tests {
         remote.git(&["switch", "-c", "topic"]);
         remote.git(&["commit", "--allow-empty", "-m", "old remote tip"]);
         let bare = fixture.directory.path().join("bare.git");
-        fixture.git(&["clone", "--bare", remote.request.repository.to_str().unwrap(), bare.to_str().unwrap()]);
+        fixture.git(&[
+            "clone",
+            "--bare",
+            remote.request.repository.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
         fixture.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
         fixture.git(&["fetch", "origin"]);
         let old = fixture.git(&["rev-parse", "origin/topic"]);
@@ -12397,42 +12720,76 @@ mod worktree_journal_tests {
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         assert_ne!(fixture.git(&["rev-parse", "topic"]), old);
-        assert_eq!(fixture.git(&["rev-parse", "topic"]), remote.git(&["rev-parse", "topic"]));
+        assert_eq!(
+            fixture.git(&["rev-parse", "topic"]),
+            remote.git(&["rev-parse", "topic"])
+        );
         assert_eq!(fixture.git(&["config", "branch.topic.remote"]), "origin");
     }
 
     #[test]
     fn uncached_remote_branch_fetch_allows_successful_transfers_longer_than_discovery_timeout() {
         use std::os::unix::fs::PermissionsExt;
-        let mut fixture = Fixture::new(); let remote = Fixture::new();
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
         remote.git(&["branch", "topic"]);
         let bare = fixture.directory.path().join("bare.git");
-        fixture.git(&["clone", "--bare", remote.request.repository.to_str().unwrap(), bare.to_str().unwrap()]);
+        fixture.git(&[
+            "clone",
+            "--bare",
+            remote.request.repository.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
         fixture.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
         let upload_pack = fixture.directory.path().join("slow-upload-pack");
-        fs::write(&upload_pack, "#!/bin/sh\ntouch \"$0.ran\"\nsleep 4\nexec git-upload-pack \"$@\"\n").unwrap();
+        fs::write(
+            &upload_pack,
+            "#!/bin/sh\ntouch \"$0.ran\"\nsleep 4\nexec git-upload-pack \"$@\"\n",
+        )
+        .unwrap();
         fs::set_permissions(&upload_pack, fs::Permissions::from_mode(0o755)).unwrap();
-        fixture.git(&["config", "remote.origin.uploadpack", upload_pack.to_str().unwrap()]);
+        fixture.git(&[
+            "config",
+            "remote.origin.uploadpack",
+            upload_pack.to_str().unwrap(),
+        ]);
         fixture.resolve(fixture.input("origin/topic"));
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         assert!(upload_pack.with_file_name("slow-upload-pack.ran").exists());
-        assert_eq!(fixture.git(&["rev-parse", "topic"]), remote.git(&["rev-parse", "topic"]));
+        assert_eq!(
+            fixture.git(&["rev-parse", "topic"]),
+            remote.git(&["rev-parse", "topic"])
+        );
     }
 
     #[test]
     fn unavailable_remote_branch_refresh_falls_back_to_cached_ref_with_warning() {
         let mut fixture = Fixture::new();
-        let remote = Fixture::new(); remote.git(&["branch", "topic"]);
-        fixture.add_remote("origin", &remote); fixture.git(&["fetch", "origin"]);
+        let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        fixture.add_remote("origin", &remote);
+        fixture.git(&["fetch", "origin"]);
         let cached = fixture.git(&["rev-parse", "origin/topic"]);
-        fixture.git(&["remote", "set-url", "origin", "/nonexistent/cagents-offline-remote.git"]);
+        fixture.git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "/nonexistent/cagents-offline-remote.git",
+        ]);
         fixture.resolve(fixture.input("origin/topic"));
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-        assert!(report.detail.contains("using cached refs/remotes/origin/topic"), "{report:?}");
+        assert!(
+            report
+                .detail
+                .contains("using cached refs/remotes/origin/topic"),
+            "{report:?}"
+        );
         assert_eq!(fixture.git(&["rev-parse", "topic"]), cached);
-        assert!(matches!(&report.outcome, Some(WorktreeCreationOutcome::Created {warnings, ..}) if !warnings.is_empty()));
+        assert!(
+            matches!(&report.outcome, Some(WorktreeCreationOutcome::Created {warnings, ..}) if !warnings.is_empty())
+        );
     }
 
     #[test]
@@ -12441,10 +12798,14 @@ mod worktree_journal_tests {
         let original = fixture.git(&["rev-parse", "HEAD"]);
         fixture.git(&["tag", "-a", "v1", "-m", "release"]);
         fixture.git(&["commit", "--allow-empty", "-m", "later work"]);
-        let mut input = fixture.input("from-tag"); input.base = "v1".into();
+        let mut input = fixture.input("from-tag");
+        input.base = "v1".into();
         fixture.resolve(input);
         assert!(matches!(&fixture.request.base, BaseRevision::ObjectId(oid) if oid == &original));
-        assert_eq!(fixture.run(&CancellationToken::new()).state, WorktreeOperationState::Created);
+        assert_eq!(
+            fixture.run(&CancellationToken::new()).state,
+            WorktreeOperationState::Created
+        );
         assert_eq!(fixture.git(&["rev-parse", "from-tag"]), original);
     }
 
@@ -12502,14 +12863,8 @@ mod worktree_journal_tests {
         fixture.resolve(fixture.input("topic"));
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-        assert_eq!(
-            fixture.git(&["rev-parse", "topic"]),
-            cached
-        );
-        assert_eq!(
-            fixture.git(&["rev-parse", "topic@{upstream}"]),
-            cached
-        );
+        assert_eq!(fixture.git(&["rev-parse", "topic"]), cached);
+        assert_eq!(fixture.git(&["rev-parse", "topic@{upstream}"]), cached);
     }
 
     #[test]

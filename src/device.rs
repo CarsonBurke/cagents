@@ -360,8 +360,15 @@ fn ssh(control: Option<&str>) -> Command {
 fn bridge_command(device: &Device, control: Option<&str>) -> Command {
     let mut command = ssh(control);
     command.args(["--", &device.host]);
-    let policy = if crate::control::daemon_autostart_disabled() { " --no-start" } else { "" };
-    command.arg(format!("{}{policy} daemon bridge", quote(&device.executable)));
+    let policy = if crate::control::daemon_autostart_disabled() {
+        " --no-start"
+    } else {
+        ""
+    };
+    command.arg(format!(
+        "{}{policy} daemon bridge",
+        quote(&device.executable)
+    ));
     command
 }
 /// The control socket of one master, or `None` where SSH could not use it:
