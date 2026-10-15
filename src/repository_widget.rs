@@ -5244,11 +5244,15 @@ impl RepositoryRuntime {
             if document.active_save.is_none() && document.present && document.presence_id != document.saved_presence_id
                 && document.presence_id != 0 && !document.restorations.contains_key(&document.presence_id) {
                 document.error = Some("The Undo restoration metadata is unavailable. Reload before saving.".into());
+                self.source_surface = SourceSurface::Editor;
+                self.markdown_mode = MarkdownMode::Edit;
                 return Task::none();
             }
             if !document.present && !document.restorations.contains_key(&document.presence_id)
                 && document.restorations.len() >= 64 {
-                document.error = Some("The file has too many retained deletion snapshots. Reload to release Undo metadata before saving.".into());
+                document.error = Some("The file has too many retained deletion snapshots. Close and reopen this editor to release old Undo metadata before saving the removal.".into());
+                self.source_surface = SourceSurface::Editor;
+                self.markdown_mode = MarkdownMode::Edit;
                 return Task::none();
             }
         }

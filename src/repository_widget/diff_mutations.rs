@@ -548,6 +548,19 @@ mod tests {
         runtime.apply_diff_buffer_revert_with_presence(&identity, revision.unwrap(), patch.buffer_change.take(), patch.working_present.unwrap(), patch.working_mode).unwrap();
     }
 
+    fn initialize_presence_fixture(root: &Path) {
+    let initialized = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "init", "--template=", "-b", "main"])
+        .arg(&root).env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR").env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_CONFIG").env_remove("GIT_CONFIG_PARAMETERS").env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_OBJECT_DIRECTORY").env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .output().unwrap();
+    assert!(initialized.status.success(), "{}", String::from_utf8_lossy(&initialized.stderr));
+    }
+
     async fn finish_lineage_save(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
         use cosmic::iced::futures::StreamExt;
         let mut pending = std::collections::VecDeque::from([task]);
@@ -572,16 +585,7 @@ mod tests {
         for (save_between_undos, late_completion) in [(true, false), (false, false), (false, true)] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().canonicalize().unwrap();
-            let initialized = std::process::Command::new("git")
-                .args(["-c", "core.fsmonitor=false", "init", "--template=", "-b", "main"])
-                .arg(&root).env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
-                .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_COMMON_DIR").env_remove("GIT_INDEX_FILE")
-                .env_remove("GIT_CONFIG").env_remove("GIT_CONFIG_PARAMETERS").env_remove("GIT_CONFIG_COUNT")
-                .env_remove("GIT_OBJECT_DIRECTORY").env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-                .output().unwrap();
-            assert!(initialized.status.success(), "{}", String::from_utf8_lossy(&initialized.stderr));
+            initialize_presence_fixture(&root);
             std::fs::write(root.join("new.sh"), "synthetic alpha\n").unwrap();
             std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600)).unwrap();
             let card = CardId::new();
@@ -632,6 +636,46 @@ mod tests {
             assert!(!runtime.is_dirty());
         }
         eprintln!("PRESENCE_LINEAGE_VERIFIED");
+    }
+
+    #[tokio::test]
+    async fn partial_change_presence_capacity_refuses_before_disk_effects_and_preserves_undo() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        initialize_presence_fixture(&root);
+        std::fs::write(root.join("new.sh"), "synthetic initial\n").unwrap();
+        std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let card = CardId::new();
+        let (mut runtime, _) = added_file_runtime(card, &root, "synthetic initial\n");
+        let mut latest = String::new();
+        for index in 1..=64 {
+            revert_complete_added_buffer(&mut runtime, card, 0o100644);
+            let task = runtime.request_save_inner(card, false, false);
+            finish_lineage_save(&mut runtime, task).await;
+            assert!(!root.join("new.sh").exists());
+            latest = format!("synthetic cycle {index}\n");
+            let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+            document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(latest.clone()))));
+            let task = runtime.request_save_inner(card, false, false);
+            finish_lineage_save(&mut runtime, task).await;
+            assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), latest);
+        }
+        revert_complete_added_buffer(&mut runtime, card, 0o100644);
+        let refused = runtime.request_save_inner(card, false, false);
+        assert!(iced::runtime::task::into_stream(refused).is_none());
+        assert!(runtime.save_error().unwrap().contains("retained deletion snapshots"));
+        assert_eq!(runtime.source_surface, SourceSurface::Editor, "the recovery message must be visible");
+        assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), latest);
+        assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().permissions().mode() & 0o777, 0o600);
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), latest);
+        assert!(!runtime.is_dirty());
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        assert_eq!(document.restorations.len(), 64);
+        document.history.clear();
+        document.prune_restorations();
+        assert_eq!(document.restorations.len(), 1, "only the current/saved lineage remains after history is dropped");
     }
 
     #[tokio::test]
