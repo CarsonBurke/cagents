@@ -35,12 +35,16 @@ impl RepositoryRuntime {
     pub(super) fn compare_disk(&mut self, card: CardId) -> Task<RepositoryAction> {
         let Some(key) = self.disk_comparison_key(card) else { return Task::none(); };
         self.source_surface = SourceSurface::Diff;
-        if self.disk_comparison_applied.as_ref() == Some(&key) && matches!(self.disk_comparison, Some(DiffState::Ready { .. })) { return Task::none(); }
+        if self.disk_comparison_applied.as_ref() == Some(&key) && matches!(self.disk_comparison, Some(DiffState::Ready(..))) { return Task::none(); }
         if let Some(job) = &self.disk_comparison_job {
             if job.key != key { job.cancellation.cancel(); }
             // Keep the old slot occupied even if cancellation is slow. Its
             // receipt will admit at most one current replacement snapshot.
-            self.disk_comparison = Some(DiffState::Loading { request: job.request.as_u128() as u64, cancellation: job.cancellation.clone() });
+            // Dropping a Loading state cancels its token. Preserve the
+            // existing presentation instead of cancelling on a duplicate.
+            if self.disk_comparison.is_none() {
+                self.disk_comparison = Some(DiffState::Loading { request: job.request.as_u128() as u64, cancellation: job.cancellation.clone() });
+            }
             return Task::none();
         }
         self.disk_comparison_applied = None;
@@ -82,5 +86,61 @@ impl RepositoryRuntime {
             None => RenderedDiff::Error("Could not compare the buffer and disk. Your edits have been kept.".into()),
         }));
         Task::none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::futures::StreamExt;
+
+    fn fixture(card: CardId) -> RepositoryRuntime {
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "note.rs", "buffer");
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        document.external_version = Some(crate::editor_reload::Version { text: "disk".into(), content_hash: blake3::hash(b"disk"), source: document.source.clone(), markdown: false, mapping: Default::default(), restoration: None });
+        document.conflict = true;
+        runtime
+    }
+    async fn completion(task: Task<RepositoryAction>) -> RepositoryAction {
+        let mut stream = iced::runtime::task::into_stream(task).expect("actual comparison worker task");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(action @ RepositoryAction::DiskComparisonLoaded { .. }) = action { return action; }
+        }
+        panic!("comparison task must return its owned receipt");
+    }
+    #[tokio::test]
+    async fn actual_compare_admissions_coalesce_edits_and_reject_duplicate_old_completion() {
+        let card = CardId::new(); let mut runtime = fixture(card);
+        let first = runtime.update(RepositoryAction::CompareDisk { card });
+        let job = runtime.disk_comparison_job.as_ref().unwrap(); let request = job.request; let old = job.key.clone();
+        for _ in 0..20 { assert!(iced::runtime::task::into_stream(runtime.update(RepositoryAction::CompareDisk { card })).is_none()); }
+        assert!(!runtime.disk_comparison_job.as_ref().unwrap().cancellation.is_cancelled(), "duplicate Compare must not drop/cancel its Loading token");
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: EditorAction::Edit(EditorEdit::Insert('x')) }));
+        assert!(iced::runtime::task::into_stream(runtime.update(RepositoryAction::CompareDisk { card })).is_none());
+        assert_eq!(runtime.disk_comparison_job.as_ref().unwrap().request, request);
+        assert!(runtime.disk_comparison_job.as_ref().unwrap().cancellation.is_cancelled());
+        let replacement = runtime.update(completion(first).await);
+        let next = runtime.disk_comparison_job.as_ref().unwrap().request; assert_ne!(next, request);
+        drop(runtime.update(RepositoryAction::DiskComparisonLoaded { identity: old.identity, request, revision: old.revision, disk_hash: old.disk_hash, model: None }));
+        assert_eq!(runtime.disk_comparison_job.as_ref().unwrap().request, next, "old receipt cannot release a newer worker");
+        drop(runtime.update(completion(replacement).await));
+        assert!(runtime.disk_comparison_job.is_none());
+        let Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) = &runtime.disk_comparison else { panic!("latest comparison ready"); };
+        assert_eq!(&*model.after, runtime.editor_text().as_deref().unwrap()); assert_eq!(&*model.before, "disk");
+        assert!(iced::runtime::task::into_stream(runtime.update(RepositoryAction::CompareDisk { card })).is_none(), "unchanged ready comparison needs no duplicate work");
+    }
+    #[tokio::test]
+    async fn dismissed_and_frozen_comparisons_release_only_on_their_actual_receipt() {
+        for freeze in [false, true] {
+            let card = CardId::new(); let mut runtime = fixture(card);
+            let task = runtime.update(RepositoryAction::CompareDisk { card });
+            if freeze {
+                let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+                document.workspace_edit = Some(77);
+            } else { runtime.dismiss_disk_comparison(); }
+            assert!(runtime.disk_comparison_job.is_some());
+            drop(runtime.update(completion(task).await));
+            assert!(runtime.disk_comparison_job.is_none()); assert!(runtime.disk_comparison.is_none());
+        }
     }
 }
