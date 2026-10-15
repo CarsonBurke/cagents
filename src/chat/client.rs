@@ -29,6 +29,11 @@ const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
 mod provider_exit;
 pub(crate) use provider_exit::Output as ProviderExitOutput;
+mod diagnostic_read;
+pub(crate) use diagnostic_read::{
+    DiagnosticAuthority, DiagnosticCompletion, DiagnosticCopyCompletion, DiagnosticCopyInterest,
+    DiagnosticCopyReceipt, DiagnosticOutput, DiagnosticReadRequest, DiagnosticSource,
+};
 
 // Keep ordinary request IDs below the local-query namespace. This prevents
 // an expired diagnostic reply from becoming an unrelated conversation error.
