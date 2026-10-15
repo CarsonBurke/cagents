@@ -1,14 +1,9 @@
-use std::any::Any;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
-use cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::{
-    Anchor, Gravity,
-};
-use iced_core::layout::Limits;
+use cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::Gravity;
 use iced_core::window::Id;
-use iced_core::{Element, Point, Rectangle, Size};
+use iced_core::{Point, Rectangle, Size};
 
 /// Subsurface creation details
 #[derive(Debug, Clone)]

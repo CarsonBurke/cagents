@@ -1,10 +1,7 @@
 //! Access the clipboard.
 
-use std::any::Any;
-
 use dnd::{DndDestinationRectangle, DndSurface};
-use iced_core::clipboard::DndSource;
-use window_clipboard::mime::{AllowedMimeTypes, AsMimeTypes};
+use window_clipboard::mime::AllowedMimeTypes;
 
 use crate::{Action, Task, oneshot, task};
 

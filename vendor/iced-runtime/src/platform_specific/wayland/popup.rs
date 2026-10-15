@@ -1,14 +1,12 @@
-use std::any::Any;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::{
     Anchor, Gravity,
 };
 use iced_core::layout::Limits;
 use iced_core::window::Id;
-use iced_core::{Element, Rectangle};
+use iced_core::Rectangle;
 
 /// Popup creation details
 #[derive(Debug, Clone)]

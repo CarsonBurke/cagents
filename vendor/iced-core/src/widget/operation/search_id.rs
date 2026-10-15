@@ -4,7 +4,7 @@ use super::Operation;
 use crate::{
     Rectangle,
     id::Id,
-    widget::operation::{Outcome, focusable::Count},
+    widget::operation::Outcome,
 };
 
 /// Produces an [`Operation`] that searches for the Id

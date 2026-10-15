@@ -14,7 +14,6 @@
 //! * `wayland-csd-adwaita-crossfont`.
 //! * `wayland-csd-adwaita-notitle`.
 //! * `wayland-csd-adwaita-notitlebar`.
-use std::any::Any;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -104,7 +103,7 @@ pub trait WindowExtWayland {
     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
 
-    fn xdg_surface_handle<'a>(&'a self) -> Option<&dyn HasXdgSurfaceHandle>;
+    fn xdg_surface_handle(&self) -> Option<&dyn HasXdgSurfaceHandle>;
 
     fn window_state(&self) -> Option<WindowState>;
 }
