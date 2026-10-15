@@ -3192,6 +3192,9 @@ mod tests {
             program: "private-provider-not-executed".into(), arguments: vec!["--resume".into(), ID.into()], working_directory: cwd,
             environment: [("HOME".into(), home_a.to_str().unwrap().into())].into(), unset_environment: Default::default(),
         }};
+        std::fs::create_dir(&launch.recipe.working_directory).unwrap();
+        assert!(!launch.needs_read_only_history());
+        std::fs::remove_dir(&launch.recipe.working_directory).unwrap();
         assert!(launch.needs_read_only_history());
         let issued = launch.clone();
         let restored = upgrade_environment(&launch, false, [("HOME".into(), home_b.to_str().unwrap().into()),
