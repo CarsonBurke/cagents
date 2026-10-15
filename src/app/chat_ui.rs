@@ -13920,6 +13920,30 @@ mod tests {
     }
 
     #[test]
+    fn composer_typing_and_cursor_keep_sidebar_projection_generation_and_source() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        // Warm initial projections through the actual application tail.
+        drop(app.update(Message::Sidebar(crate::sidebar::SidebarAction::SearchChanged(String::new()))));
+        let before = app.update_tail.runs;
+        let source = app.chat_return_session(card).unwrap();
+        let target = chat_runtime(&app, card).target;
+        for _ in 0..10 { write(&mut app, card, "typed "); }
+        let cursor = text_editor::Cursor { position: text_editor::Position { line: 0, column: 2 }, selection: None };
+        drop(app.update(Message::ChatUi(Action::ComposerCursor(target, cursor))));
+        assert_eq!(app.update_tail.runs, before, "composer-only messages do not rebuild any cached workspace projection");
+        assert_eq!(chat_runtime(&app, card).composer.text(), "typed ".repeat(10));
+        assert_eq!(chat_runtime(&app, card).composer.cursor(), cursor);
+        assert_eq!(app.chat_return_session(card), Some(source));
+        assert!(!app.chat_start_pending(card));
+        assert!(chat_runtime(&app, card).is_draft());
+        // This exemption is narrow. Existing unknown/semantic paths retain
+        // conservative invalidation instead of silently hiding future inputs.
+        drop(app.update(Message::Sidebar(crate::sidebar::SidebarAction::SearchChanged("different".into()))));
+        assert!(app.update_tail.runs.iter().zip(before).all(|(after, before)| *after > before));
+    }
+
+    #[test]
     fn prepared_pr_context_preserves_the_existing_unsent_draft_and_does_not_send() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
