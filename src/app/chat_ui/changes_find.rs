@@ -6,14 +6,15 @@ use chat::cache::{SourceEpoch,SourceKey,changes::Manifest};
 #[derive(Clone,Debug,PartialEq,Eq)]
 pub(super) struct Scope {
     target:Target,actor:Option<usize>,session:Option<String>,selected:Option<String>,
-    context:u64,revision:u64,cwd:PathBuf,
+    context:u64,revision:u64,cwd:PathBuf,find_active:bool,
 }
 impl Scope {
     fn current(runtime:&Runtime)->Option<Self> {
         runtime.visible.load(Ordering::Relaxed).then(||Self {target:runtime.target,
             actor:runtime.handle().map(|handle|Arc::as_ptr(handle) as usize),session:runtime.snapshot.session_id.clone(),
             selected:runtime.selected_subagent.clone(),context:runtime.logical_changes.context_token(),
-            revision:runtime.logical_changes.revision(),cwd:runtime.session.launch.recipe.working_directory.clone()})
+            revision:runtime.logical_changes.revision(),cwd:runtime.session.launch.recipe.working_directory.clone(),
+            find_active:runtime.find.as_ref().is_some_and(|query|!query.is_empty())})
     }
     fn same_actor(&self,other:&Self)->bool {
         self.target==other.target && self.actor==other.actor && self.session==other.session && self.selected==other.selected
@@ -173,7 +174,16 @@ pub(super) fn sync(runtime:&mut Runtime) {
     if !runtime.changes_find.needs(&scope) {return;}
     let invalidated=runtime.changes_find.stage(scope,runtime.logical_changes.find_sources(),runtime.logical_changes.complete_for_find(),runtime.handle().map(Arc::downgrade));
     if invalidated {runtime.presentation_revision=runtime.presentation_revision.wrapping_add(1);}
-    runtime.set_find_external(runtime.changes_find.map(),false);
+    publish(runtime,false);
+}
+fn publish(runtime:&mut Runtime,complete:bool) {
+    let active=runtime.find.as_ref().is_some_and(|query|!query.is_empty());
+    let documents=if active {runtime.changes_find.map()} else {HashMap::new()};
+    runtime.set_find_external(documents,!active || complete);
+}
+pub(super) fn close(runtime:&mut Runtime) {
+    runtime.logical_changes.reconcile_demand(&runtime.expanded,false);
+    sync(runtime);publish(runtime,false);
 }
 pub(super) fn subscriptions(runtime:&Runtime)->Vec<Subscription<Message>> {
     runtime.changes_find.query.as_ref().filter(|_|runtime.visible.load(Ordering::Relaxed))
@@ -187,7 +197,7 @@ pub(super) fn complete(runtime:&mut Runtime,id:u64,ready:Ready) {
         Ok(prepared) if accepted && Some(&prepared.scope)==current.as_ref()=>{
             let old=std::mem::replace(&mut runtime.changes_find.ready,prepared.documents);
             runtime.changes_find.query=None;runtime.changes_find.complete=prepared.complete;
-            runtime.set_find_external(runtime.changes_find.map(),prepared.complete);
+            publish(runtime,prepared.complete);
             // Same exact prepared leaves drive the cached selection document.
             runtime.presentation_revision=runtime.presentation_revision.wrapping_add(1);
             retire((old,prepared._permit));
@@ -195,7 +205,7 @@ pub(super) fn complete(runtime:&mut Runtime,id:u64,ready:Ready) {
         Ok(prepared)=>retire(prepared),
         Err(error) if accepted=>{
             runtime.changes_find.query=None;runtime.changes_find.complete=false;
-            runtime.changes_find.error=Some(error);runtime.set_find_external(runtime.changes_find.map(),false);
+            runtime.changes_find.error=Some(error);publish(runtime,false);
         }
         Err(_)=>{}
     }
@@ -232,7 +242,7 @@ mod tests {
             offset:0,next_offset:None,omitted_files:0,files:vec![File {file_index:0,path:"/project/new.rs".into(),
                 kind:chat::ChangeKind::Renamed {from:"/project/old.rs".into()},source_len:text.len(),additions:Some(1),deletions:Some(1)}]});
         Request {id:next(),scope:Scope {target:Target {card:CardId::new(),generation:1},actor:Some(42),session:Some("session".into()),selected:None,
-            context:1,revision:1,cwd:"/project".into()},payload:Arc::new(RequestSlot(Mutex::new(Some(Payload {sources:vec![changes_sources::FindSource {source,epoch,revision:1,manifests:vec![manifest],
+            context:1,revision:1,cwd:"/project".into(),find_active:true},payload:Arc::new(RequestSlot(Mutex::new(Some(Payload {sources:vec![changes_sources::FindSource {source,epoch,revision:1,manifests:vec![manifest],
                 prefixes:vec![(0,reader_source::Source::new(&text).prefixes())],patches:vec![(0,text)],complete:true}],
             previous:HashMap::new(),probe:None})))),complete:true,cancelled:Arc::new(AtomicBool::new(false)),actor_guard:None}
     }
@@ -338,6 +348,23 @@ mod tests {
         let id=request.id;runtime.changes_find.query=Some(request);complete(&mut runtime,id,Ready::new(Err("Malformed patch file metadata".into())));
         assert_eq!(runtime.error.as_deref(),Some("Existing connection diagnostic"));assert_eq!(runtime.snapshot.error.as_deref(),Some("Provider overloaded: root cause"));
         assert_eq!(runtime.changes_find.error.as_deref(),Some("Malformed patch file metadata"));assert!(notice(&runtime).is_some());
+    }
+
+    #[test]
+    fn closed_find_rejects_pending_old_adapter_output_and_cannot_republish_external_bodies() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
+        let handle=Arc::new(ClientHandle::fixture(session.clone(),Snapshot {ready:true,..Default::default()}));
+        let mut runtime=Runtime::new(Target {card:CardId::new(),generation:1},session,Connection::Live(handle),true,crate::settings::EditorSyntaxTheme::default());
+        runtime.find=Some("after".into());let target=runtime.target;let mut request=fixture();request.scope=Scope::current(&runtime).unwrap();
+        let id=request.id;let scope=request.scope.clone();let documents=build(&request).unwrap();let body=Arc::downgrade(&documents.values().next().unwrap().leaves[2].text);
+        runtime.changes_find.scope=Some(scope.clone());runtime.changes_find.query=Some(request);
+        let permit=Arc::new(tokio::sync::Semaphore::new(1)).try_acquire_owned().unwrap();
+        let ready=Ready::new(Ok(Prepared {scope,documents,complete:true,_permit:permit,_actor_guard:None}));
+        app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));drop(app.handle_chat_ui(Action::CloseFind(target)));
+        let runtime=app.chat_runtime_mut(target).unwrap();assert!(runtime.find.is_none());assert!(runtime.find_external.is_empty());
+        complete(runtime,id,ready);assert!(runtime.find_external.is_empty(),"late old Find output cannot refill a closed search map");
+        runtime.changes_find.clear();flush();assert!(body.upgrade().is_none());
     }
 
 }

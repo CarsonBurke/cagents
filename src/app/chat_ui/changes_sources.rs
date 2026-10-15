@@ -104,6 +104,7 @@ struct Entry {
     requested:HashMap<usize,u64>,
     page_errors:HashMap<usize,String>,
     wanted_pages:HashSet<usize>,
+    manual_pages:HashSet<usize>,
     opened:HashSet<usize>,
     patches:HashMap<usize,LoadedPatch>,
     restored:HashMap<usize,(Arc<str>,chat::source_owners::ResidentPatch)>,
@@ -137,7 +138,7 @@ fn attempt()->u64 {NEXT.fetch_add(1,Ordering::Relaxed)}
 impl Entry {
     fn new(part:chat::cache::changes::Part)->Self {
         Self {revision:attempt(),copy_all:false,copy_error:None,part,pages:Default::default(),requested:Default::default(),page_errors:Default::default(),
-            wanted_pages:Default::default(),opened:Default::default(),patches:Default::default(),restored:Default::default(),
+            wanted_pages:Default::default(),manual_pages:Default::default(),opened:Default::default(),patches:Default::default(),restored:Default::default(),
             patch_requests:Default::default(),patch_errors:Default::default()}
     }
     fn file(&self,index:usize)->Option<(&Arc<Manifest>,&File)> {
@@ -151,6 +152,11 @@ impl Entry {
     fn demand(&mut self,expanded:bool,find:bool) {
         let old=(self.requested.len(),self.patch_requests.len(),self.patches.len());
         let all=find || self.copy_all;
+        if !all {
+            self.wanted_pages=self.manual_pages.clone();
+            if !expanded {self.wanted_pages.clear();}
+            self.requested.retain(|offset,_|self.wanted_pages.contains(offset));
+        }
         if expanded || all {self.wanted_pages.insert(0);}
         if all {
             for page in self.pages.values() {
@@ -301,7 +307,7 @@ impl State {
     pub(super) fn page(&mut self,item:&str,offset:usize) {
         let Some(key)=self.aliases.get(item) else {return;};let Some(entry)=self.entries.get_mut(key) else {return;};
         if offset!=0 && !entry.pages.values().any(|page|page.next_offset==Some(offset)) {return;}
-        entry.wanted_pages.insert(offset);entry.page_errors.remove(&offset);entry.demand(true,false);
+        entry.manual_pages.insert(offset);entry.wanted_pages.insert(offset);entry.page_errors.remove(&offset);entry.demand(true,false);
     }
     pub(super) fn retry(&mut self,item:&str,index:Option<usize>) {
         let Some(key)=self.aliases.get(item) else {return;};let Some(entry)=self.entries.get_mut(key) else {return;};
@@ -829,6 +835,18 @@ mod tests {
         assert!(runtime.find_paint_for(parent.as_ref()).is_none(),"same spelling is not the child source proof");
         runtime.selected_subagent=Some("vanished-child".into());assert!(current_item(&runtime,id).is_none(),"no fallback to another transcript");
         runtime.selected_subagent=None;assert!(std::ptr::eq(current_item(&runtime,id).unwrap(),parent.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn closing_find_retires_all_file_body_demand_and_pending_metadata_requests() {
+        let text="@@ -1 +1 @@\n-before\n+after\n";let page=fixture(text);let (mut state,raw,expanded)=open(&page,"part");
+        state.project(raw,None,&expanded,true);let request=state.entries[&page.source].patch_requests[&0];
+        assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));
+        let weak=Arc::downgrade(&state.entries[&page.source].current(0).unwrap().text);
+        {let entry=state.entries.get_mut(&page.source).unwrap();entry.wanted_pages.insert(128);entry.requested.insert(128,999);}
+        state.reconcile_demand(&HashSet::new(),false);
+        let entry=&state.entries[&page.source];assert!(entry.patch_requests.is_empty());assert!(entry.requested.is_empty());
+        assert!(entry.wanted_pages.is_empty());assert_eq!(state.retained_bytes(),0);assert!(weak.upgrade().is_none());
     }
 
 }

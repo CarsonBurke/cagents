@@ -7347,6 +7347,7 @@ impl Cagents {
                     runtime.find = None;
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
+                    changes_find::close(runtime);
                 }
                 return iced::widget::operation::focus(card_control_id(
                     target.card,
