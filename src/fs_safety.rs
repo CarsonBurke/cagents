@@ -427,6 +427,9 @@ pub use directory_creation::{
 
 #[cfg(test)]
 pub(crate) use directory_creation::fixture_directory_preparation_failure;
+#[path = "fs_safety/recovery_placement.rs"]
+mod recovery_placement;
+pub use recovery_placement::{RecoveryPlacement, RecoveryRegistryCheck};
 
 /// Changes a held directory's permissions. An O_PATH fd cannot be passed to
 /// fchmod; Linux's descriptor link pins the same inode without re-resolving
