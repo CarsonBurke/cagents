@@ -37,6 +37,9 @@ pub(super) struct State {
     initialized: HashSet<Scope>,
     seeding: HashSet<Scope>,
     pending: Vec<(uuid::Uuid, Scope, Change)>,
+    /// Immutable logical-source identity captured when each Update is queued.
+    /// A later watcher snapshot must not redefine the origin of a stale edit.
+    source_bases: HashMap<uuid::Uuid, (uuid::Uuid, PathBuf)>,
     /// Explicit moves wait for host acceptance before changing local membership.
     requested_transfers: HashMap<uuid::Uuid, CardId>,
     pub attached: HashSet<CardId>,
@@ -65,6 +68,7 @@ impl State {
     /// project over the authoritative view until their own acknowledgments.
     pub(super) fn refused(&mut self, operation: uuid::Uuid) {
         self.requested_transfers.remove(&operation);
+        self.source_bases.remove(&operation);
         self.pending.retain(|(id, _, _)| *id != operation);
     }
 
@@ -113,6 +117,20 @@ impl State {
 }
 
 impl Cagents {
+    pub(super) fn capture_view_update_source(&mut self, edit: &ModelEdit) {
+        let ModelEdit::ChangeView { scope, operation, change: Change::Update { .. }, .. } = edit
+        else { return; };
+        let repository = match scope {
+            Scope::Channel(channel) => self.workspace_model.channel(*channel)
+                .map(|channel| channel.repository.clone()),
+            Scope::Worktree { repository, .. } => Some(repository.clone()),
+        };
+        if let Some(repository) = repository {
+            self.shared_views.source_bases.entry(*operation)
+                .or_insert((self.workspace_model.identity, repository));
+        }
+    }
+
     pub(super) fn refuse_conflicting_view_update(
         &mut self,
         scope: Scope,
@@ -130,7 +148,9 @@ impl Cagents {
                 Scope::Worktree { repository, .. } => Some(repository.clone()),
             }
         };
-        let captured_repository = repository(&self.workspace_model, &scope);
+        let captured_repository = self.shared_views.source_bases.get(&operation)
+            .filter(|(identity, _)| *identity == self.workspace_model.identity)
+            .map(|(_, repository)| repository.clone());
         if model.sequence >= self.workspace_model.sequence { self.workspace_model = model; }
         let Some(index) = self.shared_views.pending.iter().position(|(id, pending_scope, pending)|
             *id == operation && *pending_scope == scope && *pending == change)
@@ -176,7 +196,11 @@ impl Cagents {
         }
         tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
         self.shared_views.pending.remove(index);
+        let source_basis = self.shared_views.source_bases.remove(&operation);
         if let Some((operation, scope, revision, change)) = retry {
+            if let Some(source_basis) = source_basis {
+                self.shared_views.source_bases.insert(operation, source_basis);
+            }
             self.shared_views.pending.insert(index, (operation, scope.clone(), change.clone()));
             self.publish_model_edit(ModelEdit::ChangeView {
                 scope, expected_revision: revision, operation, change,
@@ -747,6 +771,7 @@ impl Cagents {
     pub(super) fn acknowledge_view_edit(&mut self, scope: Scope, operation: Option<uuid::Uuid>) {
         if let Some(operation) = operation {
             self.shared_views.requested_transfers.remove(&operation);
+            self.shared_views.source_bases.remove(&operation);
             self.shared_views
                 .pending
                 .retain(|(id, _, _)| *id != operation);
@@ -793,7 +818,11 @@ impl Cagents {
                 discarded.insert(*operation);
                 continue;
             }
+            let source_basis = self.shared_views.source_bases.remove(operation);
             *operation = uuid::Uuid::new_v4();
+            if let Some(source_basis) = source_basis {
+                self.shared_views.source_bases.insert(*operation, source_basis);
+            }
             *scope = owner.scope.clone();
             edits.push(ModelEdit::ChangeView {
                 scope: scope.clone(), expected_revision: owner.revision,
@@ -801,6 +830,7 @@ impl Cagents {
             });
         }
         self.shared_views.pending.retain(|(operation, _, _)| !discarded.contains(operation));
+        self.shared_views.source_bases.retain(|operation, _| !discarded.contains(operation));
         for edit in edits { self.publish_model_edit(edit); }
         if stale_actor {
             self.notices.record(TransientNotice::warning(
@@ -1853,7 +1883,7 @@ mod tests {
     #[test]
     fn a_source_conflict_refuses_session_intent_and_reissues_only_safe_presentation() {
         use super::super::workspace_model_sync::ModelUpdate;
-        for control in ["current", "missing", "foreign-project", "later-title"] {
+        for control in ["current", "missing", "foreign-project", "foreign-watch-first", "uncaptured", "later-title"] {
             let (mut app, source, _, before) = channel_move_fixture();
             let (tx, rx) = async_channel::unbounded();
             app.workspace_model_tx = tx;
@@ -1866,6 +1896,12 @@ mod tests {
             desired.scope = Some("/stale-source".into());
             let change = Change::Update { before: before.clone(), pane: desired.clone() };
             app.shared_views.pending.push((operation, Scope::Channel(source), change.clone()));
+            if control != "uncaptured" {
+                app.publish_model_edit(ModelEdit::ChangeView { scope: Scope::Channel(source),
+                    expected_revision: 17, operation, change: change.clone() });
+                assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+                    operation: queued, .. } if queued == operation));
+            }
             let later_operation = uuid::Uuid::new_v4();
             if control == "later-title" {
                 let mut later = before.clone();
@@ -1880,11 +1916,16 @@ mod tests {
             current.scope = Some("/authoritative-source".into());
             let expected = current.clone();
             if control == "missing" { model.views[0].panes.clear(); }
-            if control == "foreign-project" {
+            if matches!(control, "foreign-project" | "foreign-watch-first") {
                 model.channels.iter_mut().find(|channel| channel.id == source).unwrap()
                     .repository = "/foreign/.git".into();
             }
             model.sequence += 1;
+            if control == "foreign-watch-first" {
+                // A preceding watcher must not redefine this operation's
+                // captured logical source before its conflict reply arrives.
+                app.workspace_model = model.clone();
+            }
             drop(app.apply_workspace_model_update(ModelUpdate::ViewConflicted {
                 scope: Scope::Channel(source), operation, change, model: model.clone(),
                 error: "The pane source changed".into(),
@@ -1892,8 +1933,9 @@ mod tests {
             assert!(!app.shared_views.pending.iter().any(|(id, _, _)| *id == operation));
             assert!(app.notices.recent().any(|entry|
                 entry.notice.message.contains("session update was refused")));
-            if matches!(control, "missing" | "foreign-project") {
+            if matches!(control, "missing" | "foreign-project" | "foreign-watch-first" | "uncaptured") {
                 assert!(rx.try_recv().is_err(), "refusal cannot rename a missing or foreign source");
+                assert!(!app.shared_views.source_bases.contains_key(&operation));
                 continue;
             }
             let ModelEdit::ChangeView { operation: retry, change, .. } = rx.try_recv().unwrap() else {
@@ -1924,6 +1966,7 @@ mod tests {
                 scope: Scope::Channel(source), operation: Some(retry), model,
             }));
             assert!(!app.shared_views.pending.iter().any(|(id, _, _)| *id == retry));
+            assert!(!app.shared_views.source_bases.contains_key(&retry));
             assert!(rx.try_recv().is_err());
         }
     }
