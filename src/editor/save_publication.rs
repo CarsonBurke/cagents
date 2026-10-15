@@ -2,8 +2,12 @@
 //!
 //! A private acquisition and RENAME_NOREPLACE protect the destination name.
 //! They cannot exclude a noncooperating writer holding an already-open file
-//! descriptor after the final content/metadata fence. Such writers do not
-//! participate in a filesystem pathname compare-and-swap protocol.
+//! descriptor after the final content/metadata fence. The protected INTERNAL
+//! namespace assumption applies to the complete transaction/retry lifetime of
+//! the freshly owned0700 original directory and its private entries. Its public
+//! directory name, ancestors and reconstructed lookalikes are not trusted.
+//! Existing-FD content/version mutations remain in scope up to the final fence;
+//! this does not claim a universal atomic content compare-and-swap protocol.
 use super::*;
 use std::{
     collections::BTreeMap,
@@ -135,8 +139,22 @@ impl Holding {
         // later verification error keeps this inode pinned in the result.
         let retained_source = source.try_clone().map_err(io_error)?;
         let name = OsString::from(format!(".cagents-save-{}", uuid::Uuid::new_v4()));
-        let mut publication = match fs_safety::create_directory_beneath(parent, Path::new(&name), 0o700)
-            .map_err(resolve_error)? {
+        let creation = match fs_safety::create_directory_beneath(parent, Path::new(&name), 0o700) {
+            Ok(creation) => creation,
+            Err(mut error) => {
+                let message = error.to_string();
+                if let Some(mut preparation) = error.take_recovery() {
+                    let description = format!("Private save preparation originally named {}", preparation.diagnostic_path().display());
+                    let authority = slot.retain(description, move || {
+                        preparation.retry_cleanup().map_err(|error|error.to_string())?;
+                        fs_safety::sync_directory(&retained_parent).map_err(|error|error.to_string())
+                    });
+                    return Err(FileIoError::Recovery { message, authority });
+                }
+                return Err(FileIoError::Io(message));
+            }
+        };
+        let mut publication = match creation {
             fs_safety::DirectoryCreation::Published(receipt) => receipt,
             fs_safety::DirectoryCreation::Existing(_) => return Err(FileIoError::Io(
                 "The private save holding directory already exists; it was left intact.".into())),
