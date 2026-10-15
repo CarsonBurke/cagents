@@ -8966,6 +8966,7 @@ mod tests {
             assert_eq!(help.active_parameter,Some(1));assert_eq!(help.signatures[0].parameters[0].range,Some(2..6));assert_eq!(help.signatures[0].parameters[1].label,"value");
             handle.notify("window/showMessage",json!({"type":1,"message":"workspace failed to load"}));
             let message=next_matching(&events,|e|match e{LspEvent::ServerMessage{level:LspMessageLevel::Error,message,..}=>Some(message.clone()),_=>None}).await;assert_eq!(message,"workspace failed to load");
+            let key=manager.documents.get(&doc).unwrap().session.clone();manager.sessions.get(&key).unwrap().request_retirement();assert!(!manager.capabilities(doc).ready);
             manager.begin_shutdown().await;
         });
     }

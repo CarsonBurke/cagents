@@ -126,7 +126,7 @@ impl LspManager {
     pub fn capabilities(&self, doc:LspDocumentId)->LspCapabilities {
         self.documents.get(&doc).and_then(|r| self.sessions.get(&r.session)).map(|s| {
             let mut caps=s.capabilities.lock().unwrap_or_else(|p|p.into_inner()).clone();
-            caps.ready=s.status.lock().unwrap_or_else(|p|p.into_inner()).is_ready();caps
+            caps.ready=!s.retired.load(Ordering::Acquire) && !s.commands.is_closed() && s.status.lock().unwrap_or_else(|p|p.into_inner()).is_ready();caps
         }).unwrap_or_default()
     }
     pub fn formatting_settings(&self, doc:LspDocumentId)->Option<(bool,Duration)> {
