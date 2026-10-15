@@ -148,9 +148,10 @@ fn apply_reports(
     let mut exhausted = Vec::new();
     let mut changed_logins = Vec::new();
     for account in registry.accounts(homes) {
-        if !registry.automatic(account.provider) {
-            continue;
-        }
+        // Received reports are exact captured-home evidence even for pinned
+        // providers. Automatic controls background scheduling/alternate work,
+        // never whether a known login contradiction reaches shared readers.
+        let automatic = registry.automatic(account.provider);
         let Some(home) = account.resolved_home() else {
             continue;
         };
@@ -230,7 +231,7 @@ fn apply_reports(
         if updated {
             let _ = cache.store(&key, entry.clone());
         }
-        if routing::needs_alternate_for(&account, &entry.snapshot, now) {
+        if automatic && routing::needs_alternate_for(&account, &entry.snapshot, now) {
             exhausted.push(account);
         }
     }
@@ -563,12 +564,16 @@ mod tests {
             now
         );
         registry.set_default(&account);
+        let (report, _) = pending.homes.values().next().unwrap().events.front().unwrap();
+        signal.record(&scope,report.clone(),now+1);
         let (_, exhausted, _) =
-            apply_reports(&registry, Some(&homes), &cache, pending.clone(), now);
+            apply_reports(&registry, Some(&homes), &cache, signal.drain(), now+1);
         assert!(
             exhausted.is_empty(),
             "pinned provider defaults do not schedule exhaustion probes"
         );
+        assert_eq!(cache.load(now+1)[&account.cache_key().unwrap()].snapshot.observed_at,now+1,
+            "received exact-scope figures still reach pinned-provider readers");
         registry.set_automatic(provider);
         cache
             .store(
@@ -825,7 +830,7 @@ mod tests {
         use crate::account::{LiveReport, UsageSnapshot, UsageSource, UsageStatus, UsageWindow, WindowKind,
             cache::Entry, registry::{Registered, Registry}, scope::LaunchAccountScope};
         use std::os::unix::fs::MetadataExt;
-        for mode in ["login", "overflow", "older-than-quota"] {
+        for mode in ["login", "overflow", "older-than-quota", "pinned"] {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
             let homes = Homes::at(root.path().join("homes"));
             let provider = crate::agent::Provider::Codex;
@@ -839,6 +844,7 @@ mod tests {
             let mut registry = Registry::default();
             registry.register(Registered { key, provider, linked_home: None, label: None,
                 email: Some("old@fixture.invalid".into()), organization: None, added_at: 0 }, &[]).unwrap();
+            if mode == "pinned" { registry.set_default(&account); }
             let cache = Cache::at(root.path().join("cache"));
             let cache_key = account.cache_key().unwrap();
             let positive = |at, source| { let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", at);

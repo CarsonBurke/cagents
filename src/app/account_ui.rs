@@ -2301,6 +2301,7 @@ impl Cagents {
                 login_changed |= !login.describes(state.snapshot.as_ref(), state.identity.as_ref());
             } else if !state.verification.as_ref().is_some_and(|proof|proof.pending())
                 && let Some(snapshot) = state.snapshot.as_mut()
+                && snapshot.status != UsageStatus::NeedsLogin
                 && report.apply(snapshot, observed_at, now)
             {
                 state.schedule.observe(snapshot.observed_at);
@@ -8153,6 +8154,27 @@ mod app_tests {
     }
 
     #[test]
+    fn legacy_signed_out_cache_without_a_stamp_cannot_become_live_allowance() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let account = Account::managed(Provider::Codex,uuid::Uuid::new_v4(),root.path().into());
+        let id = account.id();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.accounts = vec![AccountState::new(account)];
+        app.account_ui.restore(vec![Restored { id: id.clone(),present: true,entry: Some(Entry {
+            verification: None,identity: None,
+            snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin,"Signed out",100),
+        }) }]);
+        let recipe = recipe_on(&app,&id);
+        assert_eq!(app.chat_account(Provider::Codex,&recipe),Some(id.clone()));
+        drop(app.account_reported(Provider::Codex,&recipe,vec![(LiveReport::CodexLimits(account::codex::LimitsUpdate {
+            windows: vec![],credits: None,plan: Some("pro".into()),limited: false,
+        }),101)]));
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(state.snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin);
+        assert!(state.verification.is_none());
+    }
+
+    #[test]
     fn identity_verdicts_cross_quota_timestamps_in_restore_and_actual_probe_dispatch() {
         for delivered_by_probe in [false, true] {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -8219,6 +8241,21 @@ mod app_tests {
                 })));
             }
             assert_eq!(app.account_ui.account(&id).unwrap().identity.as_ref().unwrap().email.as_deref(),Some("new@fixture.invalid"));
+            let negative = cache.fixture_verify_identity(&key,Entry { verification: None,identity: None,
+                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin,"Signed out",99) }).unwrap();
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner: app.account_ui.probe_owner(&id).unwrap(),id: id.clone(),
+                outcome: Outcome::Answered { verification: negative.verification,
+                    identity: negative.identity,snapshot: negative.snapshot,catalog: None },
+            })));
+            assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin);
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner: app.account_ui.probe_owner(&id).unwrap(),id: id.clone(),
+                outcome: Outcome::Answered { verification: verified.verification,
+                    identity: verified.identity,snapshot: verified.snapshot,catalog: None },
+            })));
+            assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin,
+                "a late positive with the old verified revision cannot undo negative authentication");
         }
     }
 

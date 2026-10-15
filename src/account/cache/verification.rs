@@ -70,6 +70,21 @@ impl Pending {
         temporary.persist(cache.directory.join(FILE)).map_err(|error|error.error)?;
         cache.sync_directory()
     }
+    fn invalidate(&mut self, key: &str, observed_at: u64, detail: &str) -> io::Result<()> {
+        if key.len() > 16384 || detail.len() > 1024 || (self.entries.len() >= LIMIT && !self.entries.contains_key(key)) {
+            self.blocked = true;
+            self.entries.clear();
+            return Err(io::Error::other("Account identity verification capacity exceeded; repair the private account cache before routing"));
+        }
+        let Some(revision) = self.entries.get(key).map_or(Some(1), |old|old.revision.checked_add(1)) else {
+            self.blocked = true;
+            self.entries.clear();
+            return Err(io::Error::other("Account identity verification revision exhausted; repair the private account cache before routing"));
+        };
+        self.entries.insert(key.into(), Barrier { nonce: uuid::Uuid::new_v4(), revision, observed_at,
+            detail: detail.into(), pending: true });
+        Ok(())
+    }
     fn stamp(&self, key: &str) -> Option<IdentityVerification> {
         self.entries.get(key).map(|barrier| IdentityVerification { epoch: self.epoch,
             revision: barrier.revision, pending: barrier.pending })
@@ -96,27 +111,54 @@ impl Cache {
     /// Only the real provider-probe path calls this with its pre-auth token.
     /// Commit the entry durably before clearing the matching invalidation.
     pub(in crate::account) fn finish_verification(&self, token: Token, entry: Entry, persist: bool) -> io::Result<Entry> {
-        let _lock = self.lock(libc::LOCK_EX)?;
+        let lock = self.lock(libc::LOCK_EX)?;
         let mut state = Pending::read(self)?;
         if state.entries.get(&token.key).map(|barrier|(barrier.nonce,barrier.revision)) != token.nonce {
             return Err(io::Error::other("The account sign-in changed during verification; retry checking this account"));
         }
         let confirmed = entry.identity.is_some() && entry.snapshot.status != super::super::UsageStatus::NeedsLogin;
+        let mut document = if persist { read_document(&self.path()).unwrap_or_default() } else { Document::default() };
+        let identity_changed = persist && confirmed
+            && document.entries.get(&token.key).and_then(|old|old.identity.as_ref()) != entry.identity.as_ref();
         let mut visible = entry;
-        let clear = persist && confirmed && state.entries.get(&token.key).is_some_and(|barrier|barrier.pending);
-        if clear {
-            let barrier = state.entries.get_mut(&token.key).unwrap();
-            barrier.revision = barrier.revision.checked_add(1)
-                .ok_or_else(||io::Error::other("Account identity verification revision exhausted"))?;
-            barrier.pending = false;
+        // An actual negative authentication verdict is itself a new identity
+        // invalidation, even without a separate provider login-change event.
+        // Commit it before touching quota; only later positive auth may clear.
+        let negative_auth = persist && visible.snapshot.status == super::super::UsageStatus::NeedsLogin;
+        if negative_auth && !state.entries.get(&token.key).is_some_and(|barrier|barrier.pending) {
+            let verdict = state.invalidate(&token.key,visible.snapshot.observed_at,
+                "The provider needs this account to sign in again");
+            self.save_invalidation(&lock,&state,|state|state.write(self))?;
+            verdict?;
+        }
+        if identity_changed && !state.entries.get(&token.key).is_some_and(|barrier|barrier.pending) {
+            // Fence the previous identity before replacing its quota, even
+            // for an external sign-in with no streamed change notification.
+            // A failed final sidecar write then leaves a recoverable pending
+            // verdict, never a new identity carrying the previous revision.
+            let verdict = state.invalidate(&token.key,visible.snapshot.observed_at,
+                "The account identity changed during verification");
+            self.save_invalidation(&lock,&state,|state|state.write(self))?;
+            verdict?;
+        }
+        let verified = persist && confirmed && (identity_changed
+            || state.entries.get(&token.key).is_some_and(|barrier|barrier.pending));
+        if verified {
+            // An actual changed identity is causal evidence even when no
+            // streamed Login event preceded it and quota time moved backward.
+            if let Err(error) = state.invalidate(&token.key,visible.snapshot.observed_at,
+                "The account identity was verified") {
+                self.save_invalidation(&lock,&state,|state|state.write(self))?;
+                return Err(error);
+            }
+            state.entries.get_mut(&token.key).unwrap().pending = false;
         }
         // The sidecar on disk still holds pending until AFTER the verified
         // quota entry commits. Its overlay wins across any intervening crash.
         state.overlay(&token.key, &mut visible);
         if persist {
-            let mut document = read_document(&self.path()).unwrap_or_default();
             document.version = VERSION;
-            if token.pending || document.entries.get(&token.key).is_none_or(|old| !supersedes(old.snapshot.observed_at, visible.snapshot.observed_at)) {
+            if token.pending || negative_auth || identity_changed || document.entries.get(&token.key).is_none_or(|old| !supersedes(old.snapshot.observed_at, visible.snapshot.observed_at)) {
                 document.entries.insert(token.key.clone(), visible.clone());
                 self.write(&document)?;
                 self.sync_directory()?;
@@ -125,7 +167,7 @@ impl Cache {
                 // barrier cleared by this older completed probe.
                 return Err(io::Error::other("A newer account observation arrived during verification; retry checking this account"));
             }
-            if clear { state.write(self)?; }
+            if verified { state.write(self)?; }
         }
         Ok(visible)
     }
@@ -144,25 +186,11 @@ impl Cache {
         detail: &str,
         save: impl FnOnce(&Pending) -> io::Result<()>,
     ) -> io::Result<Entry> {
-        if key.len() > 16384 || detail.len() > 1024 || (state.entries.len() >= LIMIT && !state.entries.contains_key(key)) {
-            state.blocked = true;
-            state.entries.clear();
-            self.save_invalidation(lock, state, save)?;
-            return Err(io::Error::other("Account identity verification capacity exceeded; repair the private account cache before routing"));
-        }
-        let revision = match state.entries.get(key).map_or(Some(1), |old|old.revision.checked_add(1)) {
-            Some(revision) => revision,
-            None => {
-                state.blocked = true;
-                state.entries.clear();
-                self.save_invalidation(lock, state, save)?;
-                return Err(io::Error::other("Account identity verification revision exhausted; repair the private account cache before routing"));
-            }
-        };
-        state.entries.insert(key.into(), Barrier { nonce: uuid::Uuid::new_v4(), revision, observed_at, detail: detail.into(), pending: true });
-        // Persist the invalidation first. A crash before quota replacement
-        // must leave every reader blocked, including after a process restart.
-        self.save_invalidation(lock, state, save)?;
+        let verdict = state.invalidate(key,observed_at,detail);
+        // Persist the invalidation (including global capacity refusal) first.
+        // A crash before quota replacement must leave matched readers blocked.
+        self.save_invalidation(lock,state,save)?;
+        verdict?;
         let mut entry = read_document(&self.path()).and_then(|mut document|document.entries.remove(key))
             .unwrap_or_else(||Entry { verification: None, identity: None, snapshot: UsageSnapshot::state(super::super::UsageStatus::NeedsLogin, detail, observed_at) });
         state.overlay(key, &mut entry);
@@ -198,7 +226,18 @@ impl Cache {
     }
     pub(super) fn overlay_verification(&self, entries: &mut BTreeMap<String, Entry>) -> io::Result<()> {
         let state = Pending::read(self)?;
-        for (key,entry) in entries { state.overlay(key,entry); }
+        for (key,entry) in entries.iter_mut() { state.overlay(key,entry); }
+        // The sidecar is independent authority for pending identity. Losing,
+        // pruning or rejecting the quota document must not hide that verdict.
+        for (key,barrier) in state.entries.iter().filter(|(_,barrier)|barrier.pending) {
+            entries.entry(key.clone()).or_insert_with(|| {
+                let mut entry = Entry { verification: None, identity: None,
+                    snapshot: UsageSnapshot::state(super::super::UsageStatus::NeedsLogin,
+                        &barrier.detail,barrier.observed_at) };
+                state.overlay(key,&mut entry);
+                entry
+            });
+        }
         Ok(())
     }
     pub(super) fn protect_verification(&self, key: &str, entry: &mut Entry, existing: Option<&Entry>) -> io::Result<()> {
@@ -415,6 +454,56 @@ mod tests {
         state.write(&cache).unwrap();
         assert!(cache.fixture_verify_identity(KEY,reading(20,UsageSource::Probe,"new@fixture.invalid")).is_err());
         assert_pending(&cache,20);
+    }
+
+    #[test]
+    fn pending_identity_remains_visible_when_quota_document_or_entry_is_missing() {
+        for missing_document in [false,true] {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let cache = Cache::at(root.path());
+            cache.store(KEY,reading(1,UsageSource::Probe,"old@fixture.invalid")).unwrap();
+            cache.invalidate_identity(KEY,10,"Login changed").unwrap();
+            if missing_document { std::fs::remove_file(cache.path()).unwrap(); }
+            else { cache.write(&Document { version: VERSION,..Document::default() }).unwrap(); }
+            let reopened = Cache::at(root.path());
+            assert_pending(&reopened,20);
+        }
+    }
+    #[test]
+    fn actual_negative_authentication_creates_a_new_pending_causal_verdict() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cache = Cache::at(root.path());
+        cache.store(KEY,reading(100,UsageSource::Probe,"old@fixture.invalid")).unwrap();
+        cache.invalidate_identity(KEY,100,"First change").unwrap();
+        let confirmed = cache.fixture_verify_identity(KEY,reading(100,UsageSource::Probe,"current@fixture.invalid")).unwrap();
+        let negative = cache.finish_verification(cache.begin_verification(KEY).unwrap(),Entry { verification: None,
+            identity: None,snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin,"Signed out",99) },true);
+        let negative = negative.unwrap();
+        assert_eq!(negative.snapshot.status,UsageStatus::NeedsLogin);
+        assert_eq!(negative.snapshot.observed_at,99,"negative authentication must not be discarded or backdated by quota precedence");
+        let pending = cache.load(100).remove(KEY).unwrap();
+        assert!(pending.verification.as_ref().unwrap().pending());
+        assert!(adopt_identity_verdict(pending.verification.as_ref(),confirmed.verification.as_ref(),
+            &pending.snapshot,Some(&confirmed.snapshot),false));
+        assert!(pending.identity.is_none());
+        assert_eq!(pending.snapshot.status,UsageStatus::NeedsLogin);
+        cache.store(KEY,reading(200,UsageSource::Live,"current@fixture.invalid")).unwrap();
+        assert_pending(&cache,200);
+    }
+
+    #[test]
+    fn actual_changed_identity_outranks_newer_quota_without_a_streamed_login_event() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cache = Cache::at(root.path());
+        let previous = cache.fixture_verify_identity(KEY,reading(200,UsageSource::Probe,"old@fixture.invalid")).unwrap();
+        let before_change = cache.begin_verification(KEY).unwrap();
+        let current = cache.fixture_verify_identity(KEY,reading(199,UsageSource::Probe,"new@fixture.invalid")).unwrap();
+        assert_eq!(current.snapshot.observed_at,199);
+        assert_eq!(current.identity.as_ref().unwrap().email.as_deref(),Some("new@fixture.invalid"));
+        assert!(adopt_identity_verdict(current.verification.as_ref(),previous.verification.as_ref(),
+            &current.snapshot,Some(&previous.snapshot),false));
+        assert!(cache.finish_verification(before_change,reading(201,UsageSource::Probe,"old@fixture.invalid"),true).is_err());
+        assert_eq!(cache.load(201).remove(KEY).unwrap(),current);
     }
 
 }
