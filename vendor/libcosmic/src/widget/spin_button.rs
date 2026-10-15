@@ -60,7 +60,7 @@ where
         step,
         min,
         max,
-        Orientation::Horizontal,
+        Orientation::Vertical,
         on_press,
     );
 
@@ -316,8 +316,36 @@ fn container_style(theme: &crate::Theme) -> iced_widget::container::Style {
 
 #[cfg(test)]
 mod tests {
+    use super::{Orientation, spin_button, vertical};
+
     #[test]
     fn decrement() {
         assert_eq!(super::decrement(0i32, 10, 15, 35), 15);
+    }
+
+    #[test]
+    fn constructors_select_the_documented_orientation() {
+        let horizontal = spin_button(
+            "value",
+            #[cfg(feature = "a11y")]
+            "value",
+            1,
+            1,
+            0,
+            2,
+            |value| value,
+        );
+        let vertical = vertical(
+            "value",
+            #[cfg(feature = "a11y")]
+            "value",
+            1,
+            1,
+            0,
+            2,
+            |value| value,
+        );
+        assert!(matches!(horizontal.orientation, Orientation::Horizontal));
+        assert!(matches!(vertical.orientation, Orientation::Vertical));
     }
 }
