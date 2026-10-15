@@ -3,8 +3,8 @@
 
 mod cleanup;
 mod transport;
-pub(crate) use cleanup::{publish_actor_close,actor_close_proved};
 pub(crate) use cleanup::{Detached, closed_pair_holder, closed_source, confirm_pair_closed};
+pub(crate) use cleanup::{actor_close_proved, publish_actor_close};
 pub(crate) use transport::{Holder, adopt, inspect, spawn};
 
 use crate::{
@@ -378,7 +378,12 @@ mod tests {
         let home = directory.path().join("home");
         std::fs::create_dir(&home).unwrap();
         let mut original = recovery();
-        let scope = crate::account::scope::LaunchAccountScope::resolve(Provider::Codex, directory.path(), |name| (name == "CODEX_HOME").then(|| home.as_os_str().to_owned())).unwrap();
+        let scope = crate::account::scope::LaunchAccountScope::resolve(
+            Provider::Codex,
+            directory.path(),
+            |name| (name == "CODEX_HOME").then(|| home.as_os_str().to_owned()),
+        )
+        .unwrap();
         original.launch_account_scope = Some(scope.clone());
         let wire = serde_json::to_vec(&original).unwrap();
         std::fs::rename(&home, directory.path().join("old-home")).unwrap();
@@ -388,8 +393,16 @@ mod tests {
         assert_eq!(retained.launch_account_scope.as_ref(), Some(&scope));
         assert!(retained.launch_account_scope.unwrap().revalidate().is_err());
         let mut legacy = serde_json::to_value(&original).unwrap();
-        legacy.as_object_mut().unwrap().remove("launch_account_scope");
-        assert!(serde_json::from_value::<Recovery>(legacy).unwrap().launch_account_scope.is_none());
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("launch_account_scope");
+        assert!(
+            serde_json::from_value::<Recovery>(legacy)
+                .unwrap()
+                .launch_account_scope
+                .is_none()
+        );
     }
 
     #[test]

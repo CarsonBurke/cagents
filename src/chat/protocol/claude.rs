@@ -38,7 +38,9 @@ const MODES: &[&str] = &[
 ];
 
 #[cfg(test)]
-pub(crate) fn fixture_adapter() -> Box<dyn Adapter> { Box::new(Claude::default()) }
+pub(crate) fn fixture_adapter() -> Box<dyn Adapter> {
+    Box::new(Claude::default())
+}
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     let mut spec = ProcessSpec::from(&launch.recipe);
@@ -328,7 +330,7 @@ struct Claude {
     >,
     execution: Option<crate::model::RunId>,
     pending: HashMap<String, Value>,
-    decision_generations: HashMap<String,u64>,
+    decision_generations: HashMap<String, u64>,
     retired: VecDeque<String>,
     controls: HashMap<String, Value>,
     control_deadlines: HashMap<String, std::time::Instant>,
@@ -430,14 +432,25 @@ impl Claude {
                 if string(&request, "subtype") == "interrupt" {
                     self.interruption = None;
                     if let Some(generation) = request["_cagents_turn"].as_u64()
-                        && let Some((key, outcome, run)) = self.deferred_attention.remove(&generation) {
-                        self.publish_deferred_finish(generation,key,outcome,&mut step);
-                        if let Some(run) = run { step.events.push(Event::Execution { run, event: crate::agent_execution::ProviderEvent::Finished { outcome } }); }
+                        && let Some((key, outcome, run)) =
+                            self.deferred_attention.remove(&generation)
+                    {
+                        self.publish_deferred_finish(generation, key, outcome, &mut step);
+                        if let Some(run) = run {
+                            step.events.push(Event::Execution {
+                                run,
+                                event: crate::agent_execution::ProviderEvent::Finished { outcome },
+                            });
+                        }
                     }
                 }
                 let operation = super::preview(string(&request, "subtype").as_bytes(), 100);
-                let seconds=if string(&request,"subtype")=="initialize" {30} else {5};
-                if string(&request,"subtype")=="initialize" {
+                let seconds = if string(&request, "subtype") == "initialize" {
+                    30
+                } else {
+                    5
+                };
+                if string(&request, "subtype") == "initialize" {
                     step.events.push(Event::Error {message:"Claude did not confirm initialization within 30 seconds; restart the session".into(),fatal:true});
                 }
                 self.control_replies.push((
@@ -470,13 +483,21 @@ impl Claude {
             for id in old {
                 self.controls.remove(&id);
                 self.control_deadlines.remove(&id);
-                self.control_replies.push((id, Err("A newer interrupt request superseded this one".into())));
+                self.control_replies.push((
+                    id,
+                    Err("A newer interrupt request superseded this one".into()),
+                ));
             }
         }
         self.command_ack = Some(id.clone());
         self.control_deadlines.insert(
             id.clone(),
-            std::time::Instant::now() + std::time::Duration::from_secs(if string(&request,"subtype")=="initialize" {30} else {5}),
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(if string(&request, "subtype") == "initialize" {
+                    30
+                } else {
+                    5
+                }),
         );
         self.controls.insert(id.clone(), request.clone());
         let wire = request
@@ -492,7 +513,12 @@ impl Claude {
             events: expired.events,
         })
     }
-    fn followup_control(&mut self, mut request: Value, acknowledgement: &str, deadline: Option<std::time::Instant>) -> Result<Step, String> {
+    fn followup_control(
+        &mut self,
+        mut request: Value,
+        acknowledgement: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Step, String> {
         request["_cagents_ack"] = Value::String(acknowledgement.into());
         let next = self.control(request)?;
         if let Some(deadline) = deadline {
@@ -573,24 +599,40 @@ impl Claude {
             self.retired.pop_front();
         }
     }
-    fn remember_decision(&mut self,id:String,raw:Value) {
-        self.decision_generations.insert(id.clone(),self.attention_generation);
-        self.pending.insert(id,raw);
+    fn remember_decision(&mut self, id: String, raw: Value) {
+        self.decision_generations
+            .insert(id.clone(), self.attention_generation);
+        self.pending.insert(id, raw);
     }
-    fn retire_turn_decisions(&mut self,generation:u64,step:&mut Step) {
-        let ids=self.decision_generations.iter().filter(|(_,owner)|**owner==generation).map(|(id,_)|id.clone()).collect::<Vec<_>>();
-        for id in ids {self.retire(id,step);}
+    fn retire_turn_decisions(&mut self, generation: u64, step: &mut Step) {
+        let ids = self
+            .decision_generations
+            .iter()
+            .filter(|(_, owner)| **owner == generation)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.retire(id, step);
+        }
     }
-    fn publish_deferred_finish(&mut self,generation:u64,key:Option<String>,outcome:crate::notifications::Kind,step:&mut Step) {
+    fn publish_deferred_finish(
+        &mut self,
+        generation: u64,
+        key: Option<String>,
+        outcome: crate::notifications::Kind,
+        step: &mut Step,
+    ) {
         use crate::notifications::Kind;
-        if matches!(outcome,Kind::Cancelled|Kind::Failed) {self.retire_turn_decisions(generation,step);}
-        let current=generation.wrapping_add(1)==self.attention_generation
-            && self.started_generation!=Some(self.attention_generation);
+        if matches!(outcome, Kind::Cancelled | Kind::Failed) {
+            self.retire_turn_decisions(generation, step);
+        }
+        let current = generation.wrapping_add(1) == self.attention_generation
+            && self.started_generation != Some(self.attention_generation);
         if current {
-            self.status(!self.pending.is_empty(),"Claude turn complete",step);
-            step.events.push(Event::TurnFinished {key,outcome});
+            self.status(!self.pending.is_empty(), "Claude turn complete", step);
+            step.events.push(Event::TurnFinished { key, outcome });
         } else {
-            step.events.push(Event::PastTurnFinished {key,outcome});
+            step.events.push(Event::PastTurnFinished { key, outcome });
         }
     }
     fn tool(&mut self, item: Item) {
@@ -1632,7 +1674,10 @@ impl Claude {
 }
 
 impl Adapter for Claude {
-    fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> { self.cwd = directory.to_path_buf(); Ok(()) }
+    fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
+        self.cwd = directory.to_path_buf();
+        Ok(())
+    }
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
@@ -2115,7 +2160,7 @@ impl Adapter for Claude {
                         } else {
                             outcome
                         };
-                        self.publish_deferred_finish(generation,key,outcome,&mut step);
+                        self.publish_deferred_finish(generation, key, outcome, &mut step);
                         if let Some(run) = execution {
                             step.events.push(Event::Execution {
                                 run,
@@ -2157,9 +2202,9 @@ impl Adapter for Claude {
                         });
                     }
                 } else if string(response, "subtype") != "success" {
-                    self.warn_unknown("control response", string(response,"subtype"));
+                    self.warn_unknown("control response", string(response, "subtype"));
                     acknowledged=Err("Claude returned an unrecognized control response; the requested change is unconfirmed".into());
-                    if string(&request,"subtype")=="initialize" {
+                    if string(&request, "subtype") == "initialize" {
                         step.events.push(Event::Error {message:"Claude could not confirm initialization; restart the session after updating the provider".into(),fatal:true});
                     }
                 } else {
@@ -2291,7 +2336,9 @@ impl Adapter for Claude {
                         _ => {}
                     }
                 }
-                if !chained { self.control_replies.push((acknowledgement, acknowledged)); }
+                if !chained {
+                    self.control_replies.push((acknowledgement, acknowledged));
+                }
             }
             "assistant" | "user" => {
                 // The replay acknowledgement can precede consumption. Its
@@ -2363,8 +2410,8 @@ impl Adapter for Claude {
                     } else {
                         Kind::Succeeded
                     };
-                    if matches!(outcome,Kind::Cancelled|Kind::Failed) {
-                        self.retire_turn_decisions(self.attention_generation,&mut step);
+                    if matches!(outcome, Kind::Cancelled | Kind::Failed) {
+                        self.retire_turn_decisions(self.attention_generation, &mut step);
                     }
                     let execution = self.execution.take();
                     if let Some(run) = execution {
@@ -2580,16 +2627,28 @@ impl Adapter for Claude {
 
 fn provider_error_text(value: &Value) -> String {
     fn readable(value: &Value) -> Option<&str> {
-        value.as_str().or_else(|| value["message"].as_str()).or_else(|| value["text"].as_str())
+        value
+            .as_str()
+            .or_else(|| value["message"].as_str())
+            .or_else(|| value["text"].as_str())
     }
-    if let Some(text) = readable(value) { return super::preview(text.as_bytes(),1024); }
+    if let Some(text) = readable(value) {
+        return super::preview(text.as_bytes(), 1024);
+    }
     if let Some(errors) = value.as_array() {
         let mut message = String::new();
         for error in errors {
             if let Some(text) = readable(error) {
-                if !message.is_empty() { message.push_str("; "); }
-                message.push_str(&super::preview(text.as_bytes(),1024usize.saturating_sub(message.len())));
-                if message.len() >= 1024 { break; }
+                if !message.is_empty() {
+                    message.push_str("; ");
+                }
+                message.push_str(&super::preview(
+                    text.as_bytes(),
+                    1024usize.saturating_sub(message.len()),
+                ));
+                if message.len() >= 1024 {
+                    break;
+                }
             }
         }
         message.truncate(message.floor_char_boundary(1024));
@@ -3882,7 +3941,13 @@ impl Claude {
             }
             "ping" => {}
             "error" => step.events.push(Event::Error {
-                message: event["error"]["message"].as_str().or_else(|| event["error"].as_str()).map(str::to_owned).unwrap_or_else(|| "Claude reported a stream error without a readable message".into()),
+                message: event["error"]["message"]
+                    .as_str()
+                    .or_else(|| event["error"].as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        "Claude reported a stream error without a readable message".into()
+                    }),
                 fatal: false,
             }),
             other => self.warn_unknown("stream event", other),
@@ -5176,7 +5241,11 @@ mod tests {
     #[test]
     fn three_hundred_completed_tools_never_imply_a_successful_turn() {
         let run = crate::model::RunId::new();
-        let mut adapter = Claude {busy:true,execution:Some(run),..Default::default()};
+        let mut adapter = Claude {
+            busy: true,
+            execution: Some(run),
+            ..Default::default()
+        };
         for index in 0..300 {
             let id = format!("tool-{index}");
             for frame in [
@@ -5184,43 +5253,90 @@ mod tests {
                 json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"done","is_error":false}]}}),
             ] {
                 let step = adapter.receive(frame).unwrap();
-                assert!(!step.events.iter().any(|event| matches!(event,Event::TurnFinished {..} | Event::Execution {event:crate::agent_execution::ProviderEvent::Finished{..},..})),"individual tool completion cannot settle a run");
+                assert!(
+                    !step.events.iter().any(|event| matches!(
+                        event,
+                        Event::TurnFinished { .. }
+                            | Event::Execution {
+                                event: crate::agent_execution::ProviderEvent::Finished { .. },
+                                ..
+                            }
+                    )),
+                    "individual tool completion cannot settle a run"
+                );
             }
         }
         assert!(adapter.busy);
-        assert_eq!(adapter.execution,Some(run));
-        let failed = adapter.receive(json!({"type":"result","subtype":"error_during_execution","is_error":false})).unwrap();
+        assert_eq!(adapter.execution, Some(run));
+        let failed = adapter
+            .receive(json!({"type":"result","subtype":"error_during_execution","is_error":false}))
+            .unwrap();
         assert!(failed.events.iter().any(|event| matches!(event,Event::Execution {run:actual,event:crate::agent_execution::ProviderEvent::Finished {outcome:crate::notifications::Kind::Failed}} if *actual==run)));
-        assert!(!failed.events.iter().any(|event| matches!(event,Event::TurnFinished {outcome:crate::notifications::Kind::Succeeded,..})));
+        assert!(!failed.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
     }
 
     #[test]
     fn multi_step_control_refusal_resolves_original_caller_with_original_deadline() {
-        let mut adapter = Claude { ready:true,models:vec![Model{id:"sonnet".into(),label:"Sonnet".into(),reasoning:vec!["high".into()]}],..Default::default() };
-        let first = adapter.command(Command::SetModel { model:"sonnet".into(),reasoning:Some("high".into()) }).unwrap();
+        let mut adapter = Claude {
+            ready: true,
+            models: vec![Model {
+                id: "sonnet".into(),
+                label: "Sonnet".into(),
+                reasoning: vec!["high".into()],
+            }],
+            ..Default::default()
+        };
+        let first = adapter
+            .command(Command::SetModel {
+                model: "sonnet".into(),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
         let first_id = first.writes[0]["request_id"].as_str().unwrap().to_owned();
         let deadline = adapter.control_deadlines[&first_id];
         let next = adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":first_id,"response":{}}})).unwrap();
-        assert!(adapter.control_replies().is_empty(), "first acknowledgement does not confirm effort settings");
+        assert!(
+            adapter.control_replies().is_empty(),
+            "first acknowledgement does not confirm effort settings"
+        );
         let next_id = next.writes[0]["request_id"].as_str().unwrap();
-        assert_eq!(adapter.control_deadlines[next_id],deadline);
+        assert_eq!(adapter.control_deadlines[next_id], deadline);
         assert!(next.writes[0]["request"].get("_cagents_ack").is_none());
         let failed = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":next_id,"error":"Rejected effort"}})).unwrap();
-        assert!(!failed.events.iter().any(|event| matches!(event,Event::Error{..})));
+        assert!(
+            !failed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
         let replies = adapter.control_replies();
-        assert_eq!(replies.len(),1);
-        assert_eq!(replies[0].0,first_id);
-        assert!(replies[0].1.as_ref().unwrap_err().contains("Rejected effort"));
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, first_id);
+        assert!(
+            replies[0]
+                .1
+                .as_ref()
+                .unwrap_err()
+                .contains("Rejected effort")
+        );
 
-        let initial = adapter.control(json!({"subtype":"set_model","model":"sonnet"})).unwrap();
+        let initial = adapter
+            .control(json!({"subtype":"set_model","model":"sonnet"}))
+            .unwrap();
         let id = initial.writes[0]["request_id"].as_str().unwrap();
         let next = adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{}}})).unwrap();
-        assert_eq!(next.writes.len(),1);
+        assert_eq!(next.writes.len(), 1);
         assert!(adapter.control_replies().is_empty());
-        adapter.expire_controls(std::time::Instant::now()+std::time::Duration::from_secs(6));
+        adapter.expire_controls(std::time::Instant::now() + std::time::Duration::from_secs(6));
         let replies = adapter.control_replies();
-        assert_eq!(replies.len(),1);
-        assert_eq!(replies[0].0,id);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, id);
         assert!(replies[0].1.is_err());
     }
 
@@ -5231,73 +5347,171 @@ mod tests {
             json!({"type":"result","subtype":"error_max_turns","is_error":false}),
             json!({"type":"result","is_error":false}),
         ] {
-            let mut adapter = Claude { busy:true, ..Default::default() };
+            let mut adapter = Claude {
+                busy: true,
+                ..Default::default()
+            };
             let step = adapter.receive(result).unwrap();
-            assert!(step.events.iter().any(|event| matches!(event,Event::TurnFinished { outcome:crate::notifications::Kind::Failed,.. })));
-            assert!(!step.events.iter().any(|event| matches!(event,Event::TurnFinished { outcome:crate::notifications::Kind::Succeeded,.. })));
+            assert!(step.events.iter().any(|event| matches!(
+                event,
+                Event::TurnFinished {
+                    outcome: crate::notifications::Kind::Failed,
+                    ..
+                }
+            )));
+            assert!(!step.events.iter().any(|event| matches!(
+                event,
+                Event::TurnFinished {
+                    outcome: crate::notifications::Kind::Succeeded,
+                    ..
+                }
+            )));
         }
     }
 
     #[test]
     fn provider_startup_keeps_its_handshake_budget_before_expiring() {
-        let mut adapter=Claude::default();
+        let mut adapter = Claude::default();
         adapter.initialize().unwrap();
-        let after_user_deadline=adapter.expire_controls(std::time::Instant::now()+std::time::Duration::from_secs(6));
-        assert!(after_user_deadline.events.is_empty());assert_eq!(adapter.controls.len(),1);
-        let expired=adapter.expire_controls(std::time::Instant::now()+std::time::Duration::from_secs(31));
+        let after_user_deadline =
+            adapter.expire_controls(std::time::Instant::now() + std::time::Duration::from_secs(6));
+        assert!(after_user_deadline.events.is_empty());
+        assert_eq!(adapter.controls.len(), 1);
+        let expired =
+            adapter.expire_controls(std::time::Instant::now() + std::time::Duration::from_secs(31));
         assert!(expired.events.iter().any(|event|matches!(event,Event::Error {fatal:true,message} if message.contains("initialization") && message.contains("30 seconds"))));
         assert!(adapter.controls.is_empty());
     }
 
     #[test]
     fn unfamiliar_control_acknowledgements_refuse_only_the_command() {
-        let mut adapter=Claude::default();
-        let request=adapter.control(json!({"subtype":"set_permission_mode","mode":"manual"})).unwrap();
-        let id=request.writes[0]["request_id"].as_str().unwrap();
+        let mut adapter = Claude::default();
+        let request = adapter
+            .control(json!({"subtype":"set_permission_mode","mode":"manual"}))
+            .unwrap();
+        let id = request.writes[0]["request_id"].as_str().unwrap();
         let step=adapter.receive(json!({"type":"control_response","response":{"subtype":"future_ack","request_id":id}})).unwrap();
         assert!(step.events.is_empty());
-        let replies=adapter.control_replies();assert_eq!(replies.len(),1);assert_eq!(replies[0].0,id);assert!(replies[0].1.is_err());
+        let replies = adapter.control_replies();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, id);
+        assert!(replies[0].1.is_err());
     }
 
     #[test]
     fn failed_turn_retires_pending_decisions_before_reporting_idle() {
-        let mut adapter=Claude {ready:true,busy:true,..Default::default()};
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            ..Default::default()
+        };
         adapter.receive(json!({"type":"control_request","request_id":"old","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-old","input":{"command":"true"}}})).unwrap();
-        let failed=adapter.receive(json!({"type":"result","subtype":"error_during_execution","is_error":true})).unwrap();
-        assert!(adapter.pending.is_empty()); assert!(adapter.decision_generations.is_empty()); assert!(!adapter.busy);
-        assert!(failed.events.contains(&Event::RequestResolved {id:"old".into()}));
-        assert!(!failed.events.iter().any(|event|matches!(event,Event::Status {busy:true,..})));
-        assert!(adapter.command(Command::Prompt {text:"new prompt".into(),attachments:Vec::new(),mode:PromptMode::Send}).is_ok());
+        let failed = adapter
+            .receive(json!({"type":"result","subtype":"error_during_execution","is_error":true}))
+            .unwrap();
+        assert!(adapter.pending.is_empty());
+        assert!(adapter.decision_generations.is_empty());
+        assert!(!adapter.busy);
+        assert!(
+            failed
+                .events
+                .contains(&Event::RequestResolved { id: "old".into() })
+        );
+        assert!(
+            !failed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Status { busy: true, .. }))
+        );
+        assert!(
+            adapter
+                .command(Command::Prompt {
+                    text: "new prompt".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send
+                })
+                .is_ok()
+        );
     }
 
     #[test]
     fn late_interrupt_result_retires_only_its_original_decisions_and_not_the_new_turn() {
-        let mut adapter=Claude {ready:true,busy:true,..Default::default()};
-        let request=|id:&str|json!({"type":"control_request","request_id":id,"request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":format!("tool-{id}"),"input":{"command":"true"}}});
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            ..Default::default()
+        };
+        let request = |id: &str| json!({"type":"control_request","request_id":id,"request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":format!("tool-{id}"),"input":{"command":"true"}}});
         adapter.receive(request("old")).unwrap();
-        let interrupt=adapter.command(Command::Interrupt).unwrap();
-        let id=interrupt.writes[0]["request_id"].clone();
-        adapter.receive(json!({"type":"result","uuid":"old-result","subtype":"success","is_error":false})).unwrap();
-        let mut start=Step::default(); adapter.start_turn(&mut start);
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let id = interrupt.writes[0]["request_id"].clone();
+        adapter
+            .receive(
+                json!({"type":"result","uuid":"old-result","subtype":"success","is_error":false}),
+            )
+            .unwrap();
+        let mut start = Step::default();
+        adapter.start_turn(&mut start);
         adapter.receive(request("new")).unwrap();
         let reply=adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{}}})).unwrap();
-        assert!(!adapter.pending.contains_key("old")); assert!(adapter.pending.contains_key("new")); assert!(adapter.busy);
-        assert!(reply.events.contains(&Event::RequestResolved {id:"old".into()}));
-        assert!(!reply.events.contains(&Event::RequestResolved {id:"new".into()}));
-        assert!(reply.events.iter().any(|event|matches!(event,Event::PastTurnFinished {outcome:crate::notifications::Kind::Cancelled,..})));
-        assert!(!reply.events.iter().any(|event|matches!(event,Event::TurnFinished{..}|Event::Status {busy:false,..})));
+        assert!(!adapter.pending.contains_key("old"));
+        assert!(adapter.pending.contains_key("new"));
+        assert!(adapter.busy);
+        assert!(
+            reply
+                .events
+                .contains(&Event::RequestResolved { id: "old".into() })
+        );
+        assert!(
+            !reply
+                .events
+                .contains(&Event::RequestResolved { id: "new".into() })
+        );
+        assert!(reply.events.iter().any(|event| matches!(
+            event,
+            Event::PastTurnFinished {
+                outcome: crate::notifications::Kind::Cancelled,
+                ..
+            }
+        )));
+        assert!(!reply.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished { .. } | Event::Status { busy: false, .. }
+        )));
     }
 
     #[test]
     fn expired_interrupt_releases_its_deferred_provider_result() {
-        let mut adapter = Claude { busy:true, ..Default::default() };
+        let mut adapter = Claude {
+            busy: true,
+            ..Default::default()
+        };
         adapter.command(Command::Interrupt).unwrap();
-        let waiting = adapter.receive(json!({"type":"result","subtype":"success","is_error":false})).unwrap();
-        assert!(!waiting.events.iter().any(|event| matches!(event,Event::TurnFinished { .. })));
-        let expired = adapter.expire_controls(std::time::Instant::now()+std::time::Duration::from_secs(6));
-        assert!(expired.events.iter().any(|event| matches!(event,Event::TurnFinished { outcome:crate::notifications::Kind::Succeeded,.. })));
+        let waiting = adapter
+            .receive(json!({"type":"result","subtype":"success","is_error":false}))
+            .unwrap();
+        assert!(
+            !waiting
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        );
+        let expired =
+            adapter.expire_controls(std::time::Instant::now() + std::time::Duration::from_secs(6));
+        assert!(expired.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
         assert!(adapter.deferred_attention.is_empty());
-        assert!(adapter.control_replies().iter().any(|(_,reply)|reply.is_err()));
+        assert!(
+            adapter
+                .control_replies()
+                .iter()
+                .any(|(_, reply)| reply.is_err())
+        );
     }
 
     #[test]
@@ -5305,10 +5519,21 @@ mod tests {
         let mut adapter = Claude::default();
         let step = adapter.receive(json!({"type":"result","subtype":"error_during_execution","is_error":true,"errors":[{"opaque_protocol_payload":"secret raw JSON"}]})).unwrap();
         assert!(step.events.iter().any(|event| matches!(event,Event::Error{message,..} if message.contains("error_during_execution") && !message.contains("opaque_protocol_payload"))));
-        for frame in [json!({"type":"auth_status","error":"x".repeat(5000)}),json!({"type":"result","subtype":"error","is_error":true,"errors":[{"message":"x".repeat(5000)}]})] {
+        for frame in [
+            json!({"type":"auth_status","error":"x".repeat(5000)}),
+            json!({"type":"result","subtype":"error","is_error":true,"errors":[{"message":"x".repeat(5000)}]}),
+        ] {
             let step = adapter.receive(frame).unwrap();
-            assert!(step.events.iter().any(|event| matches!(event,Event::Error{message,..} if message.len()<=1024)));
-            assert!(step.events.iter().all(|event| !matches!(event,Event::Error{message,..} if message.len()>1024)));
+            assert!(
+                step.events
+                    .iter()
+                    .any(|event| matches!(event,Event::Error{message,..} if message.len()<=1024))
+            );
+            assert!(
+                step.events
+                    .iter()
+                    .all(|event| !matches!(event,Event::Error{message,..} if message.len()>1024))
+            );
         }
     }
 
@@ -5323,8 +5548,18 @@ mod tests {
         let system = adapter.receive(json!({"type":"system", "subtype":"future_system", "payload":"secret raw protocol"})).unwrap();
         assert!(system.events.is_empty());
         adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
-        for event in [json!({"type":"future_stream_event"}),json!({"type":"content_block_start","index":1,"content_block":{"type":"future_content","opaque":"raw protocol"}}),json!({"type":"content_block_delta","index":1,"delta":{"type":"future_delta"}})] {
-            assert!(adapter.receive(json!({"type":"stream_event","event":event})).unwrap().events.is_empty());
+        for event in [
+            json!({"type":"future_stream_event"}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"future_content","opaque":"raw protocol"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"future_delta"}}),
+        ] {
+            assert!(
+                adapter
+                    .receive(json!({"type":"stream_event","event":event}))
+                    .unwrap()
+                    .events
+                    .is_empty()
+            );
         }
         adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}})).unwrap();
         let delta = adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}})).unwrap();
@@ -5398,7 +5633,11 @@ mod tests {
         );
         let refused = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":request.writes[0]["request_id"],"error":"Fast mode unavailable"}})).unwrap();
         assert!(refused.events.is_empty());
-        assert!(adapter.control_replies().iter().any(|(_, result)| result.as_ref().is_err_and(|message| message.contains("Fast mode unavailable"))));
+        assert!(adapter.control_replies().iter().any(|(_, result)| {
+            result
+                .as_ref()
+                .is_err_and(|message| message.contains("Fast mode unavailable"))
+        }));
         assert!(!adapter.fast_mode.as_ref().unwrap().enabled());
         let request = adapter
             .command(Command::SetFastMode { enabled: true })
@@ -5672,7 +5911,11 @@ mod tests {
             "subtype":"error","request_id":apply.writes[0]["request_id"],"error":"Policy rejected the change"
         }})).unwrap();
         assert!(failed.events.is_empty());
-        assert!(adapter.control_replies().iter().any(|(_, result)| result.as_ref().is_err_and(|message| message.contains("Policy rejected"))));
+        assert!(adapter.control_replies().iter().any(|(_, result)| {
+            result
+                .as_ref()
+                .is_err_and(|message| message.contains("Policy rejected"))
+        }));
         assert!(failed.writes.is_empty());
         assert!(adapter.permissions.unwrap().settings.rules.is_empty());
     }
@@ -5731,9 +5974,15 @@ mod tests {
                     "subtype":"success","request_id":ack.writes[0]["request_id"],"response":returned
                 }}))
                 .unwrap();
-            assert!(matches!(confirmed.events.as_slice(), [Event::PermissionSettings(_)]));
+            assert!(matches!(
+                confirmed.events.as_slice(),
+                [Event::PermissionSettings(_)]
+            ));
             let replies = adapter.control_replies();
-            let message = replies.iter().find_map(|(_, reply)| reply.as_ref().err()).unwrap();
+            let message = replies
+                .iter()
+                .find_map(|(_, reply)| reply.as_ref().err())
+                .unwrap();
             assert!(message.contains(if removal {
                 "did not remove"
             } else {
@@ -7508,7 +7757,9 @@ mod tests {
             .unwrap();
         adapter.receive(stream(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash"}}))).unwrap();
         let partial = adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls"}}))).unwrap();
-        assert!(matches!(&partial.events[..], [Event::InputDelta { id, offset:0, delta }] if id == "tool-1" && delta == "{\"command\":\"ls"));
+        assert!(
+            matches!(&partial.events[..], [Event::InputDelta { id, offset:0, delta }] if id == "tool-1" && delta == "{\"command\":\"ls")
+        );
         adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"}"}}))).unwrap();
         let stopped = adapter
             .receive(stream(json!({"type":"content_block_stop","index":0})))
@@ -8478,7 +8729,9 @@ mod tests {
         let interrupt = adapter.command(Command::Interrupt).unwrap();
         let request_id = interrupt.writes[0]["request_id"].as_str().unwrap();
         let settled = adapter
-            .receive(json!({"type":"result","subtype":"success","uuid":"first-result","is_error":false}))
+            .receive(
+                json!({"type":"result","subtype":"success","uuid":"first-result","is_error":false}),
+            )
             .unwrap();
         assert!(settled.events.iter().any(|event| matches!(event,
             Event::Execution { run, event: ProviderEvent::Settled } if *run == first)));
@@ -8519,7 +8772,9 @@ mod tests {
                     .is_none()
             );
             let first = adapter
-                .receive(json!({"type":"result","subtype":"success","uuid":"first","is_error":false}))
+                .receive(
+                    json!({"type":"result","subtype":"success","uuid":"first","is_error":false}),
+                )
                 .unwrap();
             assert!(
                 !first
@@ -8549,7 +8804,9 @@ mod tests {
             };
             assert!(acknowledged.events.iter().any(|event| matches!(event, Event::TurnFinished { key, outcome } if key.as_deref() == Some("claude:first") && *outcome == expected)));
             let second = adapter
-                .receive(json!({"type":"result","subtype":"success","uuid":"second","is_error":false}))
+                .receive(
+                    json!({"type":"result","subtype":"success","uuid":"second","is_error":false}),
+                )
                 .unwrap();
             assert!(second.events.iter().any(|event| matches!(event, Event::TurnFinished { key, outcome: crate::notifications::Kind::Succeeded } if key.as_deref() == Some("claude:second"))));
         }
@@ -8631,7 +8888,11 @@ mod tests {
         );
         assert!(settings.events.iter().any(|event| matches!(event, Event::Models { selected, reasoning, .. } if selected.as_deref() == Some("sonnet") && reasoning.as_deref() == Some("high"))));
         let failed = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":settings.writes[0]["request_id"],"error":"Settings rejected"}})).unwrap();
-        assert!(adapter.control_replies().iter().any(|(_, result)| result.as_ref().is_err_and(|message| message.contains("Settings rejected"))));
+        assert!(adapter.control_replies().iter().any(|(_, result)| {
+            result
+                .as_ref()
+                .is_err_and(|message| message.contains("Settings rejected"))
+        }));
         assert!(
             !failed
                 .events
@@ -8683,7 +8944,11 @@ mod tests {
             .unwrap();
         let failed = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":change.writes[0]["request_id"],"error":"Model rejected"}})).unwrap();
         assert!(failed.writes.is_empty());
-        assert!(adapter.control_replies().iter().any(|(_, result)| result.as_ref().is_err_and(|message| message.contains("Model rejected"))));
+        assert!(adapter.control_replies().iter().any(|(_, result)| {
+            result
+                .as_ref()
+                .is_err_and(|message| message.contains("Model rejected"))
+        }));
         assert!(
             !failed
                 .events
@@ -9315,14 +9580,44 @@ mod tests {
     /// frame used to do with the raw JSON of the frame.
     #[test]
     fn explicit_compaction_uses_ordinary_prompt_turn_boundaries() {
-        let mut adapter=Claude {ready:true,commands:vec![chat::SlashCommand {name:"compact".into(),description:String::new()}],..Default::default()};
-        let requested=adapter.command(Command::Compact).unwrap();
+        let mut adapter = Claude {
+            ready: true,
+            commands: vec![chat::SlashCommand {
+                name: "compact".into(),
+                description: String::new(),
+            }],
+            ..Default::default()
+        };
+        let requested = adapter.command(Command::Compact).unwrap();
         assert!(requested.events.contains(&Event::TurnStarted));
-        assert!(requested.writes.iter().any(|frame|frame["message"]["content"][0]["text"]=="/compact"));
-        assert!(!requested.events.iter().any(|event|matches!(event,Event::Compaction{..})));
-        let completed=adapter.receive(json!({"type":"result","subtype":"success","is_error":false})).unwrap();
-        assert!(completed.events.iter().any(|event|matches!(event,Event::TurnFinished{outcome:crate::notifications::Kind::Succeeded,..})));
-        assert!(!completed.events.iter().any(|event|matches!(event,Event::Compaction{..})));
+        assert!(
+            requested
+                .writes
+                .iter()
+                .any(|frame| frame["message"]["content"][0]["text"] == "/compact")
+        );
+        assert!(
+            !requested
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Compaction { .. }))
+        );
+        let completed = adapter
+            .receive(json!({"type":"result","subtype":"success","is_error":false}))
+            .unwrap();
+        assert!(completed.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+        assert!(
+            !completed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Compaction { .. }))
+        );
         assert!(!adapter.busy);
     }
 
