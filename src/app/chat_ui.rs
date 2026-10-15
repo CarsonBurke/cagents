@@ -3735,6 +3735,8 @@ impl Cagents {
             runtime.draft_permission_choice = configuration.permission_mode.clone();
             runtime.error = None;
         }
+        // A committed choice is work even before the first character is typed.
+        self.chat_ui.default_chats.remove(&target.card);
         self.remember_chat_model(provider, model, reasoning);
         if moved.is_none() {
             self.persist();
@@ -3856,6 +3858,7 @@ impl Cagents {
         runtime.draft_automatic = false;
         runtime.draft_permission_choice = configuration.permission_mode.clone();
         if session == runtime.session {
+            self.chat_ui.default_chats.remove(&target.card);
             self.persist();
             return Task::none();
         }
@@ -3864,6 +3867,7 @@ impl Cagents {
         Arc::make_mut(&mut runtime.snapshot).permission_mode =
             draft_permission_mode(&session.launch.recipe, account.provider);
         runtime.completion.restart(true);
+        self.chat_ui.default_chats.remove(&target.card);
         self.replace_chat_conversation(target.card, session);
         self.load_draft_skills(target)
     }
@@ -8269,6 +8273,7 @@ impl Cagents {
                         return Task::none();
                     }
                     Arc::make_mut(&mut runtime.snapshot).reasoning = Some(reasoning.clone());
+                    self.chat_ui.default_chats.remove(&target.card);
                     self.remember_chat_model(provider, Some(model), Some(reasoning));
                     self.persist();
                     return Task::none();
@@ -8301,6 +8306,7 @@ impl Cagents {
                     runtime.draft_permission_choice = Some(mode.clone());
                     Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
                     let session = runtime.session.clone();
+                    self.chat_ui.default_chats.remove(&target.card);
                     self.replace_chat_conversation(target.card, session);
                     return Task::none();
                 }
@@ -13809,6 +13815,58 @@ mod tests {
             }
         }
         assert!(store.load_workspace(saved.id, None).unwrap().unwrap().configured_chat_drafts.contains_key(&original_card));
+    }
+
+    #[test]
+    fn settings_empty_default_choices_survive_restart_and_new_window_without_promoting_picker_opens() {
+        use crate::persistence::{StateStore, SnapshotBase};
+        let directory = tempfile::tempdir().unwrap();
+        for choice in ["model", "effort", "permission", "account"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.observe_listed_models(Provider::Claude, vec![fixture_model("model-one", &["low", "high"])]));
+            app.settings.agents.insert("claude".into(), settings::AgentLaunchSettings {
+                model: Some("model-one".into()), effort: Some("low".into()), permission_mode: Some("plan".into()), ..Default::default()
+            });
+            drop(app.new_native_chat_with_lifetime(Provider::Claude, Some(directory.path().into()), true));
+            let card = app.workspace.focused().unwrap();
+            let target = chat_runtime(&app, card).target;
+            assert!(app.chat_ui.default_chats.contains(&card));
+            assert!(!app.persistent_workspace().configured_chat_drafts.contains_key(&card));
+            drop(app.update(Message::ChatUi(Action::ModelPicker(target, true))));
+            drop(app.update(Message::ChatUi(Action::PermissionMode(target, "invalid-mode".into()))));
+            let mut stale = target; stale.generation += 1;
+            drop(app.update(Message::ChatUi(Action::DraftModel(stale, Provider::Claude, None))));
+            assert!(app.chat_ui.default_chats.contains(&card), "picker/rejected callbacks: {choice}");
+            let action = match choice {
+                "model" => Action::DraftModel(target, Provider::Claude, None),
+                "effort" => Action::Reasoning(target, "model-one".into(), "high".into()),
+                "permission" => Action::PermissionMode(target, "manual".into()),
+                "account" => Action::ChooseAccount(target, Account::system(Provider::Claude).id()),
+                _ => unreachable!(),
+            };
+            drop(app.update(Message::ChatUi(action)));
+            assert!(!app.chat_ui.default_chats.contains(&card), "explicit {choice}");
+            assert!(chat_runtime(&app, card).composer.is_empty());
+            assert!(!app.chat_start_pending(card));
+            let expected = chat_runtime(&app, card).configured_start().unwrap().unwrap();
+            let saved = app.persistent_workspace();
+            assert_eq!(saved.configured_chat_drafts[&card], expected);
+            let source = directory.path().join(format!("{choice}.sqlite3"));
+            let boot = crate::model::BootId::new("empty-configured-choice");
+            let store = StateStore::open(&source, boot.clone()).unwrap();
+            store.save_workspace(&saved, SnapshotBase { workspace: 0, cards: &std::collections::BTreeMap::new() }).unwrap();
+            let restarted = StateStore::open(&source, boot.clone()).unwrap();
+            assert_eq!(restarted.load_workspace(saved.id, None).unwrap().unwrap().configured_chat_drafts[&card], expected);
+            let copied = directory.path().join(format!("{choice}-copy.sqlite3"));
+            StateStore::copy_window_snapshot(&source, &copied, boot.clone()).unwrap();
+            let copied = StateStore::open(&copied, boot).unwrap();
+            let copied = copied.load_workspace(saved.id, None).unwrap().unwrap();
+            let (&new_card, actual) = copied.configured_chat_drafts.iter().next().unwrap();
+            assert_ne!(new_card, card);
+            assert_ne!(actual.id, expected.id);
+            let mut normalized = actual.clone(); normalized.id = expected.id;
+            assert_eq!(normalized, expected, "copied explicit {choice}");
+        }
     }
 
     #[test]
