@@ -1142,7 +1142,11 @@ fn serve(control: UnixStream) -> i32 {
         Ok(child) => child,
         Err(error) => return fail(format!("spawn {program}: {error:#}")),
     };
-    drop(directory);
+    // Retain the directory for this holder's entire lifetime. For a shebang
+    // program exec success only starts its interpreter; the interpreter can
+    // open argv[0] through /proc/<holder>/fd/N afterwards. Closing this pin at
+    // spawn return would race that open even though the child's cwd is valid.
+    let _execution_directory = directory;
     drop(pair.slave);
     let Some(pid) = child.process_id().map(|pid| pid as libc::pid_t) else {
         return fail(format!("spawn {program}: no process id"));
