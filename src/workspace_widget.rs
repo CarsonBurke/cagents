@@ -82,6 +82,9 @@ pub enum GlobalShortcut {
     SettingsAccounts,
     SettingsNotifications,
     SettingsAbout,
+    NextDiagnostic,
+    PreviousDiagnostic,
+
     EndConversation,
 
     EditorUndo,
@@ -226,6 +229,9 @@ impl GlobalShortcut {
             Self::SettingsAccounts => "settings_accounts",
             Self::SettingsNotifications => "settings_notifications",
             Self::SettingsAbout => "settings_about",
+            Self::NextDiagnostic => "next_diagnostic",
+            Self::PreviousDiagnostic => "previous_diagnostic",
+
             Self::EndConversation => "end_conversation",
 
             Self::EditorUndo => "editor_undo",
@@ -411,6 +417,7 @@ pub struct CommandContext {
     pub can_reopen: bool,
     pub has_unread: bool,
     pub editor_commands: u8,
+    pub can_navigate_diagnostics: bool,
     pub can_search_project: bool,
     pub has_attention: bool,
     pub can_cycle_workspace: bool,
@@ -485,6 +492,7 @@ impl ShortcutDescriptor {
         }
         let pane = context.pane_index.is_some();
         match self.action {
+            GlobalShortcut::NextDiagnostic | GlobalShortcut::PreviousDiagnostic => context.can_navigate_diagnostics,
             GlobalShortcut::OpenInExternalEditor => context.pane_external_editor,
             GlobalShortcut::NewWorktree => context.active_git_project,
             GlobalShortcut::EndConversation => context.can_end_conversation,
@@ -993,6 +1001,19 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
+        action: GlobalShortcut::NextDiagnostic,
+        label: "Next diagnostic",
+        repeatable: true,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PreviousDiagnostic,
+        label: "Previous diagnostic",
+        repeatable: true,
+        scope: ShortcutScope::Editor,
+    },
+
+    ShortcutDescriptor {
         action: GlobalShortcut::EndConversation,
         label: "Close conversation…",
         repeatable: false,
@@ -1128,6 +1149,9 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::SettingsAccounts => &shortcuts.settings_accounts,
         GlobalShortcut::SettingsNotifications => &shortcuts.settings_notifications,
         GlobalShortcut::SettingsAbout => &shortcuts.settings_about,
+        GlobalShortcut::NextDiagnostic => &shortcuts.next_diagnostic,
+        GlobalShortcut::PreviousDiagnostic => &shortcuts.previous_diagnostic,
+
         GlobalShortcut::EndConversation => &shortcuts.end_conversation,
 
         GlobalShortcut::EditorUndo => &shortcuts.editor_undo,

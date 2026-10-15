@@ -316,6 +316,9 @@ pub struct KeyboardShortcuts {
     pub settings_accounts: Vec<String>,
     pub settings_notifications: Vec<String>,
     pub settings_about: Vec<String>,
+    pub next_diagnostic: Vec<String>,
+    pub previous_diagnostic: Vec<String>,
+
     pub end_conversation: Vec<String>,
 
     pub editor_undo: Vec<String>,
@@ -429,6 +432,9 @@ impl Default for KeyboardShortcuts {
             settings_accounts: Vec::new(),
             settings_notifications: Vec::new(),
             settings_about: Vec::new(),
+            next_diagnostic: vec!["F8".into()],
+            previous_diagnostic: vec!["Shift+F8".into()],
+
             end_conversation: vec![],
 
             editor_undo: vec!["Ctrl+Z".into()],
@@ -492,7 +498,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 103] {
+    pub fn actions(&self) -> [&Vec<String>; 105] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -568,6 +574,9 @@ impl KeyboardShortcuts {
             &self.settings_accounts,
             &self.settings_notifications,
             &self.settings_about,
+            &self.next_diagnostic,
+            &self.previous_diagnostic,
+
             &self.end_conversation,
 
             &self.editor_undo,
@@ -605,7 +614,7 @@ impl KeyboardShortcuts {
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 103] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 105] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -681,6 +690,8 @@ impl KeyboardShortcuts {
             &mut self.settings_accounts,
             &mut self.settings_notifications,
             &mut self.settings_about,
+            &mut self.next_diagnostic,
+            &mut self.previous_diagnostic,
             &mut self.end_conversation,
             &mut self.editor_undo,
             &mut self.editor_redo,
@@ -759,7 +770,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 103] = [
+const SHORTCUT_ACTIONS: [&str; 105] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -834,6 +845,9 @@ const SHORTCUT_ACTIONS: [&str; 103] = [
     "settings_accounts",
     "settings_notifications",
     "settings_about",
+    "next_diagnostic",
+    "previous_diagnostic",
+
     "end_conversation",
 
     "editor_undo",
@@ -2003,7 +2017,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 98] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 100] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2073,6 +2087,9 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 98] = [
     "settings_accounts",
     "settings_notifications",
     "settings_about",
+    "next_diagnostic",
+    "previous_diagnostic",
+
     "end_conversation",
 
     "editor_undo",

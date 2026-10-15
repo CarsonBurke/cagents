@@ -1042,6 +1042,7 @@ impl Cagents {
                 _ if state.is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) => workspace_widget::FocusedPane::ChatPane,
                 _ => workspace_widget::FocusedPane::Other,
             },
+            can_navigate_diagnostics: card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.diagnostic_navigation_available())),
             editor_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_command_capabilities(), _ => 0 }),
             pane_index,
             pane_count: self.workspace.order().count(),
@@ -1168,7 +1169,7 @@ impl Cagents {
             return self.update(message);
         }
         match command {
-            Command::EditorUndo | Command::EditorRedo | Command::EditorCut | Command::EditorCopy | Command::EditorPaste | Command::EditorSelectAll => self.workspace.focused().and_then(|card| repository_widget::editor_command_action(card, command)).map_or_else(Task::none, |action| self.update(Message::Repository(action))),
+            Command::EditorUndo | Command::EditorRedo | Command::EditorCut | Command::EditorCopy | Command::EditorPaste | Command::EditorSelectAll | Command::NextDiagnostic | Command::PreviousDiagnostic => self.workspace.focused().and_then(|card| repository_widget::editor_command_action(card, command)).map_or_else(Task::none, |action| self.update(Message::Repository(action))),
             Command::NewBrowser => self.update(Message::NewBrowser),
             Command::MarkAllRead => self.update(Message::Sidebar(SidebarAction::MarkAllRead)),
             Command::SearchInProject => self.update(Message::SelectContextTab(ContextTab::Search)),
@@ -1295,6 +1296,8 @@ impl Cagents {
             | Command::EditorPaste
             | Command::EditorSelectAll
             | Command::EndConversation
+            | Command::NextDiagnostic
+            | Command::PreviousDiagnostic
             | Command::CopyBranch
             | Command::OpenOrCreatePullRequest
             | Command::NewWorktreeFromBranch
@@ -1519,6 +1522,8 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => Some(Command::SettingsAccounts),
             Self::ShortcutSettingsNotifications => Some(Command::SettingsNotifications),
             Self::ShortcutSettingsAbout => Some(Command::SettingsAbout),
+            Self::ShortcutNextDiagnostic => Some(Command::NextDiagnostic),
+            Self::ShortcutPreviousDiagnostic => Some(Command::PreviousDiagnostic),
             Self::ShortcutEndConversation => Some(Command::EndConversation),
 
             Self::ShortcutEditorUndo => Some(Command::EditorUndo),
@@ -1659,6 +1664,8 @@ impl ShortcutDraft {
                 self.settings_notifications.as_str(),
             ),
             (Command::SettingsAbout, self.settings_about.as_str()),
+            (Command::NextDiagnostic, self.next_diagnostic.as_str()),
+            (Command::PreviousDiagnostic, self.previous_diagnostic.as_str()),
             (Command::EndConversation, self.end_conversation.as_str()),
 
             (Command::EditorUndo, self.editor_undo.as_str()),

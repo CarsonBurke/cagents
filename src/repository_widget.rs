@@ -7631,6 +7631,7 @@ fn registered_editor_binding(card: CardId, runtime: &RepositoryRuntime, press: &
 pub fn editor_command_action(card: CardId, command: crate::workspace_widget::GlobalShortcut) -> Option<RepositoryAction> {
     use crate::workspace_widget::GlobalShortcut as Command;
     Some(match command {
+        Command::NextDiagnostic | Command::PreviousDiagnostic => RepositoryAction::Language { card, action: EditorLspAction::Diagnostic(command == Command::NextDiagnostic) },
         Command::EditorUndo => RepositoryAction::Undo { card },
         Command::EditorRedo => RepositoryAction::Redo { card },
         Command::EditorCut => RepositoryAction::Clipboard { card, op: ClipboardOp::Cut },
@@ -8740,7 +8741,6 @@ fn editable_document_view<'a>(
                     {
                         Some(EditorLspAction::Complete)
                     }
-                    Key::Named(Named::F8) if !press.modifiers.control() && !press.modifiers.alt() && !press.modifiers.logo() => Some(EditorLspAction::Diagnostic(!press.modifiers.shift())),
                     Key::Named(Named::F12) => Some(if press.modifiers.shift() {
                         EditorLspAction::References
                     } else {
@@ -16069,6 +16069,39 @@ mod tests {
             "the caret follows the text the user chose, past the edit inserted above it"
         );
         assert!(runtime.is_dirty());
+    }
+
+    #[test]
+    fn registered_diagnostic_bindings_follow_remapping_and_clearing() {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        use iced::keyboard::{Key, key::{Named, Physical, NativeCode}};
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "source");
+        let press = |shift| iced::widget::text_editor::KeyPress {
+            key: Key::Named(Named::F8), modified_key: Key::Named(Named::F8),
+            physical_key: Physical::Unidentified(NativeCode::Unidentified),
+            modifiers: if shift { iced::keyboard::Modifiers::SHIFT } else { iced::keyboard::Modifiers::empty() },
+            text: None, status: iced::widget::text_editor::Status::Focused { is_hovered: false },
+        };
+        for (shift, forward) in [(false, true), (true, false)] {
+            assert!(matches!(registered_editor_binding(card, &runtime, &press(shift)), Some(Some(text_editor::Binding::Custom(RepositoryAction::Language { card: id, action: EditorLspAction::Diagnostic(direction) }))) if id == card && direction == forward));
+        }
+        let mut shortcuts = crate::settings::KeyboardShortcuts::default();
+        shortcuts.next_diagnostic.clear();
+        shortcuts.previous_diagnostic = vec!["Ctrl+Alt+F8".into()];
+        runtime.set_keyboard_shortcuts(Arc::new(shortcuts));
+        assert!(registered_editor_binding(card, &runtime, &press(false)).is_none());
+        assert!(registered_editor_binding(card, &runtime, &press(true)).is_none());
+        let mut remapped = press(false);
+        remapped.modifiers = iced::keyboard::Modifiers::CTRL | iced::keyboard::Modifiers::ALT;
+        assert!(matches!(registered_editor_binding(card, &runtime, &remapped), Some(Some(text_editor::Binding::Custom(RepositoryAction::Language { action: EditorLspAction::Diagnostic(false), .. })))));
+        let descriptor = crate::workspace_widget::shortcut_descriptor(Command::NextDiagnostic);
+        let mut context = crate::workspace_widget::CommandContext { focused: crate::workspace_widget::FocusedPane::Editor, ..Default::default() };
+        assert!(!descriptor.available(&context));
+        context.can_navigate_diagnostics = true;
+        assert!(descriptor.available(&context));
+        context.focused = crate::workspace_widget::FocusedPane::TextInput;
+        assert!(!descriptor.available(&context));
     }
 
     #[test]

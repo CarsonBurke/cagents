@@ -2864,6 +2864,9 @@ pub enum SettingsField {
     ShortcutSettingsAccounts,
     ShortcutSettingsNotifications,
     ShortcutSettingsAbout,
+    ShortcutNextDiagnostic,
+    ShortcutPreviousDiagnostic,
+
     ShortcutEndConversation,
 
     ShortcutEditorUndo,
@@ -2900,7 +2903,7 @@ pub enum SettingsField {
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 103] = [
+    const SHORTCUTS: [Self; 105] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2975,6 +2978,9 @@ impl SettingsField {
         Self::ShortcutSettingsAccounts,
         Self::ShortcutSettingsNotifications,
         Self::ShortcutSettingsAbout,
+        Self::ShortcutNextDiagnostic,
+        Self::ShortcutPreviousDiagnostic,
+
         Self::ShortcutEndConversation,
 
         Self::ShortcutEditorUndo,
@@ -3084,6 +3090,9 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => "Open settings: Accounts",
             Self::ShortcutSettingsNotifications => "Open settings: Notifications",
             Self::ShortcutSettingsAbout => "Open settings: About",
+            Self::ShortcutNextDiagnostic => "Next diagnostic",
+            Self::ShortcutPreviousDiagnostic => "Previous diagnostic",
+
             Self::ShortcutEndConversation => "Close conversation…",
 
             Self::ShortcutEditorUndo => "Undo in editor",
@@ -3252,6 +3261,8 @@ impl SettingsField {
             | Self::ShortcutSettingsAccounts
             | Self::ShortcutSettingsNotifications
             | Self::ShortcutSettingsAbout
+            | Self::ShortcutNextDiagnostic
+            | Self::ShortcutPreviousDiagnostic
             | Self::ShortcutEndConversation
             | Self::ShortcutEditorUndo
             | Self::ShortcutEditorRedo
@@ -3377,6 +3388,9 @@ struct ShortcutDraft {
     settings_accounts: String,
     settings_notifications: String,
     settings_about: String,
+    next_diagnostic: String,
+    previous_diagnostic: String,
+
     end_conversation: String,
 
     editor_undo: String,
@@ -3492,6 +3506,9 @@ impl ShortcutDraft {
             settings_accounts: settings::format_chords(&shortcuts.settings_accounts),
             settings_notifications: settings::format_chords(&shortcuts.settings_notifications),
             settings_about: settings::format_chords(&shortcuts.settings_about),
+            next_diagnostic: settings::format_chords(&shortcuts.next_diagnostic),
+            previous_diagnostic: settings::format_chords(&shortcuts.previous_diagnostic),
+
             end_conversation: settings::format_chords(&shortcuts.end_conversation),
 
             editor_undo: settings::format_chords(&shortcuts.editor_undo),
@@ -3819,6 +3836,9 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.settings_notifications = value
             }
             SettingsField::ShortcutSettingsAbout => self.keyboard_shortcuts.settings_about = value,
+            SettingsField::ShortcutNextDiagnostic => self.keyboard_shortcuts.next_diagnostic = value,
+            SettingsField::ShortcutPreviousDiagnostic => self.keyboard_shortcuts.previous_diagnostic = value,
+
             SettingsField::ShortcutEndConversation => self.keyboard_shortcuts.end_conversation = value,
 
             SettingsField::ShortcutEditorUndo => self.keyboard_shortcuts.editor_undo = value,
@@ -4082,6 +4102,15 @@ fn settings_update(
             next.keyboard_shortcuts.settings_about = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutNextDiagnostic => {
+            next.keyboard_shortcuts.next_diagnostic = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPreviousDiagnostic => {
+            next.keyboard_shortcuts.previous_diagnostic = settings::parse_chords(value);
+            Ok(())
+        }
+
         SettingsField::ShortcutEndConversation => {
             next.keyboard_shortcuts.end_conversation = settings::parse_chords(value);
             Ok(())
