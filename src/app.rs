@@ -11272,8 +11272,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -13435,9 +13438,9 @@ impl Application for Cagents {
                 self.refresh_ui.projects.remove(&project_id);
                 self.refresh_ui.finished(
                     project_id,
-                    result.as_ref().is_ok_and(|loaded| {
-                        loaded.github.refresh_succeeded()
-                    }),
+                    result
+                        .as_ref()
+                        .is_ok_and(|loaded| loaded.github.refresh_succeeded()),
                 );
                 let mut task = Task::none();
                 match result {

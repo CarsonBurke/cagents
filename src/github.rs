@@ -1494,7 +1494,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
         )?;
         if !output.success
             && let Some(limit) = polling::RateLimit::classify(
-                &format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)),
+                &format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
                 polling::now(),
             )
         {
@@ -1676,7 +1680,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
         Self::check_remote_rate_limits(remotes)?;
         let result = self.resolve_repository_inner(repository, cancellation);
         if let Err(error) = &result {
-            for key in remotes.iter().filter_map(|remote| remote.fetch_url.as_deref()).filter_map(remote_repository_key) {
+            for key in remotes
+                .iter()
+                .filter_map(|remote| remote.fetch_url.as_deref())
+                .filter_map(remote_repository_key)
+            {
                 polling::failed(&key.host, error);
             }
         }
@@ -3349,12 +3357,26 @@ mod tests {
         let executor = Arc::new(FakeExecutor::default());
         let service = GitHubService::new("gh", executor.clone());
         let cancellation = CancellationToken::new();
-        polling::failed(host, &GitHubError::RateLimited {
-            limit: polling::RateLimit { retry_at: polling::now() + 120 },
-        });
-        assert!(matches!(service.has_associated_remote(&remotes, &cancellation), Err(GitHubError::RateLimited { .. })));
-        assert!(matches!(service.resolve_repository(Path::new("/repo"), &remotes, &cancellation), Err(GitHubError::RateLimited { .. })));
-        assert!(matches!(service.auth_status(&repository, &cancellation), Err(GitHubError::RateLimited { .. })));
+        polling::failed(
+            host,
+            &GitHubError::RateLimited {
+                limit: polling::RateLimit {
+                    retry_at: polling::now() + 120,
+                },
+            },
+        );
+        assert!(matches!(
+            service.has_associated_remote(&remotes, &cancellation),
+            Err(GitHubError::RateLimited { .. })
+        ));
+        assert!(matches!(
+            service.resolve_repository(Path::new("/repo"), &remotes, &cancellation),
+            Err(GitHubError::RateLimited { .. })
+        ));
+        assert!(matches!(
+            service.auth_status(&repository, &cancellation),
+            Err(GitHubError::RateLimited { .. })
+        ));
         assert!(executor.commands.lock().unwrap().is_empty());
     }
 
@@ -3363,14 +3385,23 @@ mod tests {
         let host = "review-discovery-observed-limit.invalid";
         let remotes = [remote("origin", &format!("https://{host}/o/r"))];
         let executor = Arc::new(FakeExecutor::with_outputs(vec![Ok(ProcessOutput {
-            exit_code: Some(1), signal: None, success: false, stdout: Vec::new(),
+            exit_code: Some(1),
+            signal: None,
+            success: false,
+            stdout: Vec::new(),
             stderr: b"secondary rate limit\nRetry-After: 120".to_vec(),
         })]));
         let service = GitHubService::new("gh", executor.clone());
         let cancellation = CancellationToken::new();
-        assert!(matches!(service.resolve_repository(Path::new("/repo"), &remotes, &cancellation), Err(GitHubError::Process(_))));
+        assert!(matches!(
+            service.resolve_repository(Path::new("/repo"), &remotes, &cancellation),
+            Err(GitHubError::Process(_))
+        ));
         assert!(polling::rate_limit(host).is_some());
-        assert!(matches!(service.resolve_repository(Path::new("/repo"), &remotes, &cancellation), Err(GitHubError::RateLimited { .. })));
+        assert!(matches!(
+            service.resolve_repository(Path::new("/repo"), &remotes, &cancellation),
+            Err(GitHubError::RateLimited { .. })
+        ));
         assert_eq!(executor.commands.lock().unwrap().len(), 1);
     }
 
