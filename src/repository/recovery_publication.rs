@@ -8,7 +8,7 @@
 //! trusted. Unknown entries are retained, never removed
 //! using a diagnostic spelling or a guessed Git temporary filename.
 use super::*;
-use crate::recovery_authority::{RecoveryContext, RecoverySlot};
+use crate::{filesystem_recovery_context::FilesystemRecoveryContext, recovery_authority::RecoverySlot};
 use std::os::unix::fs::FileExt;
 
 /// Create and retain the actual output inode before giving it to Git. Git
@@ -40,119 +40,91 @@ struct Holding {
     parent: fs_safety::Root,
     slot: Option<RecoverySlot>,
     files: Vec<Arc<fs::File>>,
+    context: FilesystemRecoveryContext,
 }
 
+enum FailedHoldingDirectory {
+    Preparation(fs_safety::DirectoryPreparation),
+    Publication(fs_safety::DirectoryPublication),
+    Unverified(fs_safety::Root),
+}
+struct FailedHolding {
+    directory: FailedHoldingDirectory,
+    parent: fs_safety::Root,
+    context: FilesystemRecoveryContext,
+}
+impl FailedHolding {
+    fn retry(&mut self) -> Result<(), String> {
+        self.context.placement().validate().map_err(|error| error.to_string())?;
+        match &mut self.directory {
+            FailedHoldingDirectory::Preparation(preparation) => preparation.retry_cleanup().map_err(|error| error.to_string())?,
+            FailedHoldingDirectory::Publication(publication) => {
+                if !publication.is_removed() {
+                    self.context.validate_payload_root(publication.directory()).map_err(|error| error.to_string())?;
+                    publication.resolve_recovery().map_err(|error| error.to_string())?;
+                    publication.cleanup_empty().map_err(|error| error.to_string())?;
+                }
+            }
+            FailedHoldingDirectory::Unverified(directory) => {
+                if directory.metadata().map_err(|error| error.to_string())?.nlink() != 0 {
+                    return Err("The unverified Undo holding was preserved; resolve it before retrying".into());
+                }
+            }
+        }
+        fs_safety::sync_directory(self.context.placement().directory()).map_err(|error| error.to_string())?;
+        fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string())
+    }
+}
 impl Holding {
-    fn create(
-        parent: &fs_safety::Root,
-        recovery: &DiscardRecovery,
-        context: &RecoveryContext,
-    ) -> Result<Self, String> {
+    fn create(parent: &fs_safety::Root, recovery: &DiscardRecovery, context: &FilesystemRecoveryContext) -> Result<Self, String> {
         let slot = context.reserve()?;
         let held_parent = parent.try_clone().map_err(|error| error.to_string())?;
         let name = PathBuf::from(format!(".cagents-undo-{}", Uuid::new_v4()));
-        let creation = match fs_safety::create_directory_beneath(parent, &name, 0o700) {
+        let creation = match fs_safety::create_directory_in_namespace(context.placement().namespace(), context.placement().directory(), &name, 0o700) {
             Ok(creation) => creation,
             Err(mut error) => {
                 let message = error.to_string();
-                if let Some(mut preparation) = error.take_recovery() {
-                    let description = format!(
-                        "Private Undo preparation originally named {}",
-                        preparation.diagnostic_path().display()
-                    );
-                    recovery
-                        .live_recovery
-                        .retain(slot.retain(description, move || {
-                            preparation
-                                .retry_cleanup()
-                                .map_err(|error| error.to_string())?;
-                            fs_safety::sync_directory(&held_parent)
-                                .map_err(|error| error.to_string())
-                        }));
+                if let Some(preparation) = error.take_recovery() {
+                    let description = format!("Private Undo preparation originally named {}", preparation.diagnostic_path().display());
+                    let mut failed = FailedHolding { directory: FailedHoldingDirectory::Preparation(preparation), parent: held_parent, context: context.clone() };
+                    recovery.live_recovery.retain(slot.retain(description, move || failed.retry()));
                 }
                 return Err(message);
             }
         };
-        let mut publication = match creation {
+        let publication = match creation {
             fs_safety::DirectoryCreation::Published(publication) => publication,
-            fs_safety::DirectoryCreation::Existing(_) => {
-                return Err(
-                    "The private Undo holding name already exists; it was preserved".into(),
-                );
-            }
+            fs_safety::DirectoryCreation::Existing(_) => return Err("The private Undo holding name already exists; it was preserved".into()),
             fs_safety::DirectoryCreation::Unverified { directory, reason } => {
-                let description = format!(
-                    "Unverified Undo holding originally named {}",
-                    directory.path().display()
-                );
-                recovery
-                    .live_recovery
-                    .retain(slot.retain(description, move || {
-                        if directory
-                            .metadata()
-                            .map_err(|error| error.to_string())?
-                            .nlink()
-                            == 0
-                        {
-                            Ok(())
-                        } else {
-                            Err(
-                            "The unverified Undo holding was preserved; resolve it before retrying"
-                                .into(),
-                        )
-                        }
-                    }));
-                return Err(format!(
-                    "Private Undo creation ownership is unverified; no saved entry was published: {reason}"
-                ));
+                let description = format!("Unverified Undo holding originally named {}", directory.path().display());
+                let mut failed = FailedHolding { directory: FailedHoldingDirectory::Unverified(directory), parent: held_parent, context: context.clone() };
+                recovery.live_recovery.retain(slot.retain(description, move || failed.retry()));
+                return Err(format!("Private Undo creation ownership is unverified; no saved entry was published: {reason}"));
             }
         };
         let checked = (|| {
-            if let Some(error) = publication.publication_error() {
-                return Err(error.to_owned());
-            }
-            set_exact_directory_mode(publication.directory(), 0o700)
-                .map_err(|error| error.to_string())?;
-            let metadata = publication
-                .directory()
-                .metadata()
-                .map_err(|error| error.to_string())?;
-            if metadata.uid() != unsafe { libc::geteuid() } {
+            if let Some(error) = publication.publication_error() { return Err(error.to_owned()); }
+            context.register_payload_root(publication.directory()).map_err(|error| error.to_string())?;
+            set_exact_directory_mode(publication.directory(), 0o700).map_err(|error| error.to_string())?;
+            if publication.directory().metadata().map_err(|error| error.to_string())?.uid() != unsafe { libc::geteuid() } {
                 return Err("Undo holding ownership changed".into());
             }
-            publication
-                .directory()
-                .try_clone()
-                .map_err(|error| error.to_string())
+            fs_safety::sync_directory(context.placement().directory()).map_err(|error| error.to_string())?;
+            publication.directory().try_clone().map_err(|error| error.to_string())
         })();
         let root = match checked {
             Ok(root) => root,
             Err(error) => {
-                let description = format!(
-                    "Undo holding originally named {}",
-                    publication.directory().path().display()
-                );
-                recovery
-                    .live_recovery
-                    .retain(slot.retain(description, move || {
-                        publication
-                            .resolve_recovery()
-                            .map_err(|error| error.to_string())?;
-                        publication
-                            .cleanup_empty()
-                            .map_err(|error| error.to_string())?;
-                        fs_safety::sync_directory(&held_parent).map_err(|error| error.to_string())
-                    }));
+                let description = format!("Undo holding originally named {}", publication.directory().path().display());
+                let mut failed = FailedHolding { directory: FailedHoldingDirectory::Publication(publication), parent: held_parent, context: context.clone() };
+                recovery.live_recovery.retain(slot.retain(description, move || failed.retry()));
                 return Err(error);
             }
         };
-        Ok(Self {
-            publication,
-            root,
-            parent: held_parent,
-            slot: Some(slot),
-            files: vec![],
-        })
+        Ok(Self { publication, root, parent: held_parent, slot: Some(slot), files: vec![], context: context.clone() })
+    }
+    fn validate(&self) -> Result<(), String> {
+        self.context.validate_payload_root(&self.root).map_err(|error| error.to_string())
     }
 
     fn open(&mut self, name: &Path) -> Result<Arc<fs::File>, String> {
@@ -180,15 +152,14 @@ impl Holding {
     }
 
     fn retry(&mut self) -> Result<(), String> {
-        self.publication
-            .resolve_recovery()
-            .map_err(|error| error.to_string())?;
-        // Manual resolution may move preserved contents out. Only the exact
-        // empty original directory can then be removed; unknown leaf entries
-        // and newer destinations are never destroyed by a cleanup retry.
-        self.publication
-            .cleanup_empty()
-            .map_err(|error| error.to_string())?;
+        if !self.publication.is_removed() {
+            self.validate()?;
+            self.publication.resolve_recovery().map_err(|error| error.to_string())?;
+            self.publication.cleanup_empty().map_err(|error| error.to_string())?;
+        } else {
+            self.context.placement().validate().map_err(|error| error.to_string())?;
+        }
+        fs_safety::sync_directory(self.context.placement().directory()).map_err(|error| error.to_string())?;
         fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string())
     }
 }
@@ -430,7 +401,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         entry: &DiscardRecoveryEntry,
         parent: &fs_safety::Root,
         name: &OsStr,
-        context: &RecoveryContext,
+        context: &FilesystemRecoveryContext,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, String> {
         let source = self
@@ -439,7 +410,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let mut holding = Holding::create(parent, recovery, context)?;
         let result =
             self.publish_saved_entry(&source, &mut holding, recovery, entry, name, cancellation);
-        if !holding.publication.is_removed() {
+        if !holding.publication.is_removed() || result.as_ref().is_ok_and(|warning| warning.is_some()) {
             holding.retain(recovery);
         }
         result
@@ -454,6 +425,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         name: &OsStr,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, String> {
+        holding.validate()?;
         let materialized = match &entry.before {
             SavedEntry::Absent => None,
             SavedEntry::Symlink { target } => {
@@ -472,6 +444,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 // The creator's exact FD survives every error, including a
                 // failed/partial cat-file write. No returned Git name is trusted.
                 holding.files.push(file.clone());
+                holding.validate()?;
                 self.stream_recovery_object(
                     source,
                     &holding.publication,
@@ -535,6 +508,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let mut moved = false;
         let before_publication: Result<(), String> = (|| {
             if current.is_some() {
+                holding.validate()?;
                 fs_safety::rename_new_between(
                     &holding.parent,
                     name,
@@ -584,6 +558,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             if cancellation.is_cancelled() {
                 return Err("Undo cancelled before publication".into());
             }
+            holding.validate()?;
             fs_safety::sync_directory(&holding.root).map_err(|error| error.to_string())?;
             if let Some((generated, _)) = &materialized {
                 fs_safety::rename_new_between(
@@ -600,7 +575,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             let rollback = if !moved {
                 Ok(())
             } else if let Some(proof) = &acquired {
-                proof.same_identity(holding, previous).and_then(|()| {
+                holding.validate().and_then(|()| proof.same_identity(holding, previous)).and_then(|()| {
                     fs_safety::rename_new_between(
                         &holding.root,
                         previous.as_os_str(),
@@ -627,6 +602,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // The publication (or intended absence) is known. Cleanup errors may
         // not become a NotApplied report or discard live recovery ownership.
         let cleanup = (|| {
+            holding.validate()?;
             if let Some(proof) = &acquired {
                 proof.verify(holding, previous, cancellation)?;
                 fs_safety::unlink_within(&holding.root, previous.as_os_str())
@@ -636,6 +612,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .publication
                 .cleanup_empty()
                 .map_err(|error| error.to_string())?;
+            fs_safety::sync_directory(holding.context.placement().directory()).map_err(|error| error.to_string())?;
             fs_safety::sync_directory(&holding.parent).map_err(|error| error.to_string())
         })();
         Ok(cleanup.err().map(|error| {
@@ -663,10 +640,46 @@ mod tests {
         let holding = Holding::create(
             &root,
             &recovery,
-            &RecoveryContext::with_guard((), 0).unwrap(),
+            &crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap(),
         )
         .unwrap();
         (directory, recovery, holding)
+    }
+
+    #[test]
+    fn undo_holding_is_outside_source_and_refuses_actual_payload_relocation() {
+        let (directory, recovery, holding) = fixture();
+        let source_file = directory.path().join("current");
+        fs::write(&source_file, b"newer source").unwrap();
+        let original = holding.root.path().to_owned();
+        assert!(!original.starts_with(directory.path()));
+        let relocated = directory.path().join("moved-holding");
+        fs::rename(&original, &relocated).unwrap();
+        holding.context.placement().validate().unwrap();
+        assert!(holding.validate().is_err(), "actual H ancestry, not just safe outside parent, must be fenced");
+        let private = holding.root.try_clone().unwrap();
+        holding.retain(&recovery);
+        let service = RepositoryService::system("git");
+        assert!(service.resolve_discard_recovery(&recovery, &CancellationToken::new()).is_err());
+        assert_eq!(fs::read(&source_file).unwrap(), b"newer source");
+        assert!(private.read_dir().unwrap().next().is_none());
+        fs::rename(&relocated, &original).unwrap();
+        service.resolve_discard_recovery(&recovery, &CancellationToken::new()).unwrap();
+        assert!(!recovery.live_recovery.needs_resolution());
+        assert_eq!(fs::read(&source_file).unwrap(), b"newer source");
+    }
+
+    #[test]
+    fn undo_without_original_context_refuses_before_any_filesystem_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("current"), b"newer source").unwrap();
+        let root = fs_safety::Root::open(directory.path()).unwrap();
+        let metadata = root.metadata().unwrap();
+        let recovery = DiscardRecovery { worktree: directory.path().to_owned(), worktree_identity: (metadata.dev(),metadata.ino()), live_recovery: LiveDiscardRecovery::default(), directories: BTreeMap::new(), entries: vec![], expires_unix_ms: u64::MAX };
+        let error = RepositoryService::system("git").undo_discard(&recovery, &CancellationToken::new()).unwrap_err();
+        assert!(error.to_string().contains("original protected outside-checkout recovery context"));
+        assert_eq!(fs::read(directory.path().join("current")).unwrap(), b"newer source");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -684,8 +697,9 @@ mod tests {
             crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), false)
                 .unwrap();
         assert!(protection.protects_root(&root).unwrap());
-        let count = protection.retained_descriptor_count();
-        let context = RecoveryContext::with_guard(protection, count).unwrap();
+        let fixture = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
+        let context = FilesystemRecoveryContext::new(&root, Arc::new(Some(protection)), fixture.placement().clone()).unwrap();
+        drop(fixture);
         let holding = Holding::create(&root, &recovery, &context).unwrap();
         let private = holding.root.try_clone().unwrap();
         fs::write(private.path().join("unresolved"), b"preserve").unwrap();

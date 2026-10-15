@@ -619,26 +619,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if !recovery.can_undo() {
             return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason: "Undo discard has expired; backups remain in Git objects and the system Trash".into() } });
         }
-        let protection = Arc::new(
-            crate::worktree_cleanup::protect(&recovery.worktree)
-                .map_err(|error| ValidationError::Io(error.to_string()))?,
-        );
+        let context = self.recovery_context.as_ref().ok_or_else(|| ValidationError::Io(
+            "Undo requires the original protected outside-checkout recovery context; no path was undone.".into()
+        ))?;
         let root = self.captured_worktree_root(&recovery.worktree)?;
-        let descriptors = match protection.as_ref() {
-            Some(protection) => {
-                if !protection
-                    .protects_root(&root)
-                    .map_err(|error| ValidationError::Io(error.to_string()))?
-                {
-                    return Err(ValidationError::Io("The cleanup lease no longer protects this exact recovery worktree; no path was undone".into()).into());
-                }
-                protection.retained_descriptor_count()
-            }
-            None => 0,
-        };
-        let context =
-            crate::recovery_authority::RecoveryContext::with_guard(protection, descriptors)
-                .map_err(ValidationError::Io)?;
+        context.validate_for_source(&root).map_err(|error| ValidationError::Io(error.to_string()))?;
         let directory = root
             .metadata()
             .map_err(|error| ValidationError::Io(error.to_string()))?;
@@ -755,6 +740,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             &recovery.directories,
             created_directories,
         )?;
+        created_directories.context.validate_for_source(root).map_err(|error| error.to_string())?;
         if let Some(trash) = &entry.trash {
             return restore_trashed_entry(trash, &parent, &name, cancellation, || {});
         }
@@ -806,7 +792,7 @@ struct RecoveryDirectoryFrontier {
     owned: BTreeMap<RepoPath, OwnedRecoveryDirectory>,
     warnings: BTreeMap<RepoPath, MutationFailure>,
     live: LiveDiscardRecovery,
-    context: crate::recovery_authority::RecoveryContext,
+    context: crate::filesystem_recovery_context::FilesystemRecoveryContext,
 }
 
 struct OwnedRecoveryDirectory {
@@ -817,6 +803,7 @@ struct OwnedRecoveryDirectory {
     temporary_installed: bool,
     pending_mode: Option<RecoveryModeTransition>,
     sync_file: Option<fs::File>,
+    context: crate::filesystem_recovery_context::FilesystemRecoveryContext,
 }
 /// A chmod may succeed before a subsequent metadata read fails. Retain the
 /// intended transition before that effect so retry recognizes its exact
@@ -884,6 +871,7 @@ fn recovery_mode_transition(
 
 impl OwnedRecoveryDirectory {
     fn install_temporary(&mut self) -> Result<(), String> {
+        self.context.placement().validate().map_err(|error| error.to_string())?;
         if self.temporary_installed {
             return Ok(());
         }
@@ -983,15 +971,15 @@ fn open_directory_sync_handle(root: &fs_safety::Root) -> io::Result<fs::File> {
 
 impl RecoveryDirectoryFrontier {
     #[cfg(test)]
-    fn new(_root: &fs_safety::Root) -> Self {
+    fn new(root: &fs_safety::Root) -> Self {
         Self::new_with_recovery(
             &LiveDiscardRecovery::default(),
-            &crate::recovery_authority::RecoveryContext::with_guard((), 0).unwrap(),
+            &crate::filesystem_recovery_context::fixtures::fixture_context(root).unwrap(),
         )
     }
     fn new_with_recovery(
         live: &LiveDiscardRecovery,
-        context: &crate::recovery_authority::RecoveryContext,
+        context: &crate::filesystem_recovery_context::FilesystemRecoveryContext,
     ) -> Self {
         Self {
             owned: BTreeMap::new(),
@@ -1100,6 +1088,7 @@ fn recovery_parent(
         // Own the exact parent before mkdir so error cleanup retains both its
         // lease and the directory requiring fsync, without a post-effect clone.
         let preparation_parent = parent.try_clone().map_err(|error| error.to_string())?;
+        let retry_context = created.context.clone();
         let result = match fs_safety::create_directory_beneath(
             &parent,
             Path::new(component.as_os_str()),
@@ -1114,6 +1103,7 @@ fn recovery_parent(
                         preparation.diagnostic_path().display()
                     );
                     created.live.retain(slot.retain(description, move || {
+                        retry_context.placement().validate().map_err(|error| error.to_string())?;
                         preparation
                             .retry_cleanup()
                             .map_err(|error| error.to_string())?;
@@ -1135,6 +1125,7 @@ fn recovery_parent(
                     Ok(retained) => retained,
                     Err(error) => {
                         created.live.retain(slot.retain(description, move || {
+                            retry_context.placement().validate().map_err(|error| error.to_string())?;
                             if directory.metadata().map_err(|error|error.to_string())?.nlink() == 0 { Ok(()) }
                             else { Err("The unverified directory is still retained; its entry was not modified".into()) }
                         }));
@@ -1142,6 +1133,7 @@ fn recovery_parent(
                     }
                 };
                 created.live.retain(slot.retain(description, move || {
+                    retry_context.placement().validate().map_err(|error| error.to_string())?;
                     if retained.metadata().map_err(|error|error.to_string())?.nlink() == 0 { Ok(()) }
                     else { Err("Creation ownership is unverified; the retained directory was left unchanged".into()) }
                 }));
@@ -1169,6 +1161,7 @@ fn recovery_parent(
                         temporary_installed: false,
                         pending_mode: None,
                         sync_file: None,
+                        context: created.context.clone(),
                     },
                 );
                 created.owned.get_mut(&key).unwrap().install_temporary()?;
