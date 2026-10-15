@@ -19,6 +19,14 @@ pub(super) fn rewrite_epoch(transaction: &rusqlite::Transaction<'_>, id: &str) -
 fn storage(error: impl ToString) -> SourceError { SourceError::Transport(error.to_string()) }
 
 impl Store {
+    pub(super) fn source_changed(&mut self)->Result<(),String>{self.source_revision=epoch()?;Ok(())}
+    pub(super) fn removes_text_sources(&self,ids:&[String])->Result<bool,String>{
+        for id in ids {
+            let metadata:Option<Vec<u8>>=self.db.query_row("SELECT metadata FROM items WHERE id=?1",[id],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
+            if metadata.as_ref().is_some_and(|bytes|postcard::from_bytes::<Item>(bytes).is_ok_and(|item|matches!(item.content,ItemContent::Text{..}))) {return Ok(true);}
+        }
+        Ok(false)
+    }
     pub(crate) fn source_page(&mut self, query: SourceQuery) -> Result<SourcePage, SourceError> {
         if !(4..=PAGE_BYTES).contains(&query.limit) || query.source.source_id.len()>METADATA_LIMIT || query.source.agent_id.as_ref().is_some_and(|id|id.len()>METADATA_LIMIT)
             || (query.offset>0 && (query.until.is_none() || query.expected_epoch.is_none())) || (query.until.is_some() && query.expected_epoch.is_none()) {
@@ -94,6 +102,8 @@ impl Store {
             Event::SubagentItem{id,item}=>{
                 if id.len()>METADATA_LIMIT || item.id.len()>METADATA_LIMIT {return Ok(());}
                 let text=match &item.content {ItemContent::Text{text,..}=>Some(text.as_str()),_=>None};
+                let was_text:bool=self.db.query_row("SELECT supported FROM child_sources WHERE agent=?1 AND id=?2",params![id,item.id],|row|row.get(0)).optional().map_err(|e|e.to_string())?.unwrap_or(false);
+                if text.is_some() || was_text {self.source_changed()?;}
                 let tx=self.db.transaction().map_err(|e|e.to_string())?;
                 tx.execute("INSERT INTO child_sources VALUES(?1,?2,?3,?4,?5) ON CONFLICT(agent,id) DO UPDATE SET epoch=excluded.epoch,len=excluded.len,supported=excluded.supported",params![id,item.id,epoch()?,text.map_or(0,str::len),text.is_some()]).map_err(|e|e.to_string())?;
                 tx.execute("DELETE FROM child_source_chunks WHERE agent=?1 AND id=?2",params![id,item.id]).map_err(|e|e.to_string())?;
@@ -102,6 +112,7 @@ impl Store {
             }
             Event::SubagentTextDelta{id,item_id,delta,..}=>{
                 if id.len()>METADATA_LIMIT || item_id.len()>METADATA_LIMIT {return Ok(());}
+                if !delta.is_empty() {self.source_changed()?;}
                 if self.pending_child_source.as_ref().is_some_and(|pending|pending.0!=*id || pending.1!=*item_id || pending.2.len().saturating_add(delta.len())>64*1024) {
                     self.flush_child_source()?;
                 }
@@ -109,7 +120,10 @@ impl Store {
                 else if let Some(pending)=&mut self.pending_child_source {pending.2.push_str(delta);}
                 else {self.pending_child_source=Some((id.clone(),item_id.clone(),delta.clone()));}
             }
-            Event::SubagentItemsRemoved{id,ids}=>{for source in ids {self.db.execute("DELETE FROM child_sources WHERE agent=?1 AND id=?2",params![id,source]).map_err(|e|e.to_string())?;}}
+            Event::SubagentItemsRemoved{id,ids}=>{for source in ids {
+                let supported:bool=self.db.query_row("SELECT supported FROM child_sources WHERE agent=?1 AND id=?2",params![id,source],|row|row.get(0)).optional().map_err(|e|e.to_string())?.unwrap_or(false);
+                if supported {self.source_changed()?;}
+                self.db.execute("DELETE FROM child_sources WHERE agent=?1 AND id=?2",params![id,source]).map_err(|e|e.to_string())?;}}
             Event::Reset{..}=>{self.db.execute("DELETE FROM child_sources",[]).map_err(|e|e.to_string())?;}
             _=>{}
         }
@@ -182,6 +196,25 @@ mod tests {
         store.apply(Event::SubagentItemsRemoved{id:"one".into(),ids:vec!["same".into()]}).unwrap();
         assert_eq!(store.source_page(next(&first)),Err(SourceError::NotFound));
     }
+    #[test]
+    fn source_revision_ignores_status_but_tracks_off_window_prose() {
+        let mut store=Store::new().unwrap();
+        store.apply(Event::Item(item("old","original"))).unwrap();
+        let initial=store.source_revision;
+        store.apply(Event::Status{busy:true,detail:"Working".into()}).unwrap();
+        assert_eq!(store.source_revision,initial);
+        let mut image=item("image","");image.content=ItemContent::Image{path:"image.png".into(),description:"image".into()};
+        store.apply(Event::Item(image)).unwrap();
+        assert_eq!(store.source_revision,initial);
+        store.apply(Event::TextDelta{id:"old".into(),role:Role::Assistant,thinking:false,delta:" append".into()}).unwrap();
+        let append=store.source_revision;assert_ne!(append,initial);
+        store.apply(Event::SubagentTextDelta{id:"child".into(),item_id:"same".into(),role:Role::Assistant,thinking:false,delta:"child source".into()}).unwrap();
+        assert_ne!(store.source_revision,append);
+        let child=store.source_revision;
+        store.apply(Event::SubagentItemsRemoved{id:"child".into(),ids:vec!["same".into()]}).unwrap();
+        assert_ne!(store.source_revision,child);
+    }
+
     #[test]
     fn child_token_deltas_batch_before_disk_reads() {
         let mut store=Store::new().unwrap();
