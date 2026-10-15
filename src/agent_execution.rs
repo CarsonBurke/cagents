@@ -283,7 +283,8 @@ pub enum HostedSession {
 }
 
 impl HostedSession {
-    /// All components of the current host proof must be present.
+    /// Equality alone also compares absent proofs. Explicit live activation
+    /// requires a complete issued proof before comparing current descriptors.
     pub(crate) fn has_complete_proof(&self) -> bool {
         match self {
             Self::Chat(session) => session
