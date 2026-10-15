@@ -17633,7 +17633,7 @@ mod tests {
         use iced::advanced::{Layout, Shell, clipboard, mouse};
         use iced::keyboard::{Key, key::{Code, Physical}};
         #[derive(Debug, Clone)]
-        enum Observation { Editor(RepositoryAction), Sidebar(String) }
+        enum Observation { Editor(RepositoryAction), Sidebar }
         let first = CardId::new();
         let second = CardId::new();
         let (first_runtime, _) = RepositoryRuntime::lsp_open_fixture(first, "first");
@@ -17644,7 +17644,7 @@ mod tests {
         let mut element: Element<'_, Observation> = widget::row::with_children(vec![
             widget::container(editor_surface(first, &first_runtime).map(Observation::Editor)).width(320).height(200).into(),
             widget::container(editor_surface(second, &second_runtime).map(Observation::Editor)).width(320).height(200).into(),
-            widget::text_input("Sidebar", "query").id(sidebar.clone()).on_input(Observation::Sidebar).width(240).into(),
+            widget::text_input("Sidebar", "query").id(sidebar.clone()).on_input(|_| Observation::Sidebar).width(240).into(),
         ]).into();
         let renderer = headless_renderer();
         let mut tree = Tree::new(element.as_widget());
