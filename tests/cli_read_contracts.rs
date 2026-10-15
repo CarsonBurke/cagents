@@ -157,3 +157,33 @@ fn a_closed_listener_with_a_held_inventory_lease_is_not_daemon_absence() {
     assert_eq!(error["error"]["kind"],"device","{error}");
     assert!(!fixture.root.path().join("spawned").exists());
 }
+
+#[test]
+fn no_start_daemon_start_still_requires_a_protocol_handshake() {
+    use std::{os::unix::net::UnixListener,thread,time::Instant};
+    let fixture=Fixture::new();
+    let runtime=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir(&runtime).unwrap();
+    let listener=UnixListener::bind(runtime.join(cagents::terminal_ipc::SOCKET_FILE_NAME)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let worker=thread::spawn(move || {
+        let deadline=Instant::now()+Duration::from_secs(3);
+        let mut accepted=0;
+        while accepted<2 && Instant::now()<deadline {
+            match listener.accept() {
+                Ok((stream,_))=>{accepted+=1;drop(stream);}
+                Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>thread::sleep(Duration::from_millis(5)),
+                Err(error)=>panic!("{error}"),
+            }
+        }
+        accepted
+    });
+    let output=fixture.output(&["daemon","start","--no-start"],false);
+    let accepted=worker.join().unwrap();
+    assert_eq!(accepted,2,"both availability and actual protocol connection must be checked");
+    assert_eq!(output.exit_code,Some(1),"{output:?}");
+    assert!(output.stdout.is_empty());
+    let error:Value=serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"],"protocol","{error}");
+    assert!(!fixture.root.path().join("spawned").exists());
+}

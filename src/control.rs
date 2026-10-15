@@ -2579,6 +2579,11 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
         }
         DaemonCommand::Start => {
             let socket = control_daemon_socket()?;
+            if daemon_autostart_disabled() {
+                // Readiness still requires the matched protocol; a listener
+                // alone does not prove this daemon can serve CLI requests.
+                let _client=ControlClient::connect(&socket).map_err(protocol_error)?;
+            }
             let mut data = json!({ "instance": instance::NAME, "running": true, "socket": socket });
             // Installers discard a successful start's output, but a daemon that
             // came up without some retained conversations must still say so.

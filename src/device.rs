@@ -275,6 +275,7 @@ impl Cancellation {
 /// This prevents a cycle from making cancellation depend on process exit.
 struct Transport {
     device: Device,
+    no_start: bool,
     directory: PathBuf,
     pool: Arc<Mutex<Vec<Master>>>,
     paused: Mutex<Option<Instant>>,
@@ -372,11 +373,11 @@ fn ssh(control: Option<&str>) -> Command {
     }
     command
 }
-fn bridge_command(device: &Device, control: Option<&str>) -> Command {
+fn bridge_command(transport: &Transport, control: Option<&str>) -> Command {
     let mut command = ssh(control);
-    command.args(["--", &device.host]);
-    let policy = if crate::control::daemon_autostart_disabled() { " --no-start" } else { "" };
-    command.arg(format!("{}{policy} daemon bridge", quote(&device.executable)));
+    command.args(["--", &transport.device.host]);
+    let policy = if transport.no_start { " --no-start" } else { "" };
+    command.arg(format!("{}{policy} daemon bridge", quote(&transport.device.executable)));
     command
 }
 /// The control socket of one master, or `None` where SSH could not use it:
@@ -458,6 +459,7 @@ impl ConnectionContext {
         fs::create_dir(&directory)?;
         let transport = Arc::new(Transport {
             device: self.device.clone(),
+            no_start: crate::control::daemon_autostart_disabled(),
             directory,
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
@@ -549,7 +551,7 @@ fn spawn_stream(
     }
     let listening = || control.is_some_and(|control| UnixStream::connect(control).is_ok());
     let cold = control.is_some() && !listening();
-    let child = bridge_command(device, control)
+    let child = bridge_command(transport, control)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1072,6 +1074,7 @@ mod tests {
     fn fixture_transport(device: Device, directory: PathBuf) -> Arc<Transport> {
         Arc::new(Transport {
             device,
+            no_start: false,
             directory,
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
@@ -1139,6 +1142,28 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!path.exists());
         assert!(context.socket_path().is_err());
+    }
+
+    #[test]
+    fn delayed_bridge_worker_keeps_the_original_no_start_policy_after_cleanup() {
+        let directory=tempfile::tempdir().unwrap();
+        let mut transport=fixture_transport(Device{name:"fixture".into(),host:"fixture-host".into(),executable:"cagents".into()},directory.path().to_path_buf());
+        Arc::get_mut(&mut transport).unwrap().no_start=true;
+        let owned=transport.clone();
+        let (ready_tx,ready_rx)=std::sync::mpsc::channel();
+        let (release_tx,release_rx)=std::sync::mpsc::channel();
+        let worker=thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            bridge_command(&owned,None).get_args().map(|argument|argument.to_os_string()).collect::<Vec<_>>()
+        });
+        let ready=ready_rx.recv_timeout(Duration::from_secs(5));
+        transport.cancelled.cancel();
+        drop(transport);
+        let _=release_tx.send(());
+        let command=worker.join().unwrap();
+        ready.unwrap();
+        assert_eq!(command.last().unwrap(),"'cagents' --no-start daemon bridge");
     }
 
     #[test]
@@ -1556,8 +1581,10 @@ mod tests {
             host: "marvin@fw16".into(),
             executable: "/home/a b/cagents".into(),
         };
+        let directory = tempfile::tempdir().unwrap();
+        let transport = fixture_transport(device, directory.path().to_path_buf());
         let arguments = |control| {
-            bridge_command(&device, control)
+            bridge_command(&transport, control)
                 .get_args()
                 .map(|argument| argument.to_str().unwrap().to_owned())
                 .collect::<Vec<_>>()
