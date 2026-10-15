@@ -247,6 +247,52 @@ mod tests {
         assert_eq!(app.editor_features.requests.get(&request).unwrap().doc, LspDocumentId(2));
     }
 
+    #[tokio::test]
+    async fn server_edit_anchored_to_read_only_source_can_change_a_writable_worktree_target() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let original = "fn old() {}\n";
+        for name in ["a.rs", "b.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+        let external_path = external.path().join("stdlib.rs");
+        std::fs::write(&external_path, original).unwrap();
+        let mut app = app();
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        let a = buffer(&mut app, root.path(), "a.rs", original);
+        let read_only = buffer(&mut app, root.path(), external_path.to_str().unwrap(), original);
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&read_only) { runtime.set_external_source(external_path.clone()); }
+        let b = buffer(&mut app, root.path(), "b.rs", original);
+        // Registration stays pending in this controller fixture: discovery
+        // events are not consumed, so no external server process can launch.
+        for (card, doc, path) in [(a, LspDocumentId(1), root.path().join("a.rs")), (read_only, LspDocumentId(2), external_path.clone()), (b, LspDocumentId(3), root.path().join("b.rs"))] {
+            app.lsp_documents.insert(doc, card);
+            app.lsp_contexts.entry(card).or_default().document = Some(doc);
+            if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
+                drop(runtime.take_lsp_intents());
+                drop(runtime.take_lsp_edits());
+                runtime.set_lsp_document(Some(doc));
+            }
+            let language = app.lsp.language_for(&path).unwrap();
+            app.lsp.open(doc, &path, root.path(), language, 1, original);
+        }
+        app.close_lsp_document(a);
+        app.cards.remove(&a);
+        let task = app.editor_feature_event(&LspEvent::ApplyWorkspaceEdit { doc: LspDocumentId(2), id: LspServerEditId(700), label: Some("Import quick fix".into()), edit: LspWorkspaceEdit { documents: vec![LspDocumentEdits { path: root.path().join("b.rs"), version: Some(1), observed_version: Some(1), coordinates: LspCoordinates::Scalar, edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }] }], ..Default::default() } }).unwrap();
+        let mut tasks = vec![task];
+        while let Some(task) = tasks.pop() {
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(Message::EditorFeatures(action))) = action { tasks.push(app.update_editor_features(action)); }
+                }
+            }
+        }
+        assert_eq!(text(&app, b), "fn renamed() {}\n");
+        assert_eq!(text(&app, read_only), original);
+        assert_eq!(std::fs::read_to_string(external_path).unwrap(), original);
+        assert!(!app.editor_features.modal_open());
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&b) { drop(runtime.update(RepositoryAction::Undo { card: b })); }
+        assert_eq!(text(&app, b), original);
+    }
+
     #[test]
     fn save_and_close_may_format_only_the_buffer_named_by_its_confirmation() {
         let mut app = app();
@@ -525,7 +571,7 @@ impl Cagents {
                 Some(Task::none())
             }
             LspEvent::ApplyWorkspaceEdit { doc, id, edit, .. } => {
-                let operation = self.lsp_documents.get(doc).copied().and_then(|card| self.editor_operation(card, LspEditKind::CodeAction));
+                let operation = self.server_workspace_edit_operation(*doc);
                 if let Some(mut operation) = operation {
                     operation.server_request = Some(*id);
                     Some(self.prepare_editor_workspace_edit(operation, edit.clone()))
@@ -542,6 +588,16 @@ impl Cagents {
             }
             _ => None,
         }
+    }
+
+    fn server_workspace_edit_operation(&self, doc: LspDocumentId) -> Option<Operation> {
+        let card = *self.lsp_documents.get(&doc)?;
+        if self.lsp_document(card) != Some(doc) || !matches!(self.cards.get(&card), Some(CardRuntime::Repository(_))) { return None; }
+        // A server chooses a session document as its root/context anchor. It
+        // can be a read-only std tab; writability is checked independently for
+        // every actual target by the workspace planner and publication fence.
+        Some(Operation { card, doc, version: self.lsp.document_version(doc)?, kind: LspEditKind::CodeAction,
+            save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
     }
 
     fn editor_operation(&self, card: CardId, kind: LspEditKind) -> Option<Operation> {
