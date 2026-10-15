@@ -120,6 +120,9 @@ pub(crate) fn require_quiescent(admin: &Path, creation: OperationId, lease: &Fil
 pub(crate) fn reserve(admin: &Path, creation: OperationId, run: OperationId, terminal: TerminalId, lease: &File) -> io::Result<SetupExecutionReservation> {
     require_quiescent(admin, creation, lease)?;
     let root = fs_safety::Root::open(admin)?;
+    if read(&root, creation)?.is_some_and(|prior| matches!(prior.phase, Phase::FamilyReaped(previous) if previous.run == run)) {
+        return Err(io::Error::other("This setup run already had an execution attempt. Review setup again to authorize a fresh run; a completed cleanup receipt does not permit replay."));
+    }
     let reservation = SetupExecutionReservation {creation, run, terminal, admin: admin.into(), admin_identity: validate_root(&root, creation)?, lease_identity: identity(lease)?};
     publish(&root, &Disposition {creation, admin_identity: reservation.admin_identity, phase: Phase::Reserved(reservation.clone())}, false)?;
     Ok(reservation)
@@ -201,6 +204,28 @@ mod tests {
         assert!(require_quiescent(directory.path(), creation, &lease).is_err());
         std::fs::write(directory.path().join(FILE_NAME), b"{}").unwrap();
         assert!(require_quiescent(directory.path(), creation, &lease).is_err());
+    }
+
+    #[test]
+    fn proved_cleanup_does_not_authorize_replaying_the_same_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(directory.path()).unwrap();
+        let creation = OperationId::new();
+        super::super::worktree_setup_intent::record_creation_identity(&root, creation).unwrap();
+        let lease = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(directory.path().join("original.lease")).unwrap();
+        assert_eq!(unsafe {libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)}, 0);
+        let run = OperationId::new();
+        let terminal = TerminalId::new();
+        let completed = reserve(directory.path(), creation, run, terminal, &lease).unwrap();
+        // Controlled completed-state fixture. Actual ReapedFamily publication
+        // is separately exercised by the real holder/daemon integration suite.
+        publish(&root, &Disposition {creation, admin_identity: completed.admin_identity, phase: Phase::FamilyReaped(completed.clone())}, false).unwrap();
+        for candidate in [terminal, TerminalId::new()] {
+            assert!(reserve(directory.path(), creation, run, candidate, &lease).is_err(), "changing terminal identity cannot grant a second execution of the same run");
+            assert_eq!(read(&root, creation).unwrap().unwrap().phase, Phase::FamilyReaped(completed.clone()));
+        }
+        let fresh = reserve(directory.path(), creation, OperationId::new(), TerminalId::new(), &lease).unwrap();
+        assert_ne!(fresh.run, run, "only a newly reviewed run can reserve execution after cleanup");
     }
 }
 
