@@ -85,7 +85,7 @@ impl Cagents {
         if let Some(next) = next { Arc::make_mut(&mut self.durable).shared_project_bindings.insert(id, next); self.persist(); }
     }
 
-    fn project_root(&self, project: &SidebarProject) -> PathBuf {
+    pub(super) fn project_root(&self, project: &SidebarProject) -> PathBuf {
         self.durable.shared_project_bindings.get(&project.id).and_then(|binding| binding.root.clone())
             .or_else(|| self.project_ui.primary_checkout_roots.get(&project.repository).cloned())
             .or_else(|| self.project_ui.checkout_roots.get(&project.repository).cloned())
