@@ -724,7 +724,11 @@ mod tests {
             // visible upper widget's legitimate pointer gesture.
             app.resume_ui.open = true;
             drop(app.finish_modal_update(Task::none()));
-            drop(app.update(Message::ResetSettings));
+            // Seed the upper payload as a lifecycle/retained-state fixture.
+            // The normal global ResetSettings user action is intentionally
+            // refused while Resume owns input, before any UI is mounted.
+            app.settings_reset_confirm = true;
+            drop(app.finish_modal_update(Task::none()));
             let original = app.modal_surface_target(Modal::SettingsReset);
             let mut renderer = super::super::tests::headless_renderer();
             let bounds = iced::Size::new(1280.0, 900.0);
@@ -759,7 +763,8 @@ mod tests {
                 // Process close/reopen without rendering an intermediate
                 // frame: the named widget cache still contains A's press.
                 drop(app.update(Message::CancelResetSettings));
-                app.update(Message::ResetSettings)
+                app.settings_reset_confirm = true;
+                app.finish_modal_update(Task::none())
             } else {
                 app.resume_ui.open = false;
                 app.finish_modal_update(Task::none())
