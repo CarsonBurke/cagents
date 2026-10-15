@@ -14,8 +14,21 @@ const MAX_RECOVERY_ROOTS: usize = 256;
 pub(super) struct WindowRecoveryRoots {
     registry: uuid::Uuid,
     required_projects: Vec<(PathBuf, u32)>,
-    projects: Vec<worktree_dialog::WorktreeCreationSource>,
+    projects: Vec<WindowRecoveryProject>,
     edited: Vec<Arc<Root>>,
+}
+
+#[derive(Clone, Debug)]
+struct WindowRecoveryProject {
+    observed: (PathBuf, u32),
+    source: worktree_dialog::WorktreeCreationSource,
+}
+
+/// Metadata proof is not a checkout exclusion. Its association must be checked
+/// by the owning daemon against the original common-directory descriptor.
+pub(super) struct ResolvedCommonMetadata {
+    pub(super) observed: (PathBuf, u32),
+    pub(super) directory: Arc<Root>,
 }
 
 pub(super) struct ResolvedWindowRoots {
@@ -26,6 +39,7 @@ pub(super) struct ResolvedWindowRoots {
     /// for an already accepted cleanup lease.
     pub(super) required_projects: Vec<(PathBuf, u32)>,
     pub(super) edited_and_project_roots: Vec<Arc<Root>>,
+    pub(super) common_metadata: Vec<ResolvedCommonMetadata>,
     common_directory_candidates: Vec<(RecoveryDirectoryStamp, Arc<Root>)>,
 }
 
@@ -54,7 +68,11 @@ impl Cagents {
             return Err("Recovery exceeds the bounded registered-project census; no file was changed.".into());
         }
         let projects: Vec<_> = self.sidebar_model.projects.iter()
-            .filter_map(|project| self.retained_project_creation_source(project.id))
+            .filter_map(|project| {
+                let source = self.retained_project_creation_source(project.id)?;
+                let observed = required_projects.iter().find(|(key, _)| key == &project.repository)?.clone();
+                Some(WindowRecoveryProject { observed, source })
+            })
             .take(MAX_RECOVERY_ROOTS + 1)
             .collect();
         let edited: Vec<_> = self.cards.values().filter_map(|runtime| match runtime {
@@ -91,10 +109,12 @@ impl WindowRecoveryRoots {
         check_cancelled()?;
         let mut roots = self.edited;
         let mut common = Vec::new();
+        let mut common_metadata = Vec::new();
         for project in self.projects {
             check_cancelled()?;
-            let (source, candidate) = project.recovery_roots().map_err(|error| io::Error::other(error.to_string()))?;
+            let (source, candidate) = project.source.recovery_roots().map_err(|error| io::Error::other(error.to_string()))?;
             let identity = recovery_directory_stamp(&source)?;
+            common_metadata.push(ResolvedCommonMetadata { observed: project.observed, directory: candidate.clone() });
             common.push((identity, candidate));
             roots.push(source);
         }
@@ -105,11 +125,11 @@ impl WindowRecoveryRoots {
             let identity = recovery_directory_stamp(&root)?;
             if known.insert(identity) { unique.push(root); }
         }
-        if unique.len() > MAX_RECOVERY_ROOTS {
+        if unique.len().checked_add(common_metadata.len()).is_none_or(|count| count > MAX_RECOVERY_ROOTS) {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Recovery exceeds the bounded current-window root census; no file was changed."));
         }
         check_cancelled()?;
-        Ok(ResolvedWindowRoots { registry: self.registry, required_projects: self.required_projects, edited_and_project_roots: unique, common_directory_candidates: common })
+        Ok(ResolvedWindowRoots { registry: self.registry, required_projects: self.required_projects, edited_and_project_roots: unique, common_metadata, common_directory_candidates: common })
     }
 }
 
@@ -143,6 +163,9 @@ mod tests {
         let resolved = app.recovery_window_roots().unwrap().resolve(&CancellationToken::new()).unwrap();
         assert!(resolved.edited_and_project_roots.iter().any(|root| Arc::ptr_eq(root, &original)));
         assert!(resolved.holding_candidates(&original).unwrap().iter().any(|root| Arc::ptr_eq(root, &common)));
+        assert_eq!(resolved.common_metadata.len(), 1);
+        assert_eq!(resolved.common_metadata[0].observed, resolved.required_projects[0]);
+        assert!(Arc::ptr_eq(&resolved.common_metadata[0].directory, &common));
         let shared = app.workspace_model.projects.pop().unwrap();
         assert!(app.recovery_window_roots().is_err(), "unregistered provisional roots cannot silently disappear from the known domain");
         app.workspace_model.projects.push(shared);
@@ -174,7 +197,7 @@ mod tests {
         let ma = root("metadata-a"); let mb = root("metadata-b");
         let identity = |root: &Root| recovery_directory_stamp(root).unwrap();
         let census = ResolvedWindowRoots { registry: uuid::Uuid::new_v4(), required_projects: Vec::new(),
-            edited_and_project_roots: vec![a.clone(), b.clone()],
+            edited_and_project_roots: vec![a.clone(), b.clone()], common_metadata: Vec::new(),
             common_directory_candidates: vec![(identity(&a), ma.clone()), (identity(&b), mb.clone())],
         };
         let candidates = census.holding_candidates(&a).unwrap();
