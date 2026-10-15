@@ -9265,6 +9265,9 @@ impl Cagents {
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
+                    cleanup_projects: self.sidebar_model.projects.iter()
+                        .filter(|project| project.kind == ProjectKind::Git)
+                        .map(|project| (project.id, project.name.clone())).collect(),
                 },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
@@ -26992,7 +26995,7 @@ mod tests {
             "with nothing blocking it, the confirming button is offered: {labels:?}"
         );
 
-        let _ = app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete));
+        app.confirm_worktree_delete_fixture();
         assert!(
             app.project_ui
                 .deleting_directory(Path::new("/repo/feature")),

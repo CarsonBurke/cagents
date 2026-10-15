@@ -1,5 +1,7 @@
 use super::*;
-use crate::repository::{CommandSpec, ProcessExecutor, RemovedWorktree, SystemProcessExecutor};
+use crate::repository::{
+    CommandSpec, ProcessExecutor, RemovedWorktree, SystemProcessExecutor, WorktreeSafetySnapshot,
+};
 use crate::{
     github::avatar::{self, OwnerKey},
     model::WorktreeId,
@@ -17,6 +19,10 @@ pub struct State {
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
+    cleanup_dialog: Option<CleanupPolicyDialog>,
+    pending_delete: VecDeque<Target>,
+    next_safety_request: u64,
+    deletion_authorizations: HashMap<WorktreeId, WorktreeSafetySnapshot>,
     remove_dialog: Option<ProjectRemoval>,
     /// A confirmed removal awaiting the daemon's shared-model answer.
     pub(super) removing: HashMap<PathBuf, Vec<PathBuf>>,
@@ -54,7 +60,7 @@ impl State {
     }
 
     pub fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.remove_dialog.is_some()
+        self.dialog.is_some() || self.remove_dialog.is_some() || self.cleanup_dialog.is_some()
     }
 
     fn running(&self) -> impl Iterator<Item = &Target> {
@@ -124,20 +130,13 @@ impl State {
     }
 
     pub(super) fn focus_target(&self) -> widget::Id {
-        if self.remove_dialog.is_some() {
-            return widget::Id::new("dialog.project.remove.confirm");
+        if self.cleanup_dialog.is_some() {
+            return widget::Id::new("dialog.project.cleanup.directories");
         }
-        widget::Id::new(
-            if self
-                .dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.blocker.is_some())
-            {
-                "dialog.project.close"
-            } else {
-                "dialog.project.confirm"
-            },
-        )
+        if self.remove_dialog.is_some() {
+            return widget::Id::new("dialog.project.remove.cancel");
+        }
+        widget::Id::new("dialog.project.close")
     }
 }
 
@@ -161,6 +160,19 @@ struct Dialog {
     /// Why the last confirmed deletion of this worktree failed, when the
     /// dialog is opened again from its row. Confirming retries it.
     failure: Option<String>,
+    safety: Option<WorktreeSafetySnapshot>,
+    loading: bool,
+    request: u64,
+}
+
+#[derive(Debug)]
+struct CleanupPolicyDialog {
+    repository: PathBuf,
+    name: String,
+    directories: String,
+    loading: bool,
+    error: Option<String>,
+    request: u64,
 }
 
 impl Dialog {
@@ -187,6 +199,22 @@ pub enum Action {
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
     ConfirmDelete,
+    SafetyRead {
+        request: u64,
+        confirming: bool,
+        result: Result<WorktreeSafetySnapshot, String>,
+    },
+    OpenCleanupPolicy(ProjectId),
+    CleanupPolicyRead {
+        request: u64,
+        result: Result<Vec<String>, String>,
+    },
+    CleanupPolicyChanged(String),
+    SaveCleanupPolicy,
+    CleanupPolicySaved {
+        request: u64,
+        result: Result<(), String>,
+    },
     ConfirmRemove,
     RemovedProject {
         repository: PathBuf,
@@ -214,6 +242,11 @@ pub enum Action {
 }
 
 impl Cagents {
+    #[cfg(test)]
+    pub(super) fn confirm_worktree_delete_fixture(&mut self) {
+        tests::confirm_deletion_fixture(self);
+    }
+
     pub(super) fn sync_worktree_protections(&mut self) {
         let mut paths = Vec::new();
         if let Some(path) = &self.active_workspace {
@@ -418,7 +451,49 @@ impl Cagents {
         let Some(target) = self.project_target(project, Some(worktree)) else {
             return Task::none();
         };
-        self.start_worktree_deletion(target)
+        if self.project_ui.dialog.is_some() {
+            self.project_ui.pending_delete.push_back(target);
+            Task::none()
+        } else {
+            self.open_worktree_delete_dialog(target)
+        }
+    }
+
+    fn open_worktree_delete_dialog(&mut self, target: Target) -> Task<Message> {
+        self.project_ui.next_safety_request += 1;
+        let request = self.project_ui.next_safety_request;
+        let blocker = self.worktree_deletion_blocker(&target);
+        let failure = target
+            .worktree
+            .and_then(|id| self.project_ui.deletions.get(&id))
+            .and_then(|deletion| deletion.failure.clone());
+        let loading = blocker.is_none();
+        self.project_ui.dialog = Some(Dialog {
+            target: target.clone(),
+            blocker,
+            failure,
+            safety: None,
+            loading,
+            request,
+        });
+        let read = if loading {
+            safety_read_task(target, request, false)
+        } else {
+            Task::none()
+        };
+        Task::batch([
+            read,
+            iced::widget::operation::focus(widget::Id::new("dialog.project.close"))
+                .map(cosmic::Action::App),
+        ])
+    }
+
+    fn next_worktree_delete_dialog(&mut self) -> Task<Message> {
+        if let Some(target) = self.project_ui.pending_delete.pop_front() {
+            self.open_worktree_delete_dialog(target)
+        } else {
+            self.project_dialog_closed()
+        }
     }
     /// Apply a daemon-owned project close in every window. Channels use their
     /// existing checked close path; the project stays visible until those
@@ -896,6 +971,135 @@ impl Cagents {
 
     pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::OpenCleanupPolicy(project) => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let Some(project) = self
+                    .sidebar_model
+                    .project(project)
+                    .filter(|project| project.kind == ProjectKind::Git)
+                else {
+                    return Task::none();
+                };
+                self.project_ui.next_safety_request += 1;
+                let request = self.project_ui.next_safety_request;
+                let repository = project.repository.clone();
+                self.project_ui.cleanup_dialog = Some(CleanupPolicyDialog {
+                    repository: repository.clone(),
+                    name: project.name.clone(),
+                    directories: String::new(),
+                    loading: true,
+                    error: None,
+                    request,
+                });
+                return cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        RepositoryService::system("git")
+                            .disposable_ignored_directories(
+                                &repository,
+                                &CancellationToken::default(),
+                            )
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::ProjectUi(Action::CleanupPolicyRead { request, result })
+                });
+            }
+            Action::CleanupPolicyRead { request, result } => {
+                let Some(dialog) = self
+                    .project_ui
+                    .cleanup_dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.request == request)
+                else {
+                    return Task::none();
+                };
+                dialog.loading = false;
+                match result {
+                    Ok(directories) => {
+                        dialog.directories = format_disposable_directories(&directories)
+                    }
+                    Err(error) => {
+                        dialog.error =
+                            Some(format!("Could not read project cleanup policy: {error}"))
+                    }
+                }
+                return iced::widget::operation::focus(self.project_ui.focus_target())
+                    .map(cosmic::Action::App);
+            }
+            Action::CleanupPolicyChanged(value) => {
+                if let Some(dialog) = self
+                    .project_ui
+                    .cleanup_dialog
+                    .as_mut()
+                    .filter(|dialog| !dialog.loading)
+                {
+                    dialog.directories = value;
+                    dialog.error = None;
+                }
+            }
+            Action::SaveCleanupPolicy => {
+                let Some(dialog) = self
+                    .project_ui
+                    .cleanup_dialog
+                    .as_mut()
+                    .filter(|dialog| !dialog.loading)
+                else {
+                    return Task::none();
+                };
+                let directories = match parse_disposable_directories(&dialog.directories) {
+                    Ok(directories) => directories,
+                    Err(error) => {
+                        dialog.error = Some(error);
+                        return Task::none();
+                    }
+                };
+                dialog.loading = true;
+                dialog.error = None;
+                let repository = dialog.repository.clone();
+                let request = dialog.request;
+                return cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        RepositoryService::system("git")
+                            .set_disposable_ignored_directories(
+                                &repository,
+                                &directories,
+                                &CancellationToken::default(),
+                            )
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::ProjectUi(Action::CleanupPolicySaved { request, result })
+                });
+            }
+            Action::CleanupPolicySaved { request, result } => {
+                let Some(dialog) = self
+                    .project_ui
+                    .cleanup_dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.request == request)
+                else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(()) => {
+                        self.project_ui.cleanup_dialog = None;
+                        self.status =
+                            Some(TransientNotice::success("Project cleanup policy saved."));
+                        return self.project_dialog_closed();
+                    }
+                    Err(error) => {
+                        dialog.loading = false;
+                        dialog.error =
+                            Some(format!("Could not save project cleanup policy: {error}"));
+                    }
+                }
+            }
             Action::AwaitClosedProject(project, generation) => {
                 if self.project_ui.close_generation.get(&project) != Some(&generation) {
                     return Task::none();
@@ -1082,18 +1286,7 @@ impl Cagents {
                         return self.launch_editor(target.path, &editor_id);
                     }
                     ProjectCommand::Delete => {
-                        let blocker = self.worktree_deletion_blocker(&target);
-                        let failure = target
-                            .worktree
-                            .and_then(|id| self.project_ui.deletions.get(&id))
-                            .and_then(|deletion| deletion.failure.clone());
-                        self.project_ui.dialog = Some(Dialog {
-                            target,
-                            blocker,
-                            failure,
-                        });
-                        return iced::widget::operation::focus(self.project_ui.focus_target())
-                            .map(cosmic::Action::App);
+                        return self.open_worktree_delete_dialog(target);
                     }
                     ProjectCommand::Remove => {
                         let Some(project) = self.sidebar_model.project(project_id) else {
@@ -1173,6 +1366,8 @@ impl Cagents {
                 }
             }
             Action::Dismiss => {
+                self.project_ui.cleanup_dialog = None;
+                self.project_ui.pending_delete.clear();
                 self.project_ui.remove_dialog = None;
                 let dismissed = self.project_ui.dialog.take();
                 // Declining to run a failed deletion again is the answer to
@@ -1267,17 +1462,62 @@ impl Cagents {
                     return Task::none();
                 };
                 let target = dialog.target.clone();
+                if dialog.loading || dialog.safety.is_none() {
+                    return Task::none();
+                }
                 if let Some(blocker) = self.worktree_deletion_blocker(&target) {
                     let dialog = self.project_ui.dialog.as_mut().unwrap();
                     dialog.blocker = Some(blocker);
                     dialog.failure = None;
                     return Task::none();
                 }
-                // Confirmed is registered: the row reports the deletion from
-                // here, so the dialog has nothing left to say.
-                self.project_ui.dialog = None;
-                let deletion = self.start_worktree_deletion(target);
-                return Task::batch([deletion, self.project_dialog_closed()]);
+                let dialog = self.project_ui.dialog.as_mut().unwrap();
+                dialog.loading = true;
+                return safety_read_task(target, dialog.request, true);
+            }
+            Action::SafetyRead {
+                request,
+                confirming,
+                result,
+            } => {
+                let Some(dialog) = self
+                    .project_ui
+                    .dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.request == request)
+                else {
+                    return Task::none();
+                };
+                dialog.loading = false;
+                match result {
+                    Err(error) => {
+                        dialog.safety = None;
+                        dialog.failure = Some(format!(
+                            "Could not verify worktree safety: {error}. Cancel and try again."
+                        ));
+                    }
+                    Ok(snapshot) => {
+                        let unchanged = dialog.safety.as_ref() == Some(&snapshot);
+                        if confirming && unchanged {
+                            let target = dialog.target.clone();
+                            if let Some(blocker) = self.worktree_deletion_blocker(&target) {
+                                self.project_ui.dialog.as_mut().unwrap().blocker = Some(blocker);
+                                return Task::none();
+                            }
+                            if let Some(id) = target.worktree {
+                                self.project_ui.deletion_authorizations.insert(id, snapshot);
+                            }
+                            self.project_ui.dialog = None;
+                            let deletion = self.start_worktree_deletion(target);
+                            let next = self.next_worktree_delete_dialog();
+                            return Task::batch([deletion, next]);
+                        }
+                        dialog.safety = Some(snapshot);
+                        if confirming {
+                            dialog.failure = Some("This worktree changed while confirmation was open. Review the updated counts and confirm again.".into());
+                        }
+                    }
+                }
             }
             Action::RetryDelete(id) => {
                 let Some(deletion) = self.project_ui.deletions.get(&id) else {
@@ -1304,7 +1544,7 @@ impl Cagents {
                     self.sync_worktree_operation_rows();
                     return Task::none();
                 }
-                return self.start_worktree_deletion(target);
+                return self.open_worktree_delete_dialog(target);
             }
             Action::AutomaticallyDeleted { target, removed } => {
                 if removed
@@ -1324,6 +1564,9 @@ impl Cagents {
             }
             Action::Deleted { target, result } => match result {
                 Err(failure) => {
+                    if let Some(id) = target.worktree {
+                        self.project_ui.deletion_authorizations.remove(&id);
+                    }
                     // A blocker names what to resolve, so it outranks Git's
                     // own account of the same refusal.
                     let reason = self.worktree_deletion_blocker(&target).unwrap_or(failure);
@@ -1345,6 +1588,9 @@ impl Cagents {
                     return Task::batch([sweep, self.attach_next_restored_agent()]);
                 }
                 Ok(()) => {
+                    let safety = target
+                        .worktree
+                        .and_then(|id| self.project_ui.deletion_authorizations.remove(&id));
                     if let Some(id) = target.worktree {
                         self.project_ui.deletions.remove(&id);
                     }
@@ -1432,9 +1678,14 @@ impl Cagents {
                         }
                     };
                     self.persist();
-                    self.status = Some(TransientNotice::success(
-                        "Worktree deleted; branch retained.",
-                    ));
+                    let detail = match safety.as_ref() {
+                        Some(snapshot) if snapshot.detached_only_commits > 0 => {
+                            "Worktree deleted; detached commits preserved in a rescue branch."
+                        }
+                        Some(snapshot) if snapshot.branch.is_none() => "Detached worktree deleted.",
+                        _ => "Worktree deleted; branch retained.",
+                    };
+                    self.status = Some(TransientNotice::success(detail));
                     let refresh =
                         self.repository_load_task(target.repository, Some(target.project), false);
                     return Task::batch([
@@ -1498,11 +1749,17 @@ impl Cagents {
                 Message::ProjectUi(Action::AwaitSessions(target))
             });
         }
+        let authorization = target
+            .worktree
+            .and_then(|id| self.project_ui.deletion_authorizations.get(&id))
+            .cloned();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let removed = delete_worktree(&request)?;
+                let authorization =
+                    authorization.ok_or("Deletion safety must be checked and confirmed again.")?;
+                let removed = delete_worktree(&request, &authorization)?;
                 if let Some(store) = store
                     && let Some(removed) = removed
                     && let Err(errors) =
@@ -1648,30 +1905,11 @@ impl Cagents {
         None
     }
 
-    fn worktree_deletion_warning(&self, target: &Target) -> Option<String> {
-        let dirty = self
-            .sidebar_model
-            .projects
-            .iter()
-            .find(|project| project.id == target.project)
-            .and_then(|project| {
-                project
-                    .worktrees
-                    .iter()
-                    .find(|worktree| Some(worktree.id) == target.worktree)
-            })
-            .and_then(|worktree| worktree.dirty.as_ref())
-            .is_some_and(crate::repository::DirtyState::is_dirty);
-        let unsaved = self.cards.values().any(|runtime| {
+    fn worktree_has_unsaved_editors(&self, target: &Target) -> bool {
+        self.cards.values().any(|runtime| {
             matches!(runtime, CardRuntime::Repository(runtime)
                 if runtime.descriptor.worktree.starts_with(&target.path) && runtime.is_dirty())
-        });
-        match (dirty, unsaved) {
-            (true, true) => Some("Uncommitted changes and unsaved editor changes in this worktree will be discarded.".into()),
-            (true, false) => Some("Uncommitted changes in this worktree will be discarded.".into()),
-            (false, true) => Some("Unsaved editor changes in this worktree will be discarded.".into()),
-            (false, false) => None,
-        }
+        })
     }
 
     /// What the deletion takes with it: the open terminal and chat cards
@@ -1719,6 +1957,47 @@ impl Cagents {
     }
 
     pub(super) fn project_dialog_view(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = &self.project_ui.cleanup_dialog {
+            let mut input = crate::ui_controls::field::text(
+                "Directory names, separated by commas",
+                &dialog.directories,
+            )
+            .id(widget::Id::new("dialog.project.cleanup.directories"))
+            .width(Length::Fill);
+            if !dialog.loading {
+                input =
+                    input.on_input(|value| Message::ProjectUi(Action::CleanupPolicyChanged(value)));
+            }
+            let mut rows = vec![
+                design::title("Project cleanup policy").into(),
+                super::notice_body(&dialog.name),
+                super::notice_detail(dialog.repository.display().to_string()),
+                super::notice_body(
+                    "Only ignored files inside these directory names may be discarded by automatic cleanup. Names match at any depth in this project's worktrees. Other ignored files, including .env and local databases, block cleanup.",
+                ),
+                input.into(),
+                super::notice_detail(
+                    "Use exact directory names, not paths or patterns. Quote names containing commas or surrounding spaces. Leave empty to preserve all ignored files. This policy is stored in this clone's local Git configuration and shared by its worktrees.",
+                ),
+            ];
+            if let Some(error) = &dialog.error {
+                rows.push(super::notice_body(error));
+            }
+            if dialog.loading {
+                rows.push(super::notice_detail("Reading or saving project policy…"));
+            }
+            rows.push(super::dialog_ui::confirmation_actions(
+                crate::ui_controls::button::secondary("Cancel")
+                    .on_press(Message::ProjectUi(Action::Dismiss)),
+                crate::ui_controls::button::primary("Save policy").on_press_maybe(
+                    (!dialog.loading).then_some(Message::ProjectUi(Action::SaveCleanupPolicy)),
+                ),
+            ));
+            return Some(super::dialog_ui::surface(
+                widget::column::with_children(rows).spacing(space::M),
+                560.0,
+            ));
+        }
         if let Some(removal) = &self.project_ui.remove_dialog {
             let detail = if removal.channels == 0 {
                 "No channels are attached to this project.".to_owned()
@@ -1741,6 +2020,7 @@ impl Cagents {
                     }),
                     super::dialog_ui::confirmation_actions(
                         crate::ui_controls::button::secondary("Cancel")
+                            .id(widget::Id::new("dialog.project.remove.cancel"))
                             .on_press(Message::ProjectUi(Action::Dismiss)),
                         crate::ui_controls::button::destructive("Remove project")
                             .id(widget::Id::new("dialog.project.remove.confirm"))
@@ -1758,13 +2038,66 @@ impl Cagents {
             super::notice_body(&target.label),
             super::notice_detail(target.path.display().to_string()),
             super::notice_detail(
-                "Git will remove this worktree directory, including uncommitted and untracked files. The branch is retained. \
-                 Terminals and chats running in it, including detached ones, are closed \
-                 first.",
+                "Git will remove this worktree directory. Terminals and chats running in it, including detached sessions, close first. Safety is checked again before removal.",
             ),
         ];
-        if let Some(warning) = self.worktree_deletion_warning(target) {
-            rows.push(super::notice_body(warning));
+        if let Some(snapshot) = &dialog.safety {
+            rows.push(super::notice_body(format!(
+                "{} modified · {} untracked · {} notable ignored files",
+                snapshot.modified,
+                snapshot.untracked,
+                snapshot.notable_ignored.len()
+            )));
+            if !snapshot.notable_ignored.is_empty() {
+                let examples = snapshot
+                    .notable_ignored
+                    .iter()
+                    .take(5)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                rows.push(super::notice_detail(format!(
+                    "Ignored user data: {examples}{}",
+                    if snapshot.notable_ignored.len() > 5 {
+                        ", …"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+            rows.push(super::notice_body(format!(
+                "{} commits not on a remote · {} commits on no branch",
+                snapshot.unpushed_commits, snapshot.detached_only_commits
+            )));
+            if let Some(branch) = &snapshot.branch {
+                rows.push(super::notice_detail(format!(
+                    "Branch {branch} will be retained, including its unpushed commits."
+                )));
+            } else if snapshot.detached_only_commits > 0 {
+                let head = snapshot.head_oid.as_deref().unwrap_or("");
+                rows.push(super::notice_body(format!(
+                    "HEAD is detached. Create rescue/{} to preserve these commits before deleting.",
+                    &head[..12.min(head.len())]
+                )));
+            } else {
+                rows.push(super::notice_detail(
+                    "HEAD is detached. No branch is attached to this worktree.",
+                ));
+            }
+            if snapshot.files_to_discard() > 0 {
+                rows.push(super::notice_body(format!(
+                    "Explicitly discarding {} files cannot be undone.",
+                    snapshot.files_to_discard()
+                )));
+            }
+        }
+        if dialog.loading {
+            rows.push(super::notice_body("Checking current files and commits…"));
+        }
+        if self.worktree_has_unsaved_editors(target) {
+            rows.push(super::notice_body(
+                "Unsaved editor changes in this worktree will be discarded.",
+            ));
         }
         if let Some(cascade) = self.worktree_cascade_summary(target) {
             rows.push(super::notice_body(cascade));
@@ -1775,21 +2108,44 @@ impl Cagents {
         // Reopened from a row whose deletion failed, the dialog says why and
         // confirming runs it again; `ConfirmDelete` re-checks every
         // precondition first either way.
-        let confirm = dialog
-            .blocker
-            .is_none()
+        let confirm = (dialog.blocker.is_none() && !dialog.loading && dialog.safety.is_some())
             .then_some(Message::ProjectUi(Action::ConfirmDelete));
+        let label = match dialog.safety.as_ref() {
+            Some(snapshot) if snapshot.detached_only_commits > 0 => {
+                if snapshot.files_to_discard() > 0 {
+                    format!(
+                        "Rescue, discard {} file{} and delete",
+                        snapshot.files_to_discard(),
+                        if snapshot.files_to_discard() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    )
+                } else {
+                    "Create rescue branch and delete".to_owned()
+                }
+            }
+            Some(snapshot) if snapshot.files_to_discard() > 0 => {
+                format!(
+                    "Discard {} file{} and delete",
+                    snapshot.files_to_discard(),
+                    if snapshot.files_to_discard() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )
+            }
+            _ => "Delete worktree".to_owned(),
+        };
         rows.push(super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.project.close"))
                 .on_press(Message::ProjectUi(Action::Dismiss)),
-            crate::ui_controls::button::destructive(if dialog.failure.is_some() {
-                "Retry delete"
-            } else {
-                "Delete worktree"
-            })
-            .id(widget::Id::new("dialog.project.confirm"))
-            .on_press_maybe(confirm),
+            crate::ui_controls::button::destructive(label)
+                .id(widget::Id::new("dialog.project.confirm"))
+                .on_press_maybe(confirm),
         ));
         Some(super::dialog_ui::surface(
             widget::column::with_children(rows).spacing(space::M),
@@ -2225,7 +2581,10 @@ fn remove_project_from_cagents(
 ///
 /// Returns what was removed, by which its creation is released, or `None`
 /// when Git could not say where the worktree's administrative files were.
-fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
+fn delete_worktree(
+    target: &Target,
+    confirmed: &WorktreeSafetySnapshot,
+) -> Result<Option<RemovedWorktree>, String> {
     let id = target
         .worktree
         .ok_or("The primary repository cannot be deleted.")?;
@@ -2262,10 +2621,17 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
             );
         })
         .ok();
+    verify_worktree_safety(&service, &target.path, confirmed, &cancellation)?;
     close_worktree_sessions(target)?;
-    // Confirmation authorizes discarding this worktree's changes. Git owns
-    // directory removal and still refuses locked worktrees with one --force.
-    let command = worktree_removal_command(target);
+    // Processes may have written during shutdown; consent covers only the
+    // inspected state, not changes produced after confirmation.
+    verify_worktree_safety(&service, &target.path, confirmed, &cancellation)?;
+    if confirmed.detached_only_commits > 0 {
+        service
+            .rescue_detached_worktree(&target.path, confirmed, &cancellation)
+            .map_err(|error| format!("Could not preserve detached commits: {error}"))?;
+    }
+    let command = worktree_removal_command(target, confirmed);
     let result = SystemProcessExecutor
         .execute(&command, &cancellation)
         .and_then(|output| output.require_success(&command.program));
@@ -2283,19 +2649,171 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     Ok(removed)
 }
 
-fn worktree_removal_command(target: &Target) -> CommandSpec {
-    CommandSpec::new("git")
-        .cwd(&target.repository)
-        .args(["worktree", "remove", "--force", "--"])
+fn worktree_removal_command(target: &Target, confirmed: &WorktreeSafetySnapshot) -> CommandSpec {
+    let command = RepositoryService::system("git")
+        .git_base(&target.repository, true)
+        .args(["worktree", "remove"]);
+    let command = if confirmed.files_to_discard() > 0 {
+        command.arg("--force")
+    } else {
+        command
+    };
+    command
+        .arg("--")
         .arg(target.path.as_os_str())
         .timeout(Duration::from_secs(30))
         .output_limits(64 * 1024, 64 * 1024)
+}
+
+fn verify_worktree_safety(
+    service: &RepositoryService,
+    path: &Path,
+    confirmed: &WorktreeSafetySnapshot,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    let current = service
+        .worktree_safety(path, cancellation)
+        .map_err(|error| error.to_string())?;
+    if &current != confirmed {
+        return Err("The worktree changed after confirmation. Review its current files and commits before deleting again.".into());
+    }
+    Ok(())
+}
+
+fn safety_read_task(target: Target, request: u64, confirming: bool) -> Task<Message> {
+    cosmic::task::future(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            RepositoryService::system("git")
+                .worktree_safety(&target.path, &CancellationToken::default())
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        Message::ProjectUi(Action::SafetyRead {
+            request,
+            confirming,
+            result,
+        })
+    })
+}
+
+fn format_disposable_directories(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| {
+            if name.contains([',', '"']) || name.trim() != name {
+                format!("\"{}\"", name.replace('"', "\"\""))
+            } else {
+                name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_disposable_directories(value: &str) -> Result<Vec<String>, String> {
+    let mut directories = Vec::new();
+    let mut remaining = value.trim_start();
+    while !remaining.is_empty() {
+        let quoted = remaining.starts_with('"');
+        let name = if quoted {
+            let mut chars = remaining[1..].char_indices().peekable();
+            let mut name = String::new();
+            let mut closed = None;
+            while let Some((index, ch)) = chars.next() {
+                if ch == '"' {
+                    if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                        chars.next();
+                        name.push('"');
+                    } else {
+                        closed = Some(index + 2);
+                        break;
+                    }
+                } else {
+                    name.push(ch);
+                }
+            }
+            let end = closed.ok_or("Close the quoted directory name with a double quote.")?;
+            remaining = remaining[end..].trim_start();
+            if !remaining.is_empty() && !remaining.starts_with(',') {
+                return Err("Separate directory names with commas after a closing quote.".into());
+            }
+            name
+        } else {
+            let end = remaining.find(',').unwrap_or(remaining.len());
+            let name = remaining[..end].trim().to_owned();
+            remaining = &remaining[end..];
+            if name.contains('"') {
+                return Err(
+                    "Quote the whole directory name and double any quotes inside it.".into(),
+                );
+            }
+            name
+        };
+        remaining = remaining
+            .strip_prefix(',')
+            .unwrap_or(remaining)
+            .trim_start();
+        if name.is_empty() && !quoted {
+            continue;
+        }
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains(['/', '\\'])
+            || name.chars().any(char::is_control)
+        {
+            return Err(
+                "Enter directory names separated by commas, without paths or control characters."
+                    .into(),
+            );
+        }
+        if !directories.iter().any(|entry| entry == &name) {
+            directories.push(name);
+        }
+    }
+    Ok(directories)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    fn clean_snapshot() -> WorktreeSafetySnapshot {
+        WorktreeSafetySnapshot {
+            fingerprint: "fixture".into(),
+            modified: 0,
+            untracked: 0,
+            notable_ignored: Vec::new(),
+            unpushed_commits: 0,
+            detached_only_commits: 0,
+            branch: Some("feature".into()),
+            head_oid: None,
+        }
+    }
+
+    /// Lifecycle tests use virtual paths and inject the worker's checked reply.
+    /// Fresh filesystem inspection is covered separately with real repositories.
+    pub(super) fn confirm_deletion_fixture(app: &mut Cagents) {
+        let Some(dialog) = &app.project_ui.dialog else {
+            return;
+        };
+        let request = dialog.request;
+        let snapshot = clean_snapshot();
+        drop(app.handle_project_action(Action::SafetyRead {
+            request,
+            confirming: false,
+            result: Ok(snapshot.clone()),
+        }));
+        drop(app.handle_project_action(Action::ConfirmDelete));
+        drop(app.handle_project_action(Action::SafetyRead {
+            request,
+            confirming: true,
+            result: Ok(snapshot),
+        }));
+    }
 
     /// A window with session storage and one project at `repository` whose
     /// linked worktree is `linked`, both of them saved.
@@ -2446,7 +2964,7 @@ mod tests {
             command: ProjectCommand::Delete,
         });
         let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
-        let _ = app.handle_project_action(Action::ConfirmDelete);
+        confirm_deletion_fixture(&mut app);
         assert!(app.project_ui.dialog.is_none());
         // A repository refresh that listed the worktree before Git removed it.
         app.session
@@ -2517,7 +3035,7 @@ mod tests {
             command: ProjectCommand::Delete,
         });
         let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
-        let _ = app.handle_project_action(Action::ConfirmDelete);
+        confirm_deletion_fixture(&mut app);
         let _ = app.handle_project_action(Action::Deleted {
             target,
             result: Ok(()),
@@ -2555,7 +3073,7 @@ mod tests {
         };
 
         let _ = app.handle_project_action(delete.clone());
-        let _ = app.handle_project_action(Action::ConfirmDelete);
+        confirm_deletion_fixture(&mut app);
         assert!(!app.modal_is_open());
         assert_eq!(row(&app, id).unwrap().deletion, Some(RowDeletion::Deleting));
 
@@ -2592,6 +3110,11 @@ mod tests {
         assert_eq!(row(&app, id).unwrap().deletion, failed);
 
         let _ = app.handle_project_action(Action::RetryDelete(id));
+        assert!(
+            app.project_ui.dialog.is_some(),
+            "retry requires a fresh safety confirmation"
+        );
+        confirm_deletion_fixture(&mut app);
         assert_eq!(row(&app, id).unwrap().deletion, Some(RowDeletion::Deleting));
         let _ = app.handle_project_action(Action::Deleted {
             target,
@@ -2636,7 +3159,7 @@ mod tests {
             worktree_id: Some(id),
             command: ProjectCommand::Delete,
         });
-        let _ = app.handle_project_action(Action::ConfirmDelete);
+        confirm_deletion_fixture(&mut app);
         assert_eq!(app.active_workspace.as_ref(), Some(&repository));
         assert!(
             app.window_update_blocker().is_some(),
@@ -3046,7 +3569,7 @@ mod tests {
             worktree_id: Some(id),
             command: ProjectCommand::Delete,
         });
-        let _ = app.handle_project_action(Action::ConfirmDelete);
+        confirm_deletion_fixture(&mut app);
         loaded(&mut app, picked, picked_listing, true);
         assert_ne!(app.active_workspace.as_ref(), Some(&linked_path));
         assert_eq!(
@@ -3215,7 +3738,8 @@ mod tests {
             label: "linked".into(),
         };
         let linked_id = id_of(&linked);
-        let refusal = |target: Target| delete_worktree(&target).unwrap_err();
+        let snapshot = clean_snapshot();
+        let refusal = |target: Target| delete_worktree(&target, &snapshot).unwrap_err();
 
         assert_eq!(
             refusal(target(None, &repository)),
@@ -3252,10 +3776,13 @@ mod tests {
             .unwrap()
             .id;
         assert_eq!(
-            delete_worktree(&Target {
-                repository: bare.clone(),
-                ..target(Some(bare_id), &bare)
-            })
+            delete_worktree(
+                &Target {
+                    repository: bare.clone(),
+                    ..target(Some(bare_id), &bare)
+                },
+                &snapshot
+            )
             .unwrap_err(),
             "The primary worktree cannot be deleted."
         );
@@ -3293,13 +3820,12 @@ mod tests {
         }));
         let dialog = app.project_ui.dialog.as_ref().unwrap();
         assert!(dialog.blocker.is_none());
-        assert_eq!(
-            app.worktree_deletion_warning(&dialog.target).as_deref(),
-            Some(
-                "Uncommitted changes and unsaved editor changes in this worktree will be discarded."
-            )
+        assert!(app.worktree_has_unsaved_editors(&dialog.target));
+        assert!(
+            dialog.safety.is_none(),
+            "cached dirty state cannot authorize deletion"
         );
-        drop(app.handle_project_action(Action::ConfirmDelete));
+        confirm_deletion_fixture(&mut app);
         assert!(app.project_ui.dialog.is_none());
         assert!(app.project_ui.is_deleting(linked.id));
     }
@@ -3339,7 +3865,8 @@ mod tests {
             label: "feature".into(),
         };
         // Exercise the actual Git removal command without reaching a user's daemon.
-        let command = worktree_removal_command(&target);
+        let snapshot = service.worktree_safety(&linked, &cancellation).unwrap();
+        let command = worktree_removal_command(&target, &snapshot);
         SystemProcessExecutor
             .execute(&command, &cancellation)
             .unwrap()
@@ -3365,5 +3892,224 @@ mod tests {
             original_head.unwrap()
         );
         assert!(repository.join("tracked.txt").exists());
+    }
+
+    #[test]
+    fn deletion_waits_for_fresh_safety_and_changed_state_requires_new_consent() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("linked"),
+            Some("feature".into()),
+        );
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        drop(app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(linked.id),
+            command: ProjectCommand::Delete,
+        }));
+        let request = app.project_ui.dialog.as_ref().unwrap().request;
+        drop(app.handle_project_action(Action::ConfirmDelete));
+        assert!(!app.project_ui.is_deleting(linked.id));
+        let mut observed = clean_snapshot();
+        observed.untracked = 3;
+        drop(app.handle_project_action(Action::SafetyRead {
+            request,
+            confirming: false,
+            result: Ok(observed.clone()),
+        }));
+        assert_eq!(
+            app.project_ui.focus_target(),
+            widget::Id::new("dialog.project.close")
+        );
+        drop(app.handle_project_action(Action::ConfirmDelete));
+        assert!(app.project_ui.dialog.as_ref().unwrap().loading);
+        let mut current = observed;
+        current.untracked = 4;
+        current.fingerprint = "changed".into();
+        drop(app.handle_project_action(Action::SafetyRead {
+            request,
+            confirming: true,
+            result: Ok(current.clone()),
+        }));
+        assert!(!app.project_ui.is_deleting(linked.id));
+        let dialog = app.project_ui.dialog.as_ref().unwrap();
+        assert_eq!(dialog.safety.as_ref().unwrap().untracked, 4);
+        assert!(dialog.failure.as_deref().unwrap().contains("changed"));
+        drop(app.handle_project_action(Action::ConfirmDelete));
+        drop(app.handle_project_action(Action::SafetyRead {
+            request,
+            confirming: true,
+            result: Ok(current),
+        }));
+        assert!(app.project_ui.is_deleting(linked.id));
+        assert!(app.project_ui.dialog.is_none());
+    }
+
+    #[test]
+    fn stale_safety_reply_cannot_authorize_a_reopened_dialog() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("linked"),
+            Some("feature".into()),
+        );
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let command = Action::Command {
+            project_id: project,
+            worktree_id: Some(linked.id),
+            command: ProjectCommand::Delete,
+        };
+        drop(app.handle_project_action(command.clone()));
+        let old_request = app.project_ui.dialog.as_ref().unwrap().request;
+        drop(app.handle_project_action(Action::Dismiss));
+        drop(app.handle_project_action(command));
+        drop(app.handle_project_action(Action::SafetyRead {
+            request: old_request,
+            confirming: true,
+            result: Ok(clean_snapshot()),
+        }));
+        assert!(app.project_ui.dialog.as_ref().unwrap().safety.is_none());
+        assert!(app.project_ui.dialog.as_ref().unwrap().loading);
+        assert!(!app.project_ui.is_deleting(linked.id));
+    }
+
+    #[test]
+    fn clean_git_removal_has_no_force_and_new_untracked_files_invalidate_consent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("checkout");
+        let linked = root.join("linked");
+        git(&root, &["init", "-b", "main", "checkout"]);
+        git(&repository, &["commit", "--allow-empty", "-m", "initial"]);
+        git(
+            &repository,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        );
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let record = service
+            .list_worktrees(&repository, &cancellation)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.path == linked)
+            .unwrap();
+        let target = Target {
+            project: ProjectId::new(),
+            worktree: Some(record.id),
+            repository,
+            path: linked.clone(),
+            label: "feature".into(),
+        };
+        let clean = service.worktree_safety(&linked, &cancellation).unwrap();
+        let command = worktree_removal_command(&target, &clean);
+        assert!(!command.arguments.iter().any(|arg| arg == "--force"));
+        std::fs::write(linked.join("agent-output.txt"), "new work").unwrap();
+        let untracked = service.worktree_safety(&linked, &cancellation).unwrap();
+        assert_eq!(untracked.untracked, 1);
+        assert_eq!(untracked.modified, 0);
+        assert!(untracked.notable_ignored.is_empty());
+        assert!(
+            verify_worktree_safety(&service, &linked, &clean, &cancellation)
+                .unwrap_err()
+                .contains("changed")
+        );
+        assert!(linked.join("agent-output.txt").exists());
+        std::fs::remove_file(linked.join("agent-output.txt")).unwrap();
+        let clean = service.worktree_safety(&linked, &cancellation).unwrap();
+        let command = worktree_removal_command(&target, &clean);
+        SystemProcessExecutor
+            .execute(&command, &cancellation)
+            .unwrap()
+            .require_success(&command.program)
+            .unwrap();
+        assert!(!linked.exists());
+    }
+
+    #[test]
+    fn disposable_directory_input_is_exact_and_can_preserve_all_ignored_files() {
+        assert_eq!(
+            parse_disposable_directories("target, node_modules, target").unwrap(),
+            vec!["target", "node_modules"]
+        );
+        assert!(parse_disposable_directories("").unwrap().is_empty());
+        for invalid in ["../data", "target/build", "..", "foo\\bar", "target\n.env"] {
+            assert!(
+                parse_disposable_directories(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_policy_round_trips_names_without_expanding_the_allowlist() {
+        let names: Vec<String> = [
+            "target",
+            "build,data",
+            " cache ",
+            "quote\"name",
+            "缓存",
+            "[literal]*",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let displayed = format_disposable_directories(&names);
+        assert_eq!(parse_disposable_directories(&displayed).unwrap(), names);
+        assert_eq!(
+            parse_disposable_directories("\"build,data\"").unwrap(),
+            vec!["build,data"]
+        );
+        for malformed in ["\"unfinished", "\"target\"data", "bad\"quote", "\"\""] {
+            assert!(
+                parse_disposable_directories(malformed).is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_worktree_deletion_requires_each_safety_confirmation() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let first = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("first"),
+            Some("first".into()),
+        );
+        let second = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("second"),
+            Some("second".into()),
+        );
+        let (mut app, _directory, project) = deletable_app(&repository, &first, &primary);
+        app.sidebar_model.projects[0].worktrees.push(second.clone());
+        drop(app.delete_selected_worktree(project, first.id));
+        drop(app.delete_selected_worktree(project, second.id));
+        assert_eq!(app.project_ui.pending_delete.len(), 1);
+        confirm_deletion_fixture(&mut app);
+        assert!(app.project_ui.is_deleting(first.id));
+        assert!(!app.project_ui.is_deleting(second.id));
+        assert_eq!(
+            app.project_ui.dialog.as_ref().unwrap().target.worktree,
+            Some(second.id)
+        );
+        drop(app.handle_project_action(Action::Dismiss));
+        assert!(!app.project_ui.is_deleting(second.id));
+        assert!(app.project_ui.pending_delete.is_empty());
     }
 }

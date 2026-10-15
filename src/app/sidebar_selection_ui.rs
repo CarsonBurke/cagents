@@ -645,9 +645,7 @@ impl Cagents {
                         .collect::<Vec<_>>(),
                     "these worktrees",
                 ),
-                "Git will remove these worktree directories, including uncommitted and untracked files. \
-                 Unsaved editor changes are discarded. Their branches are retained. \
-                 Terminals and chats running in them, including detached ones, are closed first.",
+                "Review each worktree’s current files and commits before deleting. Each worktree gets its own safety confirmation; detached commits can be preserved in a rescue branch. Terminals and chats close before removal.",
             ),
             SelectionRow::Channel(_) => {
                 let conversations = dialog
