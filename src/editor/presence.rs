@@ -110,7 +110,7 @@ fn remove_document_file(
     let mut source = fs_safety::open_beneath(parent, Path::new(name)).map_err(resolve_error)?;
     let original = source.metadata().map_err(io_error)?;
     if !same_inode(&listed, &original) || !matches!(expected_mode, Some(0o100644 | 0o100755))
-        || (original.mode() & 0o111 != 0) != (expected_mode == Some(0o100755)) {
+        || (original.mode() & 0o100 != 0) != (expected_mode == Some(0o100755)) {
         return Err(FileIoError::Io("The file identity or mode changed before Revert could remove it.".into()));
     }
     let attributes = fs_safety::content_attributes(&source).map_err(io_error)?;
@@ -283,6 +283,17 @@ mod tests {
         fs::write(root.join(path), "newer agent work").unwrap();
         assert!(save_document_file(root, path, original, blake3::hash(b""), true, restore).is_err());
         assert_eq!(fs::read_to_string(root.join(path)).unwrap(), "newer agent work");
+    }
+
+    #[test]
+    fn editor_file_presence_uses_git_owner_execute_classification_and_restores_all_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("new.txt"), "bytes").unwrap();
+        fs::set_permissions(root.join("new.txt"), Permissions::from_mode(0o641)).unwrap();
+        let SaveOutcome::Absent { restoration, .. } = save_document_file(root, Path::new("new.txt"), "", blake3::hash(b"bytes"), false, PresenceSave { expected_mode: Some(0o100644), ..removal() }).unwrap() else { panic!("removed non-owner-executable file"); };
+        save_document_file(root, Path::new("new.txt"), "bytes", blake3::hash(b""), false, PresenceSave { expected_present: false, desired_present: true, expected_mode: None, restoration: Some(restoration) }).unwrap();
+        assert_eq!(fs::metadata(root.join("new.txt")).unwrap().mode() & 0o7777, 0o641);
     }
 
     #[test]
