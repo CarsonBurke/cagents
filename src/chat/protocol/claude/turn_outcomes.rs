@@ -36,18 +36,19 @@ fn emit_bind(identity:&TurnIdentity,ids:Vec<String>,step:&mut Step){
 /// These are source row aliases, not accepted input or terminal outcome proof.
 pub(super) fn history_origins(account:&crate::chat::turn_outcomes::HistoryAccountOrigin,session:&str,events:&[Event])->Vec<Event>{
     use crate::chat::turn_outcomes::{MAX_TURN_ITEM_IDS,MAX_TURN_UPDATE_BYTES,MAX_TURN_ID_BYTES,validate_history_origins};
-    let base=64+session.len();let mut bytes=base;let mut ids=Vec::new();let mut result=Vec::new();
+    use std::os::unix::ffi::OsStrExt;
+    let base=96+account.canonical_home.as_os_str().as_bytes().len()+session.len();let mut bytes=base;let mut ids=Vec::new();let mut result=Vec::new();
     for event in events {
         let Event::Item(item)=event else{continue;};
         if item.id.is_empty() || item.id.len()>MAX_TURN_ID_BYTES || item.id.chars().any(char::is_control) || ids.contains(&item.id){continue;}
         let size=item.id.len()+8;
         if !ids.is_empty() && (ids.len()==MAX_TURN_ITEM_IDS || bytes.saturating_add(size)>MAX_TURN_UPDATE_BYTES){
-            if validate_history_origins(session,&ids).is_ok(){result.push(Event::HistoryOrigins{account:account.clone(),session_id:session.into(),item_ids:std::mem::take(&mut ids)});}else{ids.clear();}bytes=base;
+            if validate_history_origins(account,session,&ids).is_ok(){result.push(Event::HistoryOrigins{account:account.clone(),session_id:session.into(),item_ids:std::mem::take(&mut ids)});}else{ids.clear();}bytes=base;
         }
         if base.saturating_add(size)>MAX_TURN_UPDATE_BYTES{continue;}
         bytes+=size;ids.push(item.id.clone());
     }
-    if !ids.is_empty() && validate_history_origins(session,&ids).is_ok(){result.push(Event::HistoryOrigins{account:account.clone(),session_id:session.into(),item_ids:ids});}
+    if !ids.is_empty() && validate_history_origins(account,session,&ids).is_ok(){result.push(Event::HistoryOrigins{account:account.clone(),session_id:session.into(),item_ids:ids});}
     result
 }
 
@@ -191,7 +192,7 @@ mod tests {
             for event in &page.events {if let Event::HistoryOrigins{account,session_id,item_ids}=event {
                 assert_eq!(session_id,SESSION);assert_eq!(account.provider,Provider::Claude);
                 assert_eq!(account.canonical_home,home.canonicalize().unwrap());assert_eq!((account.device,account.inode),(meta.dev(),meta.ino()));
-                crate::chat::turn_outcomes::validate_history_origins(session_id,item_ids).unwrap();
+                crate::chat::turn_outcomes::validate_history_origins(account,session_id,item_ids).unwrap();
                 assert!(item_ids.iter().all(|id|visible.contains(id)));all.extend(item_ids.iter().cloned());count+=1;
             }}assert!(count>0);
             assert!(page.events.iter().all(|event|!matches!(event,Event::Session{..}|Event::TurnOutcome(_))));
