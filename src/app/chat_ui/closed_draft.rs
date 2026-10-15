@@ -30,6 +30,13 @@ impl Cagents {
         }
     }
 
+    pub(in crate::app) fn clear_closed_chat_drafts(&mut self) {
+        for card in self.cards.values_mut() {
+            if let CardRuntime::Chat(runtime) = card { runtime.closed_elsewhere = false; }
+        }
+        for runtime in self.chat_ui.parked.values_mut() { runtime.closed_elsewhere = false; }
+    }
+
     pub(super) fn copy_closed_chat_draft(&mut self, target: Target, revision: u64) -> Task<Message> {
         if !self.chat_closed_elsewhere(target.card) { return Task::none(); }
         let Some(runtime) = self.chat_runtime_mut(target).filter(|runtime| runtime.closed_elsewhere && runtime.revision == revision) else { return Task::none(); };
@@ -218,6 +225,18 @@ mod tests {
         retire(&mut app, channel, target.card);
         assert!(!app.chat_closed_elsewhere(target.card));
         assert!(!runtime(&app, target).closed_elsewhere);
+
+        // A replacement registry has no authority to repeat an old registry's
+        // closure state; resetting shared metadata must also reset its UI flag.
+        let (mut app, target, channel, _) = fixture("survives registry replacement");
+        retire(&mut app, channel, target.card);
+        assert!(runtime(&app, target).closed_elsewhere);
+        let mut replacement = crate::workspace_model::WorkspaceModel::default();
+        replacement.identity = uuid::Uuid::new_v4();
+        drop(app.apply_workspace_model_update(crate::app::workspace_model_sync::ModelUpdate::Connected(replacement)));
+        assert!(!runtime(&app, target).closed_elsewhere);
+        assert!(!app.chat_closed_elsewhere(target.card));
+        assert_eq!(runtime(&app, target).unsent_text(), "survives registry replacement");
     }
 
     #[test]
