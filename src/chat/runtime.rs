@@ -155,7 +155,6 @@ pub(crate) enum Update {
     /// A provider-confirmed identity changed after initial readiness. Scalar
     /// metadata only; the host reads its exact current actor under its fence.
     Identity,
-
 }
 
 #[derive(Clone)]
@@ -220,12 +219,26 @@ impl LocalHandle {
         let state = self.0.state.try_lock()
             .map_err(|_| "Provider presentation metadata is busy or unavailable; retry close after it settles".to_owned())?;
         let completed = self.is_completed();
-        let owns_work = if self.0.history_only { false }
-            else if !completed { true }
-            else { self.0.failure.try_lock()
-                .map_err(|_| "Provider close metadata is busy or unavailable; retry close after it settles".to_owned())?.is_some() };
-        Ok(CloseIdentity {session_id: state.session_id.clone(),
-            native_continuity: state.native_continuity.clone(), owns_work, completed})
+        let owns_work = if self.0.history_only {
+            false
+        } else if !completed {
+            true
+        } else {
+            self.0
+                .failure
+                .try_lock()
+                .map_err(|_| {
+                    "Provider close metadata is busy or unavailable; retry close after it settles"
+                        .to_owned()
+                })?
+                .is_some()
+        };
+        Ok(CloseIdentity {
+            session_id: state.session_id.clone(),
+            native_continuity: state.native_continuity.clone(),
+            owns_work,
+            completed,
+        })
     }
 
     #[cfg(test)]
@@ -348,7 +361,10 @@ impl LocalHandle {
         holder: super::native_holder::Holder,
         reason: String,
     ) {
-        assert!(self.is_completed(), "fixture requires an already closed local actor");
+        assert!(
+            self.is_completed(),
+            "fixture requires an already closed local actor"
+        );
         assert!(self.0.worker.lock().unwrap().is_none());
         let mut retained = self.0.retained_native.lock().unwrap();
         assert!(retained.is_none());
@@ -3430,11 +3446,16 @@ impl Actor {
         // An outcome is acted on as soon as it is published, and its reader
         // asks which conversation produced it. Answer before announcing.
         let identity_changed = if let Some(confirmed) = confirmed {
-            let mut retained=self.confirmed_session.lock().unwrap_or_else(|p| p.into_inner());
-            let changed=*retained!=confirmed;
-            *retained=confirmed;
+            let mut retained = self
+                .confirmed_session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let changed = *retained != confirmed;
+            *retained = confirmed;
             changed
-        } else {false};
+        } else {
+            false
+        };
         // The provider's final usage/items may follow its settlement in this
         // same frame. Freeze only after applying the whole frame, then publish
         // its final outcome (which may arrive in a much later frame).
@@ -3462,7 +3483,9 @@ impl Actor {
                 let _ = reply.send(result);
             }
         }
-        if identity_changed { (self.notify)(Update::Identity); }
+        if identity_changed {
+            (self.notify)(Update::Identity);
+        }
         self.publish_activity();
         Ok(())
     }
@@ -4468,25 +4491,88 @@ mod tests {
     fn confirmed_identity_after_initial_ready_emits_a_scalar_identity_wake() {
         struct LateIdentity;
         impl Adapter for LateIdentity {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Default::default())}
-            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step {writes:vec![serde_json::json!({"identity":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})],..Default::default()})}
-            fn receive(&mut self,value:Value)->Result<Step,String> {Ok(Step {events:vec![Event::Session {id:value["identity"].as_str().unwrap().to_owned(),title:None}],..Default::default()})}
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Default::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![
+                        serde_json::json!({"identity":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, value: Value) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Session {
+                        id: value["identity"].as_str().unwrap().to_owned(),
+                        title: None,
+                    }],
+                    ..Default::default()
+                })
+            }
         }
-        let root=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec::from(&crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:Vec::new(),working_directory:root.path().into(),environment:Default::default(),unset_environment:Default::default()});
-        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
-        let store=preflight(&spec,&mut initial).unwrap();
-        let events=Arc::new(Mutex::new(Vec::new()));let observed=events.clone();
-        let handle=LocalHandle::start(spec,Box::new(LateIdentity),initial,store,None,move |update|observed.lock().unwrap().push(update)).unwrap();
-        until(&handle,|state|state.ready);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec::from(&crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: root.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        });
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let handle = LocalHandle::start(
+            spec,
+            Box::new(LateIdentity),
+            initial,
+            store,
+            None,
+            move |update| observed.lock().unwrap().push(update),
+        )
+        .unwrap();
+        until(&handle, |state| state.ready);
         assert!(handle.confirmed_session_id().is_none());
         handle.command(Command::Refresh).unwrap();
-        until(&handle,|state|state.session_id.is_some());
-        let deadline=Instant::now()+Duration::from_secs(2);
-        while !events.lock().unwrap().iter().any(|update|matches!(update,Update::Identity)) {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
-        assert_eq!(events.lock().unwrap().iter().filter(|update|matches!(update,Update::Ready)).count(),1,"the provider never reinitializes just to publish its identity");
-        assert_eq!(events.lock().unwrap().iter().filter(|update|matches!(update,Update::Identity)).count(),1);
-        assert_eq!(handle.confirmed_session_id().as_deref(),Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
+        until(&handle, |state| state.session_id.is_some());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|update| matches!(update, Update::Identity))
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|update| matches!(update, Update::Ready))
+                .count(),
+            1,
+            "the provider never reinitializes just to publish its identity"
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|update| matches!(update, Update::Identity))
+                .count(),
+            1
+        );
+        assert_eq!(
+            handle.confirmed_session_id().as_deref(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
         handle.close().unwrap();
     }
 

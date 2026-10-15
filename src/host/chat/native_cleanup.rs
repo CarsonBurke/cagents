@@ -12,8 +12,12 @@ pub(in crate::host) struct NativeClose {
 }
 
 impl NativeClose {
-    pub(super) fn consented_backend(&self) -> Option<&registry::Process> { self.consented_backend.as_ref() }
-    pub(super) fn owner_record(&self) -> &registry::Record { self.owner.record() }
+    pub(super) fn consented_backend(&self) -> Option<&registry::Process> {
+        self.consented_backend.as_ref()
+    }
+    pub(super) fn owner_record(&self) -> &registry::Record {
+        self.owner.record()
+    }
     pub(super) fn paired_owner(&self) -> Option<&registry::Record> {
         self.paired.as_ref().map(|pair| &pair.holder)
     }
@@ -71,21 +75,32 @@ pub(super) fn close_for_restart(host: &SharedHost, source: &Session) -> Result<(
     close_retained_inner(host, source, true, None)
 }
 
-pub(in crate::host) fn close_with_presentation(host: &SharedHost,
-    origin: &crate::agent_execution::Origin, target: &crate::agent_execution::PresentationCloseTarget)
-    -> Result<(), String> {
+pub(in crate::host) fn close_with_presentation(
+    host: &SharedHost,
+    origin: &crate::agent_execution::Origin,
+    target: &crate::agent_execution::PresentationCloseTarget,
+) -> Result<(), String> {
     let crate::agent_execution::HostedSession::Chat(source) = &target.observation.source else {
         return Err("Combined close requires an exact native provider".into());
     };
     close_retained_inner(host, source, false, Some((origin, target)))
 }
 
-fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
-    consent: Option<(&crate::agent_execution::Origin, &crate::agent_execution::PresentationCloseTarget)>) -> Result<(), String> {
+fn close_retained_inner(
+    host: &SharedHost,
+    source: &Session,
+    restart: bool,
+    consent: Option<(
+        &crate::agent_execution::Origin,
+        &crate::agent_execution::PresentationCloseTarget,
+    )>,
+) -> Result<(), String> {
     super::super::agent_execution::retirement_registry(host)?;
     if let Some((origin, target)) = consent {
         let store = super::super::agent_execution::registry(host)?;
-        store.lock().unwrap_or_else(|p| p.into_inner())
+        store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .preflight_presentation_close(origin, &target.observation)?;
         super::presentation_close::require_current(host, target)?;
     } else if !restart {
@@ -162,15 +177,27 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
-        let owner = pending.as_ref().map(|pending| pending.owner.record().clone())
+        let owner = pending
+            .as_ref()
+            .map(|pending| pending.owner.record().clone())
             .or_else(|| receipt.as_ref().map(|(record, _)| record.clone()))
-            .map(Ok).unwrap_or_else(|| registry::evidence(&socket, Kind::Native)
-                .and_then(|record| record.ok_or_else(|| "No exact native holder or confirmed close receipt is available".to_owned())))?;
-        if !restart { preflight_current_retirements(host, source, &owner, &proof, consent)?; }
+            .map(Ok)
+            .unwrap_or_else(|| {
+                registry::evidence(&socket, Kind::Native).and_then(|record| {
+                    record.ok_or_else(|| {
+                        "No exact native holder or confirmed close receipt is available".to_owned()
+                    })
+                })
+            })?;
+        if !restart {
+            preflight_current_retirements(host, source, &owner, &proof, consent)?;
+        }
         if let Some((origin, target)) = consent {
             super::presentation_close::require_current(host, target)?;
             let store = super::super::agent_execution::registry(host)?;
-            store.lock().unwrap_or_else(|p| p.into_inner())
+            store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
                 .preflight_presentation_close(origin, &target.observation)?;
         }
         if let Some((record, true)) = &receipt {
@@ -237,10 +264,22 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
                     let recovery = chat::native_holder::inspect(&owner, &proof)?.0;
                     (recovery.source.terminal, recovery.paired_holder)
                 };
-                let paired = retained_pair(host, paired_source.as_ref(), paired_holder.as_ref(), &proof)?;
-                let pending = NativeClose {source: source.clone(),
-                    owner: NativeOwner::Actor {record: owner.clone(), handle}, closed: false, paired, consented_backend: captured_backend(consent)};
-                host.lock().unwrap_or_else(|p| p.into_inner()).native_closing.insert(source.id, pending.clone());
+                let paired =
+                    retained_pair(host, paired_source.as_ref(), paired_holder.as_ref(), &proof)?;
+                let pending = NativeClose {
+                    source: source.clone(),
+                    owner: NativeOwner::Actor {
+                        record: owner.clone(),
+                        handle,
+                    },
+                    closed: false,
+                    paired,
+                    consented_backend: captured_backend(consent),
+                };
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .native_closing
+                    .insert(source.id, pending.clone());
                 pending
             }
             None => {
@@ -327,7 +366,9 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
         }
         if !pending.closed {
             #[cfg(test)]
-            if let Some(hook) = PRESENTATION_CLOSE_BEFORE_PROVIDER.lock().unwrap().take() { hook(); }
+            if let Some(hook) = PRESENTATION_CLOSE_BEFORE_PROVIDER.lock().unwrap().take() {
+                hook();
+            }
             pending.owner.close_retaining_receipt()?;
             pending.closed = true;
             host.lock()
@@ -391,7 +432,11 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
             }
             state.issued_chat_ids.insert(source.id);
         }
-        let retired_actor = if !restart && actor.is_some() { state.chats.remove(&source.id) } else { None };
+        let retired_actor = if !restart && actor.is_some() {
+            state.chats.remove(&source.id)
+        } else {
+            None
+        };
         let retired_close = state.native_closing.remove(&source.id);
         state.native_adoption_failures.clear(source.id);
         if !restart {
@@ -403,7 +448,9 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
         // Local Store/cache and paired terminal owners can be expensive last
         // drops. Never destroy them while the global host census is locked.
         #[cfg(test)]
-        if let Some(hook) = PRESENTATION_CLOSE_BEFORE_OWNER_DROP.lock().unwrap().take() { hook(); }
+        if let Some(hook) = PRESENTATION_CLOSE_BEFORE_OWNER_DROP.lock().unwrap().take() {
+            hook();
+        }
         drop(retired_actor);
         drop(retired_close);
         drop(actor);
@@ -422,11 +469,21 @@ fn preflight_current_retirements(
     caller: &Session,
     owner: &registry::Record,
     proof: &HostSessionProof,
-    consent: Option<(&crate::agent_execution::Origin, &crate::agent_execution::PresentationCloseTarget)>,
+    consent: Option<(
+        &crate::agent_execution::Origin,
+        &crate::agent_execution::PresentationCloseTarget,
+    )>,
 ) -> Result<(), String> {
-    let Some(store) = super::super::agent_execution::retirement_registry(host)? else { return Ok(()); };
-    let sources = store.lock().unwrap_or_else(|p| p.into_inner()).retained_agent_sources(caller.id)?;
-    if sources.is_empty() { return Ok(()); }
+    let Some(store) = super::super::agent_execution::retirement_registry(host)? else {
+        return Ok(());
+    };
+    let sources = store
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_sources(caller.id)?;
+    if sources.is_empty() {
+        return Ok(());
+    }
     let mut lineage = None;
     for retained in sources {
         let crate::agent_execution::HostedSession::Chat(current) = &retained else {
@@ -444,7 +501,9 @@ fn preflight_current_retirements(
                     (recovery.source, recovery.previous_sources)
                 };
                 if source != *caller && !previous.contains(caller) {
-                    return Err("Native holder does not recognize this exact issued descriptor".into());
+                    return Err(
+                        "Native holder does not recognize this exact issued descriptor".into(),
+                    );
                 }
                 lineage = Some((source, previous));
             }
@@ -455,7 +514,8 @@ fn preflight_current_retirements(
         }
         let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((origin, target)) = consent
-            && retained == target.observation.source {
+            && retained == target.observation.source
+        {
             store.preflight_presentation_close(origin, &target.observation)?;
         } else {
             store.preflight_agent_retirement(&retained)?;
@@ -469,7 +529,10 @@ fn retire_closed_execution(
     source: &Session,
     owner: &registry::Record,
     proof: &HostSessionProof,
-    consent: Option<(&crate::agent_execution::Origin, &crate::agent_execution::PresentationCloseTarget)>,
+    consent: Option<(
+        &crate::agent_execution::Origin,
+        &crate::agent_execution::PresentationCloseTarget,
+    )>,
 ) -> Result<(), String> {
     let Some(registry) = super::super::agent_execution::retirement_registry(host)? else {
         return Ok(());
@@ -493,16 +556,37 @@ fn retire_closed_execution(
     if let Some((origin, target)) = consent {
         super::presentation_close::require_current(host, target)?;
         #[cfg(test)]
-        if let Some(hook) = PRESENTATION_CLOSE_BEFORE_COMMIT.lock().unwrap().take() { hook(); }
-        let expected = &target.observation.source;
-        if !verified.iter().any(|source| crate::agent_execution::HostedSession::Chat(source.clone()) == *expected) {
-            return Err("The confirmed native receipt does not cover this exact consented agent".into());
+        if let Some(hook) = PRESENTATION_CLOSE_BEFORE_COMMIT.lock().unwrap().take() {
+            hook();
         }
-        let verified_sources = verified.iter().cloned().map(crate::agent_execution::HostedSession::Chat).collect::<Vec<_>>();
-        registry.lock().unwrap_or_else(|p| p.into_inner())
-            .retire_agent_process_with_presentation(origin, expected, chat::now_ms().unwrap_or(0), &target.observation, &verified_sources)?;
+        let expected = &target.observation.source;
+        if !verified
+            .iter()
+            .any(|source| crate::agent_execution::HostedSession::Chat(source.clone()) == *expected)
+        {
+            return Err(
+                "The confirmed native receipt does not cover this exact consented agent".into(),
+            );
+        }
+        let verified_sources = verified
+            .iter()
+            .cloned()
+            .map(crate::agent_execution::HostedSession::Chat)
+            .collect::<Vec<_>>();
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retire_agent_process_with_presentation(
+                origin,
+                expected,
+                chat::now_ms().unwrap_or(0),
+                &target.observation,
+                &verified_sources,
+            )?;
         #[cfg(test)]
-        if let Some(hook) = PRESENTATION_CLOSE_AFTER_COMMIT.lock().unwrap().take() { hook(); }
+        if let Some(hook) = PRESENTATION_CLOSE_AFTER_COMMIT.lock().unwrap().take() {
+            hook();
+        }
         super::super::agent_execution::announce(host, &registry);
         // Agent, current authorities and pane already committed together.
         // Never make a redundant writer transaction turn success into a close
@@ -571,36 +655,46 @@ fn retained_pair(
 // Deterministic test scheduling seam after genuine cleanup proof, before SQL
 // CAS. It cannot manufacture a receipt or bypass any production predicate.
 #[cfg(test)]
-static PRESENTATION_CLOSE_BEFORE_COMMIT: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+static PRESENTATION_CLOSE_BEFORE_COMMIT: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
 #[cfg(test)]
 pub(in crate::host) fn before_presentation_close_commit(hook: impl FnOnce() + Send + 'static) {
     *PRESENTATION_CLOSE_BEFORE_COMMIT.lock().unwrap() = Some(Box::new(hook));
 }
 
-fn captured_backend(consent: Option<(&crate::agent_execution::Origin, &crate::agent_execution::PresentationCloseTarget)>)
-    -> Option<registry::Process> {
+fn captured_backend(
+    consent: Option<(
+        &crate::agent_execution::Origin,
+        &crate::agent_execution::PresentationCloseTarget,
+    )>,
+) -> Option<registry::Process> {
     match consent?.1.backend {
-        crate::agent_execution::PresentationCloseBackend::Process {pid, start} => Some(registry::Process {pid, start}),
+        crate::agent_execution::PresentationCloseBackend::Process { pid, start } => {
+            Some(registry::Process { pid, start })
+        }
         crate::agent_execution::PresentationCloseBackend::RetiredOwner => None,
     }
 }
 
 #[cfg(test)]
-static PRESENTATION_CLOSE_BEFORE_OWNER_DROP: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+static PRESENTATION_CLOSE_BEFORE_OWNER_DROP: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
 #[cfg(test)]
 pub(in crate::host) fn before_presentation_close_owner_drop(hook: impl FnOnce() + Send + 'static) {
     *PRESENTATION_CLOSE_BEFORE_OWNER_DROP.lock().unwrap() = Some(Box::new(hook));
 }
 
 #[cfg(test)]
-static PRESENTATION_CLOSE_AFTER_COMMIT: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+static PRESENTATION_CLOSE_AFTER_COMMIT: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
 #[cfg(test)]
 pub(in crate::host) fn after_presentation_close_commit(hook: impl FnOnce() + Send + 'static) {
     *PRESENTATION_CLOSE_AFTER_COMMIT.lock().unwrap() = Some(Box::new(hook));
 }
 
 #[cfg(test)]
-static PRESENTATION_CLOSE_BEFORE_PROVIDER: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+static PRESENTATION_CLOSE_BEFORE_PROVIDER: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
 
 /// One-shot failure scheduling only; never supplies ownership/cleanup proof.
 #[cfg(test)]

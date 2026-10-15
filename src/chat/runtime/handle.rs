@@ -32,13 +32,15 @@ impl Handle {
     }
     #[cfg(test)]
     pub(crate) fn with_presentation_state_locked(&self, action: impl FnOnce()) {
-        self.local_actor().expect("fixture requires the actual Local owner")
+        self.local_actor()
+            .expect("fixture requires the actual Local owner")
             .with_presentation_state_locked(action);
     }
 
     #[cfg(test)]
     pub(crate) fn with_presentation_store_locked(&self, action: impl FnOnce()) {
-        self.local_actor().expect("fixture requires the actual Local owner")
+        self.local_actor()
+            .expect("fixture requires the actual Local owner")
             .with_presentation_store_locked(action);
     }
 

@@ -3,9 +3,9 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 mod account_isolation_tests;
 mod execution_directory;
 mod native_cleanup;
-pub(in crate::host) mod presentation_close;
 mod native_recovery;
 mod owned_listener;
+pub(in crate::host) mod presentation_close;
 pub(super) mod restart;
 pub(in crate::host) mod retained_actor;
 #[cfg(test)]
@@ -24,11 +24,16 @@ use crate::{
         ServerMessage, ServerResponse, validate_proof,
     },
 };
-pub(super) use native_cleanup::{NativeClose, close_retained as close_retained_native, close_with_presentation};
-#[cfg(test)]
-pub(super) use native_cleanup::{before_presentation_close_commit, before_presentation_close_owner_drop, after_presentation_close_commit};
 #[cfg(test)]
 pub(super) use native_cleanup::before_presentation_provider_close;
+pub(super) use native_cleanup::{
+    NativeClose, close_retained as close_retained_native, close_with_presentation,
+};
+#[cfg(test)]
+pub(super) use native_cleanup::{
+    after_presentation_close_commit, before_presentation_close_commit,
+    before_presentation_close_owner_drop,
+};
 pub(super) use native_recovery::AdoptionFailures;
 pub(super) use native_recovery::restore_orphaned_native;
 use std::{
@@ -458,8 +463,10 @@ fn changed_from(
             }
         }
     }
-    if let Some(instance)=instance {
-        if let Err(error)=super::session_locations::observe_chat_directory_thread(&host,id,instance,false) {
+    if let Some(instance) = instance {
+        if let Err(error) =
+            super::session_locations::observe_chat_directory_thread(&host, id, instance, false)
+        {
             tracing::warn!(%error,"cannot retain the owned provider's confirmed thread");
         }
     }
@@ -1039,8 +1046,8 @@ fn start_with_execution(
     // history. Codex also supports a live socket attachment, whose account is
     // deliberately not reauthorized; its transport is checked below instead.
     let binding_source = crate::agent_execution::HostedSession::Chat(session.clone());
-    let binding_registry = super::session_locations::observer_registry(host)
-        .map_err(unavailable)?;
+    let binding_registry =
+        super::session_locations::observer_registry(host).map_err(unavailable)?;
     let operational_binding = binding_registry
         .as_ref()
         .map(|registry| {
@@ -1629,42 +1636,74 @@ fn start_with_execution(
             .actor_identity()
             .map_or(execution_instance, |identity| identity.instance);
         let _ = owner_instance.set(execution_instance);
-        let approved=execution.as_ref().map(|context|context.directory_identity())
-            .transpose().map_err(unavailable)?.flatten();
-        if let Some(identity)=approved {
-            let directory=execution.as_ref().and_then(|context|context.directory_descriptor())
-                .ok_or_else(||unavailable("Native startup requires the approved directory descriptor"))?;
+        let approved = execution
+            .as_ref()
+            .map(|context| context.directory_identity())
+            .transpose()
+            .map_err(unavailable)?
+            .flatten();
+        if let Some(identity) = approved {
+            let directory = execution
+                .as_ref()
+                .and_then(|context| context.directory_descriptor())
+                .ok_or_else(|| {
+                    unavailable("Native startup requires the approved directory descriptor")
+                })?;
             if crate::agent_execution::DirectoryIdentity::from_metadata(
-                &directory.metadata().map_err(|error|unavailable(error.to_string()))?,
-            )!=identity {
-                let _=handle.close();
-                return Err(unavailable("The approved provider directory descriptor changed during startup"));
+                &directory
+                    .metadata()
+                    .map_err(|error| unavailable(error.to_string()))?,
+            ) != identity
+            {
+                let _ = handle.close();
+                return Err(unavailable(
+                    "The approved provider directory descriptor changed during startup",
+                ));
             }
         }
-        let observer_registry=match super::session_locations::observer_registry(host) {
-            Ok(registry)=>registry,
-            Err(reason)=>{let _=handle.close();return Err(unavailable(reason));}
-        };
-        let observer_registration=if let Some(registry)=&observer_registry {
-            let result=registry.lock().unwrap_or_else(|p|p.into_inner()).install_session_observer(
-                &crate::agent_execution::HostedSession::Chat(session.clone()),
-                execution_instance,Some(&previous_binding_source),
-                approved.map(|identity|(operational_directory.as_path(),identity)),None,
-            );
-            match result {
-                Ok(registration)=>Some(registration),
-                Err(reason)=>{let _=handle.close();return Err(unavailable(reason));}
+        let observer_registry = match super::session_locations::observer_registry(host) {
+            Ok(registry) => registry,
+            Err(reason) => {
+                let _ = handle.close();
+                return Err(unavailable(reason));
             }
-        } else {None};
-        let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+        };
+        let observer_registration = if let Some(registry) = &observer_registry {
+            let result = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .install_session_observer(
+                    &crate::agent_execution::HostedSession::Chat(session.clone()),
+                    execution_instance,
+                    Some(&previous_binding_source),
+                    approved.map(|identity| (operational_directory.as_path(), identity)),
+                    None,
+                );
+            match result {
+                Ok(registration) => Some(registration),
+                Err(reason) => {
+                    let _ = handle.close();
+                    return Err(unavailable(reason));
+                }
+            }
+        } else {
+            None
+        };
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             drop(state);
-            if let (Some(registry),Some(registration))=(&observer_registry,&observer_registration) {
-                if let Err(error)=registry.lock().unwrap_or_else(|p|p.into_inner()).restore_session_observer(registration) {
+            if let (Some(registry), Some(registration)) =
+                (&observer_registry, &observer_registration)
+            {
+                if let Err(error) = registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .restore_session_observer(registration)
+                {
                     tracing::warn!(%error,"cannot restore cancelled native observer ownership");
                 }
             }
-            let _=handle.close();
+            let _ = handle.close();
             return Err(unavailable("Daemon shutdown cancelled chat start"));
         }
         let observation = Observation {
@@ -1708,8 +1747,8 @@ fn start_with_execution(
         let response = session_snapshot(&record);
         let installed_handle = record.handle.clone();
         state.issued_chat_ids.insert(id);
-        if let Some(registration)=&observer_registration {
-            state.publish_chat_observer(id,execution_instance,registration.stamp());
+        if let Some(registration) = &observer_registration {
+            state.publish_chat_observer(id, execution_instance, registration.stamp());
         }
         state.chats.insert(id, record);
         if let Some(context) = &execution {
@@ -1740,10 +1779,14 @@ fn start_with_execution(
 /// Attach a CLI view without stopping the server-owned thread or its native
 /// connection. Both descriptors retain the same daemon-owned session ID.
 pub(super) fn codex_terminal_view(
-    host: &SharedHost, client: ClientId, chat_id: TerminalId,
-    handle: &Handle, session: Session, recipe: crate::model::LaunchRecipe,
+    host: &SharedHost,
+    client: ClientId,
+    chat_id: TerminalId,
+    handle: &Handle,
+    session: Session,
+    recipe: crate::model::LaunchRecipe,
 ) -> Result<ServerResponse, ProtocolError> {
-    codex_terminal_view_with(host,client,chat_id,handle,session,recipe,||{})
+    codex_terminal_view_with(host, client, chat_id, handle, session, recipe, || {})
 }
 
 pub(super) fn codex_terminal_view_with(
@@ -1753,7 +1796,7 @@ pub(super) fn codex_terminal_view_with(
     handle: &Handle,
     mut session: Session,
     recipe: crate::model::LaunchRecipe,
-    after_source:impl FnOnce(),
+    after_source: impl FnOnce(),
 ) -> Result<ServerResponse, ProtocolError> {
     let completed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -3592,20 +3635,42 @@ pub(super) fn owns_codex_listener(session: &Session) -> bool {
 
 /// Check a paired managed presentation before the terminal worker itself can
 /// stop. This is read-only; the actor path repeats its checks after teardown.
-pub(super) fn preflight_for_terminal_close(host: &SharedHost, terminal_id: TerminalId,
-    expected: &crate::terminal::TerminalHandle) -> Result<(), ProtocolError> {
+pub(super) fn preflight_for_terminal_close(
+    host: &SharedHost,
+    terminal_id: TerminalId,
+    expected: &crate::terminal::TerminalHandle,
+) -> Result<(), ProtocolError> {
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state.chats.get(&terminal_id).filter(|record| {
-            (record.session.launch.provider == Provider::Codex || record.owns_execution_console())
-                && record.session.terminal.as_ref().is_some_and(|source| source.id == terminal_id)
-        }).map(|record| {
-            if !record.paired_terminal.as_ref().is_some_and(|handle| handle.same_worker(expected))
-                || !state.terminals.get(&terminal_id).is_some_and(|current| current.handle.same_worker(expected)) {
-                return Err(unavailable("The terminal worker no longer belongs to this provider pairing"));
-            }
-            Ok(record.session.clone())
-        }).transpose()?
+        state
+            .chats
+            .get(&terminal_id)
+            .filter(|record| {
+                (record.session.launch.provider == Provider::Codex
+                    || record.owns_execution_console())
+                    && record
+                        .session
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|source| source.id == terminal_id)
+            })
+            .map(|record| {
+                if !record
+                    .paired_terminal
+                    .as_ref()
+                    .is_some_and(|handle| handle.same_worker(expected))
+                    || !state
+                        .terminals
+                        .get(&terminal_id)
+                        .is_some_and(|current| current.handle.same_worker(expected))
+                {
+                    return Err(unavailable(
+                        "The terminal worker no longer belongs to this provider pairing",
+                    ));
+                }
+                Ok(record.session.clone())
+            })
+            .transpose()?
     };
     if let Some(source) = source {
         super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;

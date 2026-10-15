@@ -366,7 +366,9 @@ impl RemoteActor {
             || !proof.is_complete()
             || proof.boot_id != record.boot
         {
-            return Err("Retained retirement request has incompatible actor or attachment authority".into());
+            return Err(
+                "Retained retirement request has incompatible actor or attachment authority".into(),
+            );
         }
         final_snapshot::retirement_proved_for_record(record, proof)
     }
@@ -393,10 +395,12 @@ impl RemoteActor {
     pub fn try_close_identity(&self) -> Result<super::CloseIdentity, String> {
         let state = self.0.state.try_lock()
             .map_err(|_| "Provider presentation metadata is busy or unavailable; retry close after it settles".to_owned())?;
-        Ok(super::CloseIdentity {session_id: state.session_id.clone(),
+        Ok(super::CloseIdentity {
+            session_id: state.session_id.clone(),
             native_continuity: state.native_continuity.clone(),
             owns_work: !self.0.preserved.load(Ordering::Acquire) && state.owns_work,
-            completed: state.completed})
+            completed: state.completed,
+        })
     }
     pub fn state(&self) -> Arc<Resident> {
         self.0
@@ -757,7 +761,7 @@ impl RemoteActor {
                         let outcome = state.outcome.clone();
                         let activity_changed = activity != old.activity || outcome != old.outcome;
                         let ready = state.ready && !old.ready;
-                        let identity_changed=state.confirmed_session != old.confirmed_session;
+                        let identity_changed = state.confirmed_session != old.confirmed_session;
                         let outcomes = (state.outbox_latest > state.outbox_ack
                             && state.outbox_latest != old.outbox_latest)
                             || (state.continuity_loss != old.continuity_loss
@@ -785,7 +789,9 @@ impl RemoteActor {
                                 outcome,
                             });
                         }
-                        if identity_changed { (actor.0.notify)(Update::Identity); }
+                        if identity_changed {
+                            (actor.0.notify)(Update::Identity);
+                        }
                         if ready {
                             (actor.0.notify)(Update::Ready);
                         }
@@ -3444,7 +3450,8 @@ done"#;
         let record = actor.identity().record;
         drop(_lease);
         let mut proof = source.proof.clone().unwrap();
-        proof.host_incarnation = crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
+        proof.host_incarnation =
+            crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
         let _replacement_lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
         let replacement =
             RemoteActor::adopt(&record, source.clone(), proof.clone(), |_| {}).unwrap();
