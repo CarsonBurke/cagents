@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod presentation;
+pub mod cache;
 pub mod pricing;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
@@ -1213,6 +1214,8 @@ pub enum Command {
         cursor: Option<FilePatchCursor>,
         revision: u64,
     },
+    /// Read original prose without hydrating or changing the presentation window.
+    LoadSource { query: cache::SourceQuery },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {

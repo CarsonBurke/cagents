@@ -2,6 +2,7 @@
 //! keep both long conversations and a single enormous tool result pageable.
 mod file_changes;
 mod append;
+mod source;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
@@ -149,6 +150,7 @@ impl Store {
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
                 CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
+            db.execute_batch(source::SCHEMA).map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
             Ok(Self {
@@ -370,6 +372,7 @@ impl Store {
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
         transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
+        source::rewrite_epoch(&transaction, &item.id)?;
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -663,6 +666,7 @@ impl Store {
             }
         }
         self.index_child_event(&event)?;
+        self.cache_child_source(&event)?;
         let mut out = Vec::new();
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })

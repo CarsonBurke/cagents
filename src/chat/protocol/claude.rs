@@ -1848,7 +1848,7 @@ impl Adapter for Claude {
                     PromptMode::Send,
                 )
             }
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } => {
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. } => {
                 return Err("File changes are served by the transcript cache".into());
             }
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
