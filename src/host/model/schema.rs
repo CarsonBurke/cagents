@@ -93,10 +93,12 @@ pub(super) fn check_readonly(db: &Connection) -> Result<(), String> {
     validate_selected(db, current)
 }
 
+#[cfg(test)]
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     migrate_after_read(db, || Ok(()))
 }
 
+#[cfg(test)]
 pub(super) fn migrate_after_read(db: &Connection, after_read: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     migrate_with_hooks(db, after_read, |_| Ok(()))
 }
@@ -113,6 +115,7 @@ pub(super) fn migrate_with_admission(db: &Connection, inspection: Connection,
     })
 }
 
+#[cfg(test)]
 fn migrate_with_hooks(db: &Connection, after_read: impl FnOnce() -> Result<(), String>, after_table: impl FnMut(usize) -> Result<(), String>) -> Result<(), String> {
     migrate_with_admission_hooks(db, after_read, after_table, || Ok(()))
 }
@@ -224,6 +227,53 @@ mod tests {
             assert!(!before.1.is_empty(), "fixture must retain actual committed WAL frames");
             assert!(Registry::at(&path).is_err());
             assert_eq!((image(&path), image(&wal)), before, "version {checkpoint}");
+        }
+    }
+
+    #[test]
+    fn constructor_read_pin_prevents_foreign_future_commit_and_preserves_its_journal() {
+        for checkpoint in [13, 18] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("registry.sqlite3");
+            legacy(&path, 12);
+            let journal = std::path::PathBuf::from(format!("{}-journal", path.display()));
+            let writer = Connection::open(&path).unwrap();
+            writer.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let mut expected = None;
+            let result = Registry::at_with_admission_hook(&path,
+                |db, inspection| {
+                    db.busy_timeout(std::time::Duration::ZERO).unwrap();
+                    migrate_with_admission(db, inspection, || Ok(()))
+                },
+                || {
+                    // This genuine writer begins AFTER constructor read-only
+                    // admission, in the old unprotected open/read gap. It can
+                    // create a rollback journal but cannot commit a private or
+                    // future schema while our admitted SHARED read survives.
+                    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    writer.pragma_update(None, "user_version", checkpoint).unwrap();
+                    writer.execute("UPDATE projects SET name='foreign pending writer'", []).unwrap();
+                    let error = writer.execute_batch("COMMIT").unwrap_err();
+                    assert!(matches!(error, rusqlite::Error::SqliteFailure(code, _)
+                        if code.code == rusqlite::ErrorCode::DatabaseBusy));
+                    assert!(!writer.is_autocommit(), "failed commit must retain the real writer");
+                    let bytes = (image(&path), image(&journal));
+                    assert!(!bytes.1.is_empty(), "fixture must own an actual rollback journal");
+                    expected = Some(bytes);
+                    Ok(())
+                });
+            assert!(result.is_err(), "the foreign writer still owns admission");
+            assert_eq!((image(&path), image(&journal)), expected.unwrap(),
+                "rejected constructor must not recover or change the foreign journal");
+            writer.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(version(&writer).unwrap(), 12);
+            // Read authority must be released on refusal. A fresh constructor
+            // also proves the successful path releases it before its own
+            // rollback-journal COMMIT rather than blocking itself indefinitely.
+            let registry = Registry::at(&path).unwrap();
+            assert_eq!(version(&registry.db).unwrap(), 17);
+            assert_eq!(registry.db.query_row("SELECT name FROM projects WHERE repository='/fixture'", [],
+                |row| row.get::<_, String>(0)).unwrap(), "preserved");
         }
     }
 
