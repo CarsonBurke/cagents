@@ -98,6 +98,11 @@ struct InboxAttention {
 #[derive(Default)]
 struct Pending {
     events: BTreeMap<Target, Event>,
+    // Durable scheduler evidence must reach the journal in commit order. Its
+    // target includes mutable presentation metadata and cannot be sorted or
+    // coalesced before each exact evidence key receives a journal receipt.
+    automation_events: VecDeque<Event>,
+    automation_keys: BTreeSet<String>,
     inboxes: Option<InboxAttention>,
     retired: BTreeSet<Target>,
     acknowledged: BTreeSet<Uuid>,
@@ -154,7 +159,19 @@ impl Handle {
             // Producers fence worker identity before enqueueing. A newer
             // worker may reuse this session while retirement is still queued;
             // apply that retirement first, then its new event in the broker.
-            if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.target()) {
+            let automation = matches!(
+                event.target,
+                Target::Automation { .. } | Target::AutomationProposal { .. }
+            );
+            if automation {
+                if pending.events.len() + pending.automation_events.len() < MAX_PENDING
+                    && pending.automation_keys.insert(event.evidence.key.clone())
+                {
+                    pending.automation_events.push_back(event);
+                }
+            } else if pending.events.contains_key(&event.target())
+                || pending.events.len() + pending.automation_events.len() < MAX_PENDING
+            {
                 pending.events.insert(event.target(), event);
             }
         });
@@ -1194,6 +1211,78 @@ mod tests {
         assert_eq!(queue.len(), MAX_PENDING);
     }
     #[test]
+    fn committed_automation_transfer_preserves_fifo_and_receipts_through_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        let registry = Arc::new(Mutex::new(crate::host::model::Registry::at(&path).unwrap()));
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let mut journal = journal::Journal::open(&directory.path().join("notices.sqlite3")).unwrap();
+        let id = Uuid::new_v4();
+        let event = |reason: &str, key: &str| Event {
+            target: Target::Automation { id, name: "Fixture".into(), reason: reason.into() },
+            source_session: None, provider: None, directory: None, destination: None,
+            evidence: crate::notifications::Evidence { key: key.into(), kind: crate::notifications::Kind::AutomationSkipped },
+        };
+        // Exercise committed scheduler rows, the actual transfer, pending queue,
+        // journal and receipt ACK. The newer reason sorts before the old reason.
+        let commit = |event: &Event| {
+            let mut connection = rusqlite::Connection::open(&path).unwrap();
+            let tx = connection.transaction().unwrap();
+            tx.execute("DELETE FROM automation_notifications", []).unwrap();
+            tx.execute("INSERT INTO automation_notifications(key,event) VALUES(?1,?2)",
+                rusqlite::params![event.evidence.key, serde_json::to_string(event).unwrap()]).unwrap();
+            tx.commit().unwrap();
+        };
+        let old = event("Z earlier", "earlier");
+        let newer = event("A newest", "newest");
+        commit(&old);
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        commit(&newer);
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        // Repeated flushes coalesce only duplicate evidence, not distinct rows.
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        let pending = std::mem::take(&mut *shared.pending.lock().unwrap());
+        assert!(pending.events.is_empty());
+        assert_eq!(pending.automation_events.iter().map(|event| event.evidence.key.as_str()).collect::<Vec<_>>(), ["earlier", "newest"]);
+        for event in pending.automation_events {
+            journal_event(&mut journal, &Arc::downgrade(&shared), event, false).unwrap();
+        }
+        assert_eq!(journal.list().unwrap()[0].event, newer);
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        assert!(registry.lock().unwrap().automation_notifications().unwrap().is_empty());
+        assert!(shared.pending.lock().unwrap().automation_events.is_empty());
+
+        // Interrupted-after-journal replay emits the missing receipt without
+        // replacing the latest content with previously seen evidence.
+        commit(&old);
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        let pending = std::mem::take(&mut *shared.pending.lock().unwrap());
+        for event in pending.automation_events {
+            assert!(journal_event(&mut journal, &Arc::downgrade(&shared), event, false).unwrap().is_none());
+        }
+        assert_eq!(journal.list().unwrap()[0].event, newer);
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        assert!(registry.lock().unwrap().automation_notifications().unwrap().is_empty());
+
+        // Identical presentation targets still journal and ACK both distinct
+        // evidence keys rather than silently losing the older pending key.
+        let first = event("Same metadata", "same-first");
+        let last = event("Same metadata", "same-last");
+        commit(&first);
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        commit(&last);
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        let pending = std::mem::take(&mut *shared.pending.lock().unwrap());
+        assert_eq!(pending.automation_events.len(), 2);
+        for event in pending.automation_events {
+            journal_event(&mut journal, &Arc::downgrade(&shared), event, false).unwrap();
+        }
+        assert_eq!(handle.take_automation_receipts(), BTreeSet::from(["same-first".into(), "same-last".into()]));
+        assert_eq!(journal.list().unwrap()[0].event, last);
+    }
+
+    #[test]
     fn stopped_and_full_notification_queues_never_fabricate_scheduler_journal_receipts() {
         let event = Event {
             target: Target::Automation {
@@ -1215,6 +1304,7 @@ mod tests {
         shared.pending.lock().unwrap().stopped = true;
         handle.record(event.clone());
         assert!(shared.pending.lock().unwrap().events.is_empty());
+        assert!(shared.pending.lock().unwrap().automation_events.is_empty());
         assert!(handle.take_automation_receipts().is_empty());
         shared.pending.lock().unwrap().stopped = false;
         for _ in 0..MAX_PENDING {
@@ -1227,9 +1317,36 @@ mod tests {
         let pending = shared.pending.lock().unwrap();
         assert_eq!(pending.events.len(), MAX_PENDING);
         assert!(!pending.events.contains_key(&event.target));
+        assert!(pending.automation_events.is_empty());
         drop(pending);
         assert!(handle.take_automation_receipts().is_empty());
     }
+}
+
+/// Return scheduler receipts only after SQLite has committed the exact evidence.
+/// A duplicate is also a durable receipt: replay must not overwrite newer notice
+/// content, and the scheduler may then retire its already-journaled outbox row.
+fn journal_event(
+    journal: &mut journal::Journal,
+    shared: &Weak<Shared>,
+    event: Event,
+    suppressed: bool,
+) -> Result<Option<Notice>, String> {
+    let receipt = matches!(
+        &event.target,
+        Target::Automation { .. } | Target::AutomationProposal { .. }
+    ).then(|| event.evidence.key.clone());
+    let result = journal.record(event, suppressed);
+    if result.is_ok()
+        && let Some(key) = receipt
+        && let Some(core) = shared.upgrade()
+    {
+        let mut receipts = core.automation_receipts.lock().unwrap_or_else(|p| p.into_inner());
+        if receipts.len() < MAX_PENDING {
+            receipts.insert(key);
+        }
+    }
+    result
 }
 
 async fn run(
@@ -1400,7 +1517,7 @@ async fn run(
             }
             queue_withdrawal(&mut withdrawals, id);
         }
-        for event in pending.events.into_values() {
+        for event in pending.events.into_values().chain(pending.automation_events) {
             if stopped(&shared) {
                 return;
             }
@@ -1411,27 +1528,13 @@ async fn run(
                     || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
-            let automation_receipt = matches!(
-                &event.target,
-                Target::Automation { .. } | Target::AutomationProposal { .. }
-            )
-            .then(|| event.evidence.key.clone());
-            let recorded = journal.record(event, suppressed);
+            let automation = matches!(&event.target, Target::Automation { .. } | Target::AutomationProposal { .. });
+            let recorded = journal_event(journal, &shared, event, suppressed);
             if recorded.is_ok()
-                && let Some(key) = automation_receipt
+                && automation
+                && let Some(host) = host.upgrade()
             {
-                if let Some(core) = shared.upgrade() {
-                    let mut receipts = core
-                        .automation_receipts
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    if receipts.len() < MAX_PENDING {
-                        receipts.insert(key);
-                    }
-                }
-                if let Some(host) = host.upgrade() {
-                    super::automations::wake(&host);
-                }
+                super::automations::wake(&host);
             }
             match recorded {
                 Ok(Some(notice)) => {

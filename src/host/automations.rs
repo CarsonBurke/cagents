@@ -45,13 +45,21 @@ pub(super) fn flush_notifications(host: &super::state::SharedHost) -> Result<(),
         return Ok(());
     };
     let registry = super::agent_execution::registry(host)?;
-    let receipts = notifications.take_automation_receipts();
-    let events = {
-        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        registry.acknowledge_automation_notifications(&receipts)?;
-        registry.automation_notifications()?
-    };
-    for event in events {
+    transfer_notifications(&registry, &notifications)
+}
+
+pub(super) fn transfer_notifications(
+    registry: &super::agent_execution::SharedRegistry,
+    notifications: &super::notifications::Handle,
+) -> Result<(), String> {
+    // Serialize read + enqueue with every outbox writer and other transfer.
+    // Enqueue only takes the bounded pending mutex; the notification broker
+    // drops that mutex before journal I/O, scheduler wakeups or host access.
+    // Releasing the registry between these operations could enqueue an older
+    // loaded event after its committed replacement from a concurrent flush.
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    registry.acknowledge_automation_notifications(&notifications.take_automation_receipts())?;
+    for event in registry.automation_notifications()? {
         notifications.record(event);
     }
     Ok(())
