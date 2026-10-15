@@ -63,6 +63,29 @@ impl RepositoryRuntime {
         }))
     }
 
+    /// Selection commands require actual selected rows. Their captured request
+    /// keeps palette activation bound to the rendered source and coordinates.
+    pub fn can_apply_diff_selection(&self, kind: git_patch::Kind) -> bool {
+        self.selected_mutation_rows(kind).is_some()
+    }
+
+    pub fn diff_selection_mutation_action(
+        &self,
+        card: CardId,
+        kind: git_patch::Kind,
+    ) -> Option<RepositoryAction> {
+        let rows = self.selected_mutation_rows(kind)?;
+        let request = self.diff_mutation_request(card, rows)?;
+        Some(RepositoryAction::ApplyDiffHunk { card, kind, request })
+    }
+
+    fn selected_mutation_rows(&self, kind: git_patch::Kind) -> Option<Range<usize>> {
+        if !self.can_mutate_diff(kind) { return None; }
+        let rows = self.selected_diff_range()?;
+        let model = self.current_diff_model_snapshot()?;
+        (!rows.is_empty() && rows.end <= model.row_count(self.diff_mode)).then_some(rows)
+    }
+
     fn can_mutate_diff(&self, kind: git_patch::Kind) -> bool {
         // A hunk edit keeps the current document open. Unsaved working
         // text is a valid source while its annotations match that revision;
@@ -565,6 +588,78 @@ mod tests {
         assert!(document.present);
         assert!(!document.dirty);
         assert!(!document.history.can_undo());
+    }
+
+    fn selected_mutation_fixture(card: CardId) -> RepositoryRuntime {
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.txt", "changed\nkeep\n");
+        runtime.source_surface = SourceSurface::Diff;
+        let mut model = crate::diff_view::build_diff("original\nkeep\n", "changed\nkeep\n");
+        model.present = [true; 2];
+        model.modes = [Some(0o100644); 2];
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(RenderedDiff::Text {
+            model: Arc::new(model), old_label: "Index".into(), new_label: "Working tree".into(),
+        }));
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        runtime.working_diff.desired = runtime.wanted_working_diff();
+        runtime.working_diff.applied_rich = true;
+        runtime.working_diff.desired_rich = true;
+        runtime
+    }
+
+    #[test]
+    fn selection_mutation_commands_require_selected_rows_and_capture_their_source() {
+        let card = CardId::new();
+        let mut runtime = selected_mutation_fixture(card);
+        assert!(!runtime.can_apply_diff_selection(git_patch::Kind::Stage));
+        assert!(runtime.diff_selection_mutation_action(card, git_patch::Kind::Revert).is_none());
+        runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(
+            runtime.diff_mode, crate::diff_interaction::Side::New, 0,
+        ));
+        assert!(runtime.can_apply_diff_selection(git_patch::Kind::Stage));
+        assert!(runtime.can_apply_diff_selection(git_patch::Kind::Revert));
+        assert!(!runtime.can_apply_diff_selection(git_patch::Kind::Unstage));
+        let RepositoryAction::ApplyDiffHunk { card: actual, kind, request } =
+            runtime.diff_selection_mutation_action(card, git_patch::Kind::Stage).unwrap()
+        else { panic!("selection must dispatch a source-bound request"); };
+        assert_eq!(actual, card);
+        assert_eq!(kind, git_patch::Kind::Stage);
+        assert_eq!(request.rows, 0..1);
+        runtime.diff_interaction.selection.as_mut().unwrap().head = 1;
+        assert_eq!(request.rows, 0..1, "later selection changes cannot retarget the action");
+        assert!(runtime.capture_diff_mutation(card, kind, Some(&request)).is_some());
+        runtime.diff_layout_revision = runtime.diff_layout_revision.wrapping_add(1);
+        assert!(runtime.capture_diff_mutation(card, kind, Some(&request)).is_none());
+    }
+
+    #[test]
+    fn selection_mutation_commands_share_basis_mode_and_current_annotation_guards() {
+        let card = CardId::new();
+        let mut runtime = selected_mutation_fixture(card);
+        let selection = crate::diff_interaction::Selection::new(
+            runtime.diff_mode, crate::diff_interaction::Side::New, 0,
+        );
+        runtime.diff_interaction.selection = Some(selection);
+        runtime.mutation_refresh_pending = true;
+        assert!(!runtime.can_apply_diff_selection(git_patch::Kind::Stage));
+        runtime.mutation_refresh_pending = false;
+        runtime.working_diff.applied = None;
+        assert!(!runtime.can_apply_diff_selection(git_patch::Kind::Stage));
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        let mut model = crate::diff_view::build_diff("original\n", "changed\n");
+        model.present = [true; 2];
+        model.modes = [Some(0o100644); 2];
+        model.source_head = Some(crate::repository::GitHeadGuard::Unborn);
+        runtime.diff_basis = DiffBasis::HeadToIndex;
+        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::ready(RenderedDiff::Text {
+            model: Arc::new(model), old_label: "HEAD".into(), new_label: "Index".into(),
+        }));
+        runtime.diff_interaction.selection = Some(selection);
+        assert!(runtime.can_apply_diff_selection(git_patch::Kind::Unstage));
+        assert!(!runtime.can_apply_diff_selection(git_patch::Kind::Stage));
+        assert!(!runtime.can_apply_diff_selection(git_patch::Kind::Revert));
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        document.dirty = true;
+        assert!(!runtime.can_apply_diff_selection(git_patch::Kind::Unstage));
     }
 
     #[test]
