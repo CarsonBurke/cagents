@@ -485,12 +485,11 @@ impl Claude {
     fn retire(&mut self, id: String, step: &mut Step) {
         self.pending.remove(&id);
         step.events.push(Event::RequestResolved { id: id.clone() });
-        // Busy outside a turn means only decisions the ended turn left behind;
-        // resolving the last of them completes it as an empty queue would have.
-        // An interrupt sent meanwhile had no turn to stop, so the next turn
-        // must not inherit it as its own cancellation.
-        if self.busy
-            && self.pending.is_empty()
+        // A background decision can arrive before or after the main result,
+        // so the adapter may already be idle when it is answered. Once no
+        // request or active turn remains, forget between-turn interruption:
+        // this idle generation also identifies the next prompt.
+        if self.pending.is_empty()
             && self.started_generation != Some(self.attention_generation)
         {
             self.interruption = None;
@@ -5772,6 +5771,15 @@ mod tests {
 
     #[test]
     fn a_between_turn_interrupt_ack_cannot_settle_the_next_runs_interrupt() {
+        between_turn_interrupt_ack_with_request_order(false);
+    }
+
+    #[test]
+    fn an_interrupt_for_a_request_arriving_after_result_cannot_settle_the_next_run() {
+        between_turn_interrupt_ack_with_request_order(true);
+    }
+
+    fn between_turn_interrupt_ack_with_request_order(request_after_result: bool) {
         use crate::agent_execution::ProviderEvent;
         use crate::notifications::Kind;
 
@@ -5784,12 +5792,17 @@ mod tests {
                 adapter
                     .send_prompt("first".into(), vec![], PromptMode::Send)
                     .unwrap();
-                adapter
-                    .receive(approval("background", "Bash", json!({"command":"true"})))
-                    .unwrap();
+                if !request_after_result {
+                    adapter.receive(approval("background", "Bash", json!({"command":"true"}))).unwrap();
+                }
                 adapter
                     .receive(json!({"type":"result","is_error":false}))
                     .unwrap();
+                if request_after_result {
+                    assert!(!adapter.busy, "main result precedes the late decision");
+                    adapter.receive(approval("background", "Bash", json!({"command":"true"}))).unwrap();
+                    assert!(!adapter.busy, "late permission does not create a new main turn");
+                }
                 let old = adapter.command(Command::Interrupt).unwrap();
                 let old_id = old.writes[0]["request_id"].as_str().unwrap();
                 adapter

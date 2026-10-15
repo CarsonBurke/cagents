@@ -2034,11 +2034,23 @@ fn a_late_between_turn_interrupt_ack_cannot_cancel_the_next_owned_run() {
     if isolated("a_late_between_turn_interrupt_ack_cannot_cancel_the_next_owned_run").is_some() {
         return;
     }
+    between_turn_interrupt_ack_fixture(false);
+}
+
+#[test]
+fn a_request_arriving_after_result_cannot_lend_its_interrupt_ack_to_the_next_owned_run() {
+    if isolated("a_request_arriving_after_result_cannot_lend_its_interrupt_ack_to_the_next_owned_run").is_some() {
+        return;
+    }
+    between_turn_interrupt_ack_fixture(true);
+}
+
+fn between_turn_interrupt_ack_fixture(request_after_result: bool) {
     let (host, request, path) = fixture();
     let root = path.parent().unwrap();
     // A real private provider process withholds the idle interrupt response
     // until the next prompt has returned its result and awaits its own ACK.
-    std::fs::write(root.join("bin/claude"), r#"#!/bin/sh
+    let script = r#"#!/bin/sh
 set -eu
 printf 'spawn\n' >> "$HOME/../spawns"
 n=0
@@ -2083,7 +2095,17 @@ while IFS= read -r frame; do
       ;;
   esac
 done
-"#).unwrap();
+"#;
+    let script = if request_after_result {
+        let request = "        printf '{\"type\":\"control_request\",\"request_id\":\"background-first\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"tool_use_id\":\"first\",\"input\":{\"command\":\"true\"}}}\\n'\n";
+        let result = "        printf '{\"type\":\"result\",\"uuid\":\"first-result\",\"is_error\":false}\\n'\n";
+        let original = format!("{request}{result}");
+        assert!(script.contains(&original), "fixture must reverse the actual decoder frames");
+        script.replacen(&original, &format!("{result}{request}"), 1)
+    } else {
+        script.to_owned()
+    };
+    std::fs::write(root.join("bin/claude"), script).unwrap();
     let owner = Authority::default();
     let accepted = submit(&host, &owner, request).unwrap();
     let agent = accepted.agent.id;
