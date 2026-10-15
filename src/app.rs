@@ -27627,7 +27627,7 @@ mod tests {
             let head = crate::pull_request_review::CleanupHead {
                 repository: target.repository.clone(),
                 branch: pr.head_ref_name.clone(),
-                head: Oid::parse(pr.head_ref_oid.clone()).unwrap(),
+                head: crate::repository::Oid::parse(pr.head_ref_oid.clone()).unwrap(),
                 merged_pull_request: Arc::clone(&target.pull_request),
             };
             let record = crate::repository::WorktreeRecord {

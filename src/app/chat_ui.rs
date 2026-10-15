@@ -4175,7 +4175,9 @@ impl Cagents {
                 return Task::batch(tasks);
             };
             if let Some(scope) = self.active_workspace.clone() {
-                self.durable_mut().card_scopes.insert(card, scope.clone());
+                Arc::make_mut(&mut self.durable)
+                    .card_scopes
+                    .insert(card, scope.clone());
                 self.worktree_owners.insert(card, scope);
             }
             card
@@ -12528,7 +12530,7 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         write(&mut app, card, "Keep this draft");
-        app.durable_mut()
+        Arc::make_mut(&mut app.durable)
             .card_scopes
             .insert(card, "/filed-elsewhere".into());
         drop(app.finish_pr_agent_context(
@@ -12575,7 +12577,7 @@ mod tests {
         })
         .collect();
         let channel = crate::model::ChannelId::new();
-        app.durable_mut()
+        Arc::make_mut(&mut app.durable)
             .channels
             .push(crate::model::ProjectChannel {
                 id: channel,
@@ -12588,7 +12590,7 @@ mod tests {
                 focused: Some(card),
             });
         drop(app.select_channel(channel));
-        app.durable_mut()
+        Arc::make_mut(&mut app.durable)
             .channels
             .iter_mut()
             .find(|row| row.id == channel)
@@ -12764,7 +12766,7 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let elsewhere = draft_chat(&mut app);
         write(&mut app, elsewhere, "Keep the other workspace draft");
-        app.durable_mut()
+        Arc::make_mut(&mut app.durable)
             .card_scopes
             .insert(elsewhere, "/filed-elsewhere".into());
         drop(app.prepare_pr_agent_context(

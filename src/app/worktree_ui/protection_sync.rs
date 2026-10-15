@@ -241,7 +241,7 @@ mod tests {
     fn empty_window() -> Cagents {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.active_workspace = None;
-        app.durable_mut().cards.clear();
+        Arc::make_mut(&mut app.durable).cards.clear();
         app.cards.clear();
         app
     }
