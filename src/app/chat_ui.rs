@@ -7623,8 +7623,7 @@ impl Cagents {
                     .map(|_| (generation, navigation, attempt + 1));
                 if let Some(location) = location {
                     let vertical = scroll::find_scroll_to::<Message>(target, location.offset);
-                    let horizontal = location.horizontal.map(scroll::find_scroll_horizontal::<Message>)
-                        .unwrap_or_else(iced::Task::none);
+                    let horizontal = iced::Task::batch(location.horizontal.into_iter().map(scroll::find_scroll_horizontal::<Message>));
                     return iced::Task::batch([vertical, horizontal]).map(cosmic::Action::App);
                 }
             }

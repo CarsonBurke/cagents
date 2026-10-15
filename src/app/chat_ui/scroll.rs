@@ -213,7 +213,7 @@ pub(super) struct LogicalLocation {
     pub offset: f32,
     pub exact: bool,
     pub stage: u8,
-    pub horizontal: Option<HorizontalLocation>,
+    pub horizontal: Vec<HorizontalLocation>,
 }
 
 #[derive(Clone, Debug)]
@@ -231,7 +231,7 @@ struct LocateLogical {
     byte: usize,
     content: Option<Rectangle>,
     viewport: Option<Rectangle>,
-    found: Option<(Rectangle, u8, Option<HorizontalLocation>)>,
+    found: Option<(Rectangle, u8, Vec<HorizontalLocation>)>,
     horizontal: Vec<(Id, Rectangle, Rectangle)>,
     pending_horizontal: Option<(Id, Rectangle, Rectangle)>,
     active: bool,
@@ -244,11 +244,17 @@ impl LocateLogical {
             .as_ref()
             .is_none_or(|(_, previous, _)| stage >= *previous)
         {
-            let horizontal = (stage >= 2).then(|| self.horizontal.last()).flatten().map(|(id, viewport, content)| HorizontalLocation {
-                id: id.clone(),
-                offset: (bounds.x - content.x - (viewport.width - bounds.width) / 2.0)
-                    .clamp(0.0, (content.width - viewport.width).max(0.0)),
-            });
+            // Inner corrections change the glyph's position in each outer
+            // content space. Center from the innermost viewport outward.
+            let mut projected = bounds;
+            let horizontal = if stage >= 2 {
+                self.horizontal.iter().rev().map(|(id, viewport, content)| {
+                    let offset = (projected.x - content.x - (viewport.width - projected.width) / 2.0)
+                        .clamp(0.0, (content.width - viewport.width).max(0.0));
+                    projected.x -= offset;
+                    HorizontalLocation { id: id.clone(), offset }
+                }).collect()
+            } else { vec![] };
             self.found = Some((bounds, stage, horizontal));
         }
     }
@@ -1549,8 +1555,80 @@ mod tests {
             let _ = locate.finish();
             let location = result.lock().unwrap().take().expect("target glyph is mounted");
             assert!(location.exact);
-            assert_eq!(location.horizontal.map(|viewport| viewport.id), nested.then(|| inner.clone()),
+            assert_eq!(location.horizontal.into_iter().map(|viewport| viewport.id).collect::<Vec<_>>(), if nested { vec![inner.clone(), outer.clone()] } else { vec![] },
                 "only the nearest native ancestor belongs to this match; overlapping sibling content is unrelated");
+        }
+    }
+
+    #[test]
+    fn logical_find_reveals_a_glyph_through_every_nested_horizontal_viewport() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target { card: CardId::new(), generation: 0 };
+        let identity = 0x9927;
+        let outer = Id::new("nested-outer"); let inner = Id::new("nested-inner");
+        let text = selectable_prose::logical_text(
+            vec![iced::widget::text::Span::new(format!("{}needle", "w".repeat(3000)))].into(),
+            design::TEXT_BODY.into(), iced::Font::MONOSPACE, target, None,
+            selectable_prose::Logical { identity, start: 0, paint: None });
+        let nested = widget::scrollable(widget::container(text).width(40000))
+            .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+            .width(600).id(inner.clone());
+        let outer_scroll = widget::scrollable(widget::row::with_children(vec![
+            widget::Space::new().width(2000).into(), nested.into(), widget::Space::new().width(3000).into(),
+        ])).direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+            .width(Length::Fill).id(outer.clone());
+        let mut element = transcript(widget::column::with_children(vec![item("nested", outer_scroll),
+            widget::Space::new().height(1000).into()]), target, None, vec![], false, vec![]);
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let result = Arc::new(std::sync::Mutex::new(None)); let sink = result.clone();
+        let mut locate = operation::map(LocateLogical {
+            scroll: card_control_id(target.card, "chat-transcript"), item: item_id("nested"), identity, byte: 3000,
+            content: None, viewport: None, found: None, horizontal: vec![], pending_horizontal: None,
+            active: false, scopes: vec![],
+        }, move |location| { *sink.lock().unwrap() = location; });
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
+        let _ = locate.finish();
+        let location = result.lock().unwrap().take().unwrap();
+        assert!(location.exact);
+        assert_eq!(location.horizontal.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>(), vec![inner.clone(), outer.clone()]);
+        assert!(location.horizontal.iter().all(|entry| entry.offset > 1000.0), "both nested viewports need correction");
+        for entry in location.horizontal {
+            let mut correction = operation::scrollable::scroll_to::<()>(entry.id,
+                operation::scrollable::AbsoluteOffset { x: Some(entry.offset), y: None });
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut correction);
+        }
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        struct Screen {
+            translation: Vector, pending: Option<Vector>,
+            viewports: HashMap<Id, Rectangle>, glyph: Option<Rectangle>, identity: u64,
+        }
+        impl Operation for Screen {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                let previous = self.translation;
+                if let Some(offset) = self.pending.take() { self.translation += offset; }
+                visit(self); self.translation = previous;
+            }
+            fn scrollable(&mut self, id: Option<&Id>, viewport: Rectangle, _: Rectangle, translation: Vector, _: &mut dyn operation::Scrollable) {
+                if let Some(id) = id { self.viewports.insert(id.clone(), Rectangle::new(viewport.position() - self.translation, viewport.size())); }
+                self.pending = Some(translation);
+            }
+            fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                    && let Some(local) = prose.logical_byte_bounds(self.identity, 3000) {
+                    self.glyph = Some(Rectangle::new(bounds.position() + Vector::new(local.x, local.y) - self.translation, local.size()));
+                }
+            }
+        }
+        let mut screen = Screen { translation: Vector::ZERO, pending: None, viewports: HashMap::new(), glyph: None, identity };
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut screen);
+        let glyph = screen.glyph.unwrap();
+        for id in [outer, inner] {
+            let viewport = screen.viewports[&id];
+            assert!(glyph.x >= viewport.x && glyph.x + glyph.width <= viewport.x + viewport.width
+                && glyph.y >= viewport.y && glyph.y + glyph.height <= viewport.y + viewport.height,
+                "actual glyph must be visible through every native ancestor: {id:?}, {glyph:?}, {viewport:?}");
         }
     }
 
@@ -1673,7 +1751,7 @@ mod tests {
                     .take()
                     .expect("mounted code glyph exists");
                 let horizontal = location
-                    .horizontal
+                    .horizontal.into_iter().next()
                     .expect("glyph belongs to a horizontal code viewport");
                 assert_eq!(horizontal.id, horizontal_id);
                 assert!(
