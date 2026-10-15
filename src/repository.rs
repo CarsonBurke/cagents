@@ -8316,7 +8316,10 @@ mod tests {
 
     #[test]
     fn snapshot_cache_unchanged_reads_only_status_and_metadata_invalidation_rereads() {
-        let outputs = (0..17).map(|_| success(b"")).collect();
+        let mut outputs = (0..17).map(|_| success(b"")).collect::<Vec<_>>();
+        for index in [1, 8, 10] {
+            outputs[index] = success(b"# branch.oid (initial)\0# branch.head main\0");
+        }
         let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor.clone());
         let mut cache = SnapshotCache::default();
@@ -8557,8 +8560,9 @@ mod tests {
     #[test]
     fn snapshot_cache_status_or_content_change_reuses_metadata() {
         let mut outputs = (0..8).map(|_| success(b"")).collect::<Vec<_>>();
-        outputs.extend([success(b"? new.txt\0"), success(b""), success(b"")]);
-        outputs.extend([success(b"? new.txt\0"), success(b""), success(b"")]);
+        outputs[1] = success(b"# branch.oid (initial)\0# branch.head main\0");
+        outputs.extend([success(b"# branch.oid (initial)\0# branch.head main\0? new.txt\0"), success(b""), success(b"")]);
+        outputs.extend([success(b"# branch.oid (initial)\0# branch.head main\0? new.txt\0"), success(b""), success(b"")]);
         let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor.clone());
         let mut cache = SnapshotCache::default();
@@ -8611,17 +8615,17 @@ mod tests {
         fs::write(&file, "abc\n").unwrap();
         let executor = Arc::new(FakeExecutor::with_outputs(vec![
             exit(1, b""),
-            success(b"? new.txt\0"),
+            success(b"# branch.oid (initial)\0# branch.head main\0? new.txt\0"),
             success(b""),
             success(b""),
             success(b"? new.txt\0"),
             exit(1, b""),
             success(b""),
             success(b""),
-            success(b"? new.txt\0"),
+            success(b"# branch.oid (initial)\0# branch.head main\0? new.txt\0"),
             success(b""),
             success(b""),
-            success(b"? new.txt\0"),
+            success(b"# branch.oid (initial)\0# branch.head main\0? new.txt\0"),
         ]));
         let git = RepositoryService::new("git", executor.clone());
         let options = SnapshotOptions {
@@ -8658,21 +8662,14 @@ mod tests {
     #[test]
     fn snapshot_cache_browse_creation_refreshes_files_without_untracked_status() {
         let directory = tempfile::tempdir().unwrap();
-        let executor = Arc::new(FakeExecutor::with_outputs(vec![
-            exit(1, b""),
-            success(b""),
-            success(b""),
-            success(b""),
-            success(b""),
-            exit(1, b""),
-            success(b""),
-            success(b""),
-            success(b""),
-            success(b""),
-            success(b""),
-            success(b"? new.txt\0"),
-            success(b""),
-        ]));
+        let mut outputs = (0..13).map(|_| success(b"")).collect::<Vec<_>>();
+        outputs[0] = exit(1, b"");
+        outputs[5] = exit(1, b"");
+        for index in [1, 8, 12] {
+            outputs[index] = success(b"# branch.oid (initial)\0# branch.head main\0");
+        }
+        outputs[11] = success(b"? new.txt\0");
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor.clone());
         let options = SnapshotOptions {
             untracked_changes: false,

@@ -12992,8 +12992,7 @@ pub(crate) mod tests {
     #[test]
     fn worktree_changes_icons_can_be_hidden_without_hiding_activity() {
         let renderer = headless_renderer();
-        let mut worktree = worktree(3, "feature", false);
-        worktree.chrome.dirty_badge = Some("3 changed files".into());
+        let worktree = worktree(3, "feature", true);
         fn badge_count(node: &layout::Node) -> usize {
             usize::from(
                 node.children().is_empty()
@@ -13038,11 +13037,15 @@ pub(crate) mod tests {
                 counts[1] + 1,
                 "only the changes badge is removed"
             );
-            assert_eq!(
-                accessible_names(&renderer, row(true)),
-                accessible_names(&renderer, row(false)),
-                "dirty status remains available to assistive technology"
-            );
+            let mut with_badge = accessible_names(&renderer, row(true));
+            let without_badge = accessible_names(&renderer, row(false));
+            assert!(without_badge.iter().any(|name| name.contains("1 changes")),
+                "the row retains its full dirty status when the visual badge is hidden");
+            // The expanded visual badge now includes a numeric text node.
+            // Removing that auxiliary node must preserve every semantic label.
+            with_badge.retain(|name| name != "1");
+            assert_eq!(with_badge, without_badge,
+                "dirty status remains available to assistive technology");
             assert!(worktree_indicator(&worktree, true, None, None, compact, false).is_some());
         }
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
@@ -13099,7 +13102,7 @@ pub(crate) mod tests {
             let has_delete = nodes.root().iter().chain(nodes.children()).any(|node| {
                 node.node()
                     .label()
-                    .is_some_and(|name| name == "Delete merged worktree Polish sidebar")
+                    .is_some_and(|name| name == "Delete merged worktree feature")
             });
             assert_eq!(has_delete, expected, "{state:?}, primary={primary}");
         }
@@ -16340,8 +16343,8 @@ pub(crate) mod tests {
             );
             let names = accessible_names(&renderer, body(&model, &state, compact, false));
             for expected in [
-                // The row is labelled by its pull request.
-                "Deleting worktree Polish sidebar",
+                // Worktree identity retains the literal branch through PR lifecycle.
+                "Deleting worktree fix-sidebar",
                 "Deleting channel Investigation",
             ] {
                 assert!(

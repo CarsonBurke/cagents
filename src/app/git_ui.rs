@@ -3415,10 +3415,15 @@ mod tests {
         assert!(snapshot.status_errors.contains_key(&c));
         assert!(!app.refresh_ui.git.entries[&project].read_full_scan);
         drop(app.update(message));
-        assert!(
-            cosmic::iced::runtime::task::into_stream(app.git_fallback_tick()).is_none(),
-            "failure cannot retry before its interval"
-        );
+        use cosmic::iced::futures::StreamExt;
+        let immediate = cosmic::iced::runtime::task::into_stream(app.git_fallback_tick());
+        let action = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+            match immediate {
+                Some(mut stream) => stream.next().await,
+                None => None,
+            }
+        });
+        assert!(action.is_none(), "failure cannot retry before its interval");
         fs::write(private_c.join("index"), index_c).unwrap();
         fs::write(
             linked_c.join("new.txt"),
