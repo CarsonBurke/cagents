@@ -1612,6 +1612,17 @@ impl FrameCodec {
         &mut self,
         reader: &mut impl Read,
     ) -> Result<Option<T>, FrameError> {
+        self.read_with(reader, |payload| postcard::from_bytes(payload))
+    }
+
+    /// Inspect a complete frame without first allocating its owned wire type.
+    /// The callback cannot retain a borrow of the connection's scratch buffer.
+    /// Length validation and partial-read resumption are identical to `read`.
+    pub(crate) fn read_with<T>(
+        &mut self,
+        reader: &mut impl Read,
+        decode: impl FnOnce(&[u8]) -> Result<T, postcard::Error>,
+    ) -> Result<Option<T>, FrameError> {
         let length = if let Some(length) = self.payload_length {
             length
         } else {
@@ -1658,7 +1669,7 @@ impl FrameCodec {
         let started =
             tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
                 .then(std::time::Instant::now);
-        let value = postcard::from_bytes(&self.read_buffer[..length]);
+        let value = decode(&self.read_buffer[..length]);
         self.prefix_read = 0;
         self.payload_length = None;
         self.payload_read = 0;
@@ -1925,6 +1936,17 @@ mod tests {
             Some("next frame".into())
         );
         assert_eq!(codec.read::<String>(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn raw_frame_callback_rejection_preserves_next_frame_and_eof() {
+        let mut bytes=Vec::new();write_frame(&mut bytes,&vec![255u8;32]).unwrap();write_frame(&mut bytes,&"next valid frame").unwrap();
+        let mut input=Cursor::new(bytes);let mut codec=FrameCodec::new(MAX_FRAME_BYTES);
+        let result:Result<Option<()>,FrameError>=codec.read_with(&mut input,|payload| {
+            assert_eq!(payload.len(),33);Err(postcard::Error::DeserializeBadEncoding)
+        });
+        assert!(matches!(result,Err(FrameError::InvalidPayload(_))));
+        assert_eq!(codec.read::<String>(&mut input).unwrap(),Some("next valid frame".into()));assert_eq!(codec.read::<String>(&mut input).unwrap(),None);
     }
 
     #[test]
