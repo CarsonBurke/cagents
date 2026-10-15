@@ -99,6 +99,16 @@ pub(in crate::host) fn restore(registry:&super::super::model::Registry,entries:&
 fn pending(operation:uuid::Uuid,phase:PublicPhase,reason:impl Into<String>)->Result<(ServerResponse,Vec<ServerMessage>,bool),ProtocolError> {
     Ok((ServerResponse::ProjectOperation{outcome:Outcome::Pending{operation,phase,reason:reason.into()}},Vec::new(),false))
 }
+/// A COMMIT response can be lost after SQLite positively settled the row.
+/// Re-reading that exact immutable receipt releases only its original lease;
+/// it never repeats effects or lets an unrelated operation consume custody.
+fn settle_original_receipt(host:&SharedHost,operation:uuid::Uuid) {
+    if let Some((reservation,owner))=super::reservation::retained_operation(host,operation) {
+        owner.settled.store(true,Ordering::Release);
+        if let Ok(mut work)=owner.work.try_lock() {*work=Work::Complete;}
+        drop(reservation);
+    }
+}
 fn public_phase(phase:Phase)->PublicPhase {
     match phase {Phase::Admitted=>PublicPhase::Preparing,Phase::Repairing=>PublicPhase::Repairing,
         Phase::Closing=>PublicPhase::Closing,Phase::PendingCommit=>PublicPhase::PendingCommit,
@@ -121,11 +131,15 @@ pub(in crate::host) fn process(host:&SharedHost,client:ClientId,request:Request)
             if row.request_digest!=digest || row.commit_digest!=commit_digest {return Err(error("This operation belongs to another original project request"));}
             match row.phase {
                 Phase::Resolved=> {
+                    settle_original_receipt(host,request.operation);
                     let model=registry.lock().unwrap_or_else(|p|p.into_inner()).model().map_err(error)?;
                     if model.identity!=request.project.registry {return Err(error("The original operation receipt belongs to a different registry"));}
                     return Ok((ServerResponse::ProjectOperation{outcome:Outcome::Committed{operation:request.operation,model}},Vec::new(),false));
                 }
-                Phase::Aborted=>return Err(error("This operation ended before effects. Start a fresh explicit project action.")),
+                Phase::Aborted=> {
+                    settle_original_receipt(host,request.operation);
+                    return Err(error("This operation ended before effects. Start a fresh explicit project action."));
+                }
                 _=>{},
             }
             let Some((reservation,operation))=super::reservation::retained_operation(host,request.operation) else {
