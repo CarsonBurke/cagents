@@ -2852,10 +2852,9 @@ pub enum StopReport {
 pub(crate) fn terminal_spawn_recipe(
     cwd: PathBuf,
     argv: Vec<String>,
-) -> Result<LaunchRecipe, AppError> {
+) -> Result<LaunchRecipe, crate::model::LoginShellError> {
     if argv.is_empty() {
-        let mut recipe =
-            LaunchRecipe::shell(cwd).map_err(|error| AppError::new("login_shell", error))?;
+        let mut recipe = LaunchRecipe::shell(cwd)?;
         if let Some(shell) = crate::device::shell() {
             recipe.program = shell.to_owned();
         }
@@ -2906,7 +2905,8 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         TerminalCommand::Spawn { cwd, argv } => {
             let cwd = absolute_working_directory(cwd)
                 .map_err(|error| AppError::new("working_directory", error))?;
-            let recipe = terminal_spawn_recipe(cwd, argv)?;
+            let recipe = terminal_spawn_recipe(cwd, argv)
+                .map_err(|error| AppError::new("login_shell", error))?;
             let session = TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
