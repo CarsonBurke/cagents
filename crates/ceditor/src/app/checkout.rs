@@ -362,11 +362,22 @@ impl Editor {
                     destination: dialog.destination.clone(),
                     operation_id: id,
                 };
+                let consent = dialog
+                    .prepared
+                    .as_ref()
+                    .and_then(|plan| plan.creation_consent.clone());
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        RepositoryService::system("git")
-                            .resolve_worktree_request(&input, &cancellation)
-                            .map_err(|e| e.to_string())
+                        let service = RepositoryService::system("git");
+                        match consent {
+                            Some(consent) => service.resolve_worktree_request_for_pr(
+                                &input,
+                                &consent,
+                                &cancellation,
+                            ),
+                            None => service.resolve_worktree_request(&input, &cancellation),
+                        }
+                        .map_err(|e| e.to_string())
                     })
                     .await
                     .map_err(|e| e.to_string())

@@ -2426,6 +2426,11 @@ mod tests {
                 Some("feature".into()),
             );
             let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+            app.active_workspace = Some(if scoped {
+                linked.path.clone()
+            } else {
+                repository.clone()
+            });
             let (card, task) = app.add_pull_requests_card(if scoped {
                 linked.path.clone()
             } else {

@@ -367,9 +367,14 @@ impl Cagents {
         };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .resolve_worktree_request(&input, &token)
-                    .map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
+                let service = RepositoryService::system("git");
+                let resolved = match draft.pr_checkout.as_ref() {
+                    Some(origin) => {
+                        service.resolve_worktree_request_for_pr(&input, &origin.consent, &token)
+                    }
+                    None => service.resolve_worktree_request(&input, &token),
+                };
+                resolved.map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
             })
             .await
             .map_err(|error| WorktreeInputError::general(error.to_string()))
