@@ -3577,12 +3577,13 @@ fn start_terminal_view_owned(
         .as_ref()
         .map(|environment| &environment.0)
         .unwrap_or(&session.launch.environment);
-    super::account_lifecycle::ensure_launch(
+    super::account_lifecycle::ensure_launch_at_directory(
         shared,
         &session.launch.working_directory,
         effective,
         &crate::account::launch_credential_overrides(&session.launch),
         execution_environment.is_none(),
+        execution_directory.as_deref(),
     )?;
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
