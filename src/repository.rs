@@ -23,6 +23,8 @@ use std::{
 
 mod complete_inventory;
 mod pr_checkout;
+mod pr_creation;
+pub use pr_creation::PrWorktreeCreationConsent;
 pub use pr_checkout::{
     ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, PrCheckoutDisposition, PrCheckoutFailure,
     PrCheckoutFailureKind, PrCheckoutTracking, VerifiedPrCheckout,
@@ -10560,6 +10562,9 @@ struct WorktreeJournal {
     base_oid: Option<String>,
     #[serde(default)]
     existing_branch_oid: Option<String>,
+    /// Exact PR consent is durable before fetching. Ordinary payloads stay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pr_checkout: Option<PrWorktreeCreationConsent>,
     /// The administrative directory Git keeps for the created worktree,
     /// `<common dir>/worktrees/<name>`. Unlike its path, it stays with the
     /// worktree when the worktree is moved, and no two live worktrees share
@@ -10934,6 +10939,38 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         progress: &async_channel::Sender<WorktreeProgressEvent>,
     ) -> WorktreeOperationReport {
+        self.create_worktree_journaled_with_pr_consent(
+            store, request, None, generation, cancellation, progress,
+        )
+    }
+
+    /// Create the reviewed PR commit and source through the ordinary durable
+    /// creation, tracking, setup and settlement pipeline.
+    #[cfg(feature = "ui")]
+    pub fn create_worktree_journaled_for_pr(
+        &self,
+        store: &StateStore,
+        request: &CreateWorktreeRequest,
+        consent: &PrWorktreeCreationConsent,
+        generation: u64,
+        cancellation: &CancellationToken,
+        progress: &async_channel::Sender<WorktreeProgressEvent>,
+    ) -> WorktreeOperationReport {
+        self.create_worktree_journaled_with_pr_consent(
+            store, request, Some(consent), generation, cancellation, progress,
+        )
+    }
+
+    #[cfg(feature = "ui")]
+    fn create_worktree_journaled_with_pr_consent(
+        &self,
+        store: &StateStore,
+        request: &CreateWorktreeRequest,
+        consent: Option<&PrWorktreeCreationConsent>,
+        generation: u64,
+        cancellation: &CancellationToken,
+        progress: &async_channel::Sender<WorktreeProgressEvent>,
+    ) -> WorktreeOperationReport {
         let created_at = operation_timestamp();
         let emit = |stage| {
             let _ = progress.try_send(WorktreeProgressEvent {
@@ -10973,6 +11010,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return failure_report(WorktreeOperationState::MalformedPayload, error.to_string());
             }
         };
+        if let Some(consent) = consent {
+            if let Err(error) = consent.validate_request(&journal.request) {
+                emit(WorktreeProgressStage::Finished);
+                let detail = format!("PR checkout consent changed: {error}; prepare checkout again");
+                let failure = process_failure(
+                    &CommandSpec::new(&self.git), ProcessFailureKind::Io, &detail, false,
+                );
+                let mut report = failure_report(WorktreeOperationState::NotCreated, detail);
+                report.outcome = Some(WorktreeCreationOutcome::NotCreated { failure });
+                return report;
+            }
+            journal.pr_checkout = Some(consent.clone());
+        }
         let mut payload = match serde_json::to_value(&journal) {
             Ok(payload) => payload,
             Err(error) => {
@@ -11038,6 +11088,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
+            if let Some(consent) = &journal.pr_checkout {
+                if journal.existing_branch_oid.as_deref()
+                    .is_some_and(|oid| oid != consent.expected_head().as_str())
+                {
+                    return Err(ValidationError::InvalidBranch(
+                        "The existing local branch is not at the reviewed PR commit. Its history was preserved; choose another branch or explicitly open the local work instead".into(),
+                    ).into());
+                }
+            }
             // The durable identity lease must win over changed repository state:
             // a replay is still a conflict after an earlier attempt made a branch.
             if journal.existing_branch_oid.is_some()
@@ -11072,7 +11131,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     journal_write_failed = true;
                     ValidationError::Io(format!("journal write failed: {error}"))
                 })?;
-            if let BaseRevision::RemoteRef(reference) = &journal.request.base {
+            if let Some(consent) = &journal.pr_checkout {
+                self.fetch_reviewed_pr_creation_head(&journal.request, consent, &lease, cancellation)?;
+            } else if let BaseRevision::RemoteRef(reference) = &journal.request.base {
                 let remotes = self.remotes(&journal.request.repository, cancellation)?;
                 let (remote, branch) = remotes
                     .iter()
@@ -11152,6 +11213,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         return Err(git_failure(&ahead, output).into());
                     }
                 }
+            }
+            if journal.pr_checkout.as_ref()
+                .is_some_and(|consent| oid != consent.expected_head().as_str())
+            {
+                return Err(ValidationError::InvalidBase(
+                    "The PR branch no longer serves the reviewed commit; refresh the review. No worktree was created".into(),
+                ).into());
             }
             journal.base_oid = Some(oid.clone());
             // Persist intention before the first managed-directory or Git effect.
@@ -11282,7 +11350,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             self.unlock_created_worktree(&mut journal);
         }
-        finish_worktree_journal(store, &journal, &payload, created_at, &emit)
+        let report = finish_worktree_journal(store, &journal, &payload, created_at, &emit);
+        self.guard_created_pr_checkout_report(&journal, report)
     }
 
     fn prepare_worktree_journal(
@@ -11326,6 +11395,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             checkout_completed: false,
             base_oid: None,
             existing_branch_oid,
+            pr_checkout: None,
             admin_dir: None,
             outcome: None,
             warnings: Vec::new(),
@@ -11435,6 +11505,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         let admin_dir = self.created_admin_dir(journal);
         if residual.branch_exists && owned && admin_dir.is_some() {
+            if let Some(consent) = &journal.pr_checkout {
+                if let Err(error) = self.reviewed_pr_creation_endpoint(
+                    &journal.request, consent, &CancellationToken::new(),
+                ) {
+                    journal.state = WorktreeOperationState::OutcomeUnknown;
+                    journal.detail = format!("PR checkout source changed before settlement: {error}; inspect the retained worktree");
+                    journal.outcome = Some(WorktreeCreationOutcome::OutcomeUnknown { failure, residual });
+                    return;
+                }
+            }
             journal.admin_dir = admin_dir;
             journal.state = WorktreeOperationState::Created;
             journal.outcome = Some(WorktreeCreationOutcome::Created {
@@ -11639,7 +11719,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         && (!journal.checkout_completed
                             || (journal.effects_started && journal.base_oid.is_some()))
                         && ValidatedBranchName::parse(journal.request.branch.as_str()).is_ok()
-                        && journal.request.base.validate().is_ok() =>
+                        && journal.request.base.validate().is_ok()
+                        && journal.valid_pr_checkout_evidence() =>
                 {
                     journal
                 }
@@ -11673,7 +11754,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     &|_| {},
                 ));
             } else {
-                reports.push(journal.report(operation.created_at_unix_ms));
+                reports.push(self.guard_created_pr_checkout_report(
+                    &journal, journal.report(operation.created_at_unix_ms),
+                ));
             }
         }
         Ok(reports)

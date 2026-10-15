@@ -2236,3 +2236,156 @@ fn tracking_only_preserve_requires_absent_pair_and_fresh_confirmation() {
             .contains("wholly absent")
     );
 }
+
+#[cfg(feature = "ui")]
+fn creation_request(fixture: &Fixture, track: bool) -> (CreateWorktreeRequest, PrWorktreeCreationConsent, StateStore) {
+    let root = fixture.temporary.path().join("managed");
+    let consent = PrWorktreeCreationConsent::new(
+        GitHubRepoKey::new("fixture.invalid", None, "owner", "repo").unwrap(),
+        ValidatedBranchName::parse("feature").unwrap(), fixture.original.clone(), "origin".into(), track,
+    ).unwrap();
+    let request = CreateWorktreeRequest {
+        repository: fixture.root.clone(), managed_root: root.clone(), destination: root.join("reviewed"),
+        branch: ValidatedBranchName::parse("reviewed").unwrap(),
+        base: if track { BaseRevision::remote_ref("refs/remotes/origin/feature").unwrap() }
+            else { BaseRevision::object_id(fixture.original.as_str()).unwrap() },
+        track, operation_id: OperationId::new(), setup_intent: Some(WorktreeSetupIntent::default()),
+    };
+    let store = StateStore::open(fixture.temporary.path().join("creation.sqlite3"), crate::model::BootId::new("pr-creation-fixture")).unwrap();
+    (request, consent, store)
+}
+
+#[cfg(feature = "ui")]
+fn create_reviewed(fixture: &Fixture, request: &CreateWorktreeRequest, consent: &PrWorktreeCreationConsent, store: &StateStore) -> WorktreeOperationReport {
+    let (progress, _receiver) = async_channel::bounded(8);
+    fixture.service.create_worktree_journaled_for_pr(store, request, consent, 7, &CancellationToken::new(), &progress)
+}
+
+#[test]
+#[cfg(feature = "ui")]
+fn new_pr_creation_keeps_exact_reviewed_commit_tracking_and_setup_on_restart() {
+    if isolated_fixture_case(concat!(module_path!(), "::new_pr_creation_keeps_exact_reviewed_commit_tracking_and_setup_on_restart")) { return; }
+    for track in [true, false] {
+        let fixture = Fixture::new(false);
+        let (request, consent, store) = creation_request(&fixture, track);
+        let report = create_reviewed(&fixture, &request, &consent, &store);
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert!(matches!(&report.outcome, Some(WorktreeCreationOutcome::Created {worktree, ..}) if worktree.head_oid.as_deref() == Some(fixture.original.as_str())));
+        assert_eq!(git_text(&request.destination, &["rev-parse", "HEAD"]), fixture.original.as_str());
+        let upstream = fixture.service.pr_values(&request.destination, "branch.reviewed.remote", &CancellationToken::new()).unwrap();
+        assert_eq!(upstream, if track { vec!["origin".to_owned()] } else { vec![] });
+        let saved = store.journaled_worktree_operation(request.operation_id).unwrap().unwrap();
+        let journal: WorktreeJournal = serde_json::from_value(saved.payload.clone()).unwrap();
+        assert_eq!(journal.pr_checkout.as_ref(), Some(&consent));
+        assert_eq!(journal.request.setup_intent, request.setup_intent);
+        assert!(journal.valid_pr_checkout_evidence());
+        let reloaded = fixture.service.rehydrate_worktree_operations(&store).unwrap();
+        assert_eq!(reloaded[0].state, WorktreeOperationState::Created);
+        assert!(matches!(reloaded[0].outcome, Some(WorktreeCreationOutcome::Created { .. })));
+        assert_eq!(fixture.service.worktree_setup_creation(&store, request.operation_id).unwrap().unwrap().state, WorktreeOperationState::Created);
+        // Removing the optional consent keeps the old v1 JSON shape readable.
+        let mut legacy = saved.payload;
+        legacy.as_object_mut().unwrap().remove("pr_checkout");
+        let legacy: WorktreeJournal = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.pr_checkout.is_none());
+        assert!(!serde_json::to_value(legacy).unwrap().as_object().unwrap().contains_key("pr_checkout"));
+    }
+}
+
+#[test]
+#[cfg(feature = "ui")]
+fn new_pr_creation_refuses_remote_advance_before_any_worktree_effect() {
+    if isolated_fixture_case(concat!(module_path!(), "::new_pr_creation_refuses_remote_advance_before_any_worktree_effect")) { return; }
+    for track in [true, false] {
+        let fixture = Fixture::new(false);
+        let (request, consent, store) = creation_request(&fixture, track);
+        let advanced = fixture.advance(|producer| fs::write(producer.join("file"), "new PR head\n").unwrap());
+        assert_ne!(advanced, fixture.original);
+        let report = create_reviewed(&fixture, &request, &consent, &store);
+        assert_eq!(report.state, WorktreeOperationState::NotCreated, "{report:?}");
+        assert!(matches!(report.outcome, Some(WorktreeCreationOutcome::NotCreated { .. })));
+        assert!(!request.managed_root.exists());
+        assert_eq!(run_git(&fixture.root, &["show-ref", "--verify", "--quiet", "refs/heads/reviewed"]).status.code(), Some(1));
+        assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), fixture.original.as_str());
+        assert_eq!(fixture.service.rehydrate_worktree_operations(&store).unwrap()[0].state, WorktreeOperationState::NotCreated);
+    }
+}
+
+#[test]
+#[cfg(feature = "ui")]
+fn new_pr_creation_refuses_unmounted_local_ahead_without_implicit_preserve() {
+    if isolated_fixture_case(concat!(module_path!(), "::new_pr_creation_refuses_unmounted_local_ahead_without_implicit_preserve")) { return; }
+    let fixture = Fixture::new(false);
+    let (request, consent, store) = creation_request(&fixture, true);
+    run_git(&fixture.root, &["switch", "-c", "reviewed"]);
+    fs::write(fixture.root.join("file"), "local work\n").unwrap();
+    run_git(&fixture.root, &["commit", "-qam", "local ahead"]);
+    let local = git_text(&fixture.root, &["rev-parse", "HEAD"]);
+    run_git(&fixture.root, &["switch", "feature"]);
+    fixture.intercept(|command| assert!(!command.arguments.iter().any(|arg| arg == "fetch"), "local history refusal precedes fetch"));
+    let report = create_reviewed(&fixture, &request, &consent, &store);
+    assert_eq!(report.state, WorktreeOperationState::NotCreated, "{report:?}");
+    assert!(report.detail.contains("existing local branch"), "{}", report.detail);
+    assert!(!request.managed_root.exists());
+    assert_eq!(git_text(&fixture.root, &["rev-parse", "refs/heads/reviewed"]), local);
+}
+
+#[test]
+#[cfg(feature = "ui")]
+fn new_pr_creation_retains_unknown_after_delayed_source_change() {
+    if isolated_fixture_case(concat!(module_path!(), "::new_pr_creation_retains_unknown_after_delayed_source_change")) { return; }
+    for phase in ["fetch", "unlock"] {
+    let fixture = Fixture::new(false);
+    let (request, consent, store) = creation_request(&fixture, true);
+    let root = fixture.root.clone();
+    let mut swapped = false;
+    fixture.intercept(move |command| {
+        if !swapped && command.arguments.iter().any(|arg| arg == phase) {
+            swapped = true;
+            if phase == "fetch" {
+                assert!(command.environment.values().any(|value| value == "https://fixture.invalid/owner/repo.git"));
+            }
+            run_git(&root, &["remote", "set-url", "origin", "https://fixture.invalid/other/repo.git"]);
+        }
+    });
+    let report = create_reviewed(&fixture, &request, &consent, &store);
+    assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{report:?}");
+    assert!(!matches!(report.outcome, Some(WorktreeCreationOutcome::Created { .. })));
+    assert_eq!(git_text(&request.destination, &["rev-parse", "HEAD"]), fixture.original.as_str());
+    assert_eq!(git_text(&fixture.root, &["config", "remote.origin.url"]), "https://fixture.invalid/other/repo.git");
+    let saved = store.journaled_worktree_operation(request.operation_id).unwrap().unwrap();
+    let journal: WorktreeJournal = serde_json::from_value(saved.payload).unwrap();
+    assert_eq!(journal.pr_checkout, Some(consent));
+    assert_eq!(fixture.service.rehydrate_worktree_operations(&store).unwrap()[0].state, WorktreeOperationState::OutcomeUnknown);
+    }
+}
+
+#[test]
+#[cfg(feature = "ui")]
+fn new_pr_creation_restart_rejects_changed_source_head_and_forged_consent() {
+    if isolated_fixture_case(concat!(module_path!(), "::new_pr_creation_restart_rejects_changed_source_head_and_forged_consent")) { return; }
+    for change in ["source", "head", "payload"] {
+        let fixture = Fixture::new(false);
+        let (request, consent, store) = creation_request(&fixture, true);
+        assert_eq!(create_reviewed(&fixture, &request, &consent, &store).state, WorktreeOperationState::Created);
+        match change {
+            "source" => { run_git(&fixture.root, &["remote", "set-url", "origin", "https://fixture.invalid/other/repo.git"]); }
+            "head" => {
+                fs::write(request.destination.join("file"), "changed after completion\n").unwrap();
+                run_git(&request.destination, &["commit", "-qam", "later work"]);
+            }
+            _ => {
+                let saved = store.journaled_worktree_operation(request.operation_id).unwrap().unwrap();
+                let mut changed = saved.payload.clone();
+                changed["pr_checkout"]["expected_head"] = serde_json::json!("f".repeat(40));
+                store.update_operation(request.operation_id, &saved.payload, &changed, PendingOperationStatus::Applied).unwrap();
+            }
+        }
+        let before = git_text(&request.destination, &["rev-parse", "HEAD"]);
+        let report = fixture.service.rehydrate_worktree_operations(&store).unwrap().remove(0);
+        assert!(!matches!(report.outcome, Some(WorktreeCreationOutcome::Created { .. })), "{change}: {report:?}");
+        assert_eq!(report.state, if change == "payload" { WorktreeOperationState::MalformedPayload } else { WorktreeOperationState::OutcomeUnknown });
+        assert!(fixture.service.worktree_setup_creation(&store, request.operation_id).is_err());
+        assert_eq!(git_text(&request.destination, &["rev-parse", "HEAD"]), before);
+    }
+}

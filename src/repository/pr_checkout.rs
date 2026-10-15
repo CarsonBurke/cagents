@@ -197,7 +197,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         effect::reconcile(self, plan, cancellation)
     }
 
-    fn pr_values(
+    pub(super) fn pr_values(
         &self,
         worktree: &Path,
         key: &str,
