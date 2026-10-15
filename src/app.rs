@@ -7250,14 +7250,33 @@ impl Cagents {
     }
 
     fn agent_worktree(&self, card: CardId) -> Option<ActiveWorktreeKey> {
-        let state = self
-            .card_state(card)
-            .filter(|state| state.existence.is_open())?;
-        if !matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_)) {
+        let state = self.card_state(card)?;
+        let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
+        let roots = self.indexed_worktree_roots();
+        self.agent_worktree_indexed(state, &locations, &roots)
+    }
+
+    fn agent_worktree_indexed(
+        &self,
+        state: &CardState,
+        locations: &crate::workspace_model::views::AttentionDirectoryIndex<'_>,
+        roots: &worktree_ui::WorktreeRoots<'_>,
+    ) -> Option<ActiveWorktreeKey> {
+        if !state.existence.is_open() || !matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_)) {
             return None;
         }
-        self.sidebar_model
-            .worktree_at(self.unchanneled_card_worktree(state)?)
+        // Explicit filing remains display authority. Verified operational
+        // location only replaces the historical launch-directory fallback.
+        if self.worktree_owners.contains_key(&state.id) || self.durable.card_scopes.contains_key(&state.id) {
+            return self.sidebar_model.worktree_at(self.unchanneled_card_worktree(state)?);
+        }
+        use crate::workspace_model::views::AttentionDirectory;
+        let directory = match locations.directory(state) {
+            AttentionDirectory::Verified(directory) => directory,
+            AttentionDirectory::Launch => card_directory(state)?,
+            AttentionDirectory::Unavailable => return None,
+        };
+        self.sidebar_model.worktree_at(roots.resolve(directory).unwrap_or(directory))
     }
 
     /// Reconcile only when repository roots change, not on runtime/frame wakes.
@@ -7283,6 +7302,7 @@ impl Cagents {
                 .ancestors()
                 .find_map(|ancestor| roots.get(ancestor).copied())
         };
+        let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
         let owners: Vec<_> = self
             .durable
             .cards
@@ -7296,11 +7316,14 @@ impl Cagents {
                 let owner = if let Some(scope) = self.durable.card_scopes.get(&card.id) {
                     resolve(scope)
                 } else {
-                    card_directory(card).and_then(resolve).or_else(|| {
-                        self.worktree_owners
-                            .get(&card.id)
-                            .and_then(|scope| resolve(scope))
-                    })
+                    use crate::workspace_model::views::AttentionDirectory;
+                    let directory = match locations.directory(card) {
+                        AttentionDirectory::Verified(directory) => Some(directory),
+                        AttentionDirectory::Launch => card_directory(card),
+                        AttentionDirectory::Unavailable => None,
+                    };
+                    self.worktree_owners.get(&card.id).and_then(|scope| resolve(scope))
+                        .or_else(|| directory.and_then(resolve))
                 };
                 (card.id, owner)
             })
@@ -14445,8 +14468,10 @@ impl Application for Cagents {
                         self.mark_cards_read(cards)
                     }
                     SidebarAction::MarkWorktreeRead(project, worktree) => {
+                        let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
+                        let roots = self.indexed_worktree_roots();
                         let cards = self.durable.cards.iter().filter(|card| card.existence.is_open())
-                            .filter(|card| self.agent_worktree(card.id).is_some_and(|key| key.project_id == project && key.worktree_id == worktree))
+                            .filter(|card| self.agent_worktree_indexed(card, &locations, &roots).is_some_and(|key| key.project_id == project && key.worktree_id == worktree))
                             .map(|card| card.id).collect();
                         self.mark_cards_read(cards)
                     }

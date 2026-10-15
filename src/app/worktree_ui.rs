@@ -25,7 +25,7 @@ impl<'a> WorktreeRoots<'a> {
         }
     }
 
-    fn resolve(&self, directory: &Path) -> Option<&'a Path> {
+    pub(super) fn resolve(&self, directory: &Path) -> Option<&'a Path> {
         directory
             .ancestors()
             .find_map(|ancestor| self.roots.get(ancestor).copied())
