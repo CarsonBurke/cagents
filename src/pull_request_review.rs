@@ -43,6 +43,7 @@ use crate::{
 type ActionTask = iced::Task<Action>;
 
 pub mod cache;
+pub mod completion;
 pub mod checkout;
 pub mod discussion;
 pub mod discussion_ui;
@@ -78,11 +79,18 @@ pub struct CheckoutTarget {
     pub repository: PathBuf,
     pub number: u64,
     pub head: crate::repository::Oid,
+    pub pull_request: Option<PullRequestKey>,
+    pub head_ref_name: String,
 }
 
 impl CheckoutTarget {
+    /// A caller without a forge identity can still request a local commit checkout.
+    pub fn read_only(repository: PathBuf, number: u64, head: crate::repository::Oid) -> Self {
+        Self { repository, number, head, pull_request: None, head_ref_name: String::new() }
+    }
+
     pub fn suggested_branch(&self) -> String {
-        format!("pr/{}-{}", self.number, &self.head.as_str()[..8])
+        if self.head_ref_name.is_empty() { format!("pr/{}", self.number) } else { self.head_ref_name.clone() }
     }
 }
 
@@ -105,6 +113,7 @@ pub enum ViewedSync {
 pub struct ReviewFile {
     pub entry: DiffEntry,
     pub viewed: bool,
+    pub changed_since_viewed: bool,
     pub sync: ViewedSync,
 }
 
@@ -117,6 +126,8 @@ pub struct Loaded {
     pub next_file_cursor: Option<String>,
     pub range: PullRequestRange,
     pub entries: Vec<DiffEntry>,
+    /// A cheap unchanged refresh can leave the already loaded conversation intact.
+    pub discussion_stamp: Option<String>,
 }
 
 /// The state of the load that owns the file list.
@@ -157,6 +168,7 @@ pub enum Action {
         action: Box<Action>,
     },
     Discussion(discussion_ui::Action),
+    Completion(completion::Action),
     SetSource(Option<ReviewSource>),
     Cached {
         generation: u64,
@@ -165,12 +177,16 @@ pub enum Action {
     CacheSaved {
         generation: u64,
         order: u64,
+        draft_version: Option<String>,
         result: Result<(), String>,
     },
+    RetryCacheSave,
     /// A shell without its own list asks it to (re)load.
     LoadList,
     LoadMore,
     BrowserQuery(String),
+    BrowserSearch(String),
+    BrowserFocused,
     BrowserFilterIndex(usize),
     ListLoaded {
         generation: u64,
@@ -203,6 +219,7 @@ pub enum Action {
     PreviousChange,
     SetFileListMode(FileListMode),
     ToggleHideViewed,
+    ToggleChangedSinceViewed,
     ToggleViewed(RepoPath),
     SetDirectoryViewed {
         directory: RepoPath,
@@ -214,6 +231,12 @@ pub enum Action {
         generation: u64,
         authority_revision: u64,
         results: Vec<(RepoPath, bool, ViewedOutcome)>,
+    },
+    ViewedBatchSummary {
+        generation: u64,
+        authority_revision: u64,
+        failed: usize,
+        total: usize,
     },
     OpenUrl(Url),
     Checkout,
@@ -233,11 +256,21 @@ impl Action {
                 | Self::Cached { .. }
                 | Self::CacheSaved { .. }
                 | Self::ViewedApplied { .. }
+                | Self::Discussion(discussion_ui::Action::SuggestionLines { .. } | discussion_ui::Action::SuggestionPreview { .. } | discussion_ui::Action::SuggestionApplied { .. })
+                | Self::Completion(completion::Action::Loaded { .. } | completion::Action::Candidates { .. } | completion::Action::Finished { .. } | completion::Action::Search { .. })
+                | Self::ViewedBatchSummary { .. }
                 | Self::Discussion(
-                    discussion_ui::Action::Loaded { .. } | discussion_ui::Action::Finished { .. }
+                    discussion_ui::Action::Loaded { .. } | discussion_ui::Action::Finished { .. } | discussion_ui::Action::Reanchored { .. }
                 )
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupHead {
+    pub repository: GitHubRepoKey,
+    pub branch: String,
+    pub head: Oid,
 }
 
 /// Work the shell carries out on the state's behalf.
@@ -255,6 +288,7 @@ pub enum Effect {
     PreviousChange,
     OpenUrl(Url),
     Checkout(CheckoutTarget),
+    CleanupMergedHead(CleanupHead),
     /// Which pull request is under review changed; `None` after `Close`.
     SelectionChanged(Option<u64>),
     /// A discussion of the whole file opened above the first diff row, so
@@ -381,11 +415,14 @@ impl ReviewSource {
 pub struct State {
     unavailable_reason: Option<String>,
     discussion: discussion_ui::DiscussionState,
+    completion: completion::Controls,
     parked_discussions: Vec<(ReviewTarget, discussion_ui::DiscussionState)>,
     api: Arc<dyn GitHubReviewApi>,
     cache: Option<Arc<dyn cache::Store>>,
     cache_dirty: bool,
     cache_order: u64,
+    cache_owner: String,
+    cache_save_error: bool,
     cache_loading: bool,
     cached_viewer: Option<String>,
     restore_selection: Option<RepoPath>,
@@ -399,6 +436,8 @@ pub struct State {
     list_loading: bool,
     list_appending: bool,
     list_error: Option<String>,
+    list_last_refresh: Option<Instant>,
+    list_loaded_query: Option<String>,
     browser_query: String,
     browser_keys: BTreeMap<u64, (String, String)>,
     browser_viewport: (f32, f32),
@@ -413,10 +452,13 @@ pub struct State {
     load_generation: u64,
     last_refresh: Option<Instant>,
     cancellation: CancellationToken,
+    viewed_cancellation: CancellationToken,
     load: LoadState,
     /// True while a refresh runs behind an already listed set of files.
     refreshing: bool,
     context: Option<ReviewContext>,
+    loaded_snapshot: Option<Arc<Loaded>>,
+    force_conversation: bool,
     authority_revision: u64,
     range: Option<PullRequestRange>,
     files: Vec<ReviewFile>,
@@ -427,6 +469,7 @@ pub struct State {
     rows: Vec<Row>,
     file_list_mode: FileListMode,
     hide_viewed: bool,
+    only_changed_since_viewed: bool,
     collapsed_directories: BTreeSet<RepoPath>,
     selected: Option<RepoPath>,
     notice: Option<String>,
@@ -449,6 +492,7 @@ impl std::fmt::Debug for State {
 impl Drop for State {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        self.viewed_cancellation.cancel();
         self.list_cancellation.cancel();
     }
 }
@@ -460,7 +504,7 @@ impl State {
     }
 
     fn adopt_cache(&mut self, snapshot: cache::Snapshot) {
-        let Some(target) = &self.target else {
+        let Some(target) = self.target.clone() else {
             return;
         };
         if snapshot.validate().is_err()
@@ -469,6 +513,7 @@ impl State {
         {
             return;
         }
+        self.restore_drafts(snapshot.drafts.clone(), snapshot.drafts_version.clone());
         self.restore_selection = snapshot.selected.clone();
         // A browser row may already know a newer head. Keep only the path
         // preference in that case; cached marks belong to the old head.
@@ -487,6 +532,7 @@ impl State {
             .map(|file| ReviewFile {
                 entry: file.entry.clone(),
                 viewed: file.viewed,
+                changed_since_viewed: file.changed_since_viewed,
                 sync: if snapshot.unknown_paths.contains(&file.entry.path) {
                     ViewedSync::Unknown
                 } else if file.unverified {
@@ -528,6 +574,9 @@ impl State {
             return ActionTask::none();
         };
         let write_order = cache::WriteOrder::capture();
+        let draft_version = self
+            .drafts_need_save()
+            .then(|| uuid::Uuid::new_v4().to_string());
         let snapshot = cache::Snapshot {
             key,
             viewer,
@@ -539,6 +588,7 @@ impl State {
                 .map(|file| cache::File {
                     entry: file.entry.clone(),
                     viewed: file.viewed,
+                    changed_since_viewed: file.changed_since_viewed,
                     unverified: file.sync != ViewedSync::Settled,
                 })
                 .collect(),
@@ -549,6 +599,11 @@ impl State {
                 .map(|file| file.entry.path.clone())
                 .collect(),
             selected: self.selected.clone(),
+            drafts: self.local_drafts(),
+            drafts_changed: self.drafts_need_save(),
+            drafts_owner: Some(self.cache_owner.clone()),
+            drafts_version: draft_version.clone(),
+            drafts_basis: self.draft_cache_basis(),
             saved_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -570,6 +625,7 @@ impl State {
                 Action::CacheSaved {
                     generation,
                     order,
+                    draft_version,
                     result,
                 }
             },
@@ -581,11 +637,14 @@ impl State {
         Self {
             unavailable_reason: None,
             discussion: discussion_ui::DiscussionState::default(),
+            completion: completion::Controls::default(),
             parked_discussions: Vec::new(),
             api,
             cache: None,
             cache_dirty: false,
             cache_order: 0,
+            cache_owner: uuid::Uuid::new_v4().to_string(),
+            cache_save_error: false,
             cache_loading: false,
             cached_viewer: None,
             restore_selection: None,
@@ -598,6 +657,8 @@ impl State {
             list_loading: false,
             list_appending: false,
             list_error: None,
+            list_last_refresh: None,
+            list_loaded_query: None,
             browser_query: String::new(),
             browser_keys: BTreeMap::new(),
             browser_viewport: (0.0, 480.0),
@@ -608,9 +669,12 @@ impl State {
             load_generation: 0,
             last_refresh: None,
             cancellation: CancellationToken::new(),
+            viewed_cancellation: CancellationToken::new(),
             load: LoadState::Idle,
             refreshing: false,
             context: None,
+            loaded_snapshot: None,
+            force_conversation: true,
             authority_revision: 0,
             range: None,
             files: Vec::new(),
@@ -621,6 +685,7 @@ impl State {
             rows: Vec::new(),
             file_list_mode: FileListMode::Tree,
             hide_viewed: false,
+            only_changed_since_viewed: false,
             collapsed_directories: BTreeSet::new(),
             selected: None,
             notice: None,
@@ -645,6 +710,8 @@ impl State {
         self.list_cursor = None;
         self.list_loading = false;
         self.list_error = None;
+        self.list_last_refresh = None;
+        self.list_loaded_query = None;
         self.browser_query.clear();
         self.browser_keys.clear();
         self.browser_viewport.0 = 0.0;
@@ -660,8 +727,19 @@ impl State {
         self.source.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn browser_is_refreshing(&self) -> bool {
+        self.list_loading
+    }
+
     pub fn list(&self) -> &ListState {
         &self.list
+    }
+
+    pub fn selection_generation(&self) -> u64 { self.generation }
+
+    pub fn report_checkout_error(&mut self, error: String) {
+        self.notice=Some(format!("Could not prepare PR checkout. {error}"));
     }
 
     pub fn target(&self) -> Option<&ReviewTarget> {
@@ -762,14 +840,26 @@ impl State {
             Action::CacheSaved {
                 generation,
                 order,
+                draft_version,
                 result,
             } => {
-                if generation == self.generation
-                    && order == self.cache_order
-                    && let Err(error) = result
-                {
-                    self.notice = Some(format!("Could not save review cache: {error}"));
+                if generation == self.generation && order == self.cache_order {
+                    match result {
+                        Ok(()) => {
+                            self.cache_save_error = false;
+                            self.drafts_cache_saved(draft_version);
+                        }
+                        Err(error) => {
+                            self.cache_save_error = true;
+                            self.notice = Some(format!("Could not save review draft: {error}"))
+                        }
+                    }
                 }
+                ActionTask::none()
+            }
+            Action::RetryCacheSave => {
+                self.cache_dirty = true;
+                self.cache_save_error = false;
                 ActionTask::none()
             }
             Action::BrowserFenced { generation, action } => {
@@ -789,16 +879,49 @@ impl State {
                 self.update(*action)
             }
             Action::Discussion(action) => self.update_discussion(action),
+            Action::Completion(action) => self.update_completion(action),
             Action::SetSource(source) => self.set_source(source),
+            Action::BrowserFocused => {
+                if self.target.is_none()
+                    && !self.list_loading
+                    && self.source.as_ref().is_some_and(|source| {
+                        crate::github::polling::ready(&source.repository.host, false)
+                    })
+                {
+                    self.load_list()
+                } else {
+                    ActionTask::none()
+                }
+            }
             Action::LoadList => self.load_list(),
             Action::LoadMore => self.load_list_page(true),
             Action::BrowserQuery(query) => {
-                self.browser_query = query;
+                self.browser_query = query.clone();
+                self.list_cursor = None;
                 self.browser_viewport.0 = 0.0;
-                iced::widget::operation::scroll_to(
-                    widget::Id::new("pr.browser"),
-                    iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
-                )
+                self.list_cancellation.cancel();
+                self.list_generation = self.list_generation.wrapping_add(1);
+                self.list_loading = false;
+                ActionTask::batch([
+                    iced::widget::operation::scroll_to(
+                        widget::Id::new("pr.browser"),
+                        iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
+                    ),
+                    ActionTask::perform(
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            Action::BrowserSearch(query)
+                        },
+                        |action| action,
+                    ),
+                ])
+            }
+            Action::BrowserSearch(query) => {
+                if self.browser_query == query {
+                    self.load_list()
+                } else {
+                    ActionTask::none()
+                }
             }
             Action::BrowserViewport { offset, height } => {
                 self.browser_viewport = (offset, height);
@@ -821,6 +944,10 @@ impl State {
                 self.list_loading = false;
                 match result {
                     Ok(page) => {
+                        self.list_loaded_query = Some(self.browser_query.trim().to_owned());
+                        if let Some(source) = &self.source {
+                            crate::github::polling::succeeded(&source.repository.host);
+                        }
                         self.list_cursor = page.next_cursor;
                         let mut rows = if self.list_appending {
                             match std::mem::replace(&mut self.list, ListState::Idle) {
@@ -860,7 +987,10 @@ impl State {
                     Err(message) => self.list = ListState::Failed(message),
                 }
                 // A partial page cannot establish which PR refs are obsolete.
-                if self.list_cursor.is_none() && self.list_error.is_none() {
+                if self.browser_query.trim().is_empty()
+                    && self.list_cursor.is_none()
+                    && self.list_error.is_none()
+                {
                     self.prune_fetched_refs()
                 } else {
                     ActionTask::none()
@@ -895,7 +1025,23 @@ impl State {
                 self.refreshing = false;
                 match result {
                     Ok(loaded) => {
+                        let unchanged_conversation = !self.force_conversation
+                            && loaded.context.pending.is_none()
+                            && self.discussion.has_conversation()
+                            && self.loaded_snapshot.as_ref().is_some_and(|previous| {
+                                loaded.discussion_stamp.is_some()
+                                    && loaded.discussion_stamp == previous.discussion_stamp
+                                    && same_diff_authority(&loaded.context, &previous.context)
+                            });
+                        self.force_conversation = false;
+                        self.loaded_snapshot = Some(loaded.clone());
                         self.adopt(&loaded);
+                        if unchanged_conversation {
+                            if let Some(target) = &self.target {
+                                crate::github::polling::succeeded(&target.repository.host);
+                            }
+                            return ActionTask::none();
+                        }
                         return self.load_discussion();
                     }
                     Err(message) => {
@@ -910,12 +1056,27 @@ impl State {
             }
             Action::Refresh => self.refresh(),
             Action::RefreshIfDue(now) => {
+                if self.target.is_none()
+                    && self.source.as_ref().is_some_and(|source| {
+                        crate::github::polling::ready(&source.repository.host, false)
+                    })
+                    && !self.list_loading
+                    && self.list_last_refresh.is_none_or(|last| {
+                        now.saturating_duration_since(last) >= Duration::from_secs(30)
+                    })
+                {
+                    return self.load_list();
+                }
                 if !self.refreshing
+                    && !self.discussion_is_busy()
+                    && self.target.as_ref().is_some_and(|target| {
+                        crate::github::polling::ready(&target.repository.host, false)
+                    })
                     && self.last_refresh.is_some_and(|last| {
                         now.saturating_duration_since(last) >= Duration::from_secs(30)
                     })
                 {
-                    self.refresh()
+                    self.refresh_mode(false)
                 } else {
                     ActionTask::none()
                 }
@@ -958,6 +1119,11 @@ impl State {
                 self.rebuild_rows();
                 ActionTask::none()
             }
+            Action::ToggleChangedSinceViewed => {
+                self.only_changed_since_viewed = !self.only_changed_since_viewed;
+                self.pages.offset = 0.0;
+                ActionTask::none()
+            }
             Action::ToggleHideViewed => {
                 self.hide_viewed = !self.hide_viewed;
                 ActionTask::none()
@@ -985,6 +1151,8 @@ impl State {
                     return ActionTask::none();
                 };
                 if self.files[index].sync == ViewedSync::Unknown {
+                    self.notice = Some("Viewed state is still loading. Wait for the remaining files, then try again.".into());
+                    self.pages.hydrate_all = true;
                     return ActionTask::none();
                 }
                 let viewed = !self.files[index].viewed;
@@ -1002,6 +1170,11 @@ impl State {
                 if generation != self.generation || authority_revision != self.authority_revision {
                     return ActionTask::none();
                 }
+                let failures = results
+                    .iter()
+                    .filter(|(_, _, outcome)| !matches!(outcome, ViewedOutcome::Applied))
+                    .count();
+                let total = results.len();
                 for (path, viewed, outcome) in results {
                     let Some(index) = self.file_index(&path) else {
                         continue;
@@ -1009,6 +1182,7 @@ impl State {
                     let file = &mut self.files[index];
                     match outcome {
                         ViewedOutcome::Applied => {
+                            file.changed_since_viewed = false;
                             file.sync = ViewedSync::Settled;
                         }
                         ViewedOutcome::NotApplied(message) => {
@@ -1029,7 +1203,30 @@ impl State {
                         }
                     }
                 }
+                if failures > 0 && total > 1 {
+                    let detail = self.notice.take().unwrap_or_default();
+                    self.notice = Some(format!(
+                        "{failures} of {total} files in this batch could not be marked. {detail}"
+                    ));
+                }
                 self.cache_dirty = true;
+                ActionTask::none()
+            }
+            Action::ViewedBatchSummary {
+                generation,
+                authority_revision,
+                failed,
+                total,
+            } => {
+                if generation == self.generation
+                    && authority_revision == self.authority_revision
+                    && failed > 0
+                {
+                    let detail = self.notice.take().unwrap_or_default();
+                    self.notice = Some(format!(
+                        "{failed} of {total} files could not be marked. {detail}"
+                    ));
+                }
                 ActionTask::none()
             }
             Action::OpenUrl(url) => {
@@ -1046,6 +1243,8 @@ impl State {
                         repository: target.worktree.clone(),
                         number: target.pull_request.number,
                         head: range.head.clone(),
+                        pull_request: Some(PullRequestKey::new(target.repository.clone(), target.pull_request.number).expect("validated PR identity")),
+                        head_ref_name: target.pull_request.head_ref_name.clone(),
                     }));
                 }
                 ActionTask::none()
@@ -1111,6 +1310,9 @@ impl State {
         let Some(source) = self.source.clone() else {
             return ActionTask::none();
         };
+        if !crate::github::polling::ready(&source.repository.host, true) {
+            return ActionTask::none();
+        }
         self.list_cancellation.cancel();
         self.list_cancellation = CancellationToken::new();
         let cancellation = self.list_cancellation.clone();
@@ -1122,17 +1324,53 @@ impl State {
             None
         };
         self.list_loading = true;
+        self.list_last_refresh = Some(Instant::now());
         self.list_appending = append;
         self.list_error = None;
         if !matches!(self.list, ListState::Ready(_)) {
             self.list = ListState::Loading;
         }
         let api = Arc::clone(&self.api);
+        let query = self.browser_query.trim().to_owned();
+        let page_limit = if append || self.list_loaded_query.as_deref() != Some(query.as_str()) {
+            1
+        } else {
+            match &self.list {
+                ListState::Ready(rows) => rows.len().div_ceil(50).max(1),
+                _ => 1,
+            }
+        };
         ActionTask::perform(
             async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    api.pull_request_page(&source.repository, cursor.as_deref(), &cancellation)
-                        .map_err(|error| error.to_string())
+                    let mut cursor = cursor;
+                    let mut rows = Vec::new();
+                    for _ in 0..page_limit {
+                        let page = if query.is_empty() {
+                            api.pull_request_page(
+                                &source.repository,
+                                cursor.as_deref(),
+                                &cancellation,
+                            )
+                        } else {
+                            api.search_pull_requests(
+                                &source.repository,
+                                &query,
+                                cursor.as_deref(),
+                                &cancellation,
+                            )
+                        }
+                        .map_err(|error| error.to_string())?;
+                        rows.extend(page.pull_requests);
+                        cursor = page.next_cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+                    Ok(PullRequestPage {
+                        pull_requests: rows,
+                        next_cursor: cursor,
+                    })
                 })
                 .await
                 .unwrap_or_else(|error| Err(format!("pull request list task failed: {error}")));
@@ -1218,8 +1456,10 @@ impl State {
     }
 
     fn reset_target(&mut self) {
+        self.completion.reset();
         self.cache_loading = false;
         self.cache_dirty = false;
+        self.cache_save_error = false;
         self.cached_viewer = None;
         self.restore_selection = None;
         let discussion = std::mem::take(&mut self.discussion);
@@ -1231,6 +1471,8 @@ impl State {
         }
         self.cancellation.cancel();
         self.cancellation = CancellationToken::new();
+        self.viewed_cancellation.cancel();
+        self.viewed_cancellation = CancellationToken::new();
         self.generation = self.generation.wrapping_add(1);
         self.load_generation = 0;
         self.last_refresh = None;
@@ -1238,6 +1480,8 @@ impl State {
         self.load = LoadState::Idle;
         self.refreshing = false;
         self.context = None;
+        self.loaded_snapshot = None;
+        self.force_conversation = true;
         self.range = None;
         self.files.clear();
         self.pages = file_pages::Pages::default();
@@ -1255,7 +1499,24 @@ impl State {
     }
 
     fn refresh(&mut self) -> ActionTask {
-        if self.target.is_none() {
+        self.refresh_mode(true)
+    }
+
+    fn refresh_mode(&mut self, manual: bool) -> ActionTask {
+        self.force_conversation |= manual;
+        if self.target.is_none() || self.discussion_is_busy() {
+            return ActionTask::none();
+        }
+        if !self
+            .target
+            .as_ref()
+            .is_some_and(|target| crate::github::polling::ready(&target.repository.host, manual))
+        {
+            self.notice = self
+                .target
+                .as_ref()
+                .and_then(|target| crate::github::polling::rate_limit(&target.repository.host))
+                .map(|limit| limit.to_string());
             return ActionTask::none();
         }
         match self.load {
@@ -1280,10 +1541,30 @@ impl State {
         let cancellation = self.cancellation.clone();
         let api = Arc::clone(&self.api);
         let git = self.git.clone();
+        let previous = self.loaded_snapshot.clone();
         ActionTask::perform(
             async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    load_review(api.as_ref(), &git, &target, &cancellation).map(Arc::new)
+                    let result = load_review(
+                        api.as_ref(),
+                        &git,
+                        &target,
+                        previous.as_deref(),
+                        &cancellation,
+                    );
+                    match &result {
+                        Ok(_) => {}
+                        Err(message)
+                            if crate::github::polling::ready(&target.repository.host, false) =>
+                        {
+                            crate::github::polling::failed(
+                                &target.repository.host,
+                                &crate::github::GitHubError::Inspection(message.clone()),
+                            )
+                        }
+                        Err(_) => {}
+                    }
+                    result.map(Arc::new)
                 })
                 .await
                 .unwrap_or_else(|error| Err(format!("review load task failed: {error}")));
@@ -1301,16 +1582,21 @@ impl State {
     /// is not undone by the older answer a refresh may return.
     fn adopt(&mut self, loaded: &Loaded) {
         if let Some(target) = &mut self.target {
+            self.cache_dirty |= *target.pull_request != loaded.pull_request;
             target.pull_request = Arc::new(loaded.pull_request.clone());
         }
         self.cache_loading = false;
         self.cached_viewer = None;
         self.notice = None;
-        self.cache_dirty = true;
-        let previous: HashMap<RepoPath, (bool, ViewedSync)> = self
+        let entries_changed = self
+            .files
+            .iter()
+            .map(|f| &f.entry)
+            .ne(loaded.entries.iter());
+        let previous: HashMap<RepoPath, (bool, ViewedSync, bool)> = self
             .files
             .drain(..)
-            .map(|file| (file.entry.path, (file.viewed, file.sync)))
+            .map(|file| (file.entry.path, (file.viewed, file.sync, file.changed_since_viewed)))
             .collect();
         // The open file compares against the whole basis, which the base
         // moving under the pull request changes as surely as a new head.
@@ -1324,12 +1610,23 @@ impl State {
                 || previous.base_oid != loaded.context.base_oid
                 || previous.viewer != loaded.context.viewer
         });
-        self.pages = file_pages::Pages {
-            cursor: loaded.next_file_cursor.clone(),
-            offset: self.pages.offset,
-            height: self.pages.height,
-            ..Default::default()
-        };
+        if authority_changed {
+            self.viewed_cancellation.cancel();
+            self.viewed_cancellation = CancellationToken::new();
+            self.pages = file_pages::Pages {
+                cursor: loaded.next_file_cursor.clone(),
+                offset: self.pages.offset,
+                height: self.pages.height,
+                // A new head invalidates all later marks. Hydrate them in the
+                // background rather than requiring the reader to scroll first.
+                hydrate_all: self.context.is_some(),
+                ..Default::default()
+            };
+        } else {
+            // The cursor and completed pages still describe this exact revision.
+            // A refresh must not restart pagination merely to recover old marks.
+            self.pages.loading = false;
+        }
         self.files = join_files(&loaded.entries, &loaded.files);
         if loaded.next_file_cursor.is_some() {
             let known: BTreeSet<&str> = loaded
@@ -1346,12 +1643,20 @@ impl State {
         }
         for file in &mut self.files {
             if !authority_changed
-                && let Some((viewed, ViewedSync::Pending)) = previous.get(&file.entry.path)
+                && let Some((viewed, sync, changed)) = previous.get(&file.entry.path)
+                && (*sync == ViewedSync::Pending || file.sync == ViewedSync::Unknown)
             {
                 file.viewed = *viewed;
-                file.sync = ViewedSync::Pending;
+                file.changed_since_viewed = *changed;
+                file.sync = *sync;
             }
         }
+        self.cache_dirty |= authority_changed
+            || entries_changed
+            || self
+                .files
+                .iter()
+                .any(|file| previous.get(&file.entry.path) != Some(&(file.viewed, file.sync, file.changed_since_viewed)));
         self.files_truncated = loaded.files.truncated;
         self.rebuild_rows();
         if authority_changed {
@@ -1517,14 +1822,19 @@ impl State {
         self.select_file(self.files[index].entry.path.clone());
     }
 
-    /// Flips the marks optimistically and sends them to GitHub in one
-    /// sequential task: a directory of fifty files is fifty `gh` runs, and
-    /// running them at once would only contend for the same permits.
+    /// Optimistic marks settle one bounded aliased mutation chunk at a time.
+    /// Authority is checked once; each chunk yields progress back to the UI.
     fn set_viewed(&mut self, indices: Vec<usize>, viewed: bool) -> ActionTask {
         if indices
             .iter()
             .any(|index| self.files[*index].sync == ViewedSync::Unknown)
         {
+            self.notice = Some(
+                "Viewed state is still loading. Wait for the remaining files, then try again."
+                    .into(),
+            );
+            self.pages.error = None;
+            self.pages.hydrate_all = true;
             return ActionTask::none();
         }
         let (Some(target), Some(context)) = (&self.target, &self.context) else {
@@ -1551,66 +1861,97 @@ impl State {
         let authority = discussion::Authority {
             target: target.clone(),
             context: context.clone(),
+            merge_base: self.range.as_ref().map(|range| range.merge_base.clone()),
         };
         let git = self.git.clone();
         let api = Arc::clone(&self.api);
-        let cancellation = self.cancellation.clone();
+        let cancellation = self.viewed_cancellation.clone();
         let generation = self.generation;
-        // If the blocking task itself is lost, the marks' fate is unknown,
-        // not applied; leaving them pending would freeze them until the
-        // pull request is reopened.
-        let lost = paths.clone();
         let authority_revision = self.authority_revision;
-        ActionTask::perform(
-            async move {
-                let results = tokio::task::spawn_blocking(move || {
-                    let mut refused: Option<String> = None;
-                    paths
-                        .into_iter()
-                        .map(|path| {
-                            if let Some(message) = &refused {
-                                return (path, viewed, ViewedOutcome::NotApplied(message.clone()));
-                            }
-                            if let Err(failure) = discussion::verify_authority(
-                                api.as_ref(),
-                                &git,
-                                &authority,
-                                &cancellation,
-                            ) {
-                                let message = match failure {
-                                    discussion::Outcome::Refused(message)
-                                    | discussion::Outcome::Unknown(message) => message,
+        let total = paths.len();
+        let chunks: Vec<Vec<RepoPath>> = paths
+            .chunks(crate::github::VIEWED_BATCH_SIZE)
+            .map(<[RepoPath]>::to_vec)
+            .collect();
+        let stream = iced::futures::stream::unfold(
+            (chunks.into_iter(), false, None::<String>, 0usize, false),
+            move |(mut chunks, verified, refused, failed, finished)| {
+                let api = api.clone();
+                let git = git.clone();
+                let authority = authority.clone();
+                let cancellation = cancellation.clone();
+                let repository = repository.clone();
+                let pull_request_id = pull_request_id.clone();
+                async move {
+                    let paths = match chunks.next() {
+                        Some(paths) => paths,
+                        None if failed > 0 && !finished => {
+                            return Some((
+                                Action::ViewedBatchSummary {
+                                    generation,
+                                    authority_revision,
+                                    failed,
+                                    total,
+                                },
+                                (chunks, verified, refused, failed, true),
+                            ));
+                        }
+                        None => return None,
+                    };
+                    let lost = paths.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let mut refused = refused;
+                        if cancellation.is_cancelled() { refused = Some("The review revision changed before this chunk was sent.".into()); }
+                        if !verified && refused.is_none() {
+                            if let Err(failure) = discussion::verify_authority(api.as_ref(), &git, &authority, &cancellation) {
+                                refused = Some(match failure {
+                                    discussion::Outcome::Refused(message) | discussion::Outcome::Unknown(message) => message,
                                     discussion::Outcome::Applied => unreachable!(),
-                                };
-                                refused = Some(message.clone());
-                                return (path, viewed, ViewedOutcome::NotApplied(message));
+                                });
                             }
-                            let outcome = api.set_file_viewed(
-                                &repository,
-                                &pull_request_id,
-                                &path.display(),
-                                viewed,
-                                &cancellation,
-                            );
-                            (path, viewed, viewed_outcome(outcome))
-                        })
-                        .collect()
-                })
-                .await
-                .unwrap_or_else(|error| {
-                    let outcome = ViewedOutcome::Unknown(error.to_string());
-                    lost.into_iter()
-                        .map(|path| (path, viewed, outcome.clone()))
-                        .collect()
-                });
-                Action::ViewedApplied {
-                    generation,
-                    authority_revision,
-                    results,
+                        }
+                        if refused.is_none() && !crate::github::polling::ready(&repository.host, false) {
+                            refused = Some("GitHub polling is paused after a failure or rate limit. Retry after the reset.".into());
+                        }
+                        let results: Vec<(RepoPath, bool, ViewedOutcome)> = if let Some(message) = &refused {
+                            paths.into_iter().map(|path| (path, viewed, ViewedOutcome::NotApplied(message.clone()))).collect()
+                        } else {
+                            let names: Vec<String> = paths.iter().map(|path| path.display().into_owned()).collect();
+                            let mut outcomes: HashMap<_, _> = api.set_files_viewed(&repository, &pull_request_id, &names, viewed, &cancellation).into_iter().collect();
+                            paths.into_iter().map(|path| {
+                                let outcome = outcomes.remove(path.display().as_ref()).map(viewed_outcome)
+                                    .unwrap_or_else(|| ViewedOutcome::Unknown("GitHub omitted this file from the batch response".into()));
+                                (path, viewed, outcome)
+                            }).collect()
+                        };
+                        (results, refused)
+                    }).await;
+                    let (results, refused) = result.unwrap_or_else(|error| {
+                        let message = error.to_string();
+                        (
+                            lost.into_iter()
+                                .map(|path| (path, viewed, ViewedOutcome::Unknown(message.clone())))
+                                .collect(),
+                            Some(message),
+                        )
+                    });
+                    let failed = failed
+                        + results
+                            .iter()
+                            .filter(|(_, _, outcome)| !matches!(outcome, ViewedOutcome::Applied))
+                            .count();
+                    Some((
+                        Action::ViewedApplied {
+                            generation,
+                            authority_revision,
+                            results,
+                        },
+                        (chunks, true, refused, failed, false),
+                    ))
                 }
             },
-            |action| action,
-        )
+        );
+        ActionTask::run(stream, |action| action)
     }
 
     /// The header row: which pull request is under review and the controls
@@ -1673,7 +2014,7 @@ impl State {
         })
         .center(Length::Fixed(ROW_ICON_WIDTH))
         .into();
-        let controls = crate::ui_controls::toolbar_actions(vec![
+        let mut controls: Vec<Element<'_, Action>> = vec![
             icon_button(Icon::Branch, "Create worktree from reviewed commit")
                 .on_press_maybe(
                     (!modal_open && !busy && self.context.is_some() && self.range.is_some())
@@ -1696,7 +2037,16 @@ impl State {
             icon_button(Icon::Close, "Close review")
                 .on_press_maybe((!modal_open).then_some(Action::Close))
                 .into(),
-        ]);
+        ];
+        if self.cache_save_error && self.drafts_need_save() {
+            controls.insert(
+                0,
+                crate::ui_controls::button::secondary("Retry saving draft")
+                    .on_press_maybe((!modal_open).then(|| self.fenced(Action::RetryCacheSave)))
+                    .into(),
+            );
+        }
+        let controls = crate::ui_controls::toolbar_actions(controls);
         widget::row::with_children(vec![
             identity,
             widget::Space::new().width(Length::Fill).into(),
@@ -1764,6 +2114,7 @@ impl State {
                     ))
                     .width(Length::Fill)
                     .into(),
+                crate::ui_controls::button::quiet("PR actions").on_press_maybe((!modal_open && self.context.is_some()).then(||self.fenced(Action::Completion(completion::Action::Toggle)))).into(),
                 self.review_control(modal_open),
             ])
             .spacing(space::M)
@@ -1774,6 +2125,7 @@ impl State {
             })
             .into(),
         );
+        if self.completion.open { rows.push(self.completion_view(modal_open)); }
         widget::column::with_children(rows)
             .spacing(space::XS)
             .padding(Padding::from([space::M, space::M]))
@@ -1874,6 +2226,10 @@ impl State {
             .selected(self.hide_viewed)
             .on_press_maybe((!modal_open).then_some(Action::ToggleHideViewed))
             .into(),
+            icon_button(Icon::History, "Only files changed since you viewed")
+                .selected(self.only_changed_since_viewed)
+                .on_press_maybe((!modal_open).then_some(Action::ToggleChangedSinceViewed))
+                .into(),
             icon_button(Icon::ChevronRight, "Next unviewed file")
                 .on_press_maybe(
                     (!modal_open && self.files.iter().any(|file| !file.viewed))
@@ -1882,8 +2238,9 @@ impl State {
                 .into(),
         ]);
         let viewed = self.files.iter().filter(|file| file.viewed).count();
+        let changed = self.files.iter().filter(|file| file.changed_since_viewed).count();
         let toolbar = widget::row::with_children(vec![
-            design::caption(format!("{viewed}/{} viewed", self.files.len()))
+            design::caption(format!("{viewed}/{} viewed · {changed} changed since viewed{}", self.files.len(), if self.file_marks_incomplete() { " (incomplete)" } else { "" }))
                 .width(Length::Fill)
                 .into(),
             controls,
@@ -1931,16 +2288,30 @@ impl State {
     }
 
     fn displayed_file_rows(&self, tallies: &[(usize, usize, usize)]) -> Vec<usize> {
+        let changed_paths: BTreeSet<PathBuf> = if self.only_changed_since_viewed {
+            self.files.iter().filter(|file| file.changed_since_viewed)
+                .flat_map(|file| file.entry.path.as_path().ancestors().map(Path::to_path_buf))
+                .collect()
+        } else { BTreeSet::new() };
         visible_review_rows(&self.rows, &self.collapsed_directories)
             .filter(|(index, row)| {
-                !self.hide_viewed
+                (!self.only_changed_since_viewed || changed_paths.contains(row.path.as_path())) && (!self.hide_viewed
                     || match row.file {
                         Some(file) => !self.files[file].viewed,
                         None => tallies[*index].0 != tallies[*index].1,
-                    }
+                    })
             })
             .map(|(index, _)| index)
             .collect()
+    }
+
+    fn file_marks_incomplete(&self) -> bool {
+        self.pages.cursor.is_some() || self.files.iter().any(|file| file.sync == ViewedSync::Unknown)
+    }
+
+    fn changed_files_empty_label(&self) -> &'static str {
+        if self.file_marks_incomplete() { "Changed-file results are incomplete until all viewed states are loaded." }
+        else { "No files changed since you viewed them." }
     }
 
     fn file_scrollable(&self, modal_open: bool, height: f32) -> Element<'_, Action> {
@@ -1991,6 +2362,7 @@ impl State {
         if rows.is_empty() {
             let message = match &self.load {
                 LoadState::Loading => "",
+                LoadState::Ready if self.only_changed_since_viewed => self.changed_files_empty_label(),
                 LoadState::Ready if self.hide_viewed && !self.files.is_empty() => {
                     "All files viewed."
                 }
@@ -2066,6 +2438,12 @@ impl State {
                 .into(),
             );
         }
+        if file.changed_since_viewed {
+            trailing.push(crate::interaction::tooltip(
+                widget::icon(Icon::History.handle()).size(design::COMPACT_ICON_SIZE),
+                "Changed since you viewed",
+            ));
+        }
         trailing.push(viewed_control(
             Mark::from_file(file),
             if file.sync == ViewedSync::Unknown {
@@ -2074,9 +2452,7 @@ impl State {
                 "Mark viewed"
             },
             "Mark not viewed",
-            self.context.is_some()
-                && !matches!(file.sync, ViewedSync::Pending | ViewedSync::Unknown)
-                && !modal_open,
+            self.context.is_some() && file.sync != ViewedSync::Pending && !modal_open,
             self.fenced(Action::ToggleViewed(row.path.clone())),
         ));
         let name = design::body(&*row.label)
@@ -2365,7 +2741,7 @@ impl State {
         .into();
         let controls = widget::column::with_children(vec![
             crate::ui_controls::field::search(
-                "Search loaded PRs by title, # or @author",
+                "Search repository PRs by title, # or @author",
                 &self.browser_query,
             )
             .on_input(Action::BrowserQuery)
@@ -2384,10 +2760,15 @@ impl State {
             .spacing(space::S)
             .into(),
             design::caption(format!(
-                "{count} matching · {} loaded",
+                "{count} matching · {} loaded{}",
                 match &self.list {
                     ListState::Ready(rows) => rows.len(),
                     _ => 0,
+                },
+                if self.browser_query.trim().is_empty() {
+                    ""
+                } else {
+                    " · repository search"
                 }
             ))
             .into(),
@@ -2669,12 +3050,13 @@ fn join_files(entries: &[DiffEntry], files: &PullRequestFiles) -> Vec<ReviewFile
     let mut joined: Vec<ReviewFile> = entries
         .iter()
         .map(|entry| {
-            let viewed = remote
-                .remove(entry.path.display().as_ref())
-                .is_some_and(|file| file.viewer_viewed_state == FileViewedState::Viewed);
+            let mark = remote.remove(entry.path.display().as_ref()).map(|file| &file.viewer_viewed_state);
+            let viewed = mark == Some(&FileViewedState::Viewed);
+            let changed_since_viewed = mark == Some(&FileViewedState::Dismissed);
             ReviewFile {
                 entry: entry.clone(),
                 viewed,
+                changed_since_viewed,
                 sync: ViewedSync::Settled,
             }
         })
@@ -2694,6 +3076,7 @@ fn join_files(entries: &[DiffEntry], files: &PullRequestFiles) -> Vec<ReviewFile
                 removed_lines: Some(file.deletions),
             },
             viewed: file.viewer_viewed_state == FileViewedState::Viewed,
+            changed_since_viewed: file.viewer_viewed_state == FileViewedState::Dismissed,
             sync: ViewedSync::Settled,
         });
     }
@@ -2773,14 +3156,61 @@ fn metadata_matches_context(pull_request: &PullRequest, context: &ReviewContext)
             .is_none_or(|oid| oid == &context.base_oid)
 }
 
-fn load_review(
+fn same_diff_authority(a: &ReviewContext, b: &ReviewContext) -> bool {
+    a.pull_request_id == b.pull_request_id
+        && a.head_oid == b.head_oid
+        && a.base_oid == b.base_oid
+        && a.viewer == b.viewer
+}
+
+fn load_review<E: crate::repository::ProcessExecutor>(
     api: &dyn GitHubReviewApi,
-    git: &RepositoryService,
+    git: &RepositoryService<E>,
     target: &ReviewTarget,
+    previous: Option<&Loaded>,
     cancellation: &CancellationToken,
 ) -> Result<Loaded, String> {
     let key = PullRequestKey::new(target.repository.clone(), target.pull_request.number)
         .map_err(|error| error.to_string())?;
+    // The context query fences the expensive Git lane. Unchanged revisions
+    // need only fresh viewed/conversation data, never another fetch or diff.
+    let initial = api
+        .review_refresh(&key, cancellation)
+        .map_err(|error| error.to_string())?;
+    let initial_context = &initial.context;
+    if let Some(previous) = previous
+        && same_diff_authority(&previous.context, initial_context)
+    {
+        let page = initial.files;
+        if !file_pages::matches_context(&page, initial_context) {
+            return Err("The viewer or pull request changed while refreshing viewed marks. Refresh to retry.".into());
+        }
+        let mut pull_request = previous.pull_request.clone();
+        let discussion_stamp = initial
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.updated_at.clone());
+        if let Some(metadata) = initial.metadata {
+            pull_request.title = metadata.title;
+            pull_request.body = metadata.body;
+            pull_request.state = metadata.state;
+            pull_request.is_draft = metadata.is_draft;
+            pull_request.updated_at = metadata.updated_at;
+            pull_request.review_decision = metadata.review_decision;
+        }
+        return Ok(Loaded {
+            context: initial.context,
+            pull_request,
+            discussion_stamp,
+            files: PullRequestFiles {
+                files: page.files,
+                truncated: false,
+            },
+            next_file_cursor: page.next_cursor,
+            ..previous.clone()
+        });
+    }
+    let mut initial = Some(initial);
     let remotes = git
         .remotes(&target.worktree, cancellation)
         .map_err(|error| error.to_string())?;
@@ -2791,10 +3221,16 @@ fn load_review(
         )
     })?;
     let mut attempts = 0;
-    let (pull_request, context, page, range) = loop {
-        let context = api
-            .review_context(&key, cancellation)
-            .map_err(|error| error.to_string())?;
+    let (pull_request, context, page, range, discussion_stamp) = loop {
+        let snapshot = match initial.take() {
+            Some(snapshot) => snapshot,
+            None => api
+                .review_refresh(&key, cancellation)
+                .map_err(|error| error.to_string())?,
+        };
+        let context = snapshot.context;
+        let files = snapshot.files;
+        let discussion_stamp = snapshot.metadata.map(|metadata| metadata.updated_at);
         let pull_request = api
             .pull_request(&key, cancellation)
             .map_err(|error| error.to_string())?;
@@ -2806,9 +3242,6 @@ fn load_review(
             return Err("The pull request changed while loading its header. Refresh to load a consistent revision.".into());
         }
         let base_branch = ValidatedBranchName::parse(pull_request.base_ref_name.as_str())
-            .map_err(|error| error.to_string())?;
-        let files = api
-            .pull_request_file_page(&key, None, cancellation)
             .map_err(|error| error.to_string())?;
         if !file_pages::matches_context(&files, &context) {
             if attempts == 0 {
@@ -2824,7 +3257,7 @@ fn load_review(
         match git.fetch_pull_request_range(
             &target.worktree, &remote, target.pull_request.number, &base_branch, &head, cancellation,
         ) {
-            Ok(range) if range.base_tip.as_str() == context.base_oid => break (pull_request, context, files, range),
+            Ok(range) if range.base_tip.as_str() == context.base_oid => break (pull_request, context, files, range, discussion_stamp),
             Ok(_) | Err(RepositoryError::PullRequestHeadMoved { .. }) if attempts == 0 => { attempts += 1; }
             Ok(_) => return Err("The pull request base moved while loading. Refresh to fetch a consistent review range.".into()),
             Err(error) => return Err(error.to_string()),
@@ -2848,6 +3281,7 @@ fn load_review(
         next_file_cursor: page.next_cursor,
         range,
         entries,
+        discussion_stamp,
     })
 }
 
@@ -2862,6 +3296,20 @@ pub(crate) struct ScriptedApi {
     pub viewed_outcome: std::sync::Mutex<ReviewMutationOutcome<()>>,
     pub conversation: std::sync::Mutex<crate::github::PullRequestConversation>,
     pub submitted: std::sync::Mutex<Vec<crate::github::SubmitReviewRequest>>,
+    pub search_pages: std::sync::Mutex<std::collections::VecDeque<PullRequestPage>>,
+    pub searches: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    pub controls: std::sync::Mutex<Option<crate::github::review_controls::ReviewControls>>,
+    pub control_context: std::sync::Mutex<Option<ReviewContext>>,
+    pub controls_written: std::sync::Mutex<Vec<crate::github::review_controls::ReviewControlMutation>>,
+    pub control_outcome: std::sync::Mutex<ReviewMutationOutcome<()>>,
+    pub context: std::sync::Mutex<Option<ReviewContext>>,
+    pub context_calls: std::sync::atomic::AtomicUsize,
+    pub page: std::sync::Mutex<Option<crate::github::PullRequestFilePage>>,
+    pub batch_calls: std::sync::atomic::AtomicUsize,
+    pub replies: std::sync::Mutex<Vec<crate::github::ReplyToThreadRequest>>,
+    pub updated_comments: std::sync::Mutex<Vec<(String, String)>>,
+    pub discarded: std::sync::Mutex<Vec<String>>,
+    pub merge_base: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -2872,12 +3320,47 @@ impl ScriptedApi {
             viewed_outcome: std::sync::Mutex::new(ReviewMutationOutcome::Applied(())),
             conversation: std::sync::Mutex::new(Default::default()),
             submitted: std::sync::Mutex::new(Vec::new()),
+            search_pages: Default::default(),
+            searches: Default::default(),
+            controls: Default::default(),
+            control_context: Default::default(),
+            controls_written: Default::default(),
+            control_outcome: std::sync::Mutex::new(ReviewMutationOutcome::Applied(())),
+            context: Default::default(),
+            context_calls: Default::default(),
+            page: Default::default(),
+            batch_calls: Default::default(),
+            replies: Default::default(),
+            updated_comments: Default::default(),
+            discarded: Default::default(),
+            merge_base: Default::default(),
         }
     }
 }
 
 #[cfg(test)]
 impl GitHubReviewApi for ScriptedApi {
+    fn search_pull_requests(
+        &self,
+        _repository: &GitHubRepoKey,
+        query: &str,
+        cursor: Option<&str>,
+        _: &CancellationToken,
+    ) -> Result<PullRequestPage, crate::github::GitHubError> {
+        self.searches
+            .lock()
+            .unwrap()
+            .push((query.to_owned(), cursor.map(str::to_owned)));
+        Ok(self
+            .search_pages
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted search page"))
+    }
+    fn review_controls(&self,_:&PullRequestKey,_:&CancellationToken)->Result<crate::github::review_controls::ReviewControls,crate::github::GitHubError>{self.controls.lock().unwrap().clone().ok_or_else(||crate::github::GitHubError::Inspection("No scripted controls".into()))}
+    fn mutate_review_control(&self,_:&GitHubRepoKey,_:&str,mutation:&crate::github::review_controls::ReviewControlMutation,_:&CancellationToken)->Result<ReviewMutationOutcome<()>,crate::github::GitHubError>{self.controls_written.lock().unwrap().push(mutation.clone());Ok(self.control_outcome.lock().unwrap().clone())}
+
     fn pull_request(
         &self,
         _key: &PullRequestKey,
@@ -2898,7 +3381,24 @@ impl GitHubReviewApi for ScriptedApi {
         _key: &PullRequestKey,
         _cancellation: &CancellationToken,
     ) -> Result<ReviewContext, crate::github::GitHubError> {
-        unreachable!("tests install loads directly")
+        self.context_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.control_context.lock().unwrap().clone().or_else(||self.context.lock().unwrap().clone()).ok_or_else(||crate::github::GitHubError::Inspection("No scripted review context".into()))
+    }
+
+    fn review_merge_base(
+        &self,
+        _: &PullRequestKey,
+        _: &str,
+        _: &str,
+        _: &CancellationToken,
+    ) -> Result<String, crate::github::GitHubError> {
+        Ok(self
+            .merge_base
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("scripted merge base"))
     }
 
     fn pull_request_file_page(
@@ -2907,7 +3407,12 @@ impl GitHubReviewApi for ScriptedApi {
         _cursor: Option<&str>,
         _cancellation: &CancellationToken,
     ) -> Result<crate::github::PullRequestFilePage, crate::github::GitHubError> {
-        unreachable!("tests install pages directly")
+        Ok(self
+            .page
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("scripted file page"))
     }
 
     fn pull_request_files(
@@ -2952,22 +3457,26 @@ impl GitHubReviewApi for ScriptedApi {
     fn reply_to_thread(
         &self,
         _repository: &GitHubRepoKey,
-        _request: &crate::github::ReplyToThreadRequest,
+        request: &crate::github::ReplyToThreadRequest,
         _cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<crate::github::PullRequestComment>, crate::github::GitHubError>
     {
-        unreachable!()
+        self.replies.lock().unwrap().push(request.clone());
+        Ok(ReviewMutationOutcome::Applied(serde_json::from_value(serde_json::json!({
+            "id":"reply", "body":request.body, "createdAt":"2026-01-01T00:00:00Z", "url":"https://github.com/o/r/pull/1#reply"
+        })).unwrap()))
     }
 
     fn update_comment(
         &self,
         _repository: &GitHubRepoKey,
-        _comment_id: &str,
-        _body: &str,
+        comment_id: &str,
+        body: &str,
         _cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<crate::github::PullRequestComment>, crate::github::GitHubError>
     {
-        unreachable!()
+        self.updated_comments.lock().unwrap().push((comment_id.into(), body.into()));
+        Ok(ReviewMutationOutcome::Applied(serde_json::from_value(serde_json::json!({"id":comment_id,"body":body,"createdAt":"now","url":"https://github.com/o/r/pull/1#comment"})).unwrap()))
     }
 
     fn delete_comment(
@@ -2999,10 +3508,11 @@ impl GitHubReviewApi for ScriptedApi {
     fn discard_review(
         &self,
         _repository: &GitHubRepoKey,
-        _review_id: &str,
+        review_id: &str,
         _cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<()>, crate::github::GitHubError> {
-        unreachable!()
+        self.discarded.lock().unwrap().push(review_id.into());
+        Ok(ReviewMutationOutcome::Applied(()))
     }
 
     fn set_thread_resolved(
@@ -3035,6 +3545,30 @@ impl GitHubReviewApi for ScriptedApi {
                 }
             }
         })
+    }
+
+    fn set_files_viewed(
+        &self,
+        repository: &GitHubRepoKey,
+        pr: &str,
+        paths: &[String],
+        viewed: bool,
+        cancellation: &CancellationToken,
+    ) -> Vec<(
+        String,
+        Result<ReviewMutationOutcome<()>, crate::github::GitHubError>,
+    )> {
+        self.batch_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    self.set_file_viewed(repository, pr, path, viewed, cancellation),
+                )
+            })
+            .collect()
     }
 
     fn list_pull_requests(
@@ -3108,6 +3642,7 @@ pub(crate) mod tests {
     pub(crate) fn loaded(entries: Vec<DiffEntry>, files: Vec<PullRequestFile>) -> Loaded {
         let head = Oid::parse("a".repeat(40)).unwrap();
         Loaded {
+            discussion_stamp: None,
             pull_request: pull_request(1),
             context: ReviewContext {
                 pull_request_id: "PR_1".into(),
@@ -3144,6 +3679,119 @@ pub(crate) mod tests {
     fn open_with(state: &mut State, loaded: Loaded) {
         drop(state.update(Action::Open(target(1))));
         finish_load(state, loaded);
+    }
+
+    #[test]
+    fn unchanged_refresh_never_calls_git_or_rewrites_unchanged_cache() {
+        struct NoGit;
+        impl crate::repository::ProcessExecutor for NoGit {
+            fn execute(
+                &self,
+                _: &crate::repository::CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<crate::repository::ProcessOutput, crate::repository::ProcessFailure>
+            {
+                panic!("unchanged review must not run Git, including fetch or diff");
+            }
+        }
+        let api = ScriptedApi::new();
+        let previous = loaded(
+            vec![entry("file.rs", ChangeKind::Modified)],
+            vec![remote_file("file.rs", true)],
+        );
+        *api.context.lock().unwrap() = Some(previous.context.clone());
+        *api.page.lock().unwrap() = Some(crate::github::PullRequestFilePage {
+            files: previous.files.files.clone(),
+            next_cursor: None,
+            viewer: previous.context.viewer.clone(),
+            pull_request_id: previous.context.pull_request_id.clone(),
+            head_oid: previous.context.head_oid.clone(),
+            base_oid: previous.context.base_oid.clone(),
+        });
+        let refreshed = load_review(
+            &api,
+            &RepositoryService::new("git", Arc::new(NoGit)),
+            &target(1),
+            Some(&previous),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            api.context_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let (mut state, _) = state();
+        state.target = Some(target(1));
+        state.adopt(&previous);
+        state.cache_dirty = false;
+        state.adopt(&refreshed);
+        assert!(!state.cache_dirty);
+    }
+
+    #[tokio::test]
+    async fn two_hundred_folder_marks_use_one_authority_and_four_chunks() {
+        use cosmic::iced::futures::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["remote", "add", "origin", "https://github.com/o/r"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        for viewed in [true, false] {
+            let (mut state, api) = state();
+            let mut target = target(1);
+            target.worktree = dir.path().into();
+            state.target = Some(target);
+            let files: Vec<_> = (0..200).map(|i| format!("folder/file-{i}.rs")).collect();
+            let previous = loaded(
+                files
+                    .iter()
+                    .map(|name| entry(name, ChangeKind::Modified))
+                    .collect(),
+                files
+                    .iter()
+                    .map(|name| remote_file(name, !viewed))
+                    .collect(),
+            );
+            *api.context.lock().unwrap() = Some(previous.context.clone());
+            state.adopt(&previous);
+            let task = state.set_viewed((0..200).collect(), viewed);
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            let mut completions = 0;
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action) = action {
+                    drop(state.update_inner(action));
+                    completions += 1;
+                }
+            }
+            assert_eq!(completions, 4);
+            assert_eq!(
+                api.context_calls.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                api.batch_calls.load(std::sync::atomic::Ordering::Relaxed),
+                4
+            );
+            assert!(
+                state
+                    .files
+                    .iter()
+                    .all(|file| file.viewed == viewed && file.sync == ViewedSync::Settled)
+            );
+        }
     }
 
     #[test]
@@ -3245,6 +3893,7 @@ pub(crate) mod tests {
         snapshot.files.push(cache::File {
             entry: entry("z.rs", ChangeKind::Modified),
             viewed: false,
+            changed_since_viewed: false,
             unverified: false,
         });
         state.adopt_cache(snapshot);
@@ -3260,6 +3909,133 @@ pub(crate) mod tests {
             load: state.load_generation,
             result: Ok(Arc::new(loaded)),
         }));
+    }
+
+    pub(crate) fn ready_due_browser(state: &mut State) {
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_generation,
+            result: Ok(PullRequestPage {
+                pull_requests: Vec::new(),
+                next_cursor: None,
+            }),
+        }));
+        state.list_last_refresh = Some(Instant::now() - Duration::from_secs(31));
+    }
+
+    #[test]
+    fn multi_page_search_refresh_retains_loaded_depth_query_and_viewport() {
+        use cosmic::iced::futures::StreamExt;
+        let (mut state, api) = state();
+        state.source = Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        });
+        state.browser_query = "needle".into();
+        state.list_loaded_query = Some("needle".into());
+        state.list = ListState::Ready(
+            (1..=100)
+                .map(|number| Arc::new(pull_request(number)))
+                .collect(),
+        );
+        state.list_last_refresh = Some(Instant::now() - Duration::from_secs(31));
+        state.browser_viewport.0 = 800.0;
+        api.search_pages.lock().unwrap().extend([
+            PullRequestPage {
+                pull_requests: (2..=51).map(pull_request).collect(),
+                next_cursor: Some("page-2".into()),
+            },
+            PullRequestPage {
+                pull_requests: (52..=101).map(pull_request).collect(),
+                next_cursor: Some("page-3".into()),
+            },
+        ]);
+        let task = state.update(Action::RefreshIfDue(Instant::now()));
+        let reply = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(action @ Action::ListLoaded { .. }) =
+                        action
+                    {
+                        return action;
+                    }
+                }
+                panic!("list request produced no result");
+            });
+        drop(state.update(reply));
+        assert_eq!(
+            *api.searches.lock().unwrap(),
+            vec![
+                ("needle".into(), None),
+                ("needle".into(), Some("page-2".into()))
+            ]
+        );
+        let ListState::Ready(rows) = &state.list else {
+            panic!("loaded search")
+        };
+        assert_eq!(rows.len(), 100);
+        assert!(state.listed_target(1).is_none());
+        assert!(state.listed_target(101).is_some());
+        assert_eq!(state.browser_query, "needle");
+        assert_eq!(state.browser_viewport.0, 800.0);
+    }
+
+    #[test]
+    fn visible_browser_refreshes_on_cadence_and_drops_closed_rows() {
+        let (mut state, _) = state();
+        drop(state.set_source(Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        })));
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_generation,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(1)],
+                next_cursor: None,
+            }),
+        }));
+        let before = state.list_generation;
+        drop(state.update(Action::RefreshIfDue(Instant::now())));
+        assert_eq!(state.list_generation, before);
+        let due = state.list_last_refresh.unwrap() + Duration::from_secs(31);
+        drop(state.update(Action::RefreshIfDue(due)));
+        assert!(state.list_loading);
+        assert!(state.listed_target(1).is_some());
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_generation,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(2)],
+                next_cursor: None,
+            }),
+        }));
+        assert!(state.listed_target(1).is_none());
+        assert!(state.listed_target(2).is_some());
+    }
+
+    #[test]
+    fn repository_search_ignores_obsolete_query_and_old_page() {
+        let (mut state, _) = state();
+        drop(state.set_source(Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        })));
+        let old = state.list_generation;
+        drop(state.update(Action::BrowserQuery("needle".into())));
+        drop(state.update(Action::BrowserSearch("old query".into())));
+        assert!(!state.list_loading);
+        drop(state.update(Action::ListLoaded {
+            generation: old,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(1)],
+                next_cursor: None,
+            }),
+        }));
+        assert!(state.listed_target(1).is_none());
+        drop(state.update(Action::BrowserSearch("needle".into())));
+        assert!(state.list_loading);
     }
 
     #[test]
@@ -3779,7 +4555,7 @@ pub(crate) mod tests {
         };
         assert_eq!(target.repository, PathBuf::from("/repo"));
         assert_eq!(target.head.as_str(), "a".repeat(40));
-        assert_eq!(target.suggested_branch(), "pr/1-aaaaaaaa");
+        assert_eq!(target.suggested_branch(), "feature");
         state.context = None;
         drop(state.update(Action::Checkout));
         assert!(state.take_effects().is_empty());

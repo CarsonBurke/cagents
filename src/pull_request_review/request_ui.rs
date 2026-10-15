@@ -82,7 +82,10 @@ pub(crate) fn execute(
             )
             .map(Reply::History),
     }
-    .map_err(|error| error.to_string())
+    .map_err(|error| {
+        crate::github::polling::failed(&repository.host, &error);
+        error.to_string()
+    })
 }
 
 impl super::State {

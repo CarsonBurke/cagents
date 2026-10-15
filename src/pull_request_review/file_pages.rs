@@ -27,6 +27,7 @@ pub(super) struct Pages {
     pub height: f32,
     pub wanted: Option<RepoPath>,
     pub seek_unviewed: bool,
+    pub hydrate_all: bool,
     pub(super) seen: BTreeSet<String>,
 }
 
@@ -40,6 +41,7 @@ impl Default for Pages {
             height: 640.0,
             wanted: None,
             seek_unviewed: false,
+            hydrate_all: false,
             seen: BTreeSet::new(),
         }
     }
@@ -117,6 +119,7 @@ impl State {
                         && let Some(remote) = marks.get(file.entry.path.display().as_ref())
                     {
                         file.viewed = remote.viewer_viewed_state == FileViewedState::Viewed;
+                        file.changed_since_viewed = remote.viewer_viewed_state == FileViewedState::Dismissed;
                         file.sync = ViewedSync::Settled;
                     }
                 }
@@ -151,6 +154,9 @@ impl State {
     }
 
     fn needs_file_page(&self) -> bool {
+        if self.pages.hydrate_all || self.only_changed_since_viewed {
+            return true;
+        }
         let unknown = |path: &RepoPath| {
             self.file_index(path)
                 .is_some_and(|index| self.files[index].sync == ViewedSync::Unknown)
@@ -174,6 +180,9 @@ impl State {
         if self.pages.loading
             || self.pages.error.is_some()
             || self.refreshing
+            || self.target.as_ref().is_some_and(|target| {
+                !crate::github::polling::ready(&target.repository.host, false)
+            })
             || self.load != LoadState::Ready
             || self.context.is_none()
             || (!force && !self.needs_file_page())
@@ -260,6 +269,29 @@ mod tests {
     }
 
     #[test]
+    fn later_page_changed_badge_survives_refresh_pending_mark_and_refusal() {
+        let mut state=thousand_files();
+        drop(state.page_action(PageAction::More));
+        let mut remote=remote_file("file-0105.rs",false);remote.viewer_viewed_state=FileViewedState::Dismissed;
+        answer(&mut state,vec![remote],"me");
+        assert!(state.files[105].changed_since_viewed);
+        let mut refresh=loaded(
+            (0..1000).map(|i|entry(&format!("file-{i:04}.rs"),ChangeKind::Modified)).collect(),
+            (0..100).map(|i|remote_file(&format!("file-{i:04}.rs"),true)).collect());
+        refresh.next_file_cursor=Some("page-2".into());
+        state.adopt(&refresh);
+        assert!(state.files[105].changed_since_viewed);
+        assert_eq!(state.files[105].sync,ViewedSync::Settled);
+        drop(state.set_viewed(vec![105],true));
+        state.adopt(&refresh);
+        assert!(state.files[105].changed_since_viewed);
+        assert_eq!(state.files[105].sync,ViewedSync::Pending);
+        drop(state.update(Action::ViewedApplied{generation:state.generation,authority_revision:state.authority_revision,results:vec![(state.files[105].entry.path.clone(),true,ViewedOutcome::NotApplied("denied".into()))]}));
+        assert!(!state.files[105].viewed);
+        assert!(state.files[105].changed_since_viewed);
+    }
+
+    #[test]
     fn thousand_file_review_loads_only_demanded_viewed_pages() {
         let mut state = thousand_files();
         assert_eq!(state.files.len(), 1000);
@@ -291,6 +323,38 @@ mod tests {
             ViewedSync::Unknown,
             "absent state is not unviewed"
         );
+    }
+
+    #[test]
+    fn changed_only_filter_loads_a_dismissed_mark_beyond_the_first_hundred_files() {
+        use cosmic::iced::futures::StreamExt;
+        let (mut state, api) = state();
+        drop(state.update(Action::Open(target(1))));
+        let mut initial = loaded((0..101).map(|i| entry(&format!("file-{i:04}.rs"), ChangeKind::Modified)).collect(),
+            (0..100).map(|i| remote_file(&format!("file-{i:04}.rs"), true)).collect());
+        initial.next_file_cursor = Some("page-2".into());
+        finish_load(&mut state, initial);
+        assert!(!state.pages.loading);
+        let mut changed = remote_file("file-0100.rs", false); changed.viewer_viewed_state = FileViewedState::Dismissed;
+        let context = state.context.as_ref().unwrap();
+        *api.page.lock().unwrap() = Some(PullRequestFilePage { files: vec![changed], next_cursor: None,
+            viewer: context.viewer.clone(), pull_request_id: context.pull_request_id.clone(), head_oid: context.head_oid.clone(), base_oid: context.base_oid.clone() });
+        let task = state.update(Action::ToggleChangedSinceViewed);
+        assert!(state.pages.loading, "the filter must request unknown marks even when it displays no rows");
+        assert!(state.changed_files_empty_label().contains("incomplete"));
+        let receipt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action @ Action::FilePage(PageAction::Loaded { .. })) = action { return action; }
+            }
+            panic!("file-page worker returned no receipt");
+        });
+        drop(state.update(receipt));
+        assert!(state.files[100].changed_since_viewed);
+        assert!(!state.file_marks_incomplete());
+        let displayed = state.displayed_file_rows(&directory_tallies(&state.rows, &state.files));
+        assert_eq!(displayed.len(), 1);
+        assert_eq!(state.rows[displayed[0]].file, Some(100));
     }
 
     #[test]
@@ -343,6 +407,7 @@ mod tests {
                     ChangeKind::Modified,
                 ),
                 viewed: false,
+                changed_since_viewed: false,
                 sync: ViewedSync::Unknown,
             })
             .collect();
@@ -378,6 +443,37 @@ mod tests {
             state.pages.loading,
             "refresh must hydrate the still-visible deep viewport"
         );
+    }
+
+    #[test]
+    fn refresh_keeps_later_page_marks_and_cursor_for_same_authority() {
+        let mut state = thousand_files();
+        drop(state.update(Action::FilePage(PageAction::More)));
+        answer(&mut state, vec![remote_file("file-0105.rs", true)], "me");
+        let mut snapshot = loaded(
+            state.files.iter().map(|file| file.entry.clone()).collect(),
+            (0..100)
+                .map(|i| remote_file(&format!("file-{i:04}.rs"), true))
+                .collect(),
+        );
+        snapshot.next_file_cursor = Some("page-2".into());
+        finish_load(&mut state, snapshot.clone());
+        finish_load(&mut state, snapshot.clone());
+        assert!(state.files[105].viewed);
+        assert_eq!(state.files[105].sync, ViewedSync::Settled);
+        assert!(state.pages.cursor.is_none());
+        assert!(state.pages.seen.contains("page-2"));
+        snapshot.context.head_oid = "c".repeat(40);
+        snapshot.range.head = Oid::parse(&snapshot.context.head_oid).unwrap();
+        finish_load(&mut state, snapshot);
+        assert_eq!(state.files[105].sync, ViewedSync::Unknown);
+        assert!(
+            state.pages.loading,
+            "changed heads automatically hydrate later pages"
+        );
+        answer(&mut state, vec![remote_file("file-0105.rs", true)], "me");
+        assert!(state.files[105].viewed);
+        assert_eq!(state.files[105].sync, ViewedSync::Settled);
     }
 
     #[test]

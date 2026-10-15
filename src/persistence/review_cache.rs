@@ -6,6 +6,16 @@ use crate::{
     pull_request_review::cache::{self, Snapshot, Store},
 };
 
+// Keep review-only file metadata beside the existing flattened diff entry.
+// Old cache rows have no badge field and remain readable without a schema bump.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredEntry {
+    #[serde(flatten)]
+    entry: crate::repository::DiffEntry,
+    #[serde(default)]
+    changed_since_viewed: bool,
+}
+
 impl Store for StateStore {
     fn load(&self, key: &PullRequestKey) -> Result<Option<Snapshot>, String> {
         key.validate().map_err(|error| error.to_string())?;
@@ -53,8 +63,10 @@ impl Store for StateStore {
             if bytes > cache::MAX_CACHE_BYTES {
                 return Err("Cached review exceeds the size limit".into());
             }
+            let stored:StoredEntry=serde_json::from_str(&entry).map_err(|error|error.to_string())?;
             snapshot.files.push(cache::File {
-                entry: serde_json::from_str(&entry).map_err(|error| error.to_string())?,
+                entry: stored.entry,
+                changed_since_viewed: stored.changed_since_viewed,
                 viewed: row.get(1).map_err(|error| error.to_string())?,
                 unverified: row.get(2).map_err(|error| error.to_string())?,
             });
@@ -71,32 +83,44 @@ impl Store for StateStore {
     fn save(&self, snapshot: &Snapshot, order: &cache::WriteOrder) -> Result<(), String> {
         snapshot.validate()?;
         let repository = snapshot.key.repository.gh_selector().to_ascii_lowercase();
-        let mut metadata = snapshot.clone();
-        metadata.files.clear();
-        let record = serde_json::to_string(&metadata).map_err(|error| error.to_string())?;
         let entries = snapshot
             .files
             .iter()
-            .map(|file| serde_json::to_string(&file.entry))
+            .map(|file| serde_json::to_string(&StoredEntry{entry:file.entry.clone(),changed_since_viewed:file.changed_since_viewed}))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-        let byte_size =
-            record.len() as u64 + entries.iter().map(|entry| entry.len() as u64).sum::<u64>();
-        if byte_size > cache::MAX_CACHE_BYTES {
-            return Err("Cached review exceeds the size limit".into());
-        }
         let mut inner = self.lock_inner().map_err(|error| error.to_string())?;
         ensure_open(&inner).map_err(|error| error.to_string())?;
         let tx = inner
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let previous: Option<(String, u64)> = tx.query_row(
-            "SELECT write_epoch, write_order FROM review_cache WHERE repository = ?1 AND number = ?2",
-            params![repository, snapshot.key.number], |row| Ok((row.get(0)?, row.get(1)?)),
+        let previous: Option<(String, u64, String)> = tx.query_row(
+            "SELECT write_epoch, write_order, record FROM review_cache WHERE repository = ?1 AND number = ?2",
+            params![repository, snapshot.key.number], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional().map_err(|error| error.to_string())?;
-        if previous.is_some_and(|(boot, previous)| order.superseded_by(&boot, previous)) {
-            return Ok(());
+        if previous
+            .as_ref()
+            .is_some_and(|(boot, previous, _)| order.superseded_by(boot, *previous))
+        {
+            return if snapshot.drafts_changed {
+                Err("A newer local review save finished first. Your draft is not saved yet; retry saving it.".into())
+            } else {
+                Ok(())
+            };
+        }
+        let mut metadata = snapshot.clone();
+        metadata.files.clear();
+        if let Some((_, _, record)) = previous {
+            let old: Snapshot = serde_json::from_str(&record).map_err(|error| error.to_string())?;
+            metadata.merge_drafts(&old)?;
+        }
+        metadata.drafts_basis = None;
+        let record = serde_json::to_string(&metadata).map_err(|error| error.to_string())?;
+        let byte_size =
+            record.len() as u64 + entries.iter().map(|entry| entry.len() as u64).sum::<u64>();
+        if byte_size > cache::MAX_CACHE_BYTES {
+            return Err("Cached review exceeds the size limit".into());
         }
         // Reinsert an accepted snapshot at the newest rowid while holding the
         // transaction. The parent deletion cascades its old file rows; neither
@@ -145,16 +169,44 @@ impl Store for StateStore {
                     .map_err(|error| error.to_string())?;
             }
         }
-        tx.execute(
-            "DELETE FROM review_cache WHERE rowid IN
-                (SELECT rowid FROM (
-                    SELECT rowid, row_number() OVER (ORDER BY rowid DESC) AS rank,
-                        sum(byte_size) OVER (ORDER BY rowid DESC) AS bytes
-                    FROM review_cache
-                 ) WHERE rank > ?1 OR bytes > ?2)",
-            params![cache::MAX_CACHED_REVIEWS, cache::MAX_CACHE_BYTES],
-        )
-        .map_err(|error| error.to_string())?;
+        let records: Vec<(i64, u64, bool)> = {
+            let mut statement = tx
+                .prepare("SELECT rowid, byte_size, record FROM review_cache ORDER BY rowid ASC")
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.map(|row| {
+                let (id, bytes, record) = row.map_err(|error| error.to_string())?;
+                let snapshot: Snapshot =
+                    serde_json::from_str(&record).map_err(|error| error.to_string())?;
+                Ok((id, bytes, snapshot.drafts.is_some()))
+            })
+            .collect::<Result<_, String>>()?
+        };
+        let mut count = records.len();
+        let mut bytes = records.iter().map(|(_, bytes, _)| *bytes).sum::<u64>();
+        for (id, size, has_draft) in records {
+            if count <= cache::MAX_CACHED_REVIEWS && bytes <= cache::MAX_CACHE_BYTES {
+                break;
+            }
+            if has_draft {
+                continue;
+            }
+            tx.execute("DELETE FROM review_cache WHERE rowid = ?1", params![id])
+                .map_err(|error| error.to_string())?;
+            count -= 1;
+            bytes = bytes.saturating_sub(size);
+        }
+        if count > cache::MAX_CACHED_REVIEWS || bytes > cache::MAX_CACHE_BYTES {
+            return Err("Local review storage is full of saved drafts. Saved text was kept; finish or cancel a saved draft before saving another.".into());
+        }
         tx.commit().map_err(|error| error.to_string())
     }
 }
@@ -162,6 +214,68 @@ impl Store for StateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_since_viewed_survives_sqlite_and_legacy_rows_default_to_false() {
+        let directory=tempfile::tempdir().unwrap();
+        let store=StateStore::open(directory.path().join("state.sqlite3"),crate::model::BootId::new("boot")).unwrap();
+        let mut snapshot=cache::fixture();snapshot.files[0].changed_since_viewed=true;
+        store.save(&snapshot,&cache::WriteOrder::fixture(1)).unwrap();
+        assert!(store.load(&snapshot.key).unwrap().unwrap().files[0].changed_since_viewed);
+        let legacy=serde_json::to_string(&snapshot.files[0].entry).unwrap();
+        store.lock_inner().unwrap().connection.execute("UPDATE review_cache_files SET entry = ?1",params![legacy]).unwrap();
+        assert!(!store.load(&snapshot.key).unwrap().unwrap().files[0].changed_since_viewed);
+    }
+
+    #[test]
+    fn sqlite_recovery_text_has_order_conflict_and_eviction_protection() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot"),
+        )
+        .unwrap();
+        cache::assert_draft_protection(&store);
+    }
+
+    #[test]
+    fn unrelated_snapshot_preserves_draft_but_explicit_local_cancel_clears_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot"),
+        )
+        .unwrap();
+        let mut draft = cache::fixture();
+        draft.drafts = Some(cache::Drafts {
+            composer: None,
+            summary: "Keep my draft".into(),
+            event: crate::github::ReviewEvent::Comment,
+            unknown: Some("unresolved receipt".into()),
+        });
+        draft.drafts_changed = true;
+        store.save(&draft, &cache::WriteOrder::fixture(1)).unwrap();
+        let mut background = cache::fixture();
+        background.files[0].viewed = false;
+        store
+            .save(&background, &cache::WriteOrder::fixture(2))
+            .unwrap();
+        let restored = store.load(&background.key).unwrap().unwrap();
+        assert_eq!(restored.drafts, draft.drafts);
+        assert!(!restored.files[0].viewed);
+        background.drafts_changed = true;
+        store
+            .save(&background, &cache::WriteOrder::fixture(3))
+            .unwrap();
+        assert!(
+            store
+                .load(&background.key)
+                .unwrap()
+                .unwrap()
+                .drafts
+                .is_none()
+        );
+    }
 
     #[test]
     fn sqlite_eviction_tracks_commits_and_repeated_updates_after_clock_rollback() {

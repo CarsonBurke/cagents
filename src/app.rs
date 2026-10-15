@@ -28,6 +28,7 @@ mod notification_ui;
 mod palette_ui;
 mod project_ui;
 mod pull_request_ui;
+mod pull_request_cleanup;
 mod refresh_ui;
 mod resume_ui;
 mod review_request_ui;
@@ -2620,7 +2621,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::PreviewLocalFile(_)
             | Message::ChatUi(chat_ui::Action::OpenUrl(_))
             | Message::PullRequestUi(
-                pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
+                pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_) | pull_request_ui::Action::OpenPreparedContext
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::FocusCard(_)
@@ -2669,7 +2670,8 @@ fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
 fn completion_navigates(message: &Message) -> bool {
     matches!(
         message,
-        Message::RepositoryLoaded {
+        Message::PullRequestCheckoutReady { .. }
+            | Message::RepositoryLoaded {
             open_cards: true,
             result: Ok(_),
             ..
@@ -2679,7 +2681,7 @@ fn completion_navigates(message: &Message) -> bool {
         } | Message::PullRequestCreated {
             result: Ok(PullRequestCreationOutcome::Created { .. }),
             ..
-        }
+        } | Message::PullRequestCleanupReady { result: Ok(Some(_)), .. }
     )
 }
 
@@ -4311,9 +4313,23 @@ pub enum Message {
     },
     ProjectUi(project_ui::Action),
     PullRequestUi(pull_request_ui::Action),
+    PullRequestCheckoutReady {
+        card: CardId,
+        project: ProjectId,
+        generation: u64,
+        target: pull_request_review::CheckoutTarget,
+        result: Result<pull_request_review::checkout::PreparedCheckout, String>,
+    },
     PullRequestReview {
         card: CardId,
         action: pull_request_review::Action,
+    },
+    PullRequestCleanupReady {
+        card: CardId,
+        project: ProjectId,
+        generation: u64,
+        head: pull_request_review::CleanupHead,
+        result: Result<Option<crate::repository::WorktreeRecord>, String>,
     },
     NativeWindowAction(cosmic::app::Action),
     ChatUi(chat_ui::Action),
@@ -6497,6 +6513,7 @@ impl Cagents {
         let mut selection: Option<Option<u64>> = dismissed_pending.then_some(None);
         let mut links = Vec::new();
         let mut checkout = None;
+        let mut cleanup = None;
         for effect in pane.review.take_effects() {
             match effect {
                 pull_request_review::Effect::OpenFile {
@@ -6531,6 +6548,7 @@ impl Cagents {
                         .project(&self.sidebar_model)
                         .map(|project| (project, target));
                 }
+                pull_request_review::Effect::CleanupMergedHead(head) => { cleanup=pane.project(&self.sidebar_model).map(|project|(project,head)); }
                 pull_request_review::Effect::SelectionChanged(number) => {
                     selection = Some(number);
                 }
@@ -6547,16 +6565,16 @@ impl Cagents {
         for url in links {
             tasks.push(self.open_clicked_link(url));
         }
+        if let Some((project, head)) = cleanup { tasks.push(self.open_merged_pull_request_cleanup(card,project,head)); }
         if let Some((project_id, target)) = checkout {
-            tasks.push(self.open_worktree_dialog(
-                project_id,
-                target.repository.clone(),
-                WorktreeDraft {
-                    base: target.head.as_str().to_owned(),
-                    ..WorktreeDraft::branch(target.suggested_branch())
-                },
-                None,
-            ));
+            let generation=match self.cards.get(&card){Some(CardRuntime::PullRequests(pane))=>pane.review.selection_generation(),_=>return Task::batch(tasks)};
+            self.status = Some(TransientNotice::success("Preparing PR checkout…"));
+            tasks.push(cosmic::task::future(async move {
+                let work = target.clone();
+                let result = tokio::task::spawn_blocking(move || pull_request_review::checkout::prepare(&work, &CancellationToken::new()))
+                    .await.map_err(|error| error.to_string()).and_then(|result| result);
+                Message::PullRequestCheckoutReady { card, project: project_id, generation, target, result }
+            }));
         }
         Task::batch(tasks)
     }
@@ -11272,8 +11290,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -16080,9 +16101,27 @@ impl Application for Cagents {
             }
             Message::ProjectUi(action) => self.handle_project_action(action),
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
+            Message::PullRequestCheckoutReady { card, project, generation, target, result } => {
+                if self.nested_modal_focus_target().is_some()
+                    || !matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(pane))
+                        if pane.review.selection_generation()==generation && pane.review.range().is_some_and(|range| range.head == target.head)
+                        && pane.review.target().is_some_and(|review| review.worktree == target.repository && review.pull_request.number == target.number))
+                { return Task::none(); }
+                match result {
+                    Ok(plan) => {
+                        if let Some(path) = plan.existing_worktree { self.status = Some(TransientNotice::warning(plan.notice)); return self.select_worktree(path, false); }
+                        let task = self.open_worktree_dialog(project, plan.repository,
+                            WorktreeDraft { branch: plan.branch_input, base: plan.base, destination: String::new(), ..Default::default() }, None);
+                        if let Some(dialog) = &mut self.worktree_dialog { dialog.set_checkout_notice(plan.notice); }
+                        task
+                    }
+                    Err(error) => { if let Some(CardRuntime::PullRequests(pane))=self.cards.get_mut(&card){pane.review.report_checkout_error(error);}Task::none() },
+                }
+            }
             Message::PullRequestReview { card, action } => {
                 self.handle_pull_request_review(card, action)
             }
+            Message::PullRequestCleanupReady { card, project, generation, head, result } => self.merged_pull_request_cleanup_ready(card,project,generation,head,result),
             Message::ReviewFilePanelToggle { card, collapsed } => {
                 if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
                     pane.file_panel_collapsed = Some(collapsed);
@@ -27225,6 +27264,37 @@ mod tests {
             number,
             url: Url::parse(&format!("https://github.com/o/r/pull/{number}")).unwrap(),
         })
+    }
+
+    #[test]
+    fn a_visible_pull_request_browser_refreshes_beside_the_focused_chat() {
+        let (mut app, _) = pull_request_test_app(&[]);
+        app.active_workspace = Some("/repo".into());
+        let (browser, _) = app.add_pull_requests_card("/repo".into());
+        if let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&browser) {
+            crate::pull_request_review::tests::ready_due_browser(&mut pane.review);
+        }
+        drop(app.new_native_chat(crate::agent::Provider::Codex, Some("/repo".into())));
+        assert_ne!(app.workspace.focused(), Some(browser));
+        app.workspace.resize_viewport(2400.0);
+        app.workspace.native_scroll(0.0, 2400.0);
+        assert_eq!(
+            app.workspace.visibility(browser),
+            Some(VisibilityClass::Visible)
+        );
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        drop(app.update_refresh(refresh_ui::Action::Tick));
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&browser) else {
+            panic!("PR browser")
+        };
+        // A started refresh cancels the prior generation's request: the new
+        // page response must not be accepted by the prior browser surface.
+        assert!(matches!(
+            pane.review.list(),
+            crate::pull_request_review::ListState::Ready(_)
+        ));
+        assert!(pane.review.browser_is_refreshing());
     }
 
     #[test]

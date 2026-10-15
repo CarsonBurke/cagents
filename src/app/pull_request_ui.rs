@@ -3,12 +3,11 @@ use crate::github::{
     PullRequest, PullRequestComment, PullRequestConversation, PullRequestInspection,
     PullRequestReviewThread,
 };
-use crate::repository::HeadState;
 use cosmic::widget::markdown;
 
 type ActionTask = iced::Task<Action>;
 
-/// Includes local HEAD and remote authority, not just the branch's display name.
+/// Stable inspector identity, with a separate local HEAD revision for refresh fencing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub worktree: PathBuf,
@@ -27,6 +26,14 @@ pub enum Section {
 #[derive(Debug, Clone)]
 pub enum Action {
     Refresh,
+    RerunFailed(u64),
+    RerunFinished(Target, u64, u64, Result<(), String>),
+    FixCheck(Url),
+    OpenPreparedContext,
+    ToggleThread(String),
+    SelectUnresolved,
+    SendThreads,
+    AgentContext(Target, u64, Result<String, String>),
     Resolved(Target, u64, Result<Option<Arc<PullRequest>>, String>),
     Loaded(
         Target,
@@ -42,7 +49,7 @@ pub enum Action {
 
 impl Action {
     pub(super) fn allowed_while_modal(&self) -> bool {
-        matches!(self, Self::Resolved(..) | Self::Loaded(..))
+        matches!(self, Self::Resolved(..) | Self::Loaded(..) | Self::RerunFinished(..) | Self::AgentContext(..))
     }
 }
 
@@ -66,6 +73,20 @@ pub struct State {
     comment_markdown: HashMap<String, Vec<markdown::Item>>,
     checks_collapsed: bool,
     discussion_collapsed: bool,
+    selected_threads: std::collections::BTreeSet<String>,
+    context_loading: bool,
+    context_error: Option<String>,
+    prepared_context: Option<(PathBuf, String)>,
+    rerunning: std::collections::BTreeSet<u64>,
+
+}
+
+impl Target {
+    fn same_identity(&self, other: &Self) -> bool {
+        self.worktree == other.worktree
+            && self.branch == other.branch
+            && self.repository == other.repository
+    }
 }
 
 impl State {
@@ -80,9 +101,23 @@ impl State {
         if self.target == target {
             return ActionTask::none();
         }
+        let same_identity = self
+            .target
+            .as_ref()
+            .zip(target.as_ref())
+            .is_some_and(|(old, new)| old.same_identity(new));
         self.cancellation.cancel();
         self.generation = self.generation.wrapping_add(1);
         self.target = target;
+        if same_identity {
+            self.loading = false;
+            if self.target.as_ref().is_some_and(|target| {
+                !crate::github::polling::ready(&target.repository.host, false)
+            }) {
+                return ActionTask::none();
+            }
+            return self.refresh();
+        }
         self.inspection = None;
         self.pull_request = None;
         self.preview = None;
@@ -91,6 +126,11 @@ impl State {
         self.loaded = false;
         self.loading = false;
         self.filter.clear();
+        self.selected_threads.clear();
+        self.context_loading = false;
+        self.context_error = None;
+        self.prepared_context = None;
+        self.rerunning.clear();
         self.description.clear();
         self.comment_markdown.clear();
         self.refresh()
@@ -100,6 +140,11 @@ impl State {
         let Some(target) = self.target.clone() else {
             return ActionTask::none();
         };
+        if !crate::github::polling::ready(&target.repository.host, true) {
+            return ActionTask::none();
+        }
+        self.context_loading = false;
+        self.rerunning.clear();
         self.cancellation.cancel();
         self.cancellation = CancellationToken::new();
         let cancellation = self.cancellation.clone();
@@ -131,7 +176,6 @@ impl State {
                             &cancellation,
                         )
                         .map_err(|error| error.to_string())?;
-                    verify_local_head(&work, &cancellation)?;
                     Ok(result.map(Arc::new))
                 })
                 .await
@@ -145,6 +189,109 @@ impl State {
 
     pub fn update(&mut self, action: Action) -> ActionTask {
         match action {
+            Action::RerunFailed(run) => {
+                let Some(target) = self.target.clone() else { return ActionTask::none(); };
+                let actionable = self.inspection.as_ref().and_then(|inspection| inspection.checks.as_ref().ok())
+                    .is_some_and(|checks| checks.iter().any(|check| sidebar::is_check_failure(&check.bucket.0)
+                        && crate::github::agent_context::workflow_run(&target.repository, &check.link) == Some(run)));
+                if !actionable || !self.rerunning.insert(run) { return ActionTask::none(); }
+                let generation = self.generation;
+                let cancellation = self.cancellation.clone();
+                self.context_error = None;
+                return ActionTask::perform(async move {
+                    let repo = target.repository.clone();
+                    let result = tokio::task::spawn_blocking(move || GitHubService::system("gh")
+                        .rerun_failed_workflow(&repo, run, &cancellation).map_err(|error| error.to_string()))
+                        .await.unwrap_or_else(|error| Err(format!("Workflow rerun failed: {error}")));
+                    Action::RerunFinished(target, generation, run, result)
+                }, |action| action);
+            }
+            Action::RerunFinished(target, generation, run, result) => {
+                if !self.accepts(&target, generation) { return ActionTask::none(); }
+                self.rerunning.remove(&run);
+                match result {
+                    Err(error) => self.context_error = Some(error),
+                    Ok(()) => {
+                        if let Some(inspection) = self.inspection.as_mut() {
+                            let inspection = Arc::make_mut(inspection);
+                            GitHubService::<crate::repository::SystemProcessExecutor>::invalidate_checks(&target.repository, inspection.pull_request.number);
+                            if let Ok(checks) = &mut inspection.checks {
+                                for check in checks.iter_mut().filter(|check| sidebar::is_check_failure(&check.bucket.0) && crate::github::agent_context::workflow_run(&target.repository, &check.link) == Some(run)) {
+                                    check.bucket.0 = "pending".into();
+                                    check.state.0 = "IN_PROGRESS".into();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Action::FixCheck(link) => {
+                if self.context_loading { return ActionTask::none(); }
+                let Some(target) = self.target.clone() else { return ActionTask::none(); };
+                let Some(inspection) = self.inspection.as_ref() else { return ActionTask::none(); };
+                let Some(check) = inspection.checks.as_ref().ok().and_then(|checks| checks.iter().find(|check| check.link == link && sidebar::is_check_failure(&check.bucket.0))).cloned() else { return ActionTask::none(); };
+                let Some(run) = crate::github::agent_context::workflow_run(&target.repository, &check.link) else { return ActionTask::none(); };
+                let pr = inspection.pull_request.clone();
+                let cancellation = self.cancellation.clone();
+                let generation = self.generation;
+                self.context_loading = true;
+                self.context_error = None;
+                return ActionTask::perform(async move {
+                    let repo = target.repository.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let logs = GitHubService::system("gh").failed_workflow_logs(&repo, run, &cancellation)
+                            .map_err(|error| error.to_string())?;
+                        Ok(crate::github::agent_context::failed_check_prompt(&pr, &check, &logs))
+                    }).await.unwrap_or_else(|error| Err(format!("Failed to prepare CI context: {error}")));
+                    Action::AgentContext(target, generation, result)
+                }, |action| action);
+            }
+            Action::ToggleThread(id) => {
+                if self.inspection.as_ref().and_then(|inspection| inspection.conversation.as_ref().ok())
+                    .is_some_and(|conversation| conversation.threads.iter().any(|thread| thread.id == id))
+                    && !self.selected_threads.remove(&id) { self.selected_threads.insert(id); }
+            }
+            Action::SelectUnresolved => {
+                self.selected_threads = self.inspection.as_ref()
+                    .and_then(|inspection| inspection.conversation.as_ref().ok())
+                    .map(|conversation| conversation.threads.iter().filter(|thread| !thread.resolved).map(|thread| thread.id.clone()).collect())
+                    .unwrap_or_default();
+            }
+            Action::SendThreads => {
+                if self.context_loading { return ActionTask::none(); }
+                let Some(target) = self.target.clone() else { return ActionTask::none(); };
+                let Some(inspection) = self.inspection.as_ref() else { return ActionTask::none(); };
+                let Some(conversation) = inspection.conversation.as_ref().ok() else { return ActionTask::none(); };
+                let threads: Vec<_> = conversation.threads.iter().filter(|thread| self.selected_threads.contains(&thread.id)).cloned().collect();
+                if threads.is_empty() { return ActionTask::none(); }
+                let pr = inspection.pull_request.clone();
+                let cancellation = self.cancellation.clone();
+                let generation = self.generation;
+                self.context_loading = true;
+                self.context_error = None;
+                return ActionTask::perform(async move {
+                    let repo = target.repository.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let service = GitHubService::system("gh");
+                        let ids=threads.iter().map(|thread|thread.id.clone()).collect::<Vec<_>>();
+                        let hunks=service.review_thread_hunks(&repo,&ids,&cancellation).map_err(|error|error.to_string())?;
+                        let threads=threads.into_iter().zip(hunks).map(|(thread,hunk)| {
+                            if thread.truncated { service.complete_review_thread_comments(&repo,thread,&cancellation).map(|thread|(thread,hunk)).map_err(|error|error.to_string()) }
+                            else { Ok((thread,hunk)) }
+                        }).collect::<Result<Vec<_>,String>>()?;
+                        crate::github::agent_context::review_threads_prompt(&pr, &threads)
+                    }).await.unwrap_or_else(|error| Err(format!("Failed to prepare review context: {error}")));
+                    Action::AgentContext(target, generation, result)
+                }, |action| action);
+            }
+            Action::AgentContext(target, generation, result) => {
+                if !self.accepts(&target, generation) { return ActionTask::none(); }
+                self.context_loading = false;
+                match result {
+                    Ok(prompt) => self.prepared_context = Some((target.worktree, prompt)),
+                    Err(error) => self.context_error = Some(error),
+                }
+            }
             Action::Refresh => {
                 if let Some(target) = &self.target {
                     if let Some(pr) = self.pull_request.as_ref() {
@@ -199,7 +346,6 @@ impl State {
                     async move {
                         let work = target.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            verify_local_head(&work, &cancellation)?;
                             let inspection = GitHubService::system("gh")
                                 .inspect_pull_request(
                                     &work.repository,
@@ -207,7 +353,6 @@ impl State {
                                     &cancellation,
                                 )
                                 .map_err(|error| error.to_string())?;
-                            verify_local_head(&work, &cancellation)?;
                             Ok(Some(Arc::new(inspection)))
                         })
                         .await
@@ -226,10 +371,16 @@ impl State {
                 self.loaded = true;
                 match result {
                     Ok(inspection) => {
+                        if inspection.as_ref().is_none_or(|inspection| {
+                            inspection.checks.is_ok() && inspection.conversation.is_ok()
+                        }) {
+                            crate::github::polling::succeeded(&target.repository.host);
+                        }
                         self.comment_markdown.clear();
                         if let Some(inspection) = &inspection
                             && let Ok(conversation) = &inspection.conversation
                         {
+                            self.selected_threads.retain(|id| conversation.threads.iter().any(|thread| thread.id == *id));
                             for comment in conversation
                                 .comments
                                 .iter()
@@ -271,7 +422,7 @@ impl State {
             Action::Filter(filter) => self.filter = filter,
             Action::ToggleResolved => self.hide_resolved = !self.hide_resolved,
             // Link routing belongs to the application, which owns browser preferences.
-            Action::OpenUrl(_) | Action::OpenMarkdownLink(_) => {}
+            Action::OpenUrl(_) | Action::OpenMarkdownLink(_) | Action::OpenPreparedContext => {}
         }
         ActionTask::none()
     }
@@ -288,23 +439,50 @@ impl Drop for State {
 }
 
 fn verify_local_head(target: &Target, cancellation: &CancellationToken) -> Result<(), String> {
-    let status = RepositoryService::system("git")
-        .status_with_untracked(&target.worktree, false, cancellation)
+    verify_local_head_with(&RepositoryService::system("git"), target, cancellation)
+}
+
+fn verify_local_head_with<E: crate::repository::ProcessExecutor>(
+    git: &RepositoryService<E>,
+    target: &Target,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    // Resolve only the ref: scanning tracked files cannot establish a stronger
+    // revision fence and becomes very expensive with active agent worktrees.
+    let head = git
+        .resolve_head(&target.worktree, cancellation)
         .map_err(|error| error.to_string())?;
-    let matches = match status.head {
-        HeadState::Branch { name, oid } => {
-            name == target.branch && target.head_oid.as_deref() == Some(oid.as_str())
-        }
-        HeadState::Unborn { branch } => {
-            branch.as_deref() == Some(target.branch.as_str()) && target.head_oid.is_none()
-        }
-        _ => false,
-    };
-    if matches {
+    let branch = git
+        .symbolic_head(&target.worktree, cancellation)
+        .map_err(|error| error.to_string())?;
+    if head.as_ref().map(|oid| oid.as_str()) == target.head_oid.as_deref()
+        && branch
+            .as_ref()
+            .and_then(|reference| reference.as_str().strip_prefix("refs/heads/"))
+            == Some(target.branch.as_str())
+    {
         Ok(())
     } else {
-        Err("The worktree branch or HEAD changed. Refresh the repository before inspecting its pull request.".into())
+        Err(
+            "The worktree branch or HEAD changed. Refresh the repository before inspecting its pull request."
+                .into(),
+        )
     }
+}
+
+fn check_rank(check: &crate::github::PullRequestCheck) -> u8 {
+    match check.bucket.0.as_str() {
+        bucket if sidebar::is_check_failure(bucket) => 0,
+        bucket if sidebar::is_check_pending(bucket) => 1,
+        bucket if sidebar::is_check_success(bucket) => 2,
+        _ => 3,
+    }
+}
+
+fn checks_summary(checks: &[crate::github::PullRequestCheck]) -> String {
+    let mut counts = [0; 4];
+    for check in checks { counts[usize::from(check_rank(check))] += 1; }
+    format!("Checks · {} failed, {} running, {} passed, {} skipped", counts[0], counts[1], counts[2], counts[3])
 }
 
 fn link<'a>(label: &'a str, url: &Url) -> Element<'a, Action> {
@@ -768,7 +946,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
     if let Some(inspection) = &state.inspection {
         let checks_label = inspection.checks.as_ref().map_or_else(
             |_| "Checks".to_owned(),
-            |checks| format!("Checks ({})", checks.len()),
+            |checks| checks_summary(checks),
         );
         children.push(section_header(
             checks_label,
@@ -781,7 +959,9 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     children.push(design::caption("No checks reported.").into())
                 }
                 Ok(checks) => {
-                    for check in checks {
+                    let mut sorted: Vec<_> = checks.iter().enumerate().collect();
+                    sorted.sort_by_key(|(_, check)| (check_rank(check), check.name.as_str()));
+                    for (_, check) in sorted {
                         let (symbol, tone): (_, fn(&cosmic::Theme) -> cosmic::iced::Color) =
                             match check.bucket.0.as_str() {
                                 bucket if sidebar::is_check_failure(bucket) => {
@@ -851,6 +1031,17 @@ pub fn view(state: &State) -> Element<'_, Action> {
                             .on_press(Action::OpenUrl(check.link.clone()))
                             .into(),
                         );
+                        if sidebar::is_check_failure(&check.bucket.0)
+                            && let Some(target) = &state.target
+                            && let Some(run) = crate::github::agent_context::workflow_run(&target.repository, &check.link)
+                        {
+                            children.push(widget::row::with_children(vec![
+                                crate::ui_controls::button::secondary(if state.rerunning.contains(&run) { "Re-running…" } else { "Re-run failed" })
+                                    .on_press_maybe((!state.rerunning.contains(&run)).then_some(Action::RerunFailed(run))).into(),
+                                crate::ui_controls::button::secondary("Fix with agent")
+                                    .on_press_maybe((!state.context_loading).then(|| Action::FixCheck(check.link.clone()))).into(),
+                            ]).spacing(space::XS).into());
+                        }
                     }
                 }
                 Err(error) => {
@@ -907,6 +1098,11 @@ pub fn view(state: &State) -> Element<'_, Action> {
                         .width(Length::Fill)
                         .into(),
                     );
+                    children.push(widget::row::with_children(vec![
+                        crate::ui_controls::button::secondary(if conversation.threads_truncated { "Select loaded unresolved" } else { "Select all unresolved" }).on_press(Action::SelectUnresolved).into(),
+                        crate::ui_controls::button::secondary(format!("Send {} to agent", state.selected_threads.len()))
+                            .on_press_maybe((!state.context_loading && !state.selected_threads.is_empty()).then_some(Action::SendThreads)).into(),
+                    ]).spacing(space::XS).into());
                     let filter = state.filter.to_lowercase();
                     let mut shown = 0;
                     for thread in &conversation.threads {
@@ -930,6 +1126,9 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                         .width(Length::Fill)
                                         .into(),
                                 ];
+                                head.push(widget::button::custom(design::caption(if state.selected_threads.contains(&thread.id) { "Selected" } else { "Select" }))
+                                    .class(crate::ui_controls::control_style(state.selected_threads.contains(&thread.id), None))
+                                    .on_press(Action::ToggleThread(thread.id.clone())).into());
                                 if thread.outdated {
                                     head.push(crate::ui_controls::badge(
                                         "Outdated",
@@ -1022,6 +1221,11 @@ pub fn view(state: &State) -> Element<'_, Action> {
             }
         }
     }
+    if state.prepared_context.is_some() {
+        children.push(crate::ui_controls::button::secondary("Review prepared agent prompt").on_press(Action::OpenPreparedContext).into());
+    }
+    if state.context_loading { children.push(design::caption("Preparing agent context…").into()); }
+    if let Some(error) = &state.context_error { children.push(design::caption(error).into()); }
     let body = widget::scrollable(
         widget::column::with_children(children)
             .spacing(space::S)
@@ -1051,6 +1255,21 @@ pub fn view(state: &State) -> Element<'_, Action> {
 
 impl Cagents {
     pub(super) fn handle_pull_request_ui(&mut self, action: Action) -> Task<Message> {
+        if matches!(action, Action::OpenPreparedContext)
+            && let Some((worktree, prompt)) = self.pull_request_inspector.prepared_context.take()
+        { return self.prepare_pr_agent_context(worktree, prompt); }
+        if let Action::AgentContext(target, generation, Ok(prompt)) = &action
+            && self.nested_modal_focus_target().is_none()
+            && !self.focused_repository_is_saving()
+            && self.pull_request_inspector.accepts(target, *generation)
+        {
+            let worktree = target.worktree.clone();
+            let prompt = prompt.clone();
+            let update = self.pull_request_inspector.update(action).map(Message::PullRequestUi).map(cosmic::Action::App);
+            self.pull_request_inspector.prepared_context = None;
+            let draft = self.prepare_pr_agent_context(worktree, prompt);
+            return Task::batch([update, draft]);
+        }
         let url = match &action {
             Action::OpenUrl(url) => Some(Ok(url.clone())),
             Action::OpenMarkdownLink(uri) => Some(Url::parse(uri)),
@@ -1235,7 +1454,11 @@ impl Cagents {
         if !self.context_inspector_open
             || self.context_tab != ContextTab::PullRequest
             || self.pull_request_inspector.loading
-            || self.pull_request_inspector.target.is_none()
+            || self
+                .pull_request_inspector
+                .target
+                .as_ref()
+                .is_none_or(|target| !crate::github::polling::ready(&target.repository.host, false))
         {
             return Task::none();
         }
@@ -1299,6 +1522,170 @@ mod tests {
     }
 
     #[test]
+    fn failed_checks_sort_first_and_the_header_counts_every_outcome() {
+        let make = |name: &str, bucket: &str| serde_json::from_value::<crate::github::PullRequestCheck>(serde_json::json!({
+            "name":name,"bucket":bucket,"state":bucket,"link":"https://github.com/owner/repo/actions/runs/123"
+        })).unwrap();
+        let mut checks = vec![make("passed", "pass"), make("skipped", "skipping"), make("running", "pending"), make("failed", "fail")];
+        checks.sort_by_key(check_rank);
+        assert_eq!(checks.iter().map(|check| check.name.as_str()).collect::<Vec<_>>(), ["failed", "running", "passed", "skipped"]);
+        assert_eq!(checks_summary(&checks), "Checks · 1 failed, 1 running, 1 passed, 1 skipped");
+    }
+
+    #[test]
+    fn prepared_context_is_retained_for_a_modal_safe_explicit_handoff() {
+        let mut state = State::default();
+        state.target = Some(target()); state.generation = 4; state.context_loading = true;
+        drop(state.update(Action::AgentContext(target(), 4, Ok("Prepared review context".into()))));
+        assert!(!state.context_loading);
+        assert_eq!(state.prepared_context, Some((PathBuf::from("/tmp/worktree"), "Prepared review context".into())));
+        drop(state.update(Action::AgentContext(target(), 3, Ok("Stale context".into()))));
+        assert_eq!(state.prepared_context.as_ref().unwrap().1, "Prepared review context");
+    }
+
+    #[test]
+    fn a_local_commit_preserves_content_and_filter_while_refreshing() {
+        let mut state = State::default();
+        state.target = Some(target());
+        state.loaded = true;
+        state.filter = "keep this filter".into();
+        state.description = markdown::parse("loaded description").collect();
+        let pr = crate::pull_request_review::tests::pull_request(7);
+        let inspection = Arc::new(PullRequestInspection {
+            pull_request: pr.clone(),
+            checks: Ok(Vec::new()),
+            conversation: Ok(Default::default()),
+        });
+        state.pull_request = Some(Arc::new(pr));
+        state.inspection = Some(Arc::clone(&inspection));
+        let mut next = target();
+        next.head_oid = Some("bbb".into());
+        drop(state.synchronize(Some(next), None));
+        assert!(state.loaded);
+        assert!(state.loading);
+        assert_eq!(state.filter, "keep this filter");
+        assert!(!state.description.is_empty());
+        assert!(state.pull_request.is_some());
+        assert!(Arc::ptr_eq(state.inspection.as_ref().unwrap(), &inspection));
+    }
+
+    #[test]
+    fn local_head_changes_observe_automatic_host_backoff_without_blank_content() {
+        let host = "inspector-commit-backoff.invalid";
+        let mut original = target();
+        original.repository = GitHubRepoKey::new(host, None, "owner", "repo").unwrap();
+        let mut state = State::default();
+        state.target = Some(original.clone());
+        state.loaded = true;
+        state.filter = "keep".into();
+        state.description = markdown::parse("Loaded content").collect();
+        crate::github::polling::failed(
+            host,
+            &crate::github::GitHubError::Inspection("offline".into()),
+        );
+        original.head_oid = Some("b".repeat(40));
+        drop(state.synchronize(Some(original), None));
+        assert!(!state.loading);
+        assert!(state.loaded);
+        assert_eq!(state.filter, "keep");
+        assert!(!state.description.is_empty());
+        crate::github::polling::succeeded(host);
+    }
+
+    #[test]
+    fn inspector_head_verification_reads_one_oid_and_checks_symbolic_branch_without_status() {
+        use crate::repository::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput};
+        struct CountingGit {
+            calls: std::sync::Mutex<Vec<CommandSpec>>,
+            branch: Option<&'static str>,
+            unborn: bool,
+        }
+        impl ProcessExecutor for CountingGit {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                self.calls.lock().unwrap().push(command.clone());
+                let symbolic = command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "symbolic-ref");
+                let (success, stdout) = if symbolic {
+                    (
+                        self.branch.is_some(),
+                        self.branch.unwrap_or_default().to_owned(),
+                    )
+                } else {
+                    (
+                        !self.unborn,
+                        if self.unborn {
+                            String::new()
+                        } else {
+                            "a".repeat(40)
+                        },
+                    )
+                };
+                Ok(ProcessOutput {
+                    success,
+                    exit_code: Some(if success { 0 } else { 1 }),
+                    signal: None,
+                    stdout: format!("{stdout}\n").into_bytes(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+        for (branch, unborn, expected) in [
+            (Some("refs/heads/feature"), false, true),
+            (Some("refs/heads/other"), false, false),
+            (None, false, false),
+            (Some("refs/heads/feature"), true, true),
+            (Some("refs/heads/other"), true, false),
+        ] {
+            let executor = Arc::new(CountingGit {
+                calls: Default::default(),
+                branch,
+                unborn,
+            });
+            let git = RepositoryService::new("git", executor.clone());
+            let mut target = target();
+            target.head_oid = (!unborn).then(|| "a".repeat(40));
+            assert_eq!(
+                verify_local_head_with(&git, &target, &CancellationToken::new()).is_ok(),
+                expected
+            );
+            let calls = executor.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|command| command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "rev-parse"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|command| command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "symbolic-ref"))
+                    .count(),
+                1
+            );
+            assert!(calls.iter().all(|command| {
+                !command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "status")
+            }));
+        }
+    }
+
+    #[test]
     fn the_discussion_header_counts_only_what_the_filters_leave_visible() {
         let conversation = PullRequestConversation {
             threads: vec![
@@ -1311,6 +1698,7 @@ mod tests {
                 state: crate::github::RemoteValue("APPROVED".into()),
             }],
             truncated: false,
+            threads_truncated: false,
         };
         assert_eq!(discussion_count(&conversation, "", false), 4);
         // Hiding resolved threads drops the settled one and nothing else.

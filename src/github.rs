@@ -24,7 +24,18 @@ use crate::repository::{
 
 #[cfg(feature = "ui")]
 pub mod avatar;
+pub mod polling;
+pub mod review_actions;
+pub mod review_controls;
+#[cfg(feature = "ui")]
+pub mod suggested_changes;
+mod review_batches;
+mod review_refresh;
 pub mod review_requests;
+pub use review_batches::VIEWED_BATCH_SIZE;
+pub use review_refresh::ReviewRefresh;
+pub mod checkout;
+pub mod agent_context;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
 const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
@@ -545,6 +556,7 @@ pub struct PullRequestReviewThread {
 
 #[derive(Debug, Clone, Default)]
 pub struct PullRequestConversation {
+    pub threads_truncated: bool,
     pub threads: Vec<PullRequestReviewThread>,
     pub comments: Vec<PullRequestComment>,
     pub reviews: Vec<PullRequestReview>,
@@ -798,7 +810,7 @@ pub struct PullRequestFilePage {
 
 /// The viewer's unsubmitted review, if one exists. GitHub keeps at most one
 /// per viewer per pull request, and only its owner can see it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingReview {
     pub id: String,
     pub comment_count: u64,
@@ -808,7 +820,7 @@ pub struct PendingReview {
 /// What a review pane needs before its first mutation: the node id every
 /// mutation addresses, the endpoints its diff must match, and whether a
 /// pending review already exists to adopt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewContext {
     pub pull_request_id: String,
     pub head_oid: String,
@@ -1062,11 +1074,56 @@ fn validate_review_path(path: &str) -> Result<(), GitHubValidationError> {
 /// drop-in. Reads return the forge's answer or a typed error; mutations
 /// return a [`ReviewMutationOutcome`] once their inputs validate.
 pub trait GitHubReviewApi: Send + Sync {
+    #[cfg(feature = "ui")]
+    fn suggestion_lines(&self, _key: &PullRequestKey, _path: &str, _expected_head: &str, _start: u64, _end: u64, _cancellation: &CancellationToken) -> Result<String, GitHubError> {
+        Err(GitHubError::Inspection("Suggested changes are unavailable".into()))
+    }
+    #[cfg(feature = "ui")]
+    fn apply_suggestion(&self, _key: &PullRequestKey, _request: &suggested_changes::SuggestionRequest, _cancellation: &CancellationToken) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        Err(GitHubError::Inspection("Suggested changes are unavailable".into()))
+    }
+
+    fn review_controls(&self, _key: &PullRequestKey, _cancellation: &CancellationToken) -> Result<review_controls::ReviewControls, GitHubError> {
+        Err(GitHubError::Inspection("Review completion controls are unavailable".into()))
+    }
+    fn mutate_review_control(&self, _repository: &GitHubRepoKey, _pull_request_id: &str, _mutation: &review_controls::ReviewControlMutation, _cancellation: &CancellationToken) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        Err(GitHubError::Inspection("Review completion mutations are unavailable".into()))
+    }
+    fn reviewer_candidates(&self, _repository: &GitHubRepoKey, _search: &str, _cursor: Option<&str>, _teams: bool, _cancellation: &CancellationToken) -> Result<review_controls::ReviewerPage, GitHubError> {
+        Err(GitHubError::Inspection("Reviewer discovery is unavailable".into()))
+    }
+
     fn review_context(
         &self,
         key: &PullRequestKey,
         cancellation: &CancellationToken,
     ) -> Result<ReviewContext, GitHubError>;
+
+    /// A transport may fuse these reads into one inexpensive refresh query.
+    fn review_refresh(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewRefresh, GitHubError> {
+        Ok(ReviewRefresh {
+            context: self.review_context(key, cancellation)?,
+            files: self.pull_request_file_page(key, None, cancellation)?,
+            metadata: None,
+        })
+    }
+
+    /// Left-side anchors use the merge base, not the moving base branch tip.
+    fn review_merge_base(
+        &self,
+        _key: &PullRequestKey,
+        _base: &str,
+        _head: &str,
+        _cancellation: &CancellationToken,
+    ) -> Result<String, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Refresh this diff to verify its left-side anchor".into(),
+        ))
+    }
 
     fn pull_request_file_page(
         &self,
@@ -1102,6 +1159,18 @@ pub trait GitHubReviewApi: Send + Sync {
         request: &AddReviewThreadRequest,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<PullRequestReviewThread>, GitHubError>;
+
+    fn add_single_review_thread(
+        &self,
+        _key: &PullRequestKey,
+        _commit: &str,
+        _request: &AddReviewThreadRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Single comments are unavailable with this review service".into(),
+        ))
+    }
 
     fn reply_to_thread(
         &self,
@@ -1157,12 +1226,41 @@ pub trait GitHubReviewApi: Send + Sync {
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<()>, GitHubError>;
 
+    fn set_files_viewed(
+        &self,
+        repository: &GitHubRepoKey,
+        pr: &str,
+        paths: &[String],
+        viewed: bool,
+        cancellation: &CancellationToken,
+    ) -> Vec<(String, Result<ReviewMutationOutcome<()>, GitHubError>)> {
+        paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    self.set_file_viewed(repository, pr, path, viewed, cancellation),
+                )
+            })
+            .collect()
+    }
+
     /// The pull requests a review surface offers to open.
     fn list_pull_requests(
         &self,
         request: &ListPullRequestsRequest,
         cancellation: &CancellationToken,
     ) -> Result<Vec<PullRequest>, GitHubError>;
+
+    fn search_pull_requests(
+        &self,
+        _repository: &GitHubRepoKey,
+        _query: &str,
+        _cursor: Option<&str>,
+        _cancellation: &CancellationToken,
+    ) -> Result<PullRequestPage, GitHubError> {
+        Err(GitHubError::Inspection("Repository search is unavailable".into()))
+    }
 
     fn pull_request_page(
         &self,
@@ -1202,6 +1300,8 @@ pub trait GitHubReviewApi: Send + Sync {
 
 #[derive(Debug, Error)]
 pub enum GitHubError {
+    #[error("{limit}")]
+    RateLimited { limit: polling::RateLimit },
     #[error(transparent)]
     Validation(#[from] GitHubValidationError),
     #[error(transparent)]
@@ -1234,6 +1334,34 @@ pub enum GitHubError {
     Inspection(String),
 }
 
+impl GitHubError {
+    pub fn rate_limit(&self) -> Option<polling::RateLimit> {
+        match self {
+            Self::RateLimited { limit } => Some(limit.clone()),
+            Self::InvalidResponse { source, process } => source.rate_limit().or_else(|| {
+                polling::RateLimit::classify(
+                    &format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&process.stdout),
+                        String::from_utf8_lossy(&process.stderr)
+                    ),
+                    polling::now(),
+                )
+            }),
+            Self::Process(failure) => polling::RateLimit::classify(
+                &format!(
+                    "{}\n{}\n{}",
+                    failure.message,
+                    String::from_utf8_lossy(&failure.stdout),
+                    String::from_utf8_lossy(&failure.stderr)
+                ),
+                polling::now(),
+            ),
+            _ => polling::RateLimit::classify(&self.to_string(), polling::now()),
+        }
+    }
+}
+
 /// Authority to mutate is the repository identity established by the last
 /// completed successful refresh. It therefore survives an in-flight refresh,
 /// which `Loading` carries forward, and is revoked only by a completed refresh
@@ -1254,6 +1382,9 @@ pub enum GitHubAvailability {
         pull_requests: Vec<(PullRequest, Vec<PullRequestCheck>)>,
         refreshed_at: i64,
     },
+    RateLimited {
+        limit: polling::RateLimit,
+    },
     Failed {
         detail: String,
     },
@@ -1267,6 +1398,7 @@ impl GitHubAvailability {
             Self::Unauthenticated => "GitHub CLI is not signed in. Run gh auth login in a terminal, then refresh.".into(),
             Self::NotAssociated => "This repository has no supported GitHub remote. Add a GitHub remote, then refresh.".into(),
             Self::Loading { .. } => "Connecting to GitHub…".into(),
+            Self::RateLimited { limit } => limit.to_string(),
             Self::Failed { detail } => format!("Could not connect to GitHub: {detail}. Check your connection and refresh to retry."),
             Self::Ready { .. } => self.label().into(),
         }
@@ -1290,6 +1422,7 @@ impl GitHubAvailability {
                 "GitHub is up to date; no open pull requests."
             }
             Self::Ready { .. } => "GitHub is up to date.",
+            Self::RateLimited { .. } => "GitHub rate limit reached. Waiting until reset.",
             Self::Failed { .. } => {
                 "Could not connect to GitHub. Check your connection and refresh."
             }
@@ -1297,6 +1430,9 @@ impl GitHubAvailability {
     }
 
     pub fn from_error(error: GitHubError) -> Self {
+        if let Some(limit) = error.rate_limit() {
+            return Self::RateLimited { limit };
+        }
         match error {
             GitHubError::UnsupportedAuthStatus { .. } => Self::UnsupportedCli,
             GitHubError::Process(failure) if failure.kind == ProcessFailureKind::Spawn => {
@@ -1735,6 +1871,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         let mut command = self.gh_command([
             OsString::from("api"),
             "graphql".into(),
+            "--include".into(),
             "--hostname".into(),
             repository.authority().into(),
             "-f".into(),
@@ -1764,7 +1901,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
     ) -> Result<serde_json::Value, GitHubError> {
         let command = self.graphql_command(repository, query, variables);
         let output = self.run_checked(&command, repository, cancellation)?;
-        attach_process(parse_graphql(&output.stdout), &output)
+        let result = attach_process(parse_graphql(&output.stdout), &output);
+        if let Err(error) = &result {
+            polling::failed(&repository.host, error);
+        }
+        result
     }
 
     fn pull_request_variables(key: &PullRequestKey) -> Vec<(&'static str, GraphQlValue)> {
@@ -1787,8 +1928,8 @@ impl<E: ProcessExecutor> GitHubService<E> {
         for section in ["reviewThreads", "comments", "reviews"] {
             let fields = match section {
                 "reviewThreads" => REVIEW_THREAD_FIELDS,
-                "reviews" => "id author{login} body createdAt url state viewerDidAuthor",
-                _ => "id author{login} body createdAt url viewerDidAuthor",
+                "reviews" => "id author{login} body createdAt url state viewerDidAuthor viewerCanUpdate viewerCanDelete",
+                _ => "id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete",
             };
             let query = format!(
                 "query($owner:String!,$name:String!,$number:Int!,$cursor:String){{repository(owner:$owner,name:$name){{pullRequest(number:$number){{{section}(first:50,after:$cursor){{nodes{{{fields}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
@@ -1851,6 +1992,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 }
                 if page == 3 {
                     result.truncated = true;
+                    result.threads_truncated |= section == "reviewThreads";
                     break;
                 }
                 cursor = Some(next_cursor(&info, cursor.as_deref())?);
@@ -2065,8 +2207,17 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitHubError> {
         repository.validate()?;
-        let output = self.execute(command, cancellation)?;
-        self.checked_output(output, repository)
+        if let Some(limit) = polling::rate_limit(&repository.host) {
+            return Err(GitHubError::RateLimited { limit });
+        }
+        let result = self
+            .execute(command, cancellation)
+            .map_err(GitHubError::from)
+            .and_then(|output| self.checked_output(output, repository));
+        if let Err(error) = &result {
+            polling::failed(&repository.host, error);
+        }
+        result
     }
 
     fn checked_output(
@@ -2074,7 +2225,26 @@ impl<E: ProcessExecutor> GitHubService<E> {
         output: ProcessOutput,
         repository: &GitHubRepoKey,
     ) -> Result<ProcessOutput, GitHubError> {
+        if !output.success
+            && let Some(limit) = polling::RateLimit::classify(
+                &format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                polling::now(),
+            )
+        {
+            return Err(GitHubError::RateLimited { limit });
+        }
         if output.success {
+            let headers =
+                &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+            if let Some(limit) =
+                polling::RateLimit::classify(&String::from_utf8_lossy(headers), polling::now())
+            {
+                polling::failed(&repository.host, &GitHubError::RateLimited { limit });
+            }
             Ok(output)
         } else if output.exit_code == Some(4) {
             Err(GitHubError::AuthenticationRequired {
@@ -2153,7 +2323,20 @@ impl<E: ProcessExecutor> GitHubService<E> {
     ) -> Result<ReviewMutationOutcome<serde_json::Value>, GitHubError> {
         repository.validate()?;
         let command = self.graphql_command(repository, mutation, variables);
-        let output = match self.execute(&command, cancellation) {
+        self.mutate_command(repository, &command, payload, cancellation)
+    }
+
+    /// The same outcome reconciliation for stdin JSON mutations, including
+    /// file changes that exceed the operating system's per-argument limit.
+    fn mutate_command(
+        &self,
+        repository: &GitHubRepoKey,
+        command: &CommandSpec,
+        payload: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<serde_json::Value>, GitHubError> {
+        repository.validate()?;
+        let output = match self.execute(command, cancellation) {
             Ok(output) => output,
             Err(failure) if failure.started => {
                 return Ok(ReviewMutationOutcome::OutcomeUnknown { failure });
@@ -2166,7 +2349,25 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 failure: Box::new(output.require_success(&self.gh).unwrap_err()),
             });
         }
-        let body: Option<serde_json::Value> = serde_json::from_slice(&output.stdout).ok();
+        let body: Option<serde_json::Value> =
+            serde_json::from_slice(graphql_body(&output.stdout)).ok();
+        let headers = &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+        let error_text = body
+            .as_ref()
+            .and_then(|body| body.get("errors"))
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        if let Some(limit) = polling::RateLimit::classify(
+            &format!(
+                "{}\n{}\n{}",
+                String::from_utf8_lossy(headers),
+                error_text,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            polling::now(),
+        ) {
+            polling::failed(&repository.host, &GitHubError::RateLimited { limit });
+        }
         let applied = body
             .as_ref()
             .and_then(|body| body.pointer(&format!("/data{payload}")))
@@ -2261,6 +2462,25 @@ impl<E: ProcessExecutor> GitHubService<E> {
 }
 
 impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
+    #[cfg(feature = "ui")]
+    fn suggestion_lines(&self, key: &PullRequestKey, path: &str, expected_head: &str, start: u64, end: u64, cancellation: &CancellationToken) -> Result<String, GitHubError> {
+        GitHubService::suggestion_lines(self, key, path, expected_head, start, end, cancellation)
+    }
+    #[cfg(feature = "ui")]
+    fn apply_suggestion(&self, key: &PullRequestKey, request: &suggested_changes::SuggestionRequest, cancellation: &CancellationToken) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        GitHubService::apply_suggestion(self, key, request, cancellation)
+    }
+
+    fn review_controls(&self, key: &PullRequestKey, cancellation: &CancellationToken) -> Result<review_controls::ReviewControls, GitHubError> {
+        GitHubService::review_controls(self, key, cancellation)
+    }
+    fn mutate_review_control(&self, repository: &GitHubRepoKey, pull_request_id: &str, mutation: &review_controls::ReviewControlMutation, cancellation: &CancellationToken) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        GitHubService::mutate_review_control(self, repository, pull_request_id, mutation, cancellation)
+    }
+    fn reviewer_candidates(&self, repository: &GitHubRepoKey, search: &str, cursor: Option<&str>, teams: bool, cancellation: &CancellationToken) -> Result<review_controls::ReviewerPage, GitHubError> {
+        GitHubService::reviewer_candidates(self, repository, search, cursor, teams, cancellation)
+    }
+
     fn review_request_page(
         &self,
         repository: &GitHubRepoKey,
@@ -2286,6 +2506,16 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
     ) -> Result<PullRequest, GitHubError> {
         self.view(key, cancellation)
     }
+    fn search_pull_requests(
+        &self,
+        repository: &GitHubRepoKey,
+        query: &str,
+        cursor: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestPage, GitHubError> {
+        self.search_pull_request_page(repository, query, cursor, cancellation)
+    }
+
     fn pull_request_page(
         &self,
         repository: &GitHubRepoKey,
@@ -2329,6 +2559,47 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
             next_cursor: next,
         })
     }
+    fn review_refresh(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewRefresh, GitHubError> {
+        self.review_refresh_snapshot(key, cancellation)
+    }
+
+    fn review_merge_base(
+        &self,
+        key: &PullRequestKey,
+        base: &str,
+        head: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<String, GitHubError> {
+        key.validate()?;
+        validate_review_oid(base)?;
+        validate_review_oid(head)?;
+        let endpoint = format!(
+            "repos/{}/{}/compare/{base}...{head}",
+            key.repository.owner, key.repository.name
+        );
+        let command = self.gh_command([
+            "api",
+            "--include",
+            "--hostname",
+            &key.repository.authority(),
+            &endpoint,
+        ]);
+        let output = self.run_checked(&command, &key.repository, cancellation)?;
+        let data: serde_json::Value = parse_json(graphql_body(&output.stdout))?;
+        let oid = data
+            .pointer("/merge_base_commit/sha")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                GitHubError::Inspection("GitHub returned no merge base for this anchor".into())
+            })?;
+        validate_review_oid(oid)?;
+        Ok(oid.into())
+    }
+
     fn review_context(
         &self,
         key: &PullRequestKey,
@@ -2528,6 +2799,27 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
                 let comments = std::mem::take(&mut page.comments.nodes);
                 page.into_thread(comments, truncated)
             }))
+    }
+
+    fn add_single_review_thread(
+        &self,
+        key: &PullRequestKey,
+        commit: &str,
+        request: &AddReviewThreadRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        self.post_single_review_comment(key, commit, request, cancellation)
+    }
+
+    fn set_files_viewed(
+        &self,
+        repository: &GitHubRepoKey,
+        pr: &str,
+        paths: &[String],
+        viewed: bool,
+        cancellation: &CancellationToken,
+    ) -> Vec<(String, Result<ReviewMutationOutcome<()>, GitHubError>)> {
+        self.viewed_batch(repository, pr, paths, viewed, cancellation)
     }
 
     fn reply_to_thread(
@@ -2900,8 +3192,47 @@ fn decode_value<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, Git
     })
 }
 
+/// `gh api --include` exposes reset headers even on a successful final request.
+fn graphql_body(mut bytes: &[u8]) -> &[u8] {
+    while bytes.starts_with(b"HTTP/") {
+        let boundary = bytes
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .or_else(|| {
+                bytes
+                    .windows(2)
+                    .position(|part| part == b"\n\n")
+                    .map(|i| i + 2)
+            });
+        let Some(boundary) = boundary else {
+            return bytes;
+        };
+        bytes = &bytes[boundary..];
+    }
+    bytes
+}
+
 fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {
-    let mut envelope: serde_json::Value = parse_json(output)?;
+    let mut envelope: serde_json::Value = parse_json(graphql_body(output))?;
+    if envelope
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+        && let Some(limit) = polling::RateLimit::classify(
+            &format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output[..output.len() - graphql_body(output).len()]),
+                envelope
+                    .get("errors")
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            ),
+            polling::now(),
+        )
+    {
+        return Err(GitHubError::RateLimited { limit });
+    }
     if let Some(errors) = envelope.get("errors").and_then(serde_json::Value::as_array)
         && !errors.is_empty()
     {
@@ -2983,6 +3314,49 @@ mod tests {
             assert!(Instant::now() < deadline, "permit waiter did not register");
             thread::yield_now();
         }
+    }
+
+    #[test]
+    fn successful_last_budget_response_is_read_then_future_calls_pause_until_reset() {
+        let host = "headers-budget-test.invalid";
+        let reset = polling::now() + 120;
+        let output = format!(
+            "HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{\"data\":{{\"ok\":true}}}}"
+        );
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![success(output.as_bytes())]));
+        let service = GitHubService::new("gh", executor.clone());
+        let repository = GitHubRepoKey::new(host, None, "o", "r").unwrap();
+        assert_eq!(
+            service
+                .graphql(
+                    &repository,
+                    "query{viewer{login}}",
+                    vec![],
+                    &CancellationToken::new()
+                )
+                .unwrap()["ok"],
+            true
+        );
+        assert_eq!(polling::rate_limit(host).unwrap().retry_at, reset);
+        assert!(matches!(
+            service.graphql(
+                &repository,
+                "query{viewer{login}}",
+                vec![],
+                &CancellationToken::new()
+            ),
+            Err(GitHubError::RateLimited { .. })
+        ));
+        assert_eq!(
+            executor.commands.lock().unwrap().len(),
+            1,
+            "a paused read never launches gh"
+        );
+        let availability = GitHubAvailability::from_error(GitHubError::RateLimited {
+            limit: polling::RateLimit { retry_at: reset },
+        });
+        assert!(availability.guidance().contains("Retrying at"));
+        assert!(!availability.guidance().contains("Could not connect"));
     }
 
     #[test]
