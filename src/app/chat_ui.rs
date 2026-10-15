@@ -319,6 +319,7 @@ impl Action {
             Self::Ready(..)
                 | Self::Archived(..)
                 | Self::ArchiveAgents(..)
+                | Self::ArchiveProbe(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
                 | Self::Wake(..)

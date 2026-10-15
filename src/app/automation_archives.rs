@@ -185,7 +185,10 @@ mod tests {
         assert_eq!(app.archived_pane_readiness(card),Ok(Some(false)),"an unqualified possible archive waits; it never counts as Ready");
         drop(app.qualify_startup_automation_archives());
         let generation=app.chat_ui.archive_discovery.probes[&card].generation;
-        drop(app.startup_archive_probe_received(card,generation,Arc::new(Ok(archive))));
+        app.device_ui.open=true;assert!(app.modal_is_open());
+        drop(app.update(Message::ChatUi(chat_ui::Action::ArchiveProbe(card,generation,Arc::new(Ok(archive))))));
+        assert!(app.modal_is_open(),"background qualification never dismisses the user's dialog");
+        assert_eq!(app.pending_startup_archive_probes(),0,"completion under a modal must release its bounded probe slot");
         assert_eq!(app.durable.automation_archives.get(&card),Some(&id));
         assert!(matches!(&app.card_state(card).unwrap().kind,CardKind::Chat(saved) if saved.id==session.id && saved.terminal.is_some()));
         assert!(app.chat_start_pending(card),"the typed closed-owner probe transitions only into read-only payload hydration");
@@ -207,7 +210,9 @@ mod tests {
         drop(app.qualify_startup_automation_archives());
         assert_eq!(app.pending_startup_archive_probes(),4);
         let (&card,probe)=app.chat_ui.archive_discovery.probes.iter().next().unwrap();let generation=probe.generation;
-        drop(app.startup_archive_probe_received(card,generation,Arc::new(Err("ordinary live pane has no saved archive".into()))));
+        app.device_ui.open=true;assert!(app.modal_is_open());
+        drop(app.update(Message::ChatUi(chat_ui::Action::ArchiveProbe(card,generation,Arc::new(Err("ordinary live pane has no saved archive".into()))))));
+        assert_eq!(app.pending_startup_archive_probes(),3);
         assert_eq!(app.archived_pane_readiness(card),Ok(None),"a miss keeps ordinary live-pane qualification mandatory");
         assert!(app.durable.automation_archives.is_empty());
         drop(app.qualify_startup_automation_archives());
