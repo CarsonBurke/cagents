@@ -45,6 +45,7 @@ mod terminal_ui;
 mod update_ui;
 mod workspace_model_sync;
 mod worktree_dialog;
+mod worktree_choices;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
@@ -2553,6 +2554,10 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::OverwriteAndCloseRepository(_)
                 | Message::DiscardAndCloseRepository(_)
                 | Message::CancelRepositoryClose
+                | Message::WorktreeFieldFocused(_)
+                | Message::WorktreeChoiceSelected { .. }
+                | Message::WorktreePrefixChanged(_)
+                | Message::WorktreeSuggestionsDismissed(_)
                 | Message::WorktreeBranchChanged(_)
                 | Message::WorktreeBaseChanged(_)
                 | Message::WorktreeDestinationChanged(_)
@@ -4239,6 +4244,11 @@ pub enum Message {
         request: DelegateRequestId,
         result: Result<Option<Vec<PathBuf>>, String>,
     },
+    WorktreeChoicesResolved { id: crate::model::OperationId, result: Result<worktree_choices::Choices, String> },
+    WorktreeFieldFocused(WorktreeField),
+    WorktreeChoiceSelected { field: WorktreeField, reference: String },
+    WorktreePrefixChanged(String),
+    WorktreeSuggestionsDismissed(WorktreeField),
     WorktreeLinearResolved {
         id: crate::model::OperationId,
         result: Result<crate::linear::IssuePreview, String>,
@@ -15438,6 +15448,20 @@ impl Application for Cagents {
             }
             Message::WorktreeBranchChanged(value) => self.edit_worktree_branch(value),
             Message::WorktreeLinearResolved { id, result } => self.finish_worktree_linear(id, result),
+            Message::WorktreeChoicesResolved { id, result } => self.finish_worktree_choices(id, result),
+            Message::WorktreeFieldFocused(field) => {
+                if let Some(dialog) = &mut self.worktree_dialog { dialog.focus_field(field); }
+                Task::none()
+            }
+            Message::WorktreeChoiceSelected { field, reference } => self.select_worktree_choice(field, reference),
+            Message::WorktreeSuggestionsDismissed(field) => {
+                if let Some(dialog) = &mut self.worktree_dialog { dialog.dismiss_suggestions(field); }
+                Task::none()
+            }
+            Message::WorktreePrefixChanged(value) => {
+                if let Some(dialog) = &mut self.worktree_dialog { dialog.edit_prefix(value); }
+                Task::none()
+            }
             Message::WorktreeBaseChanged(value) => {
                 if let Some(dialog) = &mut self.worktree_dialog {
                     dialog.edit(WorktreeField::Base, value);
