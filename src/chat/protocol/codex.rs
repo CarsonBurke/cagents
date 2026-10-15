@@ -3070,20 +3070,28 @@ impl Codex {
         Some(identity)
     }
     fn bind_turn_items<'a>(&self, turn_id: &str, ids: impl Iterator<Item=&'a str>, step: &mut Step) {
-        use chat::turn_outcomes::{TurnUpdate, MAX_TURN_ITEM_IDS, MAX_TURN_ID_BYTES};
+        use chat::turn_outcomes::{TurnUpdate, MAX_TURN_ITEM_IDS, MAX_TURN_ID_BYTES, MAX_TURN_UPDATE_BYTES};
         let Some(identity) = self.confirmed_turn_identity(turn_id) else { return; };
+        let overhead=64+identity.session_id.len()+identity.id.len();
+        let mut bytes=overhead;
         let mut batch = Vec::new();
+        let mut emit=|item_ids| {
+            let update=TurnUpdate::Bind {identity:identity.clone(),item_ids};
+            match update.validate() {
+                Ok(())=>step.events.push(Event::TurnOutcome(update)),
+                Err(message)=>step.events.push(Event::Error {message,fatal:false}),
+            }
+        };
         for id in ids {
             if id.is_empty() || id.len() > MAX_TURN_ID_BYTES { continue; }
             if batch.iter().any(|prior| prior == id) { continue; }
-            batch.push(id.to_owned());
-            if batch.len() == MAX_TURN_ITEM_IDS {
-                step.events.push(Event::TurnOutcome(TurnUpdate::Bind { identity: identity.clone(), item_ids: std::mem::take(&mut batch) }));
+            let cost=id.len()+8;
+            if !batch.is_empty() && (batch.len()==MAX_TURN_ITEM_IDS || bytes+cost>MAX_TURN_UPDATE_BYTES) {
+                emit(std::mem::take(&mut batch));bytes=overhead;
             }
+            bytes+=cost;batch.push(id.to_owned());
         }
-        if !batch.is_empty() {
-            step.events.push(Event::TurnOutcome(TurnUpdate::Bind { identity, item_ids: batch }));
-        }
+        if !batch.is_empty() {emit(batch);}
     }
     fn record_turn_outcome(&self, turn: &Value, step: &mut Step) {
         use crate::agent::ActivityOutcome;
@@ -3099,6 +3107,8 @@ impl Codex {
             }
             _ => return,
         };
+        // First observed terminal time, including replay. This is not a
+        // claim about the provider's original historical completion clock.
         let finished_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
         step.events.push(Event::TurnOutcome(TurnUpdate::Finish { identity, outcome, finished_at }));
     }
@@ -4118,6 +4128,28 @@ mod tests {
         let reasoning = adapter.receive(json!({"method":"item/reasoning/summaryTextDelta","params":{"threadId":"thread-exact","turnId":"B","itemId":"thinking","summaryIndex":2,"delta":"proof"}})).unwrap();
         let actual = reasoning.events.iter().find_map(|event| match event { Event::TextDelta { id, .. } => Some(id), _ => None }).unwrap();
         assert!(reasoning.events.iter().any(|event| matches!(event, Event::TurnOutcome(TurnUpdate::Bind { identity, item_ids }) if identity.id == "B" && item_ids == &[actual.clone()])));
+    }
+
+    #[test]
+    fn long_native_aliases_split_into_valid_encoded_outcome_updates_without_loss() {
+        use chat::turn_outcomes::{TurnUpdate,MAX_TURN_UPDATE_BYTES};
+        let adapter=adapter();
+        let aliases:Vec<_>=(0..128).map(|index|format!("{index}-{}","x".repeat(4000))).collect();
+        let mut step=Step::default();
+        adapter.bind_turn_items("confirmed-turn",aliases.iter().map(String::as_str),&mut step);
+        let mut retained=Vec::new();let mut batches=0;
+        for event in step.events {
+            match event {
+                Event::TurnOutcome(update@TurnUpdate::Bind {..})=>{
+                    update.validate().unwrap();
+                    assert!(postcard::to_stdvec(&update).unwrap().len()<=MAX_TURN_UPDATE_BYTES);
+                    if let TurnUpdate::Bind {item_ids,..}=update {retained.extend(item_ids);}
+                    batches+=1;
+                }
+                _=>panic!("valid aliases must not be discarded or replaced by errors"),
+            }
+        }
+        assert!(batches>1);assert_eq!(retained,aliases);
     }
 
     #[test]
