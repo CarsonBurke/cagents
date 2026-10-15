@@ -679,6 +679,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::ConfiguredFileLoaded { .. }
+            | RepositoryAction::BinaryPageLoaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
@@ -7453,6 +7454,33 @@ mod tests {
         drop(app.update(Message::ResetSettings));
         drop(app.update(Message::ResetSettings));
         assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (4, true));
+    }
+
+    #[test]
+    fn binary_page_worker_finishes_behind_settings_and_updates_the_mounted_range() {
+        use cosmic::iced::advanced::{layout, widget::Tree, Layout, renderer::Headless};
+        let directory = tempfile::tempdir().unwrap();
+        let page = cagents::editor::BINARY_PREVIEW_BYTES;
+        std::fs::write(directory.path().join("bytes.bin"), vec![0; page as usize + 1]).unwrap();
+        let mut app = configured(&directory);
+        let task = app.add(Opened { root: directory.path().into(), file: Some("bytes.bin".into()), snapshot: None }, true);
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        let task = app.update(Message::Repository(RepositoryAction::BinaryPage { card, offset: page }));
+        app.settings_open = true;
+        run_tasks(&mut app, task);
+        app.settings_open = false;
+
+        let renderer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(cosmic::Renderer::new(cosmic::iced::Font::MONOSPACE, cosmic::iced::Pixels(14.0), Some("tiny-skia")))
+            .expect("headless renderer");
+        let mut element = cagents::repository_widget::view(card, &app.tab(card).unwrap().runtime);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(cosmic::iced::Size::ZERO, cosmic::iced::Size::new(1000.0, 700.0)));
+        let accessible = element.as_widget().a11y_nodes(Layout::new(&node), &tree, cosmic::iced::mouse::Cursor::Unavailable);
+        let expected = format!("bytes {}–{}", page, page + 1);
+        assert!(accessible.root().iter().chain(accessible.children()).any(|node| node.node().label().is_some_and(|label| label.contains(&expected))), "the actual completed second page must replace the first page behind a modal");
     }
 
     #[test]
