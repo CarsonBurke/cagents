@@ -39,7 +39,10 @@ pub(super) fn initialize(db: &mut Connection, owner: uuid::Uuid) -> Result<(), S
             [], |row| row.get(0),
         ).map_err(|error| error.to_string())?;
         match present {
-            0 => tx.execute_batch(SCHEMA).map_err(|error| error.to_string())?,
+            0 => {
+                tx.execute_batch(SCHEMA).map_err(|error| error.to_string())?;
+                validate_layout(&tx, false)?;
+            },
             4 => validate_layout(&tx, false)?,
             _ => return Err("Delegated tool schema is incomplete; its source data was retained".into()),
         }
