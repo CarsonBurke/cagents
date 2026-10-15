@@ -34,6 +34,7 @@ struct CloseSource {
 /// Cleanup results still settle their phase after this consent is revoked.
 #[derive(Clone)]
 pub(super) struct EndRequest {
+    registry: uuid::Uuid,
     pub(super) batch: Option<uuid::Uuid>,
     kind: CardKind,
     pub(super) session: Option<chat::Session>,
@@ -55,9 +56,10 @@ impl EndRequest {
         let paired_terminal = if matches!(&kind, CardKind::Terminal(_)) {
             Some(app.capture_card_close_for(card, batch)?)
         } else { None };
-        Some(Self { batch, kind, session, shared_source, paired_terminal })
+        Some(Self { registry: app.workspace_model.identity, batch, kind, session, shared_source, paired_terminal })
     }
     pub(super) fn source_current(&self, app: &Cagents, card: CardId) -> bool {
+        if self.registry != app.workspace_model.identity { return false; }
         let Some(state) = app.card_state(card).filter(|state| state.existence.is_open()) else { return false; };
         let same_kind = match (&self.kind, &state.kind) {
             (CardKind::Chat(expected), CardKind::Chat(current)) => terminal_close::same_chat_removal_source(expected, current),
@@ -865,6 +867,31 @@ mod tests {
         model.channels = vec![ModelChannel { id: channel, repository: directory.into(), title: "Retained conversation".into(), title_source: Default::default(), ordinal: 1 }];
         model.views = vec![view];
         app.workspace_model = model;
+    }
+
+    #[test]
+    fn an_unpublished_hidden_chat_end_cannot_cross_a_registry_join() {
+        let (mut app, card, directory) = fixture();
+        let source = attach_durable_owner(&mut app, card);
+        write(&mut app, card, "local retained prompt", false);
+        retain_in_channel(&mut app, directory.path(), vec![card]);
+        drop(app.update(Message::CloseCard(card)));
+        let decision = hide_decision(&app);
+        let receipt = hide_receipt(app.update(decision));
+        drop(app.update(receipt));
+        drop(app.update(Message::ChatClose(Action::End(card))));
+        let decision = emitted_confirm(&app);
+        drop(app.update(decision));
+        let target = pending_end(&app, card);
+        // No shared membership existed at intake; even an identical local
+        // descriptor cannot transfer this lifecycle decision to a new registry.
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        drop(app.update(Message::ChatUi(super::super::Action::RetainedCloseFinished(target, source, Ok(())))));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.cards.contains_key(&card));
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert!(app.recently_closed.is_empty());
+        assert!(app.chat_ui.end_requests.is_empty());
     }
 
     #[test]
