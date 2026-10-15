@@ -4291,6 +4291,25 @@ mod tests {
         assert_eq!(adapter.turn.as_deref(), Some("still-running"));
     }
     #[test]
+    fn expired_unanswered_allowance_read_keeps_one_rpc_and_never_spends_shared_request_budget() {
+        let mut adapter = adapter();
+        let (request, _) = allowance_request();
+        let first = adapter.read_allowance(request).unwrap();
+        for pending in adapter.pending.values_mut() {
+            if let Pending::Allowance(read) = pending { read.expire_for_test(); }
+        }
+        for _ in 0..256 {
+            let (request, _) = allowance_request();
+            assert!(adapter.read_allowance(request).unwrap_err().contains("already in flight"));
+        }
+        assert_eq!(adapter.pending.len(), 1);
+        // Late original reply is drained under its exact ID and cannot
+        // advance to another request after the original deadline.
+        let late = adapter.receive(json!({"id":first.writes[0]["id"],"result":allowance_account()})).unwrap();
+        assert!(late.writes.is_empty() && late.events.is_empty());
+        assert!(adapter.pending.is_empty());
+    }
+    #[test]
     fn allowance_login_transition_and_unavailable_method_return_only_requester_failure() {
         for login_transition in [false, true] {
             let mut adapter = adapter();

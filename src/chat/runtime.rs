@@ -1935,7 +1935,7 @@ impl Actor {
                 ActorCommand::ReadAllowance(request) => {
                     let result = request.check().and_then(|()| self.adapter.read_allowance(request));
                     match result {
-                        Ok(step) => { self.apply_step(step)?; let _ = reply.send(Ok(())); }
+                        Ok(step) => { self.step(step)?; let _ = reply.send(Ok(())); }
                         Err(error) => { let _ = reply.send(Err(error)); }
                     }
                     continue;

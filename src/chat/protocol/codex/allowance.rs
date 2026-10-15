@@ -10,10 +10,18 @@ pub(super) struct Read {
     pub(super) invalidated: bool,
 }
 
+
+#[cfg(test)]
+impl Read {
+    pub(super) fn expire_for_test(&mut self) {
+        self.request.expires = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    }
+}
+
 pub(super) fn start(adapter: &mut Codex, request: transport::Read) -> Result<Step, String> {
     request.check()?;
     if !adapter.ready { return Err("Codex connection is not ready for allowance inspection".into()); }
-    if adapter.pending.values().any(|pending| matches!(pending, Pending::Allowance(read) if read.request.expires > std::time::Instant::now())) {
+    if adapter.pending.values().any(|pending| matches!(pending, Pending::Allowance(_))) {
         return Err("An allowance request is already in flight on this connection".into());
     }
     let mut step = Step::default();
