@@ -35,6 +35,7 @@ mod step;
 mod thumbnails;
 mod tool_text;
 mod raw_original;
+mod clipboard_intent;
 mod turn;
 mod view;
 
@@ -480,6 +481,7 @@ pub(super) struct State {
     /// refused. Holding the draft here makes the round trip lossless, and the
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
+    copy_intents: clipboard_intent::Intents,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -507,6 +509,7 @@ impl Default for State {
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
             drafts: HashMap::new(),
+            copy_intents: clipboard_intent::Intents::default(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -7619,10 +7622,14 @@ impl Cagents {
             }
             Action::RawOriginalToggle(target,item,field)=>{if let Some(runtime)=self.chat_runtime_mut(target) {raw_original::toggle(runtime,&item,field,false);}}
             Action::RawOriginalReload(target,item,field)=>{if let Some(runtime)=self.chat_runtime_mut(target) {raw_original::toggle(runtime,&item,field,true);}}
-            Action::RawOriginalCopy(target,item,field)=>{if let Some(runtime)=self.chat_runtime_mut(target) {return raw_original::copy(runtime,&item,field);}}
+            Action::RawOriginalCopy(target,item,field)=>{
+                let intent=self.chat_ui.copy_intents.next();
+                if let Some(runtime)=self.chat_runtime_mut(target) {return raw_original::copy(runtime,&item,field,intent);}
+            }
             Action::RawOriginalReady(target,source,field,context,attempt,reply)=>{if let Some(runtime)=self.chat_runtime_mut(target) {raw_original::complete(runtime,source,field,context,attempt,reply);}}
             Action::RawOriginalCopied(target,context,proof,reply)=>{if let Some(runtime)=self.chat_runtime_mut(target) {return raw_original::copied(runtime,context,proof,reply);}}
             Action::Copy(target, id, part) => {
+                self.chat_ui.copy_intents.next();
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
@@ -7780,6 +7787,7 @@ impl Cagents {
                 }
             }
             Action::CopyLiteral(text) => {
+                self.chat_ui.copy_intents.next();
                 self.status = Some(TransientNotice::success("Copied code block"));
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }

@@ -241,26 +241,38 @@ fn retire(value:impl Send+'static) {
 struct CopyOutput {text:String,_reader:tokio::sync::OwnedSemaphorePermit,_capacity:chat::source_owners::ReaderCapacity}
 #[derive(Clone)]
 pub(super) struct CopyReply(Arc<CopySlot>);
-struct CopySlot(Mutex<Option<Result<CopyOutput,String>>>);
-impl Drop for CopySlot {fn drop(&mut self) {if let Some(value)=self.0.get_mut().unwrap_or_else(|error|error.into_inner()).take() {retire(value);}}}
-pub(super) fn copy(runtime:&Runtime,item:&str,field:RawSourceField)->Task<Message> {
+struct CopySlot {value:Mutex<Option<Result<CopyOutput,String>>>,intent:clipboard_intent::Intent}
+impl Drop for CopySlot {fn drop(&mut self) {if let Some(value)=self.value.get_mut().unwrap_or_else(|error|error.into_inner()).take() {retire(value);}}}
+struct CopyInput(Mutex<Option<Arc<str>>>);
+impl CopyInput {fn take(&self)->Option<Arc<str>> {self.0.lock().unwrap_or_else(|error|error.into_inner()).take()}}
+impl clipboard_intent::Pending for CopyInput {fn withdraw(&self) {if let Some(text)=self.take() {retire(text);}}}
+impl Drop for CopyInput {fn drop(&mut self) {if let Some(text)=self.0.get_mut().unwrap_or_else(|error|error.into_inner()).take() {retire(text);}}}
+pub(super) fn copy(runtime:&Runtime,item:&str,field:RawSourceField,intent:clipboard_intent::Intent)->Task<Message> {
+    if !intent.current() {return Task::none();}
     let Some(key)=runtime.raw_original.key(item,field) else {return Task::none();};
     let Some(loaded)=runtime.raw_original.entries.get(&key).and_then(|entry|entry.loaded.as_ref()) else {return Task::none();};
-    let proof=loaded.record.clone();let text=loaded.view.text.clone();let target=runtime.target;let context=runtime.raw_original.context;
+    let proof=loaded.record.clone();let input=Arc::new(CopyInput(Mutex::new(Some(loaded.view.text.clone()))));intent.register(&input);
+    let target=runtime.target;let context=runtime.raw_original.context;
     Task::perform(async move {
+        let current=intent.clone();
         let value=tokio::time::timeout(Duration::from_secs(40),async move {
             let reader=chat::source_owners::readers().clone().acquire_owned().await.map_err(|_|"Original copy stopped.".to_owned())?;
-            tokio::task::spawn_blocking(move || {let capacity=chat::source_owners::ReaderCapacity::default();let text=text.to_string();capacity.set(text.capacity());CopyOutput {text,_reader:reader,_capacity:capacity}})
-                .await.map_err(|_|"Original copy stopped.".to_owned())
+            tokio::task::spawn_blocking(move || {
+                let text=input.take().ok_or_else(||"A newer copy replaced this request.".to_owned())?;
+                if !current.current() {return Err("A newer copy replaced this request.".to_owned());}
+                let capacity=chat::source_owners::ReaderCapacity::default();let text=text.to_string();capacity.set(text.capacity());
+                Ok(CopyOutput {text,_reader:reader,_capacity:capacity})
+            }).await.map_err(|_|"Original copy stopped.".to_owned())?
         }).await.unwrap_or_else(|_|Err("The original call could not be copied in time.".into()));
-        (proof,CopyReply(Arc::new(CopySlot(Mutex::new(Some(value))))))
+        (proof,CopyReply(Arc::new(CopySlot {value:Mutex::new(Some(value)),intent})))
     },move |(proof,reply)|action(Action::RawOriginalCopied(target,context,proof,reply)))
 }
 pub(super) fn copied(runtime:&mut Runtime,context:u64,proof:ResidentRaw,reply:CopyReply)->Task<Message> {
+    if !reply.0.intent.current() {return Task::none();}
     sync(runtime);let key=Key {source:proof.source.clone(),field:proof.field};
     if runtime.raw_original.context!=context || !runtime.visible.load(Ordering::Relaxed)
         || runtime.raw_original.entries.get(&key).is_none_or(|entry|!entry.opened || entry.loaded.as_ref().is_none_or(|loaded|loaded.record!=proof)) {return Task::none();}
-    let Some(value)=reply.0.0.lock().unwrap_or_else(|error|error.into_inner()).take() else {return Task::none();};
+    let Some(value)=reply.0.value.lock().unwrap_or_else(|error|error.into_inner()).take() else {return Task::none();};
     match value {Ok(output)=>{runtime.copied=Some((proof.source.source_id,Instant::now()));iced::clipboard::write(output.text).map(cosmic::Action::App)},
         Err(error)=>{let entry=runtime.raw_original.entries.get_mut(&key).expect("current original");entry.error=Some(error);entry.revision=next_revision();Task::none()}}
 }
@@ -400,13 +412,33 @@ mod tests {
         drop(app.handle_chat_ui(Action::RawOriginalReady(target,part.source.clone(),part.field,context,attempt,ready)));
         let runtime=app.chat_runtime_mut(target).unwrap();assert!(runtime.raw_original.context!=context);assert_eq!(runtime.raw_original.retained_bytes(),0);
         let semaphore=Arc::new(tokio::sync::Semaphore::new(1));let permit=semaphore.clone().try_acquire_owned().unwrap();
-        let copy=CopyReply(Arc::new(CopySlot(Mutex::new(Some(Ok(CopyOutput {text:text.into(),_reader:permit,_capacity:Default::default()}))))));
+        let copy=CopyReply(Arc::new(CopySlot {value:Mutex::new(Some(Ok(CopyOutput {text:text.into(),_reader:permit,_capacity:Default::default()}))),intent:clipboard_intent::Intents::default().next()}));
         drop(app.handle_chat_ui(Action::RawOriginalCopied(target,context,record(&part),copy)));
         assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());flush();assert_eq!(semaphore.available_permits(),1);
         let runtime=app.chat_runtime_mut(target).unwrap();let prose=runtime.snapshot.source_revision;
         Arc::make_mut(&mut runtime.snapshot).raw_source_parts.clear();sync(runtime);
         assert_eq!(runtime.snapshot.source_revision,prose);assert!(runtime.raw_original.entries.is_empty(),"Raw removal is authoritative independently of prose revision");
     }
+    #[tokio::test]
+    async fn actual_original_copy_yields_to_newer_literal_clipboard_intent() {
+        use iced::futures::StreamExt as _;
+        let text=r#"{ "exact": "original input" }"#;
+        let (mut runtime,part)=runtime_fixture(text);let target=runtime.target;
+        toggle(&mut runtime,&part.item_id,part.field,false);let context=runtime.raw_original.context;
+        let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
+        let mut app=crate::app::tests::context_inspector_test_app(false);app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        let task=app.handle_chat_ui(Action::RawOriginalCopy(target,part.item_id.clone(),part.field));
+        let mut stream=iced::runtime::task::into_stream(task).unwrap();
+        let completed=loop {
+            if let Some(iced::runtime::Action::Output(cosmic::Action::App(message@Message::ChatUi(Action::RawOriginalCopied(..)))))=stream.next().await {break message;}
+        };
+        drop(app.handle_chat_ui(Action::CopyLiteral("newer code copy".into())));
+        drop(app.handle_chat_ui(match completed {Message::ChatUi(action)=>action,_=>unreachable!()}));
+        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        assert!(app.chat_runtime_mut(target).unwrap().raw_original.entries[&Key::of(&part)].error.is_none());
+    }
+
     #[test]
     fn original_disclosure_invalidates_only_its_own_scoped_item() {
         let first=part("first");let mut second=part("second");second.source.source_id="second-original-root".into();second.item_id="second-visible-part".into();
