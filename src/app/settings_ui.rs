@@ -1097,6 +1097,20 @@ fn settings_category_controls<'a>(
                     &draft.keyboard_shortcuts,
                 ),
                 shortcut_input(
+                    "Next pane needing attention",
+                    "Focuses waiting, failed and unread panes across all workspaces.",
+                    &draft.keyboard_shortcuts.next_attention,
+                    SettingsField::ShortcutNextAttention,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
+                    "Previous pane needing attention",
+                    "Cycles backwards through agents needing attention.",
+                    &draft.keyboard_shortcuts.previous_attention,
+                    SettingsField::ShortcutPreviousAttention,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
                     "Mark reviewed file viewed",
                     "Toggles the reviewed file's viewed mark in the focused pull request pane and moves to the next file.",
                     &draft.keyboard_shortcuts.review_toggle_viewed,

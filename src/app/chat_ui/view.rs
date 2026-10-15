@@ -1074,6 +1074,24 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Choosing attachments")
         } else if self.pending.is_some() {
             (Some(Icon::AgentWorking), "Sending")
+        } else if let Some(outcome) = snapshot
+            .outcome
+            .as_ref()
+            .filter(|outcome| outcome.reason().is_some())
+        {
+            (Some(Icon::Warning), outcome.label())
+        } else if matches!(
+            &snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Cancelled)
+        ) && (!snapshot.is_working() || snapshot.exited)
+        {
+            (Some(Icon::Cancel), "Cancelled")
+        } else if matches!(
+            &snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Succeeded)
+        ) && (!snapshot.is_working() || snapshot.exited)
+        {
+            (Some(Icon::Check), "Finished")
         } else if self.disconnected {
             (Some(Icon::Warning), "Disconnected")
         } else if snapshot.exited && self.session.owns_codex_listener() {
@@ -1100,6 +1118,10 @@ impl Runtime {
                     snapshot.detail.as_str()
                 },
             )
+        } else if let Some(crate::agent::ActivityOutcome::Cancelled) = &snapshot.outcome {
+            (Some(Icon::Cancel), "Cancelled")
+        } else if let Some(crate::agent::ActivityOutcome::Failed { .. }) = &snapshot.outcome {
+            (Some(Icon::Warning), "Failed")
         } else if snapshot.finished_at.is_some() {
             match snapshot.detail.as_str() {
                 "Turn interrupted" => (Some(Icon::Cancel), "Interrupted"),
@@ -1320,7 +1342,8 @@ impl Runtime {
                 }
             }
             if !snapshot.has_later
-                && snapshot.activity() == crate::agent::ActivityState::Idle
+                && (snapshot.activity() == crate::agent::ActivityState::Idle
+                    || (snapshot.outcome.is_some() && snapshot.exited))
                 && snapshot.queued_messages.is_empty()
                 && self.queued.is_none()
                 && self.followups.is_empty()
@@ -4852,6 +4875,196 @@ mod tests {
                 hovered.bounds, probe.bounds,
                 "hover controls must not move neighboring messages"
             );
+        }
+    }
+
+    #[test]
+    fn discarded_parked_attention_does_not_reappear_after_close() {
+        let (runtime, handle) = frame_cost::live_runtime(&[]);
+        let card = runtime.target.card;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut state = crate::app::tests::terminal_card_state();
+        state.id = card;
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        app.chat_ui.parked.insert(card, Box::new(runtime));
+        handle.observe_activity_for_test(crate::agent::ActivityState::Waiting);
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        // This is the ordinary close path's cleanup before chat_discard.
+        app.sidebar_state.clear_agent_activity(card);
+        app.sidebar_state.acknowledge_agent_update(card);
+        app.chat_discard(card);
+        assert_eq!(app.sidebar_state.card_activity(card), None);
+        assert!(app.sidebar_state.card_outcome(card).is_none());
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert_eq!(app.sidebar_state.intervention_count(), 0);
+    }
+
+    #[test]
+    fn attention_terminal_outcome_with_unknown_activity_marks_background_pane_unread() {
+        use crate::agent::{ActivityOutcome, ActivityState};
+        for outcome in [
+            ActivityOutcome::Cancelled,
+            ActivityOutcome::Failed {
+                reason: "exit 3".into(),
+            },
+            ActivityOutcome::Interrupted {
+                reason: "missing final result".into(),
+            },
+        ] {
+            let (runtime, handle) = frame_cost::live_runtime(&[]);
+            let card = runtime.target.card;
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.context_inspector_open = false;
+            app.refresh_ui.focused = false;
+            let mut state = crate::app::tests::terminal_card_state();
+            state.id = card;
+            state.kind = CardKind::Chat(runtime.session.clone());
+            Arc::make_mut(&mut app.durable).cards.push(state);
+            app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
+            app.observe_agent_activity_for_card(
+                card,
+                Some(crate::agent::Activity {
+                    provider: Provider::Claude,
+                    state: ActivityState::Unknown,
+                }),
+            );
+            assert!(!app.sidebar_state.has_card_update(card));
+            assert!(handle.observe_outcome_for_test(ActivityState::Unknown, Some(outcome.clone())));
+            app.observe_agent_activity_for_card(
+                card,
+                Some(crate::agent::Activity {
+                    provider: Provider::Claude,
+                    state: ActivityState::Unknown,
+                }),
+            );
+            assert_eq!(app.sidebar_state.card_outcome(card), Some(&outcome));
+            assert!(app.sidebar_state.has_card_update(card));
+            app.sidebar_state.acknowledge_agent_update(card);
+            app.observe_agent_activity_for_card(
+                card,
+                Some(crate::agent::Activity {
+                    provider: Provider::Claude,
+                    state: ActivityState::Unknown,
+                }),
+            );
+            assert!(!app.sidebar_state.has_card_update(card));
+        }
+    }
+
+    #[test]
+    fn attention_initial_completed_outcome_does_not_recreate_unread_after_attach() {
+        let (runtime, handle) = frame_cost::live_runtime(&[]);
+        let card = runtime.target.card;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let mut state = crate::app::tests::terminal_card_state();
+        state.id = card;
+        state.kind = CardKind::Chat(runtime.session.clone());
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
+        handle.observe_outcome_for_test(
+            crate::agent::ActivityState::Unknown,
+            Some(crate::agent::ActivityOutcome::Succeeded),
+        );
+        app.observe_agent_activity_for_card(
+            card,
+            Some(crate::agent::Activity {
+                provider: Provider::Claude,
+                state: crate::agent::ActivityState::Unknown,
+            }),
+        );
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert_eq!(
+            app.sidebar_state.card_outcome(card),
+            Some(&crate::agent::ActivityOutcome::Succeeded)
+        );
+    }
+
+    #[test]
+    fn attention_cancelled_outcome_stops_running_tool_turn() {
+        let items = [chat::Item {
+            id: "cancelled-tool".into(),
+            role: chat::Role::Assistant,
+            started_at: None,
+            at: Some(42),
+            content: ItemContent::Command {
+                label: "Long task".into(),
+                command: "sleep 600".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
+        }];
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        runtime.refresh();
+        assert!(!runtime.turns.is_empty());
+        assert!(runtime.turns.iter().any(|turn| turn.running));
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.busy = false;
+        snapshot.finished_at = Some(42);
+        snapshot.outcome = Some(crate::agent::ActivityOutcome::Cancelled);
+        handle.replace_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert!(runtime.turns.iter().all(|turn| !turn.running));
+        assert_eq!(runtime.conversation_status(false).1, "Cancelled");
+        assert!(
+            runtime
+                .finished_stamp
+                .as_ref()
+                .unwrap()
+                .1
+                .starts_with("Cancelled")
+        );
+    }
+
+    #[test]
+    fn attention_terminal_run_outcomes_have_distinct_footer_status() {
+        use crate::agent::ActivityOutcome;
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        for (outcome, label, glyph) in [
+            (ActivityOutcome::Succeeded, "Finished", Icon::Check),
+            (ActivityOutcome::Cancelled, "Cancelled", Icon::Cancel),
+            (
+                ActivityOutcome::Failed {
+                    reason: "Provider exited with code 3".into(),
+                },
+                "Failed",
+                Icon::Warning,
+            ),
+            (
+                ActivityOutcome::Interrupted {
+                    reason: "Provider exited before its final result".into(),
+                },
+                "Interrupted",
+                Icon::Warning,
+            ),
+        ] {
+            let mut next = (*runtime.snapshot).clone();
+            next.finished_at = Some(42);
+            next.outcome = Some(outcome);
+            next.generation += 1;
+            _handle.replace_snapshot_for_test(next);
+            runtime.refresh();
+            assert_eq!(runtime.conversation_status(false), (Some(glyph), label));
+            assert!(
+                runtime
+                    .finished_stamp
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .starts_with(label)
+            );
+            assert!(runtime.turns.iter().all(|turn| !turn.running));
         }
     }
 

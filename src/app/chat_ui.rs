@@ -508,6 +508,10 @@ impl Default for State {
     }
 }
 impl State {
+    pub(super) fn parked_runtime(&self, card: CardId) -> Option<&Runtime> {
+        self.parked.get(&card).map(Box::as_ref)
+    }
+
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {
         Self {
             drafts,
@@ -2237,6 +2241,24 @@ impl Runtime {
             cached.rehighlight(theme);
         }
     }
+    pub(super) fn native_activity(&self) -> Option<Activity> {
+        self.handle().map(|handle| Activity {
+            provider: self.session.launch.provider,
+            state: handle.take_activity(),
+        })
+    }
+
+    pub(super) fn parent_transcript_selected(&self) -> bool {
+        self.selected_subagent.is_none()
+    }
+
+    pub(super) fn activity_outcome(&self) -> Option<crate::agent::ActivityOutcome> {
+        match self.handle() {
+            Some(handle) => handle.activity_outcome(),
+            None => self.snapshot.outcome.clone(),
+        }
+    }
+
     fn source_now_ms(&self) -> Option<u64> {
         self.source_clock
             .map(chat::client::SourceClock::now)
@@ -2273,7 +2295,9 @@ impl Runtime {
         {
             return;
         }
-        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
+        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at
+            || self.snapshot.outcome != snapshot.outcome
+        {
             self.finished_stamp = snapshot.finished_at.and_then(|at| {
                 let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
                 let full = format!(
@@ -2283,7 +2307,16 @@ impl Runtime {
                     time.day,
                     time.clock()
                 );
-                Some((at, format!("Finished at {}", time.clock()), full))
+                let label = snapshot
+                    .outcome
+                    .as_ref()
+                    .map_or("Finished", crate::agent::ActivityOutcome::label);
+                let full = snapshot
+                    .outcome
+                    .as_ref()
+                    .and_then(crate::agent::ActivityOutcome::reason)
+                    .map_or_else(|| full.clone(), |reason| format!("{full} · {reason}"));
+                Some((at, format!("{label} at {}", time.clock()), full))
             });
         }
         self.subagent_scroll
@@ -2523,6 +2556,12 @@ impl Runtime {
             self.failures.retain(|(anchor, message)| {
                 anchor.as_deref() != current_anchor || !chat::requires_sign_in(provider, message)
             });
+        }
+        let mut turns = turns;
+        if snapshot.outcome.is_some() && (!snapshot.is_working() || snapshot.exited) {
+            for turn in &mut turns {
+                turn.running = false;
+            }
         }
         self.turns = turns;
         reconcile_disclosure(&mut self.opened, &self.turns);
@@ -4228,6 +4267,11 @@ impl Cagents {
                 }
             }
         }
+        let mut agent_updates = self.sidebar_state.unread_updates().clone();
+        agent_updates.retain(|card, _| open_cards.contains(card));
+        if agent_updates != self.durable.agent_updates {
+            Arc::make_mut(&mut self.durable).agent_updates = agent_updates;
+        }
         if defaults.is_empty()
             && chat_drafts == self.durable.chat_drafts
             && repository_navigation == self.durable.repository_navigation
@@ -4658,6 +4702,10 @@ impl Cagents {
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
+        // Forgetting a still-parked runtime can observe its final scalar state.
+        // A closed pane must not retain that attention after the actor detaches.
+        self.sidebar_state.clear_agent_activity(card);
+        self.sidebar_state.acknowledge_agent_update(card);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
@@ -6542,12 +6590,18 @@ impl Cagents {
                         }
                         _ => None,
                     };
+                    let activity = matches!(wake, Wake::Activity | Wake::Changed)
+                        .then(|| runtime.native_activity())
+                        .flatten();
                     if let Wake::Disconnected(error) = wake {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
                     if let Some((name, source)) = name {
                         self.suggest_channel_title(target.card, name, source);
+                    }
+                    if let Some(activity) = activity {
+                        self.observe_agent_activity_for_card(target.card, Some(activity));
                     }
                     return Task::none();
                 }
@@ -12537,6 +12591,184 @@ mod tests {
         settle(app, card, Ok(()));
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[test]
+    fn attention_session_notification_selects_its_parent_after_exact_focus_and_modal_deferral() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let runtime = chat_runtime(&app, card);
+        let target = runtime.target;
+        let parent = runtime.session.id;
+        let handle = runtime.handle().unwrap().clone();
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.subagents.push(chat::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            id: "child".into(),
+            kind: "fixture".into(),
+            description: "Child transcript".into(),
+            status: chat::ToolStatus::Succeeded,
+            background: false,
+            items: vec![],
+        });
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+        assert_eq!(
+            chat_runtime(&app, card).selected_subagent.as_deref(),
+            Some("child")
+        );
+        app.settings_reset_confirm = true;
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(
+                parent,
+            )),
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).selected_subagent.as_deref(),
+            Some("child"),
+            "a deferred activation cannot mutate the transcript behind a modal"
+        );
+        app.settings_reset_confirm = false;
+        drop(app.retry_notification_activation());
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(chat_runtime(&app, card).selected_subagent.is_none());
+        assert!(
+            Arc::ptr_eq(chat_runtime(&app, card).handle().unwrap(), &handle),
+            "activation preserves the exact native actor attachment"
+        );
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+        app.sidebar_state.observe_card_update(card);
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(
+                parent,
+            )),
+        )));
+        assert!(chat_runtime(&app, card).selected_subagent.is_none());
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert_eq!(chat_runtime(&app, card).session.id, parent);
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+
+        for navigation in [
+            Message::RunCommand(workspace_widget::GlobalShortcut::NextAttention),
+            Message::FocusAttention(card),
+        ] {
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+            app.sidebar_state.observe_card_update(card);
+            app.settings_reset_confirm = true;
+            drop(app.update(navigation.clone()));
+            assert_eq!(
+                chat_runtime(&app, card).selected_subagent.as_deref(),
+                Some("child")
+            );
+            assert!(app.sidebar_state.has_card_update(card));
+            app.settings_reset_confirm = false;
+            drop(app.update(navigation));
+            assert!(chat_runtime(&app, card).selected_subagent.is_none());
+            assert!(!app.sidebar_state.has_card_update(card));
+            assert_eq!(chat_runtime(&app, card).session.id, parent);
+            assert!(Arc::ptr_eq(
+                chat_runtime(&app, card).handle().unwrap(),
+                &handle
+            ));
+        }
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+        drop(app.update(Message::FocusCard(card)));
+        assert_eq!(
+            chat_runtime(&app, card).selected_subagent.as_deref(),
+            Some("child"),
+            "ordinary pane focus preserves the selected child transcript"
+        );
+    }
+
+    #[test]
+    fn attention_parent_behind_selected_child_is_unattended_and_gets_a_new_visible_dwell() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let runtime = chat_runtime(&app, card);
+        let target = runtime.target;
+        let parent = runtime.session.id;
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.subagents.push(chat::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            id: "child".into(),
+            kind: "fixture".into(),
+            description: "Child transcript".into(),
+            status: chat::ToolStatus::Succeeded,
+            background: false,
+            items: vec![],
+        });
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        app.refresh_ui.focused = true;
+        drop(app.sync_visible_attention());
+        app.sync_notification_presence();
+        assert_eq!(app.notification_ui.focused_session_for_test(), Some(parent));
+        let stale_epoch = app.attention_focus_epoch;
+        let unchanged = Arc::as_ptr(&app.durable);
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+        drop(app.sync_visible_attention());
+        app.sync_notification_presence();
+        assert_eq!(
+            Arc::as_ptr(&app.durable),
+            unchanged,
+            "child transcript selection changes no durable pane identity"
+        );
+        assert_eq!(app.notification_ui.focused_session_for_test(), None);
+        let id = uuid::Uuid::new_v4();
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Snapshot(crate::notifications::Snapshot {
+                notices: vec![crate::notifications::Notice {
+                    id,
+                    event: crate::notifications::Event {
+                        target: crate::notifications::Target::Session(parent),
+                        source_session: Some(parent),
+                        provider: Some(Provider::Claude),
+                        directory: Some("/tmp".into()),
+                        destination: None,
+                        evidence: crate::notifications::Evidence {
+                            key: "parent-waiting-behind-child".into(),
+                            kind: crate::notifications::Kind::Waiting,
+                        },
+                    },
+                    delivered: true,
+                    acknowledged: false,
+                    window: None,
+                }],
+                diagnostic: None,
+            }),
+        )));
+        assert!(app.sidebar_state.has_card_update(card));
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+        drop(app.update(Message::ChatUi(Action::SelectSubagent(target, None))));
+        assert_eq!(app.notification_ui.focused_session_for_test(), Some(parent));
+        let current_epoch = app.attention_focus_epoch;
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+        assert_eq!(app.durable.focused, app.workspace.focused());
+        let resize = app.workspace.resize_viewport(1200.0);
+        drop(app.apply_viewport(resize, true, false));
+        assert!(
+            app.sidebar_state.has_card_update(card),
+            "an unrelated viewport update cannot bypass visible dwell"
+        );
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: stale_epoch,
+        }));
+        assert!(app.sidebar_state.has_card_update(card));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: current_epoch,
+        }));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(app.notification_ui.acknowledged_for_test(id));
     }
 
     #[test]

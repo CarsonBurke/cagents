@@ -372,6 +372,11 @@ impl Cagents {
                             entry.read_failure = None;
                         }
                         let previous = std::mem::replace(&mut entry.snapshot, snapshot.clone());
+                        let attention_roots_changed = previous.worktrees.len()
+                            != snapshot.worktrees.len()
+                            || previous.worktrees.iter().zip(&snapshot.worktrees).any(
+                                |((old, _), (new, _))| old.id != new.id || old.path != new.path,
+                            );
                         let removed =
                             records_removed_outside(project, &previous, &snapshot.worktrees);
                         let reconfigure = plan.is_some();
@@ -416,6 +421,9 @@ impl Cagents {
                             self.refresh_ui.git.configure();
                         }
                         self.sync_worktree_operation_rows();
+                        if attention_roots_changed {
+                            self.reconcile_agent_attention_owners();
+                        }
                         self.refresh_sidebar_channels();
                         self.refresh_sidebar_worktree_panes();
                     }

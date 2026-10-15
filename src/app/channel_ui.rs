@@ -868,6 +868,7 @@ impl Cagents {
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
         for project in &mut self.sidebar_model.projects {
+            let worktrees = sidebar::WorktreeIndex::new(&project.worktrees);
             let mut index = 0;
             // Built in the durable vector's own order, which is the registry's
             // ascending creation ranks. Display order is not decided here:
@@ -885,6 +886,8 @@ impl Cagents {
                 let mut unread = false;
                 let mut chats = 0;
                 let mut has_panes = false;
+                let mut directories = Vec::new();
+                let mut outcome = None;
                 for id in &channel.cards {
                     // A visiting utility pane is not what the channel holds.
                     let Some(card) = durable.cards.iter().find(|card| {
@@ -893,6 +896,17 @@ impl Cagents {
                         continue;
                     };
                     has_panes = true;
+                    if let Some(directory) = card_directory(card) {
+                        directories.push(directory);
+                    }
+                    if let Some(next) = state.card_outcome(*id)
+                        && outcome.as_ref().is_none_or(|previous| {
+                            sidebar::outcome_priority(next) > sidebar::outcome_priority(previous)
+                        })
+                    {
+                        outcome = Some(next.clone());
+                    }
+
                     if matches!(&card.kind, CardKind::Chat(_))
                         || matches!(&card.kind, CardKind::Terminal(session)
                             if crate::agent::Provider::recognize_launch(&session.launch).is_some())
@@ -911,16 +925,25 @@ impl Cagents {
                         _ => {}
                     }
                 }
+                let worktree = worktrees.channel(directories);
+                let acknowledged_attention = state
+                    .attention_retained(sidebar::SelectionRow::Channel(channel.id))
+                    && !unread
+                    && !sidebar::attention_state(activity, unread, outcome.as_ref())
+                        .is_some_and(sidebar::AttentionState::needs_attention);
                 let unchanged = project.channels.get(index).is_some_and(|row| {
                     row.id == channel.id
                         && row.title == title
                         && row.selected == selected
                         && row.activity == activity
                         && row.unread == unread
+                        && row.acknowledged_attention == acknowledged_attention
                         && row.chats == chats
                         && row.has_panes == has_panes
                         && row.ordinal == channel.ordinal
                         && row.deletion == deletion
+                        && row.worktree == worktree
+                        && row.outcome == outcome
                 });
                 if !unchanged {
                     let mut row = SidebarChannel::new(
@@ -934,6 +957,8 @@ impl Cagents {
                         channel.ordinal,
                     );
                     row.deletion = deletion;
+                    row.acknowledged_attention = acknowledged_attention;
+                    row.set_attribution(worktree, outcome);
                     if index < project.channels.len() {
                         project.channels[index] = row;
                     } else {
