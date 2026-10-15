@@ -7286,22 +7286,22 @@ impl Cagents {
                         {
                             return Task::none();
                         }
-                        // Only a connected conversation with a confirmed
-                        // identity can ask the daemon for its exact terminal;
-                        // every other card still has a terminal to become.
+                        // A live named conversation can begin Return. An
+                        // ambiguous earlier Return may also replay its captured
+                        // original handle and binding after its reader ended.
                         let named = |runtime: &Runtime| {
                             runtime
                                 .handle()
                                 .is_some_and(|handle| handle.snapshot().session_id.is_some())
                         };
-                        if self.chat_ui.handoff_bindings.keys().any(|target| target.card == card)
-                            && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.connected() && named(runtime)) {
-                            self.status = Some(TransientNotice::warning("The original Return connection ended before its receipt was confirmed. Its pane and recovery intent were kept; no local fallback was started."));
+                        let replay = self.chat_ui.handoff_bindings.keys().any(|target| target.card == card);
+                        if replay && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.handle().is_some() && named(runtime)) {
+                            self.status = Some(TransientNotice::warning("The original Return owner is unavailable. Its pane and recovery intent were kept; no local fallback was started."));
                             return Task::none();
                         }
                         let runtime = match self.cards.get(&card) {
                             Some(CardRuntime::Chat(runtime))
-                                if runtime.connected() && named(runtime) =>
+                                if (runtime.connected() || replay) && named(runtime) =>
                             {
                                 runtime
                             }
@@ -9746,8 +9746,12 @@ impl Cagents {
                     self.status = Some(TransientNotice::warning("A different native backend now owns the pane. The earlier returned terminal was retained for recovery."));
                     return Task::none();
                 }
-                let Some(snapshot) = runtime.handle().map(|handle| handle.snapshot()) else { return Task::none(); };
-                let preserve = runtime.session.launch.provider == Provider::Codex && !snapshot.exited;
+                let Some(handle) = runtime.handle() else { return Task::none(); };
+                let snapshot = handle.snapshot();
+                // Keep only a live UI attachment parked. A dead-reader control
+                // replay proves the receipt/host pairing, not a revived UI
+                // connection; exact paired cleanup remains owned by the host.
+                let preserve = runtime.session.launch.provider == Provider::Codex && handle.is_connected() && !snapshot.exited;
                 // Only this host-issued result may publish first thread/pair
                 // learning. An arbitrary subsequent snapshot is not authority.
                 runtime.session = receipt.source.clone();
@@ -16375,19 +16379,20 @@ mod tests {
         assert!(app.recently_closed.is_empty());
     }
 
-    #[test]
-    fn disconnected_ambiguous_return_cannot_fall_back_to_local_conversion_or_restart() {
+    #[tokio::test]
+    async fn disconnected_ambiguous_return_cannot_fall_back_to_local_conversion_or_restart() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         drop(app.update(Message::ChatUi(Action::Switch(card))));
         let captured = app.chat_ui.handoff_bindings[&target].clone();
+        captured.handle.as_ref().unwrap().disconnect_reader_for_test();
         request_end_chat(&mut app, card);
         drop(app.update(Message::ChatUi(Action::HandoffFinished(target, captured.operation, Err("framed EOF after possible Return effects".into())))));
         drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Disconnected("original reader EOF".into())))));
         assert!(chat_runtime(&app, card).disconnected);
         let source = app.card_state(card).unwrap().kind.clone();
-        for action in [Action::Switch(card), Action::Reconnect(target), Action::StartFresh(card)] {
+        for action in [Action::Reconnect(target), Action::StartFresh(card)] {
             drop(app.update(Message::ChatUi(action)));
             assert_eq!(app.card_state(card).unwrap().kind, source);
             assert!(app.card_state(card).unwrap().existence.is_open());
@@ -16398,6 +16403,25 @@ mod tests {
             assert!(app.terminal_starts.lock().unwrap().is_empty());
             assert!(app.recently_closed.is_empty());
         }
+        // This synthetic original handle has no captured authenticated socket:
+        // the actual dead-handle replay API must refuse, then keep the intent.
+        let task = app.update(Message::ChatUi(Action::Switch(card)));
+        assert!(matches!(app.chat_ui.phases.get(&card), Some(Phase::Returning { close_requested: true, .. })));
+        assert_eq!(app.chat_ui.handoff_bindings[&target].binding, captured.binding);
+        use iced::futures::StreamExt;
+        let mut stream = iced::runtime::task::into_stream(task).expect("original bound retry task");
+        let reply = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::ChatUi(Action::HandoffFinished(..)))) = action { return message; }
+            }
+            panic!("bound retry result");
+        }).await.unwrap();
+        drop(app.update(reply));
+        assert!(app.chat_ui.phases.is_empty());
+        assert!(app.chat_ui.end_requests.contains_key(&target));
+        assert_eq!(app.card_state(card).unwrap().kind, source);
+        assert_eq!(app.chat_ui.handoff_bindings[&target].binding, captured.binding);
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
     }
 
     /// A close pressed while the card is on its way back to a terminal waits

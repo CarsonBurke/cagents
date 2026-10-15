@@ -1521,6 +1521,18 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner()) = None;
     }
 
+    /// Presentation connection liveness only; this is not native backend or
+    /// cleanup authority. A successful control replay does not revive this reader.
+    pub fn is_connected(&self) -> bool {
+        self.inner.alive.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(crate) fn disconnect_reader_for_test(&self) {
+        // Negative fixture seam: withdraw liveness, never add a source binding,
+        // endpoint, receipt or replacement attachment.
+        self.inner.alive.store(false, Ordering::Release);
+    }
+
     /// Latest authenticated live source metadata; absence grants no new authority.
     pub fn source_binding(&self) -> Option<crate::terminal_ipc::ChatSourceBinding> {
         self.inner

@@ -164,6 +164,38 @@ fn post_retirement_unknown_binding_keeps_the_exact_completed_return() {
 }
 
 #[test]
+fn exact_dead_reader_replay_keeps_end_until_attachment_without_parking_the_dead_chat() {
+    let (mut app, card, target, receipt) = returning();
+    let captured = app.chat_ui.handoff_bindings[&target].clone();
+    let original = captured.handle.as_ref().unwrap().clone();
+    super::tests::request_end_chat(&mut app, card);
+    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, captured.operation, Err("lost reply".into())))));
+    original.disconnect_reader_for_test();
+    drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Disconnected("original EOF".into())))));
+    drop(app.update(Message::ChatUi(Action::Switch(card))));
+    let retry = app.chat_ui.handoff_bindings[&target].operation;
+    assert_ne!(retry, captured.operation);
+    assert!(matches!(app.chat_ui.phases.get(&card), Some(Phase::Returning { close_requested: true, .. })));
+    // Inject a typed producer result only. Actual dead-client/real-host replay
+    // validation is covered in the owning producer's separate framed fixtures.
+    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, retry, Ok(receipt.clone())))));
+    assert!(!original.is_connected(), "replay never revives the old reader");
+    assert!(!app.chat_has_parked_runtime(card), "stale cached non-exited metadata cannot park a dead UI attachment");
+    assert!(app.terminal_start_in_flight(card));
+    assert!(app.chat_ui.handoff_closes.contains_key(&card));
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    let operation = app.terminal_start_operation(card).unwrap();
+    let peer = Peer::attach(receipt.terminal.clone(), receipt.source.proof.clone().unwrap());
+    let next = app.update(Message::ChatUi(Action::HandoffAttached(card, operation, Arc::new(receipt.clone()), Ok(peer.started(&receipt)))));
+    assert!(!app.terminal_start_in_flight(card));
+    let delivery = queued(next);
+    drop(app.update(delivery));
+    assert_eq!(app.terminal_worker_for_shared_removal(card), Some(receipt.terminal.execution_instance));
+    assert!(app.card_state(card).unwrap().existence.is_open(), "only exact worker cleanup may now finish End");
+    assert!(app.chat_ui.phases.is_empty(), "no dead UI actor cleanup is substituted");
+}
+
+#[test]
 fn a_new_handle_with_unknown_binding_does_not_receive_the_earlier_return() {
     let (mut app, card, target, receipt) = returning();
     let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("chat"); };
