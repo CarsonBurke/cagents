@@ -34,6 +34,37 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn relocate(&mut self, relocation: &crate::project_recovery::Relocation, owned: &HashSet<CardId>) {
+        let scope = |mut scope: Scope| { relocation.scope(&mut scope); scope };
+        self.baseline = std::mem::take(&mut self.baseline).into_iter().map(|(key, mut panes)| {
+            for pane in &mut panes {
+                if !owned.contains(&pane.id) { continue; }
+                relocation.card(&mut pane.kind);
+                if let Some(path) = &mut pane.scope { relocation.path(path); }
+            }
+            (scope(key), panes)
+        }).collect();
+        self.initialized = std::mem::take(&mut self.initialized).into_iter().map(scope).collect();
+        self.seeding = std::mem::take(&mut self.seeding).into_iter().map(scope).collect();
+        self.blocked = std::mem::take(&mut self.blocked).into_iter().map(scope).collect();
+        for (_, key, change) in &mut self.pending {
+            relocation.scope(key);
+            match change {
+                Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => {
+                    if !owned.contains(&pane.id) { continue; }
+                    relocation.card(&mut pane.kind); if let Some(path) = &mut pane.scope { relocation.path(path); }
+                }
+                Change::Update { before, pane } => {
+                    for item in [before, pane] { if !owned.contains(&item.id) { continue; } relocation.card(&mut item.kind); if let Some(path) = &mut item.scope { relocation.path(path); } }
+                }
+                Change::Transfer { destination, .. } => relocation.scope(destination),
+                _ => {}
+            }
+        }
+        if let Some(path) = &mut self.deferred_default { relocation.path(path); }
+        for (card,session) in &mut self.defaults { if owned.contains(card) { relocation.terminal(session); } }
+    }
+
     pub(super) fn prune_restoration_requests(&mut self, workspace: &WorkspaceState) {
         if self.restoration_requests.is_empty() {
             return;

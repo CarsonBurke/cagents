@@ -394,6 +394,8 @@ pub struct SidebarProject {
     /// than an unreadable pane, so the reason travels on the project's own row
     /// and every other project stays listed beside it.
     pub unreachable: Option<String>,
+    pub missing: bool,
+    pub missing_details: bool,
     /// Whether a read of this project is in flight. An unreadable project's
     /// retry is the one control whose effect is invisible until it finishes,
     /// and the reads that fail are the slow ones, so the row has to say that
@@ -506,6 +508,8 @@ impl SidebarProject {
             operations: Vec::new(),
             avatar: None,
             unreachable: None,
+            missing: false,
+            missing_details: false,
             reloading: false,
             chrome,
         }
@@ -525,6 +529,22 @@ impl SidebarProject {
             worktrees,
             pull_requests,
         )
+    }
+
+    pub fn relocate(&mut self, relocation: &crate::project_recovery::Relocation) {
+        self.repository = relocation.destination.clone();
+        self.chrome = ProjectChrome::new(self.id, &self.name, &self.repository);
+        self.missing = false;
+        self.unreachable = None;
+        self.reloading = false;
+        for worktree in &mut self.worktrees {
+            relocation.path(&mut worktree.path);
+            worktree.chrome.folded_path = fold(&worktree.path.to_string_lossy());
+            let label = worktree_display_name(&worktree.path, worktree.branch.as_deref(), worktree.detached);
+            worktree.chrome.folded_label = fold(&label);
+            worktree.chrome.label = label.into_boxed_str();
+            worktree.refresh_status_chrome();
+        }
     }
 
     pub fn with_kind(mut self, kind: ProjectKind) -> Self {
@@ -3345,6 +3365,7 @@ impl SidebarState {
             | SidebarAction::RetryWorktreeDeletion { .. }
             | SidebarAction::RetryChannelDeletion { .. }
             | SidebarAction::ProjectCommand { .. }
+            | SidebarAction::RecoverProject { .. }
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
             | SidebarAction::NewWorktree { .. }
@@ -3521,6 +3542,7 @@ pub enum SidebarAction {
         project_id: ProjectId,
         repository: PathBuf,
     },
+    RecoverProject { project_id: ProjectId, action: ProjectRecoveryAction },
     CreatePullRequest {
         project_id: ProjectId,
         worktree: Option<PathBuf>,
@@ -4939,6 +4961,42 @@ fn operation_accessible_name(operation: &WorktreeOperationRow) -> String {
 /// structure the project cannot currently be shown to have. Worktree
 /// operations are drawn, because a `git worktree add` this application is
 /// running is still running, and its cancel is the only way to stop it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectRecoveryAction { Locate, Remove, ClosePanes, Details }
+
+fn missing_project(project: &SidebarProject, compact: bool, modal_open: bool, sticky_viewport: row_interaction::StickyViewport) -> Element<'static, SidebarAction> {
+    let id = project.id;
+    let action = |action| {
+        if project.reloading && action != ProjectRecoveryAction::Details { None }
+        else { gated(SidebarAction::RecoverProject { project_id: id, action }, modal_open) }
+    };
+    if compact {
+        let description = if project.missing_details {
+            format!("{} · Missing. This folder was moved or deleted. {}\n{}", project.name, project.repository.display(), project.unreachable.as_deref().unwrap_or("Folder not found"))
+        } else { format!("{} · Missing. This folder was moved or deleted", project.name) };
+        return widget::container(widget::column::with_children(vec![
+            crate::ui_controls::icon_button(Icon::Warning, description).tone(design::Tone::Themed(design::warning_color)).on_press_maybe(action(ProjectRecoveryAction::Details)).into(),
+            crate::ui_controls::icon_button(Icon::OpenFolder, format!("Locate {}", project.name)).on_press_maybe(action(ProjectRecoveryAction::Locate)).into(),
+            crate::ui_controls::icon_button(Icon::Minus, format!("Remove project {}", project.name)).on_press_maybe(action(ProjectRecoveryAction::Remove)).into(),
+            crate::ui_controls::icon_button(Icon::Close, format!("Close panes in {}", project.name)).on_press_maybe(action(ProjectRecoveryAction::ClosePanes)).into(),
+        ]).align_x(Alignment::Center)).padding([space::XS, 0.0]).width(Length::Fill).into();
+    }
+    let header = widget::container(design::heading(format!("{} · Missing", project.name))).padding([space::XS, space::S]).width(Length::Fill).into();
+    let mut body = widget::column::with_children(vec![
+        design::caption("This folder was moved or deleted").into(),
+        widget::row::with_children(vec![
+            crate::ui_controls::button::secondary(if project.reloading { "Locating…" } else { "Locate…" }).on_press_maybe(action(ProjectRecoveryAction::Locate)).into(),
+            crate::ui_controls::button::quiet("Remove project").on_press_maybe(action(ProjectRecoveryAction::Remove)).into(),
+        ]).spacing(space::XS).into(),
+        crate::ui_controls::button::quiet("Close its panes").on_press_maybe(action(ProjectRecoveryAction::ClosePanes)).into(),
+        crate::ui_controls::button::quiet(if project.missing_details { "Hide details" } else { "Details" }).on_press_maybe(action(ProjectRecoveryAction::Details)).into(),
+    ]).spacing(space::XS).width(Length::Fill);
+    if project.missing_details {
+        body = body.push(design::caption(format!("{}\n{}", project.repository.display(), project.unreachable.as_deref().unwrap_or("Folder not found"))).wrapping(cosmic::iced::widget::text::Wrapping::Word));
+    }
+    RowInteraction::group(header, widget::container(body).padding(space::S).width(Length::Fill).into(), sticky_viewport)
+}
+
 fn unreachable_project<'a>(
     project: &'a SidebarProject,
     state: &SidebarState,
@@ -5032,6 +5090,7 @@ fn project_view<'a>(
     let entity = project.project;
     let chrome = &entity.chrome;
     let project_id = entity.id;
+    if entity.missing { return missing_project(entity, compact, modal_open, sticky_viewport); }
     if let Some(reason) = entity.unreachable.as_deref() {
         return unreachable_project(
             entity,

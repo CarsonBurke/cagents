@@ -27,6 +27,7 @@ mod latency_ui;
 mod notification_ui;
 mod palette_ui;
 mod project_ui;
+mod project_recovery_ui;
 mod pull_request_ui;
 mod refresh_ui;
 mod resume_ui;
@@ -2509,6 +2510,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SettingsDraftChanged { .. }
         | Message::ResetSettings
         | Message::DismissStatus => true,
+        Message::ProjectRecovery(action) => matches!(action, project_recovery_ui::Action::Command(..)),
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
@@ -4285,6 +4287,7 @@ pub enum Message {
     },
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
+    ProjectRecovery(project_recovery_ui::Action),
     TerminalFind(terminal_ui::Action),
     ZoomFont {
         card: CardId,
@@ -4749,6 +4752,7 @@ struct SourceControlMutation {
 
 pub struct Cagents {
     device_ui: device_ui::State,
+    project_recovery_ui: project_recovery_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
     cards: HashMap<CardId, CardRuntime>,
@@ -10865,6 +10869,7 @@ impl Cagents {
     /// to. A snapshot for a worktree the panel left is a read of a tree nobody
     /// is looking at.
     fn source_control_is_bound(&self, key: &ActiveWorktreeKey) -> bool {
+        if self.project_missing(key.project_id) { return false; }
         self.sidebar_model
             .source_control
             .as_ref()
@@ -10895,6 +10900,7 @@ impl Cagents {
     }
 
     fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
+        if self.project_missing(key.project_id) { return Task::none(); }
         if crate::device::is_remote() {
             return Task::none();
         }
@@ -11926,6 +11932,10 @@ impl Cagents {
         let Some(close) = self.dirty_repository_close.take() else {
             return Task::none();
         };
+        if self.project_recovery_ui.closing_panes {
+            self.queued_card_closes.clear();
+            self.project_recovery_ui.closing_panes = false;
+        }
         if matches!(close.intent, DirtyCloseIntent::PaneGroup) {
             self.chrome_ui.closing_group.clear();
         }
@@ -12918,6 +12928,7 @@ impl Application for Cagents {
             refresh_ui: refresh_ui::State::default(),
             source_control_mutations: HashMap::new(),
             device_ui: device_ui::State::default(),
+            project_recovery_ui: project_recovery_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
             automation_approval: automation_approval::State::default(),
@@ -14442,6 +14453,7 @@ impl Application for Cagents {
                         }
                         self.reload_source_control(&key)
                     },
+                    SidebarAction::RecoverProject { project_id, action } => self.update_project_recovery(project_recovery_ui::Action::Command(project_id, action)),
                     SidebarAction::OpenFile { key, path } => {
                         self.route_panel_open(&key, &path)
                     }
@@ -16043,6 +16055,7 @@ impl Application for Cagents {
             }
             Message::ToggleContextInspector if self.modal_is_open() => Task::none(),
             Message::TerminalFind(action) => self.handle_terminal_find(action),
+            Message::ProjectRecovery(action) => self.update_project_recovery(action),
             Message::ToggleContextInspector => {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
@@ -16503,6 +16516,7 @@ impl Application for Cagents {
             self.notification_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
             self.refresh_subscription(),
+            self.recovery_subscription(),
             self.review_request_subscription(),
             self.git_subscription(),
             self.account_subscription(),
@@ -19318,6 +19332,7 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                agent_locations: Vec::new(),
             };
             match frame {
                 // One adopted row.
@@ -25209,6 +25224,7 @@ mod tests {
             refresh_ui: refresh_ui::State::default(),
             source_control_mutations: HashMap::new(),
             device_ui: device_ui::State::default(),
+            project_recovery_ui: project_recovery_ui::State::default(),
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),
             automation_approval: automation_approval::State::default(),

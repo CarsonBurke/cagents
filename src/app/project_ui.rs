@@ -1936,6 +1936,7 @@ fn close_sessions_in_scope(
             format!("Could not verify project ownership before closing sessions: {error}")
         })?;
         let scope = shared_project_session_scope(worktrees, project, &model)?;
+        project_sessions.extend_model(&model, project);
         let paths = crate::instance::window_database_paths().map_err(|error| {
             format!("Could not locate other windows before closing sessions: {error}")
         })?;
@@ -1970,7 +1971,7 @@ fn close_sessions_in_scope(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err("Project removal was cancelled.".into());
         }
-        if !project_sessions.contains(session.id, &session.launch.recipe.working_directory, &scope)
+        if !project_sessions.check(session.id, &session.launch.recipe.working_directory, &scope)?
         {
             continue;
         }
@@ -1997,11 +1998,11 @@ fn close_sessions_in_scope(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err("Project removal was cancelled.".into());
         }
-        if !project_sessions.contains(
+        if !project_sessions.check(
             terminal.session.id,
             &terminal.session.launch.working_directory,
             &scope,
-        ) {
+        )? {
             continue;
         }
         let id = terminal.session.id;
@@ -2070,6 +2071,7 @@ impl ProjectSessionClosure {
 struct ProjectSessionScope {
     roots: Vec<PathBuf>,
     protected: Vec<PathBuf>,
+    unavailable_projects: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2081,6 +2083,45 @@ struct ProjectSessionOwnership {
 }
 
 impl ProjectSessionOwnership {
+    fn extend_model(&mut self, model: &crate::workspace_model::WorkspaceModel, project: &Path) {
+        let mut record = |id, repository: &Path| {
+            if repository == project { self.owned.insert(id); }
+            else { self.protected.insert(id); }
+        };
+        for agent in &model.agents {
+            for id in [agent.session.as_ref().map(crate::agent_execution::HostedSession::id), agent.console.as_ref().map(|session| session.id)].into_iter().flatten() {
+                record(id, &agent.spec.target.repository);
+            }
+        }
+        for view in &model.views {
+            let repository = match &view.scope {
+                crate::workspace_model::views::Scope::Worktree { repository, .. } => Some(repository),
+                crate::workspace_model::views::Scope::Channel(channel) => model.channels.iter().find(|entry| entry.id == *channel).map(|entry| &entry.repository),
+            };
+            let Some(repository) = repository else { continue; };
+            for pane in &view.panes {
+                match &pane.kind {
+                    CardKind::Terminal(session) => record(session.id, repository),
+                    CardKind::Chat(session) => {
+                        record(session.id, repository);
+                        if let Some(terminal) = &session.terminal { record(terminal.id, repository); }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn check(&self, id: TerminalId, directory: &Path, scope: &ProjectSessionScope) -> Result<bool, String> {
+        if self.contains(id, directory, scope) { return Ok(true); }
+        let retained_elsewhere = self.directories.get(&id).is_some_and(|paths| paths.iter().any(|path| !scope.contains(path)));
+        let maybe_owned = scope.contains(directory) || self.directories.get(&id).is_some_and(|paths| paths.iter().any(|path| scope.contains(path)));
+        if scope.topology_uncertain() && !self.owned.contains(&id) && !self.protected.contains(&id) && !retained_elsewhere && maybe_owned {
+            return Err(format!("Cannot verify which project owns session {id} at {} before removing {}: worktree locations are unavailable for {}. Restore those folders or close this session explicitly, then retry removing the project.", directory.display(), scope.roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>().join(", "), scope.unavailable_projects.iter().map(|root| root.display().to_string()).collect::<Vec<_>>().join(", ")));
+        }
+        Ok(false)
+    }
+
     fn extend_saved(
         &mut self,
         owners: Vec<(TerminalId, crate::persistence::SavedSessionOwner)>,
@@ -2110,13 +2151,15 @@ impl ProjectSessionOwnership {
             if directories.iter().any(|path| !scope.contains(path)) {
                 return false;
             }
-            return true;
+            return !scope.topology_uncertain() || self.owned.contains(&id);
         }
-        self.owned.contains(&id) || scope.contains(directory)
+        self.owned.contains(&id) || (!scope.topology_uncertain() && scope.contains(directory))
     }
 }
 
 impl ProjectSessionScope {
+    fn topology_uncertain(&self) -> bool { !self.unavailable_projects.is_empty() }
+
     fn new(roots: Vec<PathBuf>, protected: Vec<PathBuf>) -> Self {
         let canonical = |paths: Vec<PathBuf>| {
             paths
@@ -2127,6 +2170,7 @@ impl ProjectSessionScope {
         Self {
             roots: canonical(roots),
             protected: canonical(protected),
+            unavailable_projects: Vec::new(),
         }
     }
 
@@ -2155,6 +2199,7 @@ fn shared_project_session_scope(
     model: &crate::workspace_model::WorkspaceModel,
 ) -> Result<ProjectSessionScope, String> {
     let mut protected = Vec::new();
+    let mut unavailable_projects = Vec::new();
     let service = RepositoryService::system("git");
     for project in &model.projects {
         if project.repository == repository {
@@ -2163,13 +2208,25 @@ fn shared_project_session_scope(
         match project.kind {
             ProjectKind::Folder => protected.push(project.repository.clone()),
             ProjectKind::Git => {
+                if crate::project_recovery::root_missing(&project.repository) {
+                    unavailable_projects.push(project.repository.clone());
+                    protected.push(if project.repository.file_name().is_some_and(|name| name == ".git") { project.repository.parent().unwrap_or(&project.repository).to_path_buf() } else { project.repository.clone() });
+                    protected.extend(model.views.iter().filter_map(|view| match &view.scope {
+                        crate::workspace_model::views::Scope::Worktree { repository, path } if *repository == project.repository => Some(path.clone()),
+                        _ => None,
+                    }));
+                    protected.extend(model.agents.iter().filter(|agent| agent.spec.target.repository == project.repository).map(|agent| agent.spec.target.directory.clone()));
+                    continue;
+                }
                 let records = service.list_worktrees(&project.repository, &CancellationToken::default())
                     .map_err(|error| format!("Could not verify worktrees owned by {} before removing this project: {error}", project.name))?;
                 protected.extend(records.into_iter().map(|record| record.path));
             }
         }
     }
-    Ok(ProjectSessionScope::new(roots.to_vec(), protected))
+    let mut scope = ProjectSessionScope::new(roots.to_vec(), protected);
+    scope.unavailable_projects = unavailable_projects;
+    Ok(scope)
 }
 
 fn project_session_roots(
@@ -2177,7 +2234,7 @@ fn project_session_roots(
     kind: ProjectKind,
     mut roots: Vec<PathBuf>,
 ) -> Vec<PathBuf> {
-    if kind == ProjectKind::Folder {
+    if kind == ProjectKind::Folder || crate::project_recovery::root_missing(repository) {
         return roots;
     }
     let service = RepositoryService::system("git");
@@ -2296,6 +2353,28 @@ fn worktree_removal_command(target: &Target) -> CommandSpec {
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn missing_project_cleanup_respects_shared_pane_identity_over_directory() {
+        use crate::workspace_model::{WorkspaceModel, views::{Pane, Scope, View}};
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.add_terminal(PathBuf::from("/target")));
+        let card = app.durable.cards.last().unwrap().clone();
+        let CardKind::Terminal(session) = &card.kind else { panic!() };
+        let id = session.id;
+        let mut view = View::empty(Scope::Worktree { repository: "/other/.git".into(), path: "/target/linked".into() });
+        view.panes.push(Pane { id: card.id, title: card.title, user_title: None, pending_terminal_start: false, width_fraction: card.width_fraction, kind: card.kind, scope: Some("/target/linked".into()) });
+        let mut model = WorkspaceModel { views: vec![view], ..Default::default() };
+        let mut ownership = ProjectSessionOwnership::default();
+        ownership.extend_model(&model, Path::new("/target/.git"));
+        let mut scope = ProjectSessionScope::new(vec!["/target".into()], Vec::new());
+        scope.unavailable_projects.push("/missing-other/.git".into());
+        assert!(!ownership.check(id, Path::new("/target/linked"), &scope).unwrap());
+        model.views[0].scope = Scope::Worktree { repository: "/target/.git".into(), path: "/target".into() };
+        let mut owned = ProjectSessionOwnership::default();
+        owned.extend_model(&model, Path::new("/target/.git"));
+        assert!(owned.check(id, Path::new("/target/linked"), &scope).unwrap());
+    }
 
     /// A window with session storage and one project at `repository` whose
     /// linked worktree is `linked`, both of them saved.
@@ -2885,7 +2964,15 @@ mod tests {
         );
         let mut missing = model;
         missing.projects[1].repository = root.join("missing.git");
-        assert!(shared_project_session_scope(&[folder.clone()], &folder, &missing).is_err());
+        let uncertain = shared_project_session_scope(&[folder.clone()], &folder, &missing).unwrap();
+        assert!(uncertain.topology_uncertain());
+        let mut ownership = ProjectSessionOwnership::default();
+        let unknown = TerminalId::new();
+        assert!(ownership.check(unknown, &folder.join("owned"), &uncertain).is_err(), "unknown actor ownership must still refuse shutdown when Git topology is unavailable");
+        ownership.owned.insert(unknown);
+        assert!(ownership.check(unknown, &folder.join("owned"), &uncertain).unwrap(), "explicit project identity permits cleanup even while another project's folder is missing");
+        ownership.protected.insert(unknown);
+        assert!(!ownership.check(unknown, &folder.join("owned"), &uncertain).unwrap(), "another retained project still wins");
     }
 
     #[test]

@@ -228,8 +228,9 @@ impl Cagents {
         let mut tasks = Vec::new();
         tasks.push(self.git_fallback_tick());
         tasks.push(self.commit_terminal_handoffs());
+        let missing_cards = self.missing_project_cards();
         for (&card, runtime) in &mut self.cards {
-            if self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+            if !missing_cards.contains(&card) && self.workspace.visibility(card) == Some(VisibilityClass::Visible)
                 && let CardRuntime::Repository(runtime) = runtime
             {
                 tasks.push(repository_task(runtime.refresh_visible(card)));
@@ -291,7 +292,7 @@ impl Cagents {
             .schedule
             .next(
                 sidebar::selected_project(&self.sidebar_model, &self.sidebar_state)
-                    .filter(|project| project.kind == ProjectKind::Git)
+                    .filter(|project| project.kind == ProjectKind::Git && !project.missing)
                     .map(|project| project.id),
                 projects
                     .iter()

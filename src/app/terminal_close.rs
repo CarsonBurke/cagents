@@ -52,6 +52,12 @@ fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> boo
 }
 
 impl Cagents {
+    pub(super) fn close_cards_in_order(&mut self, cards: Vec<CardId>) -> Task<Message> {
+        self.project_recovery_ui.closing_panes = true;
+        self.queued_card_closes.extend(cards.into_iter().map(|card| QueuedCardClose { card, unasked: false }));
+        self.next_queued_card_close()
+    }
+
     pub(super) fn next_queued_card_close(&mut self) -> Task<Message> {
         while let Some(QueuedCardClose { card, unasked }) = self.queued_card_closes.pop_front() {
             if self
@@ -65,6 +71,7 @@ impl Cagents {
                 });
             }
         }
+        self.project_recovery_ui.closing_panes = false;
         Task::none()
     }
 
@@ -460,6 +467,10 @@ impl Cagents {
         let Some(intent) = self.terminal_close.take() else {
             return Task::none();
         };
+        if self.project_recovery_ui.closing_panes {
+            self.queued_card_closes.clear();
+            self.project_recovery_ui.closing_panes = false;
+        }
         // Dismissing a report ends the attempt it reported on. The fence
         // exists so one intent cannot submit two concurrent requests and so
         // no automatic path retries a request whose fate is unknown; it is
