@@ -201,6 +201,10 @@ fn palette_row_style(selected: bool) -> cosmic::theme::Button {
 
 impl Cagents {
     pub(super) fn update_palette(&mut self, action: Action) -> Task<Message> {
+        // Every palette action is user input; none is a lifecycle completion.
+        if self.update_prepared || self.exit.is_some() {
+            return Task::none();
+        }
         match action {
             Action::Record(field) => {
                 self.palette.recording = Some(field);
@@ -235,19 +239,26 @@ impl Cagents {
                 if self.modal_is_open() || self.focused_repository_is_saving() {
                     return Task::none();
                 }
-                let Some(card) = self.card_state(id).filter(|card| card.existence.is_open()) else {
+                if self.card_state(id).is_none_or(|card| !card.existence.is_open())
+                    || self.refuse_for_deleting_card(id)
+                {
                     return Task::none();
-                };
+                }
+                let card = self.card_state(id).expect("the open target is still present");
                 let channel = self
                     .durable
                     .channels
                     .iter()
                     .find(|channel| channel.cards.contains(&id))
                     .map(|channel| channel.id);
-                let path = self
-                    .card_worktree(card)
-                    .map(Path::to_path_buf)
-                    .or_else(|| self.active_workspace.clone());
+                let path = channel.map_or_else(
+                    || self.card_worktree(card).map(Path::to_path_buf)
+                        .or_else(|| self.active_workspace.clone()),
+                    |channel| self.channel_directory(channel),
+                );
+                if path.as_deref().is_some_and(|path| self.refuse_in_deleting_worktree(path)) {
+                    return Task::none();
+                }
                 let navigation = if self.workspace.order().any(|candidate| candidate == id) {
                     Task::none()
                 } else if let Some(channel) = channel {
@@ -1479,6 +1490,89 @@ mod tests {
         drop(app.run_palette_command(message));
         assert_eq!(app.active_workspace, Some(path));
         assert_eq!(app.workspace.focused(), Some(other.id));
+    }
+
+    fn inactive_palette_pane(channel: bool) -> (Cagents, CardId, PathBuf) {
+        let mut app = settings_focus_fixture();
+        let mut card = app.card_state(app.workspace.focused().unwrap()).unwrap().clone();
+        card.id = CardId::new();
+        card.title = "Held pane".into();
+        let path = PathBuf::from("/palette-held-workspace");
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project, RepositoryId::new(), "Held workspace".into(), path.clone(),
+            Vec::new(), Vec::new(),
+        ).with_kind(ProjectKind::Folder));
+        if channel {
+            Arc::make_mut(&mut app.durable).channels.push(crate::model::ProjectChannel {
+                id: crate::model::ChannelId::new(), project_id: project,
+                title: "Held channel".into(), title_source: Default::default(),
+                ordinal: 0, shared: false, cards: vec![card.id], focused: Some(card.id),
+            });
+        } else {
+            app.worktree_owners.insert(card.id, path.clone());
+            Arc::make_mut(&mut app.durable).card_scopes.insert(card.id, path.clone());
+        }
+        let id = card.id;
+        Arc::make_mut(&mut app.durable).cards.push(card);
+        (app, id, path)
+    }
+
+    #[test]
+    fn held_palette_pane_action_cannot_change_scope_after_actual_update_prepare() {
+        for channel in [false, true] {
+            let (mut app, target, path) = inactive_palette_pane(channel);
+            drop(app.update(Message::Palette(Action::Open)));
+            drop(app.update(Message::Palette(Action::Query("@held pane".into()))));
+            let (_, _, selected) = app.palette_entries().into_iter().find(|entry| {
+                matches!(entry.2, Message::Palette(Action::FocusPane(id)) if id == target)
+            }).unwrap();
+            let held = Message::Palette(Action::Run(MessageBox(Box::new(selected))));
+            let before = (app.active_workspace.clone(), app.durable.active_channel,
+                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
+                app.settings.palette_recents.clone());
+            let (response, _) = std::sync::mpsc::sync_channel(1);
+            drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+                action: instance::UiUpdateAction::Prepare, response,
+            })));
+            assert!(app.update_prepared, "real Prepare admitted the palette-open window");
+            drop(app.update(held.clone()));
+            assert_eq!((app.active_workspace.clone(), app.durable.active_channel,
+                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
+                app.settings.palette_recents.clone()), before);
+            assert_eq!(app.palette.query.as_deref(), Some("@held pane"));
+            let (response, receiver) = std::sync::mpsc::sync_channel(1);
+            drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+                action: instance::UiUpdateAction::Cancel, response,
+            })));
+            assert_eq!(receiver.try_recv().unwrap(), "ok");
+            drop(app.update(held));
+            assert_eq!(app.active_workspace.as_ref(), Some(&path));
+            assert_eq!(app.workspace.focused(), Some(target));
+        }
+    }
+
+    #[test]
+    fn held_palette_pane_action_refuses_deleting_workspaces_and_closing_projects() {
+        for channel in [false, true] {
+            for closing in [false, true] {
+                let (mut app, target, path) = inactive_palette_pane(channel);
+                let before = (app.active_workspace.clone(), app.durable.active_channel,
+                    app.workspace.order().collect::<Vec<_>>(), app.workspace.focused());
+                if closing {
+                    let project = app.sidebar_model.projects.last().unwrap().id;
+                    app.project_ui.closing.insert(project, path.clone());
+                } else {
+                    app.project_ui.begin_deleting(path);
+                }
+                drop(app.update(Message::Palette(Action::Run(MessageBox(Box::new(
+                    Message::Palette(Action::FocusPane(target)),
+                ))))));
+                assert_eq!((app.active_workspace.clone(), app.durable.active_channel,
+                    app.workspace.order().collect::<Vec<_>>(), app.workspace.focused()), before);
+                assert!(app.status.is_some());
+            }
+        }
     }
 
     #[test]
