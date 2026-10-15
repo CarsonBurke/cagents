@@ -2511,6 +2511,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::DetectAgentExecutable(_)
         | Message::SettingsChanged { .. }
         | Message::SettingsDraftChanged { .. }
+        | Message::AgentListEdited { .. }
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
@@ -2576,6 +2577,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::DetectAgentExecutable(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
+                | Message::AgentListEdited { .. }
                 | Message::ResetSettings
                 | Message::ConfirmResetSettings
                 | Message::CancelResetSettings
@@ -3166,11 +3168,117 @@ impl ShortcutDraft {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone)]
+pub enum AgentListEdit {
+    Argument { row: uuid::Uuid, value: String },
+    RemoveArgument(uuid::Uuid),
+    AddArgument,
+    EnvironmentName { row: uuid::Uuid, value: String },
+    EnvironmentValue { row: uuid::Uuid, value: String },
+    RemoveEnvironment(uuid::Uuid),
+    AddEnvironment,
+}
+
+#[derive(Debug, Clone)]
 struct AgentDraft {
     configuration: settings::AgentLaunchSettings,
     environment: Vec<(String, String)>,
     launch_error: Option<String>,
+    argument_owner: uuid::Uuid,
+    argument_rows: Vec<uuid::Uuid>,
+    environment_owner: uuid::Uuid,
+    environment_rows: Vec<uuid::Uuid>,
+}
+
+// Row identities fence callbacks, but are not part of the preference value.
+impl PartialEq for AgentDraft {
+    fn eq(&self, other: &Self) -> bool {
+        self.configuration == other.configuration
+            && self.environment == other.environment
+            && self.launch_error == other.launch_error
+    }
+}
+impl Eq for AgentDraft {}
+impl Default for AgentDraft {
+    fn default() -> Self { Self::new(settings::AgentLaunchSettings::default(), None) }
+}
+impl AgentDraft {
+    fn new(configuration: settings::AgentLaunchSettings, launch_error: Option<String>) -> Self {
+        let environment: Vec<_> = configuration.environment.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+        Self {
+            argument_rows: configuration.arguments.iter().map(|_| uuid::Uuid::new_v4()).collect(),
+            environment_rows: environment.iter().map(|_| uuid::Uuid::new_v4()).collect(),
+            configuration, environment, launch_error,
+            argument_owner: uuid::Uuid::new_v4(), environment_owner: uuid::Uuid::new_v4(),
+        }
+    }
+    fn set_arguments(&mut self, arguments: Vec<String>) {
+        if self.argument_rows.len() != arguments.len() {
+            self.argument_owner = uuid::Uuid::new_v4();
+            self.argument_rows = arguments.iter().map(|_| uuid::Uuid::new_v4()).collect();
+        }
+        self.configuration.arguments = arguments;
+    }
+    fn set_environment(&mut self, environment: Vec<(String, String)>) {
+        if self.environment_rows.len() != environment.len() {
+            self.environment_owner = uuid::Uuid::new_v4();
+            self.environment_rows = environment.iter().map(|_| uuid::Uuid::new_v4()).collect();
+        }
+        self.configuration.environment = environment.iter().cloned().collect();
+        self.environment = environment;
+    }
+    /// Apply one emitted row operation against the latest draft. Views capture
+    /// identities, never a whole old list that could replace another row's edit.
+    fn edit_list(&mut self, owner: uuid::Uuid, edit: AgentListEdit) -> Option<(AgentSetting, String)> {
+        match edit {
+            AgentListEdit::Argument { row, value } => {
+                if owner != self.argument_owner { return None; }
+                let index = self.argument_rows.iter().position(|id| *id == row)?;
+                let mut arguments = self.configuration.arguments.clone();
+                *arguments.get_mut(index)? = value;
+                Some((AgentSetting::Arguments, serde_json::to_string(&arguments).expect("argument strings serialize")))
+            }
+            AgentListEdit::RemoveArgument(row) => {
+                if owner != self.argument_owner { return None; }
+                let index = self.argument_rows.iter().position(|id| *id == row)?;
+                let mut arguments = self.configuration.arguments.clone();
+                arguments.remove(index); self.argument_rows.remove(index);
+                Some((AgentSetting::Arguments, serde_json::to_string(&arguments).expect("argument strings serialize")))
+            }
+            AgentListEdit::AddArgument => {
+                if owner != self.argument_owner { return None; }
+                let mut arguments = self.configuration.arguments.clone();
+                arguments.push(String::new()); self.argument_rows.push(uuid::Uuid::new_v4());
+                Some((AgentSetting::Arguments, serde_json::to_string(&arguments).expect("argument strings serialize")))
+            }
+            edit @ (AgentListEdit::EnvironmentName { .. } | AgentListEdit::EnvironmentValue { .. }) => {
+                if owner != self.environment_owner { return None; }
+                let (row, value, name) = match edit {
+                    AgentListEdit::EnvironmentName { row, value } => (row, value, true),
+                    AgentListEdit::EnvironmentValue { row, value } => (row, value, false),
+                    _ => unreachable!("matched environment column"),
+                };
+                let index = self.environment_rows.iter().position(|id| *id == row)?;
+                let mut environment = self.environment.clone();
+                let entry = environment.get_mut(index)?;
+                if name { entry.0 = value; } else { entry.1 = value; }
+                Some((AgentSetting::Environment, serde_json::to_string(&environment).expect("environment strings serialize")))
+            }
+            AgentListEdit::RemoveEnvironment(row) => {
+                if owner != self.environment_owner { return None; }
+                let index = self.environment_rows.iter().position(|id| *id == row)?;
+                let mut environment = self.environment.clone();
+                environment.remove(index); self.environment_rows.remove(index);
+                Some((AgentSetting::Environment, serde_json::to_string(&environment).expect("environment strings serialize")))
+            }
+            AgentListEdit::AddEnvironment => {
+                if owner != self.environment_owner { return None; }
+                let mut environment = self.environment.clone();
+                environment.push((String::new(), String::new())); self.environment_rows.push(uuid::Uuid::new_v4());
+                Some((AgentSetting::Environment, serde_json::to_string(&environment).expect("environment strings serialize")))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3234,20 +3342,8 @@ impl SettingsDraft {
                         .get(settings::agents::provider_key(provider))
                         .cloned()
                         .unwrap_or_default();
-                    let environment = configuration
-                        .environment
-                        .iter()
-                        .map(|(name, value)| (name.clone(), value.clone()))
-                        .collect();
                     let launch_error = configuration.validate(provider).err();
-                    (
-                        provider,
-                        AgentDraft {
-                            configuration,
-                            environment,
-                            launch_error,
-                        },
-                    )
+                    (provider, AgentDraft::new(configuration, launch_error))
                 })
                 .collect(),
             default_shell: settings.default_shell.clone().unwrap_or_default(),
@@ -3334,15 +3430,14 @@ impl SettingsDraft {
                     AgentSetting::Executable => draft.configuration.executable = optional(value),
                     AgentSetting::Arguments => {
                         if let Ok(arguments) = serde_json::from_str(&value) {
-                            draft.configuration.arguments = arguments;
+                            draft.set_arguments(arguments);
                         }
                     }
                     AgentSetting::Environment => {
                         if let Ok(environment) =
                             serde_json::from_str::<Vec<(String, String)>>(&value)
                         {
-                            draft.configuration.environment = environment.iter().cloned().collect();
-                            draft.environment = environment;
+                            draft.set_environment(environment);
                         }
                     }
                 }
@@ -4460,6 +4555,11 @@ pub enum Message {
         previous_executable: Option<String>,
         previous_path: Option<String>,
         result: Result<String, String>,
+    },
+    AgentListEdited {
+        provider: crate::agent::Provider,
+        owner: uuid::Uuid,
+        edit: AgentListEdit,
     },
     SettingsChanged {
         field: SettingsField,
@@ -16304,6 +16404,10 @@ impl Application for Cagents {
                 self.settings_search = query;
                 crate::settings_widgets::reveal_content_start()
             }
+            Message::AgentListEdited { provider, owner, edit } => {
+                let change = self.settings_draft.agents.get_mut(&provider).and_then(|draft| draft.edit_list(owner, edit));
+                change.map_or_else(Task::none, |(field, value)| self.queue_setting_input(SettingsField::Agent(provider, field), value))
+            }
             Message::SettingsChanged { field, value } => self.apply_setting_input(field, value),
             Message::SettingsDraftChanged { field, value } => {
                 self.queue_setting_input(field, value)
@@ -19811,6 +19915,98 @@ mod tests {
         let _ = app.clone_focused_pane();
         assert_eq!(open_settings_panes(&app), [pane]);
         assert_eq!(app.workspace.order().count(), 2);
+    }
+
+    fn agent_list_test_app() -> Cagents {
+        let mut app = context_inspector_test_app(true);
+        app.settings_path = None;
+        app.settings_write_blocked = true;
+        app.settings.agents.insert("claude".into(), settings::AgentLaunchSettings {
+            arguments: vec!["first".into(), "second".into()],
+            environment: std::collections::BTreeMap::from([
+                ("FIXTURE_A".into(), "a".into()), ("FIXTURE_B".into(), "b".into()),
+            ]),
+            ..Default::default()
+        });
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        app
+    }
+
+    #[test]
+    fn settings_agent_rows_apply_a_batch_without_replacing_other_rows_edits() {
+        let mut app = agent_list_test_app();
+        let provider = crate::agent::Provider::Claude;
+        let draft = &app.settings_draft.agents[&provider];
+        let (arguments, environment) = (draft.argument_owner, draft.environment_owner);
+        let (first, second) = (draft.argument_rows[0], draft.argument_rows[1]);
+        let (a, b) = (draft.environment_rows[0], draft.environment_rows[1]);
+        // Capture the IDs used by a single settings view, then reduce its
+        // emitted row operations without rebuilding a view between messages.
+        let emitted = [
+            Message::AgentListEdited { provider, owner: arguments, edit: AgentListEdit::Argument { row: first, value: "first-one".into() } },
+            Message::AgentListEdited { provider, owner: arguments, edit: AgentListEdit::Argument { row: second, value: "second-one".into() } },
+            Message::AgentListEdited { provider, owner: arguments, edit: AgentListEdit::Argument { row: first, value: "first-two".into() } },
+            Message::AgentListEdited { provider, owner: environment, edit: AgentListEdit::EnvironmentName { row: a, value: "RENAMED_A".into() } },
+            Message::AgentListEdited { provider, owner: environment, edit: AgentListEdit::EnvironmentValue { row: a, value: "updated-a".into() } },
+            Message::AgentListEdited { provider, owner: environment, edit: AgentListEdit::EnvironmentValue { row: b, value: "updated-b".into() } },
+        ];
+        for message in emitted { drop(app.update(message)); }
+        let draft = &app.settings_draft.agents[&provider];
+        assert_eq!(draft.configuration.arguments, ["first-two", "second-one"]);
+        assert_eq!(draft.environment, [("RENAMED_A".into(), "updated-a".into()), ("FIXTURE_B".into(), "updated-b".into())]);
+        let pending: Vec<_> = app.settings_pending.iter().map(|(field, (generation, _))| (*field, *generation)).collect();
+        assert_eq!(pending.len(), 2);
+        for (field, generation) in pending { drop(app.update(Message::SettingsAutosave { field, generation })); }
+        let saved = &app.settings.agents["claude"];
+        assert_eq!(saved.arguments, ["first-two", "second-one"]);
+        assert_eq!(saved.environment["RENAMED_A"], "updated-a");
+        assert_eq!(saved.environment["FIXTURE_B"], "updated-b");
+        assert!(!saved.environment.contains_key("FIXTURE_A"));
+    }
+
+    #[test]
+    fn settings_agent_rows_reject_removed_rows_and_replaced_drafts_before_mutation() {
+        let mut app = agent_list_test_app();
+        let provider = crate::agent::Provider::Claude;
+        let draft = &app.settings_draft.agents[&provider];
+        let (arguments, environment) = (draft.argument_owner, draft.environment_owner);
+        let (first, second) = (draft.argument_rows[0], draft.argument_rows[1]);
+        let (a, b) = (draft.environment_rows[0], draft.environment_rows[1]);
+        for edit in [AgentListEdit::RemoveArgument(first), AgentListEdit::Argument { row: first, value: "must-not-return".into() }, AgentListEdit::Argument { row: second, value: "still-second".into() }] {
+            drop(app.update(Message::AgentListEdited { provider, owner: arguments, edit }));
+        }
+        for edit in [AgentListEdit::RemoveEnvironment(a), AgentListEdit::EnvironmentName { row: a, value: "MUST_NOT_RETURN".into() }, AgentListEdit::EnvironmentValue { row: b, value: "still-b".into() }] {
+            drop(app.update(Message::AgentListEdited { provider, owner: environment, edit }));
+        }
+        assert_eq!(app.settings_draft.agents[&provider].configuration.arguments, ["still-second"]);
+        assert_eq!(app.settings_draft.agents[&provider].environment, [("FIXTURE_B".into(), "still-b".into())]);
+        // Two Add callbacks from the same tree both append to the current
+        // draft; newly created rows keep independent identities.
+        for _ in 0..2 { drop(app.update(Message::AgentListEdited { provider, owner: arguments, edit: AgentListEdit::AddArgument })); }
+        let draft = &app.settings_draft.agents[&provider];
+        assert_eq!(draft.configuration.arguments, ["still-second", "", ""]);
+        assert_eq!(draft.argument_rows.len(), 3);
+        assert_ne!(draft.argument_rows[1], draft.argument_rows[2]);
+        assert!(!draft.argument_rows.contains(&first));
+        drop(app.update(Message::AgentListEdited { provider, owner: environment, edit: AgentListEdit::AddEnvironment }));
+        let new_row = *app.settings_draft.agents[&provider].environment_rows.last().unwrap();
+        for edit in [AgentListEdit::EnvironmentName { row: new_row, value: "FIXTURE_C".into() }, AgentListEdit::EnvironmentValue { row: new_row, value: "c".into() }] {
+            drop(app.update(Message::AgentListEdited { provider, owner: environment, edit }));
+        }
+        assert_eq!(app.settings_draft.agents[&provider].environment, [("FIXTURE_B".into(), "still-b".into()), ("FIXTURE_C".into(), "c".into())]);
+        // External adoption/reset installs new list ownership even when the
+        // preference values compare equal. Old Add/remove/type callbacks fail.
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        app.settings_pending.clear();
+        let before = app.settings_draft.clone();
+        let generation = app.settings_generation;
+        for (owner, edit) in [(arguments, AgentListEdit::AddArgument), (arguments, AgentListEdit::RemoveArgument(second)), (environment, AgentListEdit::AddEnvironment), (environment, AgentListEdit::EnvironmentValue { row: b, value: "old".into() })] {
+            drop(app.update(Message::AgentListEdited { provider, owner, edit }));
+        }
+        assert_eq!(app.settings_draft, before);
+        assert!(app.settings_pending.is_empty());
+        assert_eq!(app.settings_generation, generation);
     }
 
     #[test]
