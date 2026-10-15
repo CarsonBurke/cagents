@@ -2730,6 +2730,11 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
+        if changed && !visible && !self.presentation_evicted {
+            if let Some(handle) = self.handle() {
+                handle.remember_visible_view(self.snapshot.clone(), self.source_clock);
+            }
+        }
         images::sync(self);
         let result = self.present();
         if visible {

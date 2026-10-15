@@ -12,6 +12,9 @@ use std::{
 };
 
 const BUFFER: usize = 64 * 1024;
+// Complete source views can exceed the bounded inline IPC representation.
+// Decoding also requires source-owner admission before allocation (union gate).
+const MAX_VIEW_BYTES: u64 = 512 * 1024 * 1024;
 
 struct Publication {
     snapshot: Arc<Snapshot>,
@@ -35,6 +38,7 @@ struct Data {
     requested_show: bool,
     revoked: bool,
     error: Option<String>,
+    rendered: bool,
 }
 
 pub(super) struct State {
@@ -79,10 +83,11 @@ impl State {
 
     // Called under the owner's snapshot lock. This transfers an existing Arc;
     // it does not clone transcript bodies or perform disk I/O on the UI thread.
-    pub(super) fn capture(self: &Arc<Self>, snapshot: Arc<Snapshot>, clock: Option<SourceClock>) {
+    pub(super) fn capture(self: &Arc<Self>, snapshot: Arc<Snapshot>, clock: Option<SourceClock>, rendered: bool) {
         {
             let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
-            if data.revoked { return; }
+            if data.revoked || (!rendered && data.rendered) { return; }
+            data.rendered |= rendered;
             data.epoch = data.epoch.wrapping_add(1);
             let epoch = data.epoch;
             data.pending = Some(Publication { snapshot, clock, epoch });
@@ -131,6 +136,7 @@ impl State {
         data.cached = None;
         data.restore = false;
         data.requested_show = false;
+        data.rendered = false;
     }
 
     /// Content reset keeps the client usable but removes the previous view.
@@ -192,8 +198,8 @@ impl State {
             writer.flush().map_err(|e| e.to_string())?;
         }
         let bytes = file.metadata().map_err(|e| e.to_string())?.len();
-        if bytes > ipc::MAX_FRAME_BYTES as u64 {
-            return Err("Cached publication exceeds its bounded wire window".into());
+        if bytes > MAX_VIEW_BYTES {
+            return Err("Cached publication exceeds its bounded view file limit".into());
         }
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         Ok(Cached { file, bytes, clock: record.clock, epoch: record.epoch })
@@ -261,7 +267,7 @@ impl State {
             self.buffer_bytes.store(BUFFER as u64, Ordering::Release);
             self.trace();
             let result = file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string()).and_then(|_| {
-                let checked = CheckedReader { state: self, epoch, request, file: file.take(ipc::MAX_FRAME_BYTES as u64 + 1) };
+                let checked = CheckedReader { state: self, epoch, request, file: file.take(MAX_VIEW_BYTES + 1) };
                 serde_json::from_reader::<_, Snapshot>(BufReader::with_capacity(BUFFER, checked))
                     .map(|snapshot| (Arc::new(snapshot), record_epoch, clock)).map_err(|e| e.to_string())
             });
@@ -490,5 +496,37 @@ mod tests {
         assert!(handle.snapshot().read_only_reason.is_some());
         handle.revoke_local_history();
         wait("revoked fallback did not release", || body.upgrade().is_none());
+    }
+
+    #[test]
+    fn last_projected_view_wins_over_a_later_bounded_raw_eviction() {
+        let handle = handle();
+        let mut view = (*handle.snapshot()).clone();
+        let mut item = (*view.items[0]).clone();
+        let super::super::super::ItemContent::Text { text, .. } = &mut item.content else { panic!("text"); };
+        *text = "complete projected prefix\n".repeat(64 * 1024);
+        let expected = text.len();
+        view.items[0] = Arc::new(item);
+        handle.remember_visible_view(Arc::new(view), None);
+        hidden_on_disk(&handle);
+        handle.set_visible(true).unwrap();
+        wait("projected cache did not restore", || handle.resident_snapshot_with_clock().is_some());
+        let snapshot = handle.snapshot();
+        let super::super::super::ItemContent::Text { text, .. } = &snapshot.items[0].content else { panic!("text"); };
+        assert_eq!(text.len(), expected, "raw inline eviction must not replace the displayed view");
+    }
+
+    #[test]
+    fn a_late_view_from_another_native_conversation_is_not_cached() {
+        let handle = handle();
+        let mut late = (*handle.snapshot()).clone();
+        late.session_id = Some("different-conversation".into());
+        late.items.clear();
+        handle.remember_visible_view(Arc::new(late), None);
+        hidden_on_disk(&handle);
+        handle.set_visible(true).unwrap();
+        wait("current cache did not restore", || handle.resident_snapshot_with_clock().is_some());
+        assert!(handle.snapshot().transcript_bytes() > 0);
+        assert_eq!(handle.snapshot().session_id.as_deref(), Some("private-offline"));
     }
 }

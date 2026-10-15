@@ -1128,7 +1128,7 @@ impl ClientHandle {
                             let resident = body_requested.load(Ordering::Acquire) && !offline.revoked();
                             if !resident {
                                 let body = Arc::new(final_snapshot);
-                                offline.capture(body.clone(), *source_clock.lock().unwrap_or_else(|p| p.into_inner()));
+                                offline.capture(body.clone(), *source_clock.lock().unwrap_or_else(|p| p.into_inner()), false);
                                 final_snapshot = (*body).clone();
                                 final_snapshot.evict_transcript();
                             }
@@ -1218,7 +1218,7 @@ impl ClientHandle {
                             let resident = body_requested.load(Ordering::Acquire) && !offline.revoked();
                             if !resident {
                                 let body = Arc::new(update);
-                                offline.capture(body.clone(), *source_clock.lock().unwrap_or_else(|p| p.into_inner()));
+                                offline.capture(body.clone(), *source_clock.lock().unwrap_or_else(|p| p.into_inner()), false);
                                 update = (*body).clone();
                                 update.evict_transcript();
                             }
@@ -1599,7 +1599,7 @@ impl ClientHandle {
         if !retain_body {
             if self.inner.transcript_resident.load(Ordering::Acquire) {
                 let clock = *self.inner.source_clock.lock().unwrap_or_else(|p| p.into_inner());
-                self.inner.offline.capture(snapshot.clone(), clock);
+                self.inner.offline.capture(snapshot.clone(), clock, false);
             }
             self.inner.append_lineage.lock().unwrap_or_else(|p| p.into_inner()).clear();
             let bytes = snapshot.transcript_bytes();
@@ -1622,6 +1622,15 @@ impl ClientHandle {
             Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => Ok(()),
             Err(crossbeam_channel::TrySendError::Disconnected(())) => Err("Chat visibility worker disconnected".into()),
         }
+    }
+
+    /// Preserve the actual projected view, including admitted full sources,
+    /// before the runtime drops its hydration/presentation owners on hide.
+    pub(crate) fn remember_visible_view(&self, view: Arc<Snapshot>, clock: Option<SourceClock>) {
+        let current = self.inner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        // A late UI view must not cross a reset/new native conversation.
+        if current.session_id != view.session_id || self.inner.offline.revoked() { return; }
+        self.inner.offline.capture(view, clock, true);
     }
 
     /// Account/history deletion must fence cached plaintext as well as the
