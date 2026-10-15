@@ -1,4 +1,5 @@
 mod presentation;
+mod terminal_instances;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -237,6 +238,7 @@ pub(crate) struct HostState {
     /// made per-frame allocation scale with the number of attached views.
     proof: Arc<HostSessionProof>,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
+    published_terminal_workers: terminal_instances::PublishedWorkers,
     spawning: BTreeSet<TerminalId>,
     /// Covers the interval before a login's live TerminalRecord exists.
     browser_logins_spawning: BTreeSet<TerminalId>,
@@ -335,6 +337,7 @@ impl HostState {
             project_removals: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
+            published_terminal_workers: terminal_instances::PublishedWorkers::default(),
             spawning: BTreeSet::new(),
             browser_logins_spawning: BTreeSet::new(),
             clients: BTreeMap::new(),
@@ -693,7 +696,10 @@ impl HostState {
             {
                 if let CardKind::Terminal(source) = &before.kind {
                     let current = self.terminals.get(&source.id);
-                    if execution_instance.is_none_or(|instance| instance.is_nil())
+                    let latest=self.published_terminal_workers.latest(source.id)
+                        .or_else(||current.map(|record|record.handle.execution_instance()));
+                    if latest.is_none() || latest!=*execution_instance
+                        || execution_instance.is_none_or(|instance| instance.is_nil())
                         || self.spawning.contains(&source.id)
                         || self.chat_spawning.contains_key(&source.id)
                         || self.chats.contains_key(&source.id)
@@ -1289,6 +1295,7 @@ impl HostState {
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
         self.inventory_generation += 1;
         self.notification_closed.remove(&terminal_id);
+        self.published_terminal_workers.observe(terminal_id,execution_instance);
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
@@ -4455,7 +4462,15 @@ mod tests {
             assert!(!handle.is_completed());
             state.spawning.remove(&session.id);
         }
+        // Simulate the UI's older A receipt while this actual B was published.
+        let older_worker=uuid::Uuid::new_v4();
         handle.shutdown().unwrap();
+        let retired=state.terminals.remove(&session.id).unwrap();
+        assert_eq!(retired.handle.execution_instance(),descriptor.execution_instance);
+        let snapshot=state.read_model().unwrap();
+        let old=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:snapshot.views[0].revision,operation:uuid::Uuid::new_v4(),change:Change::RemoveSource {registry:snapshot.identity,repository:directory.path().into(),before:pane.clone(),execution_instance:Some(older_worker)}};
+        assert!(state.edit_model(1,old).is_err(),"retired successor B must not disappear behind absent resident inventory");
+        assert_eq!(state.read_model().unwrap(),snapshot);
         let mut ended = pane.clone();
         if let CardKind::Terminal(source) = &mut ended.kind {
             source.continuity = TerminalContinuity::Exited {
