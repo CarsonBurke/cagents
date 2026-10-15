@@ -7198,16 +7198,17 @@ fn menu_bindings<A: widget::menu::Action<Message = SidebarAction>>(
     actions
         .into_iter()
         .filter_map(|action| {
-            let (command, target) = match action.message() {
+            let message = action.message();
+            let (command, target) = match commands::bound_payload(&message) {
                 SidebarAction::RunCommand {
                     command,
                     action: target,
-                } => (command, Some(target)),
-                SidebarAction::RunChangeCommand { command, .. } => (command, None),
+                } => (*command, Some(commands::bound_payload(target))),
+                SidebarAction::RunChangeCommand { command, .. } => (*command, None),
                 _ => return None,
             };
             if command == crate::workspace_widget::GlobalShortcut::OpenInExternalEditor {
-                let editor_id = match target.as_deref()? {
+                let editor_id = match target? {
                     SidebarAction::ProjectCommand {
                         command: ProjectCommand::OpenEditor(id),
                         ..
