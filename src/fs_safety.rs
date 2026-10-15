@@ -167,6 +167,27 @@ impl Root {
     }
 }
 
+/// Internal worker-side ancestor observation through a retained directory.
+/// This intentional literal parent lookup is separate from confined public
+/// component resolution: `open_at` MUST continue rejecting user-supplied `..`.
+/// The returned descriptor alone does not grant placement/effect consent.
+#[cfg(target_os = "linux")]
+pub(crate) fn retained_parent_directory(root: &Root) -> io::Result<Root> {
+    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: the directory is retained, the ONLY lookup is this static NUL-
+    // terminated parent literal, and openat returns a fresh owned descriptor.
+    let descriptor = unsafe { libc::openat(root.descriptor(), c"..".as_ptr(), flags) };
+    if descriptor < 0 { return Err(io::Error::last_os_error()); }
+    Ok(Root {
+        directory: unsafe { OwnedFd::from_raw_fd(descriptor) },
+        path: root.path().join(".."),
+    })
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn retained_parent_directory(_root: &Root) -> io::Result<Root> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "Retained parent observation is unavailable on this platform."))
+}
+
 /// Why a path could not be resolved beneath a root.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResolveError {
@@ -1827,5 +1848,26 @@ pub(crate) mod tests {
         let second = resolver();
 
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod retained_parent_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    #[test]
+    fn retained_parent_opens_the_original_ancestor_without_relaxing_public_components() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("child")).unwrap();
+        let child = Root::open(&directory.path().join("child")).unwrap();
+        let expected = Root::open(directory.path()).unwrap();
+        assert!(open_at(child.descriptor(), OsStr::new(".."), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).is_err(), "confined public component lookup still rejects parent traversal");
+        let parent = retained_parent_directory(&child).unwrap();
+        assert_eq!((parent.metadata().unwrap().dev(), parent.metadata().unwrap().ino()), (expected.metadata().unwrap().dev(), expected.metadata().unwrap().ino()));
+        let retired = directory.path().join("retired");
+        std::fs::rename(directory.path().join("child"), &retired).unwrap();
+        std::fs::create_dir(directory.path().join("child")).unwrap();
+        let after = retained_parent_directory(&child).unwrap();
+        assert_eq!((after.metadata().unwrap().dev(), after.metadata().unwrap().ino()), (expected.metadata().unwrap().dev(), expected.metadata().unwrap().ino()), "the parent is observed from the original held child, not its replacement name");
     }
 }
