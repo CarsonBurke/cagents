@@ -37,6 +37,7 @@ impl WorktreeSetupPlan {
 
     /// Pane edits do not confer new setup authority. Only the canonical shell
     /// recipe and inert setup identity/timestamp metadata may use this plan.
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn matches_terminal_recipe(
         &self,
         recipe: &crate::model::LaunchRecipe,
