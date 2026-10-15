@@ -19382,6 +19382,7 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                created_start_requirements: Vec::new(),
             };
             match frame {
                 // One adopted row.
