@@ -13,6 +13,7 @@ pub struct ProjectLocation {
     pub key: PathBuf,
     pub kind: ProjectKind,
     pub checkout: Option<PathBuf>,
+    pub primary_checkout: Option<PathBuf>,
 }
 
 /// Preserve an already-open folder identity before interpreting new Git
@@ -26,6 +27,7 @@ pub(crate) fn resolve(
         return Ok(ProjectLocation {
             key: from.clone(),
             kind: project.kind,
+            primary_checkout: project.primary_checkout.clone(),
             checkout: project.checkout.clone().or_else(|| (project.kind == ProjectKind::Folder).then(|| from.clone())),
         });
     }
@@ -55,12 +57,10 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
         if key.is_empty() {
             return Err("git reported an empty repository path".into());
         }
-        return Ok(ProjectLocation {
-            key: fs::canonicalize(key)
-                .map_err(|error| format!("could not resolve Git directory {key}: {error}"))?,
-            kind: ProjectKind::Git,
-            checkout: discover_checkout(&directory)?,
-        });
+        let key = fs::canonicalize(key).map_err(|error| format!("could not resolve Git directory {key}: {error}"))?;
+        let checkout = discover_checkout(&directory)?;
+        let primary_checkout = checkout.as_deref().and_then(|checkout| primary_checkout(checkout, &key));
+        return Ok(ProjectLocation { key, kind: ProjectKind::Git, checkout, primary_checkout });
     }
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     let diagnostic = diagnostic.trim();
@@ -78,7 +78,7 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
         return Ok(ProjectLocation {
             key: directory.clone(),
             kind: ProjectKind::Folder,
-            checkout: Some(directory),
+            checkout: Some(directory), primary_checkout: None,
         });
     }
     Err(format!(
@@ -105,7 +105,6 @@ fn discover_checkout(directory: &Path) -> Result<Option<PathBuf>, String> {
 
 /// Filesystem identity for a verified checkout marker, including linked and
 /// separate Git directories. No Git subprocess is needed during navigation.
-#[cfg(feature = "host")]
 pub(crate) fn checkout_identity(directory: &Path) -> Option<(PathBuf, PathBuf)> {
     use std::os::unix::ffi::OsStrExt;
     fn reference(bytes: &[u8]) -> &Path {
@@ -123,6 +122,13 @@ pub(crate) fn checkout_identity(directory: &Path) -> Option<(PathBuf, PathBuf)> 
         Err(_) => return None,
     };
     Some((admin, common))
+}
+
+/// Only a checkout whose private Git directory is the common directory can
+/// repair Git's separate-directory primary worktree record.
+pub(crate) fn primary_checkout(directory: &Path, repository: &Path) -> Option<PathBuf> {
+    let (admin, common) = checkout_identity(directory)?;
+    (admin == common && common == repository).then(|| fs::canonicalize(directory).ok()).flatten()
 }
 
 fn exists(path: &Path) -> Result<bool, String> {
@@ -246,7 +252,7 @@ mod tests {
         assert_eq!(
             discover(&selected).unwrap(),
             ProjectLocation {
-                checkout: Some(root.path().canonicalize().unwrap()),
+                checkout: Some(root.path().canonicalize().unwrap()), primary_checkout: None,
                 key: root.path().canonicalize().unwrap(),
                 kind: ProjectKind::Folder,
             }
@@ -264,6 +270,7 @@ mod tests {
         let location = discover(&checkout).unwrap();
         assert_eq!(location.key, metadata.canonicalize().unwrap());
         assert_eq!(location.checkout, Some(checkout.canonicalize().unwrap()));
+        assert_eq!(location.primary_checkout, Some(checkout.canonicalize().unwrap()));
         assert_eq!(discover(&metadata).unwrap().checkout, None);
     }
 
@@ -284,6 +291,9 @@ mod tests {
         assert_eq!(records[0].id, crate::repository::stable_worktree_id(&records[0].path));
         let linked = root.path().join("linked");
         assert!(Command::new("git").arg("-C").arg(&checkout).args(["worktree", "add", "-b", "linked"]).arg(&linked).output().unwrap().status.success());
+        let linked_location = discover(&linked).unwrap();
+        assert_eq!(linked_location.checkout, Some(linked.canonicalize().unwrap()));
+        assert_eq!(linked_location.primary_checkout, None);
         let info = service.discover(&linked, &cancellation).unwrap();
         let records = service.list_worktrees_for_repository(&info, &cancellation).unwrap();
         assert!(records.iter().any(|record| record.path == linked.canonicalize().unwrap()));
@@ -346,7 +356,7 @@ mod tests {
             "a checkout outside every open project has no project"
         );
         model.projects.push(crate::workspace_model::ModelProject {
-            checkout: None,
+            checkout: None, primary_checkout: None,
             repository: key.clone(),
             name: "repository".into(),
             kind: ProjectKind::Git,
