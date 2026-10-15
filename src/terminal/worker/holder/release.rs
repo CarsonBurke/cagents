@@ -103,7 +103,9 @@ fn completed_until(
     Ok(result)
 }
 
-pub(super) fn start_attempt(attempt: crate::terminal::TerminalStartAttempt) -> Result<(), String> {
+pub(in crate::terminal::worker) fn start_attempt(
+    attempt: crate::terminal::TerminalStartAttempt,
+) -> Result<(), String> {
     service()?
         .try_send(Task::StartAttempt(attempt))
         .map_err(|_| "Terminal start cleanup capacity is busy; retain its exact attempt".to_owned())
