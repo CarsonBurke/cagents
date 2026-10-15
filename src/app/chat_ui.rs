@@ -37,6 +37,7 @@ mod tool_text;
 mod turn;
 mod turn_actions;
 mod originals;
+mod plain_copy;
 mod view;
 
 pub(super) fn prune_pasted_images() {
@@ -160,6 +161,7 @@ pub enum Action {
     Switch(CardId),
     Ready(Target, Ready),
     OriginalReady(Target,u64,Option<AccountId>,u64,originals::Reply),
+    PlainCopyReady(Target,u64,plain_copy::Reply),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
@@ -320,6 +322,7 @@ impl Action {
             self,
             Self::Ready(..)
                 | Self::OriginalReady(..)
+                | Self::PlainCopyReady(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
                 | Self::Wake(..)
@@ -2689,6 +2692,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
+        if !visible { self.recovery.plain_copy.clear(); }
         self.sync_original();
         images::sync(self);
         self.present()
@@ -7727,14 +7731,34 @@ impl Cagents {
                             .iter()
                             .any(|agent| &agent.id == id)
                     });
+                    runtime.recovery.plain_copy.clear();
                     runtime.deferred_page = None;
                     images::sync(runtime);
                 }
             }
+            Action::PlainCopyReady(target,id,reply) => {
+                let epoch=self.chat_ui.original_epoch;
+                let Some(runtime)=self.chat_runtime_mut(target) else {return Task::none();};
+                if let Some((item,text))=plain_copy::complete(runtime,id,epoch,reply) {
+                    let at=Instant::now();runtime.copied=Some((item,at));
+                    return Task::batch([
+                        iced::clipboard::write(text).map(cosmic::Action::App),
+                        cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            Message::ChatUi(Action::ClearCopied(target,at))
+                        }),
+                    ]);
+                }
+            }
             Action::Copy(target, id, part) => {
+                let epoch=self.chat_ui.original_epoch;
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if matches!(part,CopyPart::PlainText)
+                    && runtime.active_item(&id).is_some_and(|item|matches!(item.content,ItemContent::Text {..})) {
+                    return plain_copy::begin(runtime,&id,epoch);
+                }
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
                 let text = runtime.active_copy_text(&id,part);

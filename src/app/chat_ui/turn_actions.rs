@@ -50,6 +50,7 @@ impl Settings {
 pub(super) struct State {
     pub submitted: Option<Prompt>,
     pub originals: originals::State,
+    pub plain_copy: plain_copy::State,
     pub attachment_labels: HashMap<PathBuf,PathBuf>,
     /// Each failed generation can be retried once until provider output proves
     /// a new turn began. An ACK alone is not that proof.

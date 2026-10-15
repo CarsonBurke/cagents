@@ -123,7 +123,7 @@ impl std::hash::Hash for Job {
         self.account_hint.hash(state);self.account_epoch.hash(state);
     }
 }
-fn readers()->&'static Arc<tokio::sync::Semaphore> {
+pub(super) fn readers()->&'static Arc<tokio::sync::Semaphore> {
     static READERS:std::sync::OnceLock<Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
     READERS.get_or_init(||Arc::new(tokio::sync::Semaphore::new(2)))
 }
@@ -152,6 +152,7 @@ impl Runtime {
     }
     fn revoke_originals(&mut self) {
         self.recovery.originals.clear();
+        self.recovery.plain_copy.clear();
         self.recovery.submitted=None;
         if self.recovery.branch_draft.as_ref().is_some_and(|prompt|prompt.origin_backend) {self.recovery.branch_draft=None;}
         if self.recovery.prepared_prompt.as_ref().is_some_and(|prompt|prompt.origin_backend) {self.recovery.prepared_prompt=None;}
