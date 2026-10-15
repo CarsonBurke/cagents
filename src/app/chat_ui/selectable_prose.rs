@@ -980,6 +980,7 @@ mod tests {
             plain: source.clone().into(),
             spans,
             matches: vec![],
+            current: None,
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),
             target: Target {
