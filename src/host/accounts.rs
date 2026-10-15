@@ -232,6 +232,37 @@ fn apply_reports(
     (entries, exhausted, changed_logins)
 }
 
+/// Yield to newly reported usage before admitting another periodic probe.
+/// The current probe finishes normally; this does not cancel provider work or
+/// bound the separate login-verification/on-demand refresh batches.
+async fn periodic_probes<F, Fut>(
+    schedule: &mut Schedule,
+    accounts: impl IntoIterator<Item = (Account, bool)>,
+    hosted: bool,
+    signal: &Signal,
+    mut probe: F,
+) where
+    F: FnMut(Account) -> Fut,
+    Fut: std::future::Future,
+{
+    for (account, automatic) in accounts {
+        if signal.ready.load(Ordering::Acquire) {
+            break;
+        }
+        let now = crate::chat::now_ms().unwrap_or_default();
+        if !schedule.due(&account, automatic, hosted, now) {
+            continue;
+        }
+        schedule.attempted.insert(account.id(), now);
+        if cancellable_probe(&signal.stopped, probe(account)).await.is_none() {
+            break;
+        }
+        if *signal.stopped.0.lock().unwrap_or_else(|p| p.into_inner()) {
+            break;
+        }
+    }
+}
+
 pub(super) struct Monitor {
     stopped: Arc<(Mutex<bool>, Condvar)>,
     worker: Option<JoinHandle<()>>,
@@ -352,32 +383,18 @@ impl Monitor {
                                     }
                                 }
                             }
-                            for account in registry.accounts(homes.as_ref()) {
-                                let now = crate::chat::now_ms().unwrap_or_default();
-                                if !schedule.due(
-                                    &account,
-                                    registry.automatic(account.provider),
-                                    hosted,
-                                    now,
-                                ) {
-                                    continue;
-                                }
-                                schedule.attempted.insert(account.id(), now);
-                                // One probe at a time. Existing provider locks and
-                                // cache freshness also coordinate focused windows.
-                                if runtime
-                                    .block_on(cancellable_probe(
-                                        &signal.stopped,
-                                        probe::run(account, Cache::installation(), false),
-                                    ))
-                                    .is_none()
-                                {
-                                    break;
-                                }
-                                if *signal.stopped.0.lock().unwrap_or_else(|p| p.into_inner()) {
-                                    break;
-                                }
-                            }
+                            // One probe at a time. Let new live reports be
+                            // folded before advancing a large periodic batch.
+                            runtime.block_on(periodic_probes(
+                                &mut schedule,
+                                registry.accounts(homes.as_ref()).into_iter().map(|account| {
+                                    let automatic = registry.automatic(account.provider);
+                                    (account, automatic)
+                                }),
+                                hosted,
+                                &signal,
+                                |account| probe::run(account, Cache::installation(), false),
+                            ));
                             Ok(())
                         });
                     }
@@ -785,6 +802,84 @@ mod tests {
             UsageStatus::Limited
         );
         handle.close().unwrap();
+    }
+
+    #[test]
+    fn periodic_batch_folds_a_new_exhaustion_report_before_admitting_the_next_due_account() {
+        use crate::account::{LiveReport, UsageSnapshot, UsageStatus, cache::Entry, registry::{Registered, Registry}};
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let provider = crate::agent::Provider::Claude;
+        let mut registry = Registry::default();
+        let mut accounts = Vec::new();
+        for _ in 0..2 {
+            let key = uuid::Uuid::new_v4();
+            let account = Account::managed(provider, key, homes.path(provider, key));
+            std::fs::create_dir_all(account.resolved_home().unwrap()).unwrap();
+            registry.register(Registered { key, provider, linked_home: None, label: None,
+                email: Some(format!("periodic-{key}@fixture.invalid")), organization: None, added_at: 0 }, &[]).unwrap();
+            accounts.push(account);
+        }
+        let first = accounts[0].clone();
+        let second = accounts[1].clone();
+        let physical = first.resolved_home().unwrap().canonicalize().unwrap();
+        let metadata = physical.metadata().unwrap();
+        let scope = crate::account::scope::LaunchAccountScope {
+            provider, canonical_home: physical, device: metadata.dev(), inode: metadata.ino(),
+            registered_id: Some(first.id()), purge_ids: vec![first.id()],
+        };
+        let cache = Cache::at(root.path().join("cache"));
+        let now = crate::chat::now_ms().unwrap();
+        cache.store(&first.cache_key().unwrap(), Entry { identity: None,
+            snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now.saturating_sub(1)) }).unwrap();
+        let signal = Arc::new(Signal::new(Arc::new((Mutex::new(false), Condvar::new()))));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (started, admitted) = std::sync::mpsc::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let worker_signal = signal.clone();
+        let worker_events = events.clone();
+        let worker = std::thread::spawn(move || {
+            admitted.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker_signal.record(&scope, LiveReport::Claude(crate::account::claude::LiveUpdate {
+                windows: Vec::new(), status: Some(UsageStatus::Limited),
+            }), now);
+            worker_events.lock().unwrap().push("report");
+            release.send(()).unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut schedule = Schedule::default();
+        let mut blocked = Some(blocked);
+        let first_id = first.id();
+        runtime.block_on(periodic_probes(&mut schedule,
+            accounts.clone().into_iter().map(|account| (account, true)), true, &signal,
+            |account| {
+                let blocked = blocked.take();
+                let started = started.clone();
+                let events = events.clone();
+                let is_first = account.id() == first_id;
+                async move {
+                    events.lock().unwrap().push(if is_first { "probe-a" } else { "probe-b" });
+                    if is_first {
+                        started.send(()).unwrap();
+                        blocked.unwrap().await.unwrap();
+                    }
+                }
+            }));
+        worker.join().unwrap();
+        assert!(schedule.attempted.contains_key(&first.id()));
+        assert!(!schedule.attempted.contains_key(&second.id()), "yield before claiming the next due attempt");
+        assert_eq!(*events.lock().unwrap(), ["probe-a", "report"]);
+        let (_, exhausted, _) = apply_reports(&registry, Some(&homes), &cache, signal.drain(), now);
+        assert_eq!(exhausted, [first]);
+        events.lock().unwrap().push("fold");
+        // The deferred account is still due after processing the report; it
+        // must not be marked attempted or postponed for the full interval.
+        runtime.block_on(periodic_probes(&mut schedule,
+            accounts.into_iter().map(|account| (account, true)), true, &signal,
+            |_| { let events = events.clone(); async move { events.lock().unwrap().push("probe-b"); } }));
+        assert!(schedule.attempted.contains_key(&second.id()));
+        assert_eq!(*events.lock().unwrap(), ["probe-a", "report", "fold", "probe-b"]);
     }
 
     #[test]
