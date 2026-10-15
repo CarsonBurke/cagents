@@ -25,7 +25,7 @@ fn queue_provider_for_test(
     handle
         .0
         .commands
-        .try_send((ActorCommand::Provider { run: None, command }, reply))
+        .try_send((ActorCommand::Provider { run: None, command, decline_only: false }, reply))
         .unwrap();
     handle.wake();
     response

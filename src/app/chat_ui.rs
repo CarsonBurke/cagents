@@ -4864,6 +4864,20 @@ impl Cagents {
             .values()
             .find_map(|runtime| runtime.restart_blocker())
     }
+    /// Whether closing or a close-after-return already owns this card.
+    pub(super) fn chat_close_owned(&self, card: CardId) -> bool {
+        matches!(
+            self.chat_ui.phases.get(&card),
+            Some(
+                Phase::Closing { restart: None, .. }
+                    | Phase::Returning {
+                        close_requested: true,
+                        ..
+                    }
+            )
+        )
+    }
+
     /// Closes a chat card, in whatever state its conversation is.
     ///
     /// The card leaves at once. What the conversation holds in the daemon is
@@ -4881,6 +4895,12 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        if self.pane_transfer_pending(card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane is moving to a channel. Wait for the move to finish before closing it.",
+            ));
+            return Task::none();
+        }
         if matches!(
             self.chat_ui.phases.get(&card),
             Some(Phase::Closing { restart: None, .. })
@@ -12786,6 +12806,89 @@ mod tests {
             Ok(()),
         )));
         assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    #[test]
+    fn retained_chat_close_and_channel_move_do_not_overtake_each_other() {
+        use crate::{
+            model::{ChannelId, ProjectChannel, ProjectId},
+            workspace_model::{
+                ModelChannel, ModelEdit,
+                views::{Change, Pane, Scope, View},
+            },
+        };
+        for close_first in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let saved = app.chat_return_session(card).unwrap();
+            let repository = saved.launch.recipe.working_directory.clone();
+            let source = ChannelId::new();
+            let destination = ChannelId::new();
+            let project = ProjectId::new();
+            app.workspace_model.identity = uuid::Uuid::new_v4();
+            app.workspace_model.channels = [source, destination]
+                .into_iter()
+                .map(|id| ModelChannel {
+                    id,
+                    repository: repository.clone(),
+                    title: "Chat moves".into(),
+                    title_source: Default::default(),
+                    ordinal: 0,
+                })
+                .collect();
+            let mut view = View::empty(source);
+            view.panes
+                .push(Pane::from_card(app.card_state(card).unwrap(), None).unwrap());
+            app.workspace_model.views = vec![view, View::empty(destination)];
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.active_channel = Some(source);
+            for id in [source, destination] {
+                durable.channels.push(ProjectChannel {
+                    id,
+                    project_id: project,
+                    title: "Chat moves".into(),
+                    title_source: Default::default(),
+                    ordinal: 0,
+                    shared: true,
+                    cards: if id == source { vec![card] } else { vec![] },
+                    focused: (id == source).then_some(card),
+                });
+            }
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            assert!(app.can_move_pane_to_channel(card, destination));
+            if close_first {
+                drop(app.begin_chat_close(card));
+                let target = app.chat_ui.phases[&card].target();
+                assert!(app.chat_close_owned(card));
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert!(app.pane_move_destinations(card).is_empty());
+                drop(app.move_pane_to_channel(card, destination));
+                assert!(rx.try_recv().is_err());
+                assert!(!app.pane_transfer_pending(card));
+                // An exact failed cleanup releases that close intent without
+                // deleting or replacing the native descriptor.
+                drop(app.update(Message::ChatUi(Action::RetainedCloseFinished(
+                    target,
+                    saved.clone(),
+                    Err("fixture retains native owner".into()),
+                ))));
+                assert!(!app.chat_close_owned(card));
+                assert_eq!(app.chat_return_session(card), Some(saved));
+                assert!(app.can_move_pane_to_channel(card, destination));
+            } else {
+                drop(app.move_pane_to_channel(card, destination));
+                assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+                    change: Change::Transfer { id, .. }, ..
+                } if id == card));
+                drop(app.begin_chat_close(card));
+                assert!(!app.chat_close_owned(card));
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert_eq!(app.chat_return_session(card), Some(saved));
+                assert!(app.pane_transfer_pending(card));
+                assert!(rx.try_recv().is_err());
+            }
+        }
     }
 
     #[test]
