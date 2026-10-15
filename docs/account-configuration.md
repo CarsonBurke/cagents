@@ -94,7 +94,7 @@ cagents --device fw16 account monitor --session "$SESSION" --threshold 90 \
 
 Without `--authorize`, the monitor only inspects. The threshold applies to any
 provider-reported primary or secondary allowance window; token counts never
-trigger redemption. The monitor pins the first actual provider account and
+trigger redemption. An authorized monitor pins the first actual provider account and
 stops if it changes. The owning daemon checks the threshold again against fresh
 shared-account usage before sending consumption. Other sessions using the same
 provider account share the daemon's durable attempt history and nonblocking
