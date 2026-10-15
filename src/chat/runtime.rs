@@ -2123,7 +2123,7 @@ impl Actor {
                     // backend conditional-close barrier, so preserve this live
                     // owner instead of treating its observed revision as one.
                     let _=reply.send(Err(if unchanged {
-                        "The provider cannot atomically fence backend turns for guarded close; stop it explicitly, then refresh the worktree census".into()
+                        "This agent cannot confirm that its work is unchanged. Stop the session explicitly, then refresh the worktree.".into()
                     } else {
                         "Provider work changed before conditional close".into()
                     }));
@@ -3303,7 +3303,7 @@ mod tests {
         assert!(autonomous.turn_generation>admitted.turn_generation);
         assert!(handle.close_if_revision(admitted.close_revision).is_err());
         assert!(!handle.close_observation().closing);
-        assert!(handle.close_if_revision(autonomous.close_revision).unwrap_err().contains("atomically fence backend turns"));
+        assert!(handle.close_if_revision(autonomous.close_revision).unwrap_err().contains("work is unchanged"));
         assert!(!handle.close_observation().closing);
         handle.close().unwrap();
     }
@@ -3345,7 +3345,7 @@ mod tests {
         handle.command(Command::SetPermissionMode {mode:"manual".into()}).unwrap();
         let completed=handle.close_observation();
         assert_eq!(completed.activity,ActivityState::Idle);
-        assert!(handle.close_if_revision(completed.close_revision).unwrap_err().contains("atomically fence backend turns"));
+        assert!(handle.close_if_revision(completed.close_revision).unwrap_err().contains("work is unchanged"));
         handle.close().unwrap();
     }
 
@@ -3397,7 +3397,7 @@ mod tests {
         assert!(!handle.close_observation().closing);
         until(&handle,|state|state.turn_generation>consent.turn_generation);
         assert!(handle.close_if_revision(consent.close_revision).is_err());
-        assert!(handle.close_if_revision(handle.close_observation().close_revision).unwrap_err().contains("atomically fence backend turns"));
+        assert!(handle.close_if_revision(handle.close_observation().close_revision).unwrap_err().contains("work is unchanged"));
         handle.close().unwrap();
     }
 
@@ -3429,7 +3429,7 @@ mod tests {
         let consent=handle.close_observation();
         let refusal=handle.close_if_revision(consent.close_revision).unwrap_err();
         assert!(directory.path().join("emitted").exists(),"the provider crossed the exact post-poll gap");
-        assert!(refusal.contains("atomically fence backend turns"));
+        assert!(refusal.contains("work is unchanged"));
         assert!(!handle.is_completed());assert!(!handle.close_observation().closing);
         until(&handle,|state|state.turn_generation>consent.turn_generation);
         handle.close().unwrap();

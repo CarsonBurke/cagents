@@ -2543,7 +2543,7 @@ impl Worker {
                     // No live terminal path currently has the authoritative
                     // proof needed to accept this close. Do not freeze or
                     // inspect a process family merely to refuse it anyway.
-                    Err("This terminal has no authoritative turn revision or authoritative prompt ownership proof; close it explicitly, then refresh the worktree census".into())
+                    Err("This terminal cannot confirm that its work is unchanged. Close it explicitly, then refresh the worktree.".into())
                 };
                 let _ = reply.send(outcome);
             }
@@ -6562,7 +6562,7 @@ mod tests {
         wait_for_text(&handle, "CONSENT_READY");
         let (consent, active) = handle.close_observation().unwrap();
         assert!(active);
-        assert!(handle.close_if_revision(consent).unwrap_err().contains("authoritative turn revision"));
+        assert!(handle.close_if_revision(consent).unwrap_err().contains("work is unchanged"));
         assert!(!handle.is_completed(), "refusing unknown turn ownership must preserve its process");
         handle.input(b"queued-after-consent".to_vec()).unwrap();
         assert!(handle.close_if_revision(consent).unwrap_err().contains("changed after close consent"));
