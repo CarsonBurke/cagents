@@ -203,12 +203,32 @@ fn valid_handoff_receipt(
     true
 }
 
+fn valid_restart_attachment(
+    receipt: &super::RestartReceipt,
+    expected: &Session,
+    snapshot: &Snapshot,
+    instance: uuid::Uuid,
+    binding: Option<&ipc::ChatSourceBinding>,
+    proof: &HostSessionProof,
+) -> bool {
+    receipt.is_valid()
+        && receipt.source() == expected
+        && receipt.replacement().proof.as_ref() == Some(proof)
+        && snapshot.session_id == receipt.replacement().launch.session_id
+        && binding.is_some_and(|binding|
+            valid_source_binding(binding, receipt.replacement(), instance, proof)
+                && &binding.source == receipt.replacement())
+}
+
 struct Inner {
     id: TerminalId,
     session: Session,
     execution_instance: uuid::Uuid,
     source_binding: Arc<Mutex<Option<crate::terminal_ipc::ChatSourceBinding>>>,
     upgrade_recovery: Option<(Session, Session)>,
+    // Immutable receipt from the correlated initial Attach response. Later
+    // snapshots/binding refreshes never rewrite its original source lineage.
+    restart_receipt: Option<super::RestartReceipt>,
     proof: HostSessionProof,
     // Captured from this authenticated connection, never resolved from a later
     // device selection, daemon discovery or attachment.
@@ -604,6 +624,7 @@ impl ClientHandle {
                 execution_instance: uuid::Uuid::new_v4(),
                 source_binding: Arc::new(Mutex::new(None)),
                 upgrade_recovery: None,
+                restart_receipt: None,
                 proof,
                 return_endpoint: None,
                 return_replay: Mutex::new(()),
@@ -977,6 +998,12 @@ impl ClientHandle {
                 &mut upgrade_recovery,
             )?
         };
+        // Preserve the exact submitted source before moving the request into
+        // its envelope. Only ChatAttach may return executable restart evidence.
+        let restart_source = match &request {
+            ClientRequest::ChatAttach { session } => Some(session.clone()),
+            _ => None,
+        };
         codec
             .write(
                 &mut stream,
@@ -994,7 +1021,7 @@ impl ClientHandle {
         let mut early_activity = None;
         let mut early_observed = OutputObservation::default();
         let mut early_usage = AccountUsage::default();
-        let (session, initial, execution_instance, initial_binding) = loop {
+        let (session, initial, execution_instance, initial_binding, restart_receipt) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
             let frame = codec.read(&mut stream);
@@ -1062,7 +1089,21 @@ impl ClientHandle {
                     }) {
                         return Err("Native attachment has inconsistent backend authority".into());
                     }
-                    break (session, snapshot, execution_instance, binding);
+                    break (session, snapshot, execution_instance, binding, None);
+                }
+                ServerMessage::Response { response: ServerResponse::ChatRestarted {
+                    receipt, snapshot, execution_instance, binding,
+                }} if envelope.request_id == Some(attach_request) => {
+                    let expected_source = restart_source.as_ref().ok_or_else(||
+                        StartFailure::from("A restarted attachment did not answer an original ChatAttach request"))?;
+                    if !valid_restart_attachment(&receipt, expected_source, &snapshot,
+                        execution_instance, binding.as_ref(), &proof) {
+                        return Err("The restarted attachment did not confirm its exact source, actor and replacement binding".into());
+                    }
+                    #[cfg(feature = "ui")]
+                    crate::daemon_health::frame(&stream, None, health_request);
+                    let session = receipt.replacement().clone();
+                    break (session, snapshot, execution_instance, binding, Some(receipt));
                 }
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
@@ -1079,13 +1120,18 @@ impl ClientHandle {
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
         };
-        if let Some((_, resolved)) = &upgrade_recovery
-            && (&session != resolved || initial.session_id != resolved.launch.session_id)
-        {
-            return Err(
-                "The attached conversation did not confirm the daemon's exact upgrade replacement"
-                    .into(),
-            );
+        if let Some((_, resolved)) = &upgrade_recovery {
+            // Upgrade and same-daemon restart are distinct receipts. Keep the
+            // original upgrade tuple; the UI must persist this exact two-step
+            // chain rather than treating a new paired view as an upgrade alias.
+            let confirmed = match restart_receipt.as_ref() {
+                Some(receipt) if receipt.source() == resolved => receipt.replacement(),
+                Some(_) => return Err("The restart did not continue the exact upgrade replacement".into()),
+                None => resolved,
+            };
+            if &session != confirmed || initial.session_id != confirmed.launch.session_id {
+                return Err("The attached conversation did not confirm the daemon's exact upgrade replacement".into());
+            }
         }
         stream.set_read_timeout(None).map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
@@ -1125,6 +1171,7 @@ impl ClientHandle {
             execution_instance,
             source_binding: source_binding.clone(),
             upgrade_recovery,
+            restart_receipt,
             proof: proof.clone(),
             return_endpoint,
             return_replay: Mutex::new(()),
@@ -1389,6 +1436,11 @@ impl ClientHandle {
     }
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
         self.inner.upgrade_recovery.as_ref()
+    }
+    /// Original authenticated Attach restart evidence. Persistence callers keep
+    /// this receipt separate from the latest live descriptor and upgrade tuple.
+    pub(crate) fn restart_receipt(&self) -> Option<&super::RestartReceipt> {
+        self.inner.restart_receipt.as_ref()
     }
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner
@@ -1881,6 +1933,7 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("client_restart_tests.rs");
 
     #[test]
     fn authenticated_same_record_thread_refresh_preserves_captured_return_intents() {
@@ -2414,7 +2467,7 @@ mod tests {
             completion.success = true;
         });
         let mut peer = ReaderPeer { socket, release, done: completed, settled: false, workers: vec![worker] };
-        let handle = ClientHandle::connect_on(client, source, Intent::Attach, Some(proof), false, None, None,
+        let handle = ClientHandle::connect_on(client, source, Intent::Restore, Some(proof), false, None, None,
             move |event| { let _ = wake.send(event); }).unwrap();
         assert_eq!(handle.source_binding(), Some(binding.clone()));
         let requester = handle.clone(); let expected = binding.clone();
