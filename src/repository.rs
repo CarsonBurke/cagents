@@ -6890,9 +6890,17 @@ mod tests {
             let directory = tempfile::Builder::new()
                 .prefix("cagents-pathspec-contract-")
                 .permissions(fs::Permissions::from_mode(0o700))
-                .tempdir_in("/var/tmp").unwrap().keep();
+                .tempdir_in("/var/tmp")
+                .unwrap()
+                .keep();
             let mut command = CommandSpec::new(std::env::current_exe().unwrap())
-                .args(["--exact", name, "--nocapture", "--test-threads=1", "--color=never"])
+                .args([
+                    "--exact",
+                    name,
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--color=never",
+                ])
                 .timeout(Duration::from_secs(240))
                 .output_limits(1024 * 1024, 1024 * 1024);
             for (key, _) in std::env::vars_os() {
@@ -6915,24 +6923,47 @@ mod tests {
                 .env("GIT_CONFIG_VALUE_2", "false")
                 .env("GIT_CONFIG_KEY_3", "init.templateDir")
                 .env("GIT_CONFIG_VALUE_3", "");
-            let (success, stdout, stderr, status) = match
-                SystemProcessExecutor.execute(&command, &CancellationToken::new())
-            {
-                Ok(output) => (output.success, output.stdout, output.stderr,
-                    format!("exit {:?}, signal {:?}", output.exit_code, output.signal)),
-                Err(failure) => (false, failure.stdout, failure.stderr,
-                    format!("{:?}: {}", failure.kind, failure.message)),
-            };
+            let (success, stdout, stderr, status) =
+                match SystemProcessExecutor.execute(&command, &CancellationToken::new()) {
+                    Ok(output) => (
+                        output.success,
+                        output.stdout,
+                        output.stderr,
+                        format!("exit {:?}, signal {:?}", output.exit_code, output.signal),
+                    ),
+                    Err(failure) => (
+                        false,
+                        failure.stdout,
+                        failure.stderr,
+                        format!("{:?}: {}", failure.kind, failure.message),
+                    ),
+                };
             for (name, bytes) in [("stdout", &stdout), ("stderr", &stderr)] {
-                fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
-                    .open(directory.join(name)).unwrap().write_all(bytes).unwrap();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(directory.join(name))
+                    .unwrap()
+                    .write_all(bytes)
+                    .unwrap();
             }
             eprintln!("Retained pathspec contract root: {}", directory.display());
             let stdout = String::from_utf8_lossy(&stdout);
             let stderr = String::from_utf8_lossy(&stderr);
             assert!(success, "{status}\n{stdout}\n{stderr}");
-            assert!(stdout.lines().any(|line| line.contains(&format!("test {name} ... ok"))), "{stdout}");
-            assert!(stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")), "{stdout}");
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line.contains(&format!("test {name} ... ok"))),
+                "{stdout}"
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+                "{stdout}"
+            );
             print!("{stdout}");
             eprint!("{stderr}");
             true
@@ -6944,7 +6975,8 @@ mod tests {
                 .expect("owning private contract namespace");
             let mut directory = tempfile::Builder::new()
                 .permissions(fs::Permissions::from_mode(0o700))
-                .tempdir_in(parent).unwrap();
+                .tempdir_in(parent)
+                .unwrap();
             directory.disable_cleanup(true);
             directory
         }
