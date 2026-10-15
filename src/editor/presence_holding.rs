@@ -174,6 +174,11 @@ impl PresenceHolding {
         Ok(())
     }
     fn retry_cleanup(&mut self) -> Result<(), String> {
+        // Restore the producer's exact pending mode witness before applying
+        // this consumer's explicit private0700 policy to its original inode.
+        // This step never acquires/removes a public recovery entry.
+        self.publication.retry_publication_steps().map_err(|error| error.to_string())?;
+        fs_safety::set_directory_permissions(self.directory(), 0o700).map_err(|error| error.to_string())?;
         if self.temporary.is_some() { self.unlink_temporary().map_err(|error| error.to_string())?; }
         if self.restore_original {
             if let Some(original) = &self.original {
