@@ -12567,6 +12567,26 @@ impl Cagents {
         }
     }
 
+    fn synchronize_diff_whitespace(&mut self, origin: Option<CardId>) -> Task<Message> {
+        let enabled = self.settings.diff_ignore_whitespace;
+        let visible = self.durable.cards.iter()
+            .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
+            .map(|card| card.id).collect::<HashSet<_>>();
+        let mut tasks = Vec::new();
+        for (&card, runtime) in self.cards.iter_mut() {
+            let runtime = match runtime {
+                CardRuntime::Repository(runtime) => runtime,
+                CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                _ => continue,
+            };
+            runtime.set_diff_ignore_whitespace(enabled);
+            if Some(card) == origin || visible.contains(&card) {
+                tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
+            }
+        }
+        Task::batch(tasks)
+    }
+
     /// Applies every live effect of the settings changing from `previous` to
     /// the ones now in force.
     ///
@@ -12582,6 +12602,9 @@ impl Cagents {
             }
         }
         let mut tasks = Vec::new();
+        if previous.diff_ignore_whitespace != self.settings.diff_ignore_whitespace {
+            tasks.push(self.synchronize_diff_whitespace(None));
+        }
         if previous.editor_font_family() != self.settings.editor_font_family()
             || previous.editor_font_size() != self.settings.editor_font_size()
         {
@@ -14063,28 +14086,7 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::ToggleDiffWhitespace { card: origin }) => {
                 self.settings.diff_ignore_whitespace = !self.settings.diff_ignore_whitespace;
-                let enabled = self.settings.diff_ignore_whitespace;
-                let visible = self
-                    .durable
-                    .cards
-                    .iter()
-                    .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
-                    .map(|card| card.id)
-                    .collect::<HashSet<_>>();
-                let mut tasks = Vec::new();
-                for (&card, runtime) in self.cards.iter_mut() {
-                    let runtime = match runtime {
-                        CardRuntime::Repository(runtime) => runtime,
-                        CardRuntime::PullRequests(pane) => &mut pane.runtime,
-                        _ => continue,
-                    };
-                    runtime.set_diff_ignore_whitespace(enabled);
-                    if card == origin || visible.contains(&card) {
-                        tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
-                    }
-                }
-                tasks.push(self.save_settings_task(false));
-                Task::batch(tasks)
+                Task::batch([self.synchronize_diff_whitespace(Some(origin)), self.save_settings_task(false)])
             }
             Message::Repository(RepositoryAction::ZoomFont { card, delta }) => {
                 self.update(Message::ZoomFont {
@@ -21418,6 +21420,40 @@ mod tests {
             assert!(app.workspace_inputs_blocked());
         }
         assert!(window_geometry_message(&window::Event::Focused).is_none());
+    }
+
+    #[test]
+    fn resetting_diff_whitespace_updates_existing_repository_and_pr_panes() {
+        let (mut app, project) = pull_request_test_app(&[7]);
+        app.settings.diff_ignore_whitespace = true;
+        drop(app.update(open_pull_request(project, 7)));
+        let pr = pull_request_cards(&app)[0].0;
+        let repository = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(repository, "source.rs", "line\n");
+        runtime.set_diff_ignore_whitespace(true);
+        let mut state = app.card_state(pr).unwrap().clone();
+        state.id = repository;
+        state.kind = CardKind::Repository(runtime.descriptor.clone());
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        app.cards.insert(repository, CardRuntime::Repository(Box::new(runtime)));
+        let preferences = |app: &Cagents| {
+            [repository, pr].map(|card| match app.cards.get(&card).unwrap() {
+                CardRuntime::Repository(runtime) => runtime.diff_ignores_whitespace(),
+                CardRuntime::PullRequests(pane) => pane.runtime.diff_ignores_whitespace(),
+                _ => unreachable!(),
+            })
+        };
+        assert_eq!(preferences(&app), [true; 2]);
+        app.settings_reset_confirm = true;
+        drop(app.update(Message::ConfirmResetSettings));
+        assert!(!app.settings.diff_ignore_whitespace);
+        assert_eq!(preferences(&app), [false; 2]);
+        // The very next real toolbar action follows the restored preference.
+        for enabled in [true, false] {
+            drop(app.update(Message::Repository(RepositoryAction::ToggleDiffWhitespace { card: pr })));
+            assert_eq!(app.settings.diff_ignore_whitespace, enabled);
+            assert_eq!(preferences(&app), [enabled; 2]);
+        }
     }
 
     #[test]
