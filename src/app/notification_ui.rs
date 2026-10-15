@@ -1043,6 +1043,9 @@ mod tests {
     #[test]
     fn background_window_keeps_attention_until_its_agent_is_focused() {
         let mut app = super::super::tests::context_inspector_test_app(true);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
         let session = card_session(&app.durable.cards[0]).unwrap();
         let id = uuid::Uuid::new_v4();
         let notice = crate::notifications::Notice {
@@ -1075,19 +1078,21 @@ mod tests {
                 .acknowledged
                 .is_empty()
         );
-        app.refresh_ui.focused = true;
-        app.sync_notification_presence();
-        let pending = app.notification_ui.pending.lock().unwrap();
-        assert_eq!(pending.presence.as_ref().unwrap().focused, Some(session));
-        assert_eq!(pending.acknowledged, BTreeSet::from([id]));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
+        assert_eq!(app.notification_ui.focused_session_for_test(), Some(session));
+        assert!(!app.notification_ui.acknowledged_for_test(id), "return waits for qualified dwell");
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: app.attention_focus_epoch }));
+        assert_eq!(app.notification_ui.pending.lock().unwrap().acknowledged, BTreeSet::from([id]));
     }
 
     #[test]
     fn opted_in_focused_alert_survives_snapshot_and_is_read_on_return() {
         let mut app = super::super::tests::context_inspector_test_app(true);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.context_inspector_open = false;
         app.settings.notifications.while_focused = true;
         app.refresh_ui.focused = true;
-        app.sync_notification_presence();
+        drop(app.update(Message::ExpireNotices(Instant::now())));
         let session = card_session(&app.durable.cards[0]).unwrap();
         let id = uuid::Uuid::new_v4();
         let snapshot = Snapshot {
@@ -1123,10 +1128,11 @@ mod tests {
             "notification snapshots must not withdraw an explicitly requested focused alert"
         );
 
-        app.refresh_ui.focused = false;
-        app.sync_notification_presence();
-        app.refresh_ui.focused = true;
-        app.sync_notification_presence();
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, false))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
+        assert!(!app.notification_ui.acknowledged_for_test(id), "return waits for qualified dwell");
+        let card = app.workspace.focused().unwrap();
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: app.attention_focus_epoch }));
         assert_eq!(
             app.notification_ui.pending.lock().unwrap().acknowledged,
             BTreeSet::from([id])
@@ -1354,6 +1360,42 @@ mod tests {
             app.notification_ui.acknowledged_for_test(newer),
             "explicit Mark Read retains its declared current scope"
         );
+    }
+
+    #[test]
+    fn attention_committed_window_close_stops_claiming_viewed_content_during_exit_reap() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let session = live_session(&mut app);
+        let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        app.refresh_ui.focused = true;
+        drop(app.update(Message::ExpireNotices(Instant::now())));
+        assert_eq!(app.notification_ui.focused_session_for_test(), Some(session.id));
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert!(app.exit.is_some(), "hold the real committed exit before reap completion");
+        assert!(app.core.main_window_id().is_none());
+        assert!(app.refresh_ui.focused, "the stale native focus bit is the regression control");
+        assert_eq!(app.notification_ui.focused_session_for_test(), None);
+        let id = uuid::Uuid::new_v4();
+        drop(app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
+            notices: vec![crate::notifications::Notice {
+                id,
+                event: crate::notifications::Event {
+                    content: None, target: Target::Session(session.id),
+                    source_session: Some(session.id), provider: Some(Provider::Claude),
+                    directory: Some("/tmp".into()), destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "waiting-during-exit-reap".into(),
+                        kind: crate::notifications::Kind::Waiting,
+                    },
+                }, delivered: true, acknowledged: false, window: None,
+            }], diagnostic: None,
+        }))));
+        assert_eq!(app.notification_ui.focused_session_for_test(), None);
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+        assert!(app.sidebar_state.has_card_update(card));
     }
 
     #[test]
