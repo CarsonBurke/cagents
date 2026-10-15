@@ -11,7 +11,7 @@ use crate::{
     model::{MessageId, TerminalId},
 };
 use rusqlite::{
-    Connection, Row, Transaction, TransactionBehavior, params,
+    Connection, Row, TransactionBehavior, params,
     types::{ToSql, ToSqlOutput},
 };
 

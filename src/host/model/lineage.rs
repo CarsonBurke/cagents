@@ -7,7 +7,7 @@ use crate::{
     agent_execution::{Agent, HostedSession, Lineage, Origin},
     model::TerminalId,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
 /// Keeps an idempotency key that a rewritten origin would make collide out of

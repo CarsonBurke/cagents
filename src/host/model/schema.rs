@@ -143,7 +143,7 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
         db.pragma_update(None, "locking_mode", "NORMAL")
             .map_err(|e| e.to_string())?;
         let locking: String = db
-            .pragma_query_value(Some(rusqlite::DatabaseName::Main), "locking_mode", |r| {
+            .pragma_query_value(Some("main"), "locking_mode", |r| {
                 r.get(0)
             })
             .map_err(|e| e.to_string())?;
