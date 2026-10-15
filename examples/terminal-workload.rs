@@ -43,9 +43,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let toggle_panes = if let Some(index) = args.iter().position(|arg| arg == "--toggle-panes") {
         args.remove(index);
-        if socket.is_none() { return Err("--toggle-panes requires --socket to an isolated fixture daemon".into()); }
+        if socket.is_none() {
+            return Err("--toggle-panes requires --socket to an isolated fixture daemon".into());
+        }
         true
-    } else { false };
+    } else {
+        false
+    };
     if args.first().is_some_and(|arg| arg == "--summarize-trace") {
         let path = args.get(1).ok_or("--summarize-trace requires a log path")?;
         let mut stages: BTreeMap<String, Vec<u64>> = BTreeMap::new();
@@ -228,8 +232,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             1
         };
         let toggles = if toggle_panes {
-            Some(PaneToggles::start(socket.as_ref().expect("validated socket"))?)
-        } else { None };
+            Some(PaneToggles::start(
+                socket.as_ref().expect("validated socket"),
+            )?)
+        } else {
+            None
+        };
         let frame = Duration::from_nanos(1_000_000_000 / 60);
         let start = Instant::now();
         let cpu_start = cpu_ns();
@@ -466,9 +474,17 @@ struct PaneToggles {
 #[cfg(feature = "host")]
 impl PaneToggles {
     fn start(socket: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        use cagents::{control::ControlClient, model::{CardId, CardKind, LaunchRecipe,
-            ProjectKind, TerminalContinuity, TerminalId, TerminalSession},
-            workspace_model::{ModelEdit, views::{Change, Pane, Scope}}};
+        use cagents::{
+            control::ControlClient,
+            model::{
+                CardId, CardKind, LaunchRecipe, ProjectKind, TerminalContinuity, TerminalId,
+                TerminalSession,
+            },
+            workspace_model::{
+                ModelEdit,
+                views::{Change, Pane, Scope},
+            },
+        };
         let socket = socket.to_owned();
         let directory = std::env::current_dir()?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -476,47 +492,100 @@ impl PaneToggles {
         let (started, ready) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || -> Result<u64, String> {
             let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-            let mut model = client.edit_workspace_model(ModelEdit::OpenProject {
-                repository: directory.clone(), name: "Terminal latency fixture".into(), kind: ProjectKind::Folder,
-            }).map_err(|error| error.to_string())?;
-            let scope = Scope::Worktree { repository: directory.clone(), path: directory.clone() }.canonicalized()?;
+            let mut model = client
+                .edit_workspace_model(ModelEdit::OpenProject {
+                    repository: directory.clone(),
+                    name: "Terminal latency fixture".into(),
+                    kind: ProjectKind::Folder,
+                })
+                .map_err(|error| error.to_string())?;
+            let scope = Scope::Worktree {
+                repository: directory.clone(),
+                path: directory.clone(),
+            }
+            .canonicalized()?;
             let mut cycles = 0;
             loop {
                 let id = CardId::new();
-                let recipe = LaunchRecipe::shell(directory.clone()).map_err(|error| error.to_string())?;
-                let pane = Pane { id, title: "Pane edit latency probe".into(), user_title: None,
-                    pending_terminal_start: false, width_fraction: 1.0, scope: Some(directory.clone()),
-                    kind: CardKind::Terminal(TerminalSession { id: TerminalId::new(), launch: recipe.clone(),
-                        transcript_path: None, resume_hint: None, owned_codex_listener: None,
-                        recovery_origin: None, predecessor: None,
-                        continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None } }) };
+                let recipe =
+                    LaunchRecipe::shell(directory.clone()).map_err(|error| error.to_string())?;
+                let pane = Pane {
+                    id,
+                    title: "Pane edit latency probe".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 1.0,
+                    scope: Some(directory.clone()),
+                    kind: CardKind::Terminal(TerminalSession {
+                        id: TerminalId::new(),
+                        launch: recipe.clone(),
+                        transcript_path: None,
+                        resume_hint: None,
+                        owned_codex_listener: None,
+                        recovery_origin: None,
+                        predecessor: None,
+                        continuity: TerminalContinuity::RelaunchAvailable {
+                            recipe,
+                            last_exit: None,
+                        },
+                    }),
+                };
                 for change in [Change::Insert { pane, before: None }, Change::Remove { id }] {
-                    let revision = model.views.iter().find(|view| view.scope == scope).map_or(0, |view| view.revision);
-                    model = client.edit_workspace_model(ModelEdit::ChangeView { scope: scope.clone(),
-                        expected_revision: revision, operation: uuid::Uuid::new_v4(), change }).map_err(|error| error.to_string())?;
+                    let revision = model
+                        .views
+                        .iter()
+                        .find(|view| view.scope == scope)
+                        .map_or(0, |view| view.revision);
+                    model = client
+                        .edit_workspace_model(ModelEdit::ChangeView {
+                            scope: scope.clone(),
+                            expected_revision: revision,
+                            operation: uuid::Uuid::new_v4(),
+                            change,
+                        })
+                        .map_err(|error| error.to_string())?;
                 }
                 cycles += 1;
-                if cycles == 1 { let _ = started.send(()); }
-                if done.load(std::sync::atomic::Ordering::Acquire) { return Ok(cycles); }
+                if cycles == 1 {
+                    let _ = started.send(());
+                }
+                if done.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(cycles);
+                }
             }
         });
-        let toggles = Self { stop, worker: Some(worker) };
-        if ready.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+        let toggles = Self {
+            stop,
+            worker: Some(worker),
+        };
+        if ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_err()
+        {
             let result = toggles.finish();
-            return Err(result.err().unwrap_or_else(|| "pane toggle fixture did not start".into()).into());
+            return Err(result
+                .err()
+                .unwrap_or_else(|| "pane toggle fixture did not start".into())
+                .into());
         }
         Ok(toggles)
     }
     fn finish(mut self) -> Result<u64, String> {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
-        self.worker.take().expect("one toggle worker").join().map_err(|_| "pane toggle worker panicked".to_owned())?
+        self.worker
+            .take()
+            .expect("one toggle worker")
+            .join()
+            .map_err(|_| "pane toggle worker panicked".to_owned())?
     }
 }
 #[cfg(feature = "host")]
 impl Drop for PaneToggles {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
