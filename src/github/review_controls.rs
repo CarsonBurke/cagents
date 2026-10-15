@@ -105,7 +105,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 return self.mutate(repository,&query,variables,"/requestReviews/pullRequest",cancellation).map(|result|result.map(drop));
             }
             ReviewControlMutation::EditReviewBody{review,body}=>{
-                validate_node_id("review_id",review)?;validate_comment_body(body)?;variables=vec![("id",review.as_str().into()),("body",body.as_str().into())];
+                validate_node_id("review_id",review)?;validate_text("body",body)?;if body.len()>MAX_COMMENT_BODY_BYTES{return Err(GitHubError::Inspection("Review body exceeds GitHub's 65536-byte limit.".into()));}variables=vec![("id",review.as_str().into()),("body",body.as_str().into())];
                 ("mutation($id:ID!,$body:String!){updatePullRequestReview(input:{pullRequestReviewId:$id,body:$body}){pullRequestReview{id}}}".into(),"/updatePullRequestReview/pullRequestReview")
             }
             ReviewControlMutation::EditIssueComment{comment,body}=>{

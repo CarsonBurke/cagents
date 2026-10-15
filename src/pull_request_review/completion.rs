@@ -135,7 +135,7 @@ impl State {
             Action::EditPublished{review,id}=>{
                 if self.completion.published.is_some(){self.completion.error=Some("Save or cancel the open published comment edit first.".into());return ActionTask::none();}
                 let Some(conversation)=&self.discussion.conversation else{return ActionTask::none();};
-                let comment=if review{conversation.reviews.iter().map(|review|&review.comment).find(|comment|comment.id.as_ref()==Some(&id))}else{conversation.comments.iter().find(|comment|comment.id.as_ref()==Some(&id))};
+                let comment=if review{conversation.reviews.iter().filter(|review|review.state.0!="PENDING").map(|review|&review.comment).find(|comment|comment.id.as_ref()==Some(&id))}else{conversation.comments.iter().find(|comment|comment.id.as_ref()==Some(&id))};
                 if let Some(comment)=comment.filter(|comment|comment.viewer_did_author&&comment.viewer_can_update&&!comment.is_pending()){
                     self.completion.published=Some(PublishedEdit{review,id,original:comment.body.clone(),content:text_editor::Content::with_text(&comment.body)});
                 }
@@ -144,7 +144,7 @@ impl State {
             Action::CancelPublished=>{if !self.completion.busy{self.completion.published=None;}}
             Action::SavePublished=>{
                 let Some(editor)=&self.completion.published else{return ActionTask::none();};
-                if editor.content.text().trim().is_empty(){return ActionTask::none();}
+                if !editor.review && editor.content.text().trim().is_empty(){return ActionTask::none();}
                 let mutation=if editor.review{ReviewControlMutation::EditReviewBody{review:editor.id.clone(),body:editor.content.text()}}else{ReviewControlMutation::EditIssueComment{comment:editor.id.clone(),body:editor.content.text()}};
                 return self.mutate_completion(mutation);
             }
@@ -195,7 +195,7 @@ impl State {
                 match &mutation {
                     ReviewControlMutation::EditReviewBody{review,..}|ReviewControlMutation::EditIssueComment{comment:review,..}=>{
                         let conversation=api.conversation(&key,&cancellation).map_err(|error|error.to_string())?;
-                        let comment=if matches!(mutation,ReviewControlMutation::EditReviewBody{..}){conversation.reviews.iter().map(|review|&review.comment).find(|comment|comment.id.as_ref()==Some(review))}else{conversation.comments.iter().find(|comment|comment.id.as_ref()==Some(review))};
+                        let comment=if matches!(mutation,ReviewControlMutation::EditReviewBody{..}){conversation.reviews.iter().filter(|review|review.state.0!="PENDING").map(|review|&review.comment).find(|comment|comment.id.as_ref()==Some(review))}else{conversation.comments.iter().find(|comment|comment.id.as_ref()==Some(review))};
                         if comment.is_none_or(|comment|!comment.viewer_did_author||!comment.viewer_can_update||comment.is_pending()||Some(&comment.body)!=original.as_ref()){return Err("The comment changed or can no longer be edited. Refresh before trying again.".into());}
                     }
                     ReviewControlMutation::Merge{method,expected_head,..}=>{let context=api.review_context(&key,&cancellation).map_err(|error|error.to_string())?;if context.pending.is_some(){return Err("Submit or discard your pending review before merging.".into());}if fresh.head_oid!=*expected_head{return Err("The PR head changed; refresh and review it before merging.".into());}if let Some(reason)=fresh.merge_blocked{return Err(reason);}if !fresh.allowed_methods.contains(method){return Err("This merge method is no longer allowed by the repository.".into());}}
@@ -211,7 +211,7 @@ impl State {
     }
 
     pub(super) fn completion_view(&self,modal_open:bool)->Element<'_,super::Action>{
-        let state=&self.completion;let mut rows:Vec<Element<'_,Action>>=Vec::new();let enabled=!modal_open && !state.busy && !state.loading && !state.uncertain && !self.discussion.busy && self.discussion.unknown.is_none();
+        let state=&self.completion;let mut rows:Vec<Element<'_,Action>>=Vec::new();let enabled=!modal_open && !self.refreshing && !state.busy && !state.loading && !state.uncertain && !self.discussion.busy && self.discussion.unknown.is_none();
         if let Some(error)=&state.error{rows.push(design::caption(error).into());}
         rows.push(crate::ui_controls::button::quiet(if state.uncertain{"I checked GitHub; refresh"}else{"Refresh PR actions"}).on_press_maybe((!modal_open&&!state.busy).then_some(Action::Reload)).into());
         if state.loading{rows.push(design::caption("Loading PR actions…").into());}
@@ -229,13 +229,13 @@ impl State {
                 rows.push(crate::ui_controls::button::secondary("Save reviewer requests").on_press_maybe((enabled&&data.reviewers_complete&&state.reviewers_edited).then_some(Action::SaveReviewers)).into());
             }
             if let Some(conversation)=&self.discussion.conversation{
-                for (review,comment) in conversation.comments.iter().map(|comment|(false,comment)).chain(conversation.reviews.iter().map(|review|(true,&review.comment))).filter(|(_,comment)|comment.viewer_did_author&&comment.viewer_can_update&&!comment.is_pending()){
+                for (review,comment) in conversation.comments.iter().map(|comment|(false,comment)).chain(conversation.reviews.iter().filter(|review|review.state.0!="PENDING").map(|review|(true,&review.comment))).filter(|(_,comment)|comment.viewer_did_author&&comment.viewer_can_update&&!comment.is_pending()){
                     if let Some(id)=&comment.id{rows.push(crate::ui_controls::button::quiet(format!("Edit your {} · {}",if review{"review summary"}else{"comment"},comment.created_at)).on_press_maybe((enabled&&state.published.is_none()).then(||Action::EditPublished{review,id:id.clone()})).into());}
                 }
             }
             if let Some(editor)=&state.published{
                 let mut body=text_editor::TextEditor::new(&editor.content).height(Length::Fixed(140.0));if enabled{body=body.on_action(Action::PublishedBody);}rows.push(body.into());
-                rows.push(widget::row::with_children(vec![crate::ui_controls::button::primary("Save published comment").on_press_maybe((enabled&&!editor.content.text().trim().is_empty()).then_some(Action::SavePublished)).into(),crate::ui_controls::button::secondary("Cancel edit").on_press_maybe((!modal_open&&!state.busy).then_some(Action::CancelPublished)).into()]).spacing(space::S).into());
+                rows.push(widget::row::with_children(vec![crate::ui_controls::button::primary("Save published comment").on_press_maybe((enabled&&(editor.review||!editor.content.text().trim().is_empty())).then_some(Action::SavePublished)).into(),crate::ui_controls::button::secondary("Cancel edit").on_press_maybe((!modal_open&&!state.busy).then_some(Action::CancelPublished)).into()]).spacing(space::S).into());
             }
             if data.merged{
                 rows.push(crate::ui_controls::button::secondary("Clean up merged worktree and branch…").on_press_maybe((enabled&&self.target.as_ref().is_some_and(|target|target.pull_request.head_repository_key().is_some())).then_some(Action::Cleanup)).into());
