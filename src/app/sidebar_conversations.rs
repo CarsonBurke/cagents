@@ -103,6 +103,15 @@ impl Cagents {
                 Some(_) => return None,
                 None => (None, None, None),
             };
+            // Incoming authoritative membership must not be offered under an
+            // old durable row while its local filing is still being adopted.
+            let consistent = match shared_scope.as_ref() {
+                Some(Scope::Channel(id)) => channel == Some(*id),
+                Some(Scope::Worktree { path, .. }) => channel.is_none()
+                    && self.durable.card_scopes.get(&card.id).is_none_or(|scope| scope == path),
+                None => true,
+            };
+            if !consistent { return None; }
             // The shared accessor's descriptor fallback scans durable cards.
             // We already hold that exact descriptor; reserve the accessor for
             // its constant-time active/parked runtime path.
@@ -299,6 +308,24 @@ mod tests {
             drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Read(model))));
             assert!(preparation_count() > before);
         }
+    }
+
+    #[test]
+    fn sidebar_end_bulk_waits_for_authoritative_channel_filing_instead_of_using_a_stale_row() {
+        let (mut app, card, _channel, directory) = fixture();
+        let current = crate::model::ChannelId::new();
+        app.workspace_model.channels.push(crate::workspace_model::ModelChannel {
+            id: current, repository: directory.path().into(), title: "Current shared filing".into(), title_source: Default::default(), ordinal: 2,
+        });
+        let pane = crate::workspace_model::views::Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        app.workspace_model.views.push(crate::workspace_model::views::View { scope: Scope::Channel(current), revision: 1, panes: vec![pane], retired: Vec::new() });
+        assert!(app.capture_conversation_end_targets().is_empty(), "never put the current shared conversation under the historical channel");
+        Arc::make_mut(&mut app.durable).channels[0].id = current;
+        let rows = app.capture_conversation_end_targets();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target.channel, Some(current));
+        app.workspace_model.views[0].scope = Scope::Worktree { repository: directory.path().into(), path: directory.path().into() };
+        assert!(app.capture_conversation_end_targets().is_empty(), "a shared worktree pane is not a channel conversation");
     }
 
     #[test]
