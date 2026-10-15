@@ -57,7 +57,8 @@ def fixture_environment(root):
                 "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_PROFILE",
                 "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "OPENAI_API_KEY",
                 "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_FEDERATION_RULE_ID",
-                "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT", "OMP_PROFILE", "PI_PROFILE"):
+                "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT", "OMP_PROFILE", "PI_PROFILE",
+                "WAYLAND_SOCKET", "DBUS_SESSION_BUS_ADDRESS", "DBUS_STARTER_ADDRESS", "DBUS_STARTER_BUS_TYPE"):
         env.pop(key, None)
     # A nested compositor's relative socket lives in the caller's runtime.
     display = env.get("WAYLAND_DISPLAY")
@@ -222,7 +223,19 @@ def main():
         with native_lock.open("a") as native, args.build_lock.open("a") as build:
             fcntl.flock(native, fcntl.LOCK_EX)
             fcntl.flock(build, fcntl.LOCK_EX)
-            command = [str(REPOSITORY / "scripts/run-development"), "--browserless", "--debug",
+            # Bind the fixture bus to its private0700 runtime, rather than
+            # inheriting a user bus or a compositor's session bus. dbus-run-session
+            # owns the daemon lifetime and terminates it with this runner.
+            bus_config = root / "session-bus.conf"
+            bus_config.write_text(
+                '<busconfig><type>session</type><listen>unix:path=' + env["XDG_RUNTIME_DIR"] +
+                '/session-bus</listen><auth>EXTERNAL</auth><standard_session_servicedirs/>'
+                '<policy context="default"><allow send_destination="*" eavesdrop="true"/>'
+                '<allow eavesdrop="true"/><allow own="*"/></policy></busconfig>\n'
+            )
+            bus_config.chmod(0o600)
+            command = ["dbus-run-session", "--config-file", str(bus_config), "--",
+                       str(REPOSITORY / "scripts/run-development"), "--browserless", "--debug",
                        "--log-file", str(root / "ui.log")]
             if args.fresh_daemon:
                 command.append("--fresh-daemon")
