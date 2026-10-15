@@ -138,7 +138,7 @@ pub(crate) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
         | ClientRequest::ChatCommitTerminal { terminal_id } | ClientRequest::ChatClose { chat_id: terminal_id } | ClientRequest::CompletePendingTerminal { terminal_id, .. } => Some(*terminal_id),
         ClientRequest::CloseTerminalSourceChecked { source, .. } | ClientRequest::ReleaseCompletedTerminal { session: source, .. } => Some(source.id),
         ClientRequest::ChatCommand { chat_id, command } if !matches!(command, crate::chat::Command::Refresh | crate::chat::Command::LoadEarlier) => Some(*chat_id),
-        ClientRequest::ChatCloseRetained { session } => Some(session.id),
+        ClientRequest::ChatCloseRetained { session } | ClientRequest::ChatCloseSession {session} => Some(session.id),
         _ => None,
     };
     if session.is_some_and(|id| active.iter().any(|scope| scope.sessions.contains(&id))) { return Err(busy()); }
@@ -152,7 +152,10 @@ pub(crate) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
             if active.iter().any(|scope| scope.edit(&edit)) { return Err(busy()); }
         },
         ClientRequest::Spawn { session, .. } => ensure_available(host,None,Some(&session.launch.working_directory),Some(session.id))?,
-        ClientRequest::ChatStart { session, .. } | ClientRequest::ChatStartSelected { session, .. } => ensure_available(host,None,Some(&session.launch.recipe.working_directory),Some(session.id))?,
+        // ChatAttach may restart a completed provider. Defer matching
+        // attachments for this short reservation rather than guessing whether
+        // the retained backend has completed while this admission is checked.
+        ClientRequest::ChatAttach {session} | ClientRequest::ChatStart { session, .. } | ClientRequest::ChatStartSelected { session, .. } => ensure_available(host,None,Some(&session.launch.recipe.working_directory),Some(session.id))?,
         ClientRequest::ChatRecoverAccount { source, replacement, .. } => { ensure_available(host,None,Some(&source.launch.recipe.working_directory),Some(source.id))?; ensure_available(host,None,Some(&replacement.launch.recipe.working_directory),Some(replacement.id))?; },
         ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Write { root, .. } } => ensure_available(host,Some(root),Some(root),None)?,
         ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Git { root, operation } } if !matches!(operation, crate::device_service::GitOperation::Status | crate::device_service::GitOperation::Worktrees | crate::device_service::GitOperation::Diff { .. }) => ensure_available(host,Some(root),Some(root),None)?,
