@@ -2366,7 +2366,11 @@ fn process_inner(
             // shuts down. The final confirmed snapshot wins over launch flags.
             let recipe = session
                 .launch
-                .terminal_recipe_with_current_options(snapshot.selected_model.as_deref(), snapshot.reasoning.as_deref(), snapshot.permission_mode.as_deref())
+                .terminal_recipe_with_current_options(
+                    snapshot.selected_model.as_deref(),
+                    snapshot.reasoning.as_deref(),
+                    snapshot.permission_mode.as_deref(),
+                )
                 .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
             terminal.launch = recipe.clone();
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {

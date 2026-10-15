@@ -251,7 +251,9 @@ pub enum LoginShellError {
     Unavailable,
     #[error("The configured default shell is unavailable or is not executable")]
     ConfiguredUnavailable,
-    #[error("Terminal preferences could not be read; repair settings.toml before creating a new terminal")]
+    #[error(
+        "Terminal preferences could not be read; repair settings.toml before creating a new terminal"
+    )]
     PreferencesUnavailable,
 }
 
@@ -262,14 +264,26 @@ impl LaunchRecipe {
 
     /// A running window uses its last valid policy, including while an
     /// external file edit is invalid and has not been adopted.
-    pub(crate) fn shell_with_settings(working_directory: PathBuf, settings: &crate::settings::AppSettings) -> Result<Self, LoginShellError> {
-        let program = if crate::device::is_remote() { terminal_shell()? }
-            else { terminal_shell_from_preference(settings.default_shell.as_deref())? };
+    pub(crate) fn shell_with_settings(
+        working_directory: PathBuf,
+        settings: &crate::settings::AppSettings,
+    ) -> Result<Self, LoginShellError> {
+        let program = if crate::device::is_remote() {
+            terminal_shell()?
+        } else {
+            terminal_shell_from_preference(settings.default_shell.as_deref())?
+        };
         Ok(Self::shell_program(working_directory, program))
     }
 
     fn shell_program(working_directory: PathBuf, program: String) -> Self {
-        Self { program, arguments: Vec::new(), working_directory, environment: BTreeMap::new(), unset_environment: BTreeSet::new() }
+        Self {
+            program,
+            arguments: Vec::new(),
+            working_directory,
+            environment: BTreeMap::new(),
+            unset_environment: BTreeSet::new(),
+        }
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]
@@ -287,13 +301,19 @@ pub(crate) fn terminal_shell() -> Result<String, LoginShellError> {
 }
 
 fn terminal_shell_for_device(remote_shell: Option<&str>) -> Result<String, LoginShellError> {
-    if crate::device::shell_error().is_some() || (crate::device::is_remote() && remote_shell.is_none()) {
+    if crate::device::shell_error().is_some()
+        || (crate::device::is_remote() && remote_shell.is_none())
+    {
         return Err(LoginShellError::PreferencesUnavailable);
     }
     // Device preparation obtains this from the filesystem-owning daemon.
     // Local preferences and filesystem checks cannot validate a remote path.
     if let Some(shell) = remote_shell {
-        return if Path::new(shell).is_absolute() && !shell.contains('\0') { Ok(shell.to_owned()) } else { Err(LoginShellError::ConfiguredUnavailable) };
+        return if Path::new(shell).is_absolute() && !shell.contains('\0') {
+            Ok(shell.to_owned())
+        } else {
+            Err(LoginShellError::ConfiguredUnavailable)
+        };
     }
     let configured = configured_terminal_shell()?;
     terminal_shell_from_preference(configured.as_deref())
@@ -301,14 +321,22 @@ fn terminal_shell_for_device(remote_shell: Option<&str>) -> Result<String, Login
 
 fn terminal_shell_from_preference(shell: Option<&str>) -> Result<String, LoginShellError> {
     if let Some(shell) = shell {
-        return if crate::settings::agents::executable_available(shell) { Ok(shell.to_owned()) } else { Err(LoginShellError::ConfiguredUnavailable) };
+        return if crate::settings::agents::executable_available(shell) {
+            Ok(shell.to_owned())
+        } else {
+            Err(LoginShellError::ConfiguredUnavailable)
+        };
     }
     login_shell()
 }
 
 fn configured_terminal_shell() -> Result<Option<String>, LoginShellError> {
-    let Ok(path) = crate::settings::default_path() else { return Ok(None); };
-    crate::settings::load(path).map(|settings| settings.default_shell).map_err(|_| LoginShellError::PreferencesUnavailable)
+    let Ok(path) = crate::settings::default_path() else {
+        return Ok(None);
+    };
+    crate::settings::load(path)
+        .map(|settings| settings.default_shell)
+        .map_err(|_| LoginShellError::PreferencesUnavailable)
 }
 
 /// Device identity remains readable when a terminal-only pin becomes stale.
@@ -316,7 +344,9 @@ fn configured_terminal_shell() -> Result<Option<String>, LoginShellError> {
 /// executable at terminal spawn rather than silently choosing another shell.
 #[cfg(feature = "host")]
 pub(crate) fn terminal_shell_descriptor() -> Result<String, LoginShellError> {
-    configured_terminal_shell()?.map(Ok).unwrap_or_else(login_shell)
+    configured_terminal_shell()?
+        .map(Ok)
+        .unwrap_or_else(login_shell)
 }
 
 /// Login environment discovery uses the account's login shell, independently
@@ -1538,8 +1568,14 @@ mod tests {
         let shell = "/cagents-fixture-remote-only/configured-shell";
         assert!(!std::path::Path::new(shell).exists());
         assert_eq!(terminal_shell_for_device(Some(shell)).unwrap(), shell);
-        assert_eq!(terminal_shell_for_device(Some("relative-shell")), Err(LoginShellError::ConfiguredUnavailable));
-        assert_eq!(terminal_shell_for_device(Some("/remote/bad\0shell")), Err(LoginShellError::ConfiguredUnavailable));
+        assert_eq!(
+            terminal_shell_for_device(Some("relative-shell")),
+            Err(LoginShellError::ConfiguredUnavailable)
+        );
+        assert_eq!(
+            terminal_shell_for_device(Some("/remote/bad\0shell")),
+            Err(LoginShellError::ConfiguredUnavailable)
+        );
     }
 
     #[test]

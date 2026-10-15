@@ -229,9 +229,17 @@ impl Launch {
         let mut recipe = self.terminal_recipe_with_permission_mode(permission)?;
         // A provider can omit a capability or its selected value. In that
         // case retain the recorded choice instead of inventing an Automatic change.
-        crate::settings::AgentLaunchSettings::default().append_options(self.provider, &mut recipe.arguments, crate::settings::agents::LaunchDefaults {
-            model, effort, permission_mode: (self.provider != Provider::Claude).then_some(permission).flatten(),
-        });
+        crate::settings::AgentLaunchSettings::default().append_options(
+            self.provider,
+            &mut recipe.arguments,
+            crate::settings::agents::LaunchDefaults {
+                model,
+                effort,
+                permission_mode: (self.provider != Provider::Claude)
+                    .then_some(permission)
+                    .flatten(),
+            },
+        );
         Some(recipe)
     }
 
@@ -241,7 +249,10 @@ impl Launch {
         let id = self.session_id.as_deref()?;
         if id.len() != 36
             || uuid::Uuid::parse_str(id).is_err()
-            || (std::path::Path::new(&self.recipe.program).file_name()?.to_str()? != self.provider.executable()
+            || (std::path::Path::new(&self.recipe.program)
+                .file_name()?
+                .to_str()?
+                != self.provider.executable()
                 && !std::path::Path::new(&self.recipe.program).is_absolute())
         {
             return None;
@@ -2166,14 +2177,29 @@ mod tests {
             recipe: LaunchRecipe {
                 program: "/home/example/bin/claude-wrapper".into(),
                 arguments: vec!["--model".into(), "fixture-model".into()],
-                working_directory: "/project".into(), environment: Default::default(), unset_environment: Default::default(),
+                working_directory: "/project".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
             },
             session_id: Some("d1714898-6c54-4727-8113-0d5b9db7aeb9".into()),
         };
-        let recipe = launch.terminal_recipe().expect("typed native provider supports its configured wrapper");
+        let recipe = launch
+            .terminal_recipe()
+            .expect("typed native provider supports its configured wrapper");
         assert_eq!(recipe.program, launch.recipe.program);
-        assert_eq!(recipe.arguments, ["--model", "fixture-model", "--resume", "d1714898-6c54-4727-8113-0d5b9db7aeb9"]);
-        assert!(crate::model::agent_recovery::resume_recipe(&recipe).is_none(), "untyped arbitrary commands must remain unrecognized");
+        assert_eq!(
+            recipe.arguments,
+            [
+                "--model",
+                "fixture-model",
+                "--resume",
+                "d1714898-6c54-4727-8113-0d5b9db7aeb9"
+            ]
+        );
+        assert!(
+            crate::model::agent_recovery::resume_recipe(&recipe).is_none(),
+            "untyped arbitrary commands must remain unrecognized"
+        );
     }
 
     #[test]
@@ -2222,11 +2248,30 @@ mod tests {
             launch.terminal_recipe_with_permission_mode(None),
             launch.terminal_recipe()
         );
-        let updated = launch.terminal_recipe_with_current_options(Some("conversation-model"), Some("high"), Some("plan")).unwrap();
-        assert!(updated.arguments.windows(2).any(|pair| pair == ["--model", "conversation-model"]));
-        assert!(updated.arguments.windows(2).any(|pair| pair == ["--effort", "high"]));
+        let updated = launch
+            .terminal_recipe_with_current_options(
+                Some("conversation-model"),
+                Some("high"),
+                Some("plan"),
+            )
+            .unwrap();
+        assert!(
+            updated
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--model", "conversation-model"])
+        );
+        assert!(
+            updated
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--effort", "high"])
+        );
         assert!(!updated.arguments.iter().any(|argument| argument == "opus"));
-        assert_eq!(launch.terminal_recipe_with_current_options(None, None, None), launch.terminal_recipe());
+        assert_eq!(
+            launch.terminal_recipe_with_current_options(None, None, None),
+            launch.terminal_recipe()
+        );
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]
@@ -2618,9 +2663,22 @@ pub(crate) fn fresh_session(
     working_directory: std::path::PathBuf,
     account: &crate::account::Account,
 ) -> Result<Session, String> {
-    let settings = crate::settings::default_path().map_err(|error| error.to_string()).and_then(|path| crate::settings::load(path).map_err(|error| error.to_string()))?;
-    let configuration = settings.agents.get(crate::settings::agents::provider_key(provider)).cloned().unwrap_or_default();
-    fresh_session_configured(provider, id, working_directory, account, &configuration, Default::default())
+    let settings = crate::settings::default_path()
+        .map_err(|error| error.to_string())
+        .and_then(|path| crate::settings::load(path).map_err(|error| error.to_string()))?;
+    let configuration = settings
+        .agents
+        .get(crate::settings::agents::provider_key(provider))
+        .cloned()
+        .unwrap_or_default();
+    fresh_session_configured(
+        provider,
+        id,
+        working_directory,
+        account,
+        &configuration,
+        Default::default(),
+    )
 }
 
 /// One launch policy shared by native drafts, CLI runs and automations. All
@@ -2637,11 +2695,20 @@ pub(crate) fn fresh_session_configured(
     // Explicit conversation choices supersede saved defaults, including a
     // retained default from a newer build. Validate only the effective policy.
     let mut effective = configuration.clone();
-    if overrides.model.is_some() { effective.model = None; }
-    if overrides.effort.is_some() { effective.effort = None; }
-    if overrides.permission_mode.is_some() { effective.permission_mode = None; }
+    if overrides.model.is_some() {
+        effective.model = None;
+    }
+    if overrides.effort.is_some() {
+        effective.effort = None;
+    }
+    if overrides.permission_mode.is_some() {
+        effective.permission_mode = None;
+    }
     effective.validate(provider)?;
-    for value in [overrides.model, overrides.effort, overrides.permission_mode].into_iter().flatten() {
+    for value in [overrides.model, overrides.effort, overrides.permission_mode]
+        .into_iter()
+        .flatten()
+    {
         if value.trim().is_empty() || value.chars().any(char::is_control) {
             return Err("Conversation model, effort and permission choices must be non-empty names without control characters.".into());
         }
@@ -2699,8 +2766,10 @@ pub(crate) fn fresh_session_configured(
             // logins follow the current global default; independent homes
             // retain their own. Explicit environment choices and project
             // settings remain under Claude's own handling.
-            if configuration.permission_mode.is_none() && overrides.permission_mode.is_none()
-                && let Some(mode) = claude_configured_default_mode(&recipe) {
+            if configuration.permission_mode.is_none()
+                && overrides.permission_mode.is_none()
+                && let Some(mode) = claude_configured_default_mode(&recipe)
+            {
                 recipe.arguments.extend(["--permission-mode".into(), mode]);
             }
         }

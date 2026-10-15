@@ -1643,10 +1643,27 @@ mod navigation_contract_tests {
     }
     #[test]
     fn legacy_device_identity_defaults_to_no_terminal_policy_error() {
-        let reply: Reply = serde_json::from_value(serde_json::json!({"Home": {"path": "/remote", "shell": "/bin/sh", "environment": {}}})).unwrap();
-        assert!(matches!(reply, Reply::Home { shell_error: None, .. }));
-        let reply = Reply::Home { path: "/remote".into(), shell: String::new(), environment: Default::default(), shell_error: Some("Terminal preferences could not be read".into()) };
-        assert_eq!(postcard::from_bytes::<Reply>(&postcard::to_allocvec(&reply).unwrap()).unwrap(), reply);
+        let reply: Reply = serde_json::from_value(
+            serde_json::json!({"Home": {"path": "/remote", "shell": "/bin/sh", "environment": {}}}),
+        )
+        .unwrap();
+        assert!(matches!(
+            reply,
+            Reply::Home {
+                shell_error: None,
+                ..
+            }
+        ));
+        let reply = Reply::Home {
+            path: "/remote".into(),
+            shell: String::new(),
+            environment: Default::default(),
+            shell_error: Some("Terminal preferences could not be read".into()),
+        };
+        assert_eq!(
+            postcard::from_bytes::<Reply>(&postcard::to_allocvec(&reply).unwrap()).unwrap(),
+            reply
+        );
     }
 
     #[test]

@@ -1601,13 +1601,28 @@ impl AppSettings {
     /// Validate edited launch fields while retaining unavailable saved paths
     /// and policy in other fields. Each selected launch still validates fully.
     pub fn validate_transition(self, previous: &Self) -> Result<Self, SettingsError> {
-        if self.default_shell != previous.default_shell && self.default_shell.as_deref().is_some_and(|path| !agents::executable_available(path)) {
-            return Err(SettingsError::AgentLaunch("Default shell must be an absolute path to an executable file.".into()));
+        if self.default_shell != previous.default_shell
+            && self
+                .default_shell
+                .as_deref()
+                .is_some_and(|path| !agents::executable_available(path))
+        {
+            return Err(SettingsError::AgentLaunch(
+                "Default shell must be an absolute path to an executable file.".into(),
+            ));
         }
         for provider in crate::agent::Provider::ALL {
             let key = agents::provider_key(provider);
             if let Some(configuration) = self.agents.get(key) {
-                configuration.validate_changes(previous.agents.get(key).unwrap_or(&AgentLaunchSettings::default()), provider).map_err(SettingsError::AgentLaunch)?;
+                configuration
+                    .validate_changes(
+                        previous
+                            .agents
+                            .get(key)
+                            .unwrap_or(&AgentLaunchSettings::default()),
+                        provider,
+                    )
+                    .map_err(SettingsError::AgentLaunch)?;
             }
         }
         self.validate_with_agent_launches(false)
@@ -1617,10 +1632,23 @@ impl AppSettings {
         // Loading must retain pinned launch policy even if a binary disappears.
         // New edits are validated here; each actual launch validates again.
         if check_launches {
-            if self.default_shell.as_deref().is_some_and(|path| !agents::executable_available(path)) { return Err(SettingsError::AgentLaunch("Default shell must be an absolute path to an executable file.".into())); }
+            if self
+                .default_shell
+                .as_deref()
+                .is_some_and(|path| !agents::executable_available(path))
+            {
+                return Err(SettingsError::AgentLaunch(
+                    "Default shell must be an absolute path to an executable file.".into(),
+                ));
+            }
             for (key, configuration) in &self.agents {
-                if let Some(provider) = crate::agent::Provider::ALL.into_iter().find(|provider| agents::provider_key(*provider) == key) {
-                    configuration.validate(provider).map_err(SettingsError::AgentLaunch)?;
+                if let Some(provider) = crate::agent::Provider::ALL
+                    .into_iter()
+                    .find(|provider| agents::provider_key(*provider) == key)
+                {
+                    configuration
+                        .validate(provider)
+                        .map_err(SettingsError::AgentLaunch)?;
                 }
             }
         }
@@ -1931,7 +1959,9 @@ pub fn save_merged(
         &toml::Value::try_from(desired)?,
         &mut current,
     );
-    let settings = current.try_into::<AppSettings>()?.validate_transition(&previous)?;
+    let settings = current
+        .try_into::<AppSettings>()?
+        .validate_transition(&previous)?;
     save_validated_unlocked(path, &settings)
 }
 
@@ -1939,11 +1969,18 @@ pub fn save_merged(
 /// table first exists. Materialize those only in the merge baseline so two
 /// windows creating different fields do not overwrite each other's policy.
 /// Keep a removed provider absent in desired, preserving explicit table reset.
-pub(crate) fn merge_base_value(base: &AppSettings, desired: &AppSettings) -> Result<toml::Value, SettingsError> {
+pub(crate) fn merge_base_value(
+    base: &AppSettings,
+    desired: &AppSettings,
+) -> Result<toml::Value, SettingsError> {
     let mut value = toml::Value::try_from(base)?;
     let defaults = toml::Value::try_from(&AgentLaunchSettings::default())?;
     if let Some(agents) = value.get_mut("agents").and_then(toml::Value::as_table_mut) {
-        for provider in desired.agents.keys().filter(|provider| !base.agents.contains_key(*provider)) {
+        for provider in desired
+            .agents
+            .keys()
+            .filter(|provider| !base.agents.contains_key(*provider))
+        {
             agents.insert(provider.clone(), defaults.clone());
         }
     }

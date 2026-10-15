@@ -2723,11 +2723,36 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AgentSetting { Model, Effort, PermissionMode, Executable, Arguments, Environment }
+pub enum AgentSetting {
+    Model,
+    Effort,
+    PermissionMode,
+    Executable,
+    Arguments,
+    Environment,
+}
 
 impl AgentSetting {
-    const fn key(self) -> &'static str { match self { Self::Model => "model", Self::Effort => "effort", Self::PermissionMode => "permission_mode", Self::Executable => "executable", Self::Arguments => "arguments", Self::Environment => "environment" } }
-    const fn label(self) -> &'static str { match self { Self::Model => "Default model", Self::Effort => "Default effort", Self::PermissionMode => "Default permission mode", Self::Executable => "Executable", Self::Arguments => "Extra arguments", Self::Environment => "Environment" } }
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Effort => "effort",
+            Self::PermissionMode => "permission_mode",
+            Self::Executable => "executable",
+            Self::Arguments => "arguments",
+            Self::Environment => "environment",
+        }
+    }
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Model => "Default model",
+            Self::Effort => "Default effort",
+            Self::PermissionMode => "Default permission mode",
+            Self::Executable => "Executable",
+            Self::Arguments => "Extra arguments",
+            Self::Environment => "Environment",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3201,14 +3226,35 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
-            agents: crate::agent::Provider::ALL.into_iter().map(|provider| {
-                let configuration = settings.agents.get(settings::agents::provider_key(provider)).cloned().unwrap_or_default();
-                let environment = configuration.environment.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
-                let launch_error = configuration.validate(provider).err();
-                (provider, AgentDraft { configuration, environment, launch_error })
-            }).collect(),
+            agents: crate::agent::Provider::ALL
+                .into_iter()
+                .map(|provider| {
+                    let configuration = settings
+                        .agents
+                        .get(settings::agents::provider_key(provider))
+                        .cloned()
+                        .unwrap_or_default();
+                    let environment = configuration
+                        .environment
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect();
+                    let launch_error = configuration.validate(provider).err();
+                    (
+                        provider,
+                        AgentDraft {
+                            configuration,
+                            environment,
+                            launch_error,
+                        },
+                    )
+                })
+                .collect(),
             default_shell: settings.default_shell.clone().unwrap_or_default(),
-            default_shell_unavailable: settings.default_shell.as_deref().is_some_and(|path| !settings::agents::executable_available(path)),
+            default_shell_unavailable: settings
+                .default_shell
+                .as_deref()
+                .is_some_and(|path| !settings::agents::executable_available(path)),
             notifications: settings.notifications,
             app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
@@ -3272,7 +3318,8 @@ impl SettingsDraft {
     fn set(&mut self, field: SettingsField, value: String) {
         match field {
             SettingsField::DefaultShell => {
-                self.default_shell_unavailable = !value.is_empty() && !settings::agents::executable_available(&value);
+                self.default_shell_unavailable =
+                    !value.is_empty() && !settings::agents::executable_available(&value);
                 self.default_shell = value;
             }
             SettingsField::Agent(provider, field) => {
@@ -3281,10 +3328,23 @@ impl SettingsDraft {
                 match field {
                     AgentSetting::Model => draft.configuration.model = optional(value),
                     AgentSetting::Effort => draft.configuration.effort = optional(value),
-                    AgentSetting::PermissionMode => draft.configuration.permission_mode = optional(value),
+                    AgentSetting::PermissionMode => {
+                        draft.configuration.permission_mode = optional(value)
+                    }
                     AgentSetting::Executable => draft.configuration.executable = optional(value),
-                    AgentSetting::Arguments => if let Ok(arguments) = serde_json::from_str(&value) { draft.configuration.arguments = arguments; },
-                    AgentSetting::Environment => if let Ok(environment) = serde_json::from_str::<Vec<(String, String)>>(&value) { draft.configuration.environment = environment.iter().cloned().collect(); draft.environment = environment; },
+                    AgentSetting::Arguments => {
+                        if let Ok(arguments) = serde_json::from_str(&value) {
+                            draft.configuration.arguments = arguments;
+                        }
+                    }
+                    AgentSetting::Environment => {
+                        if let Ok(environment) =
+                            serde_json::from_str::<Vec<(String, String)>>(&value)
+                        {
+                            draft.configuration.environment = environment.iter().cloned().collect();
+                            draft.environment = environment;
+                        }
+                    }
                 }
                 draft.launch_error = draft.configuration.validate(provider).err();
             }
@@ -3457,22 +3517,46 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
-
-        SettingsField::DefaultShell => { next.default_shell = (!value.is_empty()).then(|| value.to_owned()); Ok(()) }
+        SettingsField::DefaultShell => {
+            next.default_shell = (!value.is_empty()).then(|| value.to_owned());
+            Ok(())
+        }
         SettingsField::Agent(provider, field) => {
-            let configuration = next.agents.entry(settings::agents::provider_key(provider).into()).or_default();
+            let configuration = next
+                .agents
+                .entry(settings::agents::provider_key(provider).into())
+                .or_default();
             let optional = || (!value.is_empty()).then(|| value.to_owned());
             match field {
-                AgentSetting::Model => { configuration.model = optional(); Ok(()) }
-                AgentSetting::Effort => { configuration.effort = optional(); Ok(()) }
-                AgentSetting::PermissionMode => { configuration.permission_mode = optional(); Ok(()) }
-                AgentSetting::Executable => { configuration.executable = optional(); Ok(()) }
-                AgentSetting::Arguments => serde_json::from_str(value).map(|arguments| configuration.arguments = arguments).map_err(|_| "Enter each argument in its own row.".to_owned()),
-                AgentSetting::Environment => serde_json::from_str::<Vec<(String, String)>>(value).map_err(|_| "Enter each environment variable in its own row.".to_owned()).and_then(|entries| {
-                    let mut names = std::collections::HashSet::new();
-                    if entries.iter().any(|(name, _)| !names.insert(name)) { return Err("Environment variable names must be unique.".into()); }
-                    configuration.environment = entries.into_iter().collect(); Ok(())
-                }),
+                AgentSetting::Model => {
+                    configuration.model = optional();
+                    Ok(())
+                }
+                AgentSetting::Effort => {
+                    configuration.effort = optional();
+                    Ok(())
+                }
+                AgentSetting::PermissionMode => {
+                    configuration.permission_mode = optional();
+                    Ok(())
+                }
+                AgentSetting::Executable => {
+                    configuration.executable = optional();
+                    Ok(())
+                }
+                AgentSetting::Arguments => serde_json::from_str(value)
+                    .map(|arguments| configuration.arguments = arguments)
+                    .map_err(|_| "Enter each argument in its own row.".to_owned()),
+                AgentSetting::Environment => serde_json::from_str::<Vec<(String, String)>>(value)
+                    .map_err(|_| "Enter each environment variable in its own row.".to_owned())
+                    .and_then(|entries| {
+                        let mut names = std::collections::HashSet::new();
+                        if entries.iter().any(|(name, _)| !names.insert(name)) {
+                            return Err("Environment variable names must be unique.".into());
+                        }
+                        configuration.environment = entries.into_iter().collect();
+                        Ok(())
+                    }),
             }
         }
         SettingsField::ShortcutToggleProjects => {
@@ -3890,8 +3974,9 @@ fn settings_update(
 fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
     let label = field.label();
     Some(match field {
-
-        SettingsField::DefaultShell => "Default shell must be an absolute path to an executable file.".into(),
+        SettingsField::DefaultShell => {
+            "Default shell must be an absolute path to an executable file.".into()
+        }
         SettingsField::TerminalScrollSize => format!(
             "{label} must be 1–{} lines.",
             settings::MAX_TERMINAL_SCROLL_SIZE
@@ -5809,15 +5894,16 @@ impl Cagents {
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
-        let mut launch = match LaunchRecipe::shell_with_settings(working_directory.clone(), &self.settings) {
-            Ok(launch) => launch,
-            Err(error) => {
-                self.status = Some(TransientNotice::error(format!(
-                    "could not create terminal: {error}"
-                )));
-                return Task::none();
-            }
-        };
+        let mut launch =
+            match LaunchRecipe::shell_with_settings(working_directory.clone(), &self.settings) {
+                Ok(launch) => launch,
+                Err(error) => {
+                    self.status = Some(TransientNotice::error(format!(
+                        "could not create terminal: {error}"
+                    )));
+                    return Task::none();
+                }
+            };
         if let Some(shell) = crate::device::shell() {
             launch.program = shell.to_owned();
         }
@@ -11348,8 +11434,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -14853,7 +14942,9 @@ impl Application for Cagents {
                     // write acknowledgement, so it cannot observe old paths
                     // or environment while the settings save is still queued.
                     self.accounts_surface_changed()
-                } else { Task::none() }
+                } else {
+                    Task::none()
+                }
             }
             Message::UiUpdate(request) => match request.action {
                 instance::UiUpdateAction::Prepare => {
@@ -16151,19 +16242,50 @@ impl Application for Cagents {
                 crate::settings_widgets::reveal_content_start()
             }
             Message::DetectAgentExecutable(provider) => {
-                let previous = self.settings_draft.agents.get(&provider).and_then(|draft| draft.configuration.executable.clone());
+                let previous = self
+                    .settings_draft
+                    .agents
+                    .get(&provider)
+                    .and_then(|draft| draft.configuration.executable.clone());
                 cosmic::task::future(async move {
-                let search = crate::account::probe::search_path().await;
-                let path = tokio::task::spawn_blocking(move || {
-                    crate::account::probe::find_executable(provider.executable(), search.as_deref()).map(|path| path.to_string_lossy().into_owned())
-                }).await.ok().flatten();
-                Message::AgentExecutableDetected(provider, previous, path)
-            }) },
-            Message::AgentExecutableDetected(provider, previous, _) if self.settings_draft.agents.get(&provider).and_then(|draft| draft.configuration.executable.as_ref()) != previous.as_ref() => Task::none(),
-            Message::AgentExecutableDetected(provider, _, Some(path)) => self.apply_setting_input(SettingsField::Agent(provider, AgentSetting::Executable), path),
+                    let search = crate::account::probe::search_path().await;
+                    let path = tokio::task::spawn_blocking(move || {
+                        crate::account::probe::find_executable(
+                            provider.executable(),
+                            search.as_deref(),
+                        )
+                        .map(|path| path.to_string_lossy().into_owned())
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    Message::AgentExecutableDetected(provider, previous, path)
+                })
+            }
+            Message::AgentExecutableDetected(provider, previous, _)
+                if self
+                    .settings_draft
+                    .agents
+                    .get(&provider)
+                    .and_then(|draft| draft.configuration.executable.as_ref())
+                    != previous.as_ref() =>
+            {
+                Task::none()
+            }
+            Message::AgentExecutableDetected(provider, _, Some(path)) => self.apply_setting_input(
+                SettingsField::Agent(provider, AgentSetting::Executable),
+                path,
+            ),
             Message::AgentExecutableDetected(provider, _, None) => {
-                self.settings_invalid.insert(SettingsField::Agent(provider, AgentSetting::Executable), format!("{} was not found on PATH. Choose an executable path.", provider.label()));
-                self.refresh_settings_feedback(); Task::none()
+                self.settings_invalid.insert(
+                    SettingsField::Agent(provider, AgentSetting::Executable),
+                    format!(
+                        "{} was not found on PATH. Choose an executable path.",
+                        provider.label()
+                    ),
+                );
+                self.refresh_settings_feedback();
+                Task::none()
             }
             Message::SettingsSearchChanged(query) => {
                 self.settings_search = query;
