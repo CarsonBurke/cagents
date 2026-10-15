@@ -449,6 +449,33 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         })
     }
 
+    // Recovery backups must land in the ORIGINAL object database. Do not
+    // inherit object-directory/config injections or run filters/hooks while
+    // authenticating a preimage. The canonical scoped executor reinstalls
+    // its owned original private/common roles after this command is built.
+    fn backup_object_command(
+        &self,
+        worktree: &Path,
+        args: impl IntoIterator<Item = impl Into<OsString>>,
+    ) -> CommandSpec {
+        let mut command = self
+            .git_mutation(
+                worktree,
+                ["--no-replace-objects", "-c", "core.hooksPath=/dev/null"],
+            )
+            .args(args);
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"GIT_") {
+                command = command.env_remove(name);
+            }
+        }
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
+    }
+
     /// Hash pinned regular-file descriptors in bounded batches. A mass discard
     /// uses one Git invocation per256 files rather than one per selected path.
     fn capture_recovery_entries(
@@ -522,8 +549,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     format!("/proc/{}/fd/{}\n", std::process::id(), file.as_raw_fd()).as_bytes(),
                 );
             }
-            let mut command =
-                self.git_mutation(worktree, ["hash-object", "--no-filters", "--stdin-paths"]);
+            let mut command = self
+                .backup_object_command(worktree, ["hash-object", "--no-filters", "--stdin-paths"]);
             if store {
                 command = command.arg("-w");
             }
@@ -591,7 +618,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             if store {
                 self.run_checked(
                     &self
-                        .git_mutation(worktree, ["hash-object", "-w", "--stdin"])
+                        .backup_object_command(worktree, ["hash-object", "-w", "--stdin"])
                         .stdin(target.as_os_str().as_bytes().to_vec()),
                     cancellation,
                 )
@@ -611,7 +638,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // The descriptor path pins the opened file rather than resolving its
         // worktree name again, and avoids allocating the whole file on stdin.
         let descriptor_path = format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd());
-        let mut command = self.git_mutation(worktree, ["hash-object", "--no-filters"]);
+        let mut command = self.backup_object_command(worktree, ["hash-object", "--no-filters"]);
         if store {
             command = command.arg("-w");
         }
