@@ -15505,6 +15505,84 @@ mod tests {
     }
 
     #[test]
+    fn chat_descriptor_unchanged_observed_wakes_keep_the_retained_workspace_allocation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let source = chat_runtime(&app, card).session.clone();
+        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        app.lifecycle
+            .register(card, Exposure::Offscreen, Residency::Hot, Instant::now());
+        // The writer and cached projections can retain a durable snapshot.
+        // An unchanged observation must not copy that whole workspace.
+        let retained = app.durable.clone();
+        let weak = Arc::downgrade(&retained);
+        for _ in 0..16 {
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Observed)));
+            assert!(Arc::ptr_eq(&retained, &app.durable));
+            assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &app.durable));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+        }
+        assert!(
+            app.lifecycle.state(card).is_none(),
+            "attachment still completes hydration"
+        );
+        assert_eq!(chat_runtime(&app, card).target, target);
+        assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn chat_descriptor_unchanged_attachment_still_promotes_cold_residency() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = chat_runtime(&app, card).session.clone();
+        app.card_state_mut(card).unwrap().residency = Residency::Cold;
+        app.lifecycle
+            .register(card, Exposure::Offscreen, Residency::Cold, Instant::now());
+        let retained = app.durable.clone();
+        assert_eq!(app.install_chat_session(card, source.clone()), None);
+        assert!(!Arc::ptr_eq(&retained, &app.durable));
+        assert_eq!(
+            retained
+                .cards
+                .iter()
+                .find(|state| state.id == card)
+                .unwrap()
+                .residency,
+            Residency::Cold
+        );
+        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
+        assert!(app.lifecycle.state(card).is_none());
+    }
+
+    #[test]
+    fn chat_descriptor_changed_source_still_replaces_the_retained_workspace_source() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let original = chat_runtime(&app, card).session.clone();
+        let mut changed = original.clone();
+        changed.launch.session_id = Some("new-provider-confirmed-thread".into());
+        let retained = app.durable.clone();
+        assert_eq!(app.install_chat_session(card, changed.clone()), Some(false));
+        assert!(!Arc::ptr_eq(&retained, &app.durable));
+        assert_eq!(
+            retained
+                .cards
+                .iter()
+                .find(|state| state.id == card)
+                .unwrap()
+                .kind,
+            CardKind::Chat(original)
+        );
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(changed));
+        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+    }
+
+    #[test]
     fn unnamed_hosted_chat_attachment_finishes_hydration_without_replacing_identity() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, None);
