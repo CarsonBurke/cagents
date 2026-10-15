@@ -124,7 +124,7 @@ impl Cache {
         // An actual negative authentication verdict is itself a new identity
         // invalidation, even without a separate provider login-change event.
         // Commit it before touching quota; only later positive auth may clear.
-        let negative_auth = persist && visible.snapshot.status == super::super::UsageStatus::NeedsLogin;
+        let negative_auth = visible.snapshot.status == super::super::UsageStatus::NeedsLogin;
         if negative_auth && !state.entries.get(&token.key).is_some_and(|barrier|barrier.pending) {
             let verdict = state.invalidate(&token.key,visible.snapshot.observed_at,
                 "The provider needs this account to sign in again");
@@ -152,6 +152,14 @@ impl Cache {
                 return Err(error);
             }
             state.entries.get_mut(&token.key).unwrap().pending = false;
+        }
+        if !persist {
+            // Uncached registration asks for the actual just-observed auth
+            // verdict, not a quota-cache projection. It cannot clear a shared
+            // pending barrier or claim its causal revision; negative auth has
+            // nevertheless invalidated shared allowance above.
+            visible.verification = None;
+            return Ok(visible);
         }
         // The sidecar on disk still holds pending until AFTER the verified
         // quota entry commits. Its overlay wins across any intervening crash.

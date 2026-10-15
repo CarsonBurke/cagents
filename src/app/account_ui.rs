@@ -3223,9 +3223,13 @@ impl Cagents {
             }
             // Current provider evidence settles this probe.
             Outcome::Answered {
-                identity, snapshot, verification, ..
+                mut identity, snapshot, verification, ..
             } => {
                 if verification.is_some() { state.verification = verification; }
+                // Sign-in consumers separately retain the provider's expired
+                // identity as retry disposition. Ordinary account display
+                // must not learn it as verified shared identity.
+                if state.verification.as_ref().is_some_and(|proof|proof.pending()) { identity = None; }
                 // A changed identity confirms that the login attempt ended,
                 // but accepting that identity for this account is separate.
                 // The attempt ends once the home reports
@@ -8821,29 +8825,28 @@ mod app_tests {
     fn a_cached_identity_with_expired_credentials_keeps_its_home_pending() {
         let mut app = context_inspector_test_app(false);
         let key = pending_login(&mut app, 515);
-        app.account_ui
-            .registry
-            .begin(Provider::Claude, key, now_ms());
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let home = root.path().join("codex-home"); std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("saved-provider-history"),"retain for retry").unwrap();
+        app.account_ui.logins[0].provider = Provider::Codex;
+        app.account_ui.logins[0].home = home.clone();
+        app.account_ui.registry.begin(Provider::Codex,key,now_ms());
+        let cache = Cache::at(root.path().join("cache"));
+        std::fs::create_dir(root.path().join("cache")).unwrap();
         for attempt in 1..=LOGIN_ATTEMPTS {
             app.account_ui.logins[0].next_check = 0;
             let _ = app.check_logins();
             let _ = app.login_verified(
                 key,
-                Outcome::Answered {
+                probe::fixture_verified_outcome(&cache,"codex:/private-login-fixture",Entry {
                     verification: None,
-                    catalog: None,
-                    identity: Some(Identity {
-                        email: Some("cached@example.com".into()),
-                        ..Identity::default()
-                    }),
-                    snapshot: UsageSnapshot::state(
-                        UsageStatus::NeedsLogin,
-                        "expired credentials",
-                        NOW,
-                    ),
-                },
+                    identity: Some(Identity { email: Some("cached@example.com".into()),..Identity::default() }),
+                    snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin,"expired credentials",NOW),
+                },true),
             );
             assert!(app.account_ui.registry.find(key).is_none());
+            assert_eq!(std::fs::read_to_string(home.join("saved-provider-history")).unwrap(),"retain for retry");
+            assert!(cache.load(NOW)["codex:/private-login-fixture"].identity.is_none());
             assert!(
                 app.account_ui
                     .registry
