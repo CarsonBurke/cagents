@@ -869,7 +869,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             "{detail}. {current}. Operation evidence: {}",
             retained_directory.display()
         );
-        private.keep();
+        let _retained_path = private.keep();
         return Err(PrCheckoutFailure {
             kind: if effects || observed_descendant {
                 PrCheckoutFailureKind::PartialOrUnknown
@@ -897,7 +897,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             "{detail}. Operation evidence: {}",
             retained_directory.display()
         );
-        private.keep();
+        let _retained_path = private.keep();
         return Err(PrCheckoutFailure {
             kind: PrCheckoutFailureKind::PartialOrUnknown,
             detail,
@@ -911,7 +911,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             state(),
             retained_directory.display()
         );
-        private.keep();
+        let _retained_path = private.keep();
         return Err(PrCheckoutFailure {
             kind: PrCheckoutFailureKind::PartialOrUnknown,
             detail,

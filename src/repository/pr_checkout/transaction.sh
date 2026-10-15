@@ -20,6 +20,22 @@ read_git() {
     repo_git --no-optional-locks -c diff.autoRefreshIndex=false "$@"
 }
 
+# Retain the exact native HEAD-lock diagnostic without changing the locale (and
+# therefore user filter/hook behavior). Bound redirected evidence independently
+# of the parent executor's output capture. A truncated/missing receipt refuses.
+head_locked_git() {
+    receipt=$1
+    shift
+    (
+        code=0
+        repo_git -c core.filesRefLockTimeout=0 "$@" 2>&1 >/dev/null || code=$?
+        printf '%s' "$code" > "$CAGENTS_PR_PRIVATE/$receipt-exit"
+    ) | /usr/bin/head -c 65537 > "$CAGENTS_PR_PRIVATE/$receipt-errors"
+    [ "$(/bin/cat "$CAGENTS_PR_PRIVATE/$receipt-exit")" = 128 ]
+    [ -s "$CAGENTS_PR_PRIVATE/$receipt-errors" ]
+    [ "$(/usr/bin/wc -c < "$CAGENTS_PR_PRIVATE/$receipt-errors")" -le 65536 ]
+}
+
 verify_identity() {
     [ "$(/usr/bin/stat -Lc '%d:%i' -- "$CAGENTS_PR_WORKTREE")" = "$CAGENTS_PR_WORKTREE_ID" ]
     [ "$(/usr/bin/stat -Lc '%d:%i' -- "$CAGENTS_PR_GITDIR")" = "$CAGENTS_PR_GITDIR_ID" ]
@@ -116,9 +132,10 @@ if [ "$1" = prepared ]; then
         [ ! -s "$CAGENTS_PR_PRIVATE/status" ]
         [ "$(/bin/cat "$CAGENTS_PR_PRIVATE/status-exit")" = 0 ]
         [ ! -s "$CAGENTS_PR_PRIVATE/status-errors" ]
-        # read-tree deliberately permits overwriting ignored files. Fence every
-        # incoming addition separately, including directory/file collisions and
-        # symlink ancestors. Unrelated ignored build directories remain intact.
+        # Diagnose pre-existing incoming collisions, including directory/file
+        # collisions and symlink ancestors, before starting native checkout.
+        # This census is NOT authority to overwrite a later ignored file.
+        # Unrelated ignored build directories remain intact.
         # Bound both captured bytes and each xargs batch; preserve NUL paths.
         (
             if read_git diff-tree --no-commit-id --name-only --diff-filter=A --no-renames -r -z \
@@ -137,9 +154,38 @@ if [ "$1" = prepared ]; then
         /usr/bin/xargs -0 -r -s 32768 /bin/sh "$CAGENTS_PR_PRIVATE/check-new-paths" \
             < "$CAGENTS_PR_PRIVATE/additions"
         printf started > "$CAGENTS_PR_PRIVATE/checkout-started"
-        # Native two-tree unpack owns index.lock and refuses dirty tracked
-        # data. The addition census above protects ignored data; never reset.
-        repo_git read-tree -m -u "$CAGENTS_PR_OLD" "$CAGENTS_PR_NEW"
+        # The outer native reference transaction retains HEAD.lock AND the
+        # branch lease throughout this block. Check the lock's native refusal
+        # before invoking the porcelain two-tree checkout. The probe is a
+        # nominal update, so its unexpected success is an uncertain effect;
+        # checkout-started was deliberately recorded before it.
+        [ -f "$CAGENTS_PR_GITDIR_FD/HEAD.lock" ]
+        [ ! -L "$CAGENTS_PR_GITDIR_FD/HEAD.lock" ]
+        head_locked_git head-lock-probe update-ref --no-deref HEAD "$CAGENTS_PR_OLD"
+        verify_identity
+        verify_config
+        verify_upstream
+
+        # Unlike read-tree -m -u, this native unpack preserves ignored entries
+        # at its own checkout check. Native checkout writes the index/worktree
+        # before trying to detach HEAD; the parent's existing HEAD.lock prevents
+        # that final publication. Only the identical native lock refusal is
+        # admissible here, never a generic failing checkout or a successful
+        # detach. User post-index-change policy stays native/original; the failed
+        # HEAD update does not reach post-checkout.
+        head_locked_git checkout checkout --no-overwrite-ignore --detach --no-progress --quiet "$CAGENTS_PR_NEW"
+        /usr/bin/cmp -s "$CAGENTS_PR_PRIVATE/head-lock-probe-errors" "$CAGENTS_PR_PRIVATE/checkout-errors"
+        [ -f "$CAGENTS_PR_GITDIR_FD/HEAD.lock" ]
+        [ ! -L "$CAGENTS_PR_GITDIR_FD/HEAD.lock" ]
+        # Compare the complete staged tree, not status against still-old HEAD.
+        # These two read-only comparisons prohibit a carried staged change or
+        # failed/partial writeout. No repair/reset/replay follows a refusal.
+        read_git diff-index --cached --quiet --no-ext-diff --no-textconv --ignore-submodules=none "$CAGENTS_PR_NEW" --
+        read_git diff-files --quiet --no-ext-diff --no-textconv --ignore-submodules=none --
+        verify_input
+        verify_identity
+        verify_config
+        verify_upstream
         printf completed > "$CAGENTS_PR_PRIVATE/checkout-completed"
     fi
     printf prepared > "$CAGENTS_PR_PRIVATE/effect-prepared"

@@ -483,7 +483,7 @@ fn ignored_collision_created_after_census_is_preserved_at_checkout_effect() {
 set -eu
 if [ "${CAGENTS_PR_MODE:-}" = effect ]; then
     for argument do
-        if [ "$argument" = read-tree ]; then
+        if [ "$argument" = read-tree ] || [ "$argument" = checkout ]; then
             # This runs after the additions/xargs census, immediately before
             # the actual native checkout command. It models an ordinary build
             # or editor creating ignored data without taking Git's locks.
@@ -508,6 +508,148 @@ exec /usr/bin/git "$@"
     assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), fixture.original.as_str());
     assert_eq!(fs::read(fixture.root.join(".git/index")).unwrap(), before_index);
     assert_eq!(fs::read(fixture.root.join(".git/config")).unwrap(), before_config);
+}
+
+#[test]
+fn native_preserving_checkout_keeps_original_head_and_index_policy() {
+    let fixture = Fixture::new(true);
+    let new = fixture.advance(|root| fs::write(root.join("file"), "native new\n").unwrap());
+    let policy = fixture.root.join(".git/index policy");
+    fs::create_dir(&policy).unwrap();
+    run_git(&fixture.root, &["config", "core.hooksPath", policy.to_str().unwrap()]);
+    let hook = policy.join("post-index-change");
+    fs::write(&hook, "#!/bin/sh\nset -eu\n[ \"${CAGENTS_PR_MODE:-}\" = effect ] || exit 0\nprintf '%s:%s:%s\\n' \"$1\" \"$2\" \"$(git config core.hooksPath)\" >> \"$CAGENTS_PR_GITDIR_FD/index-policy-events\"\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let checkout_hook = policy.join("post-checkout");
+    fs::write(&checkout_hook, "#!/bin/sh\nprintf unexpected > \"$CAGENTS_PR_GITDIR_FD/post-checkout-ran\"\n").unwrap();
+    fs::set_permissions(&checkout_hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let original_orig_head = fs::read(fixture.root.join(".git/ORIG_HEAD")).ok();
+    let old_reflog = git_text(&fixture.root, &["reflog", "show", "--format=%H", "HEAD"]);
+    let verified = fixture.apply(&fixture.prepare(&fixture.request(new.clone()))).unwrap();
+    assert_eq!(verified.head(), &new);
+    assert_eq!(git_text(&fixture.root, &["symbolic-ref", "HEAD"]), "refs/heads/feature");
+    assert_eq!(git_text(&fixture.root, &["write-tree"]), git_text(&fixture.root, &["rev-parse", &format!("{new}^{{tree}}") ]));
+    assert_eq!(fs::read(fixture.root.join(".git/ORIG_HEAD")).ok(), original_orig_head);
+    assert!(!fixture.root.join(".git/SQUASH_MSG").exists());
+    assert!(!fixture.root.join(".git/post-checkout-ran").exists());
+    let events = fs::read_to_string(fixture.root.join(".git/index-policy-events")).unwrap();
+    assert_eq!(events.lines().count(), 1, "one native index publication: {events}");
+    assert!(events.trim_end().ends_with(policy.to_str().unwrap()), "original hooksPath remains active: {events}");
+    let reflog = git_text(&fixture.root, &["reflog", "show", "--format=%H", "HEAD"]);
+    assert_eq!(reflog.lines().count(), old_reflog.lines().count() + 1);
+    assert_eq!(reflog.lines().next(), Some(new.as_str()));
+}
+
+#[test]
+fn preserving_checkout_can_advance_to_a_new_commit_with_the_same_tree() {
+    let fixture = Fixture::new(true);
+    let new = fixture.advance(|root| {
+        fs::write(root.join("file"), "intermediate\n").unwrap();
+        run_git(root, &["commit", "-qam", "intermediate"]);
+        fs::write(root.join("file"), "old\n").unwrap();
+    });
+    assert_ne!(new, fixture.original);
+    assert_eq!(git_text(&fixture.root, &["rev-parse", &format!("{new}^{{tree}}")]), git_text(&fixture.root, &["rev-parse", &format!("{}^{{tree}}", fixture.original)]));
+    let verified = fixture.apply(&fixture.prepare(&fixture.request(new.clone()))).unwrap();
+    assert_eq!(verified.head(), &new);
+    assert_eq!(git_text(&fixture.root, &["symbolic-ref", "HEAD"]), "refs/heads/feature");
+    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"old\n");
+}
+
+#[test]
+fn unexpected_head_lock_probe_success_is_uncertain_and_never_runs_checkout() {
+    let mut fixture = Fixture::new(true);
+    let new = fixture.advance(|root| fs::write(root.join("file"), "native new\n").unwrap());
+    let wrapper = fixture.temporary.path().join("unexpected-probe-git");
+    fs::write(&wrapper, r#"#!/bin/sh
+set -eu
+if [ "${CAGENTS_PR_MODE:-}" = effect ]; then
+    for argument do
+        if [ "$argument" = --no-deref ]; then
+            printf probe > "$0.entered"
+            exit 0
+        fi
+        if [ "$argument" = checkout ]; then
+            printf unexpected > "$0.checkout"
+        fi
+    done
+fi
+exec /usr/bin/git "$@"
+"#).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.service = RepositoryService::new(&wrapper, fixture.executor.clone());
+    let failure = fixture.apply(&fixture.prepare(&fixture.request(new))).unwrap_err();
+    assert_eq!(failure.kind, PrCheckoutFailureKind::PartialOrUnknown);
+    assert_eq!(fs::read(wrapper.with_extension("entered")).unwrap(), b"probe");
+    assert!(!wrapper.with_extension("checkout").exists());
+    assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), fixture.original.as_str());
+    assert_eq!(git_text(&fixture.root, &["symbolic-ref", "HEAD"]), "refs/heads/feature");
+    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"old\n");
+}
+
+#[test]
+fn a_different_checkout_failure_cannot_publish_the_parent_reference() {
+    let mut fixture = Fixture::new(true);
+    let new = fixture.advance(|root| fs::write(root.join("file"), "native new\n").unwrap());
+    let wrapper = fixture.temporary.path().join("failed-after-checkout-git");
+    fs::write(&wrapper, r#"#!/bin/sh
+set -eu
+if [ "${CAGENTS_PR_MODE:-}" = effect ]; then
+    for argument do
+        if [ "$argument" = checkout ]; then
+            code=0
+            /usr/bin/git "$@" || code=$?
+            printf 'different post-checkout command failure\n' >&2
+            printf finished > "$0.finished"
+            exit "$code"
+        fi
+    done
+fi
+exec /usr/bin/git "$@"
+"#).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.service = RepositoryService::new(&wrapper, fixture.executor.clone());
+    let failure = fixture.apply(&fixture.prepare(&fixture.request(new.clone()))).unwrap_err();
+    assert_eq!(failure.kind, PrCheckoutFailureKind::PartialOrUnknown);
+    assert_eq!(fs::read(wrapper.with_extension("finished")).unwrap(), b"finished");
+    assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), fixture.original.as_str());
+    assert_eq!(git_text(&fixture.root, &["symbolic-ref", "HEAD"]), "refs/heads/feature");
+    assert_eq!(git_text(&fixture.root, &["write-tree"]), git_text(&fixture.root, &["rev-parse", &format!("{new}^{{tree}}") ]));
+    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"native new\n", "retain known partial checkout; never reset/replay");
+}
+
+#[test]
+fn cancellation_after_native_index_publication_retains_partial_state() {
+    let fixture = Fixture::new(true);
+    let new = fixture.advance(|root| fs::write(root.join("file"), "native new\n").unwrap());
+    let hooks = fixture.root.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-index-change");
+    fs::write(&hook, r#"#!/bin/sh
+set -eu
+[ "${CAGENTS_PR_MODE:-}" = effect ] || exit 0
+printf paused > "$CAGENTS_PR_GITDIR_FD/checkout-paused"
+/usr/bin/timeout 5 /bin/sh -c 'while [ ! -e "$CAGENTS_PR_GITDIR_FD/release-checkout" ]; do /bin/sleep 0.02; done'
+"#).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let plan = fixture.prepare(&fixture.request(new.clone()));
+    let cancel = CancellationToken::default();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| fixture.service.reconcile_existing_pr_checkout(&plan, &cancel));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fixture.root.join(".git/checkout-paused").exists() {
+            assert!(Instant::now() < deadline, "native index hook must be reached");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), fixture.original.as_str());
+        cancel.cancel();
+        fs::write(fixture.root.join(".git/release-checkout"), b"release").unwrap();
+        let failure = worker.join().unwrap().unwrap_err();
+        assert_eq!(failure.kind, PrCheckoutFailureKind::PartialOrUnknown);
+    });
+    assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), fixture.original.as_str());
+    assert_eq!(git_text(&fixture.root, &["symbolic-ref", "HEAD"]), "refs/heads/feature");
+    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"native new\n");
 }
 
 #[test]
