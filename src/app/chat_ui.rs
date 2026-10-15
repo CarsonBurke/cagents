@@ -16158,12 +16158,19 @@ mod tests {
 
     #[test]
     fn ambiguous_return_retry_keeps_original_binding_and_rejects_old_attempt_results() {
+        for initially_known in [false, true] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let card = live_chat(&mut app, initially_known.then_some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        if !initially_known {
+            let mut learned = (*handle.snapshot()).clone();
+            learned.session_id = Some(KNOWN_THREAD.into());
+            handle.publish_snapshot_for_test(learned);
+        }
         drop(app.update(Message::ChatUi(Action::Switch(card))));
         let first = app.chat_ui.handoff_bindings[&target].clone();
+        assert_eq!(first.binding.source.launch.session_id.is_some(), initially_known);
         drop(app.update(Message::ChatUi(Action::HandoffFinished(target, first.operation, Err("ambiguous start disposition".into())))));
         assert!(!app.chat_ui.phases.contains_key(&card));
         assert_eq!(app.chat_ui.handoff_bindings[&target].binding, first.binding);
@@ -16184,6 +16191,7 @@ mod tests {
         assert!(!app.chat_ui.phases.contains_key(&card), "registry replacement cannot refresh the old intent");
         assert_eq!(app.chat_ui.handoff_bindings[&target].binding, first.binding);
         assert!(app.terminal_starts.lock().unwrap().is_empty());
+        }
     }
 
     /// A close pressed while the card is on its way back to a terminal waits
