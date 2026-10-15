@@ -73,7 +73,7 @@ pub(super) fn run(host:&SharedHost, client:ClientId, source:&Session, execution:
         let state=host.lock().unwrap_or_else(|p|p.into_inner());
         let Some(record)=state.chats.get(&source.id) else {return Ok(None)};
         if !record.handle.is_completed() { return Ok(None); }
-        let ServerResponse::ChatAttached{session,..}=session_snapshot(record) else {unreachable!()};
+        let session=session_descriptor(record);
         // A known alias was previously authenticated. A first request must
         // match the full immutable source and any pair it actually supplies.
         if aliases.is_empty() && (source.id!=session.id || source.proof!=session.proof
@@ -92,7 +92,7 @@ pub(super) fn run(host:&SharedHost, client:ClientId, source:&Session, execution:
             || state.chats.get(&source.id).is_none_or(|record|!record.handle.same_actor(&old_actor)||!record.handle.is_completed()) {
             return Err(unavailable("The conversation owner changed before restart; no second writer was started"));
         }
-        let ServerResponse::ChatAttached{session:observed,..}=session_snapshot(&state.chats[&source.id]) else{unreachable!()};
+        let observed=session_descriptor(&state.chats[&source.id]);
         if observed!=*plan.source() {return Err(unavailable("The exact provider descriptor changed during restart admission; no owner was stopped"));}
         let mut aliases=aliases;
         if !aliases.contains(source) { aliases.push(source.clone()); }
@@ -136,16 +136,38 @@ pub(super) fn request_id(host:&SharedHost,id:TerminalId)->Result<uuid::Uuid,Prot
 }
 
 fn publish(host:&SharedHost,client:ClientId,source:&Session,actor:&Handle,receipt:chat::RestartReceipt)->Result<ServerResponse,ProtocolError>{
+    publish_with_snapshot(host,client,source,actor,receipt,|actor|actor.snapshot(None))
+}
+
+fn publish_with_snapshot(
+    host:&SharedHost,client:ClientId,source:&Session,actor:&Handle,receipt:chat::RestartReceipt,
+    snapshot:impl FnOnce(&Handle)->Option<chat::Snapshot>,
+)->Result<ServerResponse,ProtocolError>{
     let receipt=chat::RestartReceipt::confirm(source.clone(),receipt.replacement().clone()).map_err(unavailable)?;
-    let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
-    let record=state.chats.get_mut(&source.id).filter(|record|record.handle.same_actor(actor)).ok_or_else(||unavailable("The restarted actor changed before its receipt was delivered"))?;
-    record.subscribers.entry(client).or_insert(false);
-    record.observations.entry(client).or_insert_with(||Observation{after_generation:record.handle.observe_next_update(),..Default::default()});
-    let snapshot=record.handle.snapshot(None).expect("unconditional snapshot");
-    if snapshot.session_id!=receipt.replacement().launch.session_id {return Err(unavailable("The restarted actor has not confirmed its exact conversation identity"));}
-    let restart=state.chat_restarts.get_mut(&source.id).ok_or_else(||unavailable("The restart was closed before its receipt was published"))?;
-    restart.receipt=Some(receipt.clone());
-    restart.plan.release_completed();
+    let completed_pair={
+        let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+        let record=state.chats.get_mut(&source.id).filter(|record|record.handle.same_actor(actor)).ok_or_else(||unavailable("The restarted actor changed before its receipt was delivered"))?;
+        // Subscribe before fetching history so changes concurrent with a slow
+        // remote snapshot cannot fall into an unobserved attachment gap.
+        record.subscribers.entry(client).or_insert(false);
+        record.observations.entry(client).or_insert_with(||Observation{after_generation:record.handle.observe_next_update(),..Default::default()});
+        let restart=state.chat_restarts.get_mut(&source.id).filter(|restart|restart.actor.as_ref().is_some_and(|current|current.same_actor(actor)))
+            .ok_or_else(||unavailable("The restart changed before its completed console receipt could be retained"))?;
+        // Pair/model publication already succeeded. Retain that exact receipt
+        // BEFORE fallible history I/O, or retry would attempt the durable CAS
+        // again against the old accepted-console binding.
+        restart.receipt=Some(receipt.clone());
+        restart.plan.release_completed()
+    };
+    drop(completed_pair);
+    let snapshot=snapshot(actor).ok_or_else(||unavailable("The restarted provider's history is temporarily unavailable; its exact actor, console receipt and saved pane were retained. Retry this pane; no second provider was started"))?;
+    if snapshot.session_id!=receipt.replacement().launch.session_id {return Err(unavailable("The restarted actor has not confirmed its exact conversation identity; its actor and console receipt were retained"));}
+    let state=host.lock().unwrap_or_else(|p|p.into_inner());
+    if state.chats.get(&source.id).is_none_or(|record|!record.handle.same_actor(actor))
+        || state.chat_restarts.get(&source.id).is_none_or(|restart|restart.receipt.as_ref()!=Some(&receipt)
+            || restart.actor.as_ref().is_none_or(|current|!current.same_actor(actor))) {
+        return Err(unavailable("The restarted actor changed while its history was being read; no replacement was published"));
+    }
     Ok(ServerResponse::ChatRestarted{receipt,snapshot})
 }
 
@@ -242,6 +264,35 @@ for line in sys.stdin:
             assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap().lines().count(),generation+2);
             source=receipt.replacement().clone();actor=replacement;
         }
+        // A retained provider may fail or pause its history RPC after its
+        // console/model publication succeeded. Exercise the production
+        // publisher seam: unrelated HostState census stays available, the
+        // completed receipt survives, and retry must reuse this exact actor.
+        let (entered,pending)=std::sync::mpsc::channel();
+        let (release,released)=std::sync::mpsc::channel();
+        let publishing_host=host.clone();let publishing_source=source.clone();let publishing_actor=actor.clone();
+        let publisher=thread::spawn(move||{
+            let transition=transition_gate(&publishing_host,publishing_source.id);let _transition=transition.lock().unwrap();
+            let receipt={let mut state=publishing_host.lock().unwrap();let restart=state.chat_restarts.get_mut(&publishing_source.id).unwrap();restart.busy=true;restart.receipt.clone().unwrap()};
+            let _claim=Claim{host:publishing_host.clone(),id:publishing_source.id};
+            publish_with_snapshot(&publishing_host,1,&publishing_source,&publishing_actor,receipt,move|_|{
+                entered.send(()).unwrap();released.recv_timeout(Duration::from_secs(5)).unwrap();None
+            })
+        });
+        pending.recv_timeout(Duration::from_secs(5)).unwrap();
+        let census_host=host.clone();let census_actor=actor.clone();let census_id=source.id;
+        let (censused,census)=std::sync::mpsc::channel();
+        let census_worker=thread::spawn(move||{
+            let state=census_host.lock().unwrap();
+            censused.send((state.chats[&census_id].handle.same_actor(&census_actor),state.chat_restarts[&census_id].receipt.is_some())).unwrap();
+        });
+        assert_eq!(census.recv_timeout(Duration::from_secs(2)).expect("paused snapshot RPC must not hold HostState"),(true,true));
+        census_worker.join().unwrap();
+        release.send(()).unwrap();
+        assert!(publisher.join().unwrap().unwrap_err().message.contains("receipt"));
+        assert!(matches!(super::super::process(&host,1,ClientRequest::ChatAttach{session:source.clone()}).unwrap(),ServerResponse::ChatRestarted{..}));
+        assert!(host.lock().unwrap().chats[&source.id].handle.same_actor(&actor));
+        assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap().lines().count(),3);
         // Finish with a completed actor. Management close must never route
         // through ChatAttach, which would allocate generation four.
         std::fs::write(root.join("crash"),b"1").unwrap();let _=actor.command(chat::Command::Refresh);

@@ -512,6 +512,14 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
         record.handle.observe_next_update();
     }
 }
+// Actor metadata getters are cached; descriptor authentication never fetches
+// a potentially remote transcript while HostState is locked.
+fn session_descriptor(record:&Record)->Session {
+    let mut session=record.session.clone();
+    session.launch.session_id=record.handle.session_id();
+    session.native_continuity=record.handle.native_continuity();
+    session
+}
 fn session_snapshot(record: &Record) -> ServerResponse {
     let snapshot = record
         .handle
@@ -2130,9 +2138,7 @@ fn subscribe_exact_close(host:&SharedHost,client:ClientId,source:&Session)->Resu
     let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
     validate_proof(source.proof.as_ref(),state.proof())?;
     let record=state.chats.get(&source.id).ok_or_else(||unavailable("Exact native chat is not hosted; no replacement was started"))?;
-    let mut published=record.session.clone();
-    published.launch.session_id=record.handle.session_id();
-    published.native_continuity=record.handle.native_continuity();
+    let published=session_descriptor(record);
     let issued=source==&record.session || source==&published
         || state.chat_restarts.get(&source.id).is_some_and(|restart|restart.authorizes_close(source,&record.handle));
     if !issued {return Err(error("The close does not identify the exact hosted conversation; no provider was stopped"));}
