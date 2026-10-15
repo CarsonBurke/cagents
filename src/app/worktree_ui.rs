@@ -657,6 +657,13 @@ impl Cagents {
                     .map(Path::to_owned),
             )
             .chain(selected.map(Path::to_owned))
+            // A prepared but uncommitted alias still authorizes a physical
+            // lease. Reloading the displayed scope must keep its watch alive.
+            .chain(
+                self.worktree_selection
+                    .pending_directory()
+                    .map(Path::to_owned),
+            )
             .collect::<HashSet<_>>();
         self.worktree_owner_paths.retain_paths(paths.clone());
         for path in paths {
@@ -2928,12 +2935,51 @@ mod owner_path_cache_tests {
         app.repository_generations.insert(project, 4);
         drop(app.update(Message::RepositoryLoaded {
             open_cards: false, project_id: project, generation: 4,
-            result: Ok(Box::new(loaded)),
+            result: Ok(Box::new(loaded.clone())),
         }));
         assert!(app.worktree_selection.pending);
         assert_eq!(app.worktree_selection.generation_for_test(), pending_generation);
         assert_eq!(app.active_workspace.as_ref(), Some(&selected));
         assert_eq!(calls.load(Ordering::Relaxed), initial);
+        #[cfg(unix)]
+        {
+            let first = directory.path().join("unregistered-first");
+            let second = directory.path().join("unregistered-second");
+            let alias = directory.path().join("unregistered-alias");
+            std::fs::create_dir(&first).unwrap();
+            std::fs::create_dir(&second).unwrap();
+            std::os::unix::fs::symlink(&first, &alias).unwrap();
+            app.force_selection_guard_runtime_for_test(runtime.path().to_owned());
+            let task = app.select_worktree_then(alias.clone(), false, selection::Intent::EnsureDefaultPane);
+            let prepared = super::super::tests::task_app_message(task);
+            assert!(app.worktree_selection.pending);
+            assert!(matches!(
+                crate::worktree_cleanup::fixture_protection(runtime.path(), &first, true),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ), "the uncommitted receipt must actually hold the first target lease");
+            app.repository_generations.insert(project, 5);
+            drop(app.update(Message::RepositoryLoaded {
+                open_cards: false, project_id: project, generation: 5,
+                result: Ok(Box::new(loaded)),
+            }));
+            let epoch = app.worktree_owner_paths.watch.epoch();
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&second, &alias).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while app.worktree_owner_paths.watch.epoch() == epoch {
+                assert!(Instant::now() < deadline, "reload dropped the pending alias watch");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Consume the original receipt without delivering a UI notify
+            // message first; the watcher-owned epoch must fence it directly.
+            let old_generation = app.worktree_selection.generation_for_test();
+            drop(app.update(prepared));
+            assert_eq!(app.active_workspace.as_ref(), Some(&selected));
+            assert!(app.worktree_selection.pending);
+            assert_ne!(app.worktree_selection.generation_for_test(), old_generation);
+            assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), &first, true).is_ok(),
+                "stale physical lease must retire without exposing the retargeted alias");
+        }
     }
 
     #[test]

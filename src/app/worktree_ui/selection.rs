@@ -9,10 +9,14 @@ pub(in crate::app) struct State {
     pub(in crate::app) initialize_runtimes: bool,
     /// Superseded workers can still own a not-yet-delivered directory lease.
     pub(super) inflight: HashSet<u64>,
+    /// Keep lexical and physical watches alive until this navigation retires.
+    requested: Option<PathBuf>,
     #[cfg(test)]
     local_window_override: Option<bool>,
     #[cfg(test)]
     canonicalize_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    guard_runtime_override: Option<PathBuf>,
 }
 impl State {
     #[cfg(test)]
@@ -20,9 +24,14 @@ impl State {
         self.generation
     }
 
+    pub(super) fn pending_directory(&self) -> Option<&Path> {
+        self.requested.as_deref()
+    }
+
     pub(in crate::app) fn cancel(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = false;
+        self.requested = None;
     }
 }
 
@@ -250,6 +259,8 @@ impl Cagents {
         let watch = self.worktree_owner_paths.watch.clone();
         #[cfg(test)]
         let canonicalize_calls = self.worktree_selection.canonicalize_calls.clone();
+        #[cfg(test)]
+        let guard_runtime = self.worktree_selection.guard_runtime_override.clone();
         let prepare =
             self.prepare_worktree_selection(generation, path, create, intent, epoch, move |path| {
                 prepare_target(
@@ -265,6 +276,13 @@ impl Cagents {
                         path.canonicalize()
                     },
                     |path| {
+                        #[cfg(test)]
+                        if let Some(runtime) = &guard_runtime {
+                            return crate::worktree_cleanup::fixture_protection(
+                                runtime, path, false,
+                            )
+                            .map(Some);
+                        }
                         crate::worktree_cleanup::protect(path)?
                             .ok_or_else(|| {
                                 std::io::Error::other(
@@ -285,6 +303,11 @@ impl Cagents {
     ) {
         self.worktree_selection.local_window_override = Some(true);
         self.worktree_selection.canonicalize_calls = Some(calls);
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn force_selection_guard_runtime_for_test(&mut self, runtime: PathBuf) {
+        self.worktree_selection.guard_runtime_override = Some(runtime);
     }
 
     /// Repository discovery updates ownership without superseding a deliberate
@@ -363,6 +386,7 @@ impl Cagents {
         + 'static,
     ) -> Task<Message> {
         self.worktree_selection.inflight.insert(generation);
+        self.worktree_selection.requested = Some(path.clone());
         let roots = self.known_worktree_roots.clone();
         cosmic::task::future(async move {
             let requested = path.clone();
@@ -414,6 +438,7 @@ impl Cagents {
             return self.abandon_worktree_selection(intent);
         }
         self.worktree_selection.pending = false;
+        self.worktree_selection.requested = None;
         self.refresh_worktree_owners(Some(&requested));
         if roots != self.known_worktree_roots || epoch != self.worktree_owner_paths.watch.epoch() {
             return self.select_worktree_then(requested, create, intent);
