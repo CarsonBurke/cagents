@@ -3022,8 +3022,8 @@ impl SidebarState {
                 continue;
             }
             match entry.activity.state {
-                ActivityState::Working => return Some(ActivityState::Working),
-                ActivityState::Waiting => status = Some(ActivityState::Waiting),
+                ActivityState::Waiting => return Some(ActivityState::Waiting),
+                ActivityState::Working => status = Some(ActivityState::Working),
                 _ => {}
             }
         }
@@ -12775,6 +12775,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn waiting_agent_keeps_mixed_busy_worktree_in_attention_in_either_card_order() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let project = project_id(1);
+        let worktree = WorktreeId::from_uuid(Uuid::from_u128(2));
+        let low = CardId::from_uuid(Uuid::from_u128(4));
+        let high = CardId::from_uuid(Uuid::from_u128(5));
+        let activity = |state| Activity {
+            provider: Provider::Omp,
+            state,
+        };
+        for (working, waiting) in [(low, high), (high, low)] {
+            let mut state = SidebarState::default();
+            state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+            state.set_agent_activity(working, project, worktree, activity(ActivityState::Working));
+            state.set_agent_activity(waiting, project, worktree, activity(ActivityState::Waiting));
+            assert!(
+                !state.has_agent_update(project, worktree),
+                "visibility must come from Waiting, not unread"
+            );
+            assert_eq!(
+                state.agent_activity(project, worktree),
+                Some(ActivityState::Waiting)
+            );
+            let visible = filtered_projects(&model, &state, false);
+            assert_eq!(visible.len(), 1);
+            assert_eq!(visible[0].project.id, project);
+            assert_eq!(
+                visible[0]
+                    .worktrees
+                    .iter()
+                    .map(|row| row.id)
+                    .collect::<Vec<_>>(),
+                vec![worktree]
+            );
+            drop(visible);
+
+            state.set_agent_activity(waiting, project, worktree, activity(ActivityState::Idle));
+            assert_eq!(
+                state.agent_activity(project, worktree),
+                Some(ActivityState::Working)
+            );
+            assert!(filtered_projects(&model, &state, false).is_empty());
+            state.set_agent_activity(
+                waiting,
+                project_id(99),
+                worktree,
+                activity(ActivityState::Waiting),
+            );
+            assert_eq!(
+                state.agent_activity(project, worktree),
+                Some(ActivityState::Working)
+            );
+            assert!(
+                filtered_projects(&model, &state, false).is_empty(),
+                "another project's waiting actor cannot keep this row"
+            );
+        }
+    }
+
+    #[test]
     fn working_agents_aggregate_without_clearing_other_agents_or_unread_updates() {
         use crate::agent::{Activity, ActivityState, Provider};
         let mut state = SidebarState::default();
@@ -12792,7 +12853,7 @@ pub(crate) mod tests {
         state.set_agent_activity(second, project, worktree, activity(ActivityState::Waiting));
         assert_eq!(
             state.agent_activity(project, worktree),
-            Some(ActivityState::Working)
+            Some(ActivityState::Waiting)
         );
         assert_eq!(state.agent_activity(project, other), None);
         state.set_agent_activity(first, project, worktree, activity(ActivityState::Idle));
