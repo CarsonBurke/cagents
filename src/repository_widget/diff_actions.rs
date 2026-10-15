@@ -633,7 +633,7 @@ mod tests {
         runtime.set_diff_state(
             DiffBasis::HeadToIndex,
             DiffState::ready(RenderedDiff::Text {
-                model: crate::diff_view::build_diff(&before, &after),
+                model: Arc::new(crate::diff_view::build_diff(&before, &after)),
                 old_label: "HEAD".into(),
                 new_label: "Index".into(),
             }),
@@ -761,6 +761,21 @@ mod tests {
         assert!(runtime.diff_working_file_target(&request).is_some());
         runtime.generation += 1;
         assert!(runtime.diff_working_file_target(&request).is_none());
+    }
+
+    #[test]
+    fn worker_model_capture_shares_rows_and_excludes_a_stale_display_fallback() {
+        let (mut runtime,_,_) = fixture(DiffMode::Inline);
+        let first = runtime.current_diff_model_snapshot().unwrap();
+        let second = runtime.current_diff_model_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&first,&second));
+        let basis = runtime.diff_basis.clone();
+        let index = runtime.diffs.iter().position(|(candidate,_)| *candidate == basis).unwrap();
+        let (_,state) = runtime.diffs.remove(index);
+        runtime.stale_diff = Some((runtime.selected_path().unwrap().to_path_buf(),basis,state));
+        assert!(runtime.diff_model().is_some());
+        assert!(runtime.current_diff_model_snapshot().is_none());
+        assert!(first.inline_rows.len()>1);
     }
 
     #[test]
