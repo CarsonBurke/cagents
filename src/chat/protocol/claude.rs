@@ -472,8 +472,9 @@ impl Claude {
         // Refusal must not consume expired semantic outcomes and discard their
         // Step. Leave those entries for tick() unless this call can return the
         // expiry events together with its admitted request.
-        let active = self.controls.keys().filter(|id| {
-            self.control_deadlines.get(*id).is_none_or(|deadline| *deadline > now)
+        let active = self.controls.iter().filter(|(id, value)| {
+            string(value, "subtype") != "interrupt"
+                && self.control_deadlines.get(*id).is_none_or(|deadline| *deadline > now)
         }).count();
         if !interrupt && active >= MAX_PENDING {
             return Err("Too many pending Claude control operations".into());
@@ -2209,6 +2210,7 @@ impl Adapter for Claude {
                         request.as_object_mut().unwrap().remove("promptSuggestions");
                         let retry = self.followup_control(request, &acknowledgement, deadline)?;
                         step.writes.extend(retry.writes);
+                        step.events.extend(retry.events);
                         return Ok(step);
                     }
                     if string(&request, "subtype") == "initialize" {
@@ -2275,6 +2277,7 @@ impl Adapter for Claude {
                             let next = self.followup_control(json!({"subtype":"apply_flag_settings", "settings":{"effortLevel":request["_cagents_reasoning"]}}), &acknowledgement, deadline)?;
                             chained = true;
                             step.writes.extend(next.writes);
+                            step.events.extend(next.events);
                         }
                         "get_settings" => {
                             let snapshot =
@@ -2302,6 +2305,7 @@ impl Adapter for Claude {
                             let next = self.followup_control(json!({"subtype":"get_settings", "_cagents_permission_update":request["_cagents_permission_update"]}), &acknowledgement, deadline)?;
                             chained = true;
                             step.writes.extend(next.writes);
+                            step.events.extend(next.events);
                         }
                         "apply_flag_settings" if request["settings"].get("fastMode").is_some() => {
                             // Only the acknowledged session overlay changes this setting.
@@ -4261,8 +4265,13 @@ impl Claude {
             // the usage again exactly as a refresh does, rather than
             // narrating itself into the transcript.
             "compact_boundary" => {
-                let usage = self.control(json!({"subtype":"get_context_usage"}))?;
-                step.writes.extend(usage.writes);
+                match self.control(json!({"subtype":"get_context_usage"})) {
+                    Ok(usage) => {
+                        step.writes.extend(usage.writes);
+                        step.events.extend(usage.events);
+                    }
+                    Err(error) => tracing::warn!(%error, "Deferring advisory Claude context refresh while controls are full"),
+                }
             }
             // Auxiliary session frames are not transcript data. Each one used
             // to reach the transcript as a system item holding the raw JSON of
@@ -5568,6 +5577,43 @@ mod tests {
         assert!(!tick.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
         assert!(adapter.deferred_attention.is_empty());
         assert!(adapter.busy, "the new current turn must remain active");
+    }
+
+    #[test]
+    fn chained_settings_ack_preserves_expired_old_turn_evidence() {
+        let mut adapter = Claude { ready: true, busy: true, ..Default::default() };
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let old = interrupt.writes[0]["request_id"].as_str().unwrap().to_owned();
+        adapter.receive(json!({"type":"result","uuid":"A","subtype":"success","is_error":false})).unwrap();
+        let mut started = Step::default(); adapter.start_turn(&mut started); adapter.busy = true;
+        let setting = adapter.control(json!({"subtype":"set_model","model":"sonnet","_cagents_reasoning":"high"})).unwrap();
+        let setting = setting.writes[0]["request_id"].as_str().unwrap().to_owned();
+        adapter.control_deadlines.insert(old, std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let response = adapter.receive(reply(&setting, json!({}))).unwrap();
+        assert!(response.events.iter().any(|event| matches!(event,
+            Event::PastTurnFinished { key:Some(key), outcome:crate::notifications::Kind::Succeeded } if key=="claude:A")));
+        assert!(!response.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
+        assert!(adapter.deferred_attention.is_empty());
+        assert!(response.writes.iter().any(|frame| frame["request"]["subtype"]=="apply_flag_settings"));
+        assert!(adapter.busy);
+    }
+
+    #[test]
+    fn a_full_ordinary_control_pool_keeps_its_chained_slot_and_skips_advisory_refresh() {
+        let mut adapter = Claude { ready: true, busy: true, ..Default::default() };
+        let setting = adapter.control(json!({"subtype":"set_model","model":"sonnet","_cagents_reasoning":"high"})).unwrap();
+        let setting = setting.writes[0]["request_id"].as_str().unwrap().to_owned();
+        for _ in 1..MAX_PENDING { adapter.control(json!({"subtype":"get_context_usage"})).unwrap(); }
+        adapter.command(Command::Interrupt).unwrap();
+        assert_eq!(adapter.controls.len(), MAX_PENDING + 1);
+        let response = adapter.receive(reply(&setting, json!({}))).unwrap();
+        assert!(response.writes.iter().any(|frame| frame["request"]["subtype"]=="apply_flag_settings"),
+            "the emergency interrupt credit cannot consume an existing ordinary settings chain's slot");
+        assert_eq!(adapter.controls.len(), MAX_PENDING + 1);
+        let advisory = adapter.receive(json!({"type":"system","subtype":"compact_boundary"})).unwrap();
+        assert!(advisory.writes.is_empty());
+        assert!(!advisory.events.iter().any(|event| matches!(event, Event::Error { .. })));
+        assert_eq!(adapter.controls.len(), MAX_PENDING + 1);
     }
 
     #[test]
