@@ -2479,6 +2479,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
+        | Message::MovePaneToChannel { .. }
         | Message::TerminalReviewMode { .. }
         | Message::TerminalDropped { .. }
         | Message::ResizeCard { .. }
@@ -4057,6 +4058,7 @@ pub enum Message {
     },
     Sidebar(SidebarAction),
     FocusCard(CardId),
+    MovePaneToChannel { card: CardId, channel: crate::model::ChannelId },
     TerminalReviewMode {
         card: CardId,
         terminal: crate::model::TerminalId,
@@ -14595,6 +14597,7 @@ impl Application for Cagents {
                 self.set_terminal_review_owner(None);
                 self.focus_workspace_card(id)
             }
+            Message::MovePaneToChannel { card, channel } => self.move_pane_to_channel(card, channel),
             Message::TerminalReviewMode {
                 card,
                 terminal,
@@ -17347,6 +17350,10 @@ impl Application for Cagents {
         );
         let surface = crate::input_trace::observe(surface, &self.input_trace);
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
+        let surface = crate::reorder::channel_scope(surface, widget::Id::new("workspace.tabs"),
+            !self.workspace_inputs_blocked(),
+            |card, channel| self.can_move_pane_to_channel(card, channel),
+            |card, channel| Message::MovePaneToChannel { card, channel });
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,

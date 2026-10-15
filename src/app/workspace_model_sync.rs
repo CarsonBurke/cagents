@@ -56,6 +56,7 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
+    PaneTransferFailed { operation: uuid::Uuid, error: String },
     Ranked {
         channel: ChannelId,
         ordinal: u32,
@@ -206,6 +207,11 @@ fn publish(
                     ) {
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
+                    }
+                    if let ModelEdit::ChangeView { operation, change: crate::workspace_model::views::Change::Transfer { .. }, .. } = &request {
+                        let _ = updates.send_blocking(ModelUpdate::PaneTransferFailed {
+                            operation: *operation, error: error.to_string(),
+                        });
                     }
                     if let ModelEdit::ReopenProject { repository, .. } = request {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
@@ -395,6 +401,10 @@ impl Cagents {
 
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::PaneTransferFailed { operation, error } => {
+                self.reject_pane_transfer(operation, error);
+                Task::none()
+            }
             ModelUpdate::NavigationFailed(error) => {
                 self.status = Some(TransientNotice::warning(format!(
                     "Could not reorder the sidebar: {error}"
