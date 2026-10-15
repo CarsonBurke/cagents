@@ -18719,7 +18719,7 @@ impl Application for Cagents {
         // completions and optional file lookup. Its later async reply remains
         // conservative. Keep the normal focus/persistence tail, but do not
         // invalidate every workspace/sidebar projection for each character.
-        let projection_neutral = matches!(&message, Message::ChatUi(
+        let mut projection_neutral = matches!(&message, Message::ChatUi(
             chat_ui::Action::Composer(..) | chat_ui::Action::ComposerCursor(..)
         ));
         let terminal_wake = matches!(&message, Message::TerminalWake { .. });
@@ -22087,7 +22087,22 @@ impl Application for Cagents {
                             };
                             self.run_workspace_command(command, modifiers)
                         }
-                        None => Task::none(),
+                    None => {
+                        // The subscription also reports the native text
+                        // control's captured press and ignored release. Only
+                        // after every local/global handler declined the event
+                        // can an ordinary character be projection-neutral.
+                        // Modified chords and non-character keys stay
+                        // conservative; a bound bare character took Some above.
+                        if matches!(&event,
+                            keyboard::Event::KeyPressed { key: keyboard::Key::Character(_), modifiers, .. }
+                            | keyboard::Event::KeyReleased { key: keyboard::Key::Character(_), modifiers, .. }
+                            if !modifiers.control() && !modifiers.alt() && !modifiers.logo()) {
+                            projection_neutral = true;
+                        }
+                        Task::none()
+                    },
+
                     }
                 })();
                 Task::batch([focus_task, route_task])

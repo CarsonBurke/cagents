@@ -13928,15 +13928,37 @@ mod tests {
         let before = app.update_tail.runs;
         let source = app.chat_return_session(card).unwrap();
         let target = chat_runtime(&app, card).target;
-        for _ in 0..10 { write(&mut app, card, "typed "); }
+        let press = || keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("t".into()), modified_key: keyboard::Key::Character("t".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT),
+            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(), text: Some("t".into()), repeat: false,
+        };
+        let release = || keyboard::Event::KeyReleased {
+            key: keyboard::Key::Character("t".into()), modified_key: keyboard::Key::Character("t".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT),
+            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(),
+        };
+        for _ in 0..10 {
+            drop(app.update(Message::KeyEvent { event: press(), captured: true }));
+            drop(app.update(Message::ChatUi(Action::Composer(target, text_editor::Action::Edit(text_editor::Edit::Insert('t'))))));
+            drop(app.update(Message::KeyEvent { event: release(), captured: false }));
+        }
         let cursor = text_editor::Cursor { position: text_editor::Position { line: 0, column: 2 }, selection: None };
         drop(app.update(Message::ChatUi(Action::ComposerCursor(target, cursor))));
         assert_eq!(app.update_tail.runs, before, "composer-only messages do not rebuild any cached workspace projection");
-        assert_eq!(chat_runtime(&app, card).composer.text(), "typed ".repeat(10));
+        assert_eq!(chat_runtime(&app, card).composer.text(), "t".repeat(10));
         assert_eq!(chat_runtime(&app, card).composer.cursor(), cursor);
         assert_eq!(app.chat_return_session(card), Some(source));
         assert!(!app.chat_start_pending(card));
         assert!(chat_runtime(&app, card).is_draft());
+        let semantic_before = app.update_tail.runs;
+        drop(app.update(Message::KeyEvent { event: keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("f".into()), modified_key: keyboard::Key::Character("f".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyF), location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false,
+        }, captured: false }));
+        assert!(chat_runtime(&app, card).find.is_some(), "the semantic Find shortcut still executes");
+        assert!(app.update_tail.runs.iter().zip(semantic_before).all(|(after, before)| *after > before));
         // This exemption is narrow. Existing unknown/semantic paths retain
         // conservative invalidation instead of silently hiding future inputs.
         drop(app.update(Message::Sidebar(crate::sidebar::SidebarAction::SearchChanged("different".into()))));
