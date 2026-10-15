@@ -574,6 +574,47 @@ mod tests {
     }
 
     #[test]
+    fn lost_positive_settlement_reply_releases_only_original_heavy_custody_on_same_operation_retry() {
+        if isolated_custody("host::project_removal::tests::lost_positive_settlement_reply_releases_only_original_heavy_custody_on_same_operation_retry") {return;}
+        use crate::project_recovery::{ProjectOperationRequest,ProjectOperationAction,ProjectOperationOutcome,ProjectOperationPhase};
+        let mut fixture=Fixture::new();let selected=fixture.spawn(crate::model::TerminalId::new());
+        let other=fixture._directory.path().join("independent-project");std::fs::create_dir(&other).unwrap();
+        let independent={
+            let mut state=fixture.host.lock().unwrap();
+            let model=state.edit_model(1,ModelEdit::OpenProject{repository:other.clone(),checkout:None,primary_checkout:None,name:"Other".into(),kind:ProjectKind::Folder}).unwrap();
+            ProjectInstance{registry:model.identity,repository:other.clone(),ordinal:model.project(&other).unwrap().ordinal}
+        };
+        let b=ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:independent,action:ProjectOperationAction::Remove{sessions:Vec::new()}};
+        let held=hold_final_commit(&fixture.host,b.operation);
+        assert!(matches!(operation_reply(&fixture.host,b.clone()),ProjectOperationOutcome::Pending{phase:ProjectOperationPhase::PendingCommit,..}));
+        let (_,original_b)=reservation::retained_operation(&fixture.host,b.operation).unwrap();
+        fixture.host.lock().unwrap().project_operation_before_commit=None;drop(held);
+        let a=ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:fixture.expected.clone(),action:ProjectOperationAction::Remove{sessions:vec![selected]}};
+        let operation=a.operation;
+        fixture.host.lock().unwrap().project_operation_after_settlement=Some(Arc::new(move |current| {
+            assert_eq!(current,operation);Err("Injected lost completion after actual resolved SQL COMMIT".into())
+        }));
+        assert!(matches!(operation_reply(&fixture.host,a.clone()),ProjectOperationOutcome::Pending{phase:ProjectOperationPhase::ModelCommitted,..}));
+        assert!(fixture.handles[0].is_completed(),"the actual selected terminal already closed");
+        let (_,original_a)=reservation::retained_operation(&fixture.host,a.operation).unwrap();
+        assert!(original_a.retains_prepared());assert!(!original_a.is_settled());
+        let registry=super::super::agent_execution::registry(&fixture.host).unwrap();
+        assert_eq!(registry.lock().unwrap().project_operation(a.operation).unwrap().unwrap().phase,super::super::model::project_operations::Phase::Resolved,"this is a real committed receipt, not a simulated server outcome");
+        assert!(ensure_available(&fixture.host,Some(&fixture.root),None,None).is_err());
+        assert!(ensure_available(&fixture.host,Some(&other),None,None).is_err());
+        fixture.host.lock().unwrap().project_operation_after_settlement=None;
+        assert!(matches!(operation_reply(&fixture.host,a),ProjectOperationOutcome::Committed{..}));
+        assert!(original_a.is_settled());assert!(!original_a.retains_prepared(),"positive replay releases the retained owner roster/FD phase");
+        assert!(reservation::retained_operation(&fixture.host,operation).is_none());
+        let (_,still_b)=reservation::retained_operation(&fixture.host,b.operation).unwrap();
+        assert!(Arc::ptr_eq(&original_b,&still_b));assert!(!still_b.is_settled());assert!(still_b.retains_prepared());
+        assert!(ensure_available(&fixture.host,Some(&other),None,None).is_err());
+        assert!(ensure_available(&fixture.host,Some(&fixture.root),None,None).is_ok());
+        assert!(fixture.host.lock().unwrap().read_model().unwrap().project(&other).is_some());
+        assert!(matches!(operation_reply(&fixture.host,b),ProjectOperationOutcome::Committed{..}));
+    }
+
+    #[test]
     fn final_prepared_model_edit_refuses_an_alias_retarget_after_admission() {
         use std::os::unix::fs::symlink;
         for repository_alias in [false, true] {

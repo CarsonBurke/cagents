@@ -33,6 +33,10 @@ pub(super) struct Operation {
 }
 impl Operation {
     pub(super) fn is_settled(&self)->bool {self.settled.load(Ordering::Acquire)}
+    #[cfg(test)]
+    pub(super) fn retains_prepared(&self)->bool {
+        matches!(*self.work.lock().unwrap_or_else(|p|p.into_inner()),Work::Locate(_)|Work::Remove(_))
+    }
     pub(super) fn lost(row:&Obligation,scope:&SavedScope)->Result<Self,String> {
         Ok(Self{operation:row.operation,project:scope.project.clone(),request:None,
             request_digest:row.request_digest.clone(),commit_digest:row.commit_digest.clone(),
@@ -224,6 +228,14 @@ pub(in crate::host) fn process(host:&SharedHost,client:ClientId,request:Request)
         Ok(model)=> {
             if let Err(reason)=authority.advance_phase(host,Phase::ModelCommitted,Phase::Resolved) {
                 return pending(operation.operation,PublicPhase::ModelCommitted,format!("The model commit completed, but its final custody receipt is pending: {}",reason.message));
+            }
+            #[cfg(test)] {
+                // Owning fixture simulates a lost settlement completion AFTER
+                // the real SQL COMMIT, before releasing original heavy custody.
+                let hook=host.lock().unwrap_or_else(|p|p.into_inner()).project_operation_after_settlement.clone();
+                if let Some(hook)=hook && let Err(reason)=hook(operation.operation) {
+                    return pending(operation.operation,PublicPhase::ModelCommitted,reason);
+                }
             }
             operation.settled.store(true,Ordering::Release);*work=Work::Complete;
             drop(work);drop(claim);drop(reservation);

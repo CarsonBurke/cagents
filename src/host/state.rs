@@ -306,6 +306,8 @@ pub(crate) struct HostState {
     pub(super) chat_transition_gates: BTreeMap<TerminalId,std::sync::Weak<Mutex<()>>>,
     #[cfg(test)]
     pub(super) project_operation_before_commit: Option<Arc<dyn Fn(uuid::Uuid)+Send+Sync>>,
+    #[cfg(test)]
+    pub(super) project_operation_after_settlement: Option<Arc<dyn Fn(uuid::Uuid)->Result<(),String>+Send+Sync>>,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
@@ -340,6 +342,8 @@ impl HostState {
             chat_transition_gates: BTreeMap::new(),
             #[cfg(test)]
             project_operation_before_commit: None,
+            #[cfg(test)]
+            project_operation_after_settlement: None,
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
