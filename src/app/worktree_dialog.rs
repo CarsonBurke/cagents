@@ -1517,13 +1517,18 @@ mod tests {
 
     /// Settles a creation as the journal does when Git created nothing.
     fn not_created(app: &mut Cagents, id: OperationId, detail: &str) {
+        let mut request = request(id);
+        request.repository = app.worktree_operations[&id]
+            .repository()
+            .expect("the fixture started with a resolved request")
+            .to_path_buf();
         let _ = app.finish_worktree_operation(
             id,
             1,
             Ok(crate::repository::WorktreeOperationReport {
                 operation_id: id,
                 generation: 1,
-                request: Some(request(id)),
+                request: Some(request),
                 state: WorktreeOperationState::NotCreated,
                 outcome: None,
                 detail: detail.into(),

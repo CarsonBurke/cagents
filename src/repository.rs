@@ -12978,6 +12978,12 @@ mod worktree_journal_tests {
         );
         let mut input = fixture.input("from-cached-topic");
         input.base = "topic".into();
+        fixture.resolve(input.clone());
+        assert!(
+            matches!(&fixture.request.base, BaseRevision::LocalBranch(branch) if branch.as_str() == "topic"),
+            "the local branch created above wins for an unqualified base"
+        );
+        input.base = "refs/remotes/team/nested/topic".into();
         fixture.resolve(input);
         assert!(
             matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic")

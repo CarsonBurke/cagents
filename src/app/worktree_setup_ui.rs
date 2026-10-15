@@ -1651,7 +1651,14 @@ mod tests {
         next.kind = CardKind::Terminal(session);
         Arc::make_mut(&mut app.durable).cards.push(next);
         app.refresh_worktree_setup_rows();
-        assert_eq!(app.setup_ui.terminals[&path].0, 100);
+        assert!(
+            !app.setup_ui.terminals.contains_key(&path),
+            "neither saved run proves the current checkout before receipt verification"
+        );
+        assert!(matches!(
+            app.setup_ui.statuses.get(&path),
+            Some(WorktreeSetupStatus::Interrupted(_))
+        ));
         app.recover_worktree_setup(
             current,
             path.clone(),
