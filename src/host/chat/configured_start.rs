@@ -13,6 +13,12 @@ pub(super) fn start(
 ) -> Result<ServerResponse, ProtocolError> {
     intent.validate().map_err(error)?;
     require_fresh(host, intent.id)?;
+    // The outer request still holds the existing shared control admission.
+    // Account mutation installs under its writer, so this refusal protects
+    // factory account/project default-mode reads as well as the later spawn.
+    super::super::account_lifecycle::ensure_idle(host).map_err(|_| unavailable(
+        "An account operation is still using credential directories. Wait for it to finish before starting a new conversation.",
+    ))?;
     // These paths and settings belong to this daemon. No path to a settings
     // file, executable, account home or environment comes from the request.
     // Keep all configuration and filesystem reads outside HostLock.
@@ -321,6 +327,26 @@ mod tests {
         fn prepare(&self) -> Result<Session, String> {
             prepare_at(&self.intent, &self.settings, &self.store, &self.homes, None)
         }
+    }
+
+    #[test]
+    fn configured_ingress_refuses_account_mutation_before_factory_reads_or_start_reservation() {
+        let fixture = Fixture::new();
+        let account_home = fixture.directory.path().join("reserved-home");
+        fs::create_dir(&account_home).unwrap();
+        let account = Account::linked(Provider::Codex, uuid::Uuid::new_v4(), account_home);
+        let host = crate::host::AccountReservation::test_host();
+        let _reservation = crate::host::AccountReservation::test_install(
+            &host, &[account], fixture.store.clone(), &fixture.homes,
+        ).unwrap();
+        // Exercise the actual ingress. It must refuse before looking up the
+        // installation's settings/registry or touching any provider endpoint.
+        let failure = start(&host, 1, fixture.intent.clone()).unwrap_err();
+        assert!(failure.message.contains("account operation"), "{failure:?}");
+        assert!(failure.retryable);
+        let state = host.lock().unwrap();
+        assert!(state.chat_spawning.is_empty());
+        assert!(state.chats.is_empty());
     }
 
     #[test]
