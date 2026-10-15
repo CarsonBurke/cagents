@@ -394,14 +394,6 @@ mod tests {
         assert!(!super::super::load(&path).unwrap().agents.contains_key("claude"), "explicit provider-table reset must still remove it");
     }
 
-    #[test]
-    fn account_execution_validation_ignores_conversation_defaults_only() {
-        let configuration = AgentLaunchSettings { model: Some("future\nmodel".into()), permission_mode: Some("future-mode".into()), ..Default::default() };
-        assert!(configuration.validate(Provider::Claude).is_err());
-        configuration.validate_execution(Provider::Claude).unwrap();
-        let invalid = AgentLaunchSettings { executable: Some("/missing/pinned-wrapper".into()), ..configuration };
-        assert!(invalid.validate_execution(Provider::Claude).is_err());
-    }
 
     #[test]
     fn account_execution_validation_ignores_conversation_defaults_only() {
