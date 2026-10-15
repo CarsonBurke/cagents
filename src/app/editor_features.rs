@@ -207,6 +207,18 @@ mod tests {
     }
 
     #[test]
+    fn save_and_close_may_format_only_the_buffer_named_by_its_confirmation() {
+        let mut app = app();
+        let card = CardId::new();
+        app.dirty_repository_close = Some(DirtyRepositoryClose { card, remaining: VecDeque::new(), intent: DirtyCloseIntent::Card(card), focused: DirtyCloseControl::Save, restore_card: Some(card) });
+        assert!(app.modal_is_open());
+        assert!(!app.editor_feature_action_blocked(&Action::Format { card, selection: false, save_after: true }));
+        assert!(app.editor_feature_action_blocked(&Action::Format { card: CardId::new(), selection: false, save_after: true }));
+        assert!(app.editor_feature_action_blocked(&Action::Format { card, selection: false, save_after: false }));
+        assert!(app.editor_feature_action_blocked(&Action::Rename(card)));
+    }
+
+    #[test]
     fn window_close_waits_for_unopened_only_publication_without_exiting_mid_write() {
         let mut app = app();
         let card = CardId::new();
@@ -512,10 +524,21 @@ impl Cagents {
         }
     }
 
-    pub(super) fn update_editor_features(&mut self, action: Action) -> Task<Message> {
-        if (self.modal_is_open() || crate::device::is_remote()) && matches!(&action,
+    fn editor_feature_action_blocked(&self, action: &Action) -> bool {
+        let user_action = matches!(action,
             Action::Rename(_) | Action::RenameDraft(..) | Action::SubmitRename(..) | Action::Format { .. }
-            | Action::CodeActions(_) | Action::ChooseCodeAction(..) | Action::Signature(..)) { return Task::none(); }
+            | Action::CodeActions(_) | Action::ChooseCodeAction(..) | Action::Signature(..));
+        if !user_action { return false; }
+        if crate::device::is_remote() { return true; }
+        // Save-and-close is an explicit answer to the dirty-buffer dialog.
+        // Its format phase must not be refused by that same dialog's hold.
+        let close_save = matches!(action, Action::Format { card, save_after: true, .. }
+            if self.dirty_repository_close.as_ref().is_some_and(|close| close.card == *card));
+        self.modal_is_open() && !close_save
+    }
+
+    pub(super) fn update_editor_features(&mut self, action: Action) -> Task<Message> {
+        if self.editor_feature_action_blocked(&action) { return Task::none(); }
         match action {
             Action::Rename(card) => {
                 let Some(operation) = self.editor_operation(card, LspEditKind::Rename) else { return Task::none(); };
