@@ -1,8 +1,16 @@
 use super::*;
 use crate::account::info::{Query, Report};
 
+mod list;
+
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountCommand {
+    /// List active accounts and any retained caller account from the selected daemon.
+    List {
+        /// Limit account rows to this provider; never probe its CLI.
+        #[arg(long, value_parser = crate::control::agents::parse_provider)]
+        provider: Option<crate::agent::Provider>,
+    },
     /// Read caller context and configured account plan allowances without probing.
     Info {
         /// Limit account rows to this provider.
@@ -18,23 +26,21 @@ pub enum AccountCommand {
 }
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
-    let AccountCommand::Info {
-        provider,
-        account,
-        refresh,
-    } = command;
+    let (query, listing) = match command {
+        AccountCommand::List { provider } => (list::query(provider), true),
+        AccountCommand::Info { provider, account, refresh } => (
+            Query { provider, account, refresh },
+            false,
+        ),
+    };
     let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
-    let deadline = refresh.then(|| Instant::now() + Duration::from_secs(90));
+    let deadline = query.refresh.then(|| Instant::now() + Duration::from_secs(90));
     let report = match client
         .agent_before(
             Authority::from_environment(),
-            crate::agent_execution::Operation::AccountInfo(Query {
-                provider,
-                account,
-                refresh,
-            }),
+            crate::agent_execution::Operation::AccountInfo(query),
             deadline,
         )
         .map_err(protocol_error)?
@@ -47,6 +53,9 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
             ));
         }
     };
+    if listing {
+        return Ok(list::output(&report));
+    }
     Ok(CommandOutput {
         command: "account.info",
         human: human(&report),

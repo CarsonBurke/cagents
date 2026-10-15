@@ -19,6 +19,7 @@ use thiserror::Error;
 
 mod accounts;
 pub use accounts::AccountCommand;
+mod format;
 mod agents;
 mod channels;
 pub use agents::AgentCommand;
