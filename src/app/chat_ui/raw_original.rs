@@ -84,7 +84,7 @@ impl State {
         let mut changed=false;
         for entry in self.entries.values_mut() {
             let mut entry_changed=entry.attempt.take().is_some();
-            if let Some(loaded)=entry.loaded.take() {entry.rehydrating=entry.opened;retire_loaded(loaded);entry_changed=true;}
+            if let Some(loaded)=entry.loaded.take() {entry.rehydrating=entry.opened;entry.error=None;retire_loaded(loaded);entry_changed=true;}
             if let Some(text)=entry.restored.take() {entry.rehydrating=entry.opened;retire(text);entry_changed=true;}
             if entry_changed {entry.revision=next_revision();}changed |=entry_changed;
         }
