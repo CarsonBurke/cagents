@@ -3752,6 +3752,39 @@ impl ShortcutDraft {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn language_registry_requires_live_negotiated_providers_for_the_runtime_document() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let root = tempfile::tempdir().unwrap();
+        let card = CardId::new();
+        let doc = crate::lsp::LspDocumentId(79);
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "call();\n");
+        runtime.descriptor.worktree = root.path().into();
+        runtime.descriptor.repository = root.path().into();
+        runtime.set_lsp_document(Some(doc));
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.lsp = crate::lsp::LspManager::fixture_ready_code_actions(doc,
+            &root.path().join("source.rs"), root.path(), "call();\n").await;
+        app.lsp_documents.insert(doc, card);
+        app.lsp_contexts.entry(card).or_default().document = Some(doc);
+        assert!(app.lsp.capabilities(doc).ready);
+        assert!(app.lsp.document_version(doc).is_some());
+        let diagnostics = workspace_widget::editor_language_command_bit(Command::ShowDiagnostics).unwrap();
+        assert_eq!(app.command_context(Some(card)).editor_language_commands, diagnostics,
+            "a Ready code-action-only server must expose local pushed diagnostics, without advertising unsupported providers");
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
+            runtime.set_lsp_document(Some(crate::lsp::LspDocumentId(80)));
+        }
+        assert_eq!(app.command_context(Some(card)).editor_language_commands, 0,
+            "another mounted document cannot borrow the manager's Ready capability");
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
+            runtime.set_lsp_document(Some(doc));
+        }
+        app.lsp.begin_shutdown().await;
+        assert_eq!(app.command_context(Some(card)).editor_language_commands, 0,
+            "retired session commands must disappear");
+    }
+
     #[test]
     fn utility_destinations_are_registered_bindable_and_use_actual_workspace_dispatch() {
         for (command, account) in [(Command::OpenAutomations, false), (Command::OpenAgentAccounts, true)] {
