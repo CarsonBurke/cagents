@@ -4815,11 +4815,14 @@ fn load_terminal(
 /// The caller must read and validate this card's kind/existence in that same
 /// transaction; this helper never opens a store or changes its schema/state.
 pub(crate) fn read_migration_session_at(
-    connection:&Connection,card:CardId,kind:&str,content:Option<&str>,
-)->Result<CardKind>{
-    const MAX_DESCRIPTOR_BYTES:usize=4*1024*1024;
+    connection: &Connection,
+    card: CardId,
+    kind: &str,
+    content: Option<&str>,
+) -> Result<CardKind> {
+    const MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
     match kind {
-        "terminal"=>{
+        "terminal" => {
             // Check lengths in SQLite before allocating any descriptor fields
             // in Rust, including the nullable provenance and transcript path.
             let bounded:Option<bool>=connection.query_row(
@@ -4829,11 +4832,29 @@ pub(crate) fn read_migration_session_at(
                     + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
                  FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1",
                 params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64],|row|row.get(0)).optional()?;
-            if bounded!=Some(true) {return Err(StoreError::corrupt_row(format!("migration terminal card {card}"),"missing or oversized immutable descriptor"));}
-            load_terminal_record(connection,card).map(CardKind::Terminal)
-        },
-        "chat"=>from_json("migration chat",content.filter(|value|value.len()<=MAX_DESCRIPTOR_BYTES).ok_or_else(||StoreError::corrupt_row(format!("migration chat card {card}"),"missing or oversized session descriptor"))?).map(CardKind::Chat),
-        _=>Err(StoreError::InvalidState("Migration inspection requires a saved native or terminal pane".into())),
+            if bounded != Some(true) {
+                return Err(StoreError::corrupt_row(
+                    format!("migration terminal card {card}"),
+                    "missing or oversized immutable descriptor",
+                ));
+            }
+            load_terminal_record(connection, card).map(CardKind::Terminal)
+        }
+        "chat" => from_json(
+            "migration chat",
+            content
+                .filter(|value| value.len() <= MAX_DESCRIPTOR_BYTES)
+                .ok_or_else(|| {
+                    StoreError::corrupt_row(
+                        format!("migration chat card {card}"),
+                        "missing or oversized session descriptor",
+                    )
+                })?,
+        )
+        .map(CardKind::Chat),
+        _ => Err(StoreError::InvalidState(
+            "Migration inspection requires a saved native or terminal pane".into(),
+        )),
     }
 }
 
