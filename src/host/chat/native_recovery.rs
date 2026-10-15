@@ -167,6 +167,7 @@ fn restore_authenticated(
     record: registry::Record,
     recovery: chat::native_holder::Recovery,
 ) -> Result<ServerResponse, String> {
+    let presentations = chat::native_holder::presentation_sources(&record, &recovery)?;
     let mut retained: Vec<_> = recovery
         .previous_sources
         .iter()
@@ -174,6 +175,7 @@ fn restore_authenticated(
         .chain(std::iter::once(recovery.source.clone()))
         .map(crate::agent_execution::HostedSession::Chat)
         .collect();
+    retained.extend(presentations.iter().cloned().map(crate::agent_execution::HostedSession::Chat));
     retained.push(crate::agent_execution::HostedSession::Chat(source.clone()));
     let execution_registry = super::super::agent_execution::registry(host)?;
     let directory = execution_registry
@@ -198,6 +200,7 @@ fn restore_authenticated(
     let paired_holder = recovery.paired_holder.clone();
     let expected_thread = recovery.confirmed_thread.clone();
     let mut sources = recovery.previous_sources.clone();
+    sources.extend(presentations);
     sources.push(recovery.source.clone());
     if !sources.contains(source) { sources.push(source.clone()); }
     let weak = Arc::downgrade(host);

@@ -91,6 +91,35 @@ pub(crate) fn recognized_source(record: &Record, recovery: &Recovery, requested:
     Err("Native holder does not recognize this exact issued descriptor".into())
 }
 
+/// Additional presentations genuinely witnessed by the authenticated holder.
+/// Automatic orphan adoption must retain these before an unopened saved pane
+/// arrives; hash-only cleanup attestations never invent a full descriptor.
+pub(crate) fn presentation_sources(record: &Record, recovery: &Recovery) -> Result<Vec<Session>, String> {
+    if record.kind != Kind::Native || record.application != crate::instance::APPLICATION_ID
+        || record.terminal != recovery.source.id
+        || recovery.source.proof.as_ref().is_none_or(|proof| proof.boot_id != record.boot) {
+        return Err("Native presentations lack exact holder identity".into());
+    }
+    recovery.validate(&record.boot)?;
+    let confirmation = Confirmation::from_recovery(recovery)?;
+    let mut presentations = Vec::new();
+    let mut bytes = 0usize;
+    for source in recovery.previous_sources.iter().chain(std::iter::once(&recovery.source)).filter(|source| source.launch.session_id.is_none()) {
+        for continuity in [NativeContinuity::ReconnectOnly, NativeContinuity::Durable { provider_version: confirmation.version.clone() }] {
+            let mut presentation = source.clone();
+            presentation.launch.session_id = Some(confirmation.thread.clone());
+            presentation.native_continuity = continuity;
+            if presentation == recovery.source || recovery.previous_sources.contains(&presentation) || presentations.contains(&presentation) { continue; }
+            bytes = bytes.saturating_add(serde_json::to_vec(&presentation).map_err(|e| e.to_string())?.len());
+            if presentations.len() >= 1024 || bytes > 4 * 1024 * 1024 {
+                return Err("Native presentation lineage is full; existing provider ownership was preserved".into());
+            }
+            presentations.push(presentation);
+        }
+    }
+    Ok(presentations)
+}
+
 /// The caller has authenticated the helper and its canonical wire descriptor.
 /// Persist before publishing the presentation; never evict an issued alias.
 pub(super) fn retain(record: &Record, recovery: &Recovery, published: &Session, wire: &Session) -> Result<(), String> {
@@ -109,6 +138,7 @@ impl Publisher {
     }
     /// `wire` is the exact canonical descriptor acknowledged by this helper.
     pub(super) fn retain(&self, record: &Record, published: &Session, wire: &Session) -> Result<(), String> {
+        if published == wire { return Ok(()); }
         let mut value = load(record)?.unwrap_or_else(|| Attestation { version: 1, record: record.clone(), confirmation: self.confirmation.clone(), bindings: Vec::new() });
         if value.confirmation != self.confirmation { return Err("Native alias server confirmation changed".into()); }
         let binding = Binding { published: source_digest(published)?, wire: source_digest(wire)? };
@@ -143,8 +173,9 @@ mod tests {
         let mut recovery = super::super::tests::recovery();
         let initial = recovery.source.clone();
         recovery.confirm("thread-retained".into(), super::super::tests::server_identity(), registry::Process { pid: 42, start: 1 }).unwrap();
-        // Reproduce the released helper's recipe rewrite, retaining the exact
-        // original None-ID alias as that helper did before confirmation.
+        // Released confirmation retains the exact initial None-ID alias.
+        // Fresh --remote recipes do not acquire a resume prefix here; only
+        // an existing resume ID would be rewritten by the released helper.
         crate::chat::protocol::align_resume_identity(&mut recovery.source.launch).unwrap();
         let record = Record { version: 3, build: None, kind: Kind::Native, application: crate::instance::APPLICATION_ID.into(), boot: initial.proof.as_ref().unwrap().boot_id.clone(), terminal: initial.id, holder: registry::Process { pid: 43, start: 2 }, root: registry::Process { pid: 42, start: 1 } };
         (record, recovery, initial)
@@ -158,6 +189,10 @@ mod tests {
             presentation.native_continuity = capability;
             assert_eq!(recognized_source(&record, &recovery, &presentation).unwrap(), initial);
         }
+        let projections = presentation_sources(&record, &recovery).unwrap();
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].native_continuity, NativeContinuity::ReconnectOnly);
+        assert_eq!(recognized_source(&record, &recovery, &projections[0]).unwrap(), initial);
         recovery.confirmed_thread = None;
         let mut named = initial; named.launch.session_id = Some("thread-retained".into());
         assert!(recognized_source(&record, &recovery, &named).is_err());
@@ -179,8 +214,12 @@ mod tests {
         let mut published = initial.clone();
         published.launch.session_id = recovery.confirmed_thread.clone();
         published.native_continuity = recovery.source.native_continuity.clone();
-        let wire = recognized_source(&record, &recovery, &published).unwrap();
-        let original = published.clone();
+        assert_eq!(published, recovery.source, "released fresh confirmation preserves the recipe");
+        let mut original = published.clone();
+        // Confirmed ID and durable capability occupy separate runtime locks;
+        // this named ReconnectOnly presentation is the bounded early alias.
+        original.native_continuity = NativeContinuity::ReconnectOnly;
+        let wire = recognized_source(&record, &recovery, &original).unwrap();
         let mut proof = published.proof.clone().unwrap(); proof.host_incarnation = crate::model::HostIncarnation::new("successor-one");
         recovery.adopt(&wire, proof.clone()).unwrap();
         retain(&record, &recovery, &original, &wire).unwrap();
@@ -196,10 +235,10 @@ mod tests {
         retain(&record, &recovered, &published, &recovered.source).unwrap();
         assert_eq!(recognized_source(&record, &recovered, &published).unwrap(), recovered.source);
         assert_eq!(recognized_source(&record, &recovered, &original).unwrap(), initial);
-        let hash = source_digest(&published).unwrap();
+        let hash = source_digest(&original).unwrap();
         assert!(!receipt_covers(&record, &hash, &[]).unwrap());
-        assert!(!receipt_covers(&record, &hash, &[source_digest(&initial).unwrap()]).unwrap());
-        assert!(receipt_covers(&record, &hash, &[source_digest(&recovered.source).unwrap()]).unwrap());
+        assert!(receipt_covers(&record, &hash, &[source_digest(&initial).unwrap()]).unwrap());
+        assert!(!receipt_covers(&record, &hash, &[source_digest(&recovered.source).unwrap()]).unwrap());
         for mutation in 0..7 {
             let mut forged = published.clone();
             match mutation {
@@ -221,7 +260,7 @@ mod tests {
         let mut full = load(&record).unwrap().unwrap();
         full.bindings = (0..MAX_BINDINGS).map(|index| { let mut hash = [0;32]; hash[..8].copy_from_slice(&(index as u64).to_le_bytes()); Binding { published: hash, wire: hash } }).collect();
         save(&full).unwrap();
-        assert!(retain(&record, &recovered, &published, &recovered.source).unwrap_err().contains("full"));
+        assert!(retain(&record, &recovered, &original, &recovered.source).unwrap_err().contains("full"));
         assert_eq!(load(&record).unwrap().unwrap().bindings, full.bindings);
         let bytes = fs::read(path(&record).unwrap()).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("--remote"));
