@@ -44,6 +44,7 @@ class OwnerCensus(unittest.TestCase):
         self.assertEqual(CENSUS["owner_totals"](owners)["chat_client"], {
             "owners": 0, "resident_bytes": 0})
         self.assertEqual(coverage["complete_owner_events"], 2)
+        self.assertEqual(CENSUS["observed_owner_totals"](owners, coverage)["chat_client"], {"owners": 0, "resident_bytes": 0})
 
     def test_stack_only_or_wrong_pid_does_not_qualify_owner_coverage(self):
         for text in (
@@ -90,10 +91,15 @@ class OwnerCensus(unittest.TestCase):
         self.assertEqual(coverage["complete_events_by_owner"]["chat_plain_copy_output"], 2)
 
     def test_absent_counter_has_no_observation_proof_even_when_other_owners_are_complete(self):
-        _, _, coverage = self.parse('cagents::memory: process_id=42 owner="chat_client" chat_id=chat resident_bytes=16\n')
+        owners, _, coverage = self.parse('cagents::memory: process_id=42 owner="chat_client" chat_id=chat resident_bytes=16\n')
         self.assertEqual(coverage["complete_events_by_owner"]["chat_client"], 1)
         self.assertEqual(coverage["complete_events_by_owner"]["chat_plain_copy_output"], 0)
         self.assertEqual(coverage["complete_events_by_owner"]["chat_source_pool"], 0)
+        totals = CENSUS["observed_owner_totals"](owners, coverage)
+        self.assertEqual(totals["chat_client"]["resident_bytes"], 16)
+        self.assertIsNone(totals["chat_plain_copy_output"]["retained_bytes"])
+        self.assertIsNone(totals["chat_source_pool"]["admitted_bytes"])
+        self.assertIsNone(totals["chat_source_pool"]["owners"])
 
     def test_global_copy_output_without_explicit_pid_is_not_attributed(self):
         with tempfile.TemporaryDirectory() as directory:

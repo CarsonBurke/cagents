@@ -104,6 +104,16 @@ def owner_totals(owners):
     return result
 
 
+def observed_owner_totals(owners, coverage):
+    totals = owner_totals(owners)
+    for owner, count in coverage["complete_events_by_owner"].items():
+        if count == 0:
+            # Absent instrumentation is not evidence of zero retained bytes.
+            # A complete zero or release event still produces measured zeros.
+            totals[owner] = {key: None for key in totals[owner]}
+    return totals
+
+
 def read_smaps(path):
     mappings = []
     current = None
@@ -187,7 +197,7 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     owners, stacks, coverage = trace_owners(args.log, args.pid)
-    report = {"schema_version": 5, "owner_totals": owner_totals(owners),
+    report = {"schema_version": 5, "owner_totals": observed_owner_totals(owners, coverage),
               "trace_coverage": coverage,
               "owner_counter_observed": {owner: count > 0 for owner, count in coverage["complete_events_by_owner"].items()},
               "unobserved_owner_totals_are_unavailable_not_measured_zero": True,
