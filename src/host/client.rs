@@ -543,6 +543,10 @@ pub(super) fn process_request(
                 ));
             }
             if presence.application == crate::notifications::Application::Cagents && !presence.sessions.is_empty() {
+                // The retirement reservation linearizes before a new saved
+                // pin. Retry rather than acknowledge ownership during cleanup.
+                host.lock().unwrap_or_else(|p| p.into_inner())
+                    .ensure_retention_available(&presence.sessions)?;
                 // This includes saved local panes absent from shared_views. A
                 // disconnect is not a card close, so pins remain durable.
                 if let Ok(registry) = super::agent_execution::registry(host) {
@@ -759,6 +763,8 @@ pub(super) fn process_request(
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::EditWorkspaceModel { edit } => {
+            host.lock().unwrap_or_else(|p| p.into_inner())
+                .ensure_view_retention_available(&edit)?;
             let model = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

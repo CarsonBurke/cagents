@@ -1,4 +1,6 @@
 mod presentation;
+mod retention;
+pub(super) use retention::Retirement;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -236,6 +238,7 @@ pub(crate) struct HostState {
     /// made per-frame allocation scale with the number of attached views.
     proof: Arc<HostSessionProof>,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
+    pub(super) terminal_retirements: BTreeMap<TerminalId, Retirement>,
     spawning: BTreeSet<TerminalId>,
     /// Covers the interval before a login's live TerminalRecord exists.
     browser_logins_spawning: BTreeSet<TerminalId>,
@@ -326,6 +329,7 @@ impl HostState {
             recover_holders: false,
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
+            terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
             browser_logins_spawning: BTreeSet::new(),
             clients: BTreeMap::new(),
@@ -734,6 +738,7 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<TerminalDescriptor, ProtocolError> {
+        self.ensure_retention_available(&[terminal_id])?;
         let record = self
             .terminals
             .get(&terminal_id)
@@ -980,6 +985,7 @@ impl HostState {
 
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
         let record = self.terminals.remove(&terminal_id)?;
+        self.terminal_retirements.remove(&terminal_id);
         self.notification_closed.remove(&terminal_id);
         if let Some(notifications) = &self.notifications {
             notifications.retire(terminal_id);
@@ -1028,26 +1034,33 @@ impl HostState {
         if self.shutting_down || self.upgrade.is_some() { return None; }
         self.terminals.iter().filter(|(id, record)| {
             record.handle.is_completed()
+                && !self.retention_blocked(**id, &record.handle)
                 && self.subscriptions.clients(**id).is_empty()
                 && !pinned.contains(*id)
                 && !self.chats.contains_key(*id)
                 && !self.chat_handoffs.contains_key(*id)
+                && !self.chat_spawning.contains_key(*id)
+                && !self.chat_bindings.contains_key(*id)
+                && !self.native_closing.contains_key(*id)
         }).filter_map(|(_, record)| record.completed_at?.checked_add(retention)).min()
     }
 
-    pub(super) fn retire_expired_terminals(
-        &mut self, now: Instant, retention: Duration, pinned: &BTreeSet<TerminalId>,
-    ) -> Vec<TerminalRecord> {
+    pub(super) fn expired_terminal_handles(
+        &self, now: Instant, retention: Duration, pinned: &BTreeSet<TerminalId>,
+    ) -> Vec<(TerminalId, TerminalHandle)> {
         if self.shutting_down || self.upgrade.is_some() { return Vec::new(); }
-        let expired = self.terminals.iter().filter(|(id, record)| {
+        self.terminals.iter().filter(|(id, record)| {
             record.handle.is_completed()
+                && !self.retention_blocked(**id, &record.handle)
                 && record.completed_at.and_then(|at| at.checked_add(retention)).is_some_and(|at| at <= now)
                 && self.subscriptions.clients(**id).is_empty()
                 && !pinned.contains(*id)
                 && !self.chats.contains_key(*id)
                 && !self.chat_handoffs.contains_key(*id)
-        }).map(|(id, _)| *id).collect::<Vec<_>>();
-        expired.into_iter().filter_map(|id| self.retire_terminal(id)).collect()
+                && !self.chat_spawning.contains_key(*id)
+                && !self.chat_bindings.contains_key(*id)
+                && !self.native_closing.contains_key(*id)
+        }).map(|(id, record)| (*id, record.handle.clone())).collect()
     }
 
     pub(super) fn close_terminal_attention(
@@ -6786,16 +6799,19 @@ for line in sys.stdin:
         let (mut state, id, handle) = completed_retention_fixture();
         let now = Instant::now();
         let retention = Duration::from_secs(10);
-        assert!(state.retire_expired_terminals(now, retention, &BTreeSet::new()).is_empty());
+        assert!(state.expired_terminal_handles(now, retention, &BTreeSet::new()).is_empty());
         state.unregister_client(1);
-        assert!(state.retire_expired_terminals(now, retention, &BTreeSet::from([id])).is_empty());
+        assert!(state.expired_terminal_handles(now, retention, &BTreeSet::from([id])).is_empty());
         assert!(state.terminal_retention_deadline(retention, &BTreeSet::from([id])).is_none());
-        let retired = state.retire_expired_terminals(now, retention, &BTreeSet::new());
+        let retired = state.expired_terminal_handles(now, retention, &BTreeSet::new());
         assert_eq!(retired.len(), 1);
-        assert!(!state.terminals.contains_key(&id));
-        // Teardown outside HostState releases the retained childless holder.
+        assert!(state.terminals.contains_key(&id), "eligibility alone cannot discard the cleanup owner");
+        // Only positive exact-family cleanup permits descriptor removal.
         let holder = handle.holder_identity().map(|identity| identity.holder.clone());
-        retired[0].handle.shutdown().unwrap();
+        retired[0].1.release_completed_holder_until(Instant::now() + Duration::from_secs(5)).unwrap();
+        let removed = state.retire_terminal_if_current(id, &retired[0].1).unwrap();
+        assert!(!state.terminals.contains_key(&id));
+        drop(removed);
         drop(retired);
         if let Some(holder) = holder {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -6814,8 +6830,8 @@ for line in sys.stdin:
         state.terminals.get_mut(&id).unwrap().completed_at = Some(now);
         let retention = Duration::from_secs(10);
         assert_eq!(state.terminal_retention_deadline(retention, &BTreeSet::new()), Some(now + retention));
-        assert!(state.retire_expired_terminals(now + retention - Duration::from_nanos(1), retention, &BTreeSet::new()).is_empty());
-        assert_eq!(state.retire_expired_terminals(now + retention, retention, &BTreeSet::new()).len(), 1);
+        assert!(state.expired_terminal_handles(now + retention - Duration::from_nanos(1), retention, &BTreeSet::new()).is_empty());
+        assert_eq!(state.expired_terminal_handles(now + retention, retention, &BTreeSet::new()).len(), 1);
         handle.shutdown().unwrap();
     }
 
@@ -6827,8 +6843,87 @@ for line in sys.stdin:
         assert!(state.terminal_retention_deadline(retention, &BTreeSet::new()).is_some());
         state.shutting_down = true;
         assert!(state.terminal_retention_deadline(retention, &BTreeSet::new()).is_none());
-        assert!(state.retire_expired_terminals(Instant::now(), retention, &BTreeSet::new()).is_empty());
+        assert!(state.expired_terminal_handles(Instant::now(), retention, &BTreeSet::new()).is_empty());
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn retirement_failure_retains_listed_worker_and_explicit_retry_without_an_overdue_timer() {
+        let (mut state, id, handle) = completed_retention_fixture();
+        state.unregister_client(1);
+        state.register_client(2);
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        let mut retirement = Retirement::submitting(handle.clone());
+        retirement.result = Some(result);
+        state.terminal_retirements.insert(id, retirement);
+        assert!(state.attach(2, id).is_err());
+        assert!(state.ensure_retention_available(&[id]).is_err());
+        assert!(state.terminal_retention_deadline(Duration::ZERO, &BTreeSet::new()).is_none());
+        assert!(state.terminals.contains_key(&id));
+        let gate = state.control_gate.clone();
+        let host = Arc::new(HostLock::new(state));
+        assert!(gate.try_read().is_ok(), "cleanup waiting must not retain global control admission");
+        // A constructed service outcome exercises the failure publication;
+        // this is not a claim that a legacy helper was actually contacted.
+        reply.send(Err("fixture cleanup unconfirmed".into())).unwrap();
+        let mut lifecycle = crate::host::lifecycle::Lifecycle::testing(Duration::ZERO);
+        assert!(lifecycle.maintain(&host, false).is_none());
+        {
+            let mut state = host.lock().unwrap();
+            assert!(state.terminals[&id].handle.same_worker(&handle));
+            assert_eq!(state.terminal_retirements[&id].failure.as_deref(), Some("fixture cleanup unconfirmed"));
+            assert!(state.terminal_retention_deadline(Duration::ZERO, &BTreeSet::new()).is_none());
+            assert!(state.attach(2, id).is_ok(), "failed cleanup restores explicit access to its retained result");
+        }
+        // An explicit retry still reaches the original exact holder.
+        handle.release_completed_holder_until(Instant::now() + Duration::from_secs(5)).unwrap();
+        let retired = host.lock().unwrap().retire_terminal_if_current(id, &handle).unwrap();
+        drop(retired);
+    }
+
+    #[test]
+    fn asynchronous_retirement_removes_the_record_only_after_positive_family_cleanup() {
+        let (mut state, id, handle) = completed_retention_fixture();
+        state.unregister_client(1);
+        let directory = tempfile::tempdir().unwrap();
+        state.install_model(super::super::model::Registry::at(&directory.path().join("registry.sqlite3")).unwrap());
+        let holder = handle.holder_identity().map(|identity| identity.holder.clone());
+        let gate = state.control_gate.clone();
+        let host = Arc::new(HostLock::new(state));
+        let mut lifecycle = crate::host::lifecycle::Lifecycle::testing(Duration::ZERO);
+        assert!(lifecycle.maintain(&host, false).is_none());
+        assert!(host.lock().unwrap().terminals.contains_key(&id), "queue admission is not cleanup proof");
+        assert!(gate.try_write().is_ok(), "background cleanup must release global control admission");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.lock().unwrap().terminals.contains_key(&id) {
+            assert!(Instant::now() < deadline, "actual fixture cleanup did not publish its positive result");
+            lifecycle.maintain(&host, false);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!host.lock().unwrap().terminal_retirements.contains_key(&id));
+        if let Some(holder) = holder { assert!(!holder.is_current(), "positive retirement must not leave the original holder alive"); }
+    }
+
+    #[test]
+    fn stale_retirement_completion_does_not_remove_a_replacement_worker_with_the_same_id() {
+        let (mut state, id, old) = completed_retention_fixture();
+        state.unregister_client(1);
+        let session = state.terminals[&id].session.clone();
+        old.release_completed_holder_until(Instant::now() + Duration::from_secs(5)).unwrap();
+        drop(state.retire_terminal_if_current(id, &old).unwrap());
+        let replacement = TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        state.register_client(2);
+        state.finish_spawn(2, session, replacement.clone(), false).unwrap();
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        let mut retirement = Retirement::submitting(old.clone());
+        retirement.result = Some(result);
+        state.terminal_retirements.insert(id, retirement);
+        reply.send(Ok(())).unwrap();
+        let host = Arc::new(HostLock::new(state));
+        crate::host::lifecycle::Lifecycle::testing(Duration::ZERO).maintain(&host, false);
+        assert!(host.lock().unwrap().terminals[&id].handle.same_worker(&replacement));
+        assert!(!host.lock().unwrap().terminal_retirements.contains_key(&id));
+        replacement.shutdown().unwrap();
     }
 
     #[test]

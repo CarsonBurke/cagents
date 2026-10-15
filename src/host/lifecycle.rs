@@ -9,6 +9,7 @@ const EXITED_RETENTION: Duration = Duration::from_secs(10 * 60);
 pub(super) struct Lifecycle {
     retention: Duration,
     retention_error_reported: bool,
+    cleanup_admission_error_reported: bool,
     idle: IdleTimer,
 }
 
@@ -17,8 +18,15 @@ impl Lifecycle {
         Self {
             retention: duration_setting("CAGENTS_EXITED_TERMINAL_RETENTION_SECS", EXITED_RETENTION),
             retention_error_reported: false,
+            cleanup_admission_error_reported: false,
             idle: IdleTimer::new(crate::instance::IS_DEVELOPMENT, duration_setting("CAGENTS_DEVELOPMENT_IDLE_TIMEOUT_SECS", Duration::from_secs(30 * 60))),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn testing(retention: Duration) -> Self {
+        Self { retention, retention_error_reported: false, cleanup_admission_error_reported: false,
+            idle: IdleTimer::new(false, Duration::ZERO) }
     }
 
     pub(super) fn maintain(&mut self, host: &SharedHost, connected: bool) -> Option<Instant> {
@@ -55,7 +63,65 @@ impl Lifecycle {
         }
     }
 
+    fn settle_retirements(&mut self, host: &SharedHost) {
+        use std::sync::mpsc::TryRecvError;
+        let (gate, ready) = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let ready = state.terminal_retirements.iter_mut().filter_map(|(id, retirement)| {
+                let outcome = match retirement.result.as_ref()?.try_recv() {
+                    Ok(outcome) => outcome,
+                    Err(TryRecvError::Empty) => return None,
+                    Err(TryRecvError::Disconnected) => Err("Terminal cleanup owner ended without a proof result".into()),
+                };
+                retirement.result = None;
+                Some((*id, retirement.ticket, outcome))
+            }).collect::<Vec<_>>();
+            (state.control_gate.clone(), ready)
+        };
+        // Streaming activity must not acquire exclusive admission while an
+        // asynchronous cleanup is still waiting or no retirement is pending.
+        if ready.is_empty() { return; }
+        let control = gate.write().unwrap_or_else(|p| p.into_inner());
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let mut released = Vec::new();
+        let mut retired = Vec::new();
+        let mut reports = Vec::new();
+        for (id, ticket, outcome) in ready {
+            if !state.terminal_retirements.get(&id).is_some_and(|entry| entry.ticket == ticket) { continue; }
+            let Some(mut reservation) = state.terminal_retirements.remove(&id) else { continue; };
+            if state.terminals.get(&id).is_some_and(|record| record.handle.same_worker(&reservation.handle)) {
+                match outcome {
+                    Ok(()) => {
+                        if let Some(record) = state.retire_terminal_if_current(id, &reservation.handle) { retired.push(record); }
+                        reports.push((id, None));
+                    }
+                    Err(error) => {
+                        reports.push((id, Some(error.clone())));
+                        reservation.failure = Some(error);
+                        state.terminal_retirements.insert(id, reservation);
+                        state.inventory_generation += 1;
+                        continue;
+                    }
+                }
+            }
+            released.push(reservation);
+        }
+        drop(state);
+        drop(control);
+        for (id, error) in reports {
+            if let Some(error) = error {
+                tracing::warn!(terminal = %id, %error, "Exited terminal remains listed for explicit cleanup retry");
+            } else {
+                tracing::debug!(terminal = %id, "Retired an exited terminal after exact cleanup proof");
+            }
+        }
+        // The last handle or record may own teardown; drop outside HostState.
+        drop(released);
+        drop(retired);
+    }
+
     fn maintain_retention(&mut self, host: &SharedHost) -> Option<Instant> {
+        self.settle_retirements(host);
         let now = Instant::now();
         let (deadline, gate, registry) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -66,44 +132,60 @@ impl Lifecycle {
         let deadline = deadline?;
         if deadline > now { return Some(deadline); }
 
-        // Fence pane edits, attaches and upgrades while deciding which completed
-        // descriptors can retire. Terminal output does not acquire this gate.
-        let _control = gate.write().unwrap_or_else(|p| p.into_inner());
-        // A spawn/presence admitted before this exclusive acquisition may
-        // have installed another completed, pinned terminal. Census the same
-        // current population that retirement will inspect, including at 0s.
+        let control = gate.write().unwrap_or_else(|p| p.into_inner());
         let candidates = host.lock().unwrap_or_else(|p| p.into_inner()).terminals.keys().copied().collect::<BTreeSet<_>>();
         let pinned = registry.ok_or_else(|| "The workspace registry is unavailable".to_owned())
             .and_then(|registry| registry.lock().unwrap_or_else(|p| p.into_inner()).pinned_terminals(&candidates));
-        let pinned = match pinned {
+        let mut pinned = match pinned {
             Ok(pinned) => { self.retention_error_reported = false; pinned },
             Err(error) => {
                 if !self.retention_error_reported {
                     tracing::warn!(%error, "Exited terminal retention is deferred; pane ownership is unknown");
                     self.retention_error_reported = true;
                 }
-                // Retry on actual activity, never on a periodic failure timer.
                 return None;
             },
         };
-        let (retired, next) = {
+        let handles = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let retired = state.retire_expired_terminals(now, self.retention, &pinned);
-            let next = state.terminal_retention_deadline(self.retention, &pinned);
-            (retired, next)
-        };
-        // Removal fenced ownership. Holder teardown may wait on another
-        // process, so it must not retain the global control admission gate.
-        drop(_control);
-        for record in retired {
-            let id = record.session.id;
-            if let Err(error) = record.handle.shutdown() {
-                tracing::warn!(%error, terminal = %id, "Retired terminal holder cleanup failed");
-            } else {
-                tracing::debug!(terminal = %id, "Retired an exited unattached terminal");
+            let handles = state.expired_terminal_handles(now, self.retention, &pinned);
+            for (id, handle) in &handles {
+                state.terminal_retirements.insert(*id, super::state::Retirement::submitting(handle.clone()));
+                state.inventory_generation += 1;
             }
+            handles
+        };
+        drop(control);
+        // Admission is nonblocking and uses the existing fixed cleanup pool.
+        // Neither provider cleanup nor worker joins borrow global admission.
+        for (id, handle) in handles {
+            let result = handle.release_completed_holder_async();
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let current = state.terminals.get(&id).is_some_and(|record| record.handle.same_worker(&handle));
+            let mut rejected = None;
+            if current && state.terminal_retirements.get(&id).is_some_and(|entry| entry.handle.same_worker(&handle)) {
+                match result {
+                    Ok(receiver) => {
+                        state.terminal_retirements.get_mut(&id).unwrap().result = Some(receiver);
+                        self.cleanup_admission_error_reported = false;
+                    }
+                    Err(error) => {
+                        rejected = state.terminal_retirements.remove(&id);
+                        state.inventory_generation += 1;
+                        // No overdue timer for queue pressure/service failure.
+                        // Existing pool task completion wakes the daemon to retry.
+                        pinned.insert(id);
+                        if !self.cleanup_admission_error_reported {
+                            tracing::warn!(%error, terminal = %id, "Terminal retirement admission deferred; exact worker remains listed");
+                            self.cleanup_admission_error_reported = true;
+                        }
+                    }
+                }
+            }
+            drop(state);
+            drop(rejected);
         }
-        next
+        host.lock().unwrap_or_else(|p| p.into_inner()).terminal_retention_deadline(self.retention, &pinned)
     }
 }
 

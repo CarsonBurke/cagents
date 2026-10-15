@@ -117,6 +117,9 @@ impl HostState {
         // Holder transport resolves long addresses through a private directory
         // FD; the full UUID endpoint need not fit directly in sockaddr_un.
         let can_carry = holders.is_some();
+        if self.terminal_retirements.values().any(|retirement| retirement.pending()) {
+            impact.blockers.push("Wait for completed terminal cleanup to finish.".into());
+        }
         if !self.native_closing.is_empty() {
             impact
                 .blockers
