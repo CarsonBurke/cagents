@@ -4315,9 +4315,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Option<GitOperationState>, RepositoryError> {
-        let observation = snapshot_admin_fingerprint(worktree, cancellation)
+        if cancellation.is_cancelled() {
+            return Err(process_failure(&CommandSpec::new(&self.git), ProcessFailureKind::Cancelled,
+                "Git operation metadata read cancelled", false).into());
+        }
+        // Operation markers are private-admin data. Resolving that bounded
+        // locator does not require enumerating every common ref again for each
+        // sidebar row; snapshot_cached already owns its full admin prepass.
+        let directory = local_git_dir(worktree).and_then(|directory|
+            directory.map(fs::canonicalize).transpose())
             .map_err(|error| ValidationError::Io(format!("Cannot observe Git operation metadata: {error}")))?;
-        let result = observation.git_dir.as_deref()
+        let result = directory.as_deref()
             .map(operation_metadata::read_operation_state).transpose()?.flatten();
         if cancellation.is_cancelled() {
             return Err(process_failure(&CommandSpec::new(&self.git), ProcessFailureKind::Cancelled,
@@ -8504,6 +8512,26 @@ mod tests {
             .expect("a newly truncated snapshot must update its lower-bound notice");
         assert_eq!(next.status.entries, first.status.entries);
         assert!(next.status.listing_truncated);
+    }
+
+    #[test]
+    fn operation_display_resolves_only_private_admin_without_a_common_ref_census() {
+        let directory = tempfile::tempdir().unwrap();
+        let admin = directory.path().join(".git");
+        fs::create_dir(&admin).unwrap();
+        fs::write(admin.join("MERGE_HEAD"), "abc\n").unwrap();
+        // Markers belong to this private directory even when common metadata
+        // is unavailable; no common-directory or refs traversal is required.
+        fs::write(admin.join("commondir"), "missing-common\n").unwrap();
+        let executor = Arc::new(FakeExecutor::default());
+        let service = RepositoryService::new("git", executor.clone());
+        assert_eq!(service.operation_state(directory.path(), &CancellationToken::default())
+            .unwrap().unwrap().kind, GitOperationKind::Merge);
+        assert!(executor.commands.lock().unwrap().is_empty());
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        assert!(service.operation_state(directory.path(), &cancel).is_err());
+        assert!(executor.commands.lock().unwrap().is_empty());
     }
 
     #[test]
