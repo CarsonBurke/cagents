@@ -105,12 +105,13 @@ pub(crate) fn typography_test_guard() -> impl Drop {
         active: Typography,
         request: Option<(String, f32, String, f32)>,
         toolkit_family: String,
+        toolkit_size: f32,
         // A UI-thread snapshot must never be restored on another thread.
         _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     }
     impl Drop for Restore {
         fn drop(&mut self) {
-            cosmic::widget::text::set_default_size(self.active.interface_size);
+            cosmic::widget::text::set_default_size(self.toolkit_size);
             cosmic::config::COSMIC_TK
                 .write()
                 .unwrap_or_else(|error| error.into_inner())
@@ -144,6 +145,7 @@ pub(crate) fn typography_test_guard() -> impl Drop {
     Restore {
         active: TYPOGRAPHY.with(std::cell::Cell::get),
         request: REQUEST.with(|request| request.borrow().clone()),
+        toolkit_size: cosmic::widget::text::default_size(),
         toolkit_family: cosmic::config::COSMIC_TK
             .read()
             .unwrap_or_else(|error| error.into_inner())
