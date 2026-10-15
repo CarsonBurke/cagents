@@ -672,3 +672,165 @@ fn combined_close_local_busy_presentation_identity_refuses_without_blocking_host
     assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
     assert_eq!(fixture.rpc_counts(), counts);
 }
+
+
+#[test]
+fn combined_close_retained_local_owner_refuses_actual_startup_failure_and_failed_reopen() {
+    if owning_close_isolated("combined_close_retained_local_owner_refuses_actual_startup_failure_and_failed_reopen").is_some() { return; }
+    let fixture = LocalCodexPresentationFixture::start();
+    let root = fixture.path.parent().unwrap();
+    let store = registry(&fixture.host).unwrap();
+    let HostedSession::Chat(source) = fixture.agent.session.as_ref().unwrap() else { unreachable!() };
+    let before_model = store.lock().unwrap().model().unwrap();
+    let before_run = store.lock().unwrap().agent_run(fixture.run.id).unwrap();
+    let before_holder = chat::native_holder::inspect(&fixture.owner, &fixture.proof).unwrap().0;
+    let counts = fixture.rpc_counts();
+    // This actual private constructor cannot create its database beneath a
+    // regular file. Nothing in this test substitutes a canned opener error.
+    let blocked = root.join("startup-registry-parent");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&blocked).unwrap();
+        drop(file);
+    }
+    let invalid = blocked.join("workspace.sqlite3");
+    let assert_unavailable = |host: &SharedHost| {
+        let started = Instant::now();
+        assert!(retirement_registry(host).err().expect("unavailable store must refuse retirement").contains("managed execution registry is unavailable"));
+        for result in [preflight_retirement(host, source), retired(host, source),
+            crate::host::chat::close_retained_native(host, source)] {
+            let error = result.unwrap_err();
+            assert!(error.contains("managed execution registry is unavailable"), "{error}");
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let state = host.lock().unwrap();
+        assert!(state.managed_registry_unavailable());
+        assert!(!state.native_closing.contains_key(&source.id));
+    };
+    // Unlike an intentionally model-less diagnostics host, a daemon that
+    // attempted the real opener must refuse cleanup even before any model or
+    // second execution connection exists. The original owner remains live in
+    // fixture.host; this same-proof cold host must not adopt it through fallback.
+    let cold: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(fixture.proof.clone())));
+    cold.lock().unwrap().enable_holder_recovery();
+    let mut attempted = false;
+    crate::host::initialize_model(&cold, || {
+        attempted = true;
+        assert_unavailable(&cold); // Opening, before the actual failed opener.
+        Registry::at(&invalid)
+    });
+    assert!(attempted);
+    assert_unavailable(&cold); // Unavailable after the actual constructor error.
+    assert!(cold.lock().unwrap().read_model().is_err());
+    let diagnostic: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(fixture.proof.clone())));
+    assert!(retirement_registry(&diagnostic).unwrap().is_none());
+    preflight_retirement(&diagnostic, source).unwrap();
+    assert!(!diagnostic.lock().unwrap().managed_registry_unavailable());
+    assert_eq!(store.lock().unwrap().model().unwrap(), before_model);
+
+    // Start a genuinely independent provider while admission is still Ready.
+    // Its ordinary attached user may interrupt after model failure; the closed
+    // managed-owner gate must not become a global provider-control lockout.
+    const USER: u64 = 731;
+    const FOREIGN: u64 = 732;
+    let claude = root.join("bin/claude");
+    let script = std::fs::read_to_string(&claude).unwrap();
+    let anchor = "      id=${frame#*";
+    assert_eq!(script.matches(anchor).count(), 1);
+    let observed = r#"      case "$frame" in
+        *'"subtype":"interrupt"'*) printf 'interrupt\n' >> "$HOME/../startup-interrupts" ;;
+      esac
+      id=${frame#*"#;
+    std::fs::write(&claude, script.replacen(anchor, observed, 1)).unwrap();
+    let unrelated = chat::fresh_session(Provider::Claude, TerminalId::new(), root.join("project"),
+        &Account::system(Provider::Claude)).unwrap();
+    let (response, _, _) = crate::host::client::process_request(&fixture.host, USER,
+        ClientRequest::ChatStart {session: unrelated, source: None, terminate_source: false,
+            execution_environment: Default::default()}).unwrap();
+    let ServerResponse::ChatAttached {session: unrelated, ..} = response else {panic!("independent provider not attached")};
+    let unrelated_handle = fixture.host.lock().unwrap().chats[&unrelated.id].handle.clone();
+    struct UnrelatedOwner(chat::runtime::Handle);
+    impl Drop for UnrelatedOwner {fn drop(&mut self) {let _ = self.0.close_for_resume();}}
+    let _unrelated_owner = UnrelatedOwner(unrelated_handle);
+    assert!(store.lock().unwrap().agent_for_session(unrelated.id).unwrap().is_none());
+    let interrupts = || std::fs::read_to_string(root.join("startup-interrupts")).unwrap_or_default().lines().count();
+    let before_interrupts = interrupts();
+    let before_reopen_model = store.lock().unwrap().model().unwrap();
+    let foreign = crate::host::client::process_request(&fixture.host, FOREIGN,
+        ClientRequest::ChatCommand {chat_id: unrelated.id, command: Command::Interrupt}).unwrap_err();
+    assert_eq!(foreign.code, crate::terminal_ipc::ProtocolErrorCode::PermissionDenied);
+    assert_eq!(interrupts(), before_interrupts);
+
+    // A failed reopen must not become Ready merely because its previous model
+    // and execution connection remain installed. Restore only after all failed
+    // admission observations, before cleanup of our original owned provider.
+    struct RestoreModel {host: SharedHost, path: std::path::PathBuf}
+    impl Drop for RestoreModel {fn drop(&mut self) {
+        if let Ok(registry) = Registry::at(&self.path) {self.host.lock().unwrap().install_model(registry);}
+    }}
+    let restore = RestoreModel {host: fixture.host.clone(), path: fixture.path.clone()};
+    let mut reopened = false;
+    crate::host::initialize_model(&fixture.host, || {
+        reopened = true;
+        assert!(fixture.host.lock().unwrap().read_model().is_ok());
+        assert!(fixture.host.lock().unwrap().execution_registry.is_some());
+        assert_unavailable(&fixture.host); // Retained Ready -> Opening.
+        Registry::at(&invalid)
+    });
+    assert!(reopened);
+    assert!(fixture.host.lock().unwrap().read_model().is_ok());
+    assert!(fixture.host.lock().unwrap().execution_registry.is_some());
+    assert_unavailable(&fixture.host); // Retained model/connection, but Unavailable.
+    let (response, _, _) = crate::host::client::process_request(&fixture.host, USER,
+        ClientRequest::ChatCommand {chat_id: unrelated.id, command: Command::Interrupt}).unwrap();
+    assert!(matches!(response, ServerResponse::Accepted));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while interrupts() != before_interrupts + 1 {
+        assert!(Instant::now() < deadline, "the actual independent provider must receive the authorized interrupt");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // A standalone terminal may still start and accept input through actual
+    // public dispatch while managed model admission is unavailable.
+    let launch = crate::model::LaunchRecipe {program: "/bin/sh".into(),
+        arguments: vec!["-c".into(), "IFS= read -r line; printf '%s' \"$line\" > \"$PWD/startup-terminal-input\"; exec /bin/cat".into()],
+        working_directory: root.join("project"), environment: Default::default(), unset_environment: Default::default()};
+    let terminal = crate::model::TerminalSession {id: TerminalId::new(), launch: launch.clone(),
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {recipe: launch, last_exit: None},
+        owned_codex_listener: None, recovery_origin: None, predecessor: None,
+        transcript_path: None, resume_hint: None};
+    let (spawn, _, _) = crate::host::client::process_request(&fixture.host, USER,
+        ClientRequest::Spawn {session: terminal, options: Default::default()}).unwrap();
+    let ServerResponse::Spawned {terminal} = spawn else {panic!("standalone terminal not spawned")};
+    let terminal_handle = fixture.host.lock().unwrap().terminals[&terminal.session.id].handle.clone();
+    struct TerminalOwner {handle: crate::terminal::TerminalHandle, source: crate::model::TerminalSession, proof: HostSessionProof}
+    impl Drop for TerminalOwner {fn drop(&mut self) {let _ = self.handle.close_with_receipt(&self.source, &self.proof);}}
+    let _terminal_owner = TerminalOwner {handle: terminal_handle, source: terminal.session.clone(), proof: fixture.proof.clone()};
+    let (listed, _, _) = crate::host::client::process_request(&fixture.host, USER, ClientRequest::List).unwrap();
+    let ServerResponse::Listed {terminals} = listed else {panic!("terminal inventory unavailable")};
+    assert!(terminals.iter().any(|entry| entry.session.id == terminal.session.id));
+    let (input, _, _) = crate::host::client::process_request(&fixture.host, USER,
+        ClientRequest::Input {terminal_id: terminal.session.id, bytes: b"MODEL_UNAVAILABLE_TERMINAL_OK\n".to_vec()}).unwrap();
+    assert!(matches!(input, ServerResponse::Accepted));
+    let received = root.join("project/startup-terminal-input");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while std::fs::read(&received).ok().as_deref() != Some(b"MODEL_UNAVAILABLE_TERMINAL_OK") {
+        assert!(Instant::now() < deadline, "standalone terminal did not receive admitted input");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(restore);
+    assert!(!fixture.host.lock().unwrap().managed_registry_unavailable());
+    assert!(fixture.owner.root.is_current()); assert!(fixture.owner.holder.is_current());
+    assert!(!fixture.pair.is_completed());
+    let (after_holder, exited) = chat::native_holder::inspect(&fixture.owner, &fixture.proof).unwrap();
+    assert!(!exited);
+    assert_eq!(after_holder.source, before_holder.source);
+    assert_eq!(after_holder.previous_sources, before_holder.previous_sources);
+    assert_eq!(after_holder.server_process, before_holder.server_process);
+    assert_eq!(after_holder.paired_holder, before_holder.paired_holder);
+    assert_eq!(store.lock().unwrap().model().unwrap(), before_reopen_model);
+    assert_eq!(store.lock().unwrap().agent(fixture.agent.id).unwrap(), fixture.agent);
+    assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), before_run);
+    assert_eq!(fixture.rpc_counts(), counts);
+}
