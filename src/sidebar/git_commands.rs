@@ -10,6 +10,22 @@ pub struct GitTarget {
     upstream: Option<PushTarget>,
 }
 
+// Availability is queried while menus and shortcut scopes are built. Keep it
+// independent of the complete message; only activation constructs that payload.
+fn commit_available(source: &SourceControlModel, state: &SidebarState) -> bool {
+    source.mutations_available()
+        && !source.busy()
+        && state.commit_draft.ready()
+        && (!state.commit_draft.amend || source.operation.is_none())
+        && !state.commit_draft.subject.trim().is_empty()
+        && (source.staged_count > 0
+            || (state.commit_draft.amend && source.head_oid.is_some())
+            || source.operation.as_ref().is_some_and(|operation| {
+                operation.kind == crate::repository::GitOperationKind::Merge
+            }))
+        && source.group(ChangeArea::Conflict).is_none_or(ChangeGroup::is_empty)
+}
+
 impl GitTarget {
     pub fn capture(model: &SidebarModel, state: &SidebarState) -> Option<Self> {
         let source = model.source_control.as_ref()?;
@@ -47,6 +63,7 @@ impl GitTarget {
             return false;
         };
         match command {
+            Command::GitCommit => commit_available(source, state),
             Command::GitApplyStash | Command::GitPopStash | Command::GitDropStash => {
                 source.mutations_available() && !source.busy() && !source.stashes.is_empty()
             }
@@ -122,17 +139,7 @@ impl GitTarget {
                     remotes: source.remotes.clone(),
                 });
             }
-            Command::GitCommit
-                if (!state.commit_draft.amend || source.operation.is_none())
-                    && !state.commit_draft.subject.trim().is_empty()
-                    && (source.staged_count > 0
-                        || (state.commit_draft.amend && source.head_oid.is_some())
-                        || source.operation.as_ref().is_some_and(|operation| {
-                            operation.kind == crate::repository::GitOperationKind::Merge
-                        }))
-                    && source
-                        .group(ChangeArea::Conflict)
-                        .is_none_or(ChangeGroup::is_empty) =>
+            Command::GitCommit if commit_available(source, state) =>
             {
                 return Some(SidebarAction::Commit {
                     key,
@@ -238,6 +245,43 @@ mod tests {
             assert!(target.stash_action(&model, &state, command, &entry).is_none());
         }
         assert_eq!(target.stashes(&model, &state), &[entry], "stash inspection remains readable");
+    }
+
+    #[test]
+    fn commit_palette_waits_for_amend_readiness_and_builds_only_an_activatable_message() {
+        let mut model = super::super::tests::panel_model();
+        let mut state = super::super::tests::panel_state(&model);
+        let source = model.source_control.as_mut().unwrap();
+        source.groups.retain(|group| group.area != ChangeArea::Conflict);
+        let head = Oid::parse_object(source.head_oid.as_deref().unwrap()).unwrap();
+        let target = GitTarget::capture(&model, &state).unwrap();
+        let key = target.key.clone();
+        state.apply(&SidebarAction::CommitMessageChanged { key: key.clone(), message: "Retained subject\n\nPrior body".into() });
+        assert!(target.available(&model, &state, Command::GitCommit));
+        state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: true });
+        let revision = state.amend_request_revision().unwrap();
+        state.pin_amend_head(&key, revision, head.clone());
+        assert!(!target.available(&model, &state, Command::GitCommit));
+        assert!(target.action(&model, &state, Command::GitCommit).is_none());
+        assert!(state.submitted_commit_revision(&key, state.commit_message(), true).is_none());
+        assert!(state.finish_amend_read(&key, revision));
+        assert!(!target.available(&model, &state, Command::GitCommit), "a failed read does not submit the old stashed message");
+        state.apply(&SidebarAction::CommitMessageChanged { key: key.clone(), message: "Explicit replacement after failed read".into() });
+        assert!(target.available(&model, &state, Command::GitCommit), "an explicit edit remains a valid pinned amend");
+        state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: false });
+        state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: true });
+        let revision = state.amend_request_revision().unwrap();
+        state.pin_amend_head(&key, revision, head);
+        let loaded = "Loaded subject\n\nLoaded body\n";
+        assert!(state.load_amend_message(&key, revision, loaded));
+        assert!(target.available(&model, &state, Command::GitCommit));
+        let Some(SidebarAction::Commit { key: captured, message, amend }) = target.action(&model, &state, Command::GitCommit) else { panic!("ready commit action"); };
+        assert_eq!(captured, key); assert_eq!(message, loaded); assert!(amend);
+        assert!(state.submitted_commit_revision(&key, &message, amend).is_some());
+        model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(Arc::from("Read-only host")));
+        assert!(!target.available(&model, &state, Command::GitCommit));
+        assert!(target.action(&model, &state, Command::GitCommit).is_none());
+        assert!(target.available(&model, &state, Command::GitAmend), "draft recovery remains available");
     }
 
     #[test]
