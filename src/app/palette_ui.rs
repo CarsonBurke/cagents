@@ -1660,7 +1660,7 @@ impl Cagents {
         }
     }
 
-    fn sidebar_command_target(&self) -> Option<sidebar::commands::CommandTarget> {
+    pub(super) fn sidebar_command_target(&self) -> Option<sidebar::commands::CommandTarget> {
         self.palette
             .sidebar_target
             .clone()
@@ -1834,7 +1834,7 @@ impl Cagents {
         Task::none()
     }
 
-    fn palette_origin(&self) -> PaletteOrigin {
+    pub(super) fn palette_origin(&self) -> PaletteOrigin {
         self.command_origin(self.workspace.focused(), true)
     }
 
@@ -1863,7 +1863,7 @@ impl Cagents {
 
     /// Availability is shared by palette listing and execution. A stale menu
     /// or shortcut cannot turn an unavailable command into a silent no-op.
-    fn command_context(&self, card: Option<CardId>) -> workspace_widget::CommandContext {
+    pub(super) fn command_context(&self, card: Option<CardId>) -> workspace_widget::CommandContext {
         self.command_context_for_device(card, crate::device::is_remote())
     }
 
