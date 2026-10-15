@@ -2135,7 +2135,7 @@ impl Actor {
                 _ => false,
             };
             let restoring_original=self.state.lock().unwrap_or_else(|p|p.into_inner()).original_retry_pending;
-            if authorizes_work && restoring_original {
+            if restoring_original && !matches!(&command,Command::Interrupt|Command::Refresh|Command::LoadEarlier|Command::LoadLater) {
                 if let Some(cancelled) = self.adapter.cancel_original_restoration() {
                     self.step(cancelled)?;
                 }
@@ -2298,7 +2298,7 @@ impl Actor {
                         tracing::warn!(%error,"original refusal cleanup unavailable");
                     }
                     self.adapter.original_command(None);
-                    if !is_retry {
+                    if !is_retry && !restoring_original {
                         self.apply(Event::Error {
                             message: message.clone(),
                             fatal: false,
