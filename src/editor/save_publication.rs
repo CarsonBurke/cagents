@@ -227,6 +227,11 @@ impl Holding {
         };
         // Exact chmod is authorized only for Published's original held inode.
         let checked = (|| {
+            // A producer may still own a pending permission restoration.
+            // Preserve its original witness before any consumer chmod.
+            if let Some(error) = publication.publication_error() {
+                return Err(FileIoError::Io(error.into()));
+            }
             fs_safety::set_directory_permissions(publication.directory(), 0o700)
                 .map_err(io_error)?;
             let metadata = publication.directory().metadata().map_err(io_error)?;
@@ -234,9 +239,6 @@ impl Holding {
                 return Err(FileIoError::Io(
                     "The save holding directory is not private; it was preserved.".into(),
                 ));
-            }
-            if let Some(error) = publication.publication_error() {
-                return Err(FileIoError::Io(error.into()));
             }
             publication.directory().try_clone().map_err(io_error)
         })();
