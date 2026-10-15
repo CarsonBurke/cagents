@@ -132,7 +132,7 @@ impl Preview {
     pub(super) fn view(&self) -> Element<'static, Message> {
         let text = iced::widget::rich_text(self.block.spans(cosmic::theme::is_dark()).clone())
             .font(iced::Font::MONOSPACE)
-            .size(design::TEXT_BODY)
+            .size(design::chat_size())
             .line_height(1.3)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             .width(Length::Fill)
@@ -144,7 +144,7 @@ impl Preview {
         // Shrink preserves a single row for short previews.
         widget::container(text)
             .width(Length::Fill)
-            .max_height(design::TEXT_BODY * 1.3 * 2.0)
+            .max_height(design::chat_size() * 1.3 * 2.0)
             .clip(true)
             .into()
     }
@@ -239,7 +239,7 @@ impl ToolText {
             .clone();
         let body: Element<'static, Message> = widget::container(selectable_prose::text(
             spans,
-            design::TEXT_BODY.into(),
+            design::chat_size().into(),
             iced::Font::MONOSPACE,
             target,
             find,
@@ -734,16 +734,16 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(110.0, 1000.0)),
             );
-            assert!(node.size().height > design::TEXT_BODY * 1.3);
+            assert!(node.size().height > design::chat_size() * 1.3);
             assert!(
-                node.size().height <= design::TEXT_BODY * 1.3 * 2.0 + 1.0,
+                node.size().height <= design::chat_size() * 1.3 * 2.0 + 1.0,
                 "{:?}",
                 node.size()
             );
         }
         let preview = Preview::update(
             None,
-            &tool("short"),
+            &tool("ok"),
             crate::settings::EditorSyntaxTheme::Auto,
         );
         let mut element = preview.view();
@@ -754,9 +754,34 @@ mod tests {
             &layout::Limits::new(iced::Size::ZERO, iced::Size::new(110.0, 1000.0)),
         );
         assert!(
-            node.size().height <= design::TEXT_BODY * 1.3 + 1.0,
+            node.size().height <= design::chat_size() * 1.3 + 1.0,
             "{:?}",
             node.size()
         );
+    }
+
+    #[test]
+    fn settings_chat_size_reaches_tool_output_and_preserves_preview_line_limits() {
+        use iced::advanced::{layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let text = ToolText::update(None, "first line\nsecond line", Language::Plain);
+        let target = Target { card: CardId::new(), generation: 0 };
+        let height = || {
+            let mut element = text.view(crate::settings::EditorSyntaxTheme::Auto, None, target, None);
+            let mut tree = Tree::new(element.as_widget());
+            element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(800.0, 1000.0)),
+            ).size().height
+        };
+        design::configure_typography("", 13.0, "", 14.0);
+        let small = height();
+        for size in [24.0, 40.0] {
+            design::configure_typography("", 13.0, "", size);
+            assert!(height() > small, "expanded tool text follows chat size");
+            narrow_preview_is_limited_to_two_visual_lines();
+        }
+        design::configure_typography("", 13.0, "", 14.0);
     }
 }
