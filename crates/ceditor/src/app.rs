@@ -1497,6 +1497,11 @@ impl Editor {
     }
 
     fn add_with_source(&mut self, opened: Opened, focus: bool, external: Option<PathBuf>) -> Task<Message> {
+        let git = opened.snapshot.is_some() || opened.authority.is_some();
+        self.add_with_source_context(opened, focus, external, git)
+    }
+
+    fn add_with_source_context(&mut self, opened: Opened, focus: bool, external: Option<PathBuf>, git: bool) -> Task<Message> {
         if let Some(file) = &opened.file {
             if let Some(owner) = self.file_owner(&opened.root.join(file)) {
                 if focus && !self.modal_open() {
@@ -1538,9 +1543,10 @@ impl Editor {
             repository: opened.root.clone(),
             worktree: opened.root.clone(),
         };
-        // A definition/history source tab inherits the physical Git context
-        // without copying a stale snapshot. External dependency tabs stay read-only.
-        let git = external.is_none() && (opened.snapshot.is_some() || opened.authority.is_some());
+        // Git provenance survives independently of mutation authority: on
+        // supported read-only platforms an internal source still has Git panels.
+        // External dependency tabs retain their separate read-only source policy.
+        let git = external.is_none() && git;
         let needs_git_snapshot = git && opened.snapshot.is_none();
         let mut runtime = if git {
             RepositoryRuntime::new(descriptor)
