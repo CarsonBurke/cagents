@@ -1472,6 +1472,12 @@ pub(super) struct Runtime {
     pub(super) target: Target,
     pub(super) session: chat::Session,
     connection: Connection,
+    /// The opaque picker identity retained for a fresh owning-daemon start.
+    /// A recipe path is never sent as account authority.
+    draft_account: Option<AccountId>,
+    /// An explicit window preference or composer choice. None keeps the
+    /// owning provider's own default, rather than an inferred preview mode.
+    draft_permission_choice: Option<String>,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
@@ -2060,12 +2066,14 @@ impl Runtime {
             target,
             session,
             snapshot: Arc::new(Snapshot {
-                permission_mode,
+                permission_mode: permission_mode.clone(),
                 ..Snapshot::default()
             }),
             source_clock: None,
             finished_stamp: None,
             connection,
+            draft_account: None,
+            draft_permission_choice: permission_mode,
             queued: None,
             followups: Vec::new(),
             next_followup: 0,
@@ -2986,12 +2994,13 @@ fn fresh_chat_session(
     automatic: bool,
     configuration: &settings::AgentLaunchSettings,
 ) -> Result<chat::Session, String> {
+    let configuration = draft_launch_configuration(configuration, crate::device::is_remote());
     let mut session = chat::fresh_session_draft(
         provider,
         id,
         working_directory,
         account,
-        configuration,
+        &configuration,
     )?;
     if automatic {
         session
@@ -3001,6 +3010,18 @@ fn fresh_chat_session(
             .insert(account::routing::AUTOMATIC_MARKER.into(), "1".into());
     }
     Ok(session)
+}
+
+/// Only conversation defaults belong to this window on a remote device.
+/// The remote daemon captures its executable, arguments and environment at
+/// fresh start; local execution policy cannot label or reject that program.
+fn draft_launch_configuration(configuration: &settings::AgentLaunchSettings, remote: bool) -> std::borrow::Cow<'_, settings::AgentLaunchSettings> {
+    if !remote { return std::borrow::Cow::Borrowed(configuration); }
+    let mut remote = configuration.clone();
+    remote.executable = None;
+    remote.arguments.clear();
+    remote.environment.clear();
+    std::borrow::Cow::Owned(remote)
 }
 
 /// Called only by the blocking start worker. An absolute recorded program
@@ -3668,6 +3689,8 @@ impl Cagents {
         runtime.completion.restart(true);
         if let Some(session) = &moved {
             runtime.session = session.clone();
+            runtime.draft_account = Some(account.id());
+            runtime.draft_permission_choice = configuration.permission_mode.clone();
             runtime.error = None;
         }
         self.remember_chat_model(provider, model, reasoning);
@@ -3783,6 +3806,8 @@ impl Cagents {
             .recipe
             .environment
             .remove(account::routing::AUTOMATIC_MARKER);
+        runtime.draft_account = Some(account.id());
+        runtime.draft_permission_choice = configuration.permission_mode.clone();
         if session == runtime.session {
             return Task::none();
         }
@@ -4417,10 +4442,13 @@ impl Cagents {
         } else {
             Task::none()
         };
-        Task::batch([
-            scope,
-            self.insert_chat_card_with_lifetime(session, None, ephemeral, None),
-        ])
+        let insert = self.insert_chat_card_with_lifetime(session, None, ephemeral, None);
+        if let Some(card) = self.workspace.focused()
+            && let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            runtime.draft_account = Some(account.id());
+            runtime.draft_permission_choice = self.settings.agents.get(settings::agents::provider_key(provider)).and_then(|configuration| configuration.permission_mode.clone());
+        }
+        Task::batch([scope, insert])
     }
 
     /// Opens a card for the new conversation `session`, as a draft whose first
@@ -4574,6 +4602,8 @@ impl Cagents {
             self.settings.editor_syntax_theme,
         );
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
+        runtime.draft_account = self.chat_account(runtime.session.launch.provider, &runtime.session.launch.recipe)
+            .or_else(|| (runtime.session.launch.provider == Provider::Omp).then(|| Account::system(Provider::Omp).id()));
         if let Some(draft) = self.chat_ui.drafts.remove(&card)
             && !draft.is_empty()
         {
@@ -8065,6 +8095,7 @@ impl Cagents {
                     }
                     let provider = runtime.session.launch.provider;
                     set_draft_permission_mode(&mut runtime.session.launch.recipe, provider, &mode);
+                    runtime.draft_permission_choice = Some(mode.clone());
                     Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
                     let session = runtime.session.clone();
                     self.replace_chat_conversation(target.card, session);
@@ -13360,6 +13391,33 @@ mod tests {
         ] {
             assert!(!bypasses_approvals(&asking), "{asking:?}");
         }
+    }
+
+    #[test]
+    fn settings_remote_draft_uses_window_choices_without_local_execution_policy() {
+        let configuration = settings::AgentLaunchSettings {
+            model: Some("chosen-model".into()), effort: Some("low".into()), permission_mode: Some("plan".into()),
+            executable: Some("relative-local-only".into()), arguments: vec!["invalid\0argument".into()],
+            environment: [("INVALID NAME".into(), "local-secret".into())].into(),
+        };
+        let remote = draft_launch_configuration(&configuration, true);
+        assert_eq!(remote.model, configuration.model);
+        assert_eq!(remote.effort, configuration.effort);
+        assert_eq!(remote.permission_mode, configuration.permission_mode);
+        assert!(remote.executable.is_none() && remote.arguments.is_empty() && remote.environment.is_empty());
+        assert!(remote.validate_syntax(Provider::Claude).is_ok());
+        assert!(draft_launch_configuration(&configuration, false).validate_syntax(Provider::Claude).is_err());
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings.agents.insert("claude".into(), settings::AgentLaunchSettings { permission_mode: Some("plan".into()), ..Default::default() });
+        drop(app.new_native_chat(Provider::Claude, Some(PathBuf::from(FIXTURE_DIRECTORY))));
+        let card = app.workspace.focused().unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("new draft") };
+        assert_eq!(runtime.draft_account, Some(Account::system(Provider::Claude).id()));
+        assert_eq!(runtime.draft_permission_choice.as_deref(), Some("plan"));
+        let target = runtime.target;
+        drop(app.handle_chat_ui(Action::PermissionMode(target, "manual".into())));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("same draft") };
+        assert_eq!(runtime.draft_permission_choice.as_deref(), Some("manual"));
     }
 
     #[test]
