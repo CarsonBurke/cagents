@@ -129,7 +129,6 @@ impl Indentation {
         }
         (prefix.len(), String::new())
     }
-
 }
 
 /// Reads at most 64 KiB per directory and never follows a configuration link
@@ -156,7 +155,9 @@ pub fn read(worktree: &Path, path: &Path) -> Overrides {
             .filter_map(|line| line.split_once('='))
             .filter(|(key, _)| key.trim().eq_ignore_ascii_case("root"))
             .map(|(_, value)| value.trim())
-            .filter(|value| value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false"))
+            .filter(|value| {
+                value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false")
+            })
             .last()
             .is_some_and(|value| value.eq_ignore_ascii_case("true"))
         {
@@ -438,19 +439,33 @@ mod tests {
     fn editorconfig_root_trims_key_and_value_and_uses_the_last_pair() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("src")).unwrap();
-        std::fs::write(directory.path().join(".editorconfig"),
-            "[*]\nindent_style=tab\nindent_size=8\n").unwrap();
-        for root in ["root =true", "root= true", " ROOT\t=\tTrUe ", "root=false\nroot= true"] {
-            std::fs::write(directory.path().join("src/.editorconfig"),
-                format!("{root}\n[*]\ntab_width=2\n")).unwrap();
+        std::fs::write(
+            directory.path().join(".editorconfig"),
+            "[*]\nindent_style=tab\nindent_size=8\n",
+        )
+        .unwrap();
+        for root in [
+            "root =true",
+            "root= true",
+            " ROOT\t=\tTrUe ",
+            "root=false\nroot= true",
+        ] {
+            std::fs::write(
+                directory.path().join("src/.editorconfig"),
+                format!("{root}\n[*]\ntab_width=2\n"),
+            )
+            .unwrap();
             let config = read(directory.path(), Path::new("src/a.rs"));
             assert_eq!(config.tabs, None, "{root:?}");
             assert_eq!(config.size, None, "{root:?}");
             assert_eq!(config.tab_width, Some(2));
         }
         for root in ["root=true\nroot=false", "root=true # not an inline comment"] {
-            std::fs::write(directory.path().join("src/.editorconfig"),
-                format!("{root}\n[*]\ntab_width=2\n")).unwrap();
+            std::fs::write(
+                directory.path().join("src/.editorconfig"),
+                format!("{root}\n[*]\ntab_width=2\n"),
+            )
+            .unwrap();
             assert_eq!(read(directory.path(), Path::new("src/a.rs")).size, Some(8));
         }
     }
@@ -462,7 +477,11 @@ mod tests {
             (4, 3, "\t ", "\t  "),
             (4, 8, "    ", "\t"),
         ] {
-            let indentation = Indentation { tabs: true, size, tab_width: width };
+            let indentation = Indentation {
+                tabs: true,
+                size,
+                tab_width: width,
+            };
             assert_eq!(indentation.unit(), first);
             assert_eq!(indentation.addition(first), second);
             let twice = format!("{first}{second}");
@@ -472,7 +491,11 @@ mod tests {
             let (start, suffix) = indentation.outdent(&once);
             assert_eq!(format!("{}{suffix}", &once[..start]), "");
         }
-        let indentation = Indentation { tabs: true, size: 4, tab_width: 8 };
+        let indentation = Indentation {
+            tabs: true,
+            size: 4,
+            tab_width: 8,
+        };
         let (start, suffix) = indentation.outdent("\t\t");
         assert_eq!(format!("{}{suffix}", &"\t\t"[..start]), "\t    ");
     }

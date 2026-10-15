@@ -1308,7 +1308,10 @@ where
             };
             if start < cursor.position.column {
                 self.replace_range_recorded(
-                    Position { line: cursor.position.line, column: start },
+                    Position {
+                        line: cursor.position.line,
+                        column: start,
+                    },
                     cursor.position,
                     &replacement,
                 );
@@ -1387,14 +1390,16 @@ where
         let anchor = cursor.selection.unwrap_or(cursor.position);
         let indentation = self.0.get_mut().indentation;
         if !outdent && anchor.line == cursor.position.line {
-            let unit = self.with_line(cursor.position.line, |line, _| {
-                let before = &line[..cursor.position.column.min(line.len())];
-                if before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
-                    indentation.addition(before)
-                } else {
-                    indentation.unit()
-                }
-            }).unwrap_or_else(|| indentation.unit());
+            let unit = self
+                .with_line(cursor.position.line, |line, _| {
+                    let before = &line[..cursor.position.column.min(line.len())];
+                    if before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+                        indentation.addition(before)
+                    } else {
+                        indentation.unit()
+                    }
+                })
+                .unwrap_or_else(|| indentation.unit());
             return self
                 .perform_edit(Edit::Paste(Arc::new(unit)))
                 .map(|recorded| recorded.change)
@@ -1415,7 +1420,10 @@ where
         let mut changes = Vec::new();
         for line in (first..=last).rev() {
             let Some((start, end, replacement)) = self.with_line(line, |text, _| {
-                let end = text.bytes().take_while(|byte| matches!(byte, b' ' | b'\t')).count();
+                let end = text
+                    .bytes()
+                    .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                    .count();
                 let prefix = &text[..end];
                 if outdent {
                     let (start, replacement) = indentation.outdent(prefix);
@@ -1423,10 +1431,17 @@ where
                 } else {
                     (end, end, indentation.addition(prefix))
                 }
-            }) else { continue; };
-            if start == end && replacement.is_empty() { continue; }
+            }) else {
+                continue;
+            };
+            if start == end && replacement.is_empty() {
+                continue;
+            }
             if let Some(change) = self.replace_range_recorded(
-                Position { line, column: start },
+                Position {
+                    line,
+                    column: start,
+                },
                 Position { line, column: end },
                 &replacement,
             ) {
@@ -1435,7 +1450,9 @@ where
             shifts.push((line, start, end, replacement.len()));
         }
         let map = |mut position: Position| {
-            if let Some((_, start, end, added)) = shifts.iter().find(|(line, ..)| *line == position.line) {
+            if let Some((_, start, end, added)) =
+                shifts.iter().find(|(line, ..)| *line == position.line)
+            {
                 if position.column >= *end {
                     position.column = position.column - *end + *start + *added;
                 } else if position.column > *start {
@@ -1528,7 +1545,10 @@ where
         // One replacement, so dedentation and the typed closer undo together.
         replacement.push(closer);
         self.replace_range_recorded(
-            Position { line: cursor.position.line, column: start },
+            Position {
+                line: cursor.position.line,
+                column: start,
+            },
             cursor.position,
             &replacement,
         );
@@ -5985,14 +6005,21 @@ mod tests {
     #[test]
     fn distinct_indent_size_and_tab_width_apply_to_tab_enter_and_closers() {
         for (size, width, unit) in [(8, 4, "\t\t"), (4, 3, "\t "), (4, 8, "    ")] {
-            let policy = crate::editor_indent::Indentation { tabs: true, size, tab_width: width };
+            let policy = crate::editor_indent::Indentation {
+                tabs: true,
+                size,
+                tab_width: width,
+            };
             let mut tab: Content = Content::with_text("");
             tab.configure_indentation(policy);
             tab.perform_edit(Edit::Indent).unwrap();
             assert_eq!(tab.text(), unit);
             let mut paired: Content = Content::with_text("{}");
             paired.configure_indentation(policy);
-            paired.set_cursor(Cursor { position: Position { line: 0, column: 1 }, selection: None });
+            paired.set_cursor(Cursor {
+                position: Position { line: 0, column: 1 },
+                selection: None,
+            });
             paired.perform_edit(Edit::Enter).unwrap();
             assert_eq!(paired.text(), format!("{{\n{unit}\n}}"));
             // A typed closer at the indented empty line removes exactly one level.
@@ -6001,7 +6028,13 @@ mod tests {
             // Type-over uses the same visual level while preserving the existing closer.
             let mut over: Content = Content::with_text(&format!("{unit}}}"));
             over.configure_indentation(policy);
-            over.set_cursor(Cursor { position: Position { line: 0, column: unit.len() }, selection: None });
+            over.set_cursor(Cursor {
+                position: Position {
+                    line: 0,
+                    column: unit.len(),
+                },
+                selection: None,
+            });
             over.perform_edit(Edit::Insert('}')).unwrap();
             assert_eq!(over.text(), "}");
             assert_eq!(over.cursor().position.column, 1);
@@ -6013,12 +6046,23 @@ mod tests {
         use history::{History, Replay};
         let original = format!("\t\t{}\n\t\tsecond", "x".repeat(64 * 1024));
         let mut content: Content = Content::with_text(&original);
-        content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 4, tab_width: 8 });
-        let before = Cursor { position: Position { line: 1, column: 8 }, selection: Some(Position { line: 0, column: 1 }) };
+        content.configure_indentation(crate::editor_indent::Indentation {
+            tabs: true,
+            size: 4,
+            tab_width: 8,
+        });
+        let before = Cursor {
+            position: Position { line: 1, column: 8 },
+            selection: Some(Position { line: 0, column: 1 }),
+        };
         content.set_cursor(before);
         let changes = content.indent_recorded(true);
         assert_eq!(changes.len(), 2);
-        assert!(changes.iter().all(|change| change.removed == "\t" && change.inserted == "    "));
+        assert!(
+            changes
+                .iter()
+                .all(|change| change.removed == "\t" && change.inserted == "    ")
+        );
         assert!(content.text().starts_with("\t    x"));
         assert_eq!(content.cursor().position.column, 11);
         assert_eq!(content.cursor().selection, before.selection);
