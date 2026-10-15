@@ -47,6 +47,9 @@ impl Prepared {
 
     pub fn applies_to_buffer(&self) -> bool { self.buffer_revision.is_some() }
 
+    /// Cached Stage reads captured live text and leaves disk/buffers intact.
+    pub fn stages_live_buffer(&self) -> bool { self.kind == git_patch::Kind::Stage }
+
     /// At the owned queue turn, refuse any change of the rendered source.
     /// Buffer Revert is one native Undo transaction; disk effects are returned
     /// to the host's existing ordered Git/recovery pipeline.
@@ -1126,7 +1129,7 @@ mod tests {
     fn opaque_prepared_revert_uses_one_native_undo_transaction() {
         let card = CardId::new();
         let mut runtime = selected_mutation_fixture(card);
-        let request = runtime.diff_mutation_request(card, 0..1).unwrap();
+        let request = runtime.diff_mutation_request(card, 0..2).unwrap();
         let prepared = runtime.capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request)).unwrap().prepare().unwrap();
         assert!(prepared.applies_to_buffer());
         assert!(prepared.apply(&mut runtime).unwrap().is_none());

@@ -64,7 +64,7 @@ impl Editor {
     fn origin_current(&self, origin: &GroupOrigin) -> bool {
         !self.exiting && self.tab(origin.card).is_some_and(|tab| {
             tab.git && tab.runtime.descriptor.worktree == origin.key.canonical_path
-                && origin.authority.validate().is_ok()
+                && origin.authority.path() == origin.key.canonical_path
                 && tab.change_source_revision == origin.source_revision
                 && tab.navigation.active_worktree() == Some(&origin.key)
                 && tab.navigation.change_selection_revision() == origin.selection_revision
@@ -114,7 +114,7 @@ impl Editor {
             };
             Some(Arc::new(selection))
         } else { None };
-        let Some(authority) = tab.worktree_authority.clone().filter(|authority| authority.validate().is_ok()) else { return Task::none(); };
+        let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
         let origin = GroupOrigin {
             card: tab.id,
             key: key.clone(),
@@ -235,7 +235,7 @@ impl Editor {
         if self.modal_open() || self.exiting { return Task::none(); }
         let Some(tab) = self.tab(card) else { return Task::none(); };
         let Some(key) = tab.navigation.active_worktree().cloned() else { return Task::none(); };
-        let Some(authority) = tab.worktree_authority.clone().filter(|authority| authority.validate().is_ok()) else { return Task::none(); };
+        let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
         let Some(capture) = tab.runtime.capture_diff_mutation(card, kind, Some(&request)) else { return Task::none(); };
         let origin = GroupOrigin {
             card, key: key.clone(), source_revision: tab.change_source_revision,
@@ -247,7 +247,11 @@ impl Editor {
         // group read cannot overtake an earlier large patch preparation.
         self.git_groups.entry(key.canonical_path).or_default().pending.push_back(QueuedIntent::Patch(PatchRequest { origin: origin.clone(), prepared: None }));
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || capture.prepare()).await.map_err(|error| format!("Could not prepare the selected changes: {error}"));
+            let authority = origin.authority.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                authority.validate().map_err(|error| error.to_string())?;
+                Ok(capture.prepare())
+            }).await.map_err(|error| format!("Could not prepare the selected changes: {error}")).and_then(|result| result);
             Message::DiffPatchPrepared { origin, result }
         })
     }
@@ -277,7 +281,8 @@ impl Editor {
         }
         let Some(prepared) = request.prepared else { return Task::none(); };
         let applies_to_buffer = prepared.applies_to_buffer();
-        if !applies_to_buffer && self.begin_mutation(origin.card, MutationKind::Other).is_none() {
+        let index_only_stage = prepared.stages_live_buffer();
+        if !applies_to_buffer && self.begin_mutation_with_buffer_policy(origin.card, MutationKind::Other, index_only_stage).is_none() {
             self.notice = Some("Save open files before applying the selected Git change.".into());
             return self.start_next_change_group(&root).unwrap_or_else(Task::none);
         }

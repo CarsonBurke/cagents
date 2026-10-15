@@ -1311,6 +1311,7 @@ impl Editor {
             .then(|| path.strip_prefix(&root).map(Path::to_path_buf))
             .transpose()
             .map_err(|error| error.to_string())?;
+        if let Some(authority) = &authority { authority.validate().map_err(|error| error.to_string())?; }
         Ok(Opened {
             root,
             file,
@@ -1448,12 +1449,6 @@ impl Editor {
     }
 
     fn add(&mut self, opened: Opened, focus: bool) -> Task<Message> {
-        if let Some(authority) = &opened.authority
-            && let Err(error) = authority.validate()
-        {
-            self.notice = Some(error.to_string());
-            return Task::none();
-        }
         if let Some(file) = &opened.file {
             if let Some(owner) = self.file_owner(&opened.root.join(file)) {
                 if focus && !self.modal_open() {
@@ -2389,7 +2384,7 @@ impl Editor {
             let result = tokio::task::spawn_blocking(move || {
                 let authority = authority.ok_or("The original worktree authority is unavailable")?;
                 let mut snapshot = RepositoryService::system("git")
-                    .with_worktree_authority(authority).map_err(|error| error.to_string())?
+                    .with_worktree_authority(authority.clone()).map_err(|error| error.to_string())?
                     .snapshot_with_options(&root, display_snapshot_options(status_limit), &CancellationToken::default())
                     .map_err(|error| error.to_string())?;
                 let target = worker_path
@@ -2399,6 +2394,7 @@ impl Editor {
                     })
                     .transpose()?
                     .flatten();
+                authority.validate().map_err(|error| error.to_string())?;
                 Ok((snapshot, target))
             })
             .await
@@ -2751,6 +2747,10 @@ impl Editor {
     /// A worktree may have several file tabs. Guard and refresh all of them,
     /// including unsaved buffers that are not currently visible.
     fn begin_mutation(&mut self, id: CardId, kind: MutationKind) -> Option<PathBuf> {
+        self.begin_mutation_with_buffer_policy(id, kind, false)
+    }
+
+    fn begin_mutation_with_buffer_policy(&mut self, id: CardId, kind: MutationKind, index_only_stage: bool) -> Option<PathBuf> {
         let tab = self.tab(id)?;
         if !tab.git {
             return None;
@@ -2758,7 +2758,7 @@ impl Editor {
         let root = tab.runtime.descriptor.worktree.clone();
         if self.tabs.iter().any(|tab| {
             tab.runtime.descriptor.worktree == root
-                && (tab.mutation.is_some() || tab.runtime.blocks_navigation()
+                && (tab.mutation.is_some() || if index_only_stage { tab.runtime.is_saving() || tab.runtime.has_durability_warning() } else { tab.runtime.blocks_navigation() }
                     || tab.sidebar.source_control.as_ref().is_some_and(|source| source.pending_marker_stage.is_some()))
         }) {
             self.notice = Some("Save open files and wait for pending Git operations before changing this worktree.".into());
@@ -4044,7 +4044,7 @@ impl Application for Editor {
                             let approved = std::mem::take(&mut source.pending_marker_approval);
                             let authority = tab.marker_authority.take();
                             if !confirmed { return self.resume_change_groups(); }
-                            if !authority.is_some_and(|authority| authority.validate().is_ok()) {
+                            if authority.is_none() {
                                 self.notice = Some("The original worktree was replaced; staging was refused.".into());
                                 return self.resume_change_groups();
                             }
@@ -4380,10 +4380,6 @@ impl Application for Editor {
                     {
                         return Task::none();
                     }
-                    let result = result.and_then(|result| {
-                        tab.worktree_authority.as_ref().ok_or_else(|| "The original worktree authority is unavailable".to_string())?.validate().map_err(|error| error.to_string())?;
-                        Ok(result)
-                    });
                     match result {
                         Ok((snapshot, target)) => {
                             let mut source = SourceControlModel::ready(key, &snapshot);
@@ -4434,10 +4430,6 @@ impl Application for Editor {
                             // stale result and run exactly one fresh snapshot.
                             return self.refresh_snapshot(id, false);
                         }
-                        let result = result.and_then(|snapshot| {
-                            tab.worktree_authority.as_ref().ok_or_else(|| "The original worktree authority is unavailable".to_string())?.validate().map_err(|error| error.to_string())?;
-                            Ok(snapshot)
-                        });
                         match result {
                             Ok(snapshot) => {
                                 if let Some(key) = tab.navigation.active_worktree().cloned() {
@@ -4495,7 +4487,6 @@ impl Application for Editor {
                 }
                 Message::StageMarkers { card, operation, authority, selection, markers } => {
                     let Some(tab) = self.tab_mut(card).filter(|tab| tab.mutation_operation == operation && tab.mutation == Some(MutationKind::Stage)) else { return Task::none(); };
-                    if authority.validate().is_err() { return self.finish_mutation(card, Some("The original worktree was replaced; staging was refused.".into())); }
                     tab.marker_authority = Some(authority);
                     if let Some(source) = tab.sidebar.source_control.as_mut() {
                         if source.pending_marker_stage.is_some() { return self.finish_mutation(card, Some("An earlier marker confirmation is still pending.".into())); }
@@ -8117,10 +8108,57 @@ mod tests {
             extend: false, context: false, drag: false,
         }));
         run_tasks(&mut app, selection);
+        let extension = app.update(Message::Repository(RepositoryAction::SelectDiffRow {
+            identity: request.identity.clone(), basis: request.basis.clone(), mode: request.mode,
+            revision: request.layout_revision, row: 1, side: cagents::diff_interaction::Side::New,
+            extend: true, context: false, drag: false,
+        }));
+        run_tasks(&mut app, extension);
         let selected = app.tab(id).unwrap().runtime.diff_selection_mutation_action(id, Kind::Stage).unwrap();
         let task = app.update(Message::Repository(selected));
         run_tasks(&mut app, task);
         assert_eq!(git(root, &["show", ":tracked.txt"]), "changed");
+    }
+
+    #[test]
+    fn standalone_partial_stage_accepts_dirty_live_hunks_and_selected_lines_without_saving() {
+        use cagents::{git_patch::Kind, repository::ChangeArea};
+        for selected in [false, true] {
+            let directory = git_fixture();
+            let root = directory.path();
+            std::fs::write(root.join("tracked.txt"), "disk version\n").unwrap();
+            let mut app = editor();
+            app.settings.editor_auto_save = false;
+            let id = open_real_git(&mut app, root, None);
+            open_real_change(&mut app, id, "tracked.txt", ChangeArea::Unstaged);
+            let select = app.update(Message::Repository(RepositoryAction::EditorAction { card: id, action: EditorAction::SelectAll }));
+            run_tasks(&mut app, select);
+            let edit = app.update(Message::Repository(RepositoryAction::EditorAction { card: id, action: EditorAction::Edit(EditorEdit::Paste(Arc::new("dirty live text\n".into()))) }));
+            run_tasks(&mut app, edit);
+            assert!(app.tab(id).unwrap().runtime.is_dirty());
+            if selected {
+                let request = app.tab(id).unwrap().runtime.diff_mutation_request(id, 0..2).unwrap();
+                for (row, extend) in [(0, false), (1, true)] {
+                    let task = app.update(Message::Repository(RepositoryAction::SelectDiffRow {
+                        identity: request.identity.clone(), basis: request.basis.clone(), mode: request.mode,
+                        revision: request.layout_revision, row, side: cagents::diff_interaction::Side::New,
+                        extend, context: false, drag: false,
+                    }));
+                    run_tasks(&mut app, task);
+                }
+                let action = app.tab(id).unwrap().runtime.diff_selection_mutation_action(id, Kind::Stage).expect("dirty live selected lines are advertised");
+                let task = app.update(Message::Repository(action));
+                run_tasks(&mut app, task);
+            } else { apply_real_hunk(&mut app, id, Kind::Stage); }
+            assert_eq!(git(root, &["show", ":tracked.txt"]), "dirty live text");
+            assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "disk version\n");
+            assert_eq!(app.tab(id).unwrap().runtime.editor_text().unwrap(), "dirty live text\n");
+            assert!(app.tab(id).unwrap().runtime.is_dirty());
+            let undo = app.update(Message::Repository(RepositoryAction::Undo { card: id }));
+            run_tasks(&mut app, undo);
+            assert_eq!(app.tab(id).unwrap().runtime.editor_text().unwrap(), "disk version\n", "Stage does not consume native Undo");
+            assert_eq!(git(root, &["show", ":tracked.txt"]), "dirty live text");
+        }
     }
 
     #[test]
