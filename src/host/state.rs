@@ -3625,6 +3625,29 @@ fn start_terminal_view_owned(
         &crate::account::launch_credential_overrides(&session.launch),
         execution_environment.is_none(),
     )?;
+    if let Some(recipe) = &execution_recipe {
+        // The pane retains its issued recipe, while the validated restart can
+        // use another credential directory. Admit the command actually passed
+        // to Worker as well as the immutable source retained above.
+        let removals = crate::account::launch_credential_overrides(recipe);
+        if adoption.is_some() {
+            super::account_lifecycle::ensure_terminal_adoption(
+                shared,
+                execution_environment.as_ref().map(|value| &value.0),
+                &removals,
+            )?;
+        }
+        super::account_lifecycle::ensure_launch(
+            shared,
+            &recipe.working_directory,
+            execution_environment
+                .as_ref()
+                .map(|value| &value.0)
+                .unwrap_or(&recipe.environment),
+            &removals,
+            execution_environment.is_none(),
+        )?;
+    }
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();

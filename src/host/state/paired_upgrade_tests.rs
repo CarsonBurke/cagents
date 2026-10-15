@@ -560,6 +560,80 @@ fn run_pair(mode: &str) {
 }
 
 #[test]
+fn paired_effective_account_home_is_admitted_before_worker_start() {
+    let root = tempfile::tempdir().unwrap();
+    let selected = root.path().join("selected");
+    let unrelated = root.path().join("unrelated");
+    fs::create_dir(&selected).unwrap();
+    fs::create_dir(&unrelated).unwrap();
+    let host = host("effective-account-admission");
+    let reservation = crate::host::AccountReservation::test_install(
+        &host,
+        &[crate::account::Account::linked(
+            Provider::Codex,
+            uuid::Uuid::new_v4(),
+            selected.clone(),
+        )],
+        crate::account::registry::Store::at(root.path().join("registry")),
+        &crate::account::home::Homes::at(root.path().join("homes")),
+    )
+    .unwrap();
+    let launch = LaunchRecipe {
+        program: "/bin/sh".into(),
+        arguments: Vec::new(),
+        working_directory: root.path().into(),
+        environment: [("HOME".into(), unrelated.display().to_string())].into(),
+        unset_environment: Default::default(),
+    };
+    let issued = TerminalSession {
+        id: TerminalId::new(),
+        continuity: TerminalContinuity::RelaunchAvailable {
+            recipe: launch.clone(),
+            last_exit: None,
+        },
+        launch,
+        transcript_path: None,
+        resume_hint: None,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+    };
+    super::super::account_lifecycle::ensure_launch(
+        &host,
+        &issued.launch.working_directory,
+        &issued.launch.environment,
+        &Default::default(),
+        true,
+    )
+    .unwrap();
+    let mut effective = issued.launch.clone();
+    effective.program = root.path().join("codex").display().to_string();
+    effective.arguments = vec!["resume".into(), ID.into()];
+    effective
+        .environment
+        .insert("CODEX_HOME".into(), selected.display().to_string());
+    let failure = start_terminal_view_owned(
+        &host,
+        1,
+        issued,
+        Default::default(),
+        None,
+        false,
+        None,
+        None,
+        None,
+        Some(effective),
+    )
+    .unwrap_err();
+    assert!(failure.message.contains("account"), "{failure:?}");
+    let state = host.lock().unwrap();
+    assert!(state.spawning.is_empty());
+    assert!(state.terminals.is_empty());
+    drop(state);
+    drop(reservation);
+}
+
+#[test]
 fn legacy_paired_fresh_and_shell_recipes_preserve_issued_identity_across_two_restarts() {
     if isolated() {
         return;
