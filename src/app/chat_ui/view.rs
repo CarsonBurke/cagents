@@ -1210,10 +1210,37 @@ impl Runtime {
         if let Some(coordinated) = &cached.coordination {
             for (index, content) in coordinated.contents().enumerate() { builder.markdown(&item.id, &[1, index as u32], content.items()); }
         }
-        if detail && self.expanded.contains(&item.id) {
-            if let Some(input) = &cached.tool_input { builder.plain(&item.id, &[4], input.text.clone()); }
-            if let Some(output) = &cached.tool_output { if !output.text.is_empty() { builder.plain(&item.id, &[5], output.text.clone()); } }
-            for (index, patch) in cached.patches.iter().enumerate() { if !patch.text.is_empty() { builder.plain(&item.id, &[6, index as u32], patch.text.clone()); } }
+        let opened = detail && self.expanded.contains(&item.id);
+        let plain = |builder:&mut selection::DocumentBuilder,path:&[u32],text:&str| {
+            if !text.is_empty() {builder.plain(&item.id,path,Arc::from(text));}
+        };
+        match &item.content {
+            ItemContent::Command {label,command,working_directory,..} => {
+                if cached.coordination.is_none() && !label.is_empty() && label != command {plain(builder,&[3,0],turn::step_label(&item.content));}
+                if opened {plain(builder,&[3,1],working_directory);}
+            }
+            ItemContent::Tool {name,..} if cached.coordination.is_none() => plain(builder,&[3,0],name),
+            ItemContent::WebSearch {query,results} if opened => {
+                plain(builder,&[8,0],query);
+                for (index,result) in results.iter().enumerate() {
+                    plain(builder,&[8,1,index as u32,0],&result.title);
+                    plain(builder,&[8,1,index as u32,1],&result.url);
+                    plain(builder,&[8,1,index as u32,2],&result.snippet);
+                }
+            }
+            ItemContent::Image {description,..} => plain(builder,&[9,0],description),
+            _=>{}
+        }
+        if opened {
+            if let Some(input) = &cached.tool_input {builder.plain(&item.id,&[4],input.text.clone());}
+            if let Some(output) = &cached.tool_output && !output.text.is_empty() {builder.plain(&item.id,&[5],output.text.clone());}
+            if let ItemContent::Changes {changes,..} = &item.content {
+                for (index,change) in changes.iter().enumerate() {
+                    plain(builder,&[7,index as u32,0],&change.path);
+                    if let chat::ChangeKind::Renamed {from} = &change.kind {plain(builder,&[7,index as u32,1],from);}
+                    if let Some(patch) = cached.patches.get(index) && !patch.text.is_empty() {builder.plain(&item.id,&[6,index as u32],patch.text.clone());}
+                }
+            }
         }
     }
 
@@ -3370,7 +3397,7 @@ impl Runtime {
     /// no name at all, because its "path" is the payload itself, so the tail of
     /// it is base64 and the provider's description is the only thing that reads
     /// as a label.
-    fn attachment_label<'a>(path: &'a str, description: &'a str) -> &'a str {
+    pub(super) fn attachment_label<'a>(path: &'a str, description: &'a str) -> &'a str {
         if !path.starts_with("data:") {
             if let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty()) {
                 return name;

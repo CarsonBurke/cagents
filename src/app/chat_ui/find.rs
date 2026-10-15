@@ -384,3 +384,16 @@ mod tests {
         assert!(!expanded.contains("automatic"));
     }
 }
+
+/// A named rendered field uses the same logical coordinates as prose/code.
+/// Preview echoes are not a second search occurrence of their source field.
+pub(super) fn text(
+    target: super::Target, item: &str, path: &[u32], text: impl Into<String>,
+    size: f32, font: cosmic::iced::Font, paint: Option<std::sync::Arc<Paint>>,
+) -> super::Element<'static, super::Message> {
+    super::selectable_prose::logical_text(
+        vec![cosmic::iced::widget::text::Span::new(text.into())].into(),
+        size.into(), font, target, None,
+        super::selectable_prose::Logical {identity:super::selection::logical_identity(item,path),start:0,paint},
+    )
+}

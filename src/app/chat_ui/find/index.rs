@@ -201,7 +201,13 @@ fn document(input: &Input, provider: crate::agent::Provider) -> Document {
     use crate::app::chat_ui::{coordination, markdown, markdown_source, selection};
     use crate::chat::{ItemContent, Role, DeliveryKind};
     let item = &input.item;
+    let coordinated = crate::chat::coordination::recognize(item,provider).map(coordination::Coordinated::new);
     let mut builder = selection::Catalog::builder();
+    if let Some(coordinated) = &coordinated {
+        for (index,content) in coordinated.contents().enumerate() {
+            builder.markdown(&item.id,&[1,index as u32],content.items());
+        }
+    }
     let mut parse = |body: &str| {
         let source = match markdown_source::Source::default().advance(body,input.growing) {
             markdown_source::Step::Append(text) | markdown_source::Step::Restart(text) => text,
@@ -214,23 +220,37 @@ fn document(input: &Input, provider: crate::agent::Provider) -> Document {
         ItemContent::Text {text,..} => parse(text),
         ItemContent::Delivery {kind,body,..} if *kind != DeliveryKind::Notice => parse(body),
         ItemContent::Delivery {body,..} => builder.plain(&item.id,&[2],Arc::from(body.as_str())),
-        ItemContent::Command {command,output,..} => {
+        ItemContent::Command {command,label,working_directory,output,..} => {
+            if coordinated.is_none() && !label.is_empty() && label != command {
+                builder.plain(&item.id,&[3,0],Arc::from(crate::app::chat_ui::turn::step_label(&item.content)));
+            }
+            if !working_directory.is_empty() {builder.plain(&item.id,&[3,1],Arc::from(working_directory.as_str()));}
             builder.plain(&item.id,&[4],Arc::from(command.as_str()));
             builder.plain(&item.id,&[5],Arc::from(output.as_str()));
         }
-        ItemContent::Tool {input,output,..} => {
+        ItemContent::Tool {name,input,output,..} => {
+            if coordinated.is_none() {builder.plain(&item.id,&[3,0],Arc::from(name.as_str()));}
             builder.plain(&item.id,&[4],Arc::from(input.as_str()));
             builder.plain(&item.id,&[5],Arc::from(output.as_str()));
         }
         ItemContent::Changes {changes,..} => for (index,change) in changes.iter().enumerate() {
+            builder.plain(&item.id,&[7,index as u32,0],Arc::from(change.path.as_str()));
+            if let crate::chat::ChangeKind::Renamed {from}=&change.kind {builder.plain(&item.id,&[7,index as u32,1],Arc::from(from.as_str()));}
             builder.plain(&item.id,&[6,index as u32],Arc::from(change.diff.as_str()));
         },
-        _ => {}
-    }
-    if let Some(reading) = crate::chat::coordination::recognize(item,provider) {
-        let coordinated = coordination::Coordinated::new(reading);
-        for (index,content) in coordinated.contents().enumerate() {
-            builder.markdown(&item.id,&[1,index as u32],content.items());
+        ItemContent::WebSearch {query,results} => {
+            builder.plain(&item.id,&[8,0],Arc::from(query.as_str()));
+            for (index,result) in results.iter().enumerate() {
+                if !result.title.is_empty() {builder.plain(&item.id,&[8,1,index as u32,0],Arc::from(result.title.as_str()));}
+                if !result.url.is_empty() {builder.plain(&item.id,&[8,1,index as u32,1],Arc::from(result.url.as_str()));}
+                if !result.snippet.is_empty() {builder.plain(&item.id,&[8,1,index as u32,2],Arc::from(result.snippet.as_str()));}
+            }
+        }
+        ItemContent::Image {path,description} if item.role == Role::User => {
+            builder.plain(&item.id,&[2],Arc::from(crate::app::chat_ui::Runtime::attachment_label(path,description)));
+        }
+        ItemContent::Image {description,..} => {
+            if !description.is_empty() {builder.plain(&item.id,&[9,0],Arc::from(description.as_str()));}
         }
     }
     let blocks = builder.finish().search_blocks().into_iter().map(|(identity,text)| Block {identity,text}).collect();
