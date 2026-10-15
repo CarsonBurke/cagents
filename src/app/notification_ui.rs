@@ -937,6 +937,7 @@ pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Provider;
 
     #[test]
     fn notification_preview_projection_reuses_text_and_retires_acknowledged_context() {
