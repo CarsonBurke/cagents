@@ -4461,35 +4461,43 @@ impl Cagents {
         if self.refuse_in_deleting_worktree(&working_directory) {
             return Task::none();
         }
-        let account = self.default_account_for_directory(provider, &working_directory);
-        let automatic = self.automatic_accounts_for_directory(provider, &working_directory);
-        let session = match fresh_chat_session(
-            provider,
-            TerminalId::new(),
-            working_directory.clone(),
-            &account,
-            automatic,
-        ) {
-            Ok(session) => session,
+        let intent = match self.native_chat_selection_intent(provider, working_directory.clone(), ephemeral) {
+            Ok(intent) => intent,
             Err(error) => {
                 self.status = Some(TransientNotice::error(error));
                 return Task::none();
             }
         };
-        if self.durable.active_channel.is_none()
-            && self.active_workspace.as_deref() != Some(working_directory.as_path())
-        {
-            return self.select_worktree_then(
-                working_directory,
-                false,
-                worktree_ui::selection::Intent::Chat {
-                    session,
-                    beside: None,
-                    ephemeral,
-                },
-            );
+        // Filing in a channel and launching in another directory are separate
+        // authorities. The prepared receipt protects both before exposing a draft.
+        if let Some(channel) = self.durable.active_channel {
+            self.select_channel_then(channel, intent)
+        } else {
+            self.select_worktree_then(working_directory, false, intent)
         }
-        self.insert_chat_card_with_lifetime(session, None, ephemeral, None)
+    }
+
+    pub(in crate::app) fn native_thread_selection_intent(
+        &self,
+        directory: PathBuf,
+    ) -> Result<worktree_ui::selection::Intent, String> {
+        self.native_chat_selection_intent(self.preferred_chat_provider(), directory, false)
+    }
+
+    fn native_chat_selection_intent(
+        &self,
+        provider: Provider,
+        directory: PathBuf,
+        ephemeral: bool,
+    ) -> Result<worktree_ui::selection::Intent, String> {
+        let account = self.default_account_for_directory(provider, &directory);
+        let automatic = self.automatic_accounts_for_directory(provider, &directory);
+        let session = fresh_chat_session(provider, TerminalId::new(), directory, &account, automatic)?;
+        Ok(worktree_ui::selection::Intent::Chat {
+            session,
+            beside: None,
+            ephemeral,
+        })
     }
 
     /// Opens a card for the new conversation `session`, as a draft whose first

@@ -98,6 +98,14 @@ fn context_directory(intent: &Intent) -> Option<&Path> {
     }
 }
 
+fn chat_launch_directory(intent: &Intent) -> Option<&Path> {
+    match intent {
+        Intent::Chat { session, .. } => Some(&session.launch.recipe.working_directory),
+        Intent::Channel { after, .. } => chat_launch_directory(after),
+        _ => None,
+    }
+}
+
 struct Prepared {
     path: PathBuf,
     canonical: Vec<(PathBuf, PathBuf)>,
@@ -201,6 +209,58 @@ fn prepare_target(
     Ok((validated.0, validated.2, guard))
 }
 
+
+/// Protect an executable's immutable launch directory independently of its
+/// administrative filing scope, then validate the entire mapping after BOTH
+/// guards exist. All filesystem work stays on the blocking worker.
+fn prepare_chat_target(
+    path: PathBuf,
+    launch: PathBuf,
+    roots: Vec<(PathBuf, Option<PathBuf>, bool)>,
+    cached: Option<PathBuf>,
+    watch: &owner_watch::Monitor,
+    mut canonicalize: impl FnMut(&Path) -> std::io::Result<PathBuf>,
+    mut protect: impl FnMut(&Path) -> std::io::Result<Option<crate::worktree_cleanup::Protection>>,
+) -> Result<Prepared, String> {
+    watch.register(&[(path.clone(), path.clone()), (launch.clone(), launch.clone())]);
+    let (selected, mut canonical, guard) = prepare_target(
+        path.clone(), roots.clone(), cached, watch, &mut canonicalize, &mut protect,
+    )?;
+    let physical = canonical.iter().find(|(key, _)| key == &selected)
+        .map(|(_, physical)| physical.clone()).ok_or("Missing prepared filing mapping")?;
+    let (launch_owner, launch_paths, launch_guard) = prepare_target(
+        launch.clone(), roots, None, watch, &mut canonicalize,
+        |target| if target == physical.as_path() { Ok(None) } else { protect(target) },
+    )?;
+    for (key, value) in launch_paths {
+        if let Some((_, previous)) = canonical.iter().find(|(path, _)| path == &key) {
+            if previous != &value {
+                return Err("The conversation's launch or filing alias changed during preparation".into());
+            }
+        } else {
+            canonical.push((key, value));
+        }
+    }
+    let required = [&path, &launch, &selected, &launch_owner];
+    for (key, expected) in &canonical {
+        let observed = match canonicalize(key) {
+            Ok(value) => value,
+            Err(error) if required.contains(&key) => return Err(error.to_string()),
+            Err(_) => key.clone(),
+        };
+        if &observed != expected {
+            return Err("The conversation's launch or filing alias changed while acquiring protection".into());
+        }
+    }
+    Ok(Prepared {
+        path: selected,
+        canonical,
+        guard,
+        resume: None,
+        additional_guards: launch_guard.into_iter().collect(),
+    })
+}
+
 impl Cagents {
     pub(in crate::app) fn select_worktree_then(
         &mut self,
@@ -231,6 +291,10 @@ impl Cagents {
         local_window: bool,
     ) -> Task<Message> {
         let cancelled = self.cancel_worktree_selection();
+        let launch = chat_launch_directory(&intent).map(Path::to_owned);
+        if local_window {
+            self.worktree_selection.additional_paths.extend(launch.iter().cloned());
+        }
         let epoch = local_window.then(|| self.worktree_owner_paths.invalidate_watched());
         let resolved = self.refresh_worktree_owners(Some(&path));
         if local_window
@@ -292,38 +356,34 @@ impl Cagents {
         let canonicalize_calls = self.worktree_selection.canonicalize_calls.clone();
         #[cfg(test)]
         let guard_runtime = self.worktree_selection.guard_runtime_override.clone();
-        let prepare =
-            self.prepare_worktree_selection(generation, path, create, intent, epoch, move |path| {
-                prepare_target(
-                    path,
-                    roots,
-                    cached,
-                    &watch,
-                    move |path| {
-                        #[cfg(test)]
-                        if let Some(calls) = &canonicalize_calls {
-                            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        path.canonicalize()
-                    },
-                    |path| {
-                        #[cfg(test)]
-                        if let Some(runtime) = &guard_runtime {
-                            return crate::worktree_cleanup::fixture_protection(
-                                runtime, path, false,
-                            )
-                            .map(Some);
-                        }
-                        crate::worktree_cleanup::protect(path)?
-                            .ok_or_else(|| {
-                                std::io::Error::other(
-                                    "local worktree protection became unavailable",
-                                )
-                            })
-                            .map(Some)
-                    },
-                )
-            });
+        let prepare = self.prepare_worktree_selection_receipt(
+            generation, path, create, intent, epoch, move |path| {
+                let canonicalize = move |path: &Path| {
+                    #[cfg(test)]
+                    if let Some(calls) = &canonicalize_calls {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    path.canonicalize()
+                };
+                let protect = |path: &Path| {
+                    #[cfg(test)]
+                    if let Some(runtime) = &guard_runtime {
+                        return crate::worktree_cleanup::fixture_protection(runtime, path, false).map(Some);
+                    }
+                    crate::worktree_cleanup::protect(path)?
+                        .ok_or_else(|| std::io::Error::other("local worktree protection became unavailable"))
+                        .map(Some)
+                };
+                if let Some(launch) = launch {
+                    prepare_chat_target(path, launch, roots, cached, &watch, canonicalize, protect)
+                } else {
+                    prepare_target(path, roots, cached, &watch, canonicalize, protect)
+                        .map(|(path, canonical, guard)| Prepared {
+                            path, canonical, guard, resume: None, additional_guards: Vec::new(),
+                        })
+                }
+            },
+        );
         Task::batch([cancelled, prepare])
     }
 
@@ -567,6 +627,11 @@ impl Cagents {
             ));
             return self.abandon_worktree_selection(intent);
         }
+        if let Some(launch) = chat_launch_directory(&intent)
+            && self.refuse_in_deleting_worktree(launch)
+        {
+            return self.abandon_worktree_selection(intent);
+        }
         if let Intent::ResumePlacement { entry, .. } = &intent
             && self.refuse_in_deleting_worktree(&entry.session.launch.recipe.working_directory)
         {
@@ -672,10 +737,21 @@ impl Cagents {
                 Task::batch([insert, settled])
             }
             Intent::NewTerminal(path) => self.add_terminal(path),
-            Intent::NewNativeThread => self
-                .active_workspace
-                .clone()
-                .map_or_else(Task::none, |directory| self.new_native_thread_at(directory)),
+            Intent::NewNativeThread => {
+                let Some(directory) = self.active_workspace.clone() else {
+                    return Task::none();
+                };
+                // Scope and its physical guard are installed. Choose the
+                // destination's restored preferred provider, then insert via
+                // the already-prepared continuation, never the public ingress.
+                match self.native_thread_selection_intent(directory) {
+                    Ok(intent) => self.finish_worktree_selection(intent),
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(error));
+                        Task::none()
+                    }
+                }
+            },
             Intent::Chat {
                 session,
                 beside,
@@ -1538,3 +1614,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod chat_admission_tests;
