@@ -4084,6 +4084,9 @@ impl Cagents {
     }
 
     pub(super) fn new_native_thread(&mut self) -> Task<Message> {
+        if self.terminal_directory().is_none() {
+            return self.update_onboarding(onboarding_ui::Action::HomeChat);
+        }
         self.new_native_chat(self.preferred_chat_provider(), None)
     }
 
