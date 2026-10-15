@@ -113,7 +113,14 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
-            self.service.state.lock().unwrap_or_else(|p| p.into_inner()).free.push(slot);
+            let empty = {
+                let mut state = self.service.state.lock().unwrap_or_else(|p| p.into_inner());
+                state.free.push(slot);
+                state.free.len() == state.entries.len()
+            };
+            // No timer retries the idle census. Publish eligibility before
+            // waking its owner, without borrowing the reaper's mutex.
+            if empty { crate::daemon::wake(); }
         }
     }
 }
@@ -286,8 +293,8 @@ impl Service {
                 let Some(entry) = state.entries[*slot].as_mut().filter(|entry| entry.ticket == *ticket) else { continue; };
                 // Only this original Child is queried after its pinned pidfd
                 // became ready. No process-wide wait or numeric PID signal.
-                match entry.child.try_wait() {
-                    Ok(Some(_)) => { state.entries[*slot].take(); state.free.push(*slot); }
+                let reaped = match entry.child.try_wait() {
+                    Ok(Some(_)) => { state.entries[*slot].take(); state.free.push(*slot); true }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     result => {
                         entry.suspended = true;
@@ -295,8 +302,12 @@ impl Service {
                             Err(error) => format!("exact child could not be reaped: {error}"), _ => unreachable!() };
                         state.failure = Some(error.clone());
                         tracing::error!(%error, "Retained exact child and its credit; no polling retry is armed");
+                        false
                     }
-                }
+                };
+                let empty = reaped && state.free.len() == state.entries.len();
+                drop(state);
+                if empty { crate::daemon::wake(); }
             }
         }
     }
