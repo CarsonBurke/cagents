@@ -3996,6 +3996,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         invalid_output(parse_working_files(&output.stdout), output)
     }
 
+    /// A bounded read-only inventory prefix for watch planning. A truncated
+    /// prefix is not complete membership: callers must preserve root/admin
+    /// coverage and provide an explicit directory census or polling fallback.
+    pub fn watch_files_projection(
+        &self,
+        worktree: &Path,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
+        let (output, truncated) = self.listing_output(
+            &self.working_files_command(worktree),
+            Some(limit.clamp(1, 100_000)),
+            status_limit::Format::Files,
+            cancellation,
+        )?;
+        let mut files = invalid_output(parse_working_files(&output.stdout), output)?;
+        files.listing_truncated = truncated;
+        Ok(files)
+    }
+
     /// Tracked paths alone are sufficient to watch the sidebar's tracked-only
     /// status without enumerating ignored build trees or untracked files.
     pub fn tracked_files(
@@ -7906,6 +7926,23 @@ mod tests {
             self.commands.lock().unwrap().push(command.clone());
             self.outputs.lock().unwrap().pop().unwrap()
         }
+    }
+
+    #[test]
+    fn watch_projection_preserves_a_prefix_without_changing_complete_inventory_reads() {
+        let listing = b"H first.txt\0H second.txt\0";
+        let service = fake_service(vec![success(listing), success(listing)]);
+        let cancel = CancellationToken::new();
+        let prefix = service.watch_files_projection(Path::new("/repo"), 1, &cancel).unwrap();
+        assert_eq!(prefix.paths, vec![path("first.txt")]);
+        assert_eq!(prefix.tracked_count, 1);
+        assert!(prefix.listing_truncated);
+        let complete = service.watch_files(Path::new("/repo"), &cancel).unwrap();
+        assert_eq!(complete.paths.len(), 2);
+        assert!(!complete.listing_truncated);
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands[0].stdout_record_limit, Some(1));
+        assert_eq!(commands[1].stdout_record_limit, None);
     }
 
     #[test]
