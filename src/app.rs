@@ -5247,158 +5247,231 @@ impl SettingsDraft {
                 self.link_open_destination = previous.link_open_destination
             }
             SettingsField::LinkOpenGesture => self.link_open_gesture = previous.link_open_gesture,
-            SettingsField::ShortcutNewTerminal => {
-                self.keyboard_shortcuts.new_terminal =
-                    previous.keyboard_shortcuts.new_terminal.clone()
-            }
-            SettingsField::ShortcutToggleProjects => {
-                self.keyboard_shortcuts.toggle_projects =
-                    previous.keyboard_shortcuts.toggle_projects.clone()
-            }
-            SettingsField::ShortcutRenamePane => {
-                self.keyboard_shortcuts.rename_pane =
-                    previous.keyboard_shortcuts.rename_pane.clone()
-            }
-            SettingsField::ShortcutCommandPalette => {
-                self.keyboard_shortcuts.command_palette =
-                    previous.keyboard_shortcuts.command_palette.clone()
-            }
-            SettingsField::ShortcutNewThread => {
-                self.keyboard_shortcuts.new_native_thread =
-                    previous.keyboard_shortcuts.new_native_thread.clone()
-            }
-            SettingsField::ShortcutChatPermissions => {
-                self.keyboard_shortcuts.chat_permissions =
-                    previous.keyboard_shortcuts.chat_permissions.clone()
-            }
-            SettingsField::ShortcutChatModel => {
-                self.keyboard_shortcuts.chat_model = previous.keyboard_shortcuts.chat_model.clone()
-            }
-            SettingsField::ShortcutChatAccount => {
-                self.keyboard_shortcuts.chat_account =
-                    previous.keyboard_shortcuts.chat_account.clone()
-            }
-            SettingsField::ShortcutToggleInspector => {
-                self.keyboard_shortcuts.toggle_inspector =
-                    previous.keyboard_shortcuts.toggle_inspector.clone()
-            }
-            SettingsField::ShortcutOpenSettings => {
-                self.keyboard_shortcuts.open_settings =
-                    previous.keyboard_shortcuts.open_settings.clone()
-            }
-            SettingsField::ShortcutMovePaneLeft => {
-                self.keyboard_shortcuts.move_pane_left =
-                    previous.keyboard_shortcuts.move_pane_left.clone()
-            }
-            SettingsField::ShortcutMovePaneRight => {
-                self.keyboard_shortcuts.move_pane_right =
-                    previous.keyboard_shortcuts.move_pane_right.clone()
-            }
-            SettingsField::ShortcutReopenPane => {
-                self.keyboard_shortcuts.reopen_pane =
-                    previous.keyboard_shortcuts.reopen_pane.clone()
-            }
-            SettingsField::ShortcutFocusPane1 => {
-                self.keyboard_shortcuts.focus_pane_1 =
-                    previous.keyboard_shortcuts.focus_pane_1.clone()
-            }
-            SettingsField::ShortcutFocusPane2 => {
-                self.keyboard_shortcuts.focus_pane_2 =
-                    previous.keyboard_shortcuts.focus_pane_2.clone()
-            }
-            SettingsField::ShortcutFocusPane3 => {
-                self.keyboard_shortcuts.focus_pane_3 =
-                    previous.keyboard_shortcuts.focus_pane_3.clone()
-            }
-            SettingsField::ShortcutFocusPane4 => {
-                self.keyboard_shortcuts.focus_pane_4 =
-                    previous.keyboard_shortcuts.focus_pane_4.clone()
-            }
-            SettingsField::ShortcutFocusPane5 => {
-                self.keyboard_shortcuts.focus_pane_5 =
-                    previous.keyboard_shortcuts.focus_pane_5.clone()
-            }
-            SettingsField::ShortcutFocusPane6 => {
-                self.keyboard_shortcuts.focus_pane_6 =
-                    previous.keyboard_shortcuts.focus_pane_6.clone()
-            }
-            SettingsField::ShortcutFocusPane7 => {
-                self.keyboard_shortcuts.focus_pane_7 =
-                    previous.keyboard_shortcuts.focus_pane_7.clone()
-            }
-            SettingsField::ShortcutFocusPane8 => {
-                self.keyboard_shortcuts.focus_pane_8 =
-                    previous.keyboard_shortcuts.focus_pane_8.clone()
-            }
-            SettingsField::ShortcutFocusPane9 => {
-                self.keyboard_shortcuts.focus_pane_9 =
-                    previous.keyboard_shortcuts.focus_pane_9.clone()
-            }
-            SettingsField::ShortcutNewChannel => {
-                self.keyboard_shortcuts.new_channel =
-                    previous.keyboard_shortcuts.new_channel.clone()
-            }
-            SettingsField::ShortcutClonePane => {
-                self.keyboard_shortcuts.clone_pane = previous.keyboard_shortcuts.clone_pane.clone()
-            }
-            SettingsField::ShortcutCloseFocusedColumn => {
-                self.keyboard_shortcuts.close_focused_column =
-                    previous.keyboard_shortcuts.close_focused_column.clone()
-            }
-            SettingsField::ShortcutFindInPane => {
-                self.keyboard_shortcuts.find_in_pane =
-                    previous.keyboard_shortcuts.find_in_pane.clone()
-            }
-            SettingsField::ShortcutSearchProjects => {
-                self.keyboard_shortcuts.search_projects =
-                    previous.keyboard_shortcuts.search_projects.clone()
-            }
-            SettingsField::ShortcutPreviousColumn => {
-                self.keyboard_shortcuts.previous_column =
-                    previous.keyboard_shortcuts.previous_column.clone()
-            }
-            SettingsField::ShortcutNextColumn => {
-                self.keyboard_shortcuts.next_column =
-                    previous.keyboard_shortcuts.next_column.clone()
-            }
-            SettingsField::ShortcutCyclePaneWidth => {
-                self.keyboard_shortcuts.cycle_pane_width =
-                    previous.keyboard_shortcuts.cycle_pane_width.clone()
-            }
-            SettingsField::ShortcutPreviousWorkspace => {
-                self.keyboard_shortcuts.previous_workspace =
-                    previous.keyboard_shortcuts.previous_workspace.clone()
-            }
-            SettingsField::ShortcutNextWorkspace => {
-                self.keyboard_shortcuts.next_workspace =
-                    previous.keyboard_shortcuts.next_workspace.clone()
-            }
             SettingsField::PullRequestOpenTarget => {
                 self.pull_request_open_target = previous.pull_request_open_target
             }
-            SettingsField::ShortcutReviewToggleViewed => {
-                self.keyboard_shortcuts.review_toggle_viewed =
-                    previous.keyboard_shortcuts.review_toggle_viewed.clone()
-            }
-            SettingsField::ShortcutReviewNextFile => {
-                self.keyboard_shortcuts.review_next_file =
-                    previous.keyboard_shortcuts.review_next_file.clone()
-            }
-            SettingsField::ShortcutReviewPreviousFile => {
-                self.keyboard_shortcuts.review_previous_file =
-                    previous.keyboard_shortcuts.review_previous_file.clone()
-            }
-            SettingsField::ShortcutReviewNextUnviewed => {
-                self.keyboard_shortcuts.review_next_unviewed =
-                    previous.keyboard_shortcuts.review_next_unviewed.clone()
-            }
-            SettingsField::ShortcutReviewNextChange => {
-                self.keyboard_shortcuts.review_next_change =
-                    previous.keyboard_shortcuts.review_next_change.clone()
-            }
-            SettingsField::ShortcutReviewPreviousChange => {
-                self.keyboard_shortcuts.review_previous_change =
-                    previous.keyboard_shortcuts.review_previous_change.clone()
+            SettingsField::ShortcutNewTerminal |
+            SettingsField::ShortcutNewChannel |
+            SettingsField::ShortcutClonePane |
+            SettingsField::ShortcutCloseFocusedColumn |
+            SettingsField::ShortcutSearchProjects |
+            SettingsField::ShortcutFindInPane |
+            SettingsField::ShortcutPreviousColumn |
+            SettingsField::ShortcutNextColumn |
+            SettingsField::ShortcutCyclePaneWidth |
+            SettingsField::ShortcutPreviousWorkspace |
+            SettingsField::ShortcutNextWorkspace |
+            SettingsField::ShortcutNextAttention |
+            SettingsField::ShortcutPreviousAttention |
+            SettingsField::ShortcutReviewToggleViewed |
+            SettingsField::ShortcutReviewNextFile |
+            SettingsField::ShortcutReviewPreviousFile |
+            SettingsField::ShortcutReviewNextUnviewed |
+            SettingsField::ShortcutReviewNextChange |
+            SettingsField::ShortcutReviewPreviousChange |
+            SettingsField::ShortcutCommandPalette |
+            SettingsField::ShortcutNewThread |
+            SettingsField::ShortcutChatPermissions |
+            SettingsField::ShortcutChatModel |
+            SettingsField::ShortcutChatAccount |
+            SettingsField::ShortcutToggleInspector |
+            SettingsField::ShortcutOpenSettings |
+            SettingsField::ShortcutMovePaneLeft |
+            SettingsField::ShortcutMovePaneRight |
+            SettingsField::ShortcutReopenPane |
+            SettingsField::ShortcutFocusPane1 |
+            SettingsField::ShortcutFocusPane2 |
+            SettingsField::ShortcutFocusPane3 |
+            SettingsField::ShortcutFocusPane4 |
+            SettingsField::ShortcutFocusPane5 |
+            SettingsField::ShortcutFocusPane6 |
+            SettingsField::ShortcutFocusPane7 |
+            SettingsField::ShortcutFocusPane8 |
+            SettingsField::ShortcutFocusPane9 |
+            SettingsField::ShortcutFocusLastPane |
+            SettingsField::ShortcutToggleProjects |
+            SettingsField::ShortcutRenamePane |
+            SettingsField::ShortcutNewBrowser |
+            SettingsField::ShortcutOpenFolder |
+            SettingsField::ShortcutNewWorktree |
+            SettingsField::ShortcutCloseOtherPanes |
+            SettingsField::ShortcutClosePanesToRight |
+            SettingsField::ShortcutCopyPath |
+            SettingsField::ShortcutRevealInProjects |
+            SettingsField::ShortcutForkConversation |
+            SettingsField::ShortcutFocusSidebarTree |
+            SettingsField::ShortcutRestartDaemon |
+            SettingsField::ShortcutToggleTheme |
+            SettingsField::ShortcutResumeConversation |
+            SettingsField::ShortcutSwitchPane |
+            SettingsField::ShortcutReviewConversationChanges |
+            SettingsField::ShortcutFocusProject1 |
+            SettingsField::ShortcutFocusProject2 |
+            SettingsField::ShortcutFocusProject3 |
+            SettingsField::ShortcutFocusProject4 |
+            SettingsField::ShortcutFocusProject5 |
+            SettingsField::ShortcutFocusProject6 |
+            SettingsField::ShortcutFocusProject7 |
+            SettingsField::ShortcutFocusProject8 |
+            SettingsField::ShortcutFocusProject9 |
+            SettingsField::ShortcutSettingsGeneral |
+            SettingsField::ShortcutSettingsAppearance |
+            SettingsField::ShortcutSettingsTerminal |
+            SettingsField::ShortcutSettingsLinks |
+            SettingsField::ShortcutSettingsKeyboard |
+            SettingsField::ShortcutSettingsNativeChat |
+            SettingsField::ShortcutSettingsEditor |
+            SettingsField::ShortcutSettingsAccounts |
+            SettingsField::ShortcutSettingsNotifications |
+            SettingsField::ShortcutSettingsAbout |
+            SettingsField::ShortcutMovePaneToChannel |
+            SettingsField::ShortcutDiffCopy |
+            SettingsField::ShortcutDiffCopyOld |
+            SettingsField::ShortcutDiffCopyNew |
+            SettingsField::ShortcutDiffCopyPatch |
+            SettingsField::ShortcutDiffCopyLineReference |
+            SettingsField::ShortcutDiffOpenInEditor |
+            SettingsField::ShortcutDiffSelectAll |
+            SettingsField::ShortcutNextDiagnostic |
+            SettingsField::ShortcutPreviousDiagnostic |
+            SettingsField::ShortcutEndConversation |
+            SettingsField::ShortcutEditorUndo |
+            SettingsField::ShortcutEditorRedo |
+            SettingsField::ShortcutEditorCut |
+            SettingsField::ShortcutEditorCopy |
+            SettingsField::ShortcutEditorPaste |
+            SettingsField::ShortcutEditorSelectAll |
+            SettingsField::ShortcutMarkAllRead |
+            SettingsField::ShortcutSearchInProject |
+            SettingsField::ShortcutCloneRepository |
+            SettingsField::ShortcutCopyBranch |
+            SettingsField::ShortcutOpenOrCreatePullRequest |
+            SettingsField::ShortcutNewWorktreeFromBranch |
+            SettingsField::ShortcutMoveProjectUp |
+            SettingsField::ShortcutMoveProjectDown |
+            SettingsField::ShortcutResetSidebarOrder |
+            SettingsField::ShortcutRevealInFileManager |
+            SettingsField::ShortcutOpenRepositoryUrl |
+            SettingsField::ShortcutOpenInExternalEditor |
+            SettingsField::ShortcutDeleteWorktree |
+            SettingsField::ShortcutRemoveProject |
+            SettingsField::ShortcutDeleteSelectedRows |
+            SettingsField::ShortcutRenameChannel |
+            SettingsField::ShortcutMarkChannelRead |
+            SettingsField::ShortcutDeleteChannel |
+            SettingsField::ShortcutMarkWorktreeRead |
+            SettingsField::ShortcutRenameFile |
+            SettingsField::ShortcutDuplicateFile |
+            SettingsField::ShortcutCopyRelativePath |
+            SettingsField::ShortcutStageSelectedChanges |
+            SettingsField::ShortcutUnstageSelectedChanges |
+            SettingsField::ShortcutDiscardSelectedChanges |
+            SettingsField::ShortcutOpenFile |
+            SettingsField::ShortcutRevealInFiles |
+            SettingsField::ShortcutIgnoreChangePath |
+            SettingsField::ShortcutGitFetch |
+            SettingsField::ShortcutGitPush |
+            SettingsField::ShortcutGitPublish |
+            SettingsField::ShortcutGitSync |
+            SettingsField::ShortcutGitSyncRebase |
+            SettingsField::ShortcutGitStash |
+            SettingsField::ShortcutGitStashUntracked |
+            SettingsField::ShortcutGitStashes |
+            SettingsField::ShortcutGitApplyStash |
+            SettingsField::ShortcutGitPopStash |
+            SettingsField::ShortcutGitDropStash |
+            SettingsField::ShortcutGitCommit |
+            SettingsField::ShortcutGitAmend |
+            SettingsField::ShortcutGitRefresh |
+            SettingsField::ShortcutGitAbort |
+            SettingsField::ShortcutGitContinue |
+            SettingsField::ShortcutGitOutput |
+            SettingsField::ShortcutGitAcceptOurs |
+            SettingsField::ShortcutGitAcceptTheirs |
+            SettingsField::ShortcutEditorComplete |
+            SettingsField::ShortcutGoToDefinition |
+            SettingsField::ShortcutFindReferences |
+            SettingsField::ShortcutShowHover |
+            SettingsField::ShortcutShowDiagnostics |
+            SettingsField::ShortcutEditorSave |
+            SettingsField::ShortcutEditorDiscardEdits |
+            SettingsField::ShortcutEditorEdit |
+            SettingsField::ShortcutEditorPreview |
+            SettingsField::ShortcutEditorDiff |
+            SettingsField::ShortcutPdfFirstPage |
+            SettingsField::ShortcutPdfPreviousPage |
+            SettingsField::ShortcutPdfNextPage |
+            SettingsField::ShortcutPdfLastPage |
+            SettingsField::ShortcutPdfZoomOut |
+            SettingsField::ShortcutPdfZoomIn |
+            SettingsField::ShortcutPdfFit |
+            SettingsField::ShortcutPdfToggleColors |
+            SettingsField::ShortcutDiffUnified |
+            SettingsField::ShortcutDiffSplit |
+            SettingsField::ShortcutDiffIgnoreWhitespace |
+            SettingsField::ShortcutDiffWorking |
+            SettingsField::ShortcutDiffStaged |
+            SettingsField::ShortcutDiffBranch |
+            SettingsField::ShortcutDiffHistory |
+            SettingsField::ShortcutStageFile |
+            SettingsField::ShortcutUnstageFile |
+            SettingsField::ShortcutStageOrUnstageFile |
+            SettingsField::ShortcutDiffRevert |
+            SettingsField::ShortcutDiffRetry |
+            SettingsField::ShortcutDiffStageSelection |
+            SettingsField::ShortcutDiffUnstageSelection |
+            SettingsField::ShortcutDiffRevertSelection |
+            SettingsField::ShortcutDiffStageHunk |
+            SettingsField::ShortcutDiffUnstageHunk |
+            SettingsField::ShortcutDiffRevertHunk |
+            SettingsField::ShortcutBrowserBack |
+            SettingsField::ShortcutBrowserForward |
+            SettingsField::ShortcutBrowserReload |
+            SettingsField::ShortcutBrowserStop |
+            SettingsField::ShortcutBrowserAddress |
+            SettingsField::ShortcutBrowserOpenSystem |
+            SettingsField::ShortcutBrowserImportLogins |
+            SettingsField::ShortcutChatSend |
+            SettingsField::ShortcutChatSteer |
+            SettingsField::ShortcutChatQueue |
+            SettingsField::ShortcutChatInterrupt |
+            SettingsField::ShortcutChatCompact |
+            SettingsField::ShortcutChatAttach |
+            SettingsField::ShortcutChatReasoning |
+            SettingsField::ShortcutChatLatest |
+            SettingsField::ShortcutChatTakeBackQueued |
+            SettingsField::ShortcutChatCancelQueued |
+            SettingsField::ShortcutChatToggleSteering |
+            SettingsField::ShortcutChatToggleFastMode |
+            SettingsField::ShortcutGitStageAllUnstaged |
+            SettingsField::ShortcutGitStageAllUntracked |
+            SettingsField::ShortcutGitStageAllConflicts |
+            SettingsField::ShortcutGitUnstageAllStaged |
+            SettingsField::ShortcutGitDiscardAllUnstaged |
+            SettingsField::ShortcutGitDiscardAllUntracked |
+            SettingsField::ShortcutEditorReload |
+            SettingsField::ShortcutEditorOverwrite |
+            SettingsField::ShortcutTerminalReview |
+            SettingsField::ShortcutEditorRenameSymbol |
+            SettingsField::ShortcutEditorFormatDocument |
+            SettingsField::ShortcutEditorFormatSelection |
+            SettingsField::ShortcutEditorCodeActions |
+            SettingsField::ShortcutEditorSignatureHelp |
+            SettingsField::ShortcutSettingsOpenFile |
+            SettingsField::ShortcutSettingsRevealFile |
+            SettingsField::ShortcutGitHistoryCopySha |
+            SettingsField::ShortcutGitHistoryCopyMessage |
+            SettingsField::ShortcutGitHistoryNewWorktree |
+            SettingsField::ShortcutGitHistoryCreateBranch |
+            SettingsField::ShortcutGitHistoryRevert |
+            SettingsField::ShortcutGitHistoryCherryPick |
+            SettingsField::ShortcutOpenAutomations |
+            SettingsField::ShortcutOpenAgentAccounts => {
+                let action = field.shortcut_action().expect("registered shortcut field");
+                let value = previous.keyboard_shortcuts.shortcut_values().into_iter()
+                    .find_map(|(candidate, value)| (candidate == action).then_some(value))
+                    .expect("registered shortcut draft");
+                self.set(field, value.to_owned());
             }
         }
         if let Some(raw) = previous.numeric_display.get(&field) {

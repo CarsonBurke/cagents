@@ -2842,7 +2842,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 210] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 212] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
