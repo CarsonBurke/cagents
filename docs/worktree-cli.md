@@ -49,5 +49,6 @@ A worktree entry contains `path`, `branch` (short name or null), `head_oid`,
 `primary`, `detached`, `locked`, `dirty`, `ahead`, `behind`, and `live_sessions`
 (array of terminal or chat IDs). `ahead`/`behind` are null when there is no known
 upstream comparison; null does not mean zero. Paths belong to the selected device.
-Human-readable list output is tab-separated path, branch, clean/dirty, ahead,
-behind and live-session count.
+Human-readable list output is an aligned table with path, branch, clean/dirty,
+ahead, behind and live-session count. `--no-start` reads an existing daemon and
+returns an error if none is running.

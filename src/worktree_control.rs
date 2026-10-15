@@ -92,13 +92,7 @@ pub struct BranchDeleteFailure {
 
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) fn git_command(repository: &std::path::Path) -> crate::repository::CommandSpec {
-    crate::repository::CommandSpec::new("git")
-        .cwd(repository)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .args(["--no-pager", "-c", "color.ui=false"])
+    crate::repository::RepositoryService::system("git").git_base(repository,false)
         .timeout(std::time::Duration::from_secs(30))
 }
 

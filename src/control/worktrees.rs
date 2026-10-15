@@ -49,7 +49,7 @@ pub enum WorktreeCommand {
 }
 
 pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
-    let socket=terminal::ensure_daemon_ready().map_err(|error|AppError::new("daemon_start",error))?;
+    let socket=control_daemon_socket()?;
     let mut client=ControlClient::connect(&socket).map_err(|error|AppError::new("daemon_connection",error))?;
     let model=client.read_workspace_model().map_err(protocol_error)?;
     let project=match &command {
@@ -104,7 +104,8 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
             ("worktree.create",data,human)
         }
         Reply::Listed {worktrees}=>{
-            let human=worktrees.iter().map(|entry|format!("{}\t{}\t{}\t{}\t{}\t{}",entry.path.display(),entry.branch.as_deref().unwrap_or("(detached)"),if entry.dirty {"dirty"}else{"clean"},entry.ahead.map(|count|format!("+{count}")).unwrap_or("-".into()),entry.behind.map(|count|format!("-{count}")).unwrap_or("-".into()),entry.live_sessions.len())).collect::<Vec<_>>().join("\n");
+            let rows=worktrees.iter().map(|entry|vec![entry.path.display().to_string(),entry.branch.as_deref().unwrap_or("(detached)").into(),if entry.dirty {"dirty".into()}else{"clean".into()},entry.ahead.map(|count|format!("+{count}")).unwrap_or("-".into()),entry.behind.map(|count|format!("-{count}")).unwrap_or("-".into()),entry.live_sessions.len().to_string()]).collect();
+            let human=super::format::table(&["PATH","BRANCH","STATE","AHEAD","BEHIND","SESSIONS"],rows,"No worktrees");
             ("worktree.list",json!({"schema_version":1,"worktrees":worktrees}),human)
         }
         Reply::BranchDeleted {..}|Reply::BranchDeleteRefused {..}=>return Err(AppError::new("protocol","Unexpected branch-deletion response")),
