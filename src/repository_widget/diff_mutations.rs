@@ -64,6 +64,13 @@ impl RepositoryRuntime {
         }))
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_diff_fixture(card: CardId) -> Self {
+        let mut runtime = tests::selected_mutation_fixture(card);
+        runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(runtime.diff_mode, crate::diff_interaction::Side::New, 0));
+        runtime
+    }
+
     /// Selection commands require actual selected rows. Their captured request
     /// keeps palette activation bound to the rendered source and coordinates.
     pub fn can_apply_diff_selection(&self, kind: git_patch::Kind) -> bool {
@@ -436,7 +443,7 @@ pub(super) fn gutter<'a>(
 mod tests {
     use super::*;
 
-    fn selected_mutation_fixture(card: CardId) -> RepositoryRuntime {
+    pub(super) fn selected_mutation_fixture(card: CardId) -> RepositoryRuntime {
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.txt", "changed\nkeep\n");
         runtime.source_surface = SourceSurface::Diff;
         let mut model = crate::diff_view::build_diff("original\nkeep\n", "changed\nkeep\n");

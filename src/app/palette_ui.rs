@@ -3726,6 +3726,84 @@ mod tests {
         }
     }
 
+    fn diff_command_fixture() -> (Cagents, CardId, ActiveWorktreeKey) {
+        let mut app = settings_focus_fixture();
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let card = app.workspace.focused().unwrap();
+        let mut runtime = RepositoryRuntime::selected_diff_fixture(card);
+        runtime.descriptor.project = key.project_id;
+        runtime.descriptor.worktree = key.canonical_path.clone();
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        (app, card, key)
+    }
+
+    #[test]
+    fn diff_commands_require_the_bound_ready_source_and_keep_captured_selected_rows() {
+        let (mut app, card, _) = diff_command_fixture();
+        assert!(app.command_available(Command::DiffStageSelection));
+        assert!(!app.command_available(Command::DiffUnstageSelection));
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">stage selected diff rows".into())));
+        let entries = app.palette_entries();
+        let Message::Palette(Action::RunDiffSelection(command, action)) = entries[0].2.clone() else { panic!("selection must carry its captured request"); };
+        assert_eq!(command, Command::DiffStageSelection);
+        let RepositoryAction::ApplyDiffHunk { request, kind, .. } = action.as_ref() else { panic!("source-bound mutation"); };
+        let rows = request.rows.clone();
+        assert_eq!(*kind, crate::git_patch::Kind::Stage);
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.capture_diff_mutation(card, *kind, Some(request)).is_some()));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else { unreachable!() };
+        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
+        assert_eq!(request.rows, rows, "a later layout cannot rewrite the captured row range");
+        assert!(app.palette_selection_index(&app.palette_entries()).is_none(), "new coordinates cannot replace the selected action");
+        drop(app.update_palette(Action::Submit));
+        assert!(app.palette.is_open());
+        assert!(app.source_control_mutations.is_empty());
+        drop(app.update_palette(Action::Close));
+        drop(app.update_palette(Action::RunDiffSelection(command, action)));
+        assert!(app.notices.recent().any(|entry| entry.notice.message.contains("selected diff changed")) || app.status.as_ref().is_some_and(|notice| notice.message.contains("selected diff changed")));
+        let (mut app, _, _) = diff_command_fixture();
+        app.sidebar_model.source_control.as_mut().unwrap().reloading = true;
+        assert!(!app.command_available(Command::DiffStageSelection));
+        app.sidebar_model.source_control = None;
+        for command in [Command::DiffStageSelection, Command::DiffUnstageSelection, Command::DiffRevertSelection, Command::StageFile, Command::UnstageFile, Command::StageOrUnstageFile] { assert!(!app.command_available(command), "{command:?} needs the actual current worktree source"); }
+        assert!(app.command_available(Command::DiffSplit), "presentation remains usable without mutation authority");
+    }
+
+    #[test]
+    fn file_stage_shortcut_rebinding_uses_actual_root_routing_and_never_background_fields() {
+        let press = |app: &mut Cagents, card, pane, f9| {
+            let event = if f9 { keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::F9), modified_key: keyboard::Key::Named(keyboard::key::Named::F9), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F9), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::ALT, text: None, repeat: false } }
+            else { keyboard::Event::KeyPressed { key: keyboard::Key::Character("s".into()), modified_key: keyboard::Key::Character("S".into()), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, text: None, repeat: false } };
+            drop(app.update(Message::RoutedKeyEvent { event, captured: true, region: crate::input_trace::KeyboardRegion { pane, card: Some(card) }, widget: None }));
+        };
+        for pane in [workspace_widget::FocusedPane::RepositoryPane, workspace_widget::FocusedPane::Editor, workspace_widget::FocusedPane::WorkingDiff] {
+            let (mut app, card, key) = diff_command_fixture();
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else { unreachable!() };
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: false }));
+            assert!(app.command_available(Command::StageOrUnstageFile));
+            press(&mut app, card, pane, false);
+            assert!(app.source_control_mutations.contains_key(&key.canonical_path), "{pane:?} queues the actual file mutation");
+        }
+        for pane in [workspace_widget::FocusedPane::TextInput, workspace_widget::FocusedPane::SidebarRows, workspace_widget::FocusedPane::SidebarFiles, workspace_widget::FocusedPane::SidebarChanges, workspace_widget::FocusedPane::Chat, workspace_widget::FocusedPane::Terminal] {
+            let (mut app, card, _) = diff_command_fixture();
+            press(&mut app, card, pane, false);
+            assert!(app.source_control_mutations.is_empty(), "{pane:?} cannot stage a background file");
+        }
+        let (mut app, card, _) = diff_command_fixture();
+        app.settings.keyboard_shortcuts.stage_or_unstage_file.clear();
+        press(&mut app, card, workspace_widget::FocusedPane::WorkingDiff, false);
+        assert!(app.source_control_mutations.is_empty());
+        app.settings.keyboard_shortcuts.stage_or_unstage_file = vec!["Alt+F9".into()];
+        assert!(app.settings.clone().validate().is_ok());
+        press(&mut app, card, workspace_widget::FocusedPane::WorkingDiff, false);
+        assert!(app.source_control_mutations.is_empty());
+        press(&mut app, card, workspace_widget::FocusedPane::WorkingDiff, true);
+        assert!(!app.source_control_mutations.is_empty());
+    }
+
     #[test]
     fn configured_save_retires_old_chords_and_respects_actual_repository_focus() {
         use workspace_widget::FocusedPane;

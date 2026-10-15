@@ -1802,10 +1802,10 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::DiffUnified, label: "Unified diff", repeatable: false, scope: ShortcutScope::Review },
     ShortcutDescriptor { action: GlobalShortcut::DiffSplit, label: "Side-by-side diff", repeatable: false, scope: ShortcutScope::Review },
     ShortcutDescriptor { action: GlobalShortcut::DiffIgnoreWhitespace, label: "Toggle ignored diff whitespace", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffWorking, label: "Compare index with working tree", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffStaged, label: "Compare HEAD with index", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffBranch, label: "Compare branch with base", repeatable: false, scope: ShortcutScope::Review },
-    ShortcutDescriptor { action: GlobalShortcut::DiffHistory, label: "Compare last commit with parent", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffWorking, label: "Compare index with working tree", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::DiffStaged, label: "Compare HEAD with index", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::DiffBranch, label: "Compare branch with base", repeatable: false, scope: ShortcutScope::Repository },
+    ShortcutDescriptor { action: GlobalShortcut::DiffHistory, label: "Compare last commit with parent", repeatable: false, scope: ShortcutScope::Repository },
     ShortcutDescriptor { action: GlobalShortcut::StageFile, label: "Stage file", repeatable: false, scope: ShortcutScope::Repository },
     ShortcutDescriptor { action: GlobalShortcut::UnstageFile, label: "Unstage file", repeatable: false, scope: ShortcutScope::Repository },
     ShortcutDescriptor { action: GlobalShortcut::StageOrUnstageFile, label: "Stage or unstage file", repeatable: false, scope: ShortcutScope::Repository },
@@ -7040,6 +7040,39 @@ mod tests {
             assert!(shortcut_keys(command, &KeyboardShortcuts::default()).is_empty());
             assert!(pdf_command_bit(command).is_some());
         }
+    }
+
+    #[test]
+    fn configured_file_stage_toggle_retires_fixed_keys_and_respects_native_focus() {
+        use keyboard::key::{Code, Physical};
+        let mut shortcuts = KeyboardShortcuts::default();
+        let key = key_press("s", Code::KeyS, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, false);
+        assert!(shortcuts.fault().is_none());
+        for focused in [FocusedPane::RepositoryPane, FocusedPane::Editor, FocusedPane::Review, FocusedPane::WorkingDiff] {
+            assert_eq!(global_shortcut(&key, &shortcuts, focused), Some(GlobalShortcut::StageOrUnstageFile));
+        }
+        for focused in [FocusedPane::TextInput, FocusedPane::Terminal, FocusedPane::Chat, FocusedPane::SidebarRows, FocusedPane::SidebarFiles, FocusedPane::SidebarChanges] {
+            assert_eq!(global_shortcut(&key, &shortcuts, focused), None);
+        }
+        shortcuts.stage_or_unstage_file.clear();
+        assert_eq!(global_shortcut(&key, &shortcuts, FocusedPane::Editor), None);
+        shortcuts.command_palette = vec!["Ctrl+Shift+S".into()];
+        assert!(shortcuts.fault().is_none(), "the retired native reservation must not retain this chord");
+        assert_eq!(global_shortcut(&key, &shortcuts, FocusedPane::Editor), Some(GlobalShortcut::CommandPalette));
+        shortcuts.command_palette = KeyboardShortcuts::default().command_palette;
+        shortcuts.stage_or_unstage_file = vec!["Alt+F9".into()];
+        assert_eq!(global_shortcut(&key, &shortcuts, FocusedPane::RepositoryPane), None);
+        assert_eq!(editor_shortcut(&keyboard::Key::Named(keyboard::key::Named::F9), Physical::Code(Code::F9), keyboard::Modifiers::ALT, &shortcuts), None, "repository actions stay root-owned");
+        let mut editing = KeyboardShortcuts::default();
+        editing.editor_redo = vec!["Alt+Left".into()];
+        editing.editor_save = vec!["Alt+Left".into()];
+        assert!(editing.fault().is_none(), "native word motion remains protected in editable content");
+        let word = keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::ArrowLeft), modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowLeft), physical_key: Physical::Code(Code::ArrowLeft), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::ALT, text: None, repeat: false };
+        assert_eq!(global_shortcut(&word, &editing, FocusedPane::Editor), Some(GlobalShortcut::EditorRedo));
+        assert_eq!(global_shortcut(&word, &editing, FocusedPane::RepositoryPane), Some(GlobalShortcut::EditorSave));
+        editing.editor_redo.clear();
+        assert_eq!(global_shortcut(&word, &editing, FocusedPane::Editor), None);
+        assert_eq!(global_shortcut(&word, &editing, FocusedPane::RepositoryPane), Some(GlobalShortcut::EditorSave));
     }
 
     #[test]

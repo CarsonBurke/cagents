@@ -30106,33 +30106,15 @@ mod tests {
     }
 
     #[test]
-    fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
+    fn configured_command_can_reclaim_the_retired_file_staging_chord() {
         let mut app = context_inspector_test_app(true);
-        let card = app.workspace.focused().unwrap();
-        let (runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
-        assert!(runtime.selected_staging_selection(true).is_some());
-        app.cards
-            .insert(card, CardRuntime::Repository(Box::new(runtime)));
-        let key = || Message::KeyEvent {
-            event: keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character("s".into()),
-                modified_key: keyboard::Key::Character("S".into()),
-                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
-                location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
-                text: None,
-                repeat: false,
-            },
-            captured: false,
-        };
-        assert!(matches!(
-            task_app_message(app.update(key())),
-            Message::Repository(RepositoryAction::StageSelected { card: id, stage: true })
-                if id == card
-        ));
+        app.context_inspector_open = false;
+        app.settings.keyboard_shortcuts.stage_or_unstage_file.clear();
         app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
-        drop(app.update(key()));
+        assert!(app.settings.clone().validate().is_ok());
+        drop(app.update(Message::KeyEvent { event: keyboard::Event::KeyPressed { key: keyboard::Key::Character("s".into()), modified_key: keyboard::Key::Character("S".into()), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, text: None, repeat: false }, captured: false }));
         assert!(app.palette.is_open());
+        assert!(app.source_control_mutations.is_empty());
     }
 
     #[test]
