@@ -9387,9 +9387,12 @@ mod tests {
                         &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
                     );
                     let admin = PathBuf::from(
-                        String::from_utf8(git_output(&linked, &["rev-parse", "--absolute-git-dir"]))
-                            .unwrap()
-                            .trim(),
+                        String::from_utf8(git_output(
+                            &linked,
+                            &["rev-parse", "--absolute-git-dir"],
+                        ))
+                        .unwrap()
+                        .trim(),
                     );
                     fs::rename(admin.join("commondir"), admin.join("common-target")).unwrap();
                     symlink("common-target", admin.join("commondir")).unwrap();
