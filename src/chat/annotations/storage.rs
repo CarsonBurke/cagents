@@ -276,6 +276,42 @@ impl Store {
     pub(crate) fn installation(scope: &LaunchAccountScope, session: &str) -> Result<Self, String> {
         Self::at(&installation_root()?, scope, session)
     }
+    /// A history projection reads only an already present namespace. It never
+    /// creates/migrates a database, associates an account alias, or collects
+    /// captures while opening an archive with no live provider authority.
+    pub(crate) fn existing_installation(scope: &LaunchAccountScope, session: &str) -> Result<Option<Self>, String> {
+        Self::existing_at(&installation_root()?, scope, session)
+    }
+    #[cfg(test)]
+    pub(crate) fn existing_for_test(root: &Path, scope: &LaunchAccountScope, session: &str) -> Result<Option<Self>, String> {
+        Self::existing_at(root, scope, session)
+    }
+    fn existing_at(root: &Path, scope: &LaunchAccountScope, session: &str) -> Result<Option<Self>, String> {
+        scope.revalidate()?;
+        if !valid_id(session) { return Err("Invalid confirmed conversation identity".into()); }
+        reject_revoked(root, &account_key(scope))?;
+        let directory = root.join(account_key(scope));
+        let path = directory.join("annotations.sqlite");
+        crate::secure_file::reject_symlink_components(&path).map_err(|error| error.to_string())?;
+        let file = match fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let directory_metadata = fs::symlink_metadata(&directory).map_err(|error| error.to_string())?;
+        let database_metadata = file.metadata().map_err(|error| error.to_string())?;
+        let namespace = ((directory_metadata.dev(), directory_metadata.ino()), (database_metadata.dev(), database_metadata.ino()));
+        let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+            .map_err(|error| error.to_string())?;
+        db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|error| error.to_string())?;
+        let store = Self { db, scope: scope.clone(), session: Some(session.to_owned()), directory, namespace,
+            pending_bytes: Default::default(), pending_text_bytes: Default::default() };
+        store.revalidate()?;
+        turns::require_schema(&store.db)?;
+        store.confirmed()?;
+        Ok(Some(store))
+    }
     /// Pending command bytes have physical account authority, but deliberately
     /// have no native-session authority to accept or read original records.
     pub(crate) fn pending_installation(scope: &LaunchAccountScope) -> Result<Self, String> {

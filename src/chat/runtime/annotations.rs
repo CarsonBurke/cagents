@@ -1,5 +1,7 @@
 //! Actor-local access to qualified durable metadata. Transcript hydration stays
 //! in Store; only explicit user decisions and minimal annotations live here.
+mod history_denials;
+
 use crate::{
     account::scope::LaunchAccountScope,
     chat::{
@@ -294,11 +296,11 @@ impl Authority {
             if self.turn_history_store.as_ref().is_none_or(|(account,previous,_)|account!=&selected||previous!=session) {
                 #[cfg(test)]
                 let opened=if let Some(root)=&self.root {
-                    annotations::storage::Store::for_test(root,&scope,session)
-                } else {annotations::storage::Store::installation(&scope,session)};
+                    annotations::storage::Store::existing_for_test(root,&scope,session)
+                } else {annotations::storage::Store::existing_installation(&scope,session)};
                 #[cfg(not(test))]
-                let opened=annotations::storage::Store::installation(&scope,session);
-                self.turn_history_store=Some((selected.clone(),session.to_owned(),opened?));
+                let opened=annotations::storage::Store::existing_installation(&scope,session);
+                self.turn_history_store=Some((selected.clone(),session.to_owned(),opened?.ok_or("No existing history annotation namespace")?));
             }
             &self.turn_history_store.as_ref().expect("opened history projection store").2
         };

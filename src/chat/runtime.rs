@@ -1311,6 +1311,10 @@ fn preflight_inner(
     if queued > QUEUE_LIMIT {
         return Err("Provider initialization exceeds stdin queue capacity".into());
     }
+    let mut history_annotations = annotations::Authority::new(Err("Provider preflight has no live annotation authority".into()));
+    if let Err(message) = history_annotations.normalize_history_events(&mut initial.events) {
+        tracing::warn!(%message, "historical decision annotations unavailable");
+    }
     let mut store = Store::new()?;
     store.file_cwd = Some(spec.working_directory.clone());
     store.recognize_messages(spec.messages.clone());
@@ -2443,6 +2447,10 @@ impl Actor {
             // Annotation infrastructure is not a provider failure. Keep it in
             // diagnostics so it cannot replace the turn's actual root cause.
             tracing::warn!(%message,"conversation annotation storage unavailable");
+        }
+        if let Err(message) = self.annotations.lock().unwrap_or_else(|p| p.into_inner())
+            .normalize_history_events(&mut step.events) {
+            tracing::warn!(%message, "historical decision annotations unavailable");
         }
         let (turn_session,turn_account)={
             let authority=self.annotations.lock().unwrap_or_else(|p|p.into_inner());
