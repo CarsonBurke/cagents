@@ -132,7 +132,11 @@ impl RepositoryRuntime {
         Some(FindKey { source: self.diff_source_key()?, query: self.find_query.clone(), options: self.find_options })
     }
 
-    pub(super) fn diff_find_pending(&self) -> bool { self.diff_model().is_none() || self.diff_interaction.cache.as_ref() != self.wanted_diff_find().as_ref() }
+    pub(super) fn diff_find_pending(&self) -> bool {
+        matches!(self.diff_state(&self.diff_basis), Some(DiffState::Loading { .. }))
+            || matches!(self.basis_resolution, Some(BasisResolution::Resolving(_)))
+            || self.diff_interaction.cache.as_ref() != self.wanted_diff_find().as_ref()
+    }
 
     pub(super) fn prepare_diff_find(&mut self) {
         let wanted = self.wanted_diff_find();
@@ -148,6 +152,11 @@ impl RepositoryRuntime {
         self.prepare_diff_find();
         let Some(key) = self.wanted_diff_find() else { return Task::none(); };
         if self.diff_interaction.cache.as_ref() == Some(&key) || self.diff_interaction.active.is_some() { return Task::none(); }
+        if key.query.is_empty() {
+            self.diff_interaction.cache = Some(key);
+            self.find_total = 0;
+            return Task::none();
+        }
         if self.diff_interaction.snapshot.as_ref().is_none_or(|(source,_)| source != &key.source) {
             let Some(model) = self.diff_model() else { return Task::none(); };
             self.diff_interaction.snapshot = Some((key.source.clone(),Arc::new(interaction::SearchSnapshot::new(model,self.diff_mode))));
@@ -337,6 +346,26 @@ mod tests {
             let text = match &runtime.document { DocumentState::Editable(document) => document.content.text(),_ => panic!("editable backing source") };
             assert_eq!(text, runtime.diff_model().unwrap().after.as_ref(),"search must not edit the backing source");
         }
+    }
+
+    #[test]
+    fn empty_diff_query_does_not_snapshot_rows_or_start_a_worker() {
+        let (mut runtime,card,_) = fixture(DiffMode::Inline);
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        assert!(!runtime.diff_find_pending());
+        assert!(runtime.diff_interaction.snapshot.is_none());
+        assert!(runtime.diff_interaction.active.is_none());
+    }
+
+    #[test]
+    fn unavailable_diff_search_does_not_report_a_permanent_pending_job() {
+        let (mut runtime,card,_) = fixture(DiffMode::Inline);
+        runtime.set_diff_state(DiffBasis::HeadToIndex,DiffState::ready(RenderedDiff::Error("File cannot be read".into())));
+        runtime.find_query = "needle".into();
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        assert!(!runtime.diff_find_pending());
+        assert_eq!(runtime.find_total,0);
+        assert!(runtime.diff_interaction.active.is_none());
     }
 
     #[tokio::test]
