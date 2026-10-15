@@ -579,6 +579,10 @@ pub(crate) fn adopt(
             // A historical pane may predate the paired console. Retain the
             // holder's current exact pair, then the host authenticates its worker.
             published.terminal = recovery.source.terminal.clone();
+            // A protocol attach can fail before the paired-view update. Its
+            // retained Detached owner must still resolve this rotated source
+            // for explicit receipt-proven cleanup, without loading history.
+            super::aliases::retain(record, &recovery, &published, &recovery.source)?;
             Ok((
                 Holder {
                     control: Some(control),
