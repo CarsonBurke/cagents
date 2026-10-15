@@ -623,15 +623,27 @@ mod tests {
                 Entry {
                     verification: None,
                     identity: None,
-                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "replacement login", now),
+                    snapshot: UsageSnapshot::state(
+                        UsageStatus::Ok,
+                        "replacement login",
+                        now + 2,
+                    ),
                 },
             )
             .unwrap();
+        assert_eq!(
+            cache.load(now + 2)[&account.cache_key().unwrap()].snapshot.status,
+            UsageStatus::Ok,
+            "the replacement-home assertion must begin with a newer positive reading",
+        );
         let selected = account.resolved_home().unwrap();
         std::fs::rename(&selected, root.path().join("retired-home")).unwrap();
         std::fs::create_dir(&selected).unwrap();
+        // The old actor reports AFTER the newer positive cache seed. A quota
+        // timestamp check cannot mask a broken physical-home identity fence.
+        signal.record(&scope, report.clone(), now + 3);
         let (entries, exhausted, logins) =
-            apply_reports(&registry, Some(&homes), &cache, pending, now);
+            apply_reports(&registry, Some(&homes), &cache, signal.drain(), now + 3);
         assert!(exhausted.is_empty());
         assert!(logins.is_empty());
         assert_eq!(
