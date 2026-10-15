@@ -1488,6 +1488,13 @@ impl Adapter for Omp {
             "agent_start" | "auto_compaction_start" => {
                 if text(&frame,"type")=="auto_compaction_start" {
                     self.compaction_active=true;
+                    // A new provider boundary supersedes every earlier ACK
+                    // and idle probe, even when maintenance was already active.
+                    self.compaction_request=None;
+                    self.compaction_probe=None;
+                    let probe=self.request("get_state");
+                    self.compaction_probe=probe["id"].as_str().map(str::to_owned);
+                    step.writes.push(probe);
                     step.events.push(Event::Compaction {active:true});
                 }
                 if text(&frame, "type") == "agent_start" {
@@ -2711,6 +2718,22 @@ mod tests {
         let current=adapter.receive(json!({"type":"response","id":current["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
         assert!(current.events.contains(&Event::Compaction {active:false}));
         assert!(!adapter.compaction_active);
+    }
+
+    #[test]
+    fn a_new_compaction_start_rejects_an_earlier_idle_probe() {
+        let mut adapter=Omp {ready:true,session_id:Some("same".into()),..Default::default()};
+        let requested=adapter.command(Command::Compact).unwrap();
+        let acknowledged=adapter.receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}})).unwrap();
+        let old=acknowledged.writes.iter().find(|frame|frame["type"]=="get_state").unwrap();
+        let started=adapter.receive(json!({"type":"auto_compaction_start"})).unwrap();
+        let current=started.writes.iter().find(|frame|frame["type"]=="get_state").unwrap();
+        assert_ne!(old["id"],current["id"]);
+        let old=adapter.receive(json!({"type":"response","id":old["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(old.events.is_empty());
+        assert!(adapter.compaction_active,"pre-start idle metadata cannot end later maintenance");
+        let completed=adapter.receive(json!({"type":"response","id":current["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(completed.events.contains(&Event::Compaction {active:false}));
     }
 
     #[test]
