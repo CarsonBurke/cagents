@@ -4,6 +4,8 @@
 Run prepare, then run inside an owned native compositor. In a second terminal,
 seed while that runner holds the shared build lock. Supply the runner's matched
 cagents executable explicitly. sample refuses a PID outside the private fixture.
+The run action owns native/build locks; do not nest it under another build lock.
+It uses the runner's dev-runtime profile on both revisions, never a release baseline.
 
 Record these stages on BOTH revisions, with the same viewport and renderer:
 small (one normal chat), restore100, visit20 (scroll each), hidden20 (focus the
