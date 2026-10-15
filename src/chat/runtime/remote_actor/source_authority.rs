@@ -21,7 +21,7 @@ pub(super) fn advance(current: &mut Option<SourceAuthority>, conflict: &mut Opti
     true
 }
 
-fn merge(current: &mut Option<SourceAuthority>, conflict: &mut Option<SourceAuthority>, incoming: Option<SourceAuthority>, incoming_conflict: Option<SourceAuthority>) -> bool {
+pub(super) fn merge(current: &mut Option<SourceAuthority>, conflict: &mut Option<SourceAuthority>, incoming: Option<SourceAuthority>, incoming_conflict: Option<SourceAuthority>) -> bool {
     if conflict.is_some() { return false; }
     if let (Some(first), Some(second)) = (incoming, incoming_conflict) {
         // Historical contradiction remains fatal even if a delayed caller

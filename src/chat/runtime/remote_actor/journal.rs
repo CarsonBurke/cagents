@@ -182,6 +182,12 @@ impl Journal {
             }));
             return Ok(());
         }
+        if let Update::SourceAuthorityConflict { generation, original, conflicting } = update {
+            super::source_authority::merge(&mut self.source_authority, &mut self.source_authority_conflict,
+                Some(super::SourceAuthority { incarnation:*original, generation:*generation }),
+                Some(super::SourceAuthority { incarnation:*conflicting, generation:*generation }));
+            return Ok(());
+        }
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
         if !matches!(
@@ -1212,6 +1218,19 @@ mod tests {
 mod source_authority_tests {
     use super::*;
     use super::super::{Journal, SourceAuthority};
+    #[test]
+    fn explicit_historical_conflict_is_retained_after_a_higher_scalar_without_semantic_ack() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal.append(&Update::SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:20}).unwrap();
+        let first=uuid::Uuid::new_v4(); let conflict=uuid::Uuid::new_v4();
+        journal.append(&Update::SourceAuthorityConflict {generation:10,original:first,conflicting:conflict}).unwrap();
+        journal.append(&Update::SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:21}).unwrap();
+        assert_eq!(journal.source_authority(), Some(SourceAuthority {incarnation:first,generation:10}));
+        assert_eq!(journal.source_authority_conflict(), Some(SourceAuthority {incarnation:conflict,generation:10}));
+        assert_eq!(journal.latest().unwrap(),0); assert_eq!(journal.acknowledged().unwrap(),0);
+        assert!(journal.continuity_loss().unwrap().is_none());
+    }
     #[test]
     fn journal_coalesces_actual_tokens_without_sql_or_semantic_ack() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
