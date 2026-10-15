@@ -123,6 +123,16 @@ mod tests {
         assert!(adapter.turn_inputs.confirmed.is_none());
     }
     #[test]
+    fn launch_session_constraint_does_not_confirm_missing_native_identity(){
+        let mut adapter=adapter();adapter.session_id=Some(SESSION.into());
+        let sent=adapter.command(prompt(PromptMode::Send)).unwrap();let uuid=sent.writes[0]["uuid"].as_str().unwrap();
+        let mut user=echo(uuid);user.as_object_mut().unwrap().remove("session_id");
+        let mut started=fate(uuid,"started");started.as_object_mut().unwrap().remove("session_id");
+        assert!(bindings(&adapter.receive(user).unwrap()).is_empty());
+        assert!(bindings(&adapter.receive(started).unwrap()).is_empty());
+        assert!(adapter.turn_inputs.confirmed.is_none());
+    }
+    #[test]
     fn queued_identical_inputs_keep_distinct_accepted_identity(){
         let mut adapter=adapter();let a=adapter.command(prompt(PromptMode::Queue)).unwrap();let b=adapter.command(prompt(PromptMode::Queue)).unwrap();let a=a.writes[0]["uuid"].as_str().unwrap();let b=b.writes[0]["uuid"].as_str().unwrap();assert_ne!(a,b);
         assert!(bindings(&adapter.receive(echo(a)).unwrap()).is_empty());assert!(bindings(&adapter.receive(echo(b)).unwrap()).is_empty());

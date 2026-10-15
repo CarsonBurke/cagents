@@ -2622,7 +2622,10 @@ impl Adapter for Claude {
                 *message = super::preview(message.as_bytes(), 1024);
             }
         }
-        self.turn_inputs.observe(&frame,&mut step,self.session_id.as_deref());
+        // A configured --session-id is a routing constraint, not provider
+        // confirmation. Only an actual validated native frame can seed proof.
+        let native_session=if frame["type"]!="prompt_suggestion" && frame["parent_tool_use_id"].is_null(){frame["session_id"].as_str()}else{None};
+        self.turn_inputs.observe(&frame,&mut step,native_session);
         Ok(step)
     }
 }
