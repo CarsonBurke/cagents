@@ -24,6 +24,7 @@ mod fold;
 mod hover;
 mod hydration;
 mod changes_sources;
+mod reader_source;
 mod images;
 mod layout;
 mod markdown_source;
@@ -171,6 +172,15 @@ pub enum Action {
     Wake(Target, Wake),
     LogicalSourceLoaded(Target, hydration::Key, u64, Result<hydration::Loaded, String>),
     RetryLogicalSources(Target),
+    ChangesManifestReady(Target,chat::cache::SourceKey,usize,u64,Result<Arc<chat::cache::changes::Manifest>,String>),
+    ChangePatchReady(Target,chat::cache::SourceKey,usize,u64,Result<changes_sources::PatchReady,String>),
+    ToggleChangeFile(Target,String,usize),
+    LoadChangePage(Target,String,usize),
+    RetryChangeSource(Target,String,Option<usize>),
+    CopyChangePatch(Target,String,usize),
+    CopyAllChangePatches(Target,String),
+    CompleteChangeCopy(Target,String,chat::cache::SourceEpoch,u64,Result<changes_sources::CopyReady,String>),
+
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
     SignIn(Target, Account),
@@ -331,6 +341,9 @@ impl Action {
                 | Self::ImageSaved(..)
                 | Self::ImageLoaded(..)
                 | Self::LogicalSourceLoaded(..)
+                | Self::ChangesManifestReady(..)
+                | Self::ChangePatchReady(..)
+                | Self::CompleteChangeCopy(..)
                 | Self::ThumbnailLoaded(..)
                 | Self::RetryThumbnails(..)
                 | Self::HandoffFinished(..)
@@ -1503,6 +1516,7 @@ pub(super) struct Runtime {
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
     logical_sources: hydration::State,
+    logical_changes: changes_sources::State,
     source_clock: Option<chat::client::SourceClock>,
     /// Tiny interaction metadata survives transcript window/cache eviction.
     turn_started_at: Option<u64>,
@@ -2078,6 +2092,7 @@ impl Runtime {
                 ..Snapshot::default()
             }),
             logical_sources: hydration::State::default(),
+            logical_changes: changes_sources::State::default(),
             source_clock: None,
             turn_started_at: None,
             turn_prompt_id: None,
@@ -2157,6 +2172,7 @@ impl Runtime {
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
         self.logical_sources.clear();
+        self.logical_changes.clear();
         self.cache.clear();
         self.turns.clear();
         self.selected_subagent = None;
@@ -2276,7 +2292,8 @@ impl Runtime {
             return;
         };
         let (raw_snapshot, source_clock) = handle.snapshot_with_clock();
-        let mut snapshot = self.logical_sources.project(raw_snapshot,self.selected_subagent.as_deref());
+        let snapshot = self.logical_sources.project(raw_snapshot,self.selected_subagent.as_deref());
+        let mut snapshot = self.logical_changes.project(snapshot,self.selected_subagent.as_deref(),&self.expanded,self.find.as_ref().is_some_and(|query|!query.is_empty()));
         if self.page_request.is_some_and(|(_, generation)| {
             snapshot.generation > generation && !snapshot.history_loading
         }) && self
@@ -2670,7 +2687,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
-        if !visible {hydration::release(self);}
+        if !visible {self.logical_changes.clear();hydration::release(self);}
         images::sync(self);
         self.present()
     }
@@ -4619,6 +4636,7 @@ impl Cagents {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
                 subscriptions.extend(hydration::subscriptions(runtime));
+                subscriptions.extend(changes_sources::subscriptions(runtime));
                 if runtime.visible.load(Ordering::Relaxed) {
                     subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
                 }
@@ -6298,6 +6316,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.target = target;
                             runtime.logical_sources.clear();
+                            runtime.logical_changes.clear();
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
                             runtime.account_picker = false;
@@ -7621,6 +7640,7 @@ impl Cagents {
                     if !runtime.expanded.remove(&id) {
                         runtime.expanded.insert(id.clone());
                     }
+                    runtime.refresh();
                     if let Some(item) = runtime
                         .snapshot
                         .items
@@ -7684,6 +7704,13 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if runtime.logical_changes.epoch(&id).is_some() {
+                    return match part {
+                        CopyPart::Text=>{runtime.logical_changes.request_copy_all(&id);changes_sources::copy_task(runtime,None)},
+                        CopyPart::Change(index)=>changes_sources::copy_task(runtime,Some((id,index))),
+                        _=>Task::none(),
+                    };
+                }
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
                 let text = match part {
@@ -7787,6 +7814,32 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.thumbnails.complete(&path, loaded);
                 }
+            }
+            Action::ChangesManifestReady(target,key,offset,attempt,result)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {changes_sources::manifest_ready(runtime,&key,offset,attempt,result);return changes_sources::copy_task(runtime,None);}
+            }
+            Action::ChangePatchReady(target,key,index,attempt,result)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {changes_sources::patch_ready(runtime,&key,index,attempt,result);return changes_sources::copy_task(runtime,None);}
+            }
+            Action::ToggleChangeFile(target,item,index)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.toggle_file(&item,index);}
+            }
+            Action::LoadChangePage(target,item,offset)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.page(&item,offset);}
+            }
+            Action::RetryChangeSource(target,item,index)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.retry(&item,index);}
+            }
+            Action::CopyChangePatch(target,item,index)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {return changes_sources::copy_task(runtime,Some((item,index)));}
+            }
+            Action::CopyAllChangePatches(target,item)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {
+                    runtime.logical_changes.request_copy_all(&item);return changes_sources::copy_task(runtime,None);
+                }
+            }
+            Action::CompleteChangeCopy(target,item,epoch,context,result)=>{
+                if let Some(runtime)=self.chat_runtime_mut(target) {return changes_sources::complete_copy(runtime,&item,epoch,context,result);}
             }
             Action::LogicalSourceLoaded(target, key, attempt, loaded) => {
                 if let Some(runtime)=self.chat_runtime_mut(target) {hydration::complete(runtime,&key,attempt,loaded);}

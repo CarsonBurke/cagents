@@ -3102,6 +3102,7 @@ impl Runtime {
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
             (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
+            self.logical_changes.item_revision(&item.id).hash(&mut hasher);
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
             self.copied

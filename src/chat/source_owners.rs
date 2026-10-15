@@ -133,6 +133,13 @@ pub(crate) fn admit_patch(text:&Arc<str>,record:&ResidentPatch,replaced:Option<&
     if result==Admission::Ready {state.patch_provenance.insert(Owner::Patch(text).id(),record.clone());}
     emit(pool,&mut state);result
 }
+/// Immutable viewed Changes sidecars. Snapshot transport rows contain no full
+/// patch body, so offline capture preserves verified file pages separately.
+#[derive(Clone,Debug,Default,serde::Serialize,serde::Deserialize)]
+pub(crate) struct ResidentChanges {
+    pub manifests:Vec<Arc<super::cache::changes::Manifest>>,
+    pub patches:Vec<(Arc<str>,ResidentPatch)>,
+}
 pub(crate) fn resident_patch(text:&Arc<str>)->Option<ResidentPatch> {
     let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());state.prune();emit(pool,&mut state);
     state.patch_provenance.get(&Owner::Patch(text).id()).cloned()

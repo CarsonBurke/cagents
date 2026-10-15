@@ -32,6 +32,23 @@ impl Language {
     }
 }
 
+/// Immutable complete text and its body-free geometry proof. Construct on a
+/// preparation worker: hashing/checkpoints walk the source exactly once here.
+#[derive(Clone)]
+pub(super) struct Shared {
+    text: Arc<str>,
+    reader_source: reader_source::Source,
+    language: Language,
+    key: u64,
+}
+impl Shared {
+    pub(super) fn prepare(text: Arc<str>, language: Language) -> Self {
+        let language = if text.len() > CachedItem::HIGHLIGHT_LIMIT { Language::Plain } else { language };
+        Self { key: tail_digest(language as u64, &text), reader_source: reader_source::Source::new(&text), text, language }
+    }
+    pub(super) fn text(&self) -> &Arc<str> { &self.text }
+}
+
 pub(super) struct ToolText {
     key: u64,
     language: Language,
@@ -204,6 +221,13 @@ fn output_summary(output: &str, failed: bool) -> &str {
 }
 
 impl ToolText {
+    /// The complete body and its source proof were prepared on the reader.
+    /// The canonical flow renderer also consumes this proof at final union.
+    pub(super) fn from_shared(_previous: Option<Self>, shared: Shared) -> Self {
+        Self { key:shared.key, language:shared.language, text:shared.text,
+            syntax:std::cell::RefCell::new(None) }
+    }
+
     pub(super) fn update(previous: Option<Self>, text: &str, language: Language) -> Self {
         let language = if text.len() > CachedItem::HIGHLIGHT_LIMIT {
             Language::Plain

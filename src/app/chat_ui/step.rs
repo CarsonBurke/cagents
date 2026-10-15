@@ -258,12 +258,12 @@ fn display_path<'a>(path: &'a str, cwd: &std::path::Path) -> &'a str {
         .unwrap_or(path)
 }
 
-struct PathLabel {
-    display: String,
-    absolute: String,
+pub(super) struct PathLabel {
+    pub(super) display: String,
+    pub(super) absolute: String,
 }
 
-fn path_label(path: &str, cwd: &std::path::Path) -> PathLabel {
+pub(super) fn path_label(path: &str, cwd: &std::path::Path) -> PathLabel {
     let path = std::path::Path::new(path);
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -614,6 +614,8 @@ impl Runtime {
                 turn::step_label(&item.content).to_owned(),
             ),
         };
+        let original_changes=self.logical_changes.metadata(&item.id);
+        if let Some(metadata)=original_changes {label=format!("{} {}",metadata.total_files,if metadata.total_files==1 {"file"} else {"files"});}
         let glyph = coordinated
             .and_then(Coordinated::glyph)
             .unwrap_or_else(|| kind_glyph(&item.content));
@@ -664,6 +666,7 @@ impl Runtime {
         } else {
             preview.push(cached.preview.view());
         }
+        if original_changes.is_some() {preview=vec![design::body(label.clone()).into()];}
         let cwd = &self.session.launch.recipe.working_directory;
         let path = coordinated
             .is_none()
@@ -710,8 +713,12 @@ impl Runtime {
                 .into(),
         );
         if let ItemContent::Changes { changes, .. } = &item.content {
-            let (added, removed) = diff_stat(changes);
-            line.push(design::caption(format!("+{added} −{removed}")).into());
+            if let Some(metadata)=original_changes {
+                line.push(design::caption(format!("+{} −{}",metadata.additions.map_or("?".into(),|value|value.to_string()),metadata.deletions.map_or("?".into(),|value|value.to_string()))).into());
+            } else {
+                let (added, removed) = diff_stat(changes);
+                line.push(design::caption(format!("+{added} −{removed}")).into());
+            }
         }
         if let Some(status) = item.content.status() {
             let (indicator, _) = status_indicator(status);
@@ -849,6 +856,8 @@ impl Runtime {
                 }
             }
             ItemContent::Changes { changes, .. } => {
+                if let Some(detail)=changes_sources::detail(self,&item.id) {rows.push(detail);}
+                else {
                 if changes.is_empty() {
                     rows.push(design::caption("No file changes were reported.").into());
                 }
@@ -870,6 +879,7 @@ impl Runtime {
                             Some(Self::OUTPUT_HEIGHT),
                         ));
                     }
+                }
                 }
             }
             ItemContent::WebSearch { query, results } => {
