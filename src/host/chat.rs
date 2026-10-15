@@ -988,6 +988,16 @@ fn start_with_execution(
             "Native restart launch differs from its issued conversation",
         ));
     }
+    let recorded_process_launch = restart_launch.unwrap_or(&session.launch);
+    // Retain the original recorded-selector admission independently of the
+    // private environment used by constructors and the eventual process.
+    super::account_lifecycle::ensure_launch(
+        host,
+        &recorded_process_launch.recipe.working_directory,
+        &recorded_process_launch.recipe.environment,
+        &Default::default(),
+        true,
+    )?;
     // History/title/account-root construction must see the same effective
     // environment as the process. Keep this launch private: neither transient
     // values nor normalized restart arguments rewrite the issued descriptor.
@@ -995,7 +1005,7 @@ fn start_with_execution(
     // or transient execution credentials.
     let empty_execution_environment = BTreeMap::new();
     let process_launch = prepare_native_process_launch(
-        restart_launch.unwrap_or(&session.launch),
+        recorded_process_launch,
         (!saved_history_only && source.is_none()).then(|| {
             crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false)
         }),
@@ -1013,22 +1023,14 @@ fn start_with_execution(
     if process_launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&process_launch)?;
     }
-    // Existing main adapters inspect raw recorded selectors while constructing
-    // history. Guard those operands as well as the effective/unset spawn roots;
-    // this admission cut does not reinterpret an earlier history source.
-    super::account_lifecycle::ensure_launch(
-        host,
-        &process_launch.recipe.working_directory,
-        &process_launch.recipe.environment,
-        &Default::default(),
-        true,
-    )?;
+    // This map is fully materialized. Match env_clear: absent selectors stay
+    // absent, and constructor admission uses the same captured removals.
     super::account_lifecycle::ensure_launch_at_directory(
         host,
         &process_launch.recipe.working_directory,
         &process_launch.recipe.environment,
-        &crate::account::launch_credential_overrides(&process_launch.recipe),
-        true,
+        &process_launch.recipe.unset_environment,
+        false,
         execution
             .as_ref()
             .and_then(|context| context.directory.as_deref()),
@@ -1037,8 +1039,8 @@ fn start_with_execution(
         host,
         &process_launch.recipe.working_directory,
         &process_launch.recipe.environment,
-        &crate::account::launch_credential_overrides(&process_launch.recipe),
-        true,
+        &process_launch.recipe.unset_environment,
+        false,
     )?;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener(&process_launch, owned_socket)
