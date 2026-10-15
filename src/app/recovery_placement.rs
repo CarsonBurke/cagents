@@ -26,7 +26,7 @@ pub(super) struct ResolvedWindowRoots {
     /// for an already accepted cleanup lease.
     pub(super) required_projects: Vec<(PathBuf, u32)>,
     pub(super) edited_and_project_roots: Vec<Arc<Root>>,
-    pub(super) common_directory_candidates: Vec<Arc<Root>>,
+    common_directory_candidates: Vec<((u64, u64), Arc<Root>)>,
 }
 
 impl Cagents {
@@ -65,6 +65,17 @@ impl Cagents {
     }
 }
 
+impl ResolvedWindowRoots {
+    /// A project's metadata is only a candidate for its own original source.
+    /// The issuer/placement still must reject it if any checkout encloses it.
+    pub(super) fn holding_candidates(&self, source: &Root) -> io::Result<Vec<Arc<Root>>> {
+        let identity = source.metadata()?;
+        let identity = (identity.dev(), identity.ino());
+        Ok(self.common_directory_candidates.iter().filter_map(|(owner, root)|
+            (*owner == identity).then(|| root.clone())).collect())
+    }
+}
+
 impl WindowRecoveryRoots {
     /// Blocking worker only. Every source is the original cached actor; no
     /// currently selected pane or pathname may supply a replacement. These
@@ -81,8 +92,9 @@ impl WindowRecoveryRoots {
         for project in self.projects {
             check_cancelled()?;
             let (source, candidate) = project.recovery_roots().map_err(|error| io::Error::other(error.to_string()))?;
+            let identity = source.metadata()?;
+            common.push(((identity.dev(), identity.ino()), candidate));
             roots.push(source);
-            common.push(candidate);
         }
         let mut known = HashSet::new();
         let mut unique = Vec::new();
@@ -125,7 +137,7 @@ mod tests {
         let (original, common) = source.recovery_roots().unwrap();
         let resolved = app.recovery_window_roots().unwrap().resolve(&CancellationToken::new()).unwrap();
         assert!(resolved.edited_and_project_roots.iter().any(|root| Arc::ptr_eq(root, &original)));
-        assert!(resolved.common_directory_candidates.iter().any(|root| Arc::ptr_eq(root, &common)));
+        assert!(resolved.holding_candidates(&original).unwrap().iter().any(|root| Arc::ptr_eq(root, &common)));
         let shared = app.workspace_model.projects.pop().unwrap();
         assert!(app.recovery_window_roots().is_err(), "unregistered provisional roots cannot silently disappear from the known domain");
         app.workspace_model.projects.push(shared);
