@@ -9,6 +9,7 @@ pub enum BranchDeleteFailureKind {
     CheckedOutElsewhere,
     Unmerged,
     Other,
+    AuthorityChanged,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
