@@ -9137,6 +9137,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let (mut workspace, mut session) = agent_workspace(crate::agent::Provider::Claude);
         let card = workspace.cards[0].id;
+        let source_terminal = session.terminal.clone().expect("fixture source terminal");
         // A source terminal that is not the conversation's own is refused
         // whatever storage holds.
         session.id = TerminalId::new();
@@ -9154,6 +9155,15 @@ mod tests {
         });
         assert_eq!(refusals, 1);
         assert!(store.load_card(card, None).unwrap().is_none());
+        assert!(store.card_was_closed(card));
+        assert!(store.has_unknown_closed_claims(), "a card-ID guard alone cannot replace its missing resource attribution");
+        assert!(store.terminal_was_closed(&source_terminal), "automatic inventory must not re-adopt the discarded resource");
+        store.shutdown().unwrap();
+        drop(store);
+        let reopened = StateStore::open(directory.path().join("state.sqlite3"), boot("boot")).unwrap();
+        assert!(reopened.card_was_closed(card));
+        assert!(reopened.has_unknown_closed_claims());
+        assert!(reopened.terminal_was_closed(&source_terminal));
     }
 
     #[test]
