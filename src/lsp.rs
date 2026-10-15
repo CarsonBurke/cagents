@@ -1810,11 +1810,15 @@ impl RootIdentity {
 }
 
 async fn pin_session_root(root: &Path) -> io::Result<(tokio::fs::File, RootIdentity)> {
-    // O_PATH pins identity without requiring directory read permissions. This
-    // happens on the async launch path, never on the application update thread.
+    // Linux can pin identity without directory read permissions. Other Unix
+    // systems retain a read-only directory descriptor. Both paths run off the
+    // application update thread and keep the inode alive through teardown.
+    let flags = libc::O_DIRECTORY | libc::O_CLOEXEC;
+    #[cfg(target_os = "linux")]
+    let flags = flags | libc::O_PATH;
     let directory = tokio::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .custom_flags(flags)
         .open(root)
         .await?;
     let identity = RootIdentity::from_metadata(&directory.metadata().await?);
