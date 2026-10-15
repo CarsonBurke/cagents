@@ -60,6 +60,7 @@ pub enum Operation {
         root: PathBuf,
         operation: GitOperation,
     },
+    Worktree { operation: crate::worktree_control::Operation },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -112,6 +113,7 @@ pub enum Reply {
     SavedUnconfirmed {
         error: String,
     },
+    Worktree(crate::worktree_control::Reply),
 }
 
 /// A declined automatic removal is an expected outcome, with enough detail
@@ -202,6 +204,7 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
+        Operation::Worktree { .. } => Err("Worktree control requires the daemon lifecycle fence".into()),
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
         }
