@@ -426,7 +426,7 @@ impl Cagents {
                 self.join_workspace_model(model.identity);
                 self.workspace_model = model;
                 let closed = self.apply_closed_project_tombstones();
-                Task::batch([closed, self.reconcile_workspace_model()])
+                Task::batch([closed, self.reconcile_workspace_model(), self.refresh_all_worktree_setup_receipts()])
             }
             ModelUpdate::Read(model) => {
                 if model.identity == self.workspace_model.identity

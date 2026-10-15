@@ -4252,6 +4252,8 @@ pub enum Message {
     WorktreeSetupSkipChanged(bool),
     WorktreeSetupTrustChanged(bool),
     WorktreeSetupPrepared { operation: crate::model::OperationId, worktree: PathBuf, result: Result<crate::worktree_setup::SetupPreparation, String> },
+    WorktreeSetupReceipts { project: ProjectId, repository: PathBuf, request: crate::model::OperationId,
+        result: Result<(Vec<crate::worktree_control::SetupReceipt>, Vec<String>), String> },
     WorktreeSetupSelectionCommitted { operation: crate::model::OperationId, worktree: PathBuf },
     WorktreeSetupSelectionRejected { operation: crate::model::OperationId, worktree: PathBuf },
     WorktreeChoicesResolved { id: crate::model::OperationId, result: Result<worktree_choices::Choices, String> },
@@ -13610,7 +13612,7 @@ impl Application for Cagents {
                                     self.publish_project_opened(existing_id);
                                 }
                             }
-                            return task;
+                            return Task::batch([task, self.request_worktree_setup_receipts(existing_id, false)]);
                         }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
@@ -13792,6 +13794,7 @@ impl Application for Cagents {
                             pending,
                             pr_enrichment,
                             self.project_avatar_task(project_id),
+                            self.request_worktree_setup_receipts(project_id, false),
                             self.reconcile_workspace_model(),
                         ]);
                     }
@@ -15470,6 +15473,7 @@ impl Application for Cagents {
             Message::WorktreeLinearResolved { id, result } => self.finish_worktree_linear(id, result),
             Message::WorktreeChoicesResolved { id, result } => self.finish_worktree_choices(id, result),
             Message::WorktreeSetupPrepared { operation, worktree, result } => self.finish_worktree_setup(operation, worktree, result),
+            Message::WorktreeSetupReceipts { project, repository, request, result } => self.finish_worktree_setup_receipts(project, repository, request, result),
             Message::WorktreeSetupSelectionCommitted { operation, worktree } => self.worktree_setup_selection_finished(operation, worktree, true),
             Message::WorktreeSetupSelectionRejected { operation, worktree } => self.worktree_setup_selection_finished(operation, worktree, false),
             Message::WorktreeSetupSkipChanged(skip) => {

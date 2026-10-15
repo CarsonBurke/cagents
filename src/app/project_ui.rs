@@ -1189,7 +1189,7 @@ impl Cagents {
             Action::ConfirmSetupReview { skip } => return self.confirm_setup_review(skip),
             Action::SetupReviewReady { request, result } => return self.setup_review_ready(request, result),
             Action::Dismiss => {
-                self.project_ui.setup_review = None;
+                self.dismiss_worktree_setup_review();
                 self.project_ui.remove_dialog = None;
                 let dismissed = self.project_ui.dialog.take();
                 // Declining to run a failed deletion again is the answer to

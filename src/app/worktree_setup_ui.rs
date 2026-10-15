@@ -45,6 +45,9 @@ pub(super) struct State {
     authorized_runs: std::sync::Mutex<HashSet<OperationId>>,
     expected_runs: HashMap<PathBuf, OperationId>,
     review_requests: HashMap<PathBuf, OperationId>,
+    receipt_requests: HashMap<ProjectId, (OperationId, PathBuf, Instant)>,
+    receipt_paths: HashMap<ProjectId, Vec<PathBuf>>,
+    daemon_receipts: HashMap<PathBuf, (ProjectId, OperationId)>,
 }
 
 impl Drop for State {
@@ -236,12 +239,10 @@ impl Cagents {
             && self.dirty_repository_close.is_none() && self.sidebar_selection_ui.dialog.is_none()
     }
     pub(super) fn forget_worktree_setup(&mut self, path: &Path) {
-        self.setup_ui.recovered.remove(path); self.setup_ui.statuses.remove(path); self.setup_ui.terminals.remove(path); self.setup_ui.expected_runs.remove(path); self.setup_ui.review_requests.remove(path);
+        self.setup_ui.recovered.remove(path); self.setup_ui.statuses.remove(path); self.setup_ui.terminals.remove(path); self.setup_ui.expected_runs.remove(path); self.setup_ui.review_requests.remove(path); self.setup_ui.daemon_receipts.remove(path);
     }
     pub(super) fn recover_worktree_setup(&mut self, creation: OperationId, path: PathBuf, intent: SetupIntent) {
-        let status = if intent.skip { WorktreeSetupStatus::Skipped }
-        else if intent.copy_done && intent.plan.as_ref().is_none_or(|plan| plan.commands.is_empty()) { WorktreeSetupStatus::Succeeded }
-        else { WorktreeSetupStatus::Interrupted("Creation finished before setup completion was confirmed. Review files and terminal output before resuming.".into()) };
+        let status = restored_setup_status(&intent);
         if let Some(run) = intent.run_id { self.setup_ui.expected_runs.insert(path.clone(), run); }
         self.setup_ui.recovered.insert(path.clone(), (creation, intent));
         // An inventory pass may have seen an older run before the journal
@@ -266,6 +267,7 @@ impl Cagents {
         }
         let (creation, intent) = local.unwrap_or_else(|| (OperationId::new(), SetupIntent::default()));
         let request = OperationId::new();
+        self.invalidate_setup_inventory_for_path(&path);
         let token = CancellationToken::new();
         self.setup_ui.review_requests.insert(path.clone(), request);
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
@@ -354,6 +356,7 @@ impl Cagents {
         if let Ok(completion) = &result {
             let path = match completion { ReviewCompletion::Local { path, .. } | ReviewCompletion::Remote { path, .. } => path };
             if self.setup_ui.review_requests.get(path) != Some(&request) { return Task::none(); }
+            self.invalidate_setup_inventory_for_path(path);
         }
         if !self.project_ui.setup_review.as_ref().is_some_and(|review| review.request == request) {
             if let Ok(completion) = result { self.retain_setup_completion(completion); }
@@ -452,6 +455,104 @@ fn verify_local_setup_resume(store: &crate::persistence::StateStore, creation: O
 fn setup_run_is_live(session: &TerminalSession, path: &Path, run: Option<OperationId>) -> bool {
     session.launch.working_directory == path && session.continuity.live_proof().is_some()
         && run.is_some_and(|run| session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID").is_some_and(|value| value == &run.to_string()))
+}
+
+fn restored_setup_status(intent: &SetupIntent) -> WorktreeSetupStatus {
+    setup_summary_status(intent.skip, intent.copy_done, intent.plan.as_ref().is_some_and(|plan| !plan.commands.is_empty()))
+}
+
+fn setup_summary_status(skip: bool, copy_done: bool, has_commands: bool) -> WorktreeSetupStatus {
+    if skip { WorktreeSetupStatus::Skipped }
+    else if copy_done && !has_commands { WorktreeSetupStatus::Succeeded }
+    else { WorktreeSetupStatus::Interrupted("Setup completion was not confirmed. Review files and terminal output before resuming.".into()) }
+}
+
+impl Cagents {
+    fn invalidate_setup_inventory_for_path(&mut self, path: &Path) {
+        let projects = self.sidebar_model.projects.iter().filter(|project| project.worktrees.iter().any(|row| row.path == path)).map(|project| project.id).collect::<Vec<_>>();
+        for project in projects { self.invalidate_worktree_setup_receipts(project); }
+    }
+
+    pub(super) fn dismiss_worktree_setup_review(&mut self) {
+        if let Some(review) = self.project_ui.setup_review.take() { self.invalidate_setup_inventory_for_path(&review.path); }
+    }
+
+    pub(super) fn invalidate_worktree_setup_receipts(&mut self, project: ProjectId) {
+        self.setup_ui.receipt_requests.remove(&project);
+    }
+
+    pub(super) fn refresh_all_worktree_setup_receipts(&mut self) -> Task<Message> {
+        let projects = self.sidebar_model.projects.iter().filter(|project| project.kind == ProjectKind::Git).map(|project| project.id).collect::<Vec<_>>();
+        Task::batch(projects.into_iter().map(|project| self.request_worktree_setup_receipts(project, true)))
+    }
+
+    pub(super) fn request_worktree_setup_receipts(&mut self, project: ProjectId, force: bool) -> Task<Message> {
+        let Some(row) = self.sidebar_model.project(project).filter(|row| row.kind == ProjectKind::Git) else { return Task::none(); };
+        let repository = row.repository.clone();
+        let mut paths = row.worktrees.iter().map(|row| row.path.clone()).collect::<Vec<_>>(); paths.sort();
+        if !force && self.setup_ui.receipt_paths.get(&project) == Some(&paths)
+            && self.setup_ui.receipt_requests.get(&project).is_some_and(|(_, old, at)| old == &repository && at.elapsed() < Duration::from_secs(30)) {
+            return Task::none();
+        }
+        let request = OperationId::new();
+        self.setup_ui.receipt_requests.insert(project, (request, repository.clone(), Instant::now()));
+        self.setup_ui.receipt_paths.insert(project, paths);
+        cosmic::task::future(async move {
+            let source = repository.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                match setup_control_request(crate::worktree_control::Operation::SetupIntents { repository: source })? {
+                    crate::worktree_control::Reply::SetupIntents { intents, warnings } => Ok((intents, warnings)),
+                    _ => Err("Unexpected worktree setup receipt inventory response".into()),
+                }
+            }).await.map_err(|error| error.to_string()).and_then(|result| result);
+            Message::WorktreeSetupReceipts { project, repository, request, result }
+        })
+    }
+
+    pub(super) fn finish_worktree_setup_receipts(&mut self, project: ProjectId, repository: PathBuf, request: OperationId,
+        result: Result<(Vec<crate::worktree_control::SetupReceipt>, Vec<String>), String>) -> Task<Message> {
+        if !self.setup_ui.receipt_requests.get(&project).is_some_and(|(current, source, _)| *current == request && source == &repository) { return Task::none(); }
+        let Some(row) = self.sidebar_model.project(project).filter(|row| row.repository == repository) else { return Task::none(); };
+        let known = row.worktrees.iter().map(|row| row.path.clone()).collect::<HashSet<_>>();
+        let (receipts, warnings) = match result {
+            Ok(result) => result,
+            Err(error) => { self.status = Some(TransientNotice::warning(format!("Could not refresh worktree setup recovery: {error}"))); return Task::none(); }
+        };
+        let mut seen = HashSet::new();
+        if receipts.iter().any(|receipt| !seen.insert(receipt.path.clone())) {
+            self.status = Some(TransientNotice::warning("The daemon returned ambiguous worktree setup receipts."));
+            return Task::none();
+        }
+        // A complete, warning-free inventory can retire removed receipts.
+        // A partial inventory preserves evidence rather than implying success.
+        if warnings.is_empty() {
+            let removed = self.setup_ui.daemon_receipts.iter().filter(|(path, (owner, _))| *owner == project && !seen.contains(*path)).map(|(path, _)| path.clone()).collect::<Vec<_>>();
+            for path in removed {
+                self.setup_ui.daemon_receipts.remove(&path);
+                if !self.setup_ui.recovered.contains_key(&path) && !self.setup_ui.pending.contains_key(&path) {
+                    self.setup_ui.statuses.remove(&path); self.setup_ui.expected_runs.remove(&path); self.setup_ui.terminals.remove(&path);
+                }
+            }
+        }
+        for receipt in receipts {
+            if !known.contains(&receipt.path) || self.setup_ui.pending.contains_key(&receipt.path) { continue; }
+            // An explicit review/resume in this window owns its newer run
+            // until its completion; an older background inventory cannot
+            // overwrite that run with metadata sampled before the review.
+            if self.project_ui.setup_review.as_ref().is_some_and(|review| review.path == receipt.path) { continue; }
+            if self.setup_ui.recovered.contains_key(&receipt.path) { continue; }
+            let previous = self.setup_ui.expected_runs.get(&receipt.path).copied();
+            if let Some(run) = receipt.run_id {
+                self.setup_ui.expected_runs.insert(receipt.path.clone(), run);
+                if previous != Some(run) { self.setup_ui.terminals.remove(&receipt.path); }
+            }
+            self.setup_ui.daemon_receipts.insert(receipt.path.clone(), (project, receipt.creation_id));
+            self.setup_ui.statuses.insert(receipt.path, setup_summary_status(receipt.skip, receipt.copy_done, receipt.has_commands));
+        }
+        if !warnings.is_empty() { self.status = Some(TransientNotice::warning(warnings.join("; "))); }
+        self.refresh_worktree_setup_rows();
+        Task::none()
+    }
 }
 
 pub(super) fn review_view(review: &Review) -> Element<'_, Message> {
@@ -621,6 +722,38 @@ mod tests {
         assert!(!app.setup_ui.active());
         assert!(app.setup_ui.authorized_runs.lock().unwrap().is_empty());
         assert!(matches!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Interrupted(_)));
+    }
+
+    #[test]
+    fn daemon_inventory_exposes_copy_finished_without_a_setup_terminal_as_interrupted() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let path = PathBuf::from("/repo/setup");
+        let project = ProjectId::new(); let request = OperationId::new(); let run = OperationId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "repo".into(), "/repo".into(),
+            vec![SidebarWorktree::from_durable(crate::model::WorktreeId::new(), path.clone(), Some("setup".into()))], vec![]));
+        app.setup_ui.receipt_requests.insert(project, (request, "/repo".into(), Instant::now()));
+        let receipt = crate::worktree_control::SetupReceipt { path: path.clone(), creation_id: OperationId::new(), run_id: Some(run), skip: false, copy_done: true, has_commands: true };
+        drop(app.finish_worktree_setup_receipts(project, "/repo".into(), request, Ok((vec![receipt], vec![]))));
+        assert!(matches!(app.sidebar_model.projects[0].worktrees[0].setup_status, Some(WorktreeSetupStatus::Interrupted(_))));
+        assert_eq!(app.setup_ui.expected_runs[&path], run);
+        assert!(!app.setup_ui.recovered.contains_key(&path), "daemon receipts must use daemon-owned review");
+        assert!(app.durable.cards.is_empty());
+    }
+
+    #[test]
+    fn a_metadata_inventory_sampled_before_resume_cannot_overwrite_its_receipt() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let path = PathBuf::from("/repo/setup");
+        let project = ProjectId::new(); let inventory = OperationId::new(); let review = OperationId::new(); let run = OperationId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "repo".into(), "/repo".into(),
+            vec![SidebarWorktree::from_durable(crate::model::WorktreeId::new(), path.clone(), Some("setup".into()))], vec![]));
+        app.setup_ui.receipt_requests.insert(project, (inventory, "/repo".into(), Instant::now()));
+        app.setup_ui.review_requests.insert(path.clone(), review);
+        drop(app.setup_review_ready(review, Ok(ReviewCompletion::Remote { path: path.clone(), run_id: run, setup: None, warnings: vec![], skipped: true })));
+        let old = crate::worktree_control::SetupReceipt { path: path.clone(), creation_id: OperationId::new(), run_id: Some(OperationId::new()), skip: false, copy_done: true, has_commands: true };
+        drop(app.finish_worktree_setup_receipts(project, "/repo".into(), inventory, Ok((vec![old], vec![]))));
+        assert_eq!(app.setup_ui.expected_runs[&path], run);
+        assert_eq!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Skipped);
     }
 
     #[test]

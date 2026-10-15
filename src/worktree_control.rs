@@ -20,6 +20,7 @@ pub enum Operation {
         force: bool,
         delete_branch: bool,
         expected_fingerprint: Option<String>,
+        resolved_path: Option<PathBuf>,
     },
     Inspect { repository:PathBuf, path:PathBuf },
     StaleLock { repository:PathBuf, path:PathBuf, unlock:bool },
@@ -30,6 +31,7 @@ pub enum Operation {
     ResumeSetup {repository:PathBuf,path:PathBuf,expected_run_id:Option<crate::model::OperationId>,expected_plan_fingerprint:Option<String>,trust:bool,skip:bool},
     BusySessions { repository:PathBuf, path:PathBuf },
     CloseSessions { repository:PathBuf, path:PathBuf, agents:Vec<BusyAgent>, census:Vec<BusyAgent> },
+    SetupIntents {repository:PathBuf},
 }
 
 impl Operation {
@@ -45,12 +47,25 @@ impl Operation {
             | Self::GetDisposableIgnoredDirectories {repository,..}
             | Self::BusySessions {repository,..}
             | Self::CloseSessions {repository,..}
+            | Self::SetupIntents {repository}
             | Self::SetupIntent {repository,..}
             | Self::ResumeSetup {repository,..}
             | Self::DeleteBranch {repository,..} => Some(repository),
         }
     }
-    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::BusySessions {..} | Self::Inspect { .. } | Self::ResolveProject { .. } | Self::StaleLock {unlock:false,..} | Self::GetDisposableIgnoredDirectories {..} | Self::SetupIntent {..}) }
+    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::BusySessions {..} | Self::Inspect { .. } | Self::ResolveProject { .. } | Self::StaleLock {unlock:false,..} | Self::GetDisposableIgnoredDirectories {..} | Self::SetupIntent {..} | Self::SetupIntents {..}) }
+}
+
+/// Retained creation metadata, including runs interrupted before a terminal
+/// pane could be published. It is evidence for review, never replay permission.
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+pub struct SetupReceipt {
+    pub path:PathBuf,
+    pub creation_id:crate::model::OperationId,
+    pub run_id:Option<crate::model::OperationId>,
+    pub skip:bool,
+    pub copy_done:bool,
+    pub has_commands:bool,
 }
 
 /// Daemon-observed actor identity and close revision; the full census includes
@@ -95,6 +110,7 @@ pub enum Reply {
     SetupPrepared {path:PathBuf,setup:Option<Setup>,warnings:Vec<String>,run_id:crate::model::OperationId},
     BusySessions { agents:Vec<BusyAgent>, census:Vec<BusyAgent> },
     SessionsClosed { path:PathBuf },
+    SetupIntents {intents:Vec<SetupReceipt>,warnings:Vec<String>},
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,4 +126,3 @@ pub use crate::worktree_branch::{BranchDeleteFailure,BranchDeleteFailureKind};
 pub use crate::worktree_branch::{delete_branch,delete_branch_checked,delete_branch_checked_at};
 #[cfg(feature = "host")]
 pub(crate) use crate::worktree_branch::git_command;
-
