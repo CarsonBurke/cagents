@@ -1991,6 +1991,20 @@ fn prepare_upgrade_with_carry_policy(
             paired_codex,
         )
     };
+    // The caller holds exclusive control admission through commit, after
+    // which shutting_down refuses new input. Every carried worker must have
+    // delivered its accepted bytes to the original PTY before we may destroy
+    // its Rust queue, including the emergency preservation fallback.
+    for terminal in &carried {
+        let handle = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.descriptor(0, terminal.source.id)?.session != terminal.source {
+                return Err(upgrade_error("A carried terminal changed before its input could be verified"));
+            }
+            state.terminals[&terminal.source.id].handle.clone()
+        };
+        handle.check_input_drained().map_err(upgrade_error)?;
+    }
     let store = discover().map_err(upgrade_error)?;
     if let Some(previous) = store.load().map_err(upgrade_error)?
         && (previous.proof != proof || previous.phase != Phase::Prepared)
