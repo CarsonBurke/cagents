@@ -71,8 +71,11 @@ mod tests {
     }
 
     fn plan(app: &Cagents, root: &Path, names: &[&str]) -> Arc<workspace::Plan> {
-        let open = app.cards.values().filter_map(|runtime| match runtime {
-            CardRuntime::Repository(runtime) => runtime.workspace_edit_snapshot(), _ => None,
+        let open = app.cards.iter().filter_map(|(card, runtime)| match runtime {
+            CardRuntime::Repository(runtime) => runtime.workspace_edit_snapshot().map(|(path, mut snapshot)| {
+                snapshot.protocol_version = app.lsp_document(*card).and_then(|doc| app.lsp.document_version(doc));
+                (path, snapshot)
+            }), _ => None,
         }).collect();
         let documents = names.iter().map(|name| workspace::DocumentEdits {
             path: (*name).into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar,
@@ -147,6 +150,67 @@ mod tests {
             assert!(!app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("editor-publication:90")));
             assert!(app.notices.entries.iter().any(|entry| entry.notice.message == "Workspace edit applied"));
         }
+    }
+
+    #[tokio::test]
+    async fn hidden_publication_keeps_real_autosave_and_save_close_intents() {
+        let root = tempfile::tempdir().unwrap();
+        let original = "fn old() {}\n";
+        for name in ["a.rs", "other.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+        let mut app = app();
+        let card = buffer(&mut app, root.path(), "a.rs", original);
+        let other = buffer(&mut app, root.path(), "other.rs", original);
+        let doc = LspDocumentId(44);
+        app.lsp = LspManager::fixture_ready_format_on_save(doc, &root.path().join("other.rs"), root.path(), original).await;
+        let participating_doc = LspDocumentId(45);
+        app.lsp.fixture_open_format_on_save_document(participating_doc, &root.path().join("a.rs"), root.path(), original).await;
+        app.lsp_documents.insert(participating_doc, card);
+        app.lsp_contexts.entry(card).or_default().document = Some(participating_doc);
+        app.lsp_documents.insert(doc, other);
+        app.lsp_contexts.entry(other).or_default().document = Some(doc);
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&other) {
+            drop(runtime.take_lsp_intents());
+            runtime.set_lsp_document(Some(doc));
+        }
+        assert!(app.format_on_save_enabled(other));
+        let plan = plan(&app, root.path(), &["a.rs"]);
+        let operation = operation(&app, card);
+        let _publication = app.publish_editor_workspace_edit(77, operation, plan);
+        drop(app.finish_modal_update(Task::none()));
+        let hide = dialog_key(&app, "editor-publication.hide", keyboard::key::Named::Enter, |message| matches!(message, Message::EditorFeatures(Action::HidePublication(77))));
+        drop(app.update(hide));
+        // This actual timer message is consumed by the App's enabled-format
+        // AutoSaveDue branch. Keep the write future unpolled: active_save is
+        // proof the ordinary reducer admitted this original save intent.
+        let due = {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&other) else { panic!("other buffer"); };
+            runtime.set_auto_save(true);
+            drop(runtime.update(RepositoryAction::EditorAction { card: other, action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert('x')) }));
+            let timer = runtime.auto_save_task(other);
+            let mut stream = iced::runtime::task::into_stream(timer).expect("real autosave timer");
+            loop {
+                if let Some(iced::runtime::Action::Output(action @ RepositoryAction::AutoSaveDue { .. })) = stream.next().await { break action; }
+            }
+        };
+        drop(app.update(Message::Repository(due)));
+        assert!(matches!(&app.cards[&other], CardRuntime::Repository(runtime) if runtime.is_saving()));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.workspace_edit_pending()));
+        assert!(app.editor_features.requests.is_empty(), "no competing format transaction was sent");
+        // A frozen participant's SaveAndClose is retained until Published
+        // releases that same document. It must never be unfrozen early.
+        app.dirty_repository_close = Some(DirtyRepositoryClose { request: crate::model::OperationId::new(), card, remaining: VecDeque::new(), intent: DirtyCloseIntent::Card(card), focused: DirtyCloseControl::Save, restore_card: Some(card) });
+        drop(app.finish_modal_update(Task::none()));
+        drop(app.update(Message::SaveAndCloseRepository(card)));
+        assert!(app.editor_features.publication_saves.contains_key(&card));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.workspace_edit_pending() && !runtime.is_saving()));
+        let _completion = app.update(Message::EditorFeatures(Action::Published { ticket: 77, result: Ok(workspace::PublicationReport::default()) }));
+        assert!(app.editor_features.publication_saves.is_empty());
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending() && runtime.is_saving()));
+        assert_eq!(text(&app, card), "fn renamed() {}\n");
+        assert!(app.dirty_repository_close.is_some(), "the save must finish before its close advances");
+        assert!(app.editor_features.requests.is_empty());
+        app.lsp.shutdown();
+        app.lsp.wait_for_shutdown().await;
     }
 
     #[test]
@@ -736,6 +800,7 @@ pub(super) struct State {
     signature_requests: HashMap<CardId, (LspRequestId, LspPosition)>,
     preview: Option<Preview>,
     publication: Option<Publication>,
+    publication_saves: HashMap<CardId, (repository_widget::RepositoryMenuIdentity, PathBuf)>,
     pub(super) location_history: crate::editor_locations::History,
     pub(super) jump_origins: HashMap<CardId, crate::editor_locations::Location>,
     pub(super) history_restores: HashMap<CardId, (crate::editor_locations::Location, crate::editor_locations::Target)>,
@@ -804,9 +869,35 @@ impl Cagents {
 
     pub(super) fn maybe_format_before_save(&mut self, card: CardId) -> Option<Task<Message>> {
         if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if !runtime.desired_file_present()) || !self.format_on_save_enabled(card) { return None; }
+        if self.editor_features.publishing() {
+            // Saving remains admitted work while progress is hidden. Starting
+            // a formatter would create a second workspace transaction whose
+            // busy refusal loses the already-consumed Save/autosave intent.
+            let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) else { return Some(Task::none()); };
+            self.notices.record(TransientNotice::warning("Formatting on Save was skipped while another workspace edit is applying.").key("editor-publication-save-format"));
+            if runtime.workspace_edit_pending() {
+                if let Some(path) = runtime.selected_path().map(Path::to_path_buf) {
+                    self.editor_features.publication_saves.insert(card, (runtime.menu_identity(), path));
+                }
+                return Some(Task::none());
+            }
+            return Some(repository_task(runtime.request_save(card, false)));
+        }
         if self.editor_features.requests.values().any(|operation| operation.card == card && operation.save_after)
             || self.editor_features.preparing.values().any(|operation| operation.card == card && operation.save_after) { return Some(Task::none()); }
         Some(self.update_editor_features(Action::Format { card, selection: false, save_after: true }))
+    }
+
+    fn finish_editor_publication_saves(&mut self) -> Task<Message> {
+        let saves = std::mem::take(&mut self.editor_features.publication_saves);
+        let mut tasks = Vec::new();
+        for (card, (identity, path)) in saves {
+            if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                && runtime.menu_identity() == identity && runtime.selected_path() == Some(path.as_path()) {
+                tasks.push(repository_task(runtime.request_save(card, false)));
+            }
+        }
+        Task::batch(tasks)
     }
 
     pub(super) fn editor_signature_character(&mut self, card: CardId, character: char) -> Task<Message> {
@@ -1242,7 +1333,7 @@ impl Cagents {
                         for card in publication.cards { if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.cancel_workspace_edit(ticket); } }
                         if let Some(lease) = publication.server_lease.take() { lease.respond(false, Some(error.clone())); }
                         self.feature_failure(publication.operation.card, error);
-                        return Task::batch([self.save_after_feature(&publication.operation), self.modal_restore_focus(self.modal_restore_fallback())]);
+                        return Task::batch([self.save_after_feature(&publication.operation), self.finish_editor_publication_saves(), self.modal_restore_focus(self.modal_restore_fallback())]);
                     }
                     Ok(report) => report,
                 };
@@ -1270,6 +1361,7 @@ impl Cagents {
                         self.notices.record(TransientNotice::success("Workspace edit applied"));
                     }
                 }
+                tasks.push(self.finish_editor_publication_saves());
                 tasks.push(self.modal_restore_focus(self.modal_restore_fallback()));
                 Task::batch(tasks)
             }
