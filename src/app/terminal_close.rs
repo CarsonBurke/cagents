@@ -30,7 +30,7 @@ struct CompletedAttempt { registry:uuid::Uuid,nonce:uuid::Uuid,card:CardId,batch
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemovalTarget { card:CardId,nonce:uuid::Uuid }
 impl RemovalTarget { pub(super) fn card(self)->CardId {self.card} }
-struct PendingRemoval { target:RemovalTarget,batch:Option<uuid::Uuid>,kind:CardKind,observed_chat:Option<crate::chat::Session> }
+struct PendingRemoval { registry:uuid::Uuid,target:RemovalTarget,batch:Option<uuid::Uuid>,kind:CardKind,observed_chat:Option<crate::chat::Session> }
 
 pub(super) fn same_chat_removal_source(expected:&crate::chat::Session,current:&crate::chat::Session)->bool {
     expected.id==current.id && expected.launch==current.launch && expected.proof==current.proof
@@ -38,14 +38,7 @@ pub(super) fn same_chat_removal_source(expected:&crate::chat::Session,current:&c
         && expected.terminal==current.terminal
 }
 pub(super) fn same_removal_source(expected:&CardKind,current:&CardKind)->bool {
-    match (expected,current) {
-        (CardKind::Terminal(expected),CardKind::Terminal(current))=>{
-            let mut source=current.clone(); source.continuity=expected.continuity.clone();
-            source==*expected && current.continuity.live_proof().is_none_or(|proof|expected.continuity.live_proof()==Some(proof))
-        }
-        (CardKind::Chat(expected),CardKind::Chat(current))=>same_chat_removal_source(expected,current),
-        _=>expected==current,
-    }
+    crate::workspace_model::views::same_card_source(expected,current)
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +290,13 @@ impl Cagents {
                 && surface.host_proof().is_none_or(|proof|proof==expected.proof),
             _=>false,
         }
+    }
+
+    pub(super) fn terminal_worker_for_shared_removal(&self,card:CardId)->Option<uuid::Uuid> {
+        let expected=self.terminal_close_bindings.bound.get(&card)?;
+        (self.surface_close_binding_current(card,Some(expected))
+            && self.card_state(card).is_some_and(|state|matches!(&state.kind,CardKind::Terminal(source) if source.id==expected.source.id && source.launch==expected.source.launch && source.continuity.live_proof().is_none_or(|proof|proof==expected.proof))))
+            .then_some(expected.execution_instance)
     }
 
     fn terminal_close_binding_current(&self, intent: &CloseIntent) -> bool {
@@ -558,8 +558,8 @@ impl Cagents {
             self.stop_pane_close_batch(batch);
             return Task::none();
         }
-        if !self.prepare_shared_card_removal(card) {self.stop_pane_close_batch(batch);return Task::none();}
         self.capture_terminal_close_binding(card, false);
+        if !self.prepare_shared_card_removal(card) {self.stop_pane_close_batch(batch);return Task::none();}
         let captured = self.terminal_close_bindings.bound.get(&card).cloned();
         // Unknown completion is not authority to discard a shared pane.
         // Every settled non-live descriptor uses the same source/worker check.
@@ -809,7 +809,7 @@ impl Cagents {
     }
     pub(super) fn card_removal_current(&self,target:RemovalTarget)->bool {
         let Some(pending)=self.terminal_close_bindings.pending_removals.get(&target.card).filter(|pending|pending.target==target) else{return false;};
-        self.pane_close_decision_current(target.card,pending.batch)
+        pending.registry==self.workspace_model.identity && self.pane_close_decision_current(target.card,pending.batch)
             && self.workspace.pending_close().is_some_and(|handoff|handoff.unmounting==target.card)
             && self.card_state(target.card).is_some_and(|card|card.existence.is_open() && same_removal_source(&pending.kind,&card.kind))
             && match &pending.kind {
@@ -860,7 +860,7 @@ impl Cagents {
         match reservation {
             Ok(handoff)=>{
                 self.terminal_close_bindings.pending_removals.entry(card).or_insert_with(||PendingRemoval {
-                    target:RemovalTarget {card,nonce:uuid::Uuid::new_v4()},batch,kind,observed_chat,
+                    registry:self.workspace_model.identity,target:RemovalTarget {card,nonce:uuid::Uuid::new_v4()},batch,kind,observed_chat,
                 });
                 Some(handoff)
             }
@@ -2194,6 +2194,21 @@ mod tests {
             assert!(app.pane_close_decision_current(second,batch));
             assert!(app.queued_card_closes.is_empty(),"only the acknowledged batch step advances");
         }
+    }
+
+    #[test]
+    fn held_removal_refuses_registry_join_even_when_descriptor_is_identical() {
+        let mut app=super::super::tests::context_inspector_test_app(false);
+        let card=app.workspace.focused().unwrap();app.card_state_mut(card).unwrap().kind=CardKind::Settings;
+        app.cards.insert(card,CardRuntime::Settings);
+        assert!(app.reserve_card_removal_for(card,None).is_some());
+        let held=app.pending_card_removal_target(card).unwrap();let source=app.card_state(card).unwrap().clone();
+        let mut replacement=app.workspace_model.clone();replacement.identity=uuid::Uuid::new_v4();
+        drop(app.apply_workspace_model_update(super::super::workspace_model_sync::ModelUpdate::Connected(replacement)));
+        assert!(!app.card_removal_current(held));
+        drop(app.update(Message::CommitCloseTarget(held)));
+        assert_eq!(app.card_state(card),Some(&source));assert!(app.recently_closed.is_empty());
+        assert!(app.workspace.pending_close().is_none());
     }
 
     #[test]

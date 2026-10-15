@@ -1520,7 +1520,7 @@ mod tests {
     #[test]
     fn held_focus_removal_cannot_close_a_replaced_shared_logical_source() {
         for same_chat_id in [false,true] {
-            let (mut app,channel,_,mut pane)=fixture();
+            let (mut app,channel,_,mut pane)=removal_fixture();
             let recipe=LaunchRecipe::shell(PathBuf::from("/repo")).unwrap();
             let chat=crate::chat::Session {
                 id:TerminalId::new(),launch:crate::chat::Launch {provider:crate::agent::Provider::Claude,recipe:recipe.clone(),session_id:Some(uuid::Uuid::new_v4().to_string())},

@@ -639,7 +639,7 @@ mod tests {
         for change in 0..5 {
             let (mut r,_,a,b)=setup();let original=pane();seed(&mut r,a,vec![original.clone()]);
             let identity=r.model().unwrap().identity;
-            let mut conditional=edit(&mut r,a,Change::RemoveSource {registry:identity,repository:"/repo".into(),before:original.clone()});
+            let mut conditional=edit(&mut r,a,Change::RemoveSource {registry:identity,repository:"/repo".into(),before:original.clone(),execution_instance:None});
             match change {
                 0=>if let ModelEdit::ChangeView {change:Change::RemoveSource {registry,..},..}=&mut conditional {*registry=Uuid::new_v4();},
                 1=>if let ModelEdit::ChangeView {change:Change::RemoveSource {repository,..},..}=&mut conditional {*repository="/foreign".into();},
@@ -659,7 +659,7 @@ mod tests {
     fn source_checked_remove_uses_transaction_revision_and_preserves_cli_remove_semantics() {
         let (mut r,_,a,_)=setup();let original=pane();seed(&mut r,a,vec![original.clone()]);
         let registry=r.model().unwrap().identity;
-        let mut conditional=edit(&mut r,a,Change::RemoveSource {registry,repository:"/repo".into(),before:original.clone()});
+        let mut conditional=edit(&mut r,a,Change::RemoveSource {registry,repository:"/repo".into(),before:original.clone(),execution_instance:None});
         let mut titled=original.clone();titled.title="independent display edit".into();
         let update=edit(&mut r,a,Change::Update {before:original.clone(),pane:titled});r.apply(&update).unwrap();
         let snapshot=r.model().unwrap();assert!(r.apply(&conditional).is_err());assert_eq!(r.model().unwrap(),snapshot);

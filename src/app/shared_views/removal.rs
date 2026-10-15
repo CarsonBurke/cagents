@@ -7,10 +7,12 @@ pub(in crate::app) struct RemovalSource {
     pub(super) repository: PathBuf,
     pub(super) scope: Scope,
     pub(super) before: Pane,
+    execution_instance:Option<uuid::Uuid>,
+    observed_chat:Option<crate::chat::Session>,
 }
 impl RemovalSource {
     pub(super) fn change(&self) -> Change {
-        Change::RemoveSource {registry:self.registry,repository:self.repository.clone(),before:self.before.clone()}
+        Change::RemoveSource {registry:self.registry,repository:self.repository.clone(),before:self.before.clone(),execution_instance:self.execution_instance}
     }
     pub(super) fn current(&self,model:&crate::workspace_model::WorkspaceModel)->bool {
         removal_current(model,&self.scope,&self.change())
@@ -18,7 +20,7 @@ impl RemovalSource {
 }
 
 pub(in crate::app) fn removal_current(model:&crate::workspace_model::WorkspaceModel,scope:&Scope,change:&Change)->bool {
-    let Change::RemoveSource {registry,repository,before}=change else{return !matches!(change,Change::Remove {..});};
+    let Change::RemoveSource {registry,repository,before,..}=change else{return !matches!(change,Change::Remove {..});};
     if *registry==crate::workspace_model::NO_REGISTRY || model.identity!=*registry {return false;}
     let owner=match scope {
         Scope::Channel(id)=>model.channel(*id).map(|channel|&channel.repository),
@@ -51,15 +53,16 @@ impl Cagents {
             Scope::Channel(id)=>model.channel(*id).map(|channel|channel.repository.clone()).ok_or("The pane's project is unavailable.")?,
             Scope::Worktree {repository,..}=>repository.clone(),
         };
-        let source=RemovalSource {registry:model.identity,repository,scope:scope.clone(),before:before.clone()};
+        let source=RemovalSource {registry:model.identity,repository,scope:scope.clone(),before:before.clone(),execution_instance:self.terminal_worker_for_shared_removal(card),observed_chat:self.chat_return_session(card)};
         if !source.current(model){return Err("The shared pane source is no longer authoritative.".into());}
         Ok(Some(source))
     }
     fn shared_removal_local_source_matches(&self,card:CardId,source:&RemovalSource)->bool {
         self.card_state(card).is_some_and(|state|super::super::terminal_close::same_removal_source(&source.before.kind,&views::shared_kind(&state.kind)))
-            && match (&source.before.kind,self.chat_return_session(card)) {
-                (CardKind::Chat(expected),Some(current))=>super::super::terminal_close::same_chat_removal_source(expected,&current),
-                _=>true,
+            && match (&source.observed_chat,self.chat_return_session(card)) {
+                (Some(expected),Some(current))=>super::super::terminal_close::same_chat_removal_source(expected,&current),
+                (None,None)=>true,
+                _=>false,
             }
     }
     /// Install only the original authenticated basis; never select a replacement

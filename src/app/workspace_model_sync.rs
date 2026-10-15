@@ -345,7 +345,15 @@ fn send(
 /// reconnect and revision retry. A fresh revision never grants a fresh source.
 fn prepare_removal_request(edit:&mut ModelEdit,model:&WorkspaceModel)->bool {
     let ModelEdit::ChangeView {scope,expected_revision,change,..}=edit else{return true;};
-    if !super::shared_views::removal_current(model,scope,change){return false;}
+    if !super::shared_views::removal_current(model,scope,change) {
+        // A lost ACK can leave our original operation durably applied. Probe
+        // only that same typed operation; the server's atomic source check
+        // refuses an unrecorded absent removal without consuming its receipt.
+        let crate::workspace_model::views::Change::RemoveSource {registry,repository,before,..}=change else{return false;};
+        let owner=match &*scope {crate::workspace_model::views::Scope::Channel(id)=>model.channel(*id).map(|channel|&channel.repository),crate::workspace_model::views::Scope::Worktree {repository,..}=>Some(repository)};
+        if model.identity!=*registry || *registry==crate::workspace_model::NO_REGISTRY || owner!=Some(repository)
+            || model.views.iter().any(|view|view.panes.iter().any(|pane|pane.id==before.id)) {return false;}
+    }
     let Some(view)=model.views.iter().find(|view|&view.scope==scope) else{return false;};
     *expected_revision=view.revision;
     true
@@ -2353,7 +2361,7 @@ mod tests {
         use crate::terminal::ipc::{ClientEnvelope,ClientRequest,ServerEnvelope,ServerMessage,ServerResponse,ProtocolError,ProtocolErrorCode,PROTOCOL_VERSION,read_frame,write_frame};
         for replace in [false,true] {
             let (model,scope,pane)=removal_wire_fixture();let operation=uuid::Uuid::new_v4();
-            let edit=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:0,operation,change:crate::workspace_model::views::Change::RemoveSource {registry:model.identity,repository:"/repo".into(),before:pane.clone()}};
+            let edit=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:0,operation,change:crate::workspace_model::views::Change::RemoveSource {registry:model.identity,repository:"/repo".into(),before:pane.clone(),execution_instance:None}};
             let initial=model.clone();
             let (reader,mut server)=std::os::unix::net::UnixStream::pair().unwrap();
             let handle=std::thread::spawn(move || {

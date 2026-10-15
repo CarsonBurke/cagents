@@ -14407,6 +14407,31 @@ mod tests {
     }
 
     #[test]
+    fn shared_close_basis_retains_issued_and_observed_thread_separately() {
+        use crate::workspace_model::{ModelProject,WorkspaceModel,views::{Pane,Scope,View}};
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let card=live_chat(&mut app,Some(KNOWN_THREAD));
+        let mut observed=app.chat_return_session(card).unwrap();observed.launch.session_id=Some(KNOWN_THREAD.into());
+        let runtime=match app.cards.get_mut(&card){Some(CardRuntime::Chat(runtime))=>runtime,_=>panic!()};
+        runtime.connection=Connection::Live(Arc::new(ClientHandle::fixture(observed.clone(),Snapshot {session_id:observed.launch.session_id.clone(),ready:true,..Snapshot::default()})));
+        let CardKind::Chat(issued)=&mut app.card_state_mut(card).unwrap().kind else{panic!()};issued.launch.session_id=None;
+        let directory=issued.launch.recipe.working_directory.clone();
+        let scope=Scope::Worktree {repository:directory.clone(),path:directory.clone()};
+        let pane=Pane::from_card(app.card_state(card).unwrap(),Some(directory.clone())).unwrap();
+        let mut model=WorkspaceModel::default();model.identity=uuid::Uuid::new_v4();model.projects=vec![ModelProject {repository:directory,checkout:None,primary_checkout:None,name:"fixture".into(),kind:Default::default(),ordinal:1}];
+        let mut view=View::empty(scope);view.panes=vec![pane];model.views=vec![view];app.workspace_model=model;
+        let original_model=app.workspace_model.clone();let source=app.capture_shared_removal_source(card).unwrap().unwrap();
+        assert_eq!(app.chat_return_session(card).unwrap().launch.session_id.as_deref(),Some(KNOWN_THREAD));
+        assert!(app.install_shared_removal_source(card,Some(source.clone())),"unchanged observed thread must not be compared to an unlearned issued thread");
+        assert_eq!(app.workspace_model,original_model,"observed identity never rewrites authoritative wire before");
+        let mut replacement=observed;replacement.launch.session_id=Some(uuid::Uuid::new_v4().to_string());
+        let runtime=match app.cards.get_mut(&card){Some(CardRuntime::Chat(runtime))=>runtime,_=>panic!()};
+        runtime.connection=Connection::Live(Arc::new(ClientHandle::fixture(replacement.clone(),Snapshot {session_id:replacement.launch.session_id.clone(),ready:true,..Snapshot::default()})));
+        assert!(!app.install_shared_removal_source(card,Some(source)));
+        assert_eq!(app.workspace_model,original_model);
+    }
+
+    #[test]
     fn pending_removal_checks_runtime_source_before_descriptor_refresh() {
         for same_conversation in [false,true] {
             let mut app=crate::app::tests::context_inspector_test_app(false);
