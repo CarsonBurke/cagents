@@ -51,13 +51,18 @@ const FAILURE_EXCERPT_LIMIT: usize = 64 * 1024;
 struct InheritedFile(Arc<std::fs::File>);
 
 impl PartialEq for InheritedFile {
-    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 impl Eq for InheritedFile {}
 
 fn validate_inherited_fd(fd: i32) -> io::Result<()> {
     if fd < 3 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "inherited descriptors must not name standard input, output, or error"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inherited descriptors must not name standard input, output, or error",
+        ));
     }
     Ok(())
 }
@@ -177,20 +182,41 @@ impl CommandSpec {
     /// stdout stays empty; stdout byte/record capture limits do not apply.
     /// Stderr, cancellation and process cleanup retain their normal bounds.
     /// This does not certify descendant-family absence or authorize file removal.
-    pub(crate) fn stdout_file(mut self, file: Arc<std::fs::File>, max_file_bytes: u64) -> io::Result<Self> {
+    pub(crate) fn stdout_file(
+        mut self,
+        file: Arc<std::fs::File>,
+        max_file_bytes: u64,
+    ) -> io::Result<Self> {
         validate_inherited_fd(file.as_raw_fd())?;
         // SAFETY: fcntl reads flags on the live descriptor owned by this Arc.
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-        if flags == -1 { return Err(io::Error::last_os_error()); }
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
         // SAFETY: lseek only observes the live file description offset.
         let offset = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) };
-        if offset == -1 { return Err(io::Error::last_os_error()); }
-        let metadata = file.metadata()?;
-        if flags & libc::O_ACCMODE != libc::O_RDWR || flags & libc::O_APPEND != 0 || !metadata.is_file() || metadata.len() != 0 || offset != 0 || max_file_bytes == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "stdout sink must be a fresh regular O_RDWR file at offset zero without append, with a positive file-size budget"));
+        if offset == -1 {
+            return Err(io::Error::last_os_error());
         }
-        let max_file_bytes = libc::rlim_t::try_from(max_file_bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "stdout file-size budget is not representable"))?;
+        let metadata = file.metadata()?;
+        if flags & libc::O_ACCMODE != libc::O_RDWR
+            || flags & libc::O_APPEND != 0
+            || !metadata.is_file()
+            || metadata.len() != 0
+            || offset != 0
+            || max_file_bytes == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stdout sink must be a fresh regular O_RDWR file at offset zero without append, with a positive file-size budget",
+            ));
+        }
+        let max_file_bytes = libc::rlim_t::try_from(max_file_bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stdout file-size budget is not representable",
+            )
+        })?;
         self.stdout_file = Some((InheritedFile(file), max_file_bytes));
         Ok(self)
     }
@@ -224,7 +250,9 @@ impl CommandSpec {
                         for file in &inherited {
                             let fd = file.0.as_raw_fd();
                             let flags = libc::fcntl(fd, libc::F_GETFD);
-                            if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                            if flags == -1
+                                || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                            {
                                 return Err(io::Error::last_os_error());
                             }
                         }
@@ -257,21 +285,23 @@ impl CommandSpec {
                 // run in the child. The
                 // prepared Command owns this Arc through spawn, even after the
                 // spec is dropped. Parent CLOEXEC and descriptors stay unchanged.
-                unsafe { command.pre_exec(move || {
-                    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-                    if libc::getrlimit(libc::RLIMIT_FSIZE, limit.as_mut_ptr()) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let mut limit = limit.assume_init();
-                    limit.rlim_cur = max_file_bytes.min(limit.rlim_cur).min(limit.rlim_max);
-                    if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::dup2(file.0.as_raw_fd(), libc::STDOUT_FILENO) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                }); }
+                unsafe {
+                    command.pre_exec(move || {
+                        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                        if libc::getrlimit(libc::RLIMIT_FSIZE, limit.as_mut_ptr()) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        let mut limit = limit.assume_init();
+                        limit.rlim_cur = max_file_bytes.min(limit.rlim_cur).min(limit.rlim_max);
+                        if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if libc::dup2(file.0.as_raw_fd(), libc::STDOUT_FILENO) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
             }
         } else {
             command.stdout(Stdio::piped());
@@ -1008,16 +1038,26 @@ mod tests {
         use std::os::unix::fs::FileExt;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("selected");
-        let file = Arc::new(std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap());
+        let file = Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap(),
+        );
         let spec = CommandSpec::new("/usr/bin/head")
             .args(["-c", "4096", "/dev/zero"])
             .output_limits(1, 128)
-            .stdout_file(file.clone(), 4097).unwrap();
+            .stdout_file(file.clone(), 4097)
+            .unwrap();
         let clone = spec.clone();
         assert_eq!(spec, clone);
         std::fs::rename(&path, directory.path().join("original")).unwrap();
         std::fs::write(&path, b"replacement").unwrap();
-        let output = SystemProcessExecutor.execute(&spec, &CancellationToken::new()).unwrap();
+        let output = SystemProcessExecutor
+            .execute(&spec, &CancellationToken::new())
+            .unwrap();
         assert!(output.success);
         assert!(output.stdout.is_empty());
         assert!(!output.stdout_truncated);
@@ -1039,11 +1079,15 @@ mod tests {
             (value.rlim_cur, value.rlim_max)
         };
         let before = parent_limit();
-        let output = SystemProcessExecutor.execute(
-            &CommandSpec::new("/usr/bin/head").args(["-c", "4096", "/dev/zero"])
-                .stdout_file(file.clone(), 32).unwrap(),
-            &CancellationToken::new(),
-        ).unwrap();
+        let output = SystemProcessExecutor
+            .execute(
+                &CommandSpec::new("/usr/bin/head")
+                    .args(["-c", "4096", "/dev/zero"])
+                    .stdout_file(file.clone(), 32)
+                    .unwrap(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
         assert!(!output.success);
         assert!(output.stdout.is_empty());
         assert!(file.metadata().unwrap().len() > 0);
@@ -1055,12 +1099,16 @@ mod tests {
     fn stdout_file_timeout_retains_partial_without_stdout_capture() {
         use std::os::unix::fs::FileExt;
         let file = Arc::new(tempfile::tempfile().unwrap());
-        let failure = SystemProcessExecutor.execute(
-            &CommandSpec::new("/bin/sh").args(["-c", "printf partial; sleep 5"])
-                .timeout(Duration::from_millis(100))
-                .stdout_file(file.clone(), 64).unwrap(),
-            &CancellationToken::new(),
-        ).unwrap_err();
+        let failure = SystemProcessExecutor
+            .execute(
+                &CommandSpec::new("/bin/sh")
+                    .args(["-c", "printf partial; sleep 5"])
+                    .timeout(Duration::from_millis(100))
+                    .stdout_file(file.clone(), 64)
+                    .unwrap(),
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
         assert_eq!(failure.kind, ProcessFailureKind::TimedOut);
         assert!(failure.started);
         assert!(failure.stdout.is_empty());
@@ -1073,8 +1121,10 @@ mod tests {
     fn stdout_file_prepared_command_keeps_owner_and_rejects_nonfresh_files() {
         use std::os::unix::fs::FileExt;
         let file = Arc::new(tempfile::tempfile().unwrap());
-        let spec = CommandSpec::new("/bin/sh").args(["-c", "printf exact; printf bounded-error >&2"])
-            .stdout_file(file.clone(), 64).unwrap();
+        let spec = CommandSpec::new("/bin/sh")
+            .args(["-c", "printf exact; printf bounded-error >&2"])
+            .stdout_file(file.clone(), 64)
+            .unwrap();
         let mut command = spec.to_command();
         drop(spec);
         let output = command.output().unwrap();
@@ -1085,7 +1135,11 @@ mod tests {
         assert_eq!(file.read_at(&mut bytes, 0).unwrap(), bytes.len());
         assert_eq!(&bytes, b"exact");
         assert!(CommandSpec::new("/bin/true").stdout_file(file, 64).is_err());
-        assert!(CommandSpec::new("/bin/true").stdout_file(Arc::new(tempfile::tempfile().unwrap()), 0).is_err());
+        assert!(
+            CommandSpec::new("/bin/true")
+                .stdout_file(Arc::new(tempfile::tempfile().unwrap()), 0)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1101,7 +1155,8 @@ mod tests {
         let spec = CommandSpec::new("/bin/sh")
             .args(["-c", "exec /usr/bin/stat -Lc '%d:%i' \"$1\"", "fixture"])
             .arg(format!("/proc/self/fd/{number}"))
-            .inherit_file(retained.clone()).unwrap();
+            .inherit_file(retained.clone())
+            .unwrap();
         let clone = spec.clone();
         assert_eq!(spec, clone);
         let mut command = clone.to_command();
@@ -1112,10 +1167,20 @@ mod tests {
         std::fs::rename(&path, temporary.path().join("original")).unwrap();
         std::fs::create_dir(&path).unwrap();
         let replacement = std::fs::metadata(&path).unwrap();
-        assert_ne!((metadata.dev(), metadata.ino()), (replacement.dev(), replacement.ino()));
+        assert_ne!(
+            (metadata.dev(), metadata.ino()),
+            (replacement.dev(), replacement.ino())
+        );
         let output = command.output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), format!("{}:{}", metadata.dev(), metadata.ino()));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("{}:{}", metadata.dev(), metadata.ino())
+        );
     }
 
     #[test]
@@ -1132,15 +1197,19 @@ mod tests {
         // an inherited descriptor across exec without assuming BSD stat flags.
         let spec = CommandSpec::new("/bin/sh")
             .args(["-c", ":"])
-            .inherit_file(original.clone()).unwrap();
+            .inherit_file(original.clone())
+            .unwrap();
         let other = CommandSpec::new("/bin/sh")
             .args(["-c", ":"])
-            .inherit_file(duplicate).unwrap();
+            .inherit_file(duplicate)
+            .unwrap();
         assert_ne!(spec, other);
         assert!(spec.to_command().output().unwrap().status.success());
         // SAFETY: original still owns the descriptor after child execution.
         assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, before);
-        for fd in [-1, 0, 1, 2] { assert!(validate_inherited_fd(fd).is_err()); }
+        for fd in [-1, 0, 1, 2] {
+            assert!(validate_inherited_fd(fd).is_err());
+        }
         assert!(validate_inherited_fd(descriptor).is_ok());
     }
     use std::fs;

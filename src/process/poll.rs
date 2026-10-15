@@ -116,7 +116,10 @@ impl<R: Read + AsFd> PipeCapture<R> {
     fn empty(limit: usize) -> Self {
         Self {
             pipe: None,
-            captured: PipeRead { output: Vec::new(), limit_exceeded: false },
+            captured: PipeRead {
+                output: Vec::new(),
+                limit_exceeded: false,
+            },
             listing: None,
             error: None,
             limit,
@@ -239,7 +242,9 @@ pub(super) fn execute(
         if spec.stdin.is_some() && stdin.is_none() {
             return Err(io::Error::other("stdin pipe was unavailable"));
         }
-        if let Some(stdout) = &stdout { set_nonblocking(stdout.as_fd())?; }
+        if let Some(stdout) = &stdout {
+            set_nonblocking(stdout.as_fd())?;
+        }
         set_nonblocking(stderr.as_fd())?;
         if let Some(stdin) = &stdin {
             set_nonblocking(stdin.as_fd())?;

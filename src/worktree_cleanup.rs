@@ -273,7 +273,9 @@ impl std::fmt::Debug for Protection {
 impl Protection {
     /// Actual retained native descriptors, including every discovered Git
     /// ancestor's two locks and held directory. Does no filesystem work.
-    pub(crate) fn retained_descriptor_count(&self) -> usize { self._locks.len() + self._directories.len() }
+    pub(crate) fn retained_descriptor_count(&self) -> usize {
+        self._locks.len() + self._directories.len()
+    }
 
     /// Worker-side proof that this already-acquired lease protects the exact
     /// model-open root; lexical path equality is insufficient after replacement.
@@ -282,7 +284,9 @@ impl Protection {
         let expected = root.metadata()?;
         for directory in &self._directories {
             let actual = directory.metadata()?;
-            if (expected.dev(), expected.ino()) == (actual.dev(), actual.ino()) { return Ok(true); }
+            if (expected.dev(), expected.ino()) == (actual.dev(), actual.ino()) {
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -372,7 +376,11 @@ fn acquire(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Prot
 
 /// Real isolated lock acquisition for cross-module lifetime contracts.
 #[cfg(test)]
-pub(crate) fn fixture_protection(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Protection> {
+pub(crate) fn fixture_protection(
+    runtime: &Path,
+    directory: &Path,
+    exclusive: bool,
+) -> io::Result<Protection> {
     acquire(runtime, directory, exclusive)
 }
 
