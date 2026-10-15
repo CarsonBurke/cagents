@@ -133,18 +133,26 @@ pub(crate) struct ResidentPatch {
     /// when the same source/epoch is reissued under a newer cache authority.
     #[serde(default)]
     pub parent_authority:Option<super::cache::changes::ParentAuthority>,
+    /// Delegated bodies retain their independent read-captured namespace token.
+    /// Legacy missing child authority is unavailable, never inferred later.
+    #[serde(default)]
+    pub child_authority:Option<super::cache::changes::ChildAuthority>,
 }
 impl ResidentPatch {
-    pub(crate) fn authority_matches(&self,current:Option<super::cache::changes::ParentAuthority>)->bool {
+    pub(crate) fn authority_matches(&self,parent:Option<super::cache::changes::ParentAuthority>,
+        child:Option<super::cache::changes::ChildAuthority>)->bool {
         match self.source.agent_id {
-            Some(_)=>self.parent_authority.is_none(),
-            None=>self.parent_authority.is_some_and(|proof|proof.generation>0
-                && proof.incarnation==self.epoch.incarnation && Some(proof)==current),
+            Some(_)=>self.parent_authority.is_none()
+                && self.child_authority.is_some_and(|proof|proof.generation>0
+                    && proof.incarnation==self.epoch.incarnation && Some(proof)==child),
+            None=>self.child_authority.is_none()
+                && self.parent_authority.is_some_and(|proof|proof.generation>0
+                    && proof.incarnation==self.epoch.incarnation && Some(proof)==parent),
         }
     }
     fn valid(&self,text:&str)->bool {
         !self.source.source_id.is_empty() && text.len()==self.file.source_len && text.len()<=SOURCE_BYTES
-            && self.authority_matches(self.parent_authority)
+            && self.authority_matches(self.parent_authority,self.child_authority)
     }
 }
 pub(crate) fn admit_patch(text:&Arc<str>,record:&ResidentPatch,replaced:Option<&Arc<str>>)->Admission {
@@ -355,6 +363,7 @@ mod tests {
     }
     fn patch_record(text:&Arc<str>,file_index:usize)->ResidentPatch {
         ResidentPatch {source:SourceKey {agent_id:Some("child".into()),source_id:"opaque:change:root".into()},epoch:source_epoch(7),parent_authority:None,
+            child_authority:Some(super::super::cache::changes::ChildAuthority {incarnation:source_epoch(7).incarnation,generation:1}),
             file:super::super::cache::changes::File {file_index,path:format!("src/file-{file_index}.rs"),kind:super::super::ChangeKind::Updated,
                 source_len:text.len(),additions:Some(1),deletions:Some(1)}}
     }
@@ -362,19 +371,44 @@ mod tests {
     fn parent_patch_authority_is_frozen_with_actual_allocation_and_cannot_be_relabelled() {
         use super::super::cache::changes::ParentAuthority;
         let pool=Arc::new(Mutex::new(Owners::default()));let text:Arc<str>=Arc::from("exact patch");
-        let mut record=patch_record(&text,0);record.source.agent_id=None;
+        let mut record=patch_record(&text,0);record.source.agent_id=None;record.child_authority=None;
         assert!(!record.valid(&text),"legacy parent None cannot authorize bytes");
         let token=ParentAuthority {incarnation:record.epoch.incarnation,generation:1};record.parent_authority=Some(token);
-        assert!(record.valid(&text));assert!(record.authority_matches(Some(token)));
+        assert!(record.valid(&text));assert!(record.authority_matches(Some(token),None));
         reserve_in(pool.clone(),text.len(),text.len()).unwrap().adopt_mixed(&[],&[(text.clone(),record.clone())]).unwrap();
         let mut relabelled=record.clone();relabelled.parent_authority.as_mut().unwrap().generation+=1;
-        assert!(!record.authority_matches(relabelled.parent_authority));
+        assert!(!record.authority_matches(relabelled.parent_authority,None));
         assert_eq!(reserve_in(pool.clone(),text.len(),text.len()).unwrap().adopt_mixed(&[],&[(text.clone(),relabelled)]),Err(ReserveError::InvalidPayload));
         assert_eq!(pool.lock().unwrap().patch_provenance[&Owner::Patch(&text).id()],record);
         let mut wrong=record.clone();wrong.parent_authority.as_mut().unwrap().incarnation=uuid::Uuid::new_v4();assert!(!wrong.valid(&text));
         wrong=record.clone();wrong.parent_authority.as_mut().unwrap().generation=0;assert!(!wrong.valid(&text));
-        let child=patch_record(&text,1);assert!(child.valid(&text));assert!(child.authority_matches(None));assert!(child.authority_matches(Some(token)));
+        let child=patch_record(&text,1);assert!(child.valid(&text));assert!(child.authority_matches(None,child.child_authority));assert!(child.authority_matches(Some(token),child.child_authority));
         let mut forged_child=child;forged_child.parent_authority=Some(token);assert!(!forged_child.valid(&text));
+        let weak=Arc::downgrade(&text);drop(text);assert!(weak.upgrade().is_none());
+        let mut owners=pool.lock().unwrap();owners.prune();assert_eq!(owners.bytes(),0);
+    }
+    #[test]
+    fn child_patch_authority_is_frozen_and_independent_of_parent_cache_changes() {
+        use super::super::cache::changes::{ParentAuthority,ChildAuthority};
+        let pool=Arc::new(Mutex::new(Owners::default()));let text:Arc<str>=Arc::from("exact delegated patch");
+        let record=patch_record(&text,0);let token=record.child_authority.unwrap();
+        let parent=ParentAuthority {incarnation:token.incarnation,generation:40};
+        assert!(record.valid(&text));assert!(record.authority_matches(None,Some(token)));
+        assert!(record.authority_matches(Some(parent),Some(token)),"unrelated parent token is not child authority");
+        let next=ChildAuthority {generation:token.generation+1,..token};
+        assert!(!record.authority_matches(Some(parent),Some(next)));
+        assert!(!record.authority_matches(Some(parent),None));
+        reserve_in(pool.clone(),text.len(),text.len()).unwrap().adopt_mixed(&[],&[(text.clone(),record.clone())]).unwrap();
+        let mut relabelled=record.clone();relabelled.child_authority=Some(next);
+        assert_eq!(reserve_in(pool.clone(),text.len(),text.len()).unwrap().adopt_mixed(&[],&[(text.clone(),relabelled)]),Err(ReserveError::InvalidPayload));
+        assert_eq!(pool.lock().unwrap().patch_provenance[&Owner::Patch(&text).id()],record);
+        for authority in [None,Some(ChildAuthority {generation:0,..token}),Some(ChildAuthority {incarnation:uuid::Uuid::new_v4(),..token})] {
+            let mut invalid=record.clone();invalid.child_authority=authority;assert!(!invalid.valid(&text));
+        }
+        let mut contradictory=record.clone();contradictory.parent_authority=Some(parent);assert!(!contradictory.valid(&text));
+        let mut parent_record=record.clone();parent_record.source.agent_id=None;parent_record.parent_authority=Some(parent);
+        assert!(!parent_record.valid(&text),"a parent body cannot carry the delegated token");
+        parent_record.child_authority=None;assert!(parent_record.valid(&text));
         let weak=Arc::downgrade(&text);drop(text);assert!(weak.upgrade().is_none());
         let mut owners=pool.lock().unwrap();owners.prune();assert_eq!(owners.bytes(),0);
     }
