@@ -284,12 +284,29 @@ pub(super) fn refresh(
     id: TerminalId,
     resolve: bool,
 ) -> Result<ChatSourceBinding, ProtocolError> {
+    refresh_expected(host, id, resolve, None)
+}
+
+/// Restart publication authenticates only the actor/Record captured before
+/// history I/O. It must never decorate a response from a newer resident owner.
+pub(super) fn refresh_owned(
+    host: &SharedHost, id: TerminalId, resolve: bool,
+    expected_actor: &Handle, expected_instance: uuid::Uuid,
+) -> Result<ChatSourceBinding, ProtocolError> {
+    refresh_expected(host, id, resolve, Some((expected_actor, expected_instance)))
+}
+fn refresh_expected(
+    host: &SharedHost, id: TerminalId, resolve: bool,
+    expected: Option<(&Handle, uuid::Uuid)>,
+) -> Result<ChatSourceBinding, ProtocolError> {
     let (handle, instance, proof) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
             .get(&id)
-            .ok_or_else(|| unavailable("Native backend no longer resident"))?;
+            .filter(|record| expected.is_none_or(|(actor, instance)|
+                !instance.is_nil() && record.execution_instance == instance && record.handle.same_actor(actor)))
+            .ok_or_else(|| unavailable("The exact native backend Record is no longer resident"))?;
         (
             record.handle.clone(),
             record.execution_instance,
