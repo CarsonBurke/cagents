@@ -56,12 +56,12 @@ impl Rows {
     pub fn identity(&self) -> usize { Arc::as_ptr(&self.0) as *const Entry as usize }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct EndCommand(Arc<ConversationEndTarget>);
-impl cosmic::widget::menu::Action for EndCommand {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EndCommand<'a>(&'a Arc<ConversationEndTarget>);
+impl cosmic::widget::menu::Action for EndCommand<'_> {
     type Message = super::SidebarAction;
     fn message(&self) -> Self::Message {
-        super::commands::registered(super::SidebarAction::EndConversation(Arc::clone(&self.0)))
+        super::commands::registered(super::SidebarAction::EndConversation(Arc::clone(self.0)))
     }
 }
 
@@ -69,10 +69,10 @@ impl cosmic::widget::menu::Action for EndCommand {
 /// fanout, preserve durable order, and retain every conversation at any scale.
 /// Total construction is linear in this one scope, not in the entire workspace.
 const MENU_FANOUT: usize = 24;
-fn entries(rows: &[Entry], offset: usize) -> Vec<cosmic::widget::menu::Item<EndCommand, String>> {
+fn entries(rows: &[Entry], offset: usize) -> Vec<cosmic::widget::menu::Item<EndCommand<'_>, String>> {
     use cosmic::widget::menu::Item;
     if rows.len() <= MENU_FANOUT {
-        return rows.iter().enumerate().map(|(index, row)| Item::Button(format!("{}. {}", offset + index + 1, row.title), None, EndCommand(Arc::clone(&row.target)))).collect();
+        return rows.iter().enumerate().map(|(index, row)| Item::Button(format!("{}. {}", offset + index + 1, row.title), None, EndCommand(&row.target))).collect();
     }
     let mut chunk = MENU_FANOUT;
     while rows.len().div_ceil(chunk) > MENU_FANOUT { chunk = chunk.saturating_mul(MENU_FANOUT); }
@@ -91,7 +91,7 @@ pub(super) fn append_menu(
     use cosmic::widget::menu::{Item, items};
     // One registered template serves every captured parameter. Each action's
     // hint is derived from current settings; no per-conversation registry IDs.
-    let bindings = super::menu_bindings(rows.0.iter().map(|row| EndCommand(Arc::clone(&row.target))), shortcuts, &[]);
+    let bindings = super::menu_bindings(rows.0.iter().map(|row| EndCommand(&row.target)), shortcuts, &[]);
     menu.extend(items(&bindings, vec![Item::Divider, Item::Folder(
         super::commands::label(crate::workspace_widget::GlobalShortcut::EndConversation).to_owned(),
         entries(&rows.0, 0),
@@ -120,7 +120,7 @@ mod tests {
             shared_scope: None, shared_repository: None, shared_worktree: None,
         }) }
     }
-    fn collect(items: &[Item<EndCommand, String>], out: &mut Vec<CardId>) {
+    fn collect(items: &[Item<EndCommand<'_>, String>], out: &mut Vec<CardId>) {
         assert!(items.len() <= MENU_FANOUT);
         for item in items {
             match item {
