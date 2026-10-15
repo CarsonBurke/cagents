@@ -14510,6 +14510,7 @@ mod worktree_journal_tests {
         assert_eq!(fixture.git(&["rev-parse", "feature"]), before);
     }
 
+    #[cfg(target_os = "linux")]
     struct ReplaceAtCreation {
         target: PathBuf,
         parked: PathBuf,
@@ -14517,6 +14518,7 @@ mod worktree_journal_tests {
         seen: AtomicBool,
     }
 
+    #[cfg(target_os = "linux")]
     impl ProcessExecutor for ReplaceAtCreation {
         fn execute(&self, command: &CommandSpec, token: &CancellationToken)
             -> Result<ProcessOutput, ProcessFailure>
@@ -14567,6 +14569,100 @@ mod worktree_journal_tests {
             };
             assert_eq!(fs::read(original.join("tracked.txt")).unwrap(), b"committed content\n",
                 "the command must address only its retained destination");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AlterCreatedMetadata {
+        destination: PathBuf,
+        foreign: PathBuf,
+        alteration: &'static str,
+        seen: AtomicBool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProcessExecutor for AlterCreatedMetadata {
+        fn execute(&self, command: &CommandSpec, token: &CancellationToken)
+            -> Result<ProcessOutput, ProcessFailure>
+        {
+            let output = SystemProcessExecutor.execute(command, token)?;
+            if output.success && command.arguments.windows(2)
+                .any(|pair| pair[0] == "worktree" && pair[1] == "add")
+                && !self.seen.swap(true, Ordering::SeqCst)
+            {
+                let locator = fs::read(self.destination.join(".git")).unwrap();
+                let admin = bytes_to_path(trim_one_line_ending(locator.strip_prefix(b"gitdir: ").unwrap()));
+                match self.alteration {
+                    "locator" => {
+                        fs::write(self.destination.join(".git"),
+                            format!("gitdir: {}\n", self.foreign.display())).unwrap();
+                    }
+                    "admin" => {
+                        fs::rename(&admin, admin.with_extension("original")).unwrap();
+                        fs::create_dir(&admin).unwrap();
+                        fs::write(admin.join("foreign"), b"foreign admin\n").unwrap();
+                    }
+                    "backlink" => fs::write(admin.join("gitdir"),
+                        format!("{}\n", self.foreign.join(".git").display())).unwrap(),
+                    "commondir" => fs::write(admin.join("commondir"),
+                        format!("{}\n", self.foreign.display())).unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_creation_never_grants_child_authority_after_metadata_substitution() {
+        for alteration in ["locator", "admin", "backlink", "commondir"] {
+            let fixture = Fixture::new();
+            let foreign = fixture.directory.path().join("foreign-metadata");
+            fs::create_dir(&foreign).unwrap();
+            fs::write(foreign.join("keep"), b"unrelated metadata\n").unwrap();
+            let executor = Arc::new(AlterCreatedMetadata { destination: fixture.request.destination.clone(),
+                foreign: foreign.clone(), alteration, seen: AtomicBool::new(false) });
+            let scoped = RepositoryService::new("git", executor.clone())
+                .with_worktree_authority(WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert!(executor.seen.load(Ordering::SeqCst));
+            assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{alteration}: {report:?}");
+            assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"unrelated metadata\n");
+            assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1,
+                "no destination command may rediscover or modify substituted metadata");
+            let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert_eq!(recovered[0].state, WorktreeOperationState::OutcomeUnknown, "{alteration}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_cancellation_distinguishes_published_empty_child_from_completed_checkout() {
+        for after_exit in [false, true] {
+            let fixture = Fixture::new();
+            let token = CancellationToken::new();
+            let scoped = RepositoryService::new("git", Arc::new(CancelAtGit { after_exit }))
+                .with_worktree_authority(WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &token, &sender);
+            assert!(token.is_cancelled());
+            let expected = if after_exit { WorktreeOperationState::Created }
+                else { WorktreeOperationState::OutcomeUnknown };
+            assert_eq!(report.state, expected, "{after_exit}: {report:?}");
+            assert!(fixture.journal(fixture.request.operation_id).creation_authority
+                .as_ref().unwrap().has_published_destination());
+            let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert_eq!(recovered[0].state, expected);
+            if after_exit {
+                assert_eq!(fs::read(fixture.request.destination.join("tracked.txt")).unwrap(), b"committed content\n");
+            } else {
+                assert!(fs::read_dir(&fixture.request.destination).unwrap().next().is_none(),
+                    "a published directory is a known partial effect, never a rollback claim");
+            }
         }
     }
 
