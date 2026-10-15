@@ -439,3 +439,39 @@ request, allowing the application to continue saving. Workspace-edit file
 creation, file deletion, and file renaming are rejected before applying any
 text edits; ordinary multi-file text edits retain server versions and preview
 annotations for the application to validate and confirm.
+
+### Language-server editor commands
+
+With the text editor focused, `F2` prepares a symbol rename and opens an inline
+name field. Submit the field to inspect the proposed changes in a per-file diff
+preview, then apply or cancel. `Ctrl+.` requests code actions at the caret or
+selection. Disabled actions retain the server's explanation. The command palette
+also exposes Rename symbol, Format document, Format selection, Code actions, and
+Show signature help when the current server supports them. Signature help follows
+the server's trigger characters, emphasizes the active parameter, and closes on
+`)` or Escape.
+
+Rename and multi-file text edits require preview confirmation. Each participating
+open buffer retains one independent Undo step and remains unsaved. Unopened files
+use atomic, conflict-aware writes; if a later file refuses its write, earlier
+writes are restored only while their written contents still match. A concurrent
+outside edit is preserved and reported. Changed buffers, changed tab identities,
+overlapping ranges, unsupported file operations, and paths outside the worktree
+refuse the operation before application. Previews support up to 512 files and a
+64 MiB combined before/after text budget; ordinary editable-file limits still
+apply. Server confirmation labels and descriptions appear above the comparison.
+
+With `format_on_save = true`, explicit saves and autosaves request formatting
+first. A timeout or refusal reports the failure and continues the ordinary safe
+save; formatting never bypasses disk conflict checks. Formatting edits also
+retain Undo.
+
+Definitions outside the project open a highlighted, read-only source tab. Such
+tabs retain their original project's language-server workspace, so definition
+navigation continues to work inside dependency sources. Their source path and
+caret restore locally with the window; they do not become shared workspace
+recipes. Typing, clipboard cuts/pastes, formatting, refactoring, history replay,
+and saving cannot modify these dependency sources.
+
+Server errors remain dismissible notices. Informational server messages expire
+automatically, and server log messages go to the diagnostic log.
