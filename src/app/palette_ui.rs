@@ -4,17 +4,22 @@ use workspace_widget::GlobalShortcut as Command;
 #[derive(Debug, Default)]
 pub(super) struct State {
     recording: Option<SettingsField>,
+    recording_error: Option<String>,
+    reassign: Option<(SettingsField, String, usize)>,
+    filtering_key: bool,
     query: Option<String>,
     selected: usize,
 }
 impl State {
     pub(super) fn is_open(&self) -> bool {
-        self.query.is_some() || self.recording.is_some()
+        self.query.is_some() || self.recording.is_some() || self.filtering_key
     }
 }
 #[derive(Debug, Clone)]
 pub enum Action {
     Record(SettingsField),
+    Reassign,
+    FilterKey,
     Open,
     Close,
     Query(String),
@@ -33,7 +38,46 @@ impl Cagents {
         match action {
             Action::Record(field) => {
                 self.palette.recording = Some(field);
+                self.palette.recording_error = None;
+                self.palette.reassign = None;
                 Task::none()
+            }
+            Action::FilterKey => {
+                self.palette.filtering_key = true;
+                self.palette.recording_error = None;
+                Task::none()
+            }
+            Action::Reassign => {
+                let Some((field, chord, owner)) = self.palette.reassign.take() else { return Task::none(); };
+                let binding = settings::parse_shortcut(&chord).expect("recorded chord");
+                let mut next = self.settings.clone();
+                let mut remaining = next.keyboard_shortcuts.actions()[owner].clone();
+                remaining.retain(|chord| settings::parse_shortcut(chord).ok() != Some(binding));
+                next.keyboard_shortcuts.set_action(owner, remaining.clone());
+                let index = SettingsField::SHORTCUTS.iter().position(|candidate| *candidate == field).expect("shortcut");
+                let mut mine = next.keyboard_shortcuts.actions()[index].clone();
+                mine.push(chord);
+                next.keyboard_shortcuts.set_action(index, mine.clone());
+                match next.validate() {
+                    Ok(next) => {
+                        let previous = std::mem::replace(&mut self.settings, next);
+                        self.settings_draft.set(SettingsField::SHORTCUTS[owner], settings::format_chords(&remaining));
+                        self.settings_draft.set(field, settings::format_chords(&mine));
+                        self.settings_pending.remove(&field);
+                        self.settings_pending.remove(&SettingsField::SHORTCUTS[owner]);
+                        self.settings_invalid.remove(&field);
+                        self.settings_invalid.remove(&SettingsField::SHORTCUTS[owner]);
+                        self.retry_shortcut_drafts();
+                        self.palette.recording = None;
+                        self.palette.recording_error = None;
+                        self.refresh_settings_feedback();
+                        Task::batch([self.save_settings_task(false), self.synchronize_settings(&previous)])
+                    }
+                    Err(_) => {
+                        self.palette.recording_error = Some(format!("{} requires at least one shortcut. Record another shortcut there before reassigning this one.", SettingsField::SHORTCUTS[owner].label()));
+                        Task::none()
+                    }
+                }
             }
             Action::Open => {
                 if self.workspace_inputs_blocked() {
@@ -48,6 +92,7 @@ impl Cagents {
             }
             Action::Close => {
                 self.palette.recording = None;
+                self.palette.filtering_key = false;
                 self.palette.query = None;
                 self.workspace.focused().map_or_else(Task::none, |card| {
                     iced::widget::operation::focus(self.card_keyboard_focus(card))
@@ -86,9 +131,10 @@ impl Cagents {
     }
 
     pub(super) fn palette_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
-        if let Some(field) = self.palette.recording {
+        if self.palette.recording.is_some() || self.palette.filtering_key {
             if is_escape_press(event) {
                 self.palette.recording = None;
+                self.palette.filtering_key = false;
                 return Some(Task::none());
             }
             if let keyboard::Event::KeyPressed { key, modifiers, .. } = event {
@@ -139,25 +185,11 @@ impl Cagents {
                     } else {
                         &name
                     });
-                    if settings::parse_shortcut(&chord).is_ok() {
-                        self.palette.recording = None;
-                        let value = self
-                            .settings_draft
-                            .keyboard_shortcuts
-                            .shortcut_values()
-                            .into_iter()
-                            .find(|(action, _)| Some(*action) == field.shortcut_action())
-                            .map(|(_, value)| value.to_owned())
-                            .unwrap_or_default();
-                        let mut chords = settings::parse_chords(&value);
-                        if !chords.contains(&chord) {
-                            chords.push(chord);
-                        }
-                        return Some(self.update(Message::SettingsDraftChanged {
-                            field,
-                            value: settings::format_chords(&chords),
-                        }));
+                    if self.palette.filtering_key {
+                        self.palette.filtering_key = false;
+                        return Some(self.update(Message::SettingsSearchChanged(chord)));
                     }
+                    return Some(self.record_shortcut(self.palette.recording.expect("recording field"), chord));
                 }
             }
             return Some(Task::none());
@@ -188,6 +220,35 @@ impl Cagents {
             }
         }
         Some(Task::none())
+    }
+
+    fn record_shortcut(&mut self, field: SettingsField, chord: String) -> Task<Message> {
+        self.palette.reassign = None;
+        let action = field.shortcut_action().expect("shortcut field");
+        let value = self.settings_draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).expect("shortcut draft").1;
+        let mut chords = settings::parse_chords(value);
+        if !chords.iter().any(|existing| settings::parse_shortcut(existing).ok() == settings::parse_shortcut(&chord).ok()) {
+            chords.push(chord.clone());
+        }
+        let value = settings::format_chords(&chords);
+        match settings_update(&self.settings, field, &value) {
+            SettingsDecision::Invalid(reason) => {
+                self.palette.recording_error = Some(reason);
+                if let Ok(binding) = settings::parse_shortcut(&chord)
+                    && settings::shortcut_chord_refusal(binding).is_none()
+                    && let Some(owner) = self.settings.keyboard_shortcuts.actions().iter().position(|chords| chords.iter().any(|candidate| settings::parse_shortcut(candidate).ok() == Some(binding)))
+                    && SettingsField::SHORTCUTS[owner] != field
+                {
+                    self.palette.reassign = Some((field, chord, owner));
+                }
+                Task::none()
+            }
+            _ => {
+                self.palette.recording = None;
+                self.palette.recording_error = None;
+                self.apply_setting_input(field, value)
+            }
+        }
     }
 
     fn reveal_palette_selection(&self) -> Task<Message> {
@@ -270,14 +331,15 @@ impl Cagents {
     }
 
     pub(super) fn palette_surface(&self) -> Option<Element<'_, Message>> {
-        if self.palette.recording.is_some() {
-            return Some(
-                widget::container(design::body("Press a shortcut · Escape cancels"))
-                    .class(cosmic::theme::Container::Card)
-                    .padding(20)
-                    .width(400)
-                    .into(),
-            );
+        if self.palette.recording.is_some() || self.palette.filtering_key {
+            let mut children: Vec<Element<'_, Message>> = vec![design::body("Press a shortcut · Escape cancels").into()];
+            if let Some(reason) = &self.palette.recording_error {
+                children.push(design::body(reason).class(cosmic::theme::Text::Custom(design::destructive_text)).into());
+            }
+            if let Some((_, _, owner)) = &self.palette.reassign {
+                children.push(widget::button::text(format!("Reassign from {}", SettingsField::SHORTCUTS[*owner].label())).on_press(Message::Palette(Action::Reassign)).into());
+            }
+            return Some(widget::container(widget::column::with_children(children).spacing(space::S)).class(cosmic::theme::Container::Card).padding(20).width(480).into());
         }
         let query = self.palette.query.as_ref()?;
         let input =
@@ -1119,5 +1181,40 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.insert(0, other);
         assert_eq!(app.card_state(id).unwrap().id, id);
         assert_eq!(app.card_state_mut(id).unwrap().id, id);
+    }
+}
+
+#[cfg(test)]
+mod settings_recorder_tests {
+    use super::*;
+
+    #[test]
+    fn recorder_refuses_shell_controls_and_fixed_chords_before_editing_the_draft() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let field = SettingsField::ShortcutToggleProjects;
+        let original = app.settings_draft.keyboard_shortcuts.toggle_projects.clone();
+        for (chord, reason) in [("Ctrl+C", "interrupts"), ("Ctrl+Tab", "Cycle recent panes"), ("Ctrl+=", "Increase font size")] {
+            drop(app.update_palette(Action::Record(field)));
+            drop(app.record_shortcut(field, chord.into()));
+            assert!(app.palette.recording_error.as_ref().is_some_and(|error| error.contains(reason)), "{chord}");
+            assert_eq!(app.palette.recording, Some(field));
+            assert_eq!(app.settings_draft.keyboard_shortcuts.toggle_projects, original);
+        }
+    }
+
+    #[test]
+    fn recorder_reassigns_a_conflicting_optional_chord_atomically() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let field = SettingsField::ShortcutToggleProjects;
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        drop(app.update_palette(Action::Record(field)));
+        drop(app.record_shortcut(field, chord.clone()));
+        assert!(app.palette.reassign.is_some());
+        drop(app.update_palette(Action::Reassign));
+        assert!(app.palette.recording.is_none());
+        assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
+        assert!(app.settings.keyboard_shortcuts.toggle_projects.contains(&chord));
+        assert!(app.settings_invalid.is_empty());
+        assert!(app.settings.clone().validate().is_ok());
     }
 }

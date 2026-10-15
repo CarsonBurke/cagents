@@ -3863,6 +3863,7 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
 fn shortcut_refusal(action: usize, shortcuts: &KeyboardShortcuts) -> Option<String> {
     let fault = shortcuts.fault()?;
     let Some(owner) = fault.conflicts_with else {
+        if fault.action != action { return None; }
         let settings::SettingsError::InvalidShortcut(reason) = fault.error else {
             return None;
         };
@@ -12487,6 +12488,29 @@ impl Cagents {
         }
     }
 
+    /// Retry refused shortcut drafts against the newly saved table. A different
+    /// row may have released the chord they were waiting for.
+    fn retry_shortcut_drafts(&mut self) {
+        loop {
+            let mut progressed = false;
+            let fields: Vec<_> = SettingsField::SHORTCUTS.into_iter().filter(|field| self.settings_invalid.contains_key(field)).collect();
+            for field in fields {
+                let action = field.shortcut_action().expect("shortcut field");
+                let value = self.settings_draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).expect("registered shortcut").1.to_owned();
+                match settings_update(&self.settings, field, &value) {
+                    SettingsDecision::Persist(settings) => {
+                        self.settings = settings;
+                        self.settings_invalid.remove(&field);
+                        progressed = true;
+                    }
+                    SettingsDecision::Unchanged => { self.settings_invalid.remove(&field); progressed = true; }
+                    SettingsDecision::Invalid(reason) => { self.settings_invalid.insert(field, reason); }
+                }
+            }
+            if !progressed { break; }
+        }
+    }
+
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_pending.remove(&field);
         self.settings_draft.set(field, value.clone());
@@ -12498,15 +12522,18 @@ impl Cagents {
             }
             SettingsDecision::Unchanged => {
                 self.settings_invalid.remove(&field);
-                if self.settings_save_error.is_some() {
-                    return self.save_settings_task(false);
-                }
+                let previous = self.settings.clone();
+                self.retry_shortcut_drafts();
+                let changed = previous != self.settings;
+                let save = if changed || self.settings_save_error.is_some() { self.save_settings_task(false) } else { Task::none() };
                 self.refresh_settings_feedback();
-                Task::none()
+                let effect = if changed { self.synchronize_settings(&previous) } else { Task::none() };
+                Task::batch([save, effect])
             }
             SettingsDecision::Persist(settings) => {
                 let previous = std::mem::replace(&mut self.settings, settings);
                 self.settings_invalid.remove(&field);
+                self.retry_shortcut_drafts();
                 let save = self.save_settings_task(false);
                 self.refresh_settings_feedback();
                 let effect = self.synchronize_settings(&previous);
@@ -15787,6 +15814,9 @@ impl Application for Cagents {
                         ));
                     }
                 }
+                if let Some(task) = self.palette_key_event(&event) {
+                    return task;
+                }
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
                 }
@@ -15821,9 +15851,6 @@ impl Application for Cagents {
                         return self.apply_viewport(update, true, false);
                     }
                     return Task::none();
-                }
-                if let Some(task) = self.palette_key_event(&event) {
-                    return task;
                 }
                 if let Some(task) = self.chrome_key_event(&event) {
                     return task;
@@ -19533,6 +19560,19 @@ mod tests {
             settings::load(&path).unwrap().managed_worktree_directory,
             "../trees/"
         );
+    }
+
+    #[test]
+    fn settings_releasing_a_conflict_retries_the_other_rows_refused_draft() {
+        let mut app = context_inspector_test_app(false);
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        let field = SettingsField::ShortcutToggleProjects;
+        drop(app.apply_setting_input(field, chord.clone()));
+        assert!(app.settings_invalid.contains_key(&field));
+        drop(app.apply_setting_input(SettingsField::ShortcutCommandPalette, String::new()));
+        assert!(app.settings_invalid.is_empty());
+        assert_eq!(app.settings.keyboard_shortcuts.toggle_projects, [chord]);
+        assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
     }
 
     #[test]
