@@ -3878,6 +3878,10 @@ pub enum WorktreeCreationOutcome {
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
+    /// Ephemeral worker-owned authority. Callers must retain this before
+    /// converting a report to text; it is never reconstructed or serialized.
+    #[error("repository recovery required: {message}")]
+    Recovery { message: String, authority: crate::recovery_authority::RecoveryAuthority },
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[error(transparent)]
@@ -3911,6 +3915,12 @@ pub enum RepositoryError {
         base_branch: ValidatedBranchName,
         failure: Box<ProcessFailure>,
     },
+}
+
+impl RepositoryError {
+    pub fn recovery_authority(&self) -> Option<&crate::recovery_authority::RecoveryAuthority> {
+        match self { Self::Recovery { authority, .. } => Some(authority), _ => None }
+    }
 }
 
 #[derive(Clone)]
