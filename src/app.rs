@@ -16810,6 +16810,7 @@ impl Application for Cagents {
                 dialog
             };
             let target = self.modal_surface_target(top);
+            let dialog = crate::interaction::owned_surface(dialog, target);
             crate::interaction::observe_focus(dialog, self.modal_stack.focus_snapshot(top))
                 .map(move |message| Message::ModalSurface { target, message: Box::new(message) })
         })

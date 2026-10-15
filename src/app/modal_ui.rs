@@ -598,6 +598,96 @@ mod tests {
         }));
     }
 
+    fn apply_modal_widget_task(
+        ui: &mut iced::runtime::user_interface::UserInterface<'_, cosmic::Action<Message>, cosmic::Theme, cosmic::Renderer>,
+        renderer: &cosmic::Renderer,
+        task: Task<Message>,
+    ) {
+        use iced::advanced::widget::operation;
+        use iced::futures::StreamExt;
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            let executor = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            while let Some(action) = executor.block_on(stream.next()) {
+                let iced::runtime::Action::Widget(mut operation) = action else { continue; };
+                loop {
+                    ui.operate(renderer, &mut operation);
+                    match operation.finish() {
+                        operation::Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_press_cannot_carry_consent_into_a_replaced_named_dialog_tree() {
+        use iced::advanced::{clipboard, widget::{Operation, operation}};
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        struct ButtonBounds(Option<iced::Rectangle>);
+        impl Operation for ButtonBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn focusable(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle,
+                _state: &mut dyn operation::Focusable) {
+                if id == Some(&widget::Id::new("dialog.reset-settings.confirm")) { self.0 = Some(bounds); }
+            }
+        }
+        for replace in [false, true] {
+            let mut app = app();
+            // A lower retained dialog disappearing must NOT reset a still
+            // visible upper widget's legitimate pointer gesture.
+            app.resume_ui.open = true;
+            drop(app.finish_modal_update(Task::none()));
+            drop(app.update(Message::ResetSettings));
+            let original = app.modal_surface_target(Modal::SettingsReset);
+            let mut renderer = super::super::tests::headless_renderer();
+            let bounds = iced::Size::new(1280.0, 900.0);
+            let mut messages = Vec::new();
+            let (cache, point) = {
+                let mut ui = UserInterface::build(cosmic::ApplicationExt::view_main(&app),
+                    bounds, Cache::new(), &mut renderer);
+                let mut target = ButtonBounds(None);
+                ui.operate(&renderer, &mut target);
+                let point = target.0.expect("actual destructive button bounds").center();
+                let (_, status) = ui.update(&[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))],
+                    iced::mouse::Cursor::Available(point), &mut renderer, &mut clipboard::Null, &mut messages);
+                assert_eq!(status, vec![iced::event::Status::Captured]);
+                assert!(messages.is_empty(), "consent is emitted on release, not press");
+                (ui.into_cache(), point)
+            };
+            let task = if replace {
+                // Process close/reopen without rendering an intermediate
+                // frame: the named widget cache still contains A's press.
+                drop(app.update(Message::CancelResetSettings));
+                app.update(Message::ResetSettings)
+            } else {
+                app.resume_ui.open = false;
+                app.finish_modal_update(Task::none())
+            };
+            let current = app.modal_surface_target(Modal::SettingsReset);
+            assert_eq!(current == original, !replace);
+            let mut ui = UserInterface::build(cosmic::ApplicationExt::view_main(&app), bounds, cache, &mut renderer);
+            // Apply the replacement's normal initial Cancel focus; unfocusing
+            // a native button by itself does not clear its pressed state.
+            apply_modal_widget_task(&mut ui, &renderer, task);
+            ui.update(&[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left))],
+                iced::mouse::Cursor::Available(point), &mut renderer, &mut clipboard::Null, &mut messages);
+            let decisions = messages.iter().filter(|message| matches!(message,
+                cosmic::Action::App(Message::ModalSurface { message, .. }) if matches!(&**message, Message::ConfirmResetSettings))).count();
+            assert_eq!(decisions, usize::from(!replace), "a replaced surface cannot inherit pointer consent");
+            if replace {
+                messages.clear();
+                ui.update(&[
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)),
+                ], iced::mouse::Cursor::Available(point), &mut renderer, &mut clipboard::Null, &mut messages);
+                assert!(messages.iter().any(|message| matches!(message,
+                    cosmic::Action::App(Message::ModalSurface { target, message }) if *target == current && matches!(&**message, Message::ConfirmResetSettings))),
+                    "a fresh intentional click still reaches the replacement control");
+            }
+        }
+    }
+
     fn emitted_reset_cancel(app: &Cagents) -> Message {
         use iced::advanced::{Layout, Shell, clipboard, layout, widget::{Tree, operation}};
         let renderer = super::super::tests::headless_renderer();
