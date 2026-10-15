@@ -223,7 +223,7 @@ impl Cagents {
                     "Agent accounts",
                     Icon::Avatar,
                     "empty.accounts",
-                    Message::AccountUi(account_ui::Action::OpenPane),
+                    Message::RunCommand(workspace_widget::GlobalShortcut::OpenAgentAccounts),
                 ),
             ] {
                 content.push(

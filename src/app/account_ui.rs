@@ -2223,6 +2223,13 @@ impl Cagents {
             .unwrap_or_else(Task::none)
     }
 
+    pub(super) fn open_agent_accounts(&mut self) -> Task<Message> {
+        self.account_ui.popover = None;
+        self.dismiss_chat_picker();
+        let open = self.open_utility_card(CardKind::Accounts);
+        Task::batch([open, self.accounts_surface_changed()])
+    }
+
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::RemoteHomeReady(provider, result) => match result {
@@ -2471,10 +2478,11 @@ impl Cagents {
                 Task::batch([probe, save])
             }
             Action::OpenPane => {
+                // This action comes from the owned account/picker menu. Close
+                // that surface before checking the workspace invocation.
                 self.account_ui.popover = None;
                 self.dismiss_chat_picker();
-                let open = self.open_utility_card(CardKind::Accounts);
-                Task::batch([open, self.accounts_surface_changed()])
+                self.run_workspace_command(workspace_widget::GlobalShortcut::OpenAgentAccounts, keyboard::Modifiers::empty())
             }
             Action::UseReportedLogin {
                 id,

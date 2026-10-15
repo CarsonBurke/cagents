@@ -2746,6 +2746,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
     if let Message::Sidebar(SidebarAction::RunBound { action, .. } | SidebarAction::RunCommand { action, .. }) = message {
         return workspace_navigation_blocked_during_save(&Message::Sidebar((**action).clone()));
     }
+    if let Message::Sidebar(SidebarAction::RunUtilityCommand(command)) = message { return command.blocked_during_save(); }
     // The channel deletion dialog is the one channel command that navigates
     // nowhere, so a save in flight must not strand it with no way out.
     if let Message::ChannelUi(action) = message {
@@ -3144,6 +3145,9 @@ pub enum SettingsField {
     ShortcutGitHistoryCreateBranch,
     ShortcutGitHistoryRevert,
     ShortcutGitHistoryCherryPick,
+    ShortcutOpenAutomations,
+    ShortcutOpenAgentAccounts,
+
     ShortcutTerminalReview,
 }
 
@@ -3236,7 +3240,7 @@ impl SettingsField {
     }
 
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 215] = [
+    const SHORTCUTS: [Self; 217] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3452,6 +3456,9 @@ impl SettingsField {
         Self::ShortcutGitHistoryCreateBranch,
         Self::ShortcutGitHistoryRevert,
         Self::ShortcutGitHistoryCherryPick,
+        Self::ShortcutOpenAutomations,
+        Self::ShortcutOpenAgentAccounts,
+
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3685,6 +3692,9 @@ impl SettingsField {
             Self::ShortcutGitHistoryCreateBranch => "Create branch from commit…",
             Self::ShortcutGitHistoryRevert => "Revert commit",
             Self::ShortcutGitHistoryCherryPick => "Cherry-pick commit into this worktree",
+            Self::ShortcutOpenAutomations => "Open automations",
+            Self::ShortcutOpenAgentAccounts => "Open agent accounts",
+
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3971,6 +3981,8 @@ impl SettingsField {
             | Self::ShortcutGitHistoryCreateBranch
             | Self::ShortcutGitHistoryRevert
             | Self::ShortcutGitHistoryCherryPick
+            | Self::ShortcutOpenAutomations
+            | Self::ShortcutOpenAgentAccounts
             | Self::ShortcutTerminalReview
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
@@ -4213,6 +4225,9 @@ struct ShortcutDraft {
     git_history_create_branch: String,
     git_history_revert: String,
     git_history_cherry_pick: String,
+    open_automations: String,
+    open_agent_accounts: String,
+
 
     terminal_review: String,
     command_palette: String,
@@ -4444,6 +4459,9 @@ impl ShortcutDraft {
             git_history_create_branch: settings::format_chords(&shortcuts.git_history_create_branch),
             git_history_revert: settings::format_chords(&shortcuts.git_history_revert),
             git_history_cherry_pick: settings::format_chords(&shortcuts.git_history_cherry_pick),
+            open_automations: settings::format_chords(&shortcuts.open_automations),
+            open_agent_accounts: settings::format_chords(&shortcuts.open_agent_accounts),
+
 
             terminal_review: settings::format_chords(&shortcuts.terminal_review),
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -5023,6 +5041,9 @@ impl SettingsDraft {
             SettingsField::ShortcutGitHistoryCreateBranch => self.keyboard_shortcuts.git_history_create_branch = value,
             SettingsField::ShortcutGitHistoryRevert => self.keyboard_shortcuts.git_history_revert = value,
             SettingsField::ShortcutGitHistoryCherryPick => self.keyboard_shortcuts.git_history_cherry_pick = value,
+            SettingsField::ShortcutOpenAutomations => self.keyboard_shortcuts.open_automations = value,
+            SettingsField::ShortcutOpenAgentAccounts => self.keyboard_shortcuts.open_agent_accounts = value,
+
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -6045,6 +6066,9 @@ fn settings_update(
         SettingsField::ShortcutGitHistoryCreateBranch => { next.keyboard_shortcuts.git_history_create_branch = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutGitHistoryRevert => { next.keyboard_shortcuts.git_history_revert = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutGitHistoryCherryPick => { next.keyboard_shortcuts.git_history_cherry_pick = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutOpenAutomations => { next.keyboard_shortcuts.open_automations = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutOpenAgentAccounts => { next.keyboard_shortcuts.open_agent_accounts = settings::parse_chords(value); Ok(()) }
+
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
@@ -19090,7 +19114,11 @@ impl Application for Cagents {
                     }
                     SidebarAction::ClearChangeSelection { .. } | SidebarAction::InvokeChangeRows { .. } => Task::none(),
                     SidebarAction::OpenSettings => self.open_utility_card(CardKind::Settings),
-                    SidebarAction::OpenAutomations => self.open_automations(),
+                    SidebarAction::RunUtilityCommand(command) => {
+                        if !matches!(command, workspace_widget::GlobalShortcut::OpenAutomations | workspace_widget::GlobalShortcut::OpenAgentAccounts) { return Task::none(); }
+                        self.run_workspace_command(command, keyboard::Modifiers::empty())
+                    }
+                    SidebarAction::OpenAutomations => self.run_workspace_command(workspace_widget::GlobalShortcut::OpenAutomations, keyboard::Modifiers::empty()),
                     // The handle clamps to its own rendered bounds, and the
                     // settings file accepts a narrower range, so the width is
                     // clamped again before it can reach a rejected save.

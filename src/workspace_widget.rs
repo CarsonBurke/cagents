@@ -234,6 +234,9 @@ pub enum GlobalShortcut {
     GitHistoryCreateBranch,
     GitHistoryRevert,
     GitHistoryCherryPick,
+    OpenAutomations,
+    OpenAgentAccounts,
+
 
     CommandPalette,
     NewThread,
@@ -369,6 +372,8 @@ impl GlobalShortcut {
                     | Self::ClonePane
                     | Self::ReopenPane
                     | Self::OpenSettings
+                    | Self::OpenAutomations
+                    | Self::OpenAgentAccounts
                     | Self::ToggleInspector
                     | Self::FocusLastPane
                     | Self::FocusAdjacent(_)
@@ -579,6 +584,9 @@ impl GlobalShortcut {
             Self::GitHistoryCreateBranch => "git_history_create_branch",
             Self::GitHistoryRevert => "git_history_revert",
             Self::GitHistoryCherryPick => "git_history_cherry_pick",
+            Self::OpenAutomations => "open_automations",
+            Self::OpenAgentAccounts => "open_agent_accounts",
+
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -854,6 +862,8 @@ impl ShortcutDescriptor {
             || matches!(
                 self.action,
                 GlobalShortcut::OpenSettings
+                    | GlobalShortcut::OpenAutomations
+                    | GlobalShortcut::OpenAgentAccounts
                     | GlobalShortcut::ToggleTheme
                     | GlobalShortcut::RestartDaemon
             )
@@ -914,7 +924,7 @@ impl ShortcutDescriptor {
             | GlobalShortcut::NewChannel | GlobalShortcut::CloneRepository
             | GlobalShortcut::ChatAttach | GlobalShortcut::SearchInProject
             | GlobalShortcut::MarkAllRead | GlobalShortcut::OpenInExternalEditor
-            | GlobalShortcut::ReviewConversationChanges | GlobalShortcut::RestartDaemon)
+            | GlobalShortcut::ReviewConversationChanges | GlobalShortcut::RestartDaemon | GlobalShortcut::OpenAutomations)
     }
 
     pub fn available(self, context: &CommandContext) -> bool {
@@ -2239,6 +2249,9 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::GitHistoryCreateBranch, label: "Create branch from commit…", repeatable: false, scope: ShortcutScope::Sidebar },
     ShortcutDescriptor { action: GlobalShortcut::GitHistoryRevert, label: "Revert commit", repeatable: false, scope: ShortcutScope::Sidebar },
     ShortcutDescriptor { action: GlobalShortcut::GitHistoryCherryPick, label: "Cherry-pick commit into this worktree", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::OpenAutomations, label: "Open automations", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::OpenAgentAccounts, label: "Open agent accounts", repeatable: false, scope: ShortcutScope::Workspace },
+
 
 ];
 
@@ -2439,6 +2452,9 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::GitHistoryCreateBranch => &shortcuts.git_history_create_branch,
         GlobalShortcut::GitHistoryRevert => &shortcuts.git_history_revert,
         GlobalShortcut::GitHistoryCherryPick => &shortcuts.git_history_cherry_pick,
+        GlobalShortcut::OpenAutomations => &shortcuts.open_automations,
+        GlobalShortcut::OpenAgentAccounts => &shortcuts.open_agent_accounts,
+
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,

@@ -461,6 +461,9 @@ pub struct KeyboardShortcuts {
     pub git_history_create_branch: Vec<String>,
     pub git_history_revert: Vec<String>,
     pub git_history_cherry_pick: Vec<String>,
+    pub open_automations: Vec<String>,
+    pub open_agent_accounts: Vec<String>,
+
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -690,6 +693,9 @@ impl Default for KeyboardShortcuts {
             git_history_create_branch: Vec::new(),
             git_history_revert: Vec::new(),
             git_history_cherry_pick: Vec::new(),
+            open_automations: Vec::new(),
+            open_agent_accounts: Vec::new(),
+
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -722,7 +728,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 215] {
+    pub fn actions(&self) -> [&Vec<String>; 217] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -939,12 +945,15 @@ impl KeyboardShortcuts {
             &self.git_history_create_branch,
             &self.git_history_revert,
             &self.git_history_cherry_pick,
+            &self.open_automations,
+            &self.open_agent_accounts,
+
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 215] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 217] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -1161,6 +1170,9 @@ impl KeyboardShortcuts {
             &mut self.git_history_create_branch,
             &mut self.git_history_revert,
             &mut self.git_history_cherry_pick,
+            &mut self.open_automations,
+            &mut self.open_agent_accounts,
+
         ]
     }
 
@@ -1222,7 +1234,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 215] = [
+const SHORTCUT_ACTIONS: [&str; 217] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1438,6 +1450,9 @@ const SHORTCUT_ACTIONS: [&str; 215] = [
     "git_history_create_branch",
     "git_history_revert",
     "git_history_cherry_pick",
+    "open_automations",
+    "open_agent_accounts",
+
 ];
 
 /// An action a shortcut table cannot bind.
@@ -3038,6 +3053,9 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 210] = [
     "git_history_create_branch",
     "git_history_revert",
     "git_history_cherry_pick",
+    "open_automations",
+    "open_agent_accounts",
+
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {

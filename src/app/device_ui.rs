@@ -48,6 +48,7 @@ pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
             | SidebarAction::MaximizeWindow
             | SidebarAction::WindowMenu
             | SidebarAction::OpenSettings
+            | SidebarAction::RunUtilityCommand(_)
     )
 }
 

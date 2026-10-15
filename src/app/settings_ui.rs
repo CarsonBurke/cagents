@@ -495,7 +495,7 @@ fn settings_category_controls<'a>(
                 "Manage accounts",
                 "Add, rename, sign in to or remove accounts, and compare what each has left.",
                 crate::ui_controls::button::secondary("Open Accounts")
-                    .on_press(Message::AccountUi(account_ui::Action::OpenPane))
+                    .on_press(Message::RunCommand(workspace_widget::GlobalShortcut::OpenAgentAccounts))
                     .into(),
             ));
             vec![settings_group(

@@ -2404,6 +2404,8 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if command == Command::OpenAutomations { return self.open_automations(); }
+        if command == Command::OpenAgentAccounts { return self.open_agent_accounts(); }
         if matches!(
             command,
             Command::SettingsOpenFile | Command::SettingsRevealFile
@@ -2907,7 +2909,9 @@ impl Cagents {
             | Command::GitHistoryNewWorktree
             | Command::GitHistoryCreateBranch
             | Command::GitHistoryRevert
-            | Command::GitHistoryCherryPick => self.run_registered_command(command),
+            | Command::GitHistoryCherryPick
+            | Command::OpenAutomations
+            | Command::OpenAgentAccounts => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
@@ -3268,6 +3272,9 @@ impl SettingsField {
             Self::ShortcutGitHistoryCreateBranch => Some(Command::GitHistoryCreateBranch),
             Self::ShortcutGitHistoryRevert => Some(Command::GitHistoryRevert),
             Self::ShortcutGitHistoryCherryPick => Some(Command::GitHistoryCherryPick),
+            Self::ShortcutOpenAutomations => Some(Command::OpenAutomations),
+            Self::ShortcutOpenAgentAccounts => Some(Command::OpenAgentAccounts),
+
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
@@ -3710,12 +3717,35 @@ impl ShortcutDraft {
                 Command::GitHistoryCherryPick,
                 self.git_history_cherry_pick.as_str(),
             ),
+            (Command::OpenAutomations, self.open_automations.as_str()),
+            (Command::OpenAgentAccounts, self.open_agent_accounts.as_str()),
+
         ]
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn utility_destinations_are_registered_bindable_and_use_actual_workspace_dispatch() {
+        for (command, account) in [(Command::OpenAutomations, false), (Command::OpenAgentAccounts, true)] {
+            let descriptor = workspace_widget::shortcut_descriptor(command);
+            assert!(descriptor.default_chords().is_empty());
+            assert!(!descriptor.available(&workspace_widget::CommandContext { save_in_flight: true, ..Default::default() }));
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            if account { app.settings.keyboard_shortcuts.open_agent_accounts = vec!["F10".into()]; }
+            else { app.settings.keyboard_shortcuts.open_automations = vec!["F10".into()]; }
+            assert_eq!(workspace_widget::shortcut_chords(command, &app.settings.keyboard_shortcuts), vec!["F10".to_owned()]);
+            assert!(app.command_available(command));
+            assert!(app.palette_entries(Some(">" )).iter().any(|entry| matches!(entry, Entry::Item(item) if matches!(&item.action, Message::Palette(Action::RunCommand(found)) if *found == command))));
+            drop(app.update(Message::RunCommand(command)));
+            assert!(app.durable.cards.iter().any(|card| card.existence.is_open() && if account { matches!(card.kind, CardKind::Accounts) } else { matches!(card.kind, CardKind::Automations) }));
+        }
+        let remote = workspace_widget::CommandContext { remote_device: true, ..Default::default() };
+        assert!(!workspace_widget::shortcut_descriptor(Command::OpenAutomations).available(&remote));
+        assert!(workspace_widget::shortcut_descriptor(Command::OpenAgentAccounts).available(&remote));
+    }
+
 
     #[test]
     fn pane_list_uses_shared_attention_ranking_and_preserves_unread_work() {

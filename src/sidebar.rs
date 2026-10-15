@@ -4574,6 +4574,7 @@ impl SidebarState {
             | SidebarAction::CreatePullRequest { .. }
             | SidebarAction::OpenSettings
             | SidebarAction::OpenAutomations
+            | SidebarAction::RunUtilityCommand(_)
             | SidebarAction::GitOperation { .. }
             | SidebarAction::ToggleStashes { .. }
             | SidebarAction::RequestStashDrop { .. }
@@ -4640,6 +4641,8 @@ pub enum ChangeGroupCommand {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    /// Global utility destinations share the registry rather than a row target.
+    RunUtilityCommand(crate::workspace_widget::GlobalShortcut),
     /// Original logical owner captured when this source control intent was made.
     RunBound { binding: crate::model::OperationId, action: Box<SidebarAction> },
     RunChangeGroup {
@@ -5572,8 +5575,11 @@ fn utility_controls<'a>(
             .on_press_maybe(gated(SidebarAction::OpenSettings, modal_open))
             .id(stable_id("settings"))
             .into();
-    let automations = crate::ui_controls::icon_button(Icon::Alarm, "Automations")
-        .on_press_maybe(gated(SidebarAction::OpenAutomations, modal_open))
+    let command = crate::workspace_widget::GlobalShortcut::OpenAutomations;
+    let label = shortcuts.map_or_else(|| "Automations are available in ADE".to_owned(), |shortcuts| crate::workspace_widget::shortcut_tooltip(command, shortcuts));
+    let available = shortcuts.is_some() && crate::workspace_widget::shortcut_descriptor(command).available_on_device(crate::device::is_remote());
+    let automations = crate::ui_controls::icon_button(Icon::Alarm, label)
+        .on_press_maybe((available && !modal_open).then_some(SidebarAction::RunUtilityCommand(command)))
         .id(stable_id("automations"))
         .into();
     [settings, automations]

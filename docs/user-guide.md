@@ -1041,3 +1041,8 @@ scripts/run-ceditor-development /path/to/project   # isolated development identi
   remotes (`origin` first) through `gh`, with the same viewed marks and
   **Alt+V**, **Alt+Down**, and **Alt+Up** shortcuts, configurable in Editor
   settings.
+
+The Open automations (`open_automations`) and Open agent accounts
+(`open_agent_accounts`) commands also appear in the palette and Keyboard settings.
+Both start unbound. Automations is unavailable on remote devices; account management
+uses the selected device's existing account surface.
