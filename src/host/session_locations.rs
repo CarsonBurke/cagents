@@ -1,7 +1,7 @@
 //! Prepare process evidence outside HostState, then atomically relocate logical
 //! ownership and its exact sessions. Caller holds exclusive control admission.
 use super::{
-    model::SessionMove,
+    model::{SessionDirectoryProof, SessionMove},
     state::{ClientId, SharedHost},
 };
 use crate::{
@@ -21,14 +21,30 @@ use std::{
 
 #[derive(Clone)]
 enum Owner {
-    Chat(Handle),
+    Chat {handle: Handle, instance: uuid::Uuid},
     Terminal(TerminalHandle),
     Unavailable,
+}
+enum VerifiedDirectory {
+    Live(DirectoryProof),
+    Completed {
+        identity: crate::agent_execution::DirectoryIdentity,
+        // Keep the positive original FD pin through the SQL commit.
+        context: std::sync::Arc<crate::chat::protocol::ExecutionContext>,
+    },
+}
+impl VerifiedDirectory {
+    fn evidence(&self) -> SessionDirectoryProof {
+        match self {
+            Self::Live(proof) => SessionDirectoryProof::Live {identity: proof.identity, process: proof.process.clone()},
+            Self::Completed {identity,..} => SessionDirectoryProof::Completed {identity: *identity},
+        }
+    }
 }
 struct Prepared {
     movement: SessionMove,
     owner: Owner,
-    proof: Option<DirectoryProof>,
+    proof: Option<VerifiedDirectory>,
 }
 
 fn error(message: impl Into<String>) -> ProtocolError {
@@ -248,6 +264,14 @@ pub(super) fn relocate(
     origin: ClientId,
     relocation: Relocation,
 ) -> Result<WorkspaceModel, ProtocolError> {
+    relocate_with(host, origin, relocation, || {})
+}
+fn relocate_with(
+    host: &SharedHost,
+    origin: ClientId,
+    relocation: Relocation,
+    before_commit: impl FnOnce(),
+) -> Result<WorkspaceModel, ProtocolError> {
     let edit = ModelEdit::RelocateProject { relocation }
         .canonicalized()
         .map_err(error)?;
@@ -295,6 +319,17 @@ pub(super) fn relocate(
         }
         sources
     };
+    // The control writer excludes normal ingress. Keep the same per-chat
+    // lifecycle claim as retained restart too: its Handle/instance may remain
+    // stable while the concrete backend changes. No claim waits under Host.
+    let chat_gates = sources.iter().filter_map(|(id, source)|
+        matches!(source, HostedSession::Chat(_)).then(|| super::chat::presentation_close::transition_gate(host, *id)))
+        .collect::<Vec<_>>();
+    let _transitions = chat_gates.iter().map(|gate| match gate.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Err(error("A conversation lifecycle transition is in progress; retry Locate after its exact owner settles")),
+    }).collect::<Result<Vec<_>, ProtocolError>>()?;
     // Explicit verification also repairs metadata after the last event failed
     // persistence. Capture ownership under HostLock, then release it for SQL.
     let instances={
@@ -326,7 +361,7 @@ pub(super) fn relocate(
                     (
                         source,
                         HostedSession::Chat(current),
-                        Owner::Chat(record.handle.clone()),
+                        Owner::Chat {handle: record.handle.clone(), instance: record.execution_instance},
                     )
                 } else if let HostedSession::Terminal(_) = &source
                     && let Some(record) = state.terminals.get(&id)
@@ -389,14 +424,29 @@ pub(super) fn relocate(
         let proof = if Instant::now() >= deadline {
             Err("Locate reached its provider verification time limit; retry after these providers are responsive, or close the affected panes explicitly".into())
         } else { match &owner {
-            Owner::Chat(handle) => handle.capture_execution_directory(&candidate),
+            Owner::Chat {handle,..} => {
+                // Refresh retained metadata off Host before deciding whether a
+                // live process or a completed original pin is the authority.
+                handle.refresh_retained_state().and_then(|()| {
+                    if handle.is_completed() {
+                        let expected = approved.ok_or("The completed provider has no original approved directory binding; close it explicitly instead of granting a replacement folder".to_owned())?;
+                        let context = handle.pinned_execution_directory(&candidate)?;
+                        if context.directory_identity()? != Some(expected) {
+                            return Err("The completed provider directory differs from its original approved directory".into());
+                        }
+                        Ok(VerifiedDirectory::Completed {identity: expected, context})
+                    } else {
+                        handle.capture_execution_directory(&candidate).map(VerifiedDirectory::Live)
+                    }
+                })
+            },
             Owner::Terminal(handle) => handle.holder_identity().ok_or_else(|| "The original terminal has no authenticated holder identity; close this pane explicitly or retry after recovery".to_owned()).and_then(|holder| {
                 if !holder.holder.is_current() { return Err("The original terminal holder is no longer live; recover or close this pane before retrying Locate".into()); }
-                DirectoryProof::capture_owned_process(&holder.root, &candidate, approved)
+                DirectoryProof::capture_owned_process(&holder.root, &candidate, approved).map(VerifiedDirectory::Live)
             }),
             Owner::Unavailable => Err("The original provider is not attached to this daemon. Recover its exact holder, or close this pane and start a new session in the located folder".into()),
         }}.and_then(|proof| {
-            if approved.is_some_and(|identity| proof.identity != identity) {
+            if approved.is_some_and(|identity| proof.evidence().identity() != identity) {
                 Err("The provider directory differs from its original approved directory; close it before starting in a replacement folder".into())
             } else { Ok(proof) }
         });
@@ -406,7 +456,7 @@ pub(super) fn relocate(
             candidate,
             proof: proof
                 .as_ref()
-                .map(|proof| (proof.identity, proof.process.clone()))
+                .map(VerifiedDirectory::evidence)
                 .map_err(Clone::clone),
         };
         prepared.push(Prepared {
@@ -415,14 +465,24 @@ pub(super) fn relocate(
             proof: proof.ok(),
         });
     }
+    before_commit();
+    // A retained FD is the authority, but its new spelling must still name
+    // that inode immediately before publication. Never do filesystem work
+    // under HostState or let a replaced path become execution authority.
+    for item in &prepared {
+        if let Some(VerifiedDirectory::Completed {context,..}) = &item.proof {
+            context.verify_directory(&item.movement.candidate).map_err(error)?;
+        }
+    }
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         for item in &prepared {
             let id = item.movement.source.id();
             let unchanged = match (&item.owner, &item.movement.source) {
-                (Owner::Chat(handle), HostedSession::Chat(source)) => {
+                (Owner::Chat {handle, instance}, HostedSession::Chat(source)) => {
                     state.chats.get(&id).is_some_and(|record| {
-                        record.handle.same_actor(handle)
+                        record.execution_instance == *instance && record.handle.same_actor(handle)
+                            && (!matches!(&item.proof, Some(VerifiedDirectory::Completed {..})) || handle.is_completed())
                             && HostedSession::Chat(record.session.clone())
                                 .same_process(&HostedSession::Chat(source.clone()))
                     })
@@ -457,8 +517,11 @@ pub(super) fn relocate(
     // The exclusive gate excludes further edits/starts while actor-local
     // operational paths catch up. Keep any failed actor move explicitly blocked.
     for item in &mut prepared {
-        if item.proof.is_some()
-            && let Owner::Chat(handle) = &item.owner
+        // A completed reducer has no live ownership command queue. Its
+        // immutable history stays historical; the committed Registry location
+        // and retained FD authorize the later explicit handoff/replacement.
+        if matches!(&item.proof, Some(VerifiedDirectory::Live(_)))
+            && let Owner::Chat {handle,..} = &item.owner
         {
             if let Err(reason) = handle.relocate_execution_directory(&item.movement.candidate) {
                 registry
@@ -768,6 +831,90 @@ mod tests {
             panic!("expected verified model")
         };
         model
+    }
+
+    #[test]
+    fn completed_locate_uses_original_pin_without_a_live_process_or_actor_command() {
+        let fixture = fixture(0);
+        fixture.handle.close().unwrap();
+        assert!(fixture.handle.is_completed());
+        let approved = fixture.original_context.as_ref().unwrap().directory_identity().unwrap();
+        std::fs::rename(&fixture.old, &fixture.moved).unwrap();
+        std::fs::create_dir(&fixture.old).unwrap();
+        let model = locate(&fixture);
+        assert!(model.session_location_refusals.is_empty());
+        assert_eq!(model.projects[0].repository, fixture.moved);
+        let registry = super::super::agent_execution::registry(&fixture.host).unwrap();
+        let location = registry.lock().unwrap().session_location(&HostedSession::Chat(fixture.source.clone())).unwrap().unwrap();
+        assert_eq!(location.directory, fixture.moved);
+        assert_eq!(location.approved, approved);
+        assert!(location.process.is_none(), "a retained pin never invents a live process witness");
+        let (path, context) = verified_chat_directory(&fixture.host, &fixture.source, &fixture.handle).unwrap();
+        assert_eq!(path, fixture.moved);
+        assert_eq!(context.directory_identity().unwrap(), approved);
+        let state = fixture.host.lock().unwrap();
+        assert!(state.chats[&fixture.source.id].handle.same_actor(&fixture.handle));
+        assert_eq!(state.chats[&fixture.source.id].session, fixture.source);
+        assert!(fixture.handle.is_completed());
+        assert!(fixture.calls.lock().unwrap().is_empty(), "Locate must not enqueue new provider work");
+    }
+
+    #[test]
+    fn completed_locate_refuses_replacement_inode_and_missing_original_approval() {
+        for context_mode in [0, 1] {
+            let fixture = fixture(context_mode);
+            fixture.handle.close().unwrap();
+            if context_mode == 0 {
+                std::fs::rename(&fixture.old, fixture.old.with_extension("retained-original")).unwrap();
+            } else {
+                std::fs::rename(&fixture.old, &fixture.moved).unwrap();
+            }
+            if context_mode == 0 { std::fs::create_dir(&fixture.moved).unwrap(); }
+            let model = locate(&fixture);
+            assert!(!model.session_location_refusals.is_empty());
+            assert!(verified_chat_directory(&fixture.host, &fixture.source, &fixture.handle).is_err());
+            let state = fixture.host.lock().unwrap();
+            assert!(state.chats[&fixture.source.id].handle.same_actor(&fixture.handle));
+            assert_eq!(state.chats[&fixture.source.id].session, fixture.source);
+            assert!(fixture.handle.is_completed());
+        }
+    }
+
+    #[test]
+    fn completed_locate_holds_lifecycle_and_rechecks_install_generation_before_commit() {
+        let fixture = fixture(0);
+        fixture.handle.close().unwrap();
+        std::fs::rename(&fixture.old, &fixture.moved).unwrap();
+        let gate = super::super::chat::presentation_close::transition_gate(&fixture.host, fixture.source.id);
+        let relocation = Relocation {repository: fixture.old.clone(), destination: fixture.moved.clone(),
+            old_root: fixture.old.clone(), new_root: fixture.moved.clone()};
+        let result = relocate_with(&fixture.host, 1, relocation, || {
+            assert!(matches!(gate.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                "supported same-Handle restart must remain excluded through commit");
+            // Even a publication bypassing normal ingress cannot reuse a
+            // captured completed proof for a new installation generation.
+            fixture.host.lock().unwrap().chats.get_mut(&fixture.source.id).unwrap().execution_instance = uuid::Uuid::new_v4();
+        });
+        assert!(result.unwrap_err().message.contains("hosted session changed"));
+        let state = fixture.host.lock().unwrap();
+        assert_eq!(state.read_model().unwrap().projects[0].repository, fixture.old);
+    }
+
+    #[test]
+    fn completed_locate_rechecks_candidate_spelling_after_pin_capture() {
+        let fixture = fixture(0);
+        fixture.handle.close().unwrap();
+        std::fs::rename(&fixture.old, &fixture.moved).unwrap();
+        let relocation = Relocation {repository: fixture.old.clone(), destination: fixture.moved.clone(),
+            old_root: fixture.old.clone(), new_root: fixture.moved.clone()};
+        let result = relocate_with(&fixture.host, 1, relocation, || {
+            std::fs::rename(&fixture.moved, fixture.moved.with_extension("original-pin")).unwrap();
+            std::fs::create_dir(&fixture.moved).unwrap();
+        });
+        assert!(result.is_err());
+        let state = fixture.host.lock().unwrap();
+        assert_eq!(state.read_model().unwrap().projects[0].repository, fixture.old);
+        assert_eq!(state.chats[&fixture.source.id].session, fixture.source);
     }
 
     #[test]

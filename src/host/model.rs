@@ -27,7 +27,7 @@ use crate::{
 mod agent_locations;
 mod session_locations;
 pub(crate) use agent_locations::{AgentMove, Location as AgentLocation};
-pub(crate) use session_locations::{Location as SessionLocation, SessionMove};
+pub(crate) use session_locations::{Location as SessionLocation, SessionDirectoryProof, SessionMove};
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
