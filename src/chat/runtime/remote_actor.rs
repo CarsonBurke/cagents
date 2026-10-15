@@ -765,7 +765,7 @@ impl RemoteActor {
                         let activity = state.activity;
                         let outcome = state.outcome.clone();
                         let activity_changed = activity != old.activity || outcome != old.outcome
-                            || (activity == crate::agent::ActivityState::Idle
+                            || (matches!(activity, crate::agent::ActivityState::Idle | crate::agent::ActivityState::Unknown)
                                 && generation > old.generation);
                         let ready = state.ready && !old.ready;
                         let identity_changed = state.confirmed_session != old.confirmed_session;
@@ -3698,34 +3698,55 @@ done"#;
         assert!(validate_pair(&source, Some(&source.launch.recipe), None, None).is_err());
     }
     #[test]
-    fn real_proxy_poll_forwards_newer_idle_generation_without_history_rpc() {
+    fn real_proxy_poll_forwards_newer_readiness_generation_without_history_rpc() {
         const CHILD: &str = "CAGENTS_IDLE_PROXY_EDGE_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
-            let root = tempfile::tempdir_in("/var/tmp").unwrap();
-            let test = thread::current().name().unwrap().to_owned();
-            let output = ChildCommand::new(std::env::current_exe().unwrap())
-                .args(["--exact", &test, "--nocapture"])
-                .env_clear().env(CHILD, "1")
-                .env("XDG_RUNTIME_DIR", root.path())
-                .env("XDG_DATA_HOME", root.path().join("data"))
-                .env("XDG_CONFIG_HOME", root.path().join("config"))
-                .env("XDG_CACHE_HOME", root.path().join("cache"))
-                .env("HOME", root.path().join("home"))
-                .env("PATH", "/usr/bin:/bin").output().unwrap();
-            assert!(output.status.success(), "stdout={} stderr={}",
-                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            for activity in ["idle", "unknown"] {
+                let root = tempfile::tempdir_in("/var/tmp").unwrap();
+                let test = thread::current().name().unwrap().to_owned();
+                let output = ChildCommand::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &test, "--nocapture"])
+                    .env_clear().env(CHILD, activity)
+                    .env("XDG_RUNTIME_DIR", root.path())
+                    .env("XDG_DATA_HOME", root.path().join("data"))
+                    .env("XDG_CONFIG_HOME", root.path().join("config"))
+                    .env("XDG_CACHE_HOME", root.path().join("cache"))
+                    .env("HOME", root.path().join("home"))
+                    .env("PATH", "/usr/bin:/bin").output().unwrap();
+                assert!(output.status.success(), "stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            }
             return;
         }
+        let activity = match std::env::var(CHILD).unwrap().as_str() {
+            "idle" => crate::agent::ActivityState::Idle,
+            "unknown" => crate::agent::ActivityState::Unknown,
+            _ => panic!("private fixture activity"),
+        };
         let fixture = RemoteActor::fixture();
         let mut identity = fixture.identity();
         identity.record.boot = crate::daemon::read_boot_id().unwrap();
         let mut proof = fixture.0.proof.clone();
         proof.boot_id = identity.record.boot.clone();
-        let before = fixture.state().as_ref().clone();
-        assert_eq!(before.activity, crate::agent::ActivityState::Idle);
+        let mut before = fixture.state().as_ref().clone();
+        before.activity = activity;
+        before.close.activity = activity;
+        if activity == crate::agent::ActivityState::Unknown {
+            before.ready = false;
+            before.idle = false;
+            before.close.ready = false;
+        }
         let mut after = before.clone();
         after.generation += 1;
         after.changed += 1;
+        if activity == crate::agent::ActivityState::Unknown {
+            // Model metadata settlement without changing scalar Unknown or
+            // supplying a body. This is not a native retirement proof.
+            after.completed = true;
+            after.owns_work = false;
+            after.close.completed = true;
+            after.close.owns_work = false;
+        }
         let directory = registry::directory(Kind::Native).unwrap();
         std::fs::create_dir_all(&directory).unwrap();
         let socket = registry::socket(&directory, identity.record.terminal);
@@ -3770,7 +3791,7 @@ done"#;
         }).unwrap();
         let generation = loop {
             if let Update::Activity { state, generation, .. } = receive_update.recv_timeout(Duration::from_secs(3)).unwrap() {
-                assert_eq!(state, crate::agent::ActivityState::Idle);
+                assert_eq!(state, activity);
                 break generation;
             }
         };

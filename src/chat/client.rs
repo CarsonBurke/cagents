@@ -222,9 +222,10 @@ impl ActivityObservation {
         if generation < self.generation {
             return false;
         }
-        let newer_idle = generation > self.generation && state == ActivityState::Idle;
+        let newer_readiness = generation > self.generation
+            && matches!(state, ActivityState::Idle | ActivityState::Unknown);
         self.generation = generation;
-        if self.state == state && self.outcome == outcome && !newer_idle {
+        if self.state == state && self.outcome == outcome && !newer_readiness {
             return false;
         }
         self.state = state;
@@ -2174,6 +2175,16 @@ mod tests {
         assert!(!activity.observe(7, ActivityState::Idle));
         assert!(activity.observe(9, ActivityState::Working));
         assert_eq!(activity.take(), ActivityState::Working);
+        assert!(activity.observe(10, ActivityState::Unknown));
+        assert_eq!(activity.take(), ActivityState::Unknown);
+        assert!(activity.observe(11, ActivityState::Unknown));
+        assert!(!activity.observe(12, ActivityState::Unknown), "new metadata coalesces until consumed");
+        assert_eq!(activity.take(), ActivityState::Unknown);
+        assert!(!activity.observe(12, ActivityState::Unknown));
+        assert!(!activity.observe(10, ActivityState::Unknown));
+        assert!(activity.observe_outcome(12, ActivityState::Unknown, Some(crate::agent::ActivityOutcome::Cancelled)));
+        assert_eq!(activity.take(), ActivityState::Unknown);
+        assert_eq!(activity.outcome, Some(crate::agent::ActivityOutcome::Cancelled));
     }
 
     fn host_proof(incarnation: &str) -> HostSessionProof {
