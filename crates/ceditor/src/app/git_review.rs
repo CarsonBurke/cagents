@@ -6,7 +6,7 @@ use cagents::repository::{CommitSummary, DiffEntry, HistoryRequest, HistoryRevis
 pub(super) struct Origin {
     card: CardId,
     key: ActiveWorktreeKey,
-    authority: WorktreeAuthority,
+    authority: Option<WorktreeAuthority>,
 }
 
 #[derive(Default)]
@@ -50,6 +50,22 @@ pub(super) enum Action {
 }
 
 
+
+// Portable read-only Git remains available where retained-descriptor mutations
+// are unsupported. On supported platforms, a missing captured authority is an
+// error rather than permission to recapture a possibly replaced pathname.
+macro_rules! read_git {
+    ($authority:expr, $method:ident($($argument:expr),* $(,)?)) => {{
+        let service = RepositoryService::system("git");
+        match $authority {
+            Some(authority) => service.with_worktree_authority(authority).map_err(|error| error.to_string())?
+                .$method($($argument),*).map_err(|error| error.to_string()),
+            None if !WorktreeAuthority::supported() => service.$method($($argument),*).map_err(|error| error.to_string()),
+            None => Err("The original worktree could not be retained. Reopen it before reading Git history.".to_owned()),
+        }
+    }};
+}
+
 impl Editor {
     fn git_review_bound(&self, card: CardId, key: &ActiveWorktreeKey) -> bool {
         self.tab(card).is_some_and(|tab| tab.git
@@ -60,7 +76,7 @@ impl Editor {
 
     fn git_review_origin(&self, card: CardId, key: &ActiveWorktreeKey) -> Option<Origin> {
         self.git_review_bound(card, key).then_some(())?;
-        Some(Origin { card, key: key.clone(), authority: self.tab(card)?.worktree_authority.clone()? })
+        Some(Origin { card, key: key.clone(), authority: self.tab(card)?.worktree_authority.clone() })
     }
 
     /// Returns Some only for actions owned by this adapter. Operations still
@@ -111,6 +127,17 @@ impl Editor {
         if let SidebarAction::CreateHistoryBranch { oid, name, .. } = action {
             if !self.tab(card)?.navigation.history_branch_matches(oid, name) { return Some(Task::none()); }
         }
+        let mutation_requested = matches!(action,
+            SidebarAction::Commit { .. } | SidebarAction::CreateHistoryBranch { .. }
+            | SidebarAction::HistoryCommand { command: HistoryCommand::NewWorktree | HistoryCommand::CreateBranch | HistoryCommand::Revert | HistoryCommand::CherryPick, .. });
+        if mutation_requested && origin.as_ref().is_some_and(|origin| origin.authority.is_none()) {
+            self.notice = Some(if WorktreeAuthority::supported() {
+                "The original worktree could not be retained. Reopen it before changing Git state."
+            } else {
+                "Git mutations require retained directory authority, which this platform does not support yet. Read-only history and files remain available."
+            }.into());
+            return Some(Task::none());
+        }
         self.tab_mut(card)?.navigation.apply(action);
         let Some(origin) = origin else { return Some(Task::none()); };
         Some(match action {
@@ -127,7 +154,7 @@ impl Editor {
                 match command {
                     HistoryCommand::CopySha => iced::clipboard::write(oid.to_string()).map(cosmic::Action::App),
                     HistoryCommand::CopyMessage => iced::clipboard::write(message.to_string()).map(cosmic::Action::App),
-                    HistoryCommand::NewWorktree => { self.begin_commit_checkout(origin.authority, oid.clone()); Task::none() },
+                    HistoryCommand::NewWorktree => { self.begin_commit_checkout(origin.authority.expect("mutation admission requires retained authority"), oid.clone()); Task::none() },
                     HistoryCommand::CreateBranch => Task::none(),
                     HistoryCommand::Revert | HistoryCommand::CherryPick => {
                         let operation = if *command == HistoryCommand::Revert {
@@ -180,7 +207,7 @@ impl Editor {
         cosmic::task::future(async move {
             let root = origin.key.canonical_path.clone(); let target = head.clone();
             let authority = origin.clone();
-            let result = tokio::task::spawn_blocking(move || { RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?.commit_message(&root, &target, &cancel).map_err(|error| error.to_string()) })
+            let result = tokio::task::spawn_blocking(move || { read_git!(authority.authority, commit_message(&root, &target, &cancel)) })
                 .await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::AmendLoaded { origin, revision, head, result })
         })
@@ -209,7 +236,7 @@ impl Editor {
             let request = HistoryRequest { worktree: origin.key.canonical_path.clone(), revision: HistoryRevision::Object { oid: head.clone() }, page, path: None };
             let filter = query.clone();
             let authority = origin.clone();
-            let result = tokio::task::spawn_blocking(move || { RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?.filtered_history(&request, &filter, &cancel).map_err(|error| error.to_string()) })
+            let result = tokio::task::spawn_blocking(move || { read_git!(authority.authority, filtered_history(&request, &filter, &cancel)) })
                 .await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::HistoryLoaded { origin, generation, head, page, query, result })
         })
@@ -225,7 +252,7 @@ impl Editor {
         cosmic::task::future(async move {
             let root = origin.key.canonical_path.clone(); let target = oid.clone();
             let authority = origin.clone();
-            let result = tokio::task::spawn_blocking(move || { RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?.commit_diff_entries(&root, &target, parent.as_ref(), &cancel).map_err(|error| error.to_string()) })
+            let result = tokio::task::spawn_blocking(move || { read_git!(authority.authority, commit_diff_entries(&root, &target, parent.as_ref(), &cancel)) })
                 .await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::CommitLoaded { origin, generation, oid, result })
         })
@@ -261,7 +288,7 @@ impl Editor {
             let request = CommitRequest { worktree, message };
             let authority = origin.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?;
+                let service = RepositoryService::system("git").with_worktree_authority(authority.authority.expect("mutation admission requires retained authority")).map_err(|error| error.to_string())?;
                 match expected { Some(head) if amend => service.commit_amend_at(&request, &head, &cancel), _ => service.commit_with_amend(&request, amend, &cancel) }.map_err(|error| error.to_string())
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::Committed { origin, revision, result })
@@ -337,6 +364,34 @@ mod tests {
     fn bound(app: &Editor, card: CardId) -> Origin {
         let key = app.tab(card).unwrap().navigation.active_worktree().unwrap();
         app.git_review_origin(card, key).unwrap()
+    }
+
+    #[test]
+    fn standalone_missing_authority_never_silently_admits_mutation_or_recaptures_linux_history() {
+        let directory = git_fixture(); let root = directory.path();
+        let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+        sidebar_action(&mut app, SidebarAction::SetChangesTab { key: origin.key.clone(), tab: sidebar::ChangesTab::History });
+        let row = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().history[0].clone();
+        app.tab_mut(card).unwrap().worktree_authority = None;
+        let original_head = git(root, &["rev-parse", "HEAD"]);
+        for command in [sidebar::HistoryCommand::CreateBranch, sidebar::HistoryCommand::Revert, sidebar::HistoryCommand::CherryPick, sidebar::HistoryCommand::NewWorktree] {
+            sidebar_action(&mut app, SidebarAction::HistoryCommand { key: origin.key.clone(), oid: row.oid.clone(), mainline: row.mainline, message: row.message.clone(), command });
+            assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("retained")));
+            assert!(app.checkout_dialog.is_none());
+            assert_eq!(git(root, &["rev-parse", "HEAD"]), original_head);
+        }
+        sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: origin.key.clone(), message: "Keep unsupported draft".into() });
+        sidebar_action(&mut app, SidebarAction::Commit { key: origin.key.clone(), message: "Keep unsupported draft".into(), amend: false });
+        assert!(app.tab(card).unwrap().mutation.is_none());
+        assert_eq!(app.tab(card).unwrap().navigation.commit_message(), "Keep unsupported draft");
+        sidebar_action(&mut app, SidebarAction::SearchHistory { key: origin.key, query: "Initial".into() });
+        let source = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap();
+        if WorktreeAuthority::supported() {
+            assert!(source.history_error.as_deref().is_some_and(|error| error.contains("retained")));
+        } else {
+            assert_eq!(source.history.len(), 1);
+            assert!(source.history_error.is_none());
+        }
     }
 
     #[test]
