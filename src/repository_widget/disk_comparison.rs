@@ -88,7 +88,7 @@ impl RepositoryRuntime {
         if self.disk_comparison.is_none() { return Task::none(); }
         let Some(current) = self.disk_comparison_key(identity.card) else { self.dismiss_disk_comparison(); return Task::none(); };
         if cancelled || current != completed { return self.compare_disk(identity.card); }
-        self.disk_comparison_applied = Some(current);
+        self.disk_comparison_applied = model.is_some().then_some(current);
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         self.disk_comparison = Some(DiffState::ready(match model {
             Some(model) => RenderedDiff::Text { model: Arc::new(model), old_label: "Disk".into(), new_label: "Unsaved buffer".into() },
@@ -138,6 +138,25 @@ mod tests {
         assert_eq!(&*model.after, runtime.editor_text().as_deref().unwrap()); assert_eq!(&*model.before, "disk");
         assert!(iced::runtime::task::into_stream(runtime.update(RepositoryAction::CompareDisk { card })).is_none(), "unchanged ready comparison needs no duplicate work");
     }
+    #[tokio::test]
+    async fn failed_owned_comparison_can_retry_unchanged_sources_with_a_new_worker() {
+        let card = CardId::new(); let mut runtime = fixture(card);
+        let task = runtime.update(RepositoryAction::CompareDisk { card });
+        let previous = runtime.disk_comparison_job.as_ref().unwrap().request;
+        let mut receipt = completion(task).await;
+        let RepositoryAction::DiskComparisonLoaded { model, .. } = &mut receipt else { unreachable!() };
+        // Inject the actual worker/join failure at its typed receipt boundary;
+        // identity/request/revision/hash come from the real admitted task.
+        *model = None;
+        drop(runtime.update(receipt));
+        assert!(matches!(runtime.disk_comparison, Some(DiffState::Ready(RenderedDiff::Error(_), _))));
+        assert!(runtime.can_compare_disk()); assert!(runtime.disk_comparison_applied.is_none());
+        let retry = runtime.update(RepositoryAction::CompareDisk { card });
+        assert_ne!(runtime.disk_comparison_job.as_ref().unwrap().request, previous);
+        drop(runtime.update(completion(retry).await));
+        assert!(matches!(runtime.disk_comparison, Some(DiffState::Ready(RenderedDiff::Text { .. }, _))));
+    }
+
     #[tokio::test]
     async fn dismissed_and_frozen_comparisons_release_only_on_their_actual_receipt() {
         for freeze in [false, true] {
