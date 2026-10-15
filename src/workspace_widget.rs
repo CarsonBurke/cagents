@@ -132,6 +132,12 @@ pub enum FocusedPane {
     Review,
     /// A native chat composer and transcript.
     Chat,
+    /// The native code editor.
+    Editor,
+    /// A native text field, including fields inside a pane.
+    TextInput,
+    /// A native control outside registered workspace content.
+    OutsideWorkspace,
     /// Any other pane, or none.
     #[default]
     Other,
