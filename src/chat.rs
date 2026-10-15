@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub mod coordination;
 pub mod presentation;
 pub mod pricing;
+mod conversation_key;
+pub(crate) use conversation_key::metadata_key as conversation_metadata_key;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
