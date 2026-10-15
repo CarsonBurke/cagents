@@ -186,8 +186,12 @@ def main():
             (root / name).mkdir(mode=0o700)
         settings = root / "config/cagents-development/settings.toml"
         settings.parent.mkdir()
-        settings.write_text("schema_version = 3\ncheck_for_updates = false\n"
-                            "focus_follows_mouse = false\ndefault_column_fraction = 1.0\nui_scale = 1.0\n")
+        settings.write_text("schema_version = 3\nmax_hot_cards = 6\n"
+                            "hibernation_delay_ms = 30000\nterminal_font_size = 14.0\n"
+                            "sidebar_width = 260.0\ninspector_width = 380.0\n"
+                            "check_for_updates = false\nfocus_follows_mouse = false\n"
+                            "default_column_fraction = 1.0\ndefault_native_pane_fraction = 1.0\n"
+                            "chat_content_fraction = 1.0\nui_scale = 1.0\n")
         settings.chmod(0o600)
         provider = REPOSITORY / "tests/fixtures/chat-memory-claude.py"
         shutil.copy2(provider, root / "bin/claude")
@@ -243,14 +247,16 @@ def main():
                 actors.append(cli_call(args.cli, env, [
                     "agent", "spawn", "--provider", "claude", "--model", "haiku", "--name", name,
                     "--directory", str(root / "project"), "--channel", channel["id"],
-                    "--idempotency-key", name,
+                    "--idempotency-key", name, "--wait", "--timeout", "60",
                     "memory 512 32 " + name], root))
                 write_json(manifest, actors)
-                print(index + 1, flush=True)
-            for actor in actors:
-                settled = cli_call(args.cli, env, ["agent", "wait", actor["run"]["id"], "--timeout", "60"], root)
+                # Keep setup below the product's active-turn limit on both
+                # revisions. The measured restore still owns all idle actors.
+                settled = cli_call(args.cli, env, ["agent", "wait", actors[-1]["run"]["id"],
+                                                  "--timeout", "60"], root)
                 if settled["run"]["state"] != "Succeeded":
                     raise SystemExit("fixture actor did not settle; inspect private cli.jsonl")
+                print(index + 1, flush=True)
         else:
             # Close only IDs minted by this fixture; never global inventory.
             for actor in json.loads(manifest.read_text()):
