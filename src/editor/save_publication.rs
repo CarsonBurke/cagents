@@ -119,6 +119,37 @@ fn changed() -> FileIoError {
     FileIoError::Io("The save target identity, contents or access metadata changed.".into())
 }
 
+enum FailedHoldingDirectory {
+    Preparation(fs_safety::DirectoryPreparation),
+    Publication(fs_safety::DirectoryPublication),
+    Unverified(Root),
+}
+
+/// A preparation failure keeps the original authenticated source alive too;
+/// the retry only touches its own held directory capability, never that file.
+struct FailedHolding {
+    directory: FailedHoldingDirectory,
+    parent: Root,
+    _source: File,
+}
+impl FailedHolding {
+    fn retry(&mut self) -> Result<(), String> {
+        match &mut self.directory {
+            FailedHoldingDirectory::Preparation(preparation) => preparation.retry_cleanup().map_err(|error|error.to_string())?,
+            FailedHoldingDirectory::Publication(publication) => {
+                publication.resolve_recovery().map_err(|error|error.to_string())?;
+                publication.cleanup_empty().map_err(|error|error.to_string())?;
+            }
+            FailedHoldingDirectory::Unverified(directory) => {
+                if directory.metadata().map_err(|error|error.to_string())?.nlink() != 0 {
+                    return Err("Creation ownership remains unverified; the retained directory was not changed. Resolve the entry before retrying.".into());
+                }
+            }
+        }
+        fs_safety::sync_directory(&self.parent).map_err(|error|error.to_string())
+    }
+}
+
 /// Owns the actual published private directory and its bounded recovery slot.
 /// The receipt, rather than a diagnostic path, survives unresolved outcomes.
 struct Holding {
@@ -143,28 +174,24 @@ impl Holding {
             Ok(creation) => creation,
             Err(mut error) => {
                 let message = error.to_string();
-                if let Some(mut preparation) = error.take_recovery() {
+                if let Some(preparation) = error.take_recovery() {
                     let description = format!("Private save preparation originally named {}", preparation.diagnostic_path().display());
-                    let authority = slot.retain(description, move || {
-                        preparation.retry_cleanup().map_err(|error|error.to_string())?;
-                        fs_safety::sync_directory(&retained_parent).map_err(|error|error.to_string())
-                    });
+                    let mut state = FailedHolding { directory: FailedHoldingDirectory::Preparation(preparation), parent: retained_parent, _source: retained_source };
+                    let authority = slot.retain(description, move || state.retry());
                     return Err(FileIoError::Recovery { message, authority });
                 }
                 return Err(FileIoError::Io(message));
             }
         };
-        let mut publication = match creation {
+        let publication = match creation {
             fs_safety::DirectoryCreation::Published(receipt) => receipt,
             fs_safety::DirectoryCreation::Existing(_) => return Err(FileIoError::Io(
                 "The private save holding directory already exists; it was left intact.".into())),
             fs_safety::DirectoryCreation::Unverified { directory, reason } => {
                 let message = format!("Private save holding ownership could not be established; no file was published: {reason}");
                 let description = format!("Unverified save directory originally named {}", directory.path().display());
-                let authority = slot.retain(description, move || {
-                    if directory.metadata().map_err(|e|e.to_string())?.nlink() == 0 { Ok(()) }
-                    else { Err("Creation ownership remains unverified; the retained directory was not changed. Resolve the entry before retrying.".into()) }
-                });
+                let mut state = FailedHolding { directory: FailedHoldingDirectory::Unverified(directory), parent: retained_parent, _source: retained_source };
+                let authority = slot.retain(description, move || state.retry());
                 return Err(FileIoError::Recovery { message, authority });
             }
         };
@@ -182,11 +209,8 @@ impl Holding {
             Ok(root) => root,
             Err(error) => {
                 let description = format!("Save holding originally named {}", publication.directory().path().display());
-                let authority = slot.retain(description, move || {
-                    publication.resolve_recovery().map_err(|e|e.to_string())?;
-                    publication.cleanup_empty().map_err(|e|e.to_string())?;
-                    fs_safety::sync_directory(&retained_parent).map_err(|e|e.to_string())
-                });
+                let mut state = FailedHolding { directory: FailedHoldingDirectory::Publication(publication), parent: retained_parent, _source: retained_source };
+                let authority = slot.retain(description, move || state.retry());
                 return Err(FileIoError::Recovery { message: error.to_string(), authority });
             }
         };
