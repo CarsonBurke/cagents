@@ -110,6 +110,7 @@ struct Entry {
     wanted_pages:HashSet<usize>,
     manual_pages:HashSet<usize>,
     opened:HashSet<usize>,
+    default_open_applied:bool,
     suspended:HashSet<usize>,
     suspended_paths:HashMap<usize,(bool,usize)>,
     patches:HashMap<usize,LoadedPatch>,
@@ -160,7 +161,7 @@ fn attempt()->u64 {NEXT.fetch_add(1,Ordering::Relaxed)}
 impl Entry {
     fn new(part:chat::cache::changes::Part)->Self {
         Self {revision:attempt(),render_revision:0,copy_all:false,copy_intent:None,copy_error:None,part,pages:Default::default(),requested:Default::default(),page_errors:Default::default(),
-            wanted_pages:Default::default(),manual_pages:Default::default(),opened:Default::default(),suspended:Default::default(),suspended_paths:Default::default(),patches:Default::default(),restored:Default::default(),
+            wanted_pages:Default::default(),manual_pages:Default::default(),opened:Default::default(),default_open_applied:false,suspended:Default::default(),suspended_paths:Default::default(),patches:Default::default(),restored:Default::default(),
             patch_requests:Default::default(),patch_errors:Default::default()}
     }
     fn file(&self,index:usize)->Option<(&Arc<Manifest>,&File)> {
@@ -193,7 +194,7 @@ impl Entry {
                 self.requested.entry(*offset).or_insert_with(attempt);
             }
         }
-        let wanted:HashSet<usize>=if all {self.pages.values().flat_map(|page|page.files.iter().map(|file|file.file_index)).collect()}
+        let wanted:HashSet<usize>=if all {self.pages.values().flat_map(|page|page.files.iter().map(|file|file.file_index)).chain(self.suspended.iter().copied()).collect()}
             else if expanded {self.opened.clone()} else {HashSet::new()};
         self.patch_requests.retain(|index,_|wanted.contains(index));
         self.patches.retain(|index,_|wanted.contains(index));
@@ -421,7 +422,7 @@ impl State {
             Ok(page) if page.source==*key && page.epoch==entry.part.epoch
                 && page.metadata.total_files==entry.part.metadata.total_files && page.metadata.total_bytes==entry.part.metadata.total_bytes=>{
                 if page.omitted_files>0 && entry.copy_all {entry.copy_all=false;entry.copy_error=Some("The original file list is incomplete. No partial copy was made.".into());}
-                if page.metadata.total_files==1 {entry.opened.insert(0);}
+                if offset==0 && !entry.default_open_applied {if page.metadata.total_files==1 {entry.opened.insert(0);}entry.default_open_applied=true;}
                 entry.pages.insert(offset,page);
             }
             Ok(_)=>{entry.copy_all=false;entry.copy_error=Some("The original file list changed. No partial copy was made.".into());entry.page_errors.insert(offset,"The file list changed. Reload its current contents.".into());}
@@ -955,6 +956,16 @@ mod tests {
         state.reconcile_demand(&expanded,false);
         assert!(!state.entries[&page.source].suspended.contains(&0));
         assert!(!state.suspended_paths(&page.source.source_id).contains(&vec![6,0]));
+    }
+    #[tokio::test]
+    async fn live_single_file_reload_preserves_an_explicitly_collapsed_default() {
+        let page=fixture("exact collapsed patch");let(mut state,source,expanded)=open(&page,"part");
+        assert!(state.entries[&page.source].opened.contains(&0));
+        state.toggle_file(&page.source.source_id,0,false);state.evict(false);
+        state.project(source,None,&expanded,false);let request=state.entries[&page.source].requested[&0];
+        assert!(state.complete_manifest(&page.source,0,request,Ok(page.clone())));
+        state.reconcile_demand(&expanded,false);assert!(!state.entries[&page.source].opened.contains(&0));
+        assert!(!state.entries[&page.source].patch_requests.contains_key(&0));
     }
     #[test]
     fn patch_body_transfer_removes_ui_owners_before_a_fast_reclaimer_can_run() {
