@@ -368,6 +368,7 @@ static NEXT_SERVER_EDIT_ID:AtomicU64=AtomicU64::new(1);
 struct ServerEdit {
     doc: LspDocumentId,
     deadline: std::time::Instant,
+    origin_retired: Arc<AtomicBool>,
     // None means the publication lease owns the response. Its timeout and
     // document-close paths no longer have authority to report failure.
     reply: Option<tokio::sync::oneshot::Sender<lsp_types::ApplyWorkspaceEditResponse>>,
@@ -378,14 +379,14 @@ pub(super) struct ServerEdits {
     pending: Mutex<HashMap<LspServerEditId, ServerEdit>>,
 }
 impl ServerEdits {
-    fn preview(&self, doc:LspDocumentId, deadline:std::time::Instant)
+    fn preview(&self, doc:LspDocumentId, deadline:std::time::Instant, origin_retired:Arc<AtomicBool>)
         -> Result<(LspServerEditId, tokio::sync::oneshot::Receiver<lsp_types::ApplyWorkspaceEditResponse>),String> {
         let mut pending = self.pending.lock().unwrap_or_else(|p|p.into_inner());
         if pending.len() >= 64 { return Err("too many pending workspace-edit previews".into()); }
         let id = LspServerEditId(NEXT_SERVER_EDIT_ID.fetch_update(Ordering::Relaxed,Ordering::Relaxed,
             |next|next.checked_add(1)).map_err(|_|"workspace-edit request identity space exhausted".to_owned())?);
         let (reply, receiver) = tokio::sync::oneshot::channel();
-        pending.insert(id, ServerEdit { doc, deadline, reply:Some(reply) });
+        pending.insert(id, ServerEdit { doc, deadline, origin_retired, reply:Some(reply) });
         Ok((id, receiver))
     }
     pub(super) fn close_doc(&self, doc: LspDocumentId) {
@@ -444,10 +445,21 @@ impl LspManager {
         if self.document_version(doc).is_none() { return Err("The fixture document is not registered".into()); }
         let deadline = std::time::Instant::now().checked_add(timeout)
             .ok_or("The fixture preview deadline is outside the clock range")?;
-        self.server_edits.preview(doc, deadline)
+        let origin_retired = self.documents.get(&doc).and_then(|document|self.sessions.get(&document.session))
+            .map(|session|Arc::clone(&session.retired)).unwrap_or_else(||Arc::new(AtomicBool::new(false)));
+        self.server_edits.preview(doc, deadline, origin_retired)
     }
-    /// Atomically claims an unexpired preview. Closing a document or timing
-    /// out before this point makes claiming fail without publication authority.
+    /// Marks the actual admission's originating authority as retired, for
+    /// controller refusal fixtures that intentionally launch no server.
+    #[cfg(test)]
+    pub(crate) fn fixture_retire_workspace_edit_source(&self, id:LspServerEditId) {
+        if let Some(entry) = self.server_edits.pending.lock().unwrap_or_else(|p|p.into_inner()).get(&id) {
+            entry.origin_retired.store(true, Ordering::Release);
+        }
+    }
+    /// Atomically claims an unexpired preview from its exact live server.
+    /// Closing its document, retiring its original session, or timing out
+    /// before this point makes claiming fail without publication authority.
     /// Once claimed, the lease owns the response across preview expiry and
     /// manager shutdown; it must be acknowledged after the actual publication.
     pub fn claim_workspace_edit(&mut self, id: LspServerEditId) -> Result<LspServerEditLease, String> {
@@ -463,7 +475,9 @@ impl LspManager {
         // close/clear pass. Reprove the original binding at the claim boundary.
         let has_document = self.document_version(entry.doc).is_some()
             || self.snapshots.lock().docs.contains_key(&entry.doc);
-        let refusal = if !has_document {
+        let refusal = if entry.origin_retired.load(Ordering::Acquire) {
+            Some("The originating language server retired; request the edit again")
+        } else if !has_document {
             Some("The server edit source was closed; request it again")
         } else if std::time::Instant::now() >= entry.deadline {
             Some("The server edit preview expired; request it again")
@@ -508,7 +522,7 @@ fn apply_workspace_edit_with_timeout(state:&mut RouterState, params:lsp_types::A
         let doc=state.snapshots.docs_for_session(&state.key).into_iter().next().ok_or("no open document owns this language server")?;
         let versions=state.snapshots.lock().uris.iter().filter(|(_,uri)|uri.session==state.key).map(|(uri,entry)|((**uri).clone(),entry.latest().version)).collect();
         let edit=convert_workspace_edit(&state.snapshots,params.edit,Some(&versions)).map_err(|e|e.to_string())?;
-        let (id,rx)=state.server_edits.preview(doc,deadline)?;
+        let (id,rx)=state.server_edits.preview(doc,deadline,Arc::clone(&state.retired))?;
         state.events.emit_now(LspEvent::ApplyWorkspaceEdit{doc,id,label:params.label,edit});Ok((id,rx))
     })();
     let guard=result.as_ref().ok().map(|(id,_)|ServerEditGuard{id:*id,edits:Arc::clone(&state.server_edits)});
@@ -663,11 +677,11 @@ mod tests {
     fn late_server_edit_admission_cannot_reopen_closed_or_stopping_authority() {
         let (mut manager, _) = server_edit_fixture();
         manager.snapshots.unregister(LspDocumentId(1));
-        let (id, mut response) = manager.server_edits.preview(LspDocumentId(1), std::time::Instant::now()+Duration::from_secs(120)).unwrap();
+        let (id, mut response) = manager.server_edits.preview(LspDocumentId(1), std::time::Instant::now()+Duration::from_secs(120), Arc::new(AtomicBool::new(false))).unwrap();
         assert!(manager.claim_workspace_edit(id).unwrap_err().contains("source was closed"));
         assert!(!response.try_recv().unwrap().applied);
         manager.shutdown();
-        let (id, mut response) = manager.server_edits.preview(LspDocumentId(1), std::time::Instant::now()+Duration::from_secs(120)).unwrap();
+        let (id, mut response) = manager.server_edits.preview(LspDocumentId(1), std::time::Instant::now()+Duration::from_secs(120), Arc::new(AtomicBool::new(false))).unwrap();
         assert!(manager.claim_workspace_edit(id).unwrap_err().contains("shutting down"));
         assert!(!response.try_recv().unwrap().applied);
         assert!(manager.server_edits.pending.lock().unwrap().is_empty());
@@ -691,6 +705,24 @@ mod tests {
             assert!(request.await.unwrap().applied);
             assert!(manager.server_edits.pending.lock().unwrap().is_empty());
         });
+    }
+
+    #[test]
+    fn retired_server_cannot_claim_preview_but_keeps_already_admitted_publication() {
+        let (mut manager, mut router) = server_edit_fixture();
+        let request = apply_workspace_edit(&mut router, empty_server_edit());
+        let id = latest_server_edit(&manager);
+        router.retired.store(true, Ordering::Release);
+        assert!(manager.claim_workspace_edit(id).unwrap_err().contains("server retired"));
+        let response = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(request).unwrap();
+        assert!(!response.applied);
+        router.retired = Arc::new(AtomicBool::new(false));
+        let request = apply_workspace_edit(&mut router, empty_server_edit());
+        let lease = manager.claim_workspace_edit(latest_server_edit(&manager)).unwrap();
+        router.retired.store(true, Ordering::Release);
+        lease.respond(true, None);
+        let response = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(request).unwrap();
+        assert!(response.applied, "retirement cannot revoke a previously admitted publication");
     }
 
     #[test]
