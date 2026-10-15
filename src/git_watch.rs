@@ -745,6 +745,18 @@ pub(crate) struct Monitor {
 }
 
 impl Monitor {
+    #[cfg(test)]
+    pub(crate) fn queued_fixture(changes: BTreeMap<ProjectId, Change>) -> Self {
+        let (commands, _) = mpsc::sync_channel(1);
+        let (_, receiver) = async_channel::bounded(1);
+        Self {
+            commands,
+            configuration: Arc::new(Mutex::new(Configuration::default())),
+            pending: Arc::new(Mutex::new(Pending { changes, ..Default::default() })),
+            receiver,
+            thread: None,
+        }
+    }
     pub fn start() -> std::io::Result<Self> {
         let (commands, requests) = mpsc::sync_channel(1);
         let configuration = Arc::new(Mutex::new(Configuration::default()));
