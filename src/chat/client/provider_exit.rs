@@ -31,21 +31,30 @@ pub(super) struct PendingReply {
     pub ownership: Option<diagnostic_read::DiagnosticResponseCharge>,
 }
 impl PendingReply {
-    fn legacy(reply: crossbeam_channel::Sender<Result<Page, String>>) -> Self { Self { reply:Some(reply), ownership:None } }
+    fn legacy(reply: crossbeam_channel::Sender<Result<Page, String>>) -> Self {
+        Self {
+            reply: Some(reply),
+            ownership: None,
+        }
+    }
 }
 pub(super) type Pending = Arc<Mutex<BTreeMap<u64, PendingReply>>>;
 
 pub(super) fn compact_error(error: String) -> String {
-    let mut end=error.len().min(512);
-    while !error.is_char_boundary(end) { end-=1; }
+    let mut end = error.len().min(512);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
     // A fresh bounded allocation: truncating would retain the old capacity.
-    let compact=error[..end].to_owned();
+    let compact = error[..end].to_owned();
     drop(error);
     compact
 }
 pub(super) fn disconnected(pending: &Pending, reason: &str) {
     for (_, pending) in std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner())) {
-        if let Some(reply)=pending.reply { let _=reply.try_send(Err(reason.chars().take(512).collect())); }
+        if let Some(reply) = pending.reply {
+            let _ = reply.try_send(Err(reason.chars().take(512).collect()));
+        }
         // The reader has stopped decoding before this drain. The ownership
         // charge survives any already-delivered Page in its actual receiver.
     }
@@ -245,7 +254,7 @@ mod tests {
             omitted: 1,
         };
         let page = || Page {
-                        _ownership: None,
+            _ownership: None,
             log_id: log.id.clone(),
             offset: 0,
             bytes: vec![b'a'],
