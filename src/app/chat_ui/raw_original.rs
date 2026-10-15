@@ -52,10 +52,10 @@ struct Loaded {record:ResidentRaw,view:tool_text::ToolText}
 struct Entry {part:RawSourcePart,opened:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
 impl Entry {fn new(part:RawSourcePart)->Self {Self {part,opened:false,attempt:None,loaded:None,restored:None,error:None}}}
 #[derive(Default)]
-pub(super) struct State {entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,selected:Option<String>,revision:u64}
+pub(super) struct State {entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,selected:Option<String>,revision:u64,restore_error:Option<String>}
 impl State {
     pub(super) fn clear(&mut self) {
-        let entries=std::mem::take(&mut self.entries);retire(entries);self.aliases.clear();self.actor=None;self.session=None;self.selected=None;
+        let entries=std::mem::take(&mut self.entries);for (_,entry) in entries {retire_entry(entry);}self.aliases.clear();self.actor=None;self.session=None;self.selected=None;self.restore_error=None;
         self.context=self.context.wrapping_add(1);self.revision=self.revision.wrapping_add(1);
     }
     fn sync(&mut self,snapshot:&Snapshot,selected:Option<&str>,actor:Option<&Arc<ClientHandle>>) {
@@ -73,13 +73,13 @@ impl State {
             match self.entries.get_mut(&key) {
                 Some(entry) if record(&entry.part)==record(part)=>entry.part=part.clone(),
                 Some(entry)=>{
-                    let old=std::mem::replace(entry,Entry::new(part.clone()));retire(old);self.revision=self.revision.wrapping_add(1);
+                    let old=std::mem::replace(entry,Entry::new(part.clone()));retire_entry(old);self.revision=self.revision.wrapping_add(1);
                 }
                 None=>{self.entries.insert(key,Entry::new(part.clone()));self.revision=self.revision.wrapping_add(1);}
             }
         }
         let removed:Vec<_>=self.entries.keys().filter(|key|!present.contains(*key)).cloned().collect();
-        for key in removed {if let Some(entry)=self.entries.remove(&key) {retire(entry);self.revision=self.revision.wrapping_add(1);}}
+        for key in removed {if let Some(entry)=self.entries.remove(&key) {retire_entry(entry);self.revision=self.revision.wrapping_add(1);}}
         self.aliases=aliases;
     }
     fn key(&self,item:&str,field:RawSourceField)->Option<Key> {
@@ -91,22 +91,30 @@ impl State {
         entry.opened=!entry.opened;entry.error=None;
         if entry.opened {
             match eligible(&entry.part) {Ok(())=>{self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);},Err(error)=>entry.error=Some(error)}
-        } else {entry.attempt=None;if let Some(loaded)=entry.loaded.take() {retire(loaded);}entry.restored=None;}
+        } else {entry.attempt=None;if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}entry.restored=None;}
         self.revision=self.revision.wrapping_add(1);
     }
     pub(super) fn revision(&self)->u64 {self.revision}
+    pub(super) fn render_ready(&mut self,ready:impl Fn(&tool_text::ToolText)->bool)->bool {
+        let changed=self.entries.values().filter_map(|entry|entry.loaded.as_ref()).any(|loaded|ready(&loaded.view));
+        if changed {self.revision=self.revision.wrapping_add(1);}changed
+    }
     pub(super) fn retained_bytes(&self)->usize {self.entries.values().map(|entry|entry.loaded.as_ref().map_or(0,|loaded|loaded.view.text.len())+entry.restored.as_ref().map_or(0,|text|text.len())).sum()}
     pub(super) fn capture(&self)->ResidentRawCalls {
         ResidentRawCalls {calls:self.entries.values().filter_map(|entry|entry.loaded.as_ref().map(|loaded|(loaded.view.text.clone(),loaded.record.clone()))
             .or_else(||entry.restored.as_ref().map(|text|(text.clone(),record(&entry.part))))).collect()}
     }
     pub(super) fn restore(&mut self,view:ResidentRawCalls)->Result<(),String> {
-        let mut seen=HashSet::new();
-        for (text,proof) in &view.calls {
-            let key=Key {source:proof.source.clone(),field:proof.field};
-            if !seen.insert(key.clone()) || self.entries.get(&key).is_none_or(|entry|record(&entry.part)!=*proof)
-                || chat::source_owners::resident_raw(text).as_ref()!=Some(proof) {return Err("The offline original call belongs to another source.".into());}
-        }
+        let validation=(|| {
+            let mut seen=HashSet::new();
+            for (text,proof) in &view.calls {
+                let key=Key {source:proof.source.clone(),field:proof.field};
+                if !seen.insert(key.clone()) || self.entries.get(&key).is_none_or(|entry|record(&entry.part)!=*proof)
+                    || chat::source_owners::resident_raw(text).as_ref()!=Some(proof) {return Err("The offline original call belongs to another source.".to_owned());}
+            }
+            Ok(())
+        })();
+        if let Err(error)=validation {retire(view);return Err(error);}
         for (text,proof) in view.calls {
             let key=Key {source:proof.source,field:proof.field};let entry=self.entries.get_mut(&key).expect("validated raw source");
             entry.opened=true;entry.restored=Some(text);self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);
@@ -164,7 +172,7 @@ pub(super) fn complete(runtime:&mut Runtime,source:SourceKey,field:RawSourceFiel
     match result {
         Ok(pending) if record(&pending.part)==record(&entry.part) && pending.deadline>Instant::now() && chat::source_owners::resident_raw(&pending.text).as_ref()==Some(&record(&entry.part))=>{
             let view=tool_text::ToolText::from_captured(pending.text.clone(),pending.key);
-            if let Some(old)=entry.loaded.replace(Loaded {record:record(&entry.part),view}) {retire(old);}
+            if let Some(old)=entry.loaded.replace(Loaded {record:record(&entry.part),view}) {retire_loaded(old);}
             entry.restored=None;retire(pending);
         }
         Ok(pending)=>{retire(pending);entry.error=Some("The original call changed before it was displayed. Retry its current source.".into());}
@@ -176,6 +184,7 @@ fn label(field:RawSourceField)->&'static str {match field {RawSourceField::ToolI
 fn representation(value:RawRepresentation)->&'static str {match value {RawRepresentation::StreamJson=>"Captured streamed JSON",RawRepresentation::CanonicalJson=>"Captured parsed input (JSON)",RawRepresentation::CommandMetadataJson=>"Captured command projection (JSON)"}}
 pub(super) fn detail(runtime:&Runtime,item:&str)->Element<'static,Message> {
     let mut rows=Vec::new();let target=runtime.target;
+    if let Some(error)=&runtime.raw_original.restore_error {rows.push(design::caption(error.clone()).into());}
     for field in [RawSourceField::ToolInput,RawSourceField::CommandCall] {
         let Some(key)=runtime.raw_original.key(item,field) else {continue;};let entry=&runtime.raw_original.entries[&key];
         rows.push(widget::button::text(format!("{} {}",if entry.opened {"▾"} else {"▸"},label(field)))
@@ -192,6 +201,20 @@ pub(super) fn detail(runtime:&Runtime,item:&str)->Element<'static,Message> {
     }
     if rows.is_empty() {rows.push(design::caption("The provider has no captured original call for this step.").into());}
     widget::column::with_children(rows).spacing(step::GAP_S).width(Length::Fill).into()
+}
+fn retire_loaded(loaded:Loaded) {
+    // ToolText's canonical flow cache contains UI-only Rc owners. Keep one
+    // pure body Arc alive while dropping that UI presentation, then transfer
+    // the final source allocation to the background reclaimer. No Send cast.
+    let text=loaded.view.text.clone();drop(loaded.view);retire((text,loaded.record));
+}
+fn retire_entry(mut entry:Entry) {
+    if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);}
+    if let Some(text)=entry.restored.take() {retire(text);}
+}
+pub(super) fn restore(runtime:&mut Runtime,view:ResidentRawCalls) {
+    sync(runtime);
+    if let Err(error)=runtime.raw_original.restore(view) {runtime.raw_original.restore_error=Some(error);}
 }
 fn retire(value:impl Send+'static) {
     type Retired=Box<dyn std::any::Any+Send>;
@@ -369,7 +392,7 @@ mod tests {
     }
     #[test]
     fn source_reader_and_retirement_payloads_require_safe_send() {
-        fn send<T:Send>() {}send::<Pending>();send::<Loaded>();send::<Entry>();send::<Reply>();
+        fn send<T:Send>() {}send::<Pending>();send::<Reply>();send::<ResidentRawCalls>();
         fn future<T:Send>(_:T) {}future(read(part("{}"),|_|std::future::ready(Err(SourceError::NotFound))));
     }
 }
