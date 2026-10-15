@@ -430,7 +430,9 @@ impl Claude {
             self.control_deadlines.remove(&id);
             if let Some(request) = self.controls.remove(&id) {
                 if string(&request, "subtype") == "interrupt" {
-                    self.interruption = None;
+                    if request["_cagents_turn"].as_u64()==Some(self.attention_generation) {
+                        self.interruption = None;
+                    }
                     if let Some(generation) = request["_cagents_turn"].as_u64()
                         && let Some((key, outcome, run)) =
                             self.deferred_attention.remove(&generation)
@@ -5405,6 +5407,25 @@ mod tests {
         assert!(!reply.events.contains(&Event::RequestResolved {id:"new".into()}));
         assert!(reply.events.iter().any(|event|matches!(event,Event::PastTurnFinished {outcome:crate::notifications::Kind::Cancelled,..})));
         assert!(!reply.events.iter().any(|event|matches!(event,Event::TurnFinished{..}|Event::Status {busy:false,..})));
+    }
+
+    #[test]
+    fn expiring_an_old_interrupt_cannot_clear_a_newer_turns_pending_interrupt() {
+        let mut adapter=Claude {busy:true,..Default::default()};
+        let old=adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"].as_str().unwrap().to_owned();
+        adapter.receive(json!({"type":"result","uuid":"old","subtype":"success","is_error":false})).unwrap();
+        let mut started=Step::default();adapter.start_turn(&mut started);adapter.busy=true;
+        let current=adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"].as_str().unwrap().to_owned();
+        let now=std::time::Instant::now();
+        adapter.control_deadlines.insert(old,now-std::time::Duration::from_millis(1));
+        adapter.control_deadlines.insert(current.clone(),now+std::time::Duration::from_secs(10));
+        let expired=adapter.expire_controls(now);
+        assert_eq!(adapter.interruption,Some(false));
+        assert!(expired.events.iter().any(|event|matches!(event,Event::PastTurnFinished {outcome:crate::notifications::Kind::Succeeded,..})));
+        assert!(adapter.controls.contains_key(&current));
+        adapter.receive(json!({"type":"result","uuid":"new","subtype":"success","is_error":false})).unwrap();
+        let acknowledged=adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":current,"response":{}}})).unwrap();
+        assert!(acknowledged.events.iter().any(|event|matches!(event,Event::TurnFinished {outcome:crate::notifications::Kind::Cancelled,..})));
     }
 
     #[test]
