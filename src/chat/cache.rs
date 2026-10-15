@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 
 pub const PAGE_BYTES: usize = 256 * 1024;
 pub const SOURCE_BYTES: usize = 32 * 1024 * 1024;
+/// A rewrite revision is valid only within the exact ingestion Store that
+/// issued it. Execed actor replacement must never reuse an older read proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SourceEpoch {
+    pub incarnation: uuid::Uuid,
+    pub revision: u64,
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourceKey {
     pub agent_id: Option<String>,
@@ -46,7 +53,7 @@ pub struct SourcePart {
     /// A bounded resident child placeholder represents no original bytes.
     pub replacement: bool,
     /// Changes only when the original source is replaced, never on append.
-    pub epoch: u64,
+    pub epoch: SourceEpoch,
     pub metadata: SourceMetadata,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,14 +61,14 @@ pub struct SourceQuery {
     pub source: SourceKey,
     pub offset: usize,
     pub limit: usize,
-    pub expected_epoch: Option<u64>,
+    pub expected_epoch: Option<SourceEpoch>,
     /// Prefix length from the first page. Appends do not extend this read.
     pub until: Option<usize>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourcePage {
     pub source: SourceKey,
-    pub epoch: u64,
+    pub epoch: SourceEpoch,
     /// Fixed prefix length for this read, rather than the latest streaming length.
     pub source_len: usize,
     pub offset: usize,
@@ -115,7 +122,7 @@ mod tests {
             source: source.clone(),
             offset: 4,
             limit: PAGE_BYTES,
-            expected_epoch: Some(17),
+            expected_epoch: Some(SourceEpoch { incarnation: uuid::Uuid::nil(), revision: 17 }),
             until: Some(8),
         };
         let chat_id = TerminalId::new();
@@ -129,7 +136,7 @@ mod tests {
         );
         let page = SourcePage {
             source,
-            epoch: 17,
+            epoch: SourceEpoch { incarnation: uuid::Uuid::nil(), revision: 17 },
             source_len: 8,
             offset: 4,
             next_offset: 8,
