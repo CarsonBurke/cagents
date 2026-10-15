@@ -1096,7 +1096,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                         .into(),
                     );
                     children.push(widget::row::with_children(vec![
-                        crate::ui_controls::button::secondary("Select all unresolved").on_press(Action::SelectUnresolved).into(),
+                        crate::ui_controls::button::secondary(if conversation.threads_truncated { "Select loaded unresolved" } else { "Select all unresolved" }).on_press(Action::SelectUnresolved).into(),
                         crate::ui_controls::button::secondary(format!("Send {} to agent", state.selected_threads.len()))
                             .on_press_maybe((!state.context_loading && !state.selected_threads.is_empty()).then_some(Action::SendThreads)).into(),
                     ]).spacing(space::XS).into());
