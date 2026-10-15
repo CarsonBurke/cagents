@@ -68,13 +68,16 @@ impl PresenceHolding {
         Self::create_in_context(parent, name, &context)
     }
     pub(super) fn create_in_context(parent: &Root, name: &std::ffi::OsStr, context: &RecoveryContext) -> Result<Self, FileIoError> {
+        Self::create_in_context_with(parent, name, context, |namespace, parent, leaf| fs_safety::create_directory_in_namespace(namespace, parent, leaf, 0o700))
+    }
+    fn create_in_context_with(parent: &Root, name: &std::ffi::OsStr, context: &RecoveryContext, create: impl FnOnce(&fs_safety::DirectoryNamespace, &Root, &Path) -> Result<fs_safety::DirectoryCreation, fs_safety::DirectoryCreateError>) -> Result<Self, FileIoError> {
         let slot = context.reserve().map_err(FileIoError::Io)?;
         let parent = parent.try_clone().map_err(io_error)?;
         // Published only covers this exact protected parent. Shared or unknown
         // parents refuse before creating or acquiring any presence artifacts.
         let namespace = fs_safety::DirectoryNamespace::acquire(&parent).map_err(io_error)?;
         let leaf = OsString::from(format!(".cagents-editor-{}", uuid::Uuid::new_v4()));
-        let creation = match fs_safety::create_directory_in_namespace(&namespace, &parent, Path::new(&leaf), 0o700) {
+        let creation = match create(&namespace, &parent, Path::new(&leaf)) {
             Ok(creation) => creation,
             Err(mut error) => {
                 let message = error.to_string();
@@ -200,6 +203,32 @@ impl PresenceHolding {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    #[test]
+    fn actual_prepublication_error_retains_preparation_and_cleanup_lease() {
+        let directory = tempfile::tempdir().unwrap(); let runtime = tempfile::tempdir().unwrap();
+        let named = directory.path().join("root"); let moved = directory.path().join("original");
+        fs::create_dir(&named).unwrap(); let root = Root::open(&named).unwrap();
+        let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), &named, false).unwrap();
+        let context = recovery_context_at(&root, Arc::new(Some(protection))).unwrap();
+        let mut private = None;
+        let result = PresenceHolding::create_in_context_with(&root, std::ffi::OsStr::new("file"), &context, |_, parent, _| {
+            let error = fs_safety::fixture_directory_preparation_failure(parent);
+            private = Some(Root::open(&error.recovery().expect("real producer failure must retain preparation").diagnostic_path()).unwrap());
+            Err(error)
+        });
+        let error = match result { Err(error) => error, Ok(_) => panic!("actual preparation fault must fail") };
+        let authority = error.recovery_authority().expect("consumer must preserve typed preparation").clone();
+        drop(error); drop(context);
+        fs::rename(&named, &moved).unwrap(); fs::create_dir(&named).unwrap(); fs::write(named.join("foreign"), "keep").unwrap();
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).is_err());
+        assert!(authority.retry().is_err());
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).is_err());
+        fs_safety::unlink_within(private.as_ref().unwrap(), std::ffi::OsStr::new("directory")).unwrap();
+        authority.retry().unwrap(); assert!(authority.is_resolved());
+        drop(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).unwrap());
+        assert_eq!(fs::read(named.join("foreign")).unwrap(), b"keep");
+    }
+
     #[test]
     fn private_writer_temporary_descriptor_survives_foreign_cleanup_and_failed_retry() {
         let directory = tempfile::tempdir().unwrap(); let parent = Root::open(directory.path()).unwrap();
