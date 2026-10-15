@@ -585,6 +585,7 @@ mod tests {
         })).unwrap();
         model.fold(2, &legacy_edit);
         assert_eq!(model.projects[0].checkout.as_deref(), Some(Path::new("/checkouts/project")));
+        assert_eq!(model.projects[0].name, "renamed");
         model.fold(3, &ModelEdit::OpenProject {
             repository: "/metadata/project.git".into(), checkout: Some("/checkouts/linked".into()), primary_checkout: None,
             name: "project".into(), kind: ProjectKind::Git,
@@ -592,7 +593,7 @@ mod tests {
         assert_eq!(model.projects[0].checkout.as_deref(), Some(Path::new("/checkouts/linked")));
         assert_eq!(model.projects[0].primary_checkout.as_deref(), Some(Path::new("/checkouts/project")));
         assert_eq!(model.projects[0].ordinal, 7);
-        assert_eq!(model.projects[0].name, "renamed");
+        assert_eq!(model.projects[0].name, "project");
     }
 
     #[test]
