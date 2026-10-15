@@ -310,6 +310,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sent_at = Instant::now();
         let mut pending = true;
         let mut next_frame = Instant::now();
+        let mut measured_toggle_cycles = None;
+        if let Some(toggles) = &toggles {
+            toggles.begin_measurement(sent_at)?;
+        }
         if input_mode {
             handles[0].input(b"0\n".to_vec())?;
         }
@@ -389,6 +393,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     generations[index] = snapshot.generation;
                     if input_mode && index == 0 && probe < 30 {
                         if text.contains(&format!("PROBE:{probe}")) {
+                            if probe == 29 {
+                                if let Some(toggles) = &toggles {
+                                    measured_toggle_cycles = Some(toggles.end_measurement()?);
+                                }
+                            }
+                            // Capture the final elapsed sample AFTER sealing:
+                            // every counted commit precedes this timestamp,
+                            // including if this consumer is preempted here.
                             latencies.push(sent_at.elapsed().as_nanos() as u64);
                             probe += 1;
                             sent_at = Instant::now();
@@ -401,6 +413,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     handle.acknowledge_redraw(snapshot.generation);
                 }
+            }
+        }
+        if input_mode && probe != 30 {
+            return Err("input workload ended before all 30 probe echoes were measured".into());
+        }
+        if measured_toggle_cycles.is_none() {
+            if let Some(toggles) = &toggles {
+                measured_toggle_cycles = Some(toggles.end_measurement()?);
             }
         }
         latencies.sort_unstable();
@@ -439,10 +459,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .sum()
         };
         let pane_toggles = toggles.map(PaneToggles::finish).transpose()?;
+        if measured_toggle_cycles == Some(0) {
+            return Err("no committed pane-toggle cycle overlapped the measurement window".into());
+        }
         println!(
             "{}",
             serde_json::json!({
                 "pane_toggle_cycles": pane_toggles,
+                "pane_toggle_measured_cycles": measured_toggle_cycles,
+                "pane_toggle_measured_window": if input_mode { "first_probe_to_last_sample" } else { "consumer_loop" },
                 "schema": "cagents.terminal-workload.v1", "workload": mode, "profile": if cfg!(debug_assertions) { "unoptimized-or-dev" } else { "optimized" },
                 "terminals": count, "consumer": "synthetic_60hz_snapshot_ack", "transport": if socket.is_some() { "daemon_ipc" } else { "in_process" }, "wall_ns": wall_ns,
                 "consumer_process_cpu_ns": cpu_ns().saturating_sub(cpu_start), "output_batches": batches, "resize_exercised": resized,
@@ -470,6 +495,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct PaneToggles {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<Result<u64, String>>>,
+    window: std::sync::Arc<std::sync::Mutex<PaneToggleWindow>>,
+}
+
+/// Constant-size evidence for fully committed cycles inside the observation
+/// window. The warmup and post-probe teardown cannot establish concurrent load.
+#[cfg(feature = "host")]
+#[derive(Default)]
+struct PaneToggleWindow {
+    start: Option<std::time::Instant>,
+    completed: u64,
+    sealed: bool,
+}
+#[cfg(feature = "host")]
+impl PaneToggleWindow {
+    fn record(&mut self, cycle_started: std::time::Instant) -> Result<(), String> {
+        if !self.sealed && self.start.is_some_and(|start| cycle_started >= start) {
+            self.completed = self.completed.checked_add(1)
+                .ok_or_else(|| "pane-toggle measurement counter overflowed".to_owned())?;
+        }
+        Ok(())
+    }
 }
 #[cfg(feature = "host")]
 impl PaneToggles {
@@ -489,6 +535,8 @@ impl PaneToggles {
         let directory = std::env::current_dir()?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done = stop.clone();
+        let window = std::sync::Arc::new(std::sync::Mutex::new(PaneToggleWindow::default()));
+        let measured = window.clone();
         let (started, ready) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || -> Result<u64, String> {
             let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
@@ -506,6 +554,7 @@ impl PaneToggles {
             .canonicalized()?;
             let mut cycles = 0;
             loop {
+                let cycle_started = std::time::Instant::now();
                 let id = CardId::new();
                 let recipe =
                     LaunchRecipe::shell(directory.clone()).map_err(|error| error.to_string())?;
@@ -546,6 +595,10 @@ impl PaneToggles {
                         .map_err(|error| error.to_string())?;
                 }
                 cycles += 1;
+                // Both IPC edits have returned after commit. Selection and
+                // sealing use this same tiny mutex, never any IO or HostState.
+                measured.lock().map_err(|_| "pane-toggle window is unavailable")?
+                    .record(cycle_started)?;
                 if cycles == 1 {
                     let _ = started.send(());
                 }
@@ -557,6 +610,7 @@ impl PaneToggles {
         let toggles = Self {
             stop,
             worker: Some(worker),
+            window,
         };
         if ready
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -569,6 +623,18 @@ impl PaneToggles {
                 .into());
         }
         Ok(toggles)
+    }
+    fn begin_measurement(&self, start: std::time::Instant) -> Result<(), String> {
+        let mut window = self.window.lock().map_err(|_| "pane-toggle window is unavailable")?;
+        *window = PaneToggleWindow { start: Some(start), completed: 0, sealed: false };
+        Ok(())
+    }
+    fn end_measurement(&self) -> Result<u64, String> {
+        let mut window = self.window.lock().map_err(|_| "pane-toggle window is unavailable")?;
+        // Only cycles recorded before this serialized cut count. A cycle that
+        // finishes later cannot turn a warmup-only run into concurrent evidence.
+        window.sealed = true;
+        Ok(window.completed)
     }
     fn finish(mut self) -> Result<u64, String> {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
