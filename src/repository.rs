@@ -8029,9 +8029,33 @@ mod tests {
         );
     }
 
+    fn snapshot_status(entries: &[u8]) -> Vec<u8> {
+        let mut status = b"# branch.oid (initial)\0# branch.head main\0".to_vec();
+        status.extend_from_slice(entries);
+        status
+    }
+
+    fn cached_snapshot_outputs(
+        entries: &[u8],
+        files: &[u8],
+    ) -> Vec<Result<ProcessOutput, ProcessFailure>> {
+        vec![
+            exit(1, b""), // no configured fsmonitor
+            success(&snapshot_status(entries)),
+            success(b""), // staged numstat
+            success(b""), // unstaged numstat
+            success(files),
+            exit(1, b""), // no remotes
+            success(b""), // no refs
+            success(b""), // no stashes (shared mutation API)
+        ]
+    }
+
     #[test]
     fn snapshot_cache_unchanged_reads_only_status_and_metadata_invalidation_rereads() {
-        let outputs = (0..17).map(|_| success(b"")).collect();
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        outputs.push(success(&snapshot_status(b"")));
+        outputs.extend(cached_snapshot_outputs(b"", b""));
         let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor.clone());
         let mut cache = SnapshotCache::default();
@@ -8060,9 +8084,8 @@ mod tests {
 
     #[test]
     fn snapshot_cache_notices_truncation_even_when_the_retained_prefix_is_identical() {
-        let mut outputs = vec![success(b""), success(b"? first.txt\0")];
-        outputs.extend((0..6).map(|_| success(b"")));
-        outputs.extend([success(b"? first.txt\0? second.txt\0"), success(b""), success(b"")]);
+        let mut outputs = cached_snapshot_outputs(b"? first.txt\0", b"");
+        outputs.extend([success(&snapshot_status(b"? first.txt\0? second.txt\0")), success(b""), success(b"")]);
         let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor);
         let mut cache = SnapshotCache::default();
@@ -8079,9 +8102,14 @@ mod tests {
 
     #[test]
     fn snapshot_cache_status_or_content_change_reuses_metadata() {
-        let mut outputs = (0..8).map(|_| success(b"")).collect::<Vec<_>>();
-        outputs.extend([success(b"? new.txt\0"), success(b""), success(b"")]);
-        outputs.extend([success(b"? new.txt\0"), success(b""), success(b"")]);
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        for _ in 0..2 {
+            outputs.extend([
+                success(&snapshot_status(b"? new.txt\0")),
+                success(b""),
+                success(b""),
+            ]);
+        }
         let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor.clone());
         let mut cache = SnapshotCache::default();
@@ -8135,20 +8163,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("new.txt");
         fs::write(&file, "abc\n").unwrap();
-        let executor = Arc::new(FakeExecutor::with_outputs(vec![
-            exit(1, b""),
-            success(b"? new.txt\0"),
+        let mut outputs = cached_snapshot_outputs(b"? new.txt\0", b"? new.txt\0");
+        outputs.extend([
+            success(&snapshot_status(b"? new.txt\0")),
             success(b""),
             success(b""),
-            success(b"? new.txt\0"),
-            exit(1, b""),
-            success(b""),
-            success(b""),
-            success(b"? new.txt\0"),
-            success(b""),
-            success(b""),
-            success(b"? new.txt\0"),
-        ]));
+            success(&snapshot_status(b"? new.txt\0")),
+        ]);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor.clone());
         let options = SnapshotOptions {
             status_limit: None,
@@ -8185,21 +8207,15 @@ mod tests {
     #[test]
     fn snapshot_cache_browse_creation_refreshes_files_without_untracked_status() {
         let directory = tempfile::tempdir().unwrap();
-        let executor = Arc::new(FakeExecutor::with_outputs(vec![
-            exit(1, b""),
-            success(b""),
-            success(b""),
-            success(b""),
-            success(b""),
-            exit(1, b""),
-            success(b""),
-            success(b""),
-            success(b""),
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        outputs.extend([
+            success(&snapshot_status(b"")),
             success(b""),
             success(b""),
             success(b"? new.txt\0"),
-            success(b""),
-        ]));
+            success(&snapshot_status(b"")),
+        ]);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor.clone());
         let options = SnapshotOptions {
             status_limit: None,
@@ -8270,7 +8286,9 @@ mod tests {
         fs::write(&file, "one\n").unwrap();
         let mut cache = BTreeMap::new();
         let measure = |cache: &mut BTreeMap<RepoPath, (FileIdentity, u64)>| {
-            let mut entries = parse_status(b"? new.txt\0").unwrap().entries;
+            let mut entries = parse_status(&snapshot_status(b"? new.txt\0"))
+                .unwrap()
+                .entries;
             measure_untracked_cached(
                 directory.path(),
                 &mut entries,
