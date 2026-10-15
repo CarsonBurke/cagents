@@ -645,6 +645,46 @@ impl Cagents {
         queued.batch = batch;
         Some(queued)
     }
+    /// Called after exact source-owned successful Return. Unlike ordinary
+    /// capture this uses only the host-issued descriptor, before first Attach.
+    /// The first attachment must independently be preseeded with this receipt.
+    pub(super) fn capture_handoff_card_close_for(
+        &mut self,card:CardId,batch:Option<uuid::Uuid>,
+        receipt:&crate::terminal::ipc::TerminalHandoffReceipt,
+        shared:Option<super::shared_views::RemovalSource>,
+    )->Option<QueuedCardClose> {
+        if receipt.source.archive_report.is_some() || receipt.source_binding.source.archive_report.is_some()
+            || receipt.retained_binding.as_ref().is_some_and(|binding|binding.source.archive_report.is_some()) {return None;}
+        let source=&receipt.terminal.session;
+        let proof=receipt.source.proof.clone().filter(HostSessionProof::is_complete)?;
+        if source.continuity.live_proof().is_some_and(|issued|issued!=proof) {return None;}
+        if receipt.operation.is_nil() || receipt.terminal.execution_instance.is_nil()
+            || receipt.terminal_native_epoch.is_nil()
+            || !self.pane_close_decision_current(card,batch)
+            || !self.card_state(card).is_some_and(|state|state.existence.is_open()
+                && same_removal_source(&CardKind::Terminal(source.clone()),&state.kind)) {
+            return None;
+        }
+        match &shared {
+            Some(basis) if basis.matches_handoff(receipt) && basis.current(&self.workspace_model)=>{},
+            None if !self.workspace_model.views.iter().any(|view|view.panes.iter().any(|pane|pane.id==card))
+                && !self.shared_views.attached.contains(&card)
+                && !self.shared_views.baseline.values().any(|panes|panes.iter().any(|pane|pane.id==card))=>{},
+            _=>return None,
+        }
+        let captured=CapturedTerminal {source:source.clone(),execution_instance:receipt.terminal.execution_instance,proof:proof.clone()};
+        if !self.surface_close_binding_current(card,Some(&captured)) {return None;}
+        // Exact successful transition owns this fresh binding. Existing pending
+        // intents retain their own captured source; no inventory is consulted.
+        self.record_terminal_close_binding(card,crate::terminal::HostedTerminalBinding {
+            source:source.clone(),execution_instance:receipt.terminal.execution_instance,
+        },proof,true);
+        if !same_captured(Some(&captured),self.terminal_close_bindings.bound.get(&card)) {return None;}
+        Some(QueuedCardClose {
+            registry:self.workspace_model.identity,shared:Ok(shared),batch,card,unasked:false,
+            kind:Some(CardKind::Terminal(source.clone())),captured:Some(captured),
+        })
+    }
     pub(super) fn resume_captured_card_close(&mut self, queued: QueuedCardClose) -> Task<Message> {
         if !self.pane_close_decision_current(queued.card, queued.batch) {
             return Task::none();
@@ -2003,6 +2043,43 @@ mod tests {
             assert!(!same_chat_removal_source(&session,&replacement));
             assert!(!crate::workspace_model::views::same_card_source(&CardKind::Chat(session.clone()),&CardKind::Chat(replacement)));
         }
+    }
+
+    #[test]
+    fn completed_handoff_receipt_uses_original_source_proof_without_marking_worker_live() {
+        let (mut app,card,_)=bound_fixture();
+        let (_,mut receipt)=crate::workspace_model::views::handoff_tests::fixture();
+        receipt.terminal.session.continuity=TerminalContinuity::Exited {last_exit:crate::model::TerminalExit {code:Some(0),signal:None,occurred_at_unix_ms:0}};
+        app.card_state_mut(card).unwrap().kind=CardKind::Terminal(receipt.terminal.session.clone());
+        app.cards.remove(&card);app.workspace_model.views.clear();app.shared_views.attached.remove(&card);app.shared_views.baseline.clear();
+        let queued=app.capture_handoff_card_close_for(card,None,&receipt,None).expect("completed descriptor keeps the exact returned worker and complete original proof");
+        let captured=queued.captured.as_ref().unwrap();
+        assert_eq!(Some(&captured.proof),receipt.source.proof.as_ref());
+        assert_eq!(captured.execution_instance,receipt.terminal.execution_instance);
+        assert!(matches!(captured.source.continuity,TerminalContinuity::Exited {..}));
+        let mut report_receipt=receipt.clone();
+        report_receipt.source.archive_report=Some(crate::chat::ArchiveReportReference {format:1,registry:uuid::Uuid::new_v4(),agent:crate::model::AgentId::new(),source_operation:uuid::Uuid::new_v4()});
+        assert!(app.capture_handoff_card_close_for(card,None,&report_receipt,None).is_none(),"read-only source cannot seed a terminal binding even for unpublished membership");
+        let mut missing_epoch=receipt.clone();missing_epoch.terminal_native_epoch=uuid::Uuid::nil();
+        assert!(app.capture_handoff_card_close_for(card,None,&missing_epoch,None).is_none(),"no unknown returned-resource publication fallback");
+        receipt.source.proof=None;
+        assert!(app.capture_handoff_card_close_for(card,None,&receipt,None).is_none(),"no nil/unknown proof fallback");
+    }
+
+    #[test]
+    fn handoff_continuation_captures_returned_worker_before_first_attachment() {
+        let (mut app,card,_)=bound_fixture();
+        let (_,receipt)=crate::workspace_model::views::handoff_tests::fixture();
+        app.card_state_mut(card).unwrap().kind=CardKind::Terminal(receipt.terminal.session.clone());
+        app.cards.remove(&card);
+        app.workspace_model.views.clear();app.shared_views.attached.remove(&card);app.shared_views.baseline.clear();
+        let queued=app.capture_handoff_card_close_for(card,None,&receipt,None).expect("host-issued descriptor does not require a later Attach/List");
+        assert_eq!(queued.captured.as_ref().unwrap().execution_instance,receipt.terminal.execution_instance);
+        assert_eq!(queued.captured.as_ref().unwrap().source,receipt.terminal.session);
+        let mut successor=receipt.terminal.clone();successor.execution_instance=uuid::Uuid::new_v4();
+        let proof=successor.session.continuity.live_proof().unwrap();
+        app.record_terminal_close_binding(card,crate::terminal::HostedTerminalBinding {source:successor.session,execution_instance:successor.execution_instance},proof,true);
+        assert!(app.resolve_queued_card_close(queued).is_none(),"original returned A cannot capture successor B on continuation");
     }
 
     #[test]

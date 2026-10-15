@@ -3126,7 +3126,7 @@ mod tests {
                     repository: "/repo".into(),
                     before: pane.clone(),
                     execution_instance: None,
-                },
+                 handoff: None, },
             };
             let initial = model.clone();
             let (reader, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -3356,7 +3356,7 @@ mod tests {
                 repository: "/repo".into(),
                 before:before.clone(),
                 execution_instance: None,
-            } },
+             handoff: None, } },
         };
         let (updates, rx) = async_channel::unbounded();
         let (mut first, server) = connection(model.clone(), edit.clone(), true);

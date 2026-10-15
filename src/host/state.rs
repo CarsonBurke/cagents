@@ -756,6 +756,7 @@ impl HostState {
                 crate::workspace_model::views::Change::RemoveSource {
                     before,
                     execution_instance,
+                    handoff,
                     ..
                 },
             ..
@@ -770,7 +771,17 @@ impl HostState {
                 .view_operation_seen(*operation)
                 .map_err(model_unavailable)?
             {
-                if let CardKind::Terminal(source) = &before.kind {
+                // This method is supplied by the exact handoff producer leaf
+                // 912a6d2c and must stay under this HostLock through Registry CAS.
+                if let Some(receipt)=handoff {
+                    if *execution_instance!=Some(receipt.terminal.execution_instance)
+                        || !crate::workspace_model::views::handoff_source_matches(before,receipt) {
+                        return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,"The original handoff source changed",false));
+                    }
+                    self.validate_terminal_handoff_receipt(receipt)?;
+                }
+                let terminal_source=handoff.as_ref().map(|receipt|&receipt.terminal.session).or_else(||match &before.kind {CardKind::Terminal(source)=>Some(source),_=>None});
+                if let Some(source) = terminal_source {
                     let current = self.terminals.get(&source.id);
                     let latest=self.published_terminal_workers.latest(source.id)
                         .or_else(||current.map(|record|record.handle.execution_instance()));
@@ -778,7 +789,7 @@ impl HostState {
                         || execution_instance.is_none_or(|instance| instance.is_nil())
                         || self.spawning.contains(&source.id)
                         || self.chat_spawning.contains_key(&source.id)
-                        || self.chats.contains_key(&source.id)
+                        || (handoff.is_none() && self.chats.contains_key(&source.id))
                         || current.is_some_and(|record| {
                             Some(record.handle.execution_instance()) != *execution_instance
                         })
@@ -4627,7 +4638,7 @@ mod tests {
                     repository: directory.path().into(),
                     before: pane.clone(),
                     execution_instance: worker,
-                },
+                 handoff: None, },
             };
             assert!(state.edit_model(1, edit).is_err());
             assert_eq!(state.read_model().unwrap(), before);
@@ -4648,11 +4659,11 @@ mod tests {
         let retired=state.terminals.remove(&session.id).unwrap();
         assert_eq!(retired.handle.execution_instance(),descriptor.execution_instance);
         let snapshot=state.read_model().unwrap();
-        let old=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:snapshot.views[0].revision,operation:uuid::Uuid::new_v4(),change:Change::RemoveSource {registry:snapshot.identity,repository:directory.path().into(),before:pane.clone(),execution_instance:Some(older_worker)}};
+        let old=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:snapshot.views[0].revision,operation:uuid::Uuid::new_v4(),change:Change::RemoveSource {registry:snapshot.identity,repository:directory.path().into(),before:pane.clone(),execution_instance:Some(older_worker), handoff: None, }};
         assert!(state.edit_model(1,old).is_err(),"retired successor B must not disappear behind absent resident inventory");
         assert_eq!(state.read_model().unwrap(),snapshot);
         let history=std::mem::take(&mut state.published_terminal_workers);
-        let unknown=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:snapshot.views[0].revision,operation:uuid::Uuid::new_v4(),change:Change::RemoveSource {registry:snapshot.identity,repository:directory.path().into(),before:pane.clone(),execution_instance:Some(descriptor.execution_instance)}};
+        let unknown=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:snapshot.views[0].revision,operation:uuid::Uuid::new_v4(),change:Change::RemoveSource {registry:snapshot.identity,repository:directory.path().into(),before:pane.clone(),execution_instance:Some(descriptor.execution_instance), handoff: None, }};
         assert!(state.edit_model(1,unknown).is_err(),"unknown/restart-lost/evicted history cannot authenticate absence");
         assert_eq!(state.read_model().unwrap(),snapshot);state.published_terminal_workers=history;
         let mut ended = pane.clone();
@@ -4693,7 +4704,7 @@ mod tests {
                         repository: directory.path().into(),
                         before: pane,
                         execution_instance: Some(descriptor.execution_instance),
-                    },
+                     handoff: None, },
                 },
             )
             .unwrap();

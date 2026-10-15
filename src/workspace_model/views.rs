@@ -330,6 +330,8 @@ pub enum Change {
         repository: PathBuf,
         before: Pane,
         execution_instance: Option<uuid::Uuid>,
+        /// Future matched wire leaf; validated against host-issued retained evidence.
+        handoff: Option<crate::terminal::ipc::TerminalHandoffReceipt>,
     },
 }
 
@@ -442,7 +444,7 @@ impl View {
                     self.retired.push(before.id);
                 }
             }
-            Change::RemoveSource { before, .. } => {
+            Change::RemoveSource { before, handoff, .. } => {
                 let matches = self
                     .panes
                     .iter()
@@ -451,7 +453,7 @@ impl View {
                 if matches.is_empty() {
                     return Ok(false);
                 }
-                if matches.len() != 1 || !same_pane_source(before, matches[0]) {
+                if matches.len() != 1 || !same_removal_pane_source(before, matches[0], handoff.as_ref()) {
                     return Err("workspace view removal source conflict".into());
                 }
                 self.panes.retain(|pane| pane.id != before.id);
@@ -492,6 +494,42 @@ pub fn same_pane_source(expected: &Pane, current: &Pane) -> bool {
         && same_card_source(&expected.kind, &current.kind)
         && expected.pending_terminal_start == current.pending_terminal_start
         && expected.scope == current.scope
+}
+
+/// An authenticated handoff may advance only the execution kind of the same
+/// original pane. Registry/revision and retained receipt authority are checked
+/// atomically by the host; this pure predicate is shared by projection/retry.
+pub fn same_removal_pane_source(expected:&Pane,current:&Pane,handoff:Option<&crate::terminal::ipc::TerminalHandoffReceipt>)->bool {
+    let Some(receipt)=handoff else {return same_pane_source(expected,current);};
+    if expected.id!=current.id || expected.scope!=current.scope
+        || expected.pending_terminal_start!=current.pending_terminal_start
+        || expected.pending_terminal_start || !handoff_source_matches(expected,receipt) { return false; }
+    same_card_source(&expected.kind,&current.kind)
+        || same_card_source(&CardKind::Chat(receipt.source.clone()),&current.kind)
+        || same_card_source(&CardKind::Terminal(receipt.terminal.session.clone()),&current.kind)
+}
+/// Only an unknown issued thread may learn the host-confirmed thread. A known
+/// thread, recipe, proof, paired console or listener is never substituted.
+pub fn handoff_source_matches(expected:&Pane,receipt:&crate::terminal::ipc::TerminalHandoffReceipt)->bool {
+    let CardKind::Chat(issued)=&expected.kind else {return false;};
+    !receipt.operation.is_nil() && !receipt.source_execution_instance.is_nil()
+        && !receipt.terminal_native_epoch.is_nil()
+        && !receipt.source_binding.backend.is_nil()
+        && receipt.retained_binding.as_ref().is_none_or(|binding|binding.source.archive_report.is_none())
+        && receipt.source_binding.execution_instance==receipt.source_execution_instance
+        && handoff_chat_source_matches(&receipt.source_binding.source,&receipt.source)
+        && !receipt.terminal.execution_instance.is_nil()
+        && receipt.source.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete)
+        && receipt.terminal.session.continuity.live_proof().is_none_or(|proof|receipt.source.proof.as_ref()==Some(&proof))
+        && handoff_chat_source_matches(issued,&receipt.source)
+}
+/// Receipt-owned thread learning is narrower than ordinary logical-source
+/// matching. Known thread IDs and all other issued source fields remain exact.
+pub fn handoff_chat_source_matches(expected:&crate::chat::Session,confirmed:&crate::chat::Session)->bool {
+    if expected.archive_report.is_some() || confirmed.archive_report.is_some() {return false;}
+    let mut confirmed=confirmed.clone();
+    if expected.launch.session_id.is_none() {confirmed.launch.session_id=None;}
+    same_card_source(&CardKind::Chat(expected.clone()),&CardKind::Chat(confirmed))
 }
 
 /// Logical source equality permits the same execution to finish and the same
@@ -1161,5 +1199,63 @@ mod removal_source_tests {
             },
         });
         assert!(!same_card_source(&before, &CardKind::Chat(paired)));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod handoff_tests {
+    use super::*;
+    use crate::{model::{BootId,HostSessionId,HostIncarnation,LaunchRecipe,TerminalId,TerminalContinuity},terminal::ipc::{TerminalDescriptor,TerminalHandoffReceipt,ChatSourceBinding}};
+    pub(crate) fn fixture()->(Pane,TerminalHandoffReceipt) {
+        let recipe=LaunchRecipe {program:"fixture".into(),arguments:vec![],working_directory:"/repo".into(),environment:Default::default(),unset_environment:Default::default()};
+        let mut terminal=TerminalDescriptor::relaunchable(TerminalId::new(),recipe.clone(),None);
+        terminal.execution_instance=uuid::Uuid::new_v4();
+        terminal.session.continuity=TerminalContinuity::Live {host_session_id:HostSessionId::new("host"),boot_id:BootId::new("boot"),host_incarnation:HostIncarnation::new("incarnation")};
+        let chat=crate::chat::Session {id:TerminalId::new(),launch:crate::chat::Launch {provider:crate::agent::Provider::Claude,recipe,session_id:None},proof:terminal.session.continuity.live_proof(),terminal:None,owned_codex_listener:None,native_continuity:Default::default(),archive_report:None};
+        let before=Pane {id:CardId::new(),title:"Chat".into(),user_title:None,width_fraction:1.0,pending_terminal_start:false,kind:CardKind::Chat(chat.clone()),scope:None};
+        let mut confirmed=chat;confirmed.launch.session_id=Some("confirmed".into());
+        let execution_instance=uuid::Uuid::new_v4();
+        let receipt=TerminalHandoffReceipt {operation:uuid::Uuid::new_v4(),source:confirmed.clone(),source_execution_instance:execution_instance,source_binding:ChatSourceBinding {source:confirmed,execution_instance,backend:uuid::Uuid::new_v4()},retained_binding:None,terminal_native_epoch:uuid::Uuid::new_v4(),terminal};
+        (before,receipt)
+    }
+    #[test]
+    fn original_chat_basis_accepts_only_its_authenticated_returned_kind() {
+        let (before,receipt)=fixture();let original=before.clone();
+        let mut current=before.clone();current.kind=CardKind::Terminal(receipt.terminal.session.clone());
+        assert!(!same_pane_source(&before,&current));
+        assert!(same_removal_pane_source(&before,&current,Some(&receipt)));
+        let mut view=View::empty(Scope::Worktree {repository:"/repo".into(),path:"/repo".into()});view.panes.push(current.clone());
+        view.apply(&Change::RemoveSource {registry:uuid::Uuid::new_v4(),repository:"/repo".into(),before:before.clone(),execution_instance:Some(receipt.terminal.execution_instance),handoff:Some(receipt.clone())}).unwrap();
+        assert!(view.panes.is_empty());assert_eq!(before,original);
+        let mut learned=before.clone();learned.kind=CardKind::Chat(receipt.source.clone());
+        assert!(same_removal_pane_source(&before,&learned,Some(&receipt)));
+        let mut ended_receipt=receipt.clone();ended_receipt.terminal.session.continuity=TerminalContinuity::Exited {last_exit:crate::model::TerminalExit {code:Some(0),signal:None,occurred_at_unix_ms:0}};
+        let mut ended=current.clone();ended.kind=CardKind::Terminal(ended_receipt.terminal.session.clone());
+        assert!(same_removal_pane_source(&before,&ended,Some(&ended_receipt)),"completed receipt retains source proof without synthesizing Live");
+        assert!(matches!(ended_receipt.terminal.session.continuity,TerminalContinuity::Exited {..}));
+        let mut promoted=receipt.clone();promoted.source.native_continuity=crate::chat::NativeContinuity::Durable {provider_version:"same-backend".into()};
+        assert!(same_removal_pane_source(&before,&current,Some(&promoted)),"metadata promotion does not replace the concrete source backend");
+        promoted.source_binding.source.launch.session_id=Some("other-known-thread".into());
+        assert!(!same_removal_pane_source(&before,&current,Some(&promoted)),"known backend conversation remains exact");
+        let mut report_receipt=receipt.clone();
+        report_receipt.source.archive_report=Some(crate::chat::ArchiveReportReference {format:1,registry:uuid::Uuid::new_v4(),agent:crate::model::AgentId::new(),source_operation:uuid::Uuid::new_v4()});
+        report_receipt.source_binding.source=report_receipt.source.clone();
+        assert!(!same_removal_pane_source(&before,&current,Some(&report_receipt)),"read-only report identity cannot become an executable handoff");
+        for variant in 0..8 {
+            let mut changed=current.clone();let mut proof=receipt.clone();
+            match variant {
+                0=>changed.id=CardId::new(),
+                1=>changed.pending_terminal_start=true,
+                2=>if let CardKind::Terminal(source)=&mut changed.kind {source.id=TerminalId::new();},
+                3=>proof.source.launch.recipe.program="foreign".into(),
+                4=>proof.source_binding.backend=uuid::Uuid::nil(),
+                5=>proof.terminal.execution_instance=uuid::Uuid::nil(),
+                6=>proof.terminal_native_epoch=uuid::Uuid::nil(),
+                _=>if let CardKind::Terminal(source)=&mut changed.kind {source.launch.working_directory="/foreign".into();},
+            }
+            assert!(!same_removal_pane_source(&before,&changed,Some(&proof)),"variant {variant}");
+        }
+        let mut known=before;let CardKind::Chat(source)=&mut known.kind else {panic!()};source.launch.session_id=Some("other-conversation".into());
+        assert!(!same_removal_pane_source(&known,&current,Some(&receipt)));
     }
 }

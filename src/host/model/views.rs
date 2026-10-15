@@ -544,7 +544,7 @@ pub(super) fn apply(
                 Change::Update { pane, .. } if resource_owner(transaction, pane)?.is_some() => {
                     false
                 }
-                Change::RemoveSource { before, .. } => {
+                Change::RemoveSource { before, handoff, .. } => {
                     if owner(transaction, before.id)?.as_ref() != Some(scope)
                         || view
                             .panes
@@ -553,7 +553,7 @@ pub(super) fn apply(
                             .count()
                             != 1
                         || !view.panes.iter().any(|pane| {
-                            crate::workspace_model::views::same_pane_source(before, pane)
+                            crate::workspace_model::views::same_removal_pane_source(before, pane, handoff.as_ref())
                         })
                     {
                         return Err("workspace view removal source conflict".into());
@@ -1431,7 +1431,7 @@ mod tests {
                     repository: "/repo".into(),
                     before: original.clone(),
                     execution_instance: None,
-                },
+                 handoff: None, },
             );
             match change {
                 0 => {
@@ -1523,7 +1523,7 @@ mod tests {
                 repository: "/repo".into(),
                 before: original.clone(),
                 execution_instance: None,
-            },
+             handoff: None, },
         );
         let mut titled = original.clone();
         titled.title = "independent display edit".into();
