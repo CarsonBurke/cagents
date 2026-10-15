@@ -35,13 +35,14 @@ mod execution;
 mod lineage;
 mod mailbox;
 mod native_actor;
+mod schema;
 mod navigation;
 pub(super) use native_actor::NativeActorEvent;
 mod relocation;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 15;
+const SCHEMA_VERSION: u32 = 17;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -84,8 +85,10 @@ impl Registry {
         prepare_private_file(path)
             .map_err(|error| format!("cannot prepare {}: {error}", path.display()))?;
         let db = Connection::open(path).map_err(|error| error.to_string())?;
-        configure(&db)?;
+        schema::check_readonly(&db)?;
+        configure_connection(&db)?;
         migrate(&db)?;
+        configure(&db)?;
         Ok(Self {
             db,
             path: path.to_owned(),
@@ -559,6 +562,12 @@ fn prepare_private_file(path: &Path) -> io::Result<()> {
 /// silently leave channels behind that no sidebar can reach. `FULL` makes
 /// execution acceptance durable before launching a child or submitting its
 /// prompt, including a power failure after the external side effect begins.
+fn configure_connection(db: &Connection) -> Result<(), String> {
+    db.busy_timeout(BUSY_TIMEOUT).map_err(|error| error.to_string())?;
+    db.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")
+        .map_err(|error| error.to_string())
+}
+
 fn configure(db: &Connection) -> Result<(), String> {
     db.busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| error.to_string())?;
@@ -595,15 +604,13 @@ fn configure(db: &Connection) -> Result<(), String> {
 }
 
 fn migrate(db: &Connection) -> Result<(), String> {
-    let version: u32 = db
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if version > SCHEMA_VERSION {
-        return Err(format!(
-            "workspace registry schema {version} is newer than supported schema {SCHEMA_VERSION}"
-        ));
-    }
-    db.execute_batch(
+    schema::migrate(db)
+}
+
+/// Published migration primitives run within one admitted writer transaction.
+/// The original checkpoint is stable until the final cumulative commit.
+fn migrate_legacy(tx: &rusqlite::Transaction<'_>, version: u32, target: u32) -> Result<(), String> {
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS projects(
              repository TEXT PRIMARY KEY,
              name TEXT NOT NULL,
@@ -632,7 +639,7 @@ fn migrate(db: &Connection) -> Result<(), String> {
          ) STRICT;",
     )
     .map_err(|error| error.to_string())?;
-    let has_kind: bool = db
+    let has_kind: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name = 'kind')",
             [],
@@ -640,74 +647,51 @@ fn migrate(db: &Connection) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     if !has_kind {
-        db.execute_batch("ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'git' CHECK(kind IN ('git', 'folder'));")
+        tx.execute_batch("ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'git' CHECK(kind IN ('git', 'folder'));")
             .map_err(|error| error.to_string())?;
     }
     // The identity is minted here rather than in `at`, because this is the only
     // place that can tell a store being created from one being reopened: the
     // ignored insert is what makes minting happen exactly once, and a reopened
     // registry has to keep the identity every window recorded against it.
-    db.execute(
+    tx.execute(
         "INSERT OR IGNORE INTO metadata(
              key, identity, sequence, next_project_ordinal, next_channel_ordinal
          ) VALUES (0, ?1, 0, 1, 1)",
         [Uuid::new_v4().to_string()],
     )
     .map_err(|error| error.to_string())?;
-    if version < 1 {
-        execution::migrate(db)?;
+    if version < 1 && target >= 1 {
+        execution::migrate(tx)?;
     }
-    if version < 2 {
-        automations::migrate(db)?;
+    if version < 2 && target >= 2 {
+        automations::migrate(tx)?;
     }
-    if version < 3 {
-        let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        let current: u32 = tx
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .map_err(|error| error.to_string())?;
-        if current < 3 {
-            tx.execute_batch("ALTER TABLE channels ADD COLUMN title_source INTEGER NOT NULL DEFAULT 2 CHECK(title_source BETWEEN 0 AND 2); PRAGMA user_version = 3;")
-                .map_err(|error| error.to_string())?;
-        }
-        tx.commit().map_err(|error| error.to_string())?;
-    }
-    if version < 4 {
-        lineage::migrate(db)?;
-    }
-    if version < 5 {
-        mailbox::migrate(db)?;
-    }
-    if version < 6 {
-        terminal_owners::migrate(db)?;
-    }
-    if version < 8 {
-        views::migrate(db)?;
-    }
-    if version < 9 {
-        db.pragma_update(None, "user_version", 9)
+    if version < 3 && target >= 3 {
+        tx.execute_batch("ALTER TABLE channels ADD COLUMN title_source INTEGER NOT NULL DEFAULT 2 CHECK(title_source BETWEEN 0 AND 2);")
             .map_err(|error| error.to_string())?;
     }
-    if version < 10 {
-        execution::migrate_names(db)?;
+    if version < 4 && target >= 4 {
+        lineage::migrate(tx)?;
     }
-    if version < 11 {
-        automation_proposals::migrate(db)?;
+    if version < 5 && target >= 5 {
+        mailbox::migrate(tx)?;
     }
-    if version < 12 {
-        mailbox::migrate_attention(db)?;
+    if version < 6 && target >= 6 {
+        terminal_owners::migrate(tx)?;
     }
-    if version < 13 {
-        agent_locations::migrate(db)?;
+    if version < 8 && target >= 8 {
+        views::migrate(tx)?;
     }
-    if version < 14 {
-        session_locations::migrate(db)?;
+    if version < 10 && target >= 10 {
+        execution::migrate_names(tx)?;
     }
-    if version < 15 {
-        native_actor::migrate(db)?;
+    if version < 11 && target >= 11 {
+        automation_proposals::migrate(tx)?;
     }
-    // Parent integration must allocate the cumulative schema checkpoint.
-    views::migrate_terminal_sources(db)?;
+    if version < 12 && target >= 12 {
+        mailbox::migrate_attention(tx)?;
+    }
     Ok(())
 }
 
@@ -898,6 +882,7 @@ mod tests {
                 title_source: Default::default(),
             })
             .unwrap();
+        schema::discard_selected_for_legacy_fixture(&registry.db);
         registry
             .db
             .execute_batch(

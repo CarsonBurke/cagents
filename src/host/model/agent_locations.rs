@@ -56,18 +56,7 @@ impl RelocationInput {
     }
 }
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS agent_locations (
-        agent TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
-        repository TEXT NOT NULL,
-        directory TEXT NOT NULL,
-        blocked_directory TEXT
-    ) STRICT;",
-    )
-    .map_err(|error| error.to_string())?;
+pub(super) fn backfill(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let records = tx
         .prepare("SELECT record FROM agents")
         .map_err(|error| error.to_string())?
@@ -75,11 +64,9 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
         .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
         .map_err(|error| error.to_string())?;
     for record in records {
-        insert(&tx, &decode::<Agent>(&record)?)?;
+        insert(tx, &decode::<Agent>(&record)?)?;
     }
-    tx.pragma_update(None, "user_version", 13)
-        .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn insert(db: &Connection, agent: &Agent) -> Result<(), String> {

@@ -7,7 +7,7 @@ use crate::{
     daemon::holder_registry::{Kind, Record},
     model::RunId,
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -18,14 +18,6 @@ pub(in crate::host) enum NativeActorEvent {
     Attention(crate::notifications::Evidence),
 }
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS native_actor_cursors (
-        actor TEXT PRIMARY KEY, owner TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), digest BLOB NOT NULL
-    ) STRICT; PRAGMA user_version = 15;").map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())
-}
 
 impl Registry {
     /// A typed loss is already durable in the authenticated helper. Commit all

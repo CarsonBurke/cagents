@@ -139,21 +139,6 @@ fn retain_alias(location: &mut Location, source: &HostedSession) -> Result<(), S
     Ok(())
 }
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS session_locations (
-        session TEXT PRIMARY KEY, source TEXT NOT NULL, repository TEXT,
-        directory TEXT NOT NULL, approved TEXT, process TEXT,
-        blocked_directory TEXT, refusal TEXT, previous_sources TEXT NOT NULL DEFAULT '[]'
-    ) STRICT;",
-    )
-    .map_err(|error| error.to_string())?;
-    tx.pragma_update(None, "user_version", 14)
-        .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())
-}
 
 fn read(db: &Connection, id: TerminalId) -> Result<Option<Location>, String> {
     let row = db.query_row("SELECT source,repository,directory,approved,process,blocked_directory,refusal,previous_sources FROM session_locations WHERE session=?1", [id.to_string()], |row| {
