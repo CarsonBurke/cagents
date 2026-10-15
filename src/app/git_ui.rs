@@ -123,16 +123,24 @@ fn reconcile_watch_plan(
     snapshot: &Snapshot,
     preserved: &HashSet<WorktreeId>,
 ) -> BTreeSet<WorktreeId> {
-    let upstreams = snapshot.worktrees.iter().filter_map(|(record, status)| {
-        let upstream = match &status.as_ref()?.tracking {
-            crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream),
-            crate::repository::TrackingState::Unknown { upstream } => upstream.as_ref(),
-            crate::repository::TrackingState::NoUpstream => None,
-        }?;
-        Some((record.id, upstream.clone()))
-    }).collect();
-    plan.reconcile_coverage(previous, snapshot.worktrees.iter().map(|(record, _)| record),
-        &preserved.iter().copied().collect(), &upstreams)
+    let upstreams = snapshot
+        .worktrees
+        .iter()
+        .filter_map(|(record, status)| {
+            let upstream = match &status.as_ref()?.tracking {
+                crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream),
+                crate::repository::TrackingState::Unknown { upstream } => upstream.as_ref(),
+                crate::repository::TrackingState::NoUpstream => None,
+            }?;
+            Some((record.id, upstream.clone()))
+        })
+        .collect();
+    plan.reconcile_coverage(
+        previous,
+        snapshot.worktrees.iter().map(|(record, _)| record),
+        &preserved.iter().copied().collect(),
+        &upstreams,
+    )
 }
 
 struct Entry {

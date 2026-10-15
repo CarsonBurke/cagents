@@ -230,27 +230,56 @@ impl Project {
         preserved: &BTreeSet<WorktreeId>,
         upstreams: &BTreeMap<WorktreeId, String>,
     ) -> BTreeSet<WorktreeId> {
-        let records = records.into_iter().filter(|record| !record.bare)
-            .map(|record| (record.id, record)).collect::<BTreeMap<_, _>>();
-        let previous = previous.filter(|project| project.id == self.id && project.common_dir == self.common_dir);
-        let replacements = previous.into_iter().flat_map(|project| &project.worktrees)
-            .filter(|worktree| preserved.contains(&worktree.id)
-                && records.get(&worktree.id).is_some_and(|record| record.path == worktree.root))
+        let records = records
+            .into_iter()
+            .filter(|record| !record.bare)
+            .map(|record| (record.id, record))
+            .collect::<BTreeMap<_, _>>();
+        let previous = previous
+            .filter(|project| project.id == self.id && project.common_dir == self.common_dir);
+        let replacements = previous
+            .into_iter()
+            .flat_map(|project| &project.worktrees)
+            .filter(|worktree| {
+                preserved.contains(&worktree.id)
+                    && records
+                        .get(&worktree.id)
+                        .is_some_and(|record| record.path == worktree.root)
+            })
             .collect::<Vec<_>>();
-        let replacement_ids = replacements.iter().map(|worktree| worktree.id).collect::<BTreeSet<_>>();
-        self.worktrees.retain(|worktree| !replacement_ids.contains(&worktree.id)
-            && records.get(&worktree.id).is_some_and(|record| record.path == worktree.root));
+        let replacement_ids = replacements
+            .iter()
+            .map(|worktree| worktree.id)
+            .collect::<BTreeSet<_>>();
+        self.worktrees.retain(|worktree| {
+            !replacement_ids.contains(&worktree.id)
+                && records
+                    .get(&worktree.id)
+                    .is_some_and(|record| record.path == worktree.root)
+        });
         self.worktrees.extend(replacements.into_iter().cloned());
         for worktree in &mut self.worktrees {
             worktree.branch = records[&worktree.id].branch.clone();
             worktree.upstream = upstreams.get(&worktree.id).cloned();
         }
-        let covered = self.worktrees.iter().map(|worktree| worktree.id).collect::<BTreeSet<_>>();
-        preserved.iter().copied().filter(|id| records.contains_key(id) && !covered.contains(id)).collect()
+        let covered = self
+            .worktrees
+            .iter()
+            .map(|worktree| worktree.id)
+            .collect::<BTreeSet<_>>();
+        preserved
+            .iter()
+            .copied()
+            .filter(|id| records.contains_key(id) && !covered.contains(id))
+            .collect()
     }
 
     fn polling_reason(&self) -> Option<&str> {
-        self.polling.as_deref().or_else(|| self.worktrees.iter().find_map(|worktree| worktree.polling.as_deref()))
+        self.polling.as_deref().or_else(|| {
+            self.worktrees
+                .iter()
+                .find_map(|worktree| worktree.polling.as_deref())
+        })
     }
 
     pub fn refresh_upstreams(&self, upstreams: &BTreeMap<WorktreeId, String>) -> Option<Self> {
@@ -998,13 +1027,32 @@ mod tests {
         let mut previous = project(directory.path());
         let linked = previous.worktrees[1].id;
         previous.worktrees[1].polling = Some("directory watch limit reached".into());
-        let records = previous.worktrees.iter().map(|worktree| WorktreeRecord {
-            id: worktree.id, path: worktree.root.clone(), created_at_unix_ms: None,
-            head_oid: None, branch: Some(if worktree.id == linked { "refs/heads/recovered" } else { "refs/heads/main" }.into()),
-            detached: false, bare: false, lock: Default::default(), prunable_reason: None,
-        }).collect::<Vec<_>>();
+        let records = previous
+            .worktrees
+            .iter()
+            .map(|worktree| WorktreeRecord {
+                id: worktree.id,
+                path: worktree.root.clone(),
+                created_at_unix_ms: None,
+                head_oid: None,
+                branch: Some(
+                    if worktree.id == linked {
+                        "refs/heads/recovered"
+                    } else {
+                        "refs/heads/main"
+                    }
+                    .into(),
+                ),
+                detached: false,
+                bare: false,
+                lock: Default::default(),
+                prunable_reason: None,
+            })
+            .collect::<Vec<_>>();
         for worktree in &previous.worktrees {
-            for path in &worktree.directories { std::fs::create_dir_all(path).unwrap(); }
+            for path in &worktree.directories {
+                std::fs::create_dir_all(path).unwrap();
+            }
             std::fs::create_dir_all(worktree.git_dir.join("refs")).unwrap();
         }
         std::fs::create_dir_all(previous.common_dir.join("worktrees")).unwrap();
@@ -1012,24 +1060,62 @@ mod tests {
         incoming.worktrees.retain(|worktree| worktree.id != linked);
         let preserved = BTreeSet::from([linked]);
         let upstreams = BTreeMap::from([(linked, "origin/recovered".to_owned())]);
-        assert!(incoming.reconcile_coverage(Some(&previous), &records, &preserved, &upstreams).is_empty());
-        let registrations = Registrations::within(&BTreeMap::from([(incoming.id, Arc::new(incoming.clone()))]), MAX_DIRECTORIES);
-        assert_eq!(registrations.failures.get(&incoming.id).map(String::as_str), Some("directory watch limit reached"),
-            "restored incomplete census must retain its periodic repair");
+        assert!(
+            incoming
+                .reconcile_coverage(Some(&previous), &records, &preserved, &upstreams)
+                .is_empty()
+        );
+        let registrations = Registrations::within(
+            &BTreeMap::from([(incoming.id, Arc::new(incoming.clone()))]),
+            MAX_DIRECTORIES,
+        );
+        assert_eq!(
+            registrations.failures.get(&incoming.id).map(String::as_str),
+            Some("directory watch limit reached"),
+            "restored incomplete census must retain its periodic repair"
+        );
         for name in ["refs/heads/recovered", "refs/remotes/origin/recovered"] {
-            assert_eq!(incoming.change(&modified(incoming.common_dir.join(name))).unwrap().worktrees, preserved);
+            assert_eq!(
+                incoming
+                    .change(&modified(incoming.common_dir.join(name)))
+                    .unwrap()
+                    .worktrees,
+                preserved
+            );
         }
         for name in ["refs/heads/linked", "refs/remotes/origin/linked"] {
-            assert!(incoming.change(&modified(incoming.common_dir.join(name))).unwrap().worktrees.is_empty());
+            assert!(
+                incoming
+                    .change(&modified(incoming.common_dir.join(name)))
+                    .unwrap()
+                    .worktrees
+                    .is_empty()
+            );
         }
         let remaining = records.iter().filter(|record| record.id != linked);
-        assert!(incoming.reconcile_coverage(Some(&previous), remaining, &preserved, &BTreeMap::new()).is_empty());
-        let registrations = Registrations::within(&BTreeMap::from([(incoming.id, Arc::new(incoming.clone()))]), MAX_DIRECTORIES);
-        assert!(!registrations.failures.contains_key(&incoming.id), "removed sole polling row cannot leave a stale fallback");
+        assert!(
+            incoming
+                .reconcile_coverage(Some(&previous), remaining, &preserved, &BTreeMap::new())
+                .is_empty()
+        );
+        let registrations = Registrations::within(
+            &BTreeMap::from([(incoming.id, Arc::new(incoming.clone()))]),
+            MAX_DIRECTORIES,
+        );
+        assert!(
+            !registrations.failures.contains_key(&incoming.id),
+            "removed sole polling row cannot leave a stale fallback"
+        );
         incoming.polling = Some("network filesystem".into());
-        let registrations = Registrations::within(&BTreeMap::from([(incoming.id, Arc::new(incoming.clone()))]), MAX_DIRECTORIES);
-        assert_eq!(registrations.failures.get(&incoming.id).map(String::as_str), Some("network filesystem"),
-            "project-wide fallback remains independently authoritative");
+        let registrations = Registrations::within(
+            &BTreeMap::from([(incoming.id, Arc::new(incoming.clone()))]),
+            MAX_DIRECTORIES,
+        );
+        assert_eq!(
+            registrations.failures.get(&incoming.id).map(String::as_str),
+            Some("network filesystem"),
+            "project-wide fallback remains independently authoritative"
+        );
     }
 
     #[test]
