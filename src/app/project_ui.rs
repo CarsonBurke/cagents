@@ -13,6 +13,23 @@ struct AutomaticAttempt {
     at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectCloseRegistry {
+    Local,
+    Shared(uuid::Uuid),
+}
+impl ProjectCloseRegistry {
+    fn capture(identity: uuid::Uuid) -> Self {
+        if identity == crate::workspace_model::NO_REGISTRY { Self::Local } else { Self::Shared(identity) }
+    }
+    fn matches(self, identity: uuid::Uuid) -> bool {
+        match self {
+            Self::Local => identity == crate::workspace_model::NO_REGISTRY,
+            Self::Shared(expected) => expected == identity,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     /// Discovery roots keyed by canonical repository identity. Device values
@@ -28,6 +45,7 @@ pub struct State {
     /// Projects closed by the shared model but still settling their channels.
     pub(super) closing: HashMap<ProjectId, PathBuf>,
     close_started: HashMap<ProjectId, Instant>,
+    close_registry: HashMap<ProjectId, ProjectCloseRegistry>,
     close_in_flight: HashSet<ProjectId>,
     close_failed: HashSet<ProjectId>,
     // A completed teardown must not be repeated merely because an editor
@@ -493,6 +511,7 @@ impl Cagents {
         self.project_ui
             .close_started
             .insert(project, Instant::now());
+        self.project_ui.close_registry.insert(project, ProjectCloseRegistry::capture(self.workspace_model.identity));
         self.project_ui.next_close_generation =
             self.project_ui.next_close_generation.wrapping_add(1);
         self.project_ui
@@ -539,11 +558,32 @@ impl Cagents {
         }
         self.project_ui.closing.remove(&project);
         self.project_ui.recovery_closures.remove(&project);
+        self.project_ui.close_registry.remove(&project);
         self.project_ui.close_started.remove(&project);
         self.project_ui.close_in_flight.remove(&project);
         self.project_ui.close_failed.remove(&project);
         self.project_ui.close_generation.remove(&project);
         self.project_ui.removing.remove(repository);
+    }
+
+    /// A close belongs to the registry that admitted it. Local legacy closure
+    /// is an explicit separate basis and never matches a newly joined registry.
+    pub(super) fn join_project_close_registry(&mut self, identity: uuid::Uuid) {
+        let stale=self.project_ui.closing.iter().filter(|(project,_)| {
+            self.project_ui.close_registry.get(project).is_none_or(|basis| !basis.matches(identity))
+        }).map(|(_,repository)|repository.clone()).collect::<Vec<_>>();
+        for repository in stale {
+            self.cancel_shared_project_close(&repository);
+            self.project_ui.closed.remove(&repository);
+        }
+        if self.durable.workspace_model_identity.is_some_and(|previous| previous != identity) {
+            self.project_ui.closed.clear();
+        }
+    }
+
+    fn project_close_registry_current(&self, project: ProjectId) -> bool {
+        self.project_ui.close_registry.get(&project)
+            .is_some_and(|basis|basis.matches(self.workspace_model.identity))
     }
 
     pub(super) fn complete_closed_projects(&mut self) -> Task<Message> {
@@ -564,6 +604,13 @@ impl Cagents {
             })
             .collect::<Vec<_>>();
         Task::batch(ready.into_iter().map(|project| {
+            if !self.project_close_registry_current(project) {
+                if let Some(repository)=self.project_ui.closing.get(&project).cloned() {
+                    self.cancel_shared_project_close(&repository);
+                    self.project_ui.closed.remove(&repository);
+                }
+                return Task::none();
+            }
             if let Some((generation, closure)) = self.project_ui.recovery_closures.remove(&project) {
                 if self.project_ui.close_generation.get(&project) == Some(&generation) {
                     return self.finish_closed_project(project, closure);
@@ -748,6 +795,14 @@ impl Cagents {
         id: ProjectId,
         closure: ProjectSessionClosure,
     ) -> Task<Message> {
+        if !self.project_close_registry_current(id) {
+            if let Some(repository)=self.project_ui.closing.get(&id).cloned() {
+                self.cancel_shared_project_close(&repository);
+                self.project_ui.closed.remove(&repository);
+            }
+            self.status=Some(TransientNotice::warning("The project registry changed. Its editors and local project row were kept."));
+            return Task::none();
+        }
         if self.project_ui.closing.contains_key(&id) && self.project_has_unsaved_editors(id) {
             self.project_ui.close_in_flight.remove(&id);
             if let Some(generation) = self.project_ui.close_generation.get(&id).copied() {
@@ -762,6 +817,7 @@ impl Cagents {
             return Task::none();
         };
         self.project_ui.recovery_closures.remove(&id);
+        self.project_ui.close_registry.remove(&id);
         self.project_ui.close_started.remove(&id);
         self.project_ui.close_in_flight.remove(&id);
         self.project_ui.close_failed.remove(&id);
@@ -2924,6 +2980,7 @@ mod tests {
         let (mut app,_storage,project)=deletable_app(&repository,&linked,&primary);
         // This recovery arrives after the already-admitted session teardown.
         app.project_ui.closing.insert(project,repository.clone());
+        app.project_ui.close_registry.insert(project,ProjectCloseRegistry::capture(app.workspace_model.identity));
         app.project_ui.close_generation.insert(project,7);
         app.project_ui.close_in_flight.insert(project);
         let (card,authority)=retain_project_editor_recovery(&mut app,project,&repository,&linked.path);
@@ -2974,7 +3031,8 @@ mod tests {
                 drop(app.handle_project_action(Action::Deleted{target,result:Ok(())}));
                 assert!(row(&app,linked.id).is_none());
             } else {
-                app.project_ui.closing.insert(project,repository.clone());app.project_ui.close_generation.insert(project,7);
+                app.project_ui.closing.insert(project,repository.clone());
+        app.project_ui.close_registry.insert(project,ProjectCloseRegistry::capture(app.workspace_model.identity));app.project_ui.close_generation.insert(project,7);
                 drop(app.finish_closed_project(project,ProjectSessionClosure::for_roots(vec![repository])));
                 assert!(app.sidebar_model.project(project).is_some());assert!(app.project_ui.recovery_closures.contains_key(&project));
             }
@@ -3001,7 +3059,8 @@ mod tests {
             app.cards.insert(card,CardRuntime::Repository(Box::new(runtime)));
             // Teardown was admitted first; the real publisher then freezes
             // this exact owned participant before its result is polled.
-            app.project_ui.closing.insert(project,repository.clone());app.project_ui.close_generation.insert(project,7);
+            app.project_ui.closing.insert(project,repository.clone());
+        app.project_ui.close_registry.insert(project,ProjectCloseRegistry::capture(app.workspace_model.identity));app.project_ui.close_generation.insert(project,7);
             let publishing=app.project_editor_publication_fixture(card,&repository,95);
             assert!(app.card_has_project_editor_write(card));
             drop(app.update(Message::EditorFeatures(super::super::editor_features::Action::HidePublication(95))));
@@ -3032,10 +3091,44 @@ mod tests {
     }
 
     #[test]
+    fn actual_registry_join_revokes_old_project_closure_before_held_reply() {
+        for original in [crate::workspace_model::NO_REGISTRY,uuid::Uuid::new_v4()] {
+            let repository=PathBuf::from("/registry-replacement-project");
+            let linked=SidebarWorktree::from_durable(WorktreeId::new(),repository.join("linked"),Some("feature".into()));
+            let primary=SidebarWorktree::from_durable(WorktreeId::new(),repository.clone(),Some("main".into()));
+            let (mut app,_storage,project)=deletable_app(&repository,&linked,&primary);
+            app.workspace_model.identity=original;
+            Arc::make_mut(&mut app.durable).workspace_model_identity=(original!=crate::workspace_model::NO_REGISTRY).then_some(original);
+            let (card,authority)=retain_project_editor_recovery(&mut app,project,&repository,&linked.path);
+            app.project_ui.closing.insert(project,repository.clone());
+            app.project_ui.closed.insert(repository.clone());
+            app.project_ui.close_registry.insert(project,ProjectCloseRegistry::capture(original));
+            app.project_ui.close_generation.insert(project,7);
+            drop(app.handle_project_action(Action::ProjectSessionsClosed(project,7,Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])))));
+            assert!(app.project_ui.recovery_closures.contains_key(&project));
+            let model=crate::workspace_model::WorkspaceModel {
+                identity:uuid::Uuid::new_v4(),
+                projects:vec![crate::workspace_model::ModelProject{repository:repository.clone(),checkout:Some(repository.clone()),primary_checkout:Some(repository.clone()),name:"Replacement registry project".into(),kind:Default::default(),ordinal:99}],
+                ..Default::default()
+            };
+            drop(app.apply_workspace_model_update(super::super::workspace_model_sync::ModelUpdate::Connected(model)));
+            assert!(!app.project_ui.closing.contains_key(&project));assert!(!app.project_ui.recovery_closures.contains_key(&project));
+            assert!(!app.project_ui.close_registry.contains_key(&project));assert!(!app.project_ui.closed.contains(&repository));
+            // Both the delayed asynchronous result and a direct stale final
+            // receipt have lost authority; no registry basis is recaptured.
+            drop(app.handle_project_action(Action::ProjectSessionsClosed(project,7,Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])))));
+            drop(app.finish_closed_project(project,ProjectSessionClosure::for_roots(vec![repository])));
+            assert!(app.sidebar_model.project(project).is_some());assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.cards.contains_key(&card));assert!(!authority.is_resolved());
+        }
+    }
+
+    #[test]
     fn cancellation_retires_only_the_original_recovery_closure() {
         let mut app=super::super::tests::context_inspector_test_app(false);
         let project=ProjectId::new();let repository=PathBuf::from("/recovery-project");
         app.project_ui.closing.insert(project,repository.clone());
+        app.project_ui.close_registry.insert(project,ProjectCloseRegistry::capture(app.workspace_model.identity));
         app.project_ui.close_generation.insert(project,7);
         app.project_ui.recovery_closures.insert(project,(7,ProjectSessionClosure::for_roots(vec![repository.clone()])));
         app.cancel_shared_project_close(&repository);
@@ -3486,6 +3579,7 @@ mod tests {
         assert!(!ownership.contains(child_session, &parent_path, &scope));
         app.active_workspace = Some(child_path.clone());
         app.project_ui.closing.insert(parent, parent_path.clone());
+        app.project_ui.close_registry.insert(parent,ProjectCloseRegistry::capture(app.workspace_model.identity));
         assert!(!app.refuse_in_deleting_worktree(&child_path));
         assert!(!app.refuse_for_deleting_card(child_card));
         assert!(app.refuse_in_deleting_worktree(&parent_path));
@@ -3525,6 +3619,7 @@ mod tests {
         drop(app.add_terminal(child.clone()));
         let card = app.durable.cards.last().unwrap().id;
         app.project_ui.closing.insert(parent, root.clone());
+        app.project_ui.close_registry.insert(parent,ProjectCloseRegistry::capture(app.workspace_model.identity));
         let closure = ProjectSessionClosure {
             removed_model: None,
             scope: ProjectSessionScope::new(vec![root], vec![child.clone()]),

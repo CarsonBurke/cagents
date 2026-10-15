@@ -619,6 +619,7 @@ impl Cagents {
         if self.durable.workspace_model_identity == Some(identity) {
             return;
         }
+        self.join_project_close_registry(identity);
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
