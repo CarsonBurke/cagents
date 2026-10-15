@@ -1274,9 +1274,7 @@ mod settings_recorder_tests {
             durable.cards = vec![first, second, third];
             durable.focused = Some(ids[2]);
             app.workspace = Cagents::rebuild_workspace(&app.durable);
-            app.tab_history = crate::tab_history::TabHistory::from_recent([
-                ids[2], ids[1], ids[0],
-            ]);
+            app.tab_history = crate::tab_history::TabHistory::from_recent([ids[2], ids[1], ids[0]]);
             let press = |key: keyboard::Key, physical, modifiers| Message::KeyEvent {
                 event: keyboard::Event::KeyPressed {
                     modified_key: key.clone(),
@@ -1289,11 +1287,13 @@ mod settings_recorder_tests {
                 },
                 captured: true,
             };
-            let tab = || press(
-                keyboard::Key::Named(keyboard::key::Named::Tab),
-                keyboard::key::Code::Tab,
-                keyboard::Modifiers::CTRL,
-            );
+            let tab = || {
+                press(
+                    keyboard::Key::Named(keyboard::key::Named::Tab),
+                    keyboard::key::Code::Tab,
+                    keyboard::Modifiers::CTRL,
+                )
+            };
             drop(app.update(tab()));
             assert_eq!(app.workspace.focused(), Some(ids[1]));
             assert!(app.tab_history.cycle_order().is_some());
@@ -1314,7 +1314,10 @@ mod settings_recorder_tests {
             } else {
                 keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty())
             };
-            drop(app.update(Message::KeyEvent { event, captured: true }));
+            drop(app.update(Message::KeyEvent {
+                event,
+                captured: true,
+            }));
             assert!(app.palette.is_open());
             assert!(app.tab_history.cycle_order().is_none());
             drop(app.update(press(

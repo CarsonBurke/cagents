@@ -620,7 +620,11 @@ mod tests {
 
     #[test]
     fn settings_chat_list_markers_follow_font_and_size_on_the_retained_markdown_tree() {
-        use iced::advanced::{layout, text::Paragraph as _, widget::{Tree, tree::Tag}};
+        use iced::advanced::{
+            layout,
+            text::Paragraph as _,
+            widget::{Tree, tree::Tag},
+        };
         type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
         type TextState = iced::advanced::widget::text::State<Paragraph>;
         fn markers(tree: &Tree, out: &mut Vec<(String, iced::Font, f32)>) {
@@ -628,28 +632,44 @@ mod tests {
                 let state = tree.state.downcast_ref::<TextState>();
                 let content = state.paragraph.content();
                 if matches!(content, "•" | "1." | "2.") {
-                    out.push((content.to_owned(), state.paragraph.raw().font(), state.paragraph.raw().size().0));
+                    out.push((
+                        content.to_owned(),
+                        state.paragraph.raw().font(),
+                        state.paragraph.raw().size().0,
+                    ));
                 }
             }
-            for child in &tree.children { markers(child, out); }
+            for child in &tree.children {
+                markers(child, out);
+            }
         }
         let renderer = crate::app::tests::headless_renderer();
         // Use the actual renderer's installed inventory, including private XDG
         // lanes where user-only family names may not exist. No skipped path.
         let families = design::installed_font_families(false);
         assert!(families.len() >= 2, "two installed families required");
-        let fonts = [iced::Font::with_name(families[0].as_str()), iced::Font::with_name(families[1].as_str())];
+        let fonts = [
+            iced::Font::with_name(families[0].as_str()),
+            iced::Font::with_name(families[1].as_str()),
+        ];
         assert_ne!(fonts[0].family, fonts[1].family);
-        let cached = CachedItem::new(&ItemContent::Text {
-            text: "- alpha\n- beta\n\n1. gamma\n2. delta".into(),
-            thinking: false,
-            phase: chat::Phase::Final,
-        }, crate::settings::EditorSyntaxTheme::Auto);
-        let target = Target { card: CardId::new(), generation: 17 };
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: "- alpha\n- beta\n\n1. gamma\n2. delta".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let target = Target {
+            card: CardId::new(),
+            generation: 17,
+        };
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0));
         let mut tree = None;
         for (font, size) in fonts.into_iter().zip([13.0, 24.0]) {
-            let mut settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            let mut settings =
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
             settings.style.font = font;
             settings.text_size = size.into();
             let mut element = view(&cached, settings, target, None);
@@ -658,41 +678,68 @@ mod tests {
             let _ = element.as_widget_mut().layout(tree, &renderer, &limits);
             let mut actual = Vec::new();
             markers(tree, &mut actual);
-            assert_eq!(actual.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(), ["•", "•", "1.", "2."]);
+            assert_eq!(
+                actual.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+                ["•", "•", "1.", "2."]
+            );
             for (marker, actual_font, actual_size) in actual {
-                assert_eq!(actual_font, font, "rendered list marker {marker} must follow chat prose family");
-                assert_eq!(actual_size, size, "rendered list marker {marker} must follow chat prose size");
+                assert_eq!(
+                    actual_font, font,
+                    "rendered list marker {marker} must follow chat prose family"
+                );
+                assert_eq!(
+                    actual_size, size,
+                    "rendered list marker {marker} must follow chat prose size"
+                );
             }
         }
     }
 
     #[test]
     fn settings_chat_image_text_follows_prose_and_caption_scale_on_the_retained_tree() {
-        use iced::advanced::{layout, widget::{Tree, tree::Tag}};
+        use iced::advanced::{
+            layout,
+            widget::{Tree, tree::Tag},
+        };
         fn image_text(tree: &Tree, out: &mut Vec<(String, iced::Font, f32)>) {
             if tree.tag == Tag::of::<selectable_prose::State>() {
                 let state = tree.state.downcast_ref::<selectable_prose::State>();
                 let (font, size) = state.typography_for_test();
                 out.push((state.plain.to_string(), font, size.0));
             }
-            for child in &tree.children { image_text(child, out); }
+            for child in &tree.children {
+                image_text(child, out);
+            }
         }
         let renderer = crate::app::tests::headless_renderer();
         let families = design::installed_font_families(false);
         assert!(families.len() >= 2, "two installed families required");
-        let fonts = [iced::Font::with_name(families[0].as_str()), iced::Font::with_name(families[1].as_str())];
+        let fonts = [
+            iced::Font::with_name(families[0].as_str()),
+            iced::Font::with_name(families[1].as_str()),
+        ];
         assert_ne!(fonts[0].family, fonts[1].family);
-        let cached = CachedItem::new(&ItemContent::Text {
-            text: r#"![Diagram alt](docs/diagram.png "Image caption")"#.into(),
-            thinking: false,
-            phase: chat::Phase::Final,
-        }, crate::settings::EditorSyntaxTheme::Auto);
-        assert!(matches!(cached.markdown.items(), [markdown::Item::Image { .. }]));
-        let target = Target { card: CardId::new(), generation: 17 };
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: r#"![Diagram alt](docs/diagram.png "Image caption")"#.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        assert!(matches!(
+            cached.markdown.items(),
+            [markdown::Item::Image { .. }]
+        ));
+        let target = Target {
+            card: CardId::new(),
+            generation: 17,
+        };
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0));
         let mut tree = None;
         for (font, size) in fonts.into_iter().zip([13.0, 24.0]) {
-            let mut settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            let mut settings =
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
             settings.style.font = font;
             settings.text_size = size.into();
             let mut element = view(&cached, settings, target, None);
@@ -701,9 +748,20 @@ mod tests {
             let _ = element.as_widget_mut().layout(tree, &renderer, &limits);
             let mut actual = Vec::new();
             image_text(tree, &mut actual);
-            assert_eq!(actual.len(), 2, "actual selectable alternative and caption text");
+            assert_eq!(
+                actual.len(),
+                2,
+                "actual selectable alternative and caption text"
+            );
             assert_eq!(actual[0], ("Diagram alt".to_owned(), font, size));
-            assert_eq!(actual[1], ("Image caption".to_owned(), font, size * (design::TEXT_CAPTION / design::TEXT_PROSE)));
+            assert_eq!(
+                actual[1],
+                (
+                    "Image caption".to_owned(),
+                    font,
+                    size * (design::TEXT_CAPTION / design::TEXT_PROSE)
+                )
+            );
         }
     }
 
