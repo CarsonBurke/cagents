@@ -1052,6 +1052,23 @@ impl Cagents {
         self.update(Message::Sidebar(action))
     }
 
+    fn review_command_capabilities(&self, card: CardId) -> u8 {
+        let (runtime, mut flags) = match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => (runtime.as_ref(),
+                if self.local_diff_file_target(card, true).is_some() { 2 } else { 0 }
+                    | if self.local_diff_file_target(card, false).is_some() { 4 } else { 0 }),
+            Some(CardRuntime::PullRequests(pane)) => (&pane.runtime,
+                if pane.review.can_toggle_selected_viewed() { 1 } else { 0 }
+                    | if pane.review.can_step_file(true) { 2 } else { 0 }
+                    | if pane.review.can_step_file(false) { 4 } else { 0 }
+                    | if pane.review.can_next_unviewed() { 8 } else { 0 }),
+            _ => return 0,
+        };
+        if runtime.can_step_change(true) { flags |= 16; }
+        if runtime.can_step_change(false) { flags |= 32; }
+        flags
+    }
+
     /// Availability is shared by palette listing and execution. A stale menu
     /// or shortcut cannot turn an unavailable command into a silent no-op.
     fn command_context(&self, card: Option<CardId>) -> workspace_widget::CommandContext {
@@ -1075,6 +1092,7 @@ impl Cagents {
                 _ => workspace_widget::FocusedPane::Other,
             },
             can_navigate_diagnostics: card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.diagnostic_navigation_available())),
+            review_commands: card.map_or(0, |card| self.review_command_capabilities(card)),
             diff_commands: card.map_or(0, |id| match self.cards.get(&id) {
                 Some(CardRuntime::Repository(runtime)) => Some(runtime.as_ref()),
                 Some(CardRuntime::PullRequests(pane)) => Some(&pane.runtime),
@@ -1113,7 +1131,6 @@ impl Cagents {
             can_switch: card
                 .is_some_and(|id| self.chat_switch_available(id) && self.chat_switch_ready(id)),
             can_review: card.and_then(|id| self.chat_changes_target(id)).is_some(),
-            is_pull_request: card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::PullRequests(_)))) ,
             can_find: !self.sidebar_model.projects.is_empty() || card.is_some_and(|id| match self.cards.get(&id) {
                 Some(CardRuntime::Repository(runtime)) => runtime.editor_focus_target(id).is_some(),
                 Some(CardRuntime::Chat(_) | CardRuntime::Settings | CardRuntime::Terminal(_)) => {

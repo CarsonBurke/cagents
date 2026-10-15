@@ -1486,35 +1486,37 @@ impl State {
 
     /// Moves the selection through the tree's file rows. With nothing
     /// selected, forward selects the first file and backward the last.
-    fn step_file(&mut self, direction: isize) {
-        let files: Vec<usize> = self.rows.iter().filter_map(|row| row.file).collect();
-        if files.is_empty() {
-            return;
-        }
-        let current = self
-            .selected
-            .as_ref()
-            .and_then(|path| self.file_index(path))
-            .and_then(|index| files.iter().position(|file| *file == index));
-        let visible = |index: &&usize| !self.hide_viewed || !self.files[**index].viewed;
-        let next = if direction > 0 {
-            files
-                .iter()
-                .skip(current.map_or(0, |position| position + 1))
-                .find(visible)
+    fn step_file_target(&self, direction: isize) -> Option<usize> {
+        let current = self.selected.as_ref().and_then(|path| self.file_index(path))
+            .and_then(|index| self.rows.iter().position(|row| row.file == Some(index)));
+        let visible = |index: &usize| !self.hide_viewed || !self.files[*index].viewed;
+        if direction > 0 {
+            self.rows.iter().skip(current.map_or(0, |position| position + 1))
+                .filter_map(|row| row.file).find(visible)
         } else {
-            files[..current.unwrap_or(files.len())]
-                .iter()
-                .rev()
-                .find(visible)
-        };
-        let Some(&index) = next else {
-            return;
-        };
-        if self.selected.as_ref() == Some(&self.files[index].entry.path) {
-            return;
+            self.rows[..current.unwrap_or(self.rows.len())].iter().rev()
+                .filter_map(|row| row.file).find(visible)
         }
-        self.select_file(self.files[index].entry.path.clone());
+    }
+
+    pub fn can_step_file(&self, forward: bool) -> bool {
+        self.range.is_some() && self.step_file_target(if forward { 1 } else { -1 }).is_some()
+    }
+
+    pub fn can_next_unviewed(&self) -> bool {
+        self.range.is_some() && self.rows.iter().filter_map(|row| row.file).any(|index| !self.files[index].viewed)
+    }
+
+    pub fn can_toggle_selected_viewed(&self) -> bool {
+        self.target.is_some() && self.context.is_some() && self.selected.as_ref()
+            .and_then(|path| self.file_index(path))
+            .is_some_and(|index| !matches!(self.files[index].sync, ViewedSync::Pending | ViewedSync::Unknown))
+    }
+
+    fn step_file(&mut self, direction: isize) {
+        if let Some(index) = self.step_file_target(direction) {
+            self.select_file(self.files[index].entry.path.clone());
+        }
     }
 
     /// Flips the marks optimistically and sends them to GitHub in one
@@ -3579,6 +3581,39 @@ pub(crate) mod tests {
         assert!(!state.refreshing);
         assert!(state.files[0].viewed);
         assert_eq!(state.files[0].sync, ViewedSync::Pending);
+    }
+
+    #[test]
+    fn review_command_capabilities_match_hidden_rows_boundaries_and_pending_marks() {
+        let (mut state, _) = state();
+        assert!(!state.can_step_file(true));
+        assert!(!state.can_next_unviewed());
+        assert!(!state.can_toggle_selected_viewed());
+        open_with(&mut state, loaded(vec![entry("a.rs", ChangeKind::Modified), entry("b.rs", ChangeKind::Modified)], vec![]));
+        state.select_file(path("a.rs"));
+        assert!(!state.can_step_file(false));
+        assert!(state.can_step_file(true));
+        assert!(state.can_next_unviewed());
+        assert!(state.can_toggle_selected_viewed());
+        state.hide_viewed = true;
+        state.files[1].viewed = true;
+        assert!(!state.can_step_file(true));
+        drop(state.update(Action::NextFile));
+        assert_eq!(state.selected(), Some(&path("a.rs")));
+        state.hide_viewed = false;
+        assert!(state.can_step_file(true));
+        drop(state.update(Action::NextFile));
+        assert_eq!(state.selected(), Some(&path("b.rs")));
+        assert!(!state.can_step_file(true));
+        assert!(state.can_step_file(false));
+        for sync in [ViewedSync::Pending, ViewedSync::Unknown] {
+            state.files[1].sync = sync;
+            assert!(!state.can_toggle_selected_viewed());
+        }
+        state.files[1].sync = ViewedSync::Settled;
+        assert!(state.can_toggle_selected_viewed());
+        state.files[0].viewed = true;
+        assert!(!state.can_next_unviewed());
     }
 
     #[test]

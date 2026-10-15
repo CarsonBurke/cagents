@@ -4714,6 +4714,10 @@ impl RepositoryRuntime {
             && self.diff_model().is_some()
     }
 
+    pub fn can_step_change(&self, next: bool) -> bool {
+        self.can_navigate_diff() && self.change_target(next).is_some()
+    }
+
     fn can_navigate_diff(&self) -> bool {
         self.can_change_diff_layout()
             && self.change_count() != 0
@@ -9786,7 +9790,7 @@ fn diff_review_controls(
                 "Previous",
                 "Previous hunk · Alt+K / Shift+F7",
                 false,
-                (runtime.can_navigate_diff() && runtime.change_target(false).is_some())
+                (runtime.can_step_change(false))
                     .then_some(RepositoryAction::PreviousChange { card }),
             ),
             crate::interaction::tooltip(
@@ -9810,7 +9814,7 @@ fn diff_review_controls(
                 "Next",
                 "Next hunk · Alt+J / F7",
                 false,
-                (runtime.can_navigate_diff() && runtime.change_target(true).is_some())
+                (runtime.can_step_change(true))
                     .then_some(RepositoryAction::NextChange { card }),
             ),
         ]),
@@ -15324,16 +15328,19 @@ mod tests {
         let middle = runtime.diff_rows().unwrap().offset(7);
         let last = runtime.diff_rows().unwrap().offset(15);
         runtime.diff_viewport.offset = middle + 1.0;
+        assert!(runtime.can_step_change(true));
         runtime.navigate_change(true);
         assert_eq!(runtime.diff_change, 2);
         runtime.realize_current_change();
         assert_eq!(runtime.diff_viewport.offset, last);
+        assert!(!runtime.can_step_change(true));
         runtime.navigate_change(true);
         assert_eq!(runtime.diff_change, 2);
         runtime.diff_viewport.offset = middle + 1.0;
         runtime.navigate_change(false);
         assert_eq!(runtime.diff_change, 1);
         runtime.diff_viewport.offset = 0.0;
+        assert!(!runtime.can_step_change(false));
         assert!(!runtime.navigate_change(false));
         assert_eq!(runtime.diff_viewport.offset, 0.0);
     }

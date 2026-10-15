@@ -448,13 +448,13 @@ pub struct CommandContext {
     pub chat_permissions: bool,
     pub can_switch: bool,
     pub can_review: bool,
-    pub is_pull_request: bool,
     pub can_find: bool,
     pub daemon_can_restart: bool,
     pub can_reopen: bool,
     pub has_unread: bool,
     pub editor_commands: u8,
     pub diff_commands: u8,
+    pub review_commands: u8,
     pub can_navigate_diagnostics: bool,
     pub can_search_project: bool,
     pub has_attention: bool,
@@ -526,6 +526,7 @@ impl ShortcutDescriptor {
         {
             return false;
         }
+        if let Some(bit) = review_command_bit(self.action) { return context.review_commands & bit != 0; }
         if let Some(bit) = diff_command_bit(self.action) {
             return context.diff_commands & bit != 0;
         }
@@ -543,7 +544,6 @@ impl ShortcutDescriptor {
             GlobalShortcut::NextAttention | GlobalShortcut::PreviousAttention => context.has_attention,
             GlobalShortcut::CycleWorkspace(_) => context.can_cycle_workspace,
             GlobalShortcut::SearchInProject => context.can_search_project,
-            GlobalShortcut::ReviewToggleViewed | GlobalShortcut::ReviewNextUnviewed => context.is_pull_request,
             GlobalShortcut::ChatAccount => context.chat_account,
             GlobalShortcut::ChatModel => context.chat_model,
             GlobalShortcut::ChatPermissions => context.chat_permissions,
@@ -1782,6 +1782,18 @@ fn global_shortcut_descriptor(
             && shortcut_keys(descriptor.action, shortcuts).iter().any(|chord| {
                 parse_shortcut(chord).is_ok_and(|binding| shortcut_matches(binding, key, physical_key, modifiers))
             })
+    })
+}
+
+pub const fn review_command_bit(command: GlobalShortcut) -> Option<u8> {
+    Some(match command {
+        GlobalShortcut::ReviewToggleViewed => 1,
+        GlobalShortcut::ReviewNextFile => 2,
+        GlobalShortcut::ReviewPreviousFile => 4,
+        GlobalShortcut::ReviewNextUnviewed => 8,
+        GlobalShortcut::ReviewNextChange => 16,
+        GlobalShortcut::ReviewPreviousChange => 32,
+        _ => return None,
     })
 }
 

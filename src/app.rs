@@ -7184,6 +7184,21 @@ impl Cagents {
         ])
     }
 
+    fn local_diff_file_target(&self, card: CardId, forward: bool) -> Option<(&sidebar::ActiveWorktreeKey, ChangeArea, &crate::repository::RepoPath)> {
+        let CardRuntime::Repository(runtime) = self.cards.get(&card)? else { return None; };
+        if runtime.is_saving() || !runtime.shows_diff() { return None; }
+        let source = self.sidebar_model.source_control.as_ref().filter(|source| {
+            source.key.canonical_path == runtime.descriptor.worktree
+                && self.sidebar_state.active_worktree() == Some(&source.key)
+        })?;
+        let staged = matches!(runtime.selected_diff_basis(), DiffBasis::HeadToIndex);
+        let rows = || source.groups().iter().filter(|group| (group.area == ChangeArea::Staged) == staged)
+            .flat_map(|group| group.rows().iter().map(move |row| (group.area, &row.entry.path)));
+        let current = rows().position(|(_, path)| Some(path.as_path()) == runtime.selected_path());
+        let index = match current { Some(index) if forward => index.checked_add(1)?, Some(index) => index.checked_sub(1)?, None => 0 };
+        rows().nth(index).map(|(area, path)| (&source.key, area, path))
+    }
+
     fn navigate_local_diff(
         &mut self,
         card: CardId,
@@ -7204,43 +7219,9 @@ impl Cagents {
             GlobalShortcut::ReviewNextFile | GlobalShortcut::ReviewPreviousFile => {}
             _ => return Task::none(),
         }
-        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
-            return Task::none();
-        };
-        let Some(source) = self
-            .sidebar_model
-            .source_control
-            .as_ref()
-            .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
-        else {
-            return Task::none();
-        };
-        let staged = matches!(runtime.selected_diff_basis(), DiffBasis::HeadToIndex);
-        let paths: Vec<_> = source
-            .groups()
-            .iter()
-            .filter(|group| (group.area == ChangeArea::Staged) == staged)
-            .flat_map(|group| {
-                group
-                    .rows()
-                    .iter()
-                    .map(move |row| (group.area, &row.entry.path))
-            })
-            .collect();
-        if paths.is_empty() {
-            return Task::none();
-        }
-        let current = paths
-            .iter()
-            .position(|(_, path)| Some(path.as_path()) == runtime.selected_path());
-        let index = match (shortcut, current) {
-            (GlobalShortcut::ReviewPreviousFile, Some(index)) => index.saturating_sub(1),
-            (_, Some(index)) => (index + 1).min(paths.len() - 1),
-            _ => 0,
-        };
-        let (area, path) = paths[index];
+        let Some((key, area, path)) = self.local_diff_file_target(card, shortcut == GlobalShortcut::ReviewNextFile) else { return Task::none(); };
         cosmic::task::message(Message::Sidebar(SidebarAction::OpenChange {
-            key: source.key.clone(),
+            key: key.clone(),
             path: path.clone(),
             area,
         }))
@@ -29287,6 +29268,33 @@ mod tests {
             },
         );
         (app, project)
+    }
+
+    #[test]
+    fn review_palette_availability_follows_loaded_targets_and_file_boundaries() {
+        use workspace_widget::GlobalShortcut as Command;
+        use crate::pull_request_review::tests as review_fixtures;
+        let (mut app, _) = pull_request_test_app(&[1]);
+        let (card, task) = app.add_pull_requests_card(PathBuf::from("/repo"));
+        drop(task);
+        for command in [Command::ReviewToggleViewed, Command::ReviewNextUnviewed, Command::ReviewNextFile, Command::ReviewPreviousFile, Command::ReviewNextChange, Command::ReviewPreviousChange] {
+            assert!(!app.command_available(command), "empty review {command:?}");
+        }
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else { panic!("review pane"); };
+        let (mut review, _) = review_fixtures::state();
+        drop(review.update(pull_request_review::Action::Open(review_fixtures::target(1))));
+        review_fixtures::finish_load(&mut review, review_fixtures::loaded(vec![review_fixtures::entry("a.rs", crate::repository::ChangeKind::Modified), review_fixtures::entry("b.rs", crate::repository::ChangeKind::Modified)], Vec::new()));
+        drop(review.update(pull_request_review::Action::SelectFile(crate::repository::RepoPath::parse("a.rs").unwrap())));
+        pane.review = review;
+        assert!(app.command_available(Command::ReviewNextFile));
+        assert!(!app.command_available(Command::ReviewPreviousFile));
+        assert!(app.command_available(Command::ReviewToggleViewed));
+        assert!(!app.command_available(Command::ReviewNextChange));
+        drop(app.update(Message::RunCommand(Command::ReviewNextFile)));
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&card) else { panic!("review pane"); };
+        assert_eq!(pane.review.selected(), Some(&crate::repository::RepoPath::parse("b.rs").unwrap()));
+        assert!(!app.command_available(Command::ReviewNextFile));
+        assert!(app.command_available(Command::ReviewPreviousFile));
     }
 
     fn pull_request_cards(app: &Cagents) -> Vec<(CardId, Option<u64>)> {
