@@ -692,13 +692,12 @@ fn parent_modes<'a>(
 /// been restored. The ordered caller flushes completed subtrees, so siblings
 /// do not accumulate Root descriptors for a large recovery selection.
 struct RecoveryDirectoryFrontier {
-    namespace: Option<fs_safety::DirectoryNamespace>,
     owned: BTreeMap<RepoPath, (fs_safety::DirectoryPublication, u32)>,
     warnings: BTreeMap<RepoPath, MutationFailure>,
 }
 impl RecoveryDirectoryFrontier {
-    fn new(root: &fs_safety::Root) -> Self {
-        Self { namespace: fs_safety::DirectoryNamespace::acquire(root).ok(), owned: BTreeMap::new(), warnings: BTreeMap::new() }
+    fn new(_root: &fs_safety::Root) -> Self {
+        Self { owned: BTreeMap::new(), warnings: BTreeMap::new() }
     }
     fn flush_before(&mut self, next: Option<&RepoPath>, failures: &mut Vec<MutationFailure>) {
         let mut done = self.owned.keys().filter(|path| next.is_none_or(|next| !next.as_path().starts_with(path.as_path()))).cloned().collect::<Vec<_>>();
@@ -707,7 +706,7 @@ impl RecoveryDirectoryFrontier {
             let (publication, mode) = self.owned.remove(&path).expect("selected owned frontier entry");
             // This is the prepublication held inode, including after the public
             // spelling is replaced. No naked dev/ino reopen can authorize chmod.
-            match fs_safety::set_directory_permissions(publication.directory(), mode) {
+            match set_exact_directory_mode(publication.directory(), mode) {
                 Err(error) => failures.push(MutationFailure::Path { path, reason: format!("Could not restore the created directory's previous permissions: {error}") }),
                 Ok(()) => if let Err(error) = fs_safety::sync_directory(publication.directory()) {
                     failures.push(MutationFailure::Reconciliation { reason: format!("{} archived directory permissions were restored, but durability is unconfirmed: {error}", path) });
@@ -725,6 +724,25 @@ impl RecoveryDirectoryFrontier {
     }
 }
 
+/// chmod can succeed while the kernel clears unsupported set-id bits. Report
+/// the actual retained inode's mode instead of equating syscall success with
+/// exact restoration.
+fn set_exact_directory_mode(directory: &fs_safety::Root, mode: u32) -> io::Result<()> {
+    fs_safety::set_directory_permissions(directory, mode)?;
+    verify_directory_mode(directory, mode)
+}
+
+fn verify_directory_mode(directory: &fs_safety::Root, expected: u32) -> io::Result<()> {
+    let actual = directory.metadata()?.mode() & 0o7777;
+    if actual != expected & 0o7777 {
+        return Err(io::Error::other(format!(
+            "requested permissions {:04o}, but the retained directory has {:04o}",
+            expected & 0o7777, actual,
+        )));
+    }
+    Ok(())
+}
+
 fn recovery_parent(
     root: &fs_safety::Root,
     path: &RepoPath,
@@ -738,11 +756,13 @@ fn recovery_parent(
         let key = RepoPath::parse(&relative).map_err(|error| error.to_string())?;
         if let Some(held) = created.held_parent(root, &key)? { parent = held; continue; }
         let mode = modes.get(&key).copied().unwrap_or(0o755);
-        let result = if let Some(namespace) = created.namespace.as_ref() {
-            fs_safety::create_directory_in_namespace(namespace, &parent, Path::new(component.as_os_str()), mode | 0o700)
-        } else {
-            fs_safety::create_directory_beneath(&parent, Path::new(component.as_os_str()), mode | 0o700)
-        }.map_err(|error| error.to_string())?;
+        // Creation ownership depends on the actual requested parent. A
+        // protected checkout top cannot authorize mkdir in a writable nested
+        // directory. Published parents stay private while descendants need it;
+        // their archived mode is restored by the component-ordered frontier.
+        let result = fs_safety::create_directory_beneath(
+            &parent, Path::new(component.as_os_str()), 0o700,
+        ).map_err(|error| error.to_string())?;
         parent = match result {
             fs_safety::DirectoryCreation::Existing(directory) => directory,
             fs_safety::DirectoryCreation::Unverified { directory, reason } => {
@@ -759,7 +779,7 @@ fn recovery_parent(
                 // the exact created inode for final mode restoration.
                 created.owned.insert(key.clone(), (publication, mode));
                 let publication = &created.owned[&key].0;
-                fs_safety::set_directory_permissions(publication.directory(), mode | 0o700).map_err(|error| error.to_string())?;
+                set_exact_directory_mode(publication.directory(), 0o700).map_err(|error| error.to_string())?;
                 created.held_parent(root, &key)?.ok_or("the created parent authority is unavailable")?
             }
         };
@@ -1368,6 +1388,35 @@ mod directory_frontier_tests {
         assert_eq!(fs::metadata(dir.path().join("a-z")).unwrap().mode() & 0o777, 0o710);
         assert!(failures.is_empty(), "{failures:?}");
         fs::set_permissions(dir.path().join("a"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn recovery_directory_frontier_restores_shared_modes_after_nested_private_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(dir.path()).unwrap();
+        let mut state = RecoveryDirectoryFrontier::new(&root);
+        let modes = BTreeMap::from([(path("shared"), 0o775), (path("shared/nested"), 0o750)]);
+        let (parent, _) = recovery_parent(&root, &path("shared/nested/file"), &modes, &mut state).unwrap();
+        drop(parent);
+        assert_eq!(fs::metadata(dir.path().join("shared")).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(state.owned.len(), 2, "each actual private parent must publish its own held receipt");
+        assert!(state.warnings.is_empty());
+        let mut failures = vec![];
+        state.flush_before(None, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(fs::metadata(dir.path().join("shared")).unwrap().mode() & 0o7777, 0o775);
+        assert_eq!(fs::metadata(dir.path().join("shared/nested")).unwrap().mode() & 0o7777, 0o750);
+    }
+
+    #[test]
+    fn recovery_directory_mode_verification_reports_stripped_or_different_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(dir.path()).unwrap();
+        fs_safety::set_directory_permissions(&root, 0o700).unwrap();
+        let error = verify_directory_mode(&root, 0o2700).unwrap_err();
+        assert!(error.to_string().contains("2700"));
+        assert!(error.to_string().contains("0700"));
+        verify_directory_mode(&root, 0o700).unwrap();
     }
 
     #[test]
