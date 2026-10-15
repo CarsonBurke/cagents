@@ -8,6 +8,7 @@ const ID_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OriginalText {
+    pub source_incarnation:Option<uuid::Uuid>,
     pub session_id: String,
     pub original: OriginalPrompt,
     pub text: String,
@@ -68,6 +69,7 @@ pub(crate) fn validate_page(
 /// Collects one original while fencing every later page to the first native
 /// user, confirmed session, settings, attachments, and declared byte length.
 pub(crate) struct Assembly {
+    source_incarnation:Option<uuid::Uuid>,
     user: Option<String>,
     session: Option<String>,
     original: Option<OriginalPrompt>,
@@ -78,7 +80,7 @@ pub(crate) struct Assembly {
 impl Assembly {
     pub(crate) fn new(user: Option<&str>, session: Option<&str>) -> Result<Self, OriginalError> {
         validate_query(user, session, 0, ORIGINAL_PAGE_BYTES)?;
-        Ok(Self { user: user.map(str::to_owned), session: session.map(str::to_owned),
+        Ok(Self { source_incarnation:None,user: user.map(str::to_owned), session: session.map(str::to_owned),
             original: None, text: String::new(), complete: false })
     }
 
@@ -93,7 +95,9 @@ impl Assembly {
         if self.original.as_ref().is_some_and(|original| original != &page.original) {
             return Err(OriginalError::Changed);
         }
+        if self.original.is_some() && self.source_incarnation!=page.source_incarnation {return Err(OriginalError::Changed);}
         if self.original.is_none() {
+            self.source_incarnation=page.source_incarnation;
             self.user = Some(page.original.user_id.clone());
             self.session = Some(page.session_id.clone());
             self.original = Some(page.original);
@@ -105,7 +109,7 @@ impl Assembly {
 
     pub(crate) fn finish(self) -> Result<OriginalText, OriginalError> {
         if !self.complete { return Err(OriginalError::Changed); }
-        Ok(OriginalText { session_id: self.session.ok_or(OriginalError::Changed)?,
+        Ok(OriginalText {source_incarnation:self.source_incarnation, session_id: self.session.ok_or(OriginalError::Changed)?,
             original: self.original.ok_or(OriginalError::Changed)?, text: self.text })
     }
 }
@@ -115,8 +119,18 @@ mod tests {
     use super::*;
     use crate::chat::annotations::{OriginalSettings, Setting};
 
+    #[test]
+    fn assembly_pins_source_incarnation_even_when_other_original_metadata_matches() {
+        let first=uuid::Uuid::new_v4();let second=uuid::Uuid::new_v4();
+        for (initial,next,accepted) in [(None,None,true),(Some(first),Some(first),true),(Some(first),Some(second),false),(None,Some(first),false),(Some(first),None,false)] {
+            let mut reader=Assembly::new(None,None).unwrap();let mut begin=page(0,"ab",4);begin.source_incarnation=initial;
+            assert!(!reader.push(begin).unwrap());let mut end=page(2,"cd",4);end.source_incarnation=next;
+            if accepted {assert!(reader.push(end).unwrap());let value=reader.finish().unwrap();assert_eq!(value.source_incarnation,initial);assert_eq!(value.text,"abcd");}
+            else {assert_eq!(reader.push(end).unwrap_err(),OriginalError::Changed);}
+        }
+    }
     fn page(offset: usize, text: &str, total: usize) -> OriginalPage {
-        OriginalPage { session_id: "confirmed-session".into(), original: OriginalPrompt {
+        OriginalPage {source_incarnation:None, session_id: "confirmed-session".into(), original: OriginalPrompt {
             user_id: "native-user".into(), turn_id: "native-turn".into(), text_bytes: total,
             attachments: vec![], settings: OriginalSettings { model: Setting::Value("native-model".into()),
                 reasoning: Setting::Value("low".into()), fast: Setting::Unsupported,

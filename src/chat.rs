@@ -1263,6 +1263,7 @@ pub enum Command {
     /// Retry only the exact current original. The actor reloads private input
     /// and verifies its identity; caller-provided text is never dispatched.
     PromptOriginal {
+        source_incarnation:Option<uuid::Uuid>,
         session_id:String,
         original:annotations::OriginalPrompt,
         turn_generation:u64,

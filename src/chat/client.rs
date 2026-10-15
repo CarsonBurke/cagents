@@ -3298,7 +3298,7 @@ mod tests {
 
     fn original_test_page(user: &str, offset: usize, text: &str, total: usize) -> super::super::annotations::OriginalPage {
         use super::super::annotations::{OriginalPage, OriginalPrompt, OriginalSettings, Setting};
-        OriginalPage { session_id: "native-session".into(), original: OriginalPrompt {
+        OriginalPage {source_incarnation:None, session_id: "native-session".into(), original: OriginalPrompt {
             user_id: user.into(), turn_id: format!("turn-{user}"), text_bytes: total,
             attachments: vec![], settings: OriginalSettings { model: Setting::Value("accepted-model".into()),
                 reasoning: Setting::Value("low".into()), fast: Setting::Unsupported, permission: Setting::Value("ask".into()) } },

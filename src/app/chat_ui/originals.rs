@@ -77,7 +77,7 @@ impl State {
         self.query.take()
     }
     fn metadata(&mut self,context:&Context,page:OriginalPage)->bool {
-        let valid=page.session_id==context.session && page.offset==0 && page.next_offset==page.text.len()
+        let valid=page.source_incarnation==context.source_incarnation && page.session_id==context.session && page.offset==0 && page.next_offset==page.text.len()
             && page.text.len()<=4 && page.next_offset<=page.original.text_bytes
             && page.complete==(page.next_offset==page.original.text_bytes)
             && page.original.text_bytes<=chat::annotations::ORIGINAL_TEXT_BYTES
@@ -239,7 +239,7 @@ impl Cagents {
         // The actor atomically revalidates current/latest identity, exact
         // metadata and immutable attachment hashes before restoring settings
         // and dispatching. No UI-trusted text or ordinary setter chain.
-        self.chat_send(target,Command::PromptOriginal {session_id:context.session,original,turn_generation:generation},false)
+        self.chat_send(target,Command::PromptOriginal {source_incarnation:context.source_incarnation,session_id:context.session,original,turn_generation:generation},false)
     }
     pub(super) fn begin_original_edit(&mut self,target:Target,id:&str)->Task<Message> {
         let Some(runtime)=self.chat_runtime_mut(target) else {return Task::none();};
@@ -295,7 +295,7 @@ impl Cagents {
                 Task::none()
             }
             (Purpose::Edit {branch},Value::Text(original))=>{
-                if original.session_id!=context.session || !runtime.recovery_available() {return Task::none();}
+                if original.source_incarnation!=context.source_incarnation || original.session_id!=context.session || !runtime.recovery_available() {return Task::none();}
                 let Some(mut prompt)=turn_actions::Prompt::from_original(original,&runtime.snapshot) else {return Task::none();};
                 prompt.account_hint=runtime.recovery.originals.account_hint.clone();
                 self.finish_original_edit(target,prompt,branch,context.session)
@@ -332,7 +332,7 @@ mod tests {
     }
     fn page(context:&Context,user:&str,text:&str)->OriginalPage {
         let mut end=text.len().min(4);while !text.is_char_boundary(end) {end-=1;}
-        OriginalPage {session_id:context.session.clone(),original:original(user,text),offset:0,next_offset:end,
+        OriginalPage {source_incarnation:context.source_incarnation,session_id:context.session.clone(),original:original(user,text),offset:0,next_offset:end,
             text:text[..end].into(),complete:end==text.len()}
     }
     fn runtime()->Runtime {
@@ -352,6 +352,31 @@ mod tests {
         }
         Arc::make_mut(&mut runtime.snapshot).original_retry_pending=false;
         runtime.sync_original();assert!(runtime.recovery.originals.query.is_some());
+    }
+
+    #[test]
+    fn backend_source_token_rejects_post_reset_reply_before_the_snapshot_wake_arrives() {
+        for editing in [false,true] {
+            let mut app=crate::app::tests::context_inspector_test_app(false);let mut runtime=runtime();let target=runtime.target;
+            Arc::make_mut(&mut runtime.snapshot).source_incarnation=Some(uuid::Uuid::from_u128(1));
+            runtime.replace_draft(text_editor::Content::with_text("typed while the original was loading"));
+            let current=(*runtime.snapshot).clone();runtime.handle().unwrap().publish_snapshot_for_test(current);
+            let context=Context::current(&runtime).unwrap();let handle=runtime.handle().cloned().unwrap();
+            runtime.recovery.originals.context=Some(context.clone());
+            runtime.recovery.originals.begin(target,context.clone(),handle,None,
+                if editing {Purpose::Edit {branch:None}} else {Purpose::Metadata});
+            let id=runtime.recovery.originals.query_id_for_test();
+            let value=if editing {Value::Text(chat::original::OriginalText {
+                source_incarnation:Some(uuid::Uuid::from_u128(2)),session_id:context.session.clone(),
+                original:original("old-user","complete old input"),text:"complete old input".into()})}
+                else {let mut page=page(&context,"old-user","complete old input");page.source_incarnation=Some(uuid::Uuid::from_u128(2));Value::Metadata(page)};
+            app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+            drop(app.original_ready(target,id,None,0,Reply::fixture(Ok(value))));
+            let runtime=app.chat_runtime_mut(target).unwrap();
+            assert_eq!(runtime.snapshot.source_incarnation,Some(uuid::Uuid::from_u128(1)),"UI has not observed the new source publication yet");
+            assert!(runtime.recovery.originals.metadata.is_none() && runtime.recovery.prepared_prompt.is_none());
+            assert_eq!(runtime.composer.text(),"typed while the original was loading");
+        }
     }
 
     #[test]
@@ -445,7 +470,7 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot).selected_model=Some("current-model".into());
         Arc::make_mut(&mut runtime.snapshot).permission_mode=Some("current-policy".into());
         let before=runtime.snapshot.clone();
-        let prompt=turn_actions::Prompt::from_original(chat::original::OriginalText {session_id:"confirmed-session".into(),
+        let prompt=turn_actions::Prompt::from_original(chat::original::OriginalText {source_incarnation:None,session_id:"confirmed-session".into(),
             original,text:"accepted text with complete images".into()},&runtime.snapshot).unwrap();
         runtime.load_recovery_prompt(prompt,"Editing starts a new turn.");
         assert_eq!(runtime.composer.text(),"accepted text with complete images");
@@ -469,7 +494,7 @@ mod tests {
         let mut original=original("native-user","accepted original");
         original.attachments.push(chat::annotations::OriginalAttachment {original_path:"/pictures/architecture.png".into(),
             path:"/private/capture/00000000-0000-4000-8000-000000000000.png".into(),bytes:50,sha256:[3;32]});
-        let prompt=turn_actions::Prompt::from_original(chat::original::OriginalText {session_id:"confirmed-session".into(),original,
+        let prompt=turn_actions::Prompt::from_original(chat::original::OriginalText {source_incarnation:None,session_id:"confirmed-session".into(),original,
             text:"accepted original".into()},&runtime().snapshot).unwrap();
         let mut runtime=runtime();runtime.load_recovery_prompt(prompt,"Editing starts a new turn.");
         let attachment=&runtime.attachments[0];
@@ -482,7 +507,7 @@ mod tests {
         let permit=Arc::new(tokio::sync::Semaphore::new(1));
         let original=original("native-user","accepted original");
         let reply=Reply(Arc::new(Mutex::new(Some(Output {
-            value:Ok(Value::Text(chat::original::OriginalText {session_id:"confirmed-session".into(),original,text:"accepted original".into()})),
+            value:Ok(Value::Text(chat::original::OriginalText {source_incarnation:None,session_id:"confirmed-session".into(),original,text:"accepted original".into()})),
             _permit:permit.clone().try_acquire_owned().unwrap(),
         }))));
         assert_eq!(permit.available_permits(),0);let clone=reply.clone();drop(reply);
@@ -497,7 +522,7 @@ mod tests {
         assert_ne!(first,alias);
         let context=Context::current(&runtime).unwrap();
         let original=original("native-user","private accepted original");
-        let mut prompt=turn_actions::Prompt::from_original(chat::original::OriginalText {session_id:context.session.clone(),
+        let mut prompt=turn_actions::Prompt::from_original(chat::original::OriginalText {source_incarnation:None,session_id:context.session.clone(),
             original:original.clone(),text:"private accepted original".into()},&runtime.snapshot).unwrap();
         prompt.account_hint=Some(first.clone());
         let prompt=Arc::new(prompt);let weak=Arc::downgrade(&prompt);
@@ -508,7 +533,7 @@ mod tests {
         let handle=runtime.handle().cloned().unwrap();
         runtime.recovery.originals.begin(target,context.clone(),handle,Some("native-user".into()),Purpose::Edit {branch:None});
         let id=runtime.recovery.originals.query_id_for_test();
-        let reply=Reply::fixture(Ok(Value::Text(chat::original::OriginalText {session_id:context.session,
+        let reply=Reply::fixture(Ok(Value::Text(chat::original::OriginalText {source_incarnation:None,session_id:context.session,
             original,text:"private accepted original".into()})));
         let result_owner=Arc::downgrade(&reply.0);
         app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));

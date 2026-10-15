@@ -17141,7 +17141,8 @@ mod tests {
     fn original_metadata(app:&mut Cagents,card:CardId,original:chat::annotations::OriginalPrompt,text:&str) {
         let session=chat_runtime(app,card).snapshot.session_id.clone().unwrap();
         let mut end=text.len().min(4);while !text.is_char_boundary(end) {end-=1;}
-        let page=chat::annotations::OriginalPage {session_id:session,original,offset:0,next_offset:end,text:text[..end].into(),complete:end==text.len()};
+        let source_incarnation=chat_runtime(app,card).snapshot.source_incarnation;
+        let page=chat::annotations::OriginalPage {source_incarnation,session_id:session,original,offset:0,next_offset:end,text:text[..end].into(),complete:end==text.len()};
         original_result(app,card,originals::Value::Metadata(page));
     }
     #[test]
@@ -17239,7 +17240,7 @@ mod tests {
         for command in [
             Command::Prompt {text:"new work".into(),attachments:vec![],mode:PromptMode::Send},
             Command::PromptNamed {text:"new work".into(),attachments:vec![],mode:PromptMode::Queue},
-            Command::PromptOriginal {session_id:KNOWN_THREAD.into(),original,turn_generation:0},
+            Command::PromptOriginal {source_incarnation:None,session_id:KNOWN_THREAD.into(),original,turn_generation:0},
         ] {
             drop(app.chat_send(target,command,false));
             assert!(chat_runtime(&app,card).pending.is_none());
@@ -17309,7 +17310,7 @@ mod tests {
             assert!(runtime.can_edit_prompt(&runtime.snapshot.items[0]));
             drop(app.handle_chat_ui(Action::EditPrompt(target,"turn/user".into())));
             original_result(&mut app,card,originals::Value::Text(chat::original::OriginalText {
-                session_id:KNOWN_THREAD.into(),original,text:"Original prompt".into()}));
+                source_incarnation:None,session_id:KNOWN_THREAD.into(),original,text:"Original prompt".into()}));
             let runtime=chat_runtime(&app,card);
             if provider == Provider::Claude {
                 assert_eq!(runtime.composer.text().trim_end(),"Original prompt");

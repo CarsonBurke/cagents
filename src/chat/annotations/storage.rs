@@ -357,7 +357,7 @@ impl Store {
         let next_offset=offset+text.len();
         let complete=next_offset==original.text_bytes;
         self.revalidate().map_err(OriginalError::Unavailable)?;
-        Ok(OriginalPage{session_id:session.to_owned(),original,offset,next_offset,text,complete})
+        Ok(OriginalPage{source_incarnation:None,session_id:session.to_owned(),original,offset,next_offset,text,complete})
     }
     /// Repeated delivery of an already seen Awaiting request is replay and
     /// cannot reopen a denied action. Only a distinct request starts a decision.

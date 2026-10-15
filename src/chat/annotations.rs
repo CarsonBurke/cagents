@@ -53,6 +53,9 @@ pub struct OriginalPrompt {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginalPage {
+    /// Sampled by the guarded runtime source, never inferred by durable storage.
+    #[serde(default)]
+    pub source_incarnation:Option<uuid::Uuid>,
     pub session_id:String,
     pub original: OriginalPrompt,
     pub offset: usize,
