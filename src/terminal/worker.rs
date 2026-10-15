@@ -1005,9 +1005,7 @@ impl TerminalHandle {
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
-        if key.action != KeyAction::Release && key.modifiers.control
-            && !key.modifiers.alt && !key.modifiers.super_key
-            && matches!(key.key, TerminalKey::Character('c' | 'C'))
+        if key.action != KeyAction::Release && is_interrupt_key(&key)
         {
             *self.inner.published.interrupt_key.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
             self.inner.published.interrupt_requested.store(true, Ordering::Release);
@@ -1416,8 +1414,19 @@ impl TerminalHandle {
     }
 }
 
+fn is_interrupt_key(key: &KeyInput) -> bool {
+    key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key
+        && matches!(key.key, TerminalKey::Character('c' | 'C'))
+}
+
 fn is_pty_input(command: &Command) -> bool {
-    matches!(command, Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_))
+    match command {
+        // A priority press must retain its paired release when the child
+        // negotiated key-event reporting. The release follows the press.
+        Command::Key(key) if key.action == KeyAction::Release && is_interrupt_key(key) => false,
+        Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_) => true,
+        _ => false,
+    }
 }
 
 fn command_channel(capacity: usize) -> (Sender<Command>, Receiver<Command>) {
@@ -3046,7 +3055,7 @@ impl Worker {
 
     /// True means the entire input was admitted, not necessarily consumed.
     fn write_pty(&mut self, bytes: &[u8], operation: &'static str) -> bool {
-        self.flush_pty_input();
+        if !self.flush_pty_input() { return false; }
         if bytes.len() > PTY_WRITE_CAPACITY.saturating_sub(self.pending_input.len()) {
             self.error(operation, format!(
                 "Terminal isn't reading input; {} KiB pending. Press Ctrl+C to cancel pending input.",
@@ -3055,13 +3064,12 @@ impl Worker {
             return false;
         }
         self.pending_input.extend(bytes);
-        self.flush_pty_input();
-        true
+        self.flush_pty_input()
     }
 
     /// Poll before bounded nonblocking writes. The retry deadline participates
     /// in the command/output select, so a full input buffer never stalls parsing.
-    fn flush_pty_input(&mut self) {
+    fn flush_pty_input(&mut self) -> bool {
         let mut budget = PTY_BATCH_LIMIT;
         while !self.pending_input.is_empty() && budget > 0 {
             let mut ready = libc::pollfd {
@@ -3073,17 +3081,22 @@ impl Worker {
             }
             let (front, _) = self.pending_input.as_slices();
             match self.writer.write(&front[..front.len().min(budget)]) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.pending_input.clear();
+                    self.error("write terminal input", "PTY write returned zero bytes".into());
+                    return false;
+                },
                 Ok(written) => { self.pending_input.drain(..written); budget -= written; }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => {
                     self.pending_input.clear();
                     self.error("write terminal input", error.to_string());
-                    break;
+                    return false;
                 }
             }
         }
+        true
     }
 
     fn interrupt_input(&mut self) {
@@ -5742,17 +5755,61 @@ mod tests {
 
     #[test]
     fn raw_interrupt_flushes_canceled_paste_and_preserves_its_control_byte() {
-        let handle = TerminalHandle::spawn(shell_session(
-            "stty raw -echo; echo ready; sleep 0.2; od -An -tu1 -N1"
-        ), TerminalConfig::default(), |_| {}).unwrap();
-        wait_for_text(&handle, "ready");
-        handle.input(vec![b'x'; 4096]).unwrap();
-        thread::sleep(Duration::from_millis(50));
-        handle.input(vec![3]).unwrap();
-        wait_for_text(&handle, "3");
-        assert!(!handle.snapshot().lines.iter().any(|row| row.cells.iter().map(|cell| cell.text.as_str()).collect::<String>().contains("120")),
-            "the raw child consumed canceled paste data");
-        handle.shutdown().unwrap();
+        for extended in [false, true] {
+            let mut key = key_input(KeyAction::Press, TerminalKey::Character('c'), Some("c"), Some('c'));
+            key.modifiers.control = true;
+            let mut release = key.clone();
+            release.action = KeyAction::Release;
+            let mut terminal = Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 0 }).unwrap();
+            if extended { terminal.vt_write(b"\x1b[>3u"); }
+            let mut encoder = KeyEncoder::new().unwrap();
+            let mut expected = encode_key_input(&terminal, &mut encoder, key.clone()).unwrap();
+            expected.extend(encode_key_input(&terminal, &mut encoder, release.clone()).unwrap());
+            let announce = if extended { "\\033[>3u" } else { "" };
+            let script = format!("stty raw -echo; printf '{announce}ready\\r\\n'; kill -STOP $$; od -An -tu1 -N{}", expected.len());
+            let (mut worker, _) = capture_worker_for(shell_session(&script).launch);
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let message = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+                let ready = matches!(&message, PtyMessage::Bytes(bytes) if bytes.windows(5).any(|word| word == b"ready"));
+                worker.handle_pty_message(Some(message));
+                if ready { break; }
+            }
+            worker.writer.write_all(&[b'x'; 4096]).unwrap();
+            let (commands, receiver) = command_channel(4);
+            worker.commands = receiver;
+            commands.send(Command::Key(release)).unwrap();
+            commands.send(Command::Paste("canceled".into(), PasteOrigin::Clipboard)).unwrap();
+            *worker.published.interrupt_key.lock().unwrap() = Some(key);
+            worker.interrupt_input();
+            while let Some(command) = worker.retained_commands.pop_front() { worker.handle_command(command); }
+            close_processes::signal(&worker.child.shutdown_pidfd().unwrap(), libc::SIGCONT).unwrap();
+            let mut output = String::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while let Ok(message) = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                if let PtyMessage::Bytes(bytes) = message { output.push_str(&String::from_utf8_lossy(&bytes)); }
+                else { break; }
+                let observed: Vec<u8> = output.split_whitespace().filter_map(|word| word.parse().ok()).collect();
+                if observed.len() >= expected.len() {
+                    assert_eq!(observed, expected, "extended={extended}: {output}");
+                    break;
+                }
+            }
+            let observed: Vec<u8> = output.split_whitespace().filter_map(|word| word.parse().ok()).collect();
+            assert_eq!(observed, expected, "extended={extended}: {output}");
+            drop(commands);
+            worker.run();
+        }
+    }
+
+    #[test]
+    fn hard_pty_write_failure_rejects_input_admission() {
+        let (mut worker, events) = capture_worker();
+        worker.writer = File::open("/dev/null").unwrap();
+        assert!(!worker.write_pty(b"x", "fixture input"));
+        assert!(worker.pending_input.is_empty());
+        assert!(events.try_iter().any(|event| matches!(event, TerminalEvent::Error { .. })));
+        worker.run();
     }
 
     #[test]
@@ -5776,7 +5833,11 @@ mod tests {
         let closing = handle.clone();
         let closer = thread::spawn(move || closing.close_checked(true));
         observed.recv_timeout(Duration::from_secs(1)).unwrap();
-        thread::sleep(Duration::from_millis(20));
+        let join_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while handle.inner.worker.lock().unwrap().is_some() {
+            assert!(std::time::Instant::now() < join_deadline);
+            thread::yield_now();
+        }
         let started = std::time::Instant::now();
         assert_eq!(handle.shutdown(), Err(TerminalSendError::Closed));
         assert!(started.elapsed() < Duration::from_millis(500), "shutdown waited on a lock held by join");
