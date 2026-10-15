@@ -8847,6 +8847,7 @@ mod tests {
             &mut cache,
         )
         .unwrap();
+        assert_eq!(executor.commands.lock().unwrap().len(), 8);
         let changed = git
             .snapshot_cached(
                 root,
@@ -8861,6 +8862,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(changed.status.entries.len(), 1);
+        assert_eq!(executor.commands.lock().unwrap().len(), 9);
         cache.invalidate(false);
         assert!(
             git.snapshot_cached(
@@ -8876,7 +8878,7 @@ mod tests {
             .unwrap()
             .is_some()
         );
-        assert_eq!(executor.commands.lock().unwrap().len(), 9);
+        assert_eq!(executor.commands.lock().unwrap().len(), 10);
     }
 
     #[test]
@@ -8903,6 +8905,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.status.entries[0].added_lines, Some(1));
+        assert_eq!(executor.commands.lock().unwrap().len(), 8);
         // Same size and same porcelain; only descriptor metadata detects this
         // when the native event was lost.
         fs::write(&file, "a\nb\n").unwrap();
@@ -8915,12 +8918,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.status.entries[0].added_lines, Some(2));
+        assert_eq!(executor.commands.lock().unwrap().len(), 9);
         assert!(
             git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(executor.commands.lock().unwrap().len(), 9);
+        assert_eq!(executor.commands.lock().unwrap().len(), 10);
     }
 
     #[test]
@@ -8943,6 +8947,7 @@ mod tests {
         let mut cache = SnapshotCache::default();
         git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
             .unwrap();
+        assert_eq!(executor.commands.lock().unwrap().len(), 8);
         fs::write(directory.path().join("new.txt"), "new\n").unwrap();
         fs::File::open(directory.path())
             .unwrap()
@@ -8953,12 +8958,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next.files.paths, vec![path("new.txt")]);
+        assert_eq!(executor.commands.lock().unwrap().len(), 10);
         assert!(
             git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(executor.commands.lock().unwrap().len(), 10);
+        assert_eq!(executor.commands.lock().unwrap().len(), 11);
     }
 
     #[test]
