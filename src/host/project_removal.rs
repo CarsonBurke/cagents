@@ -192,6 +192,26 @@ mod tests {
     }
 
     #[test]
+    fn nested_foreign_project_session_is_preserved_and_invalid_roster_has_no_effects() {
+        let mut fixture = Fixture::new();
+        let own = fixture.spawn(crate::model::TerminalId::new());
+        let nested = fixture.root.join("another-project"); std::fs::create_dir(&nested).unwrap();
+        let foreign = fixture.spawn_at(crate::model::TerminalId::new(), &nested);
+        {
+            let mut state = fixture.host.lock().unwrap();
+            state.edit_model(1, ModelEdit::OpenProject { repository: nested.clone(), checkout: None, primary_checkout: None, name: "Foreign".into(), kind: ProjectKind::Folder }).unwrap();
+            let HostedSession::Terminal(source) = &foreign.source else { unreachable!() };
+            state.edit_model(1, ModelEdit::SeedView { scope: Scope::Worktree { repository: nested.clone(), path: nested.clone() }, panes: vec![crate::workspace_model::views::Pane { id: crate::model::CardId::new(), title: "Foreign terminal".into(), user_title: None, pending_terminal_start: false, width_fraction: 0.5, kind: crate::model::CardKind::Terminal(source.clone()), scope: Some(nested.clone()) }], closed: Vec::new() }).unwrap();
+        }
+        assert!(fixture.request(fixture.expected.clone(), vec![own.clone(),foreign]).is_err());
+        assert!(fixture.handles.iter().all(|handle| !handle.is_completed()), "a nested foreign source rejects the entire roster before the first close");
+        let (response,_,_) = fixture.request(fixture.expected.clone(), vec![own]).unwrap();
+        let ServerResponse::WorkspaceModel { model } = response else { panic!() };
+        assert!(model.project(&fixture.root).is_none()); assert!(model.project(&nested).is_some());
+        assert!(fixture.handles[0].is_completed()); assert!(!fixture.handles[1].is_completed());
+    }
+
+    #[test]
     fn unrelated_valid_source_refuses_the_entire_project_roster() {
         let mut fixture = Fixture::new(); let own = fixture.spawn(crate::model::TerminalId::new());
         let unrelated_dir = fixture._directory.path().join("unrelated"); std::fs::create_dir(&unrelated_dir).unwrap();
