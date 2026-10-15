@@ -668,7 +668,7 @@ impl Operation for Read {
             y: bounds.y - self.translation.y,
             ..bounds
         };
-        let (identity, plain, hit, link, mounted) =
+        let (identity, plain, hit, link, mounted, empty_caret) =
             if let Some(prose) = state.downcast_mut::<Prose>() {
                 prose.managed = true;
                 prose.logical_active = self.catalog.is_some() && prose.logical.is_some();
@@ -689,9 +689,10 @@ impl Operation for Read {
                         .filter(|_| self.pointer.is_some_and(|point| bounds.contains(point)))
                         .and_then(|point| prose.target.zip(prose.link(point))),
                     true,
+                    prose.empty_line_caret(),
                 )
             } else if let Some(logical) = state.downcast_ref::<LogicalText>() {
-                (logical.identity, logical.plain.clone(), 0, None, false)
+                (logical.identity, logical.plain.clone(), 0, None, false, false)
             } else {
                 return;
             };
@@ -721,6 +722,17 @@ impl Operation for Read {
                 }
             }
         }
+        // An empty physical line has zero natural horizontal extent, but
+        // its logical caret can be selected throughout the clipped row band.
+        // This changes hit geometry only, never native scroll content width.
+        let hit_bounds = if empty_caret {
+            self.clip.map_or(
+                Rectangle { width: 1.0, ..bounds },
+                |clip| Rectangle { x: clip.x, width: clip.width, ..bounds },
+            )
+        } else {
+            bounds
+        };
         self.blocks.push(Block {
             identity,
             lists,
@@ -730,7 +742,7 @@ impl Operation for Read {
             visible: mounted
                 .then(|| {
                     self.clip
-                        .map_or(Some(bounds), |clip| bounds.intersection(&clip))
+                        .map_or(Some(hit_bounds), |clip| hit_bounds.intersection(&clip))
                 })
                 .flatten(),
             hit,

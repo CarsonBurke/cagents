@@ -6709,13 +6709,14 @@ mod tests {
         };
         let items = frame_cost::transcript(1);
         let (runtime, _handle) = frame_cost::live_runtime(&items);
-        for source in [
-            "bounded αβ words ".repeat(300),
-            format!("```\n{}```", "αβ item line\n".repeat(600)),
+        for (source, raw_code) in [
+            ("bounded αβ words ".repeat(300), false),
+            ("αβ item line\n\n".repeat(300), true),
+            ("αβ item line\r\n\r\n".repeat(300), true),
         ] {
             let cached = CachedItem::new(
                 &ItemContent::Text {
-                    text: source,
+                    text: source.clone(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
@@ -6723,19 +6724,46 @@ mod tests {
             );
             let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
             let mut builder = selection::Catalog::builder();
-            builder.markdown(
-                &format!("unbound-{}", cached.revision),
-                &[0],
-                cached.markdown.items(),
-            );
+            let item = format!("unbound-{}", cached.revision);
+            if raw_code {
+                // Code copy retains the raw CRLF and terminal newline rather
+                // than testing only a Markdown parser's normalized projection.
+                builder.plain(&item, &[0], Arc::from(source.as_str()));
+            } else {
+                builder.markdown(&item, &[0], cached.markdown.items());
+            }
             let catalog = builder.finish();
             let expected = catalog
                 .search_blocks()
                 .into_iter()
                 .map(|(_, text)| text.to_string())
                 .collect::<String>();
+            let body = if raw_code {
+                let code = prose::code_text(
+                    Arc::from(source.as_str()),
+                    Arc::from([]),
+                    design::TEXT_BODY.into(),
+                    iced::Font::MONOSPACE,
+                    runtime.target,
+                    None,
+                    Some(selectable_prose::Logical {
+                        identity: selection::logical_identity(&item, &[0]),
+                        start: 0,
+                    }),
+                    Some(cached.flow_cache.clone()),
+                    Some(super::super::reader_source::Source::new(&source)),
+                );
+                widget::scrollable(code)
+                    .direction(iced::widget::scrollable::Direction::Horizontal(
+                        iced::widget::scrollable::Scrollbar::new(),
+                    ))
+                    .width(Length::Fill)
+                    .into()
+            } else {
+                prose::view(&cached, settings, runtime.target, None)
+            };
             let content = scroll::transcript(
-                prose::view(&cached, settings, runtime.target, None),
+                body,
                 runtime.target,
                 None,
                 vec![],
@@ -6773,6 +6801,14 @@ mod tests {
                     state: &mut dyn std::any::Any,
                 ) {
                     if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                        if prose.empty_line_caret() {
+                            assert_eq!(bounds.width, 0.0, "caret adds no horizontal content extent");
+                            assert!(bounds.height > 0.0);
+                            let logical = prose.logical.as_ref().unwrap();
+                            let caret = prose.logical_byte_bounds(logical.identity, logical.start)
+                                .expect("empty physical row exposes its logical caret");
+                            assert!(caret.width > 0.0 && caret.height > 0.0);
+                        }
                         self.0.push((prose.plain.to_string(), bounds));
                     }
                 }
@@ -6785,7 +6821,10 @@ mod tests {
                 &mut text,
             );
             assert!(!text.0.is_empty(), "current selectable glyph geometry is mounted");
-            if expected.contains('\n') {
+            if raw_code {
+                assert_eq!(expected, source, "raw code oracle preserves every newline byte");
+                assert!(text.0.iter().filter(|(plain, _)| plain.is_empty()).count() > 1,
+                    "both middle and terminal empty rows are mounted");
                 assert!(text.0.len() > 2, "code selection crosses real physical row widgets");
             } else {
                 assert_eq!(text.0.len(), 1, "paragraph preserves one full-context shaped flow");
@@ -6806,7 +6845,7 @@ mod tests {
             let start = iced::Point::new(first.x, first.y + 3.0);
             let end = iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0);
             let mut clipboard = ClipboardText::default();
-            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 3000.0));
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 30000.0));
             for (event, pointer) in [
                 (
                     iced::Event::Mouse(iced::mouse::Event::ButtonPressed(

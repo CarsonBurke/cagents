@@ -115,6 +115,10 @@ impl State {
             })
     }
 
+    pub(super) fn empty_line_caret(&self) -> bool {
+        self.logical.is_some() && self.flow.is_none() && self.plain.is_empty()
+    }
+
     /// A mounted glyph cluster containing a logical byte. This inspects the
     /// existing bounded paragraph and never shapes an offscreen source.
     pub(super) fn logical_byte_bounds(&self, identity: u64, byte: usize) -> Option<Rectangle> {
@@ -133,6 +137,12 @@ impl State {
                 .byte_bounds(byte, self.plain.len());
         }
         let paragraph = self.paragraph();
+        if self.empty_line_caret() {
+            return Some(Rectangle::with_size(Size::new(
+                1.0,
+                paragraph.min_bounds().height.max(self.shape?.size.0 * 1.3),
+            )));
+        }
         let mut prefixes = Vec::with_capacity(paragraph.buffer().lines.len());
         let mut offset = 0;
         for line in &paragraph.buffer().lines {
@@ -632,11 +642,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             }
         }
         state.shape = Some(shape);
-        layout::Node::new(limits.resolve(
-            Length::Shrink,
-            Length::Shrink,
-            state.paragraph().min_bounds(),
-        ))
+        let mut natural = state.paragraph().min_bounds();
+        if state.empty_line_caret() {
+            natural.height = natural.height.max(self.size.0 * 1.3);
+        }
+        layout::Node::new(limits.resolve(Length::Shrink, Length::Shrink, natural))
     }
     fn operate(
         &mut self,
