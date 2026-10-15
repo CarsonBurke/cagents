@@ -20,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod original;
 const MAX_PENDING: usize = 64;
 const MAX_TOOLS: usize = 512;
 const ATTACHMENTS: AttachmentRules = AttachmentRules::for_provider(Provider::Claude);
@@ -298,6 +299,7 @@ enum ReportTask {
 
 #[derive(Default)]
 struct Claude {
+    originals:original::Originals,
     annotation_updates: Vec<chat::annotations::ApprovalUpdate>,
     session_id: Option<String>,
     /// Whether this process was launched to resume `session_id`, as opposed
@@ -594,7 +596,8 @@ impl Claude {
             }
             content.push(block);
         }
-        let id = uuid::Uuid::new_v4().to_string();
+        let original=self.originals.staged.take();
+        let id = original.clone().unwrap_or_else(||uuid::Uuid::new_v4().to_string());
         let mut frame = json!({"type":"user", "uuid":id, "parent_tool_use_id":null, "origin":{"kind":"human"}, "message":{"role":"user", "content":content}});
         if let Some(session) = &self.session_id {
             frame["session_id"] = json!(session);
@@ -624,6 +627,7 @@ impl Claude {
         } else {
             0
         };
+        self.original_frame_budget(&frame)?;
         self.suggestion_turn = None;
         step.events.push(Event::PromptSuggestionCleared);
         self.message(&frame, &mut step)?;
@@ -672,7 +676,7 @@ impl Claude {
                 },
             );
         }
-        step.writes.push(frame);
+        step.writes.extend(self.original_dispatch(frame,original)?);
         if !self.busy && mode == PromptMode::Send {
             self.start_turn(&mut step);
             self.status(true, "Claude is working", &mut step);
@@ -1605,6 +1609,11 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn supports_original_commands(&self,command:&Command)->bool{self.ready&&!self.busy&&matches!(command,Command::Prompt{mode:PromptMode::Send,..})}
+    fn original_command(&mut self,id:Option<String>){self.originals.staged=id;}
+    fn take_original_updates(&mut self)->Vec<chat::annotations::OriginalUpdate>{std::mem::take(&mut self.originals.updates)}
+    fn maintenance(&mut self)->Result<Step,String>{Ok(self.original_maintenance())}
+    fn maintenance_deadline(&self)->Option<std::time::Instant>{self.originals.waiting.as_ref().map(|pending|pending.deadline)}
     fn take_approval_updates(&mut self) -> Vec<chat::annotations::ApprovalUpdate> {
         std::mem::take(&mut self.annotation_updates)
     }
@@ -1755,6 +1764,7 @@ impl Adapter for Claude {
         Ok(step)
     }
     fn command(&mut self, command: Command) -> Result<Step, String> {
+        if matches!(&command,Command::SetModel{..}|Command::SetFastMode{..}|Command::SetPermissionMode{..}|Command::UpdatePermissionSettings{..}){self.originals.revision=self.originals.revision.wrapping_add(1);}
         if self.history_only {
             match command {
                 Command::LoadEarlier => {}
@@ -1765,7 +1775,8 @@ impl Adapter for Claude {
                 ),
             }
         }
-        match command {
+        let flush_before_control=!matches!(&command,Command::Prompt{..});
+        let result=(|| {match command {
             Command::Prompt {
                 text,
                 attachments,
@@ -1964,7 +1975,11 @@ impl Adapter for Claude {
                     ..Step::default()
                 })
             }
-        }
+        }})();
+        result.map(|mut step:Step|{
+            if flush_before_control{let held=self.original_flush();step.writes.splice(0..0,held);}
+            step
+        })
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
@@ -2004,6 +2019,7 @@ impl Adapter for Claude {
                 title: None,
             });
         }
+        if let Some(original)=self.original_control_response(&frame){step.writes.extend(original.writes);step.events.extend(original.events);return Ok(step);}
         match string(&frame, "type") {
             "control_request" => {
                 let permission=self.permission(frame)?;
@@ -2514,6 +2530,7 @@ impl Adapter for Claude {
             "keep_alive" => {}
             other => return Err(format!("Unsupported Claude stream-json frame type {other}")),
         }
+        self.original_observe(&frame,&step);
         Ok(step)
     }
 }

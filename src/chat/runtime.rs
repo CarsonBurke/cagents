@@ -1748,6 +1748,8 @@ impl Actor {
                 }
             }
             self.drain_commands(closing.is_some())?;
+            let maintenance=self.adapter.maintenance()?;
+            if !maintenance.writes.is_empty() || !maintenance.events.is_empty(){self.step(maintenance)?;}
             // Parse every frame that already arrived. Gating this on an empty stdin
             // queue froze streaming for a whole turn against any provider that reads
             // stdin only between turns, then killed the session by blaming its
@@ -1874,6 +1876,10 @@ impl Actor {
             } else {
                 -1
             };
+            let timeout=if let Some(deadline)=self.adapter.maintenance_deadline(){
+                let until=deadline.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32;
+                if timeout<0{until}else{timeout.min(until)}
+            }else{timeout};
             if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
@@ -2095,7 +2101,7 @@ impl Actor {
             // Original capture is optional product metadata. A capture failure
             // leaves the ordinary command and picker paths intact, and cannot
             // prevent the user from sending work to the provider.
-            let original=if run.is_none() && self.adapter.supports_original_commands(){
+            let original=if run.is_none() && self.adapter.supports_original_commands(&command){
                 match self.annotations.lock().unwrap_or_else(|p|p.into_inner()).prepare(&mut command,&self.working_directory){
                     Ok(id)=>id,
                     Err(error)=>{tracing::warn!(?error,"original command capture unavailable");None},

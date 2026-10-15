@@ -220,8 +220,10 @@ pub trait Adapter: Send {
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
     /// The actor captures immutable operator input only for adapters that
     /// implement exact provider acceptance and settings evidence.
-    fn supports_original_commands(&self) -> bool { false }
+    fn supports_original_commands(&self, _command:&Command) -> bool { false }
     fn original_command(&mut self, _command_id: Option<String>) {}
+    fn maintenance(&mut self)->Result<Step,String>{Ok(Step::default())}
+    fn maintenance_deadline(&self)->Option<std::time::Instant>{None}
     fn take_original_updates(&mut self) -> Vec<crate::chat::annotations::OriginalUpdate> { Vec::new() }
     /// Explicit live provider requests and user answers, separate from replayed
     /// transcript item states. Drained synchronously after each adapter step.
