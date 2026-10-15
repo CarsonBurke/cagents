@@ -620,6 +620,19 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
 mod tests {
     use super::*;
     #[test]
+    fn current_match_has_a_distinct_background_without_losing_span_text() {
+        let selectable = Selectable { logical:None,plain:"cat cat".into(),
+            spans:vec![Span::new("cat cat")].into(),matches:vec![0..3,4..7],current:Some(4..7),
+            size:design::TEXT_PROSE.into(),font:iced::Font::default(),
+            target:Target {card:CardId::new(),generation:0} };
+        let spans = selectable.selected_spans(&State::default());
+        assert_eq!(spans.iter().map(|span| span.text.as_ref()).collect::<String>(),"cat cat");
+        let ordinary = spans.iter().find(|span| span.text == "cat" && span.highlight.as_ref().is_some_and(|highlight| highlight.background == design::accent_wash(&cosmic::theme::active()).into())).unwrap();
+        let current = spans.iter().find(|span| span.text == "cat" && span.highlight.as_ref().is_some_and(|highlight| highlight.background == design::accent_color(&cosmic::theme::active()).into())).unwrap();
+        assert_ne!(ordinary.highlight,current.highlight);
+    }
+
+    #[test]
     fn prose_exposes_full_text_and_stable_accessible_identity() {
         let element = text(
             vec![Span::new("α first\nβ second")].into(),
@@ -703,7 +716,7 @@ mod tests {
         let identity = 0x1234;
         let mut element = logical_text(vec![Span::new(source.to_owned())].into(),
             design::TEXT_PROSE.into(), iced::Font::default(),
-            Target { card: CardId::new(), generation: 0 }, None, Logical { identity, start: 100 });
+            Target { card: CardId::new(), generation: 0 }, None, Logical { identity, start: 100, paint: None });
         let mut tree = Tree::new(&element);
         let node = element.as_widget_mut().layout(&mut tree, &renderer,
             &layout::Limits::new(Size::ZERO, Size::new(150.0, f32::INFINITY)));
@@ -815,6 +828,7 @@ mod tests {
             logical: None,
             plain: "Straße CAFÉ".into(),
             spans: vec![Span::new("Stra"), Span::new("ße"), Span::new(" CAFÉ")].into(),
+            current: None,
             matches: super::super::find::ranges("Straße CAFÉ", "STRASSE"),
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),

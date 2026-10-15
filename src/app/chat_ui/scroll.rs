@@ -776,8 +776,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 .captured
                 .as_ref()
                 .is_some_and(|captured| captured.get());
-            let user_input = navigation_input(before.0, top, scroll, wheel, child_captured)
-                || anchor.pending_input;
+            let gesture = navigation_input(before.0, top, scroll, wheel, child_captured);
+            if gesture && let Some(target) = self.target {
+                shell.publish(action(Action::FindNavigationInput(target)));
+            }
+            let user_input = gesture || anchor.pending_input;
             if changed || user_input {
                 anchor.pending_input = false;
                 anchor.reported = Some(Report {

@@ -251,6 +251,9 @@ pub enum Action {
     Find(Target, String),
     FindNext(Target, bool),
     FindIndexed(Target, u64, Option<Arc<Vec<find::Match>>>),
+    FindLocated(Target,u64,u64,u8,Option<scroll::LogicalLocation>),
+    FindFrame,
+    FindNavigationInput(Target),
     CloseFind(Target),
     FindFocused(Target, bool),
     Tick,
@@ -1477,6 +1480,8 @@ pub(super) struct Runtime {
     find_paint: Option<Arc<find::Paint>>,
     find_origin: Option<view::Scroll>,
     find_navigated: bool,
+    find_navigation: u64,
+    find_locating: Option<(u64,u64,u8)>,
     find_disclosure: find::Disclosure,
     find_index: usize,
     copied: Option<(String, Instant)>,
@@ -2106,6 +2111,8 @@ impl Runtime {
             find_paint: None,
             find_origin: None,
             find_navigated: false,
+            find_navigation: 0,
+            find_locating: None,
             find_disclosure: find::Disclosure::default(),
             find_index: 0,
             copied: None,
@@ -2590,14 +2597,7 @@ impl Runtime {
         let current = self.find_generation.clone();
         let worker = self.find_worker.clone();
         let provider = self.session.launch.provider;
-        let inputs = self.turns.iter().flat_map(|turn| {
-            turn.prompt.iter().copied().chain(turn.steps.iter().chain(&turn.prose).map(|placed| placed.index))
-                .filter_map(|index| {
-                    let item = self.snapshot.items.get(index)?.clone();
-                    let revision = self.cache.get(&item.id).map_or(0, |cached| cached.revision);
-                    Some(find::Input { item,revision,turn:turn.key.clone(),growing:self.snapshot.busy })
-                })
-        }).collect::<Vec<_>>();
+        let inputs = self.find_inputs();
         Some(cosmic::task::future(async move {
             tokio::time::sleep(Duration::from_millis(125)).await;
             let matches = if current.load(Ordering::Relaxed) != generation { None } else {
@@ -2607,6 +2607,26 @@ impl Runtime {
             };
             Message::ChatUi(Action::FindIndexed(target,generation,matches.map(Arc::new)))
         }))
+    }
+
+    fn find_inputs(&self) -> Vec<find::Input> {
+        let mut inputs = Vec::new();
+        if let Some(agent) = self.selected_subagent.as_ref().and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id)) {
+            for (index,item) in agent.items.iter().enumerate() {
+                inputs.push(find::Input {item:item.clone(),revision:self.cache.get(&item.id).map_or(0,|cached|cached.revision),turn:item.id.clone(),
+                    growing:agent.status == chat::ToolStatus::Running && index+1 == agent.items.len()});
+            }
+            return inputs;
+        }
+        for turn in &self.turns {
+            for index in turn.prompt.iter().copied().chain(turn.steps.iter().chain(&turn.prose).map(|placed| placed.index)) {
+                if let Some(item) = self.snapshot.items.get(index) {
+                    let revision = self.cache.get(&item.id).map_or(0,|cached| cached.revision);
+                    inputs.push(find::Input {item:item.clone(),revision,turn:turn.key.clone(),growing:self.snapshot.busy && index + 1 == self.snapshot.items.len()});
+                }
+            }
+        }
+        inputs
     }
 
     fn update_find_paint(&mut self) {
@@ -3466,7 +3486,7 @@ impl Cagents {
             return None;
         };
         if runtime.find.is_none() {
-            runtime.find_origin = Some(runtime.scroll);
+            runtime.find_origin = Some(runtime.active_scroll());
             runtime.find_navigated = false;
             runtime.find = Some(String::new());
         }
@@ -3496,7 +3516,7 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
         let Some(found) = runtime.find_matches.get(runtime.find_index).cloned() else { return Task::none(); };
         runtime.find_disclosure.turn(&found.turn,&mut runtime.opened);
-        if let Some(item) = runtime.snapshot.items.iter().find(|item| item.id == found.item) {
+        if let Some(item) = runtime.snapshot.items.iter().chain(runtime.snapshot.subagents.iter().flat_map(|agent| agent.items.iter())).find(|item| item.id == found.item) {
             if runtime.find_disclosure.item(&item.id,&mut runtime.expanded) {
                 let previous = runtime.cache.remove(&item.id);
                 let mut cached = CachedItem::updated(&item.content,runtime.syntax_theme,previous,true,false,
@@ -3511,9 +3531,13 @@ impl Cagents {
             }
         }
         runtime.update_find_paint();
-        crate::document_link::scroll_to_heading_anchored(
-            card_control_id(target.card,"chat-transcript"),
-            iced::advanced::widget::Id::new(format!("virtual-chunk-{:x}",found.identity)),true)
+        runtime.find_navigation = runtime.find_navigation.wrapping_add(1);
+        let generation = runtime.find_generation.load(Ordering::Relaxed);
+        let navigation = runtime.find_navigation;
+        runtime.find_locating = Some((generation,navigation,0));
+        scroll::locate_logical(target,found.item,found.identity,found.range.start)
+            .map(move |location| Message::ChatUi(Action::FindLocated(target,generation,navigation,0,location)))
+            .map(cosmic::Action::App)
     }
     fn load_chat_files(&mut self, target: Target, directory: PathBuf) -> Task<Message> {
         if crate::device::is_remote() {
@@ -4036,7 +4060,7 @@ impl Cagents {
             ),
             _ => return None,
         };
-        Some(task.map(cosmic::Action::App))
+        Some(Task::batch([task.map(cosmic::Action::App), cosmic::task::message(Message::ChatUi(Action::FindNavigationInput(runtime.target)))]))
     }
 
     pub(super) fn new_native_thread(&mut self) -> Task<Message> {
@@ -4522,6 +4546,9 @@ impl Cagents {
         let wakes = Subscription::run_with(Source(self.chat_ui.receiver.clone()), stream)
             .map(|(target, wake)| Message::ChatUi(Action::Wake(target, wake)));
         let mut subscriptions = vec![wakes];
+        if self.cards.values().any(|card| matches!(card,CardRuntime::Chat(runtime) if runtime.find_locating.is_some())) {
+            subscriptions.push(iced::window::frames().map(|_| Message::ChatUi(Action::FindFrame)));
+        }
         for card in self.cards.values() {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
@@ -7206,9 +7233,11 @@ impl Cagents {
             }
             Action::Find(target, query) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if runtime.find.is_none() { runtime.find_origin = Some(runtime.scroll); runtime.find_navigated = false; }
+                    if runtime.find.is_none() { runtime.find_origin = Some(runtime.active_scroll()); runtime.find_navigated = false; }
                     runtime.find_disclosure.restore(&mut runtime.expanded,&mut runtime.unfolded,&mut runtime.opened);
                     runtime.find_generation.fetch_add(1,Ordering::Relaxed);
+                    runtime.find_navigation = runtime.find_navigation.wrapping_add(1);
+                    runtime.find_locating = None;
                     runtime.find = Some(query);
                     runtime.find_waiting = None;
                     runtime.find_matches.clear();
@@ -7229,13 +7258,48 @@ impl Cagents {
                     return self.reveal_chat_find(target);
                 }
             }
+            Action::FindLocated(target,generation,navigation,attempt,location) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
+                if runtime.find_generation.load(Ordering::Relaxed) != generation
+                    || runtime.find_navigation != navigation || runtime.find_locating != Some((generation,navigation,attempt)) {
+                    return Task::none();
+                }
+                runtime.find_locating = location.filter(|location| !location.exact && attempt < 5)
+                    .map(|_| (generation,navigation,attempt+1));
+                if let Some(location) = location {
+                    return iced::widget::scrollable::scroll_to(card_control_id(target.card,"chat-transcript"),
+                        iced::widget::scrollable::AbsoluteOffset {x:0.0,y:location.offset}).map(cosmic::Action::App);
+                }
+            }
+            Action::FindNavigationInput(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) && runtime.find.is_some() {
+                    runtime.find_navigated = true;
+                    runtime.find_navigation = runtime.find_navigation.wrapping_add(1);
+                    runtime.find_locating = None;
+                }
+            }
+            Action::FindFrame => {
+                let tasks = self.cards.values().filter_map(|card| {
+                    let CardRuntime::Chat(runtime) = card else { return None; };
+                    let (generation,navigation,attempt) = runtime.find_locating?;
+                    let found = runtime.find_matches.get(runtime.find_index)?;
+                    let target = runtime.target;
+                    Some(scroll::locate_logical(target,found.item.clone(),found.identity,found.range.start)
+                        .map(move |location| Message::ChatUi(Action::FindLocated(target,generation,navigation,attempt,location)))
+                        .map(cosmic::Action::App))
+                }).collect::<Vec<_>>();
+                return Task::batch(tasks);
+            }
             Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
             Action::CloseFind(target) => {
                 let mut restore = None;
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.find_generation.fetch_add(1,Ordering::Relaxed);
+                    runtime.find_navigation = runtime.find_navigation.wrapping_add(1);
+                    runtime.find_locating = None;
                     runtime.find_waiting = None;
                     runtime.find_dirty = false;
+                    runtime.find_worker = Default::default();
                     runtime.find_disclosure.restore(&mut runtime.expanded,&mut runtime.unfolded,&mut runtime.opened);
                     runtime.find = None;
                     runtime.find_focused = false;
@@ -7596,6 +7660,18 @@ impl Cagents {
                             .any(|agent| &agent.id == id)
                     });
                     runtime.deferred_page = None;
+                    if runtime.find.is_some() {
+                        runtime.find_disclosure.restore(&mut runtime.expanded,&mut runtime.unfolded,&mut runtime.opened);
+                        runtime.find_generation.fetch_add(1,Ordering::Relaxed);
+                        runtime.find_navigation = runtime.find_navigation.wrapping_add(1);
+                        runtime.find_locating = None;
+                        runtime.find_waiting = None;
+                        runtime.find_origin = Some(runtime.active_scroll());
+                        runtime.find_navigated = false;
+                        runtime.find_matches.clear();
+                        runtime.find_dirty = true;
+                        runtime.update_find_paint();
+                    }
                     images::sync(runtime);
                 }
             }
@@ -8313,7 +8389,6 @@ impl Cagents {
                     runtime.subagent_scroll.insert(id, scroll);
                     return Task::none();
                 }
-                if user_input && runtime.find.is_some() { runtime.find_navigated = true; }
                 runtime.scroll = scroll;
                 let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
                 if at_bottom && !runtime.snapshot.has_later {
@@ -10679,6 +10754,62 @@ mod tests {
         assert!(chat_runtime(&app, card).pending.is_none());
     }
 
+    fn complete_find_for_test(app: &mut Cagents, target: Target) {
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let generation = runtime.find_generation.load(Ordering::Relaxed);
+        let matches = {
+            let mut worker = runtime.find_worker.lock().unwrap();
+            worker.search(&runtime.find_inputs(),runtime.session.launch.provider,
+                runtime.find.as_deref().unwrap_or_default(),generation,&runtime.find_generation).map(Arc::new)
+        };
+        drop(app.handle_chat_ui(Action::FindIndexed(target,generation,matches)));
+    }
+
+    #[test]
+    fn find_input_defers_indexing_and_stale_results_cannot_change_current_query() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app,Some("async-find"));
+        let target = chat_runtime(&app,card).target;
+        let mut snapshot = (*chat_runtime(&app,card).snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![Arc::new(chat::Item {id:"answer".into(),role:chat::Role::Assistant,
+            content:text("cat cat dog"),at:None,started_at:None})];
+        show_chat_snapshot_for_test(&mut app,card,snapshot);
+        drop(app.handle_chat_ui(Action::Find(target,"cat".into())));
+        let old = chat_runtime(&app,card).find_generation.load(Ordering::Relaxed);
+        assert!(chat_runtime(&app,card).find_matches.is_empty(),"input only echoes and schedules the worker");
+        drop(app.handle_chat_ui(Action::Find(target,"dog".into())));
+        drop(app.handle_chat_ui(Action::FindIndexed(target,old,Some(Arc::new(Vec::new())))));
+        assert_eq!(chat_runtime(&app,card).find.as_deref(),Some("dog"));
+        complete_find_for_test(&mut app,target);
+        let runtime = chat_runtime(&app,card);
+        assert_eq!(runtime.find_matches.len(),1);
+        assert_eq!(runtime.find_matches[0].range,8..11);
+        drop(app.handle_chat_ui(Action::Find(target,"cat".into())));
+        complete_find_for_test(&mut app,target);
+        assert_eq!(chat_runtime(&app,card).find_matches.len(),2);
+        drop(app.handle_chat_ui(Action::FindNext(target,true)));
+        assert_eq!(chat_runtime(&app,card).find_matches[chat_runtime(&app,card).find_index].range,4..7);
+        drop(app.handle_chat_ui(Action::FindNext(target,false)));
+        assert_eq!(chat_runtime(&app,card).find_index,0);
+    }
+
+    #[test]
+    fn opening_find_records_reading_position_without_changing_offset() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app,Some("find-position"));
+        app.workspace.focus(card).unwrap();
+        let target = chat_runtime(&app,card).target;
+        let original = view::Scroll::new(420.0,4000.0,700.0);
+        app.chat_runtime_mut(target).unwrap().scroll = original;
+        drop(app.open_chat_find());
+        let runtime = chat_runtime(&app,card);
+        assert_eq!(runtime.scroll,original);
+        assert_eq!(runtime.find_origin,Some(original));
+        assert!(!runtime.find_navigated);
+        assert!(runtime.find_locating.is_none(),"opening never navigates to a match");
+    }
+
     #[test]
     fn finding_collapsed_reasoning_reveals_it_and_restores_disclosure() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -10701,6 +10832,7 @@ mod tests {
         show_chat_snapshot_for_test(&mut app, card, snapshot);
         assert!(!chat_runtime(&app, card).expanded.contains("reasoning"));
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        complete_find_for_test(&mut app, target);
         assert!(chat_runtime(&app, card).expanded.contains("reasoning"));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(!chat_runtime(&app, card).expanded.contains("reasoning"));
@@ -10788,8 +10920,13 @@ mod tests {
             .opened
             .insert("prompt".into(), false);
         drop(app.handle_chat_ui(Action::Find(target, "STRASSE".into())));
+        complete_find_for_test(&mut app, target);
         let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.find_matches, vec!["prompt"]);
+        assert_eq!(runtime.find_matches.len(), 3);
+        assert!(runtime.find_matches.iter().all(|found| found.turn == "prompt"));
+        drop(app.handle_chat_ui(Action::FindNext(target, true)));
+        drop(app.handle_chat_ui(Action::FindNext(target, true)));
+        let runtime = chat_runtime(&app, card);
         assert!(
             ["automatic", "manual", "changed"]
                 .iter()
@@ -10806,6 +10943,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::Toggle(target, "changed".into())));
         drop(app.handle_chat_ui(Action::Toggle(target, "changed".into())));
         drop(app.handle_chat_ui(Action::Find(target, "absent".into())));
+        complete_find_for_test(&mut app, target);
         let runtime = chat_runtime(&app, card);
         assert_eq!(
             runtime.expanded,
@@ -10814,6 +10952,7 @@ mod tests {
         assert_eq!(runtime.opened.get("prompt"), Some(&false));
         assert_eq!(output_count(runtime, &renderer, &mut rendered_tree), 0);
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        complete_find_for_test(&mut app, target);
         drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
         drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
@@ -10981,6 +11120,7 @@ mod tests {
                 drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
             }
             drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        complete_find_for_test(&mut app, target);
             assert_eq!(chat_runtime(&app, card).opened.get("prompt"), Some(&true));
             snapshot.generation += 1;
             snapshot.items.remove(0);
