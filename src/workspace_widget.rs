@@ -163,6 +163,8 @@ impl GlobalShortcut {
             Self::SettingsAccounts => "settings_accounts",
             Self::SettingsNotifications => "settings_notifications",
             Self::SettingsAbout => "settings_about",
+            Self::NextAttention => "next_attention",
+            Self::PreviousAttention => "previous_attention",
             Self::CommandPalette => "command_palette",
             Self::NewThread => "new_native_thread",
             Self::ChatPermissions => "chat_permissions",
