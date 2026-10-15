@@ -2243,7 +2243,7 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
             .map(|record| record.handle.clone())
             .collect::<Vec<_>>();
         for handle in completed {
-            handle.preserve_completed_for_restart();
+            handle.preserve_completed_for_restart()?;
         }
         for terminal in &mut frozen {
             terminal.stop()?;
@@ -3171,7 +3171,7 @@ fn close_failed_restore(
                 .map(|record| record.handle.clone());
             if let Some(handle) = handle {
                 if handle.is_completed() {
-                    handle.preserve_completed_for_restart();
+                    handle.preserve_completed_for_restart()?;
                 } else if let Err(error) = handle.carry(holder_socket(holders, id)) {
                     tracing::warn!(terminal = %id, %error,
                         "could not return an adopted terminal to its holder after a failed restore");

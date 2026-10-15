@@ -1509,7 +1509,29 @@ impl TerminalHandle {
         Ok(())
     }
 
-    pub(crate) fn preserve_completed_for_restart(&self) {
+    pub(crate) fn preserve_completed_for_restart(&self) -> Result<(), String> {
+        {
+            let mut order = self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
+            if order.closing || order.handoff {
+                return Err("Terminal session stop or ownership transition already owns admission".into());
+            }
+            if !self.is_completed() {
+                return Err("Terminal completion is not yet confirmed; preserve its live owner instead".into());
+            }
+            // Claim transfer before touching the retained holder. A stop that
+            // already won keeps its exact cleanup owner; a later stop refuses.
+            order.handoff = true;
+        }
+        self.preserve_claimed_completed_for_restart()
+    }
+
+    fn preserve_claimed_completed_for_restart(&self) -> Result<(), String> {
+        {
+            let order = self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
+            if order.closing || !order.handoff {
+                return Err("Terminal preservation no longer owns admission".into());
+            }
+        }
         let holder = self
             .inner
             .published
@@ -1518,9 +1540,9 @@ impl TerminalHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(mut holder) = holder {
-            self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner()).handoff = true;
             holder.leave_for_successor();
         }
+        Ok(())
     }
 
     /// Failed checkpoint restoration must never release an adopted registered
@@ -1555,8 +1577,7 @@ impl TerminalHandle {
         if !self.join_worker_until(deadline, false) {
             return Err("terminal preservation join is pending or exceeded its deadline".into());
         }
-        self.preserve_completed_for_restart();
-        Ok(())
+        self.preserve_claimed_completed_for_restart()
     }
 
     fn join_worker_until(&self, deadline: std::time::Instant, escalate: bool) -> bool {
@@ -6634,6 +6655,35 @@ mod tests {
         assert!(handle.preserve_for_restart().is_err(),"a stop winner must not subsequently detach the holder");
         stop.finish(deadline).unwrap();
         assert!(handle.is_completed());
+    }
+
+    #[test]
+    fn completed_stop_winner_keeps_its_holder_from_restart_preservation() {
+        let handle=TerminalHandle::spawn(shell_session("exit 0"),TerminalConfig::default(),|_|{}).unwrap();
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(std::time::Instant::now()<deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(handle.inner.published.retained_holder.lock().unwrap().is_some());
+        let stop=handle.fence_session_stop(handle.execution_instance(),deadline).unwrap();
+        assert!(handle.preserve_completed_for_restart().is_err());
+        assert!(handle.inner.published.retained_holder.lock().unwrap().is_some(),"preservation cannot take the stop winner's retained owner");
+        stop.finish(deadline).unwrap();
+    }
+
+    #[test]
+    fn completed_preservation_winner_rejects_later_session_stop() {
+        let handle=TerminalHandle::spawn(shell_session("exit 0"),TerminalConfig::default(),|_|{}).unwrap();
+        let deadline=std::time::Instant::now()+Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(std::time::Instant::now()<deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        handle.preserve_completed_for_restart().unwrap();
+        assert!(handle.inner.published.input_order.lock().unwrap().handoff);
+        assert!(handle.fence_session_stop(handle.execution_instance(),deadline).is_err());
+        assert!(!handle.inner.published.input_order.lock().unwrap().closing);
     }
 
     #[test]
