@@ -101,6 +101,7 @@ struct Height {
     revision: u64,
     height: f32,
     estimate: f32,
+    cross: f32,
 }
 impl Height {
     fn for_row(&self, row: &Row<'_>) -> f32 {
@@ -113,6 +114,7 @@ struct State {
     axis: Axis,
     width: f32,
     heights: HashMap<u64, Height>,
+    cross_extents: std::collections::BTreeMap<u32, usize>,
     mounted: Vec<(usize, u64)>,
     offsets: PrefixSums,
     descriptors: u64,
@@ -196,6 +198,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         // Retain only descriptors still loaded by the transcript window.
         let keys: HashSet<_> = self.rows.iter().map(|row| row.key).collect();
         state.heights.retain(|key, _| keys.contains(key));
+        state.cross_extents.clear();
+        for measured in state.heights.values() {
+            *state.cross_extents.entry(measured.cross.to_bits()).or_default() += 1;
+        }
             state.offsets = PrefixSums::new(self.rows.iter().map(|row| {
                 state.heights.get(&row.key).map_or(row.estimate, |height| height.for_row(row)).max(0.0)
             }).collect());
@@ -227,7 +233,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                     &layout::Limits::new(Size::ZERO, child_max));
                 let height = self.axis.main(node.size());
                 changed |= (height - state.offsets.values[index]).abs() > 0.5;
-                state.heights.insert(key, Height { revision, height, estimate });
+                let cross = self.axis.cross(node.size()).max(0.0);
+                if let Some(previous) = state.heights.insert(key, Height { revision, height, estimate, cross }) {
+                    if let Some(count) = state.cross_extents.get_mut(&previous.cross.to_bits()) {
+                        *count -= 1;
+                        if *count == 0 { state.cross_extents.remove(&previous.cross.to_bits()); }
+                    }
+                }
+                *state.cross_extents.entry(cross.to_bits()).or_default() += 1;
                 state.offsets.set(index, height);
                 node.move_to_mut(self.axis.point(state.offsets.prefix(index)));
                 nodes.push(node);
@@ -250,10 +263,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         for ((index, _), node) in state.mounted.iter().zip(&mut nodes) {
             node.move_to_mut(self.axis.point(state.offsets.prefix(*index)));
         }
+        // An evicted row keeps only cheap measured geometry. Losing its
+        // cross extent would collapse a horizontal scrollbar while scrolling
+        // past short physical lines (or shrink a tall table row sideways).
+        let measured_cross = state.cross_extents.last_key_value().map_or(0.0, |(bits, _)| f32::from_bits(*bits));
         let cross = match self.axis {
             Axis::Vertical if limits.max().width.is_finite() => width,
-            Axis::Vertical => nodes.iter().map(|node| node.size().width).fold(0.0, f32::max),
-            Axis::Horizontal => nodes.iter().map(|node| node.size().height).fold(width, f32::max),
+            Axis::Vertical => measured_cross,
+            Axis::Horizontal => measured_cross.max(width),
         };
         layout::Node::with_children(self.axis.size(total, cross), nodes)
     }

@@ -47,6 +47,10 @@ impl Memory {
             state.reported = None;
         }
     }
+    pub fn reader_width(&self, context: Option<&str>, identity: u64) -> f32 {
+        self.1.borrow().entries.get(&(context.map(str::to_owned), identity))
+            .map_or(0.0, |saved| saved.content_width).max(0.0)
+    }
     pub fn retained_rows(&self) -> usize { self.0.borrow().contexts.iter().map(|context| context.rows.len()).sum() }
 }
 
