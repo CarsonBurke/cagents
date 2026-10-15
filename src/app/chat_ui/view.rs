@@ -1,3 +1,4 @@
+use crate::ui_controls::field::EditorContent;
 use super::coordination::Coordinated;
 use super::*;
 use crate::workspace_widget::GlobalShortcut as RegisteredAction;
@@ -1932,6 +1933,7 @@ impl Runtime {
                     composer_editor_style,
                 )))
                 .on_action(move |event| action(Action::Composer(target, event)))
+                .on_history(move |command| action(Action::ComposerHistory(target, command)))
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
                 .key_binding(move |press| {
                     if !matches!(press.status, text_editor::Status::Focused { .. }) {
@@ -7145,8 +7147,8 @@ mod tests {
         };
         let (mut first, _first_handle) = frame_cost::live_runtime(&[]);
         let (mut second, _second_handle) = frame_cost::live_runtime(&[]);
-        first.replace_draft(text_editor::Content::with_text("first draft"));
-        second.replace_draft(text_editor::Content::with_text("second draft"));
+        first.replace_draft(EditorContent::with_text("first draft"));
+        second.replace_draft(EditorContent::with_text("second draft"));
         let shortcuts = crate::settings::KeyboardShortcuts::default();
         fn pane<'a>(
             runtime: &'a Runtime,

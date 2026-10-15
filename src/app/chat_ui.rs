@@ -1,5 +1,6 @@
 mod session_links;
 use super::*;
+use crate::ui_controls::field::EditorContent;
 use crate::account::{Account, AccountId};
 use crate::agent::{Activity, Provider};
 use crate::app::account_ui::ChatAccounts;
@@ -181,6 +182,7 @@ pub enum Action {
     StartFresh(CardId),
     Composer(Target, text_editor::Action),
     ComposerCursor(Target, text_editor::Cursor),
+    ComposerHistory(Target, crate::ui_controls::field::EditorHistoryCommand),
     Paste(Target),
     PastedImage(Target, Option<clipboard_image::Image>),
     PastedText(Target, Option<String>),
@@ -361,6 +363,7 @@ impl Action {
     fn mutation_target(&self) -> Option<Target> {
         match self {
             Self::Composer(target, action) if action.is_edit() => Some(*target),
+            Self::ComposerHistory(target, command) if command.changes_text() => Some(*target),
             Self::DraftModel(target, _, _)
             | Self::ChooseAccount(target, _)
             | Self::AccountPicker(target, _)
@@ -1536,7 +1539,7 @@ pub(super) struct Runtime {
     /// history-page eviction within a bounded disclosure budget.
     opened: HashMap<String, bool>,
     pub(super) tool_groups_expanded: bool,
-    composer: text_editor::Content<cosmic::Renderer>,
+    composer: EditorContent,
     revision: u64,
     attachments: Vec<Attachment>,
     thumbnails: thumbnails::Cache,
@@ -1575,7 +1578,7 @@ pub(super) struct Runtime {
     history_cursor: Option<usize>,
     /// The draft that was in the composer when the walk began, restored when
     /// the walk goes past the newest message.
-    history_stash: Option<text_editor::Content<cosmic::Renderer>>,
+    history_stash: Option<EditorContent>,
     /// The most recent transcript viewport, used for history pagination.
     scroll: view::Scroll,
     subagent_scroll: HashMap<String, view::Scroll>,
@@ -1818,7 +1821,7 @@ impl Runtime {
             (true, false) => draft,
             (false, false) => format!("{text}\n{draft}"),
         };
-        let mut composer = text_editor::Content::with_text(&combined);
+        let mut composer = EditorContent::with_text(&combined);
         // The caret lands where revising the message continues from.
         let last = text.lines().next_back().unwrap_or_default();
         composer.move_to(text_editor::Cursor {
@@ -1977,7 +1980,7 @@ impl Runtime {
         };
         let composer = match next {
             Some(index) => {
-                text_editor::Content::with_text(self.history[index].trim_end_matches('\n'))
+                EditorContent::with_text(self.history[index].trim_end_matches('\n'))
             }
             None => self.history_stash.take().unwrap_or_default(),
         };
@@ -2043,7 +2046,7 @@ impl Runtime {
             return false;
         }
         self.dismiss_suggestion();
-        self.replace_draft(text_editor::Content::with_text(&expected.text));
+        self.replace_draft(EditorContent::with_text(&expected.text));
         self.history_cursor = None;
         self.history_stash = None;
         true
@@ -2051,7 +2054,7 @@ impl Runtime {
 
     /// Puts a whole new draft in the composer. Whatever the completion list
     /// was doing belonged to the old one.
-    fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
+    fn replace_draft(&mut self, composer: EditorContent) {
         self.composer = composer;
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
@@ -2108,7 +2111,7 @@ impl Runtime {
             asked: HashSet::new(),
             opened: HashMap::new(),
             tool_groups_expanded: false,
-            composer: text_editor::Content::new(),
+            composer: EditorContent::new(),
             revision: 0,
             attachments: Vec::new(),
             thumbnails: thumbnails::Cache::default(),
@@ -2207,7 +2210,7 @@ impl Runtime {
         } else {
             format!("{}\n{written}", queued.text.trim_end())
         };
-        self.replace_draft(text_editor::Content::with_text(&text));
+        self.replace_draft(EditorContent::with_text(&text));
         let written = self.replace_attachments(queued.attachments);
         self.attach(written.into_iter().map(|attachment| attachment.path));
         Some(queued.draft)
@@ -2514,7 +2517,7 @@ impl Runtime {
             && self.composer.text().trim().is_empty()
             && let Some(text) = &snapshot.composer
         {
-            self.replace_draft(text_editor::Content::with_text(text));
+            self.replace_draft(EditorContent::with_text(text));
         }
         if snapshot.session_id.is_some() || self.snapshot.session_id.is_some() {
             self.session.launch.session_id = snapshot.session_id.clone();
@@ -4664,7 +4667,7 @@ impl Cagents {
         if let Some(draft) = self.chat_ui.drafts.remove(&card)
             && !draft.is_empty()
         {
-            runtime.replace_draft(text_editor::Content::with_text(&draft));
+            runtime.replace_draft(EditorContent::with_text(&draft));
         }
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
         // hibernate: the card is whole as it stands.
@@ -5460,7 +5463,7 @@ impl Cagents {
             since: None,
             rechecking: false,
         });
-        runtime.replace_draft(text_editor::Content::new());
+        runtime.replace_draft(EditorContent::new());
         runtime.history_cursor = None;
         runtime.history_stash = None;
         runtime.error = None;
@@ -6411,7 +6414,7 @@ impl Cagents {
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
                                 && !draft.is_empty()
                             {
-                                runtime.replace_draft(text_editor::Content::with_text(&draft));
+                                runtime.replace_draft(EditorContent::with_text(&draft));
                             }
                             runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
                             runtime.show(visible);
@@ -6947,6 +6950,38 @@ impl Cagents {
                     return self.load_chat_files(target, directory);
                 }
             }
+            Action::ComposerHistory(target, command) => {
+                let mut files = None;
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    if !command.apply(&mut runtime.composer) { return Task::none(); }
+                    {
+                        runtime.dismiss_suggestion();
+                        runtime.revision = runtime.revision.wrapping_add(1);
+                        // Typing into a recalled message makes it the draft,
+                        // so the next Up starts again from the newest.
+                        runtime.history_cursor = None;
+                        runtime.history_stash = None;
+                    }
+                    // The completion rows follow the word at the caret, so
+                    // anything that can change that word starts them afresh.
+                    let rescroll = runtime.completion.restart(true);
+                    if runtime.files.is_none() && runtime.composer.text().contains('@') {
+                        runtime.files = Some(Arc::new(Vec::new()));
+                        files = Some(runtime.session.launch.recipe.working_directory.clone());
+                    }
+                    if rescroll {
+                        return Task::batch([
+                            view::completion_scroll(target, 0.0),
+                            files.map_or_else(Task::none, |directory| {
+                                self.load_chat_files(target, directory)
+                            }),
+                        ]);
+                    }
+                }
+                if let Some(directory) = files {
+                    return self.load_chat_files(target, directory);
+                }
+            }
             Action::Paste(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -7090,7 +7125,7 @@ impl Cagents {
                         // draft, just as typing or completing a word does.
                         runtime.history_cursor = None;
                         runtime.history_stash = None;
-                        runtime.replace_draft(text_editor::Content::with_text(&text));
+                        runtime.replace_draft(EditorContent::with_text(&text));
                     }
                 }
             }
@@ -7144,7 +7179,7 @@ impl Cagents {
                         );
                         return Task::none();
                     }
-                    runtime.replace_draft(text_editor::Content::new());
+                    runtime.replace_draft(EditorContent::new());
                     runtime.error = None;
                     return self.handle_chat_ui(Action::PermissionPicker(target, true));
                 }
@@ -7164,7 +7199,7 @@ impl Cagents {
                     // The command is spent once the picker answers it; a draft
                     // it leaves untouched gives its place to what is resumed.
                     if let Some(runtime) = self.chat_runtime_mut(target) {
-                        runtime.replace_draft(text_editor::Content::new());
+                        runtime.replace_draft(EditorContent::new());
                         runtime.error = None;
                     }
                     self.resume_ui.replace =
@@ -7211,7 +7246,7 @@ impl Cagents {
                         attachments: runtime.take_attachments(),
                     };
                     runtime.followups.push(followup);
-                    runtime.replace_draft(text_editor::Content::new());
+                    runtime.replace_draft(EditorContent::new());
                     runtime.error = None;
                     let _ = runtime.present();
                     return if runtime.snapshot.busy {
@@ -7389,7 +7424,7 @@ impl Cagents {
                     // real unsent draft, just like typing in the composer.
                     runtime.history_cursor = None;
                     runtime.history_stash = None;
-                    runtime.replace_draft(text_editor::Content::with_text(&draft));
+                    runtime.replace_draft(EditorContent::with_text(&draft));
                     runtime.permission_picker = false;
                     runtime.footer_picker = false;
                     return iced::widget::operation::focus(card_control_id(
@@ -7672,7 +7707,7 @@ impl Cagents {
                             let _ = runtime.present();
                         }
                         if pending.draft_revision == Some(runtime.revision) {
-                            runtime.replace_draft(text_editor::Content::new());
+                            runtime.replace_draft(EditorContent::new());
                             runtime.take_attachments();
                         }
                         if let Some(sent) = pending.sent {
@@ -8729,7 +8764,7 @@ mod tests {
         };
         let target = runtime.target;
         let draft = "/resume private project";
-        runtime.replace_draft(text_editor::Content::with_text(draft));
+        runtime.replace_draft(EditorContent::with_text(draft));
         let original_draft = runtime.composer.text();
 
         let configuration = crate::device::configuration_path().unwrap();
@@ -8793,7 +8828,7 @@ mod tests {
         assert_eq!(runtime.revision, revision.wrapping_add(1));
         assert_eq!(runtime.composer.text().trim_end(), suggestion.text);
         assert!(!runtime.accept_suggestion(&suggestion));
-        runtime.replace_draft(text_editor::Content::with_text("My own newer prompt"));
+        runtime.replace_draft(EditorContent::with_text("My own newer prompt"));
         assert!(!runtime.accept_suggestion(&suggestion));
         assert_eq!(runtime.composer.text().trim_end(), "My own newer prompt");
     }
@@ -8815,7 +8850,7 @@ mod tests {
         );
         write(&mut app, card, "Typed before the prediction");
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.replace_draft(text_editor::Content::new());
+        runtime.replace_draft(EditorContent::new());
         let state = Arc::make_mut(&mut runtime.snapshot);
         state.ready = true;
         state.busy = false;
@@ -8851,7 +8886,7 @@ mod tests {
             name: "permissions".into(),
             description: "Provider dialog".into(),
         });
-        runtime.replace_draft(text_editor::Content::with_text("/PERMISSIONS"));
+        runtime.replace_draft(EditorContent::with_text("/PERMISSIONS"));
         runtime.attachments.push(Attachment {
             path: "retained.png".into(),
         });
@@ -8894,7 +8929,7 @@ mod tests {
                 reason_type: Some("classifier".into()),
                 agent_id: None,
             });
-        runtime.replace_draft(text_editor::Content::with_text("Keep this next task"));
+        runtime.replace_draft(EditorContent::with_text("Keep this next task"));
         runtime.attachments.push(Attachment {
             path: "retained.png".into(),
         });
@@ -8922,7 +8957,7 @@ mod tests {
             let target = chat_runtime(&app, card).target;
             let runtime = app.chat_runtime_mut(target).unwrap();
             runtime.history = vec!["older sent prompt".into(), "newest sent prompt".into()];
-            runtime.replace_draft(text_editor::Content::with_text("original unsent draft"));
+            runtime.replace_draft(EditorContent::with_text("original unsent draft"));
             runtime.attachments.push(Attachment {
                 path: "retained.png".into(),
             });
@@ -9651,14 +9686,14 @@ mod tests {
         };
         Arc::make_mut(&mut runtime.snapshot).busy = true;
         Arc::make_mut(&mut runtime.snapshot).capabilities.queue = false;
-        runtime.replace_draft(text_editor::Content::with_text("next task"));
+        runtime.replace_draft(EditorContent::with_text("next task"));
         let target = runtime.target;
         let _ = app.handle_chat_ui(Action::Submit(target, PromptMode::Queue));
         assert_eq!(chat_runtime(&app, card).followups[0].text, "next task");
         assert!(chat_runtime(&app, card).composer.text().trim().is_empty());
         app.chat_runtime_mut(target)
             .unwrap()
-            .replace_draft(text_editor::Content::with_text("later draft"));
+            .replace_draft(EditorContent::with_text("later draft"));
         let _ = app.handle_chat_ui(Action::TakeBackQueued(target, None));
         let runtime = chat_runtime(&app, card);
         assert!(runtime.followups.is_empty());
@@ -9683,7 +9718,7 @@ mod tests {
             ("", vec!["third.png"]),
         ] {
             let runtime = app.chat_runtime_mut(target).unwrap();
-            runtime.replace_draft(text_editor::Content::with_text(text));
+            runtime.replace_draft(EditorContent::with_text(text));
             runtime.attach(paths.into_iter().map(PathBuf::from));
             drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
         }
@@ -9714,7 +9749,7 @@ mod tests {
         let second = runtime.followups[1].id;
         let first = runtime.followups[0].id;
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.replace_draft(text_editor::Content::with_text("later draft"));
+        runtime.replace_draft(EditorContent::with_text("later draft"));
         runtime.attach([PathBuf::from("later.png")]);
         drop(app.handle_chat_ui(Action::TakeBackQueued(
             target,
@@ -9753,7 +9788,7 @@ mod tests {
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.remember("sent earlier".into());
         runtime.followups.push(followup(0, "waiting", &[]));
-        runtime.replace_draft(text_editor::Content::with_text("unsent"));
+        runtime.replace_draft(EditorContent::with_text("unsent"));
         runtime.recall(true);
         assert_eq!(runtime.composer.text().trim(), "sent earlier");
         drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
@@ -9772,7 +9807,7 @@ mod tests {
                 let runtime = app.chat_runtime_mut(target).unwrap();
                 Arc::make_mut(&mut runtime.snapshot).busy = true;
                 Arc::make_mut(&mut runtime.snapshot).capabilities.queue = false;
-                runtime.replace_draft(text_editor::Content::with_text("next task"));
+                runtime.replace_draft(EditorContent::with_text("next task"));
                 drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
                 drop(app.chat_send(
                     target,
@@ -9811,7 +9846,7 @@ mod tests {
         for text in ["/compact", "also include the second task"] {
             app.chat_runtime_mut(target)
                 .unwrap()
-                .replace_draft(text_editor::Content::with_text(text));
+                .replace_draft(EditorContent::with_text(text));
             drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
         }
         drop(app.dispatch_queued(target));
@@ -9822,7 +9857,7 @@ mod tests {
             pending.sent.as_deref().unwrap().trim(),
             "/compact\nalso include the second task"
         );
-        runtime.replace_draft(text_editor::Content::with_text("later draft"));
+        runtime.replace_draft(EditorContent::with_text("later draft"));
         settle(&mut app, card, Ok(()));
         let runtime = chat_runtime(&app, card);
         assert!(runtime.followups.is_empty());
@@ -9845,7 +9880,7 @@ mod tests {
         ];
         drop(app.dispatch_queued(target));
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.replace_draft(text_editor::Content::with_text("later"));
+        runtime.replace_draft(EditorContent::with_text("later"));
         runtime.attach([PathBuf::from("later.png")]);
         drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
         assert_eq!(chat_runtime(&app, card).followups.len(), 2);
@@ -9891,7 +9926,7 @@ mod tests {
             text: "first".into(),
             attachments: attachments.clone(),
         }];
-        runtime.replace_draft(text_editor::Content::with_text("second"));
+        runtime.replace_draft(EditorContent::with_text("second"));
         runtime.attach([PathBuf::from("extra.png")]);
         drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
         let runtime = chat_runtime(&app, card);
@@ -9914,7 +9949,7 @@ mod tests {
         let target = chat_runtime(&app, card).target;
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.followups.push(followup(0, "queued task", &[]));
-        runtime.replace_draft(text_editor::Content::with_text("later draft"));
+        runtime.replace_draft(EditorContent::with_text("later draft"));
         let _ = app.dispatch_queued(target);
         assert!(chat_runtime(&app, card).pending.as_ref().unwrap().followup);
         settle(&mut app, card, Ok(()));
@@ -10324,7 +10359,7 @@ mod tests {
         let (card, target, handle) =
             provider_queue(&mut app, vec![provider_message("older", "stay"), newest]);
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.replace_draft(text_editor::Content::with_text("typed since"));
+        runtime.replace_draft(EditorContent::with_text("typed since"));
         assert_eq!(
             runtime.newest_take_back(),
             Some(QueueEntry::Provider("newest".into()))
@@ -10362,7 +10397,7 @@ mod tests {
         );
         app.chat_runtime_mut(target)
             .unwrap()
-            .replace_draft(text_editor::Content::with_text("draft"));
+            .replace_draft(EditorContent::with_text("draft"));
         drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
         settle(&mut app, card, Ok(()));
         // The message left the queue because it was delivered, not removed.
@@ -10380,7 +10415,7 @@ mod tests {
             provider_queue(&mut app, vec![provider_message("queued", "still waiting")]);
         app.chat_runtime_mut(target)
             .unwrap()
-            .replace_draft(text_editor::Content::with_text("draft"));
+            .replace_draft(EditorContent::with_text("draft"));
         // Refused before it reached the provider.
         drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
         settle(&mut app, card, Err("fixture refused".into()));
@@ -11280,7 +11315,7 @@ mod tests {
             }));
         }
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.replace_draft(text_editor::Content::with_text(
+        runtime.replace_draft(EditorContent::with_text(
             "Retain this unsent message",
         ));
         assert_eq!(
@@ -11342,6 +11377,36 @@ mod tests {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
         }
+    }
+
+    #[test]
+    fn actual_composer_reducer_handles_type_undo_redo_in_one_native_batch() {
+        use cosmic::iced::{advanced::clipboard, runtime::{UserInterface, user_interface::Cache}};
+        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let initial_revision = chat_runtime(&app, card).revision;
+        let events = [('a', Code::KeyA, false), ('z', Code::KeyZ, true), ('y', Code::KeyY, true)]
+            .into_iter().map(|(character, code, command)| cosmic::iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(character.to_string().into()), modified_key: keyboard::Key::Character(character.to_string().into()),
+                physical_key: Physical::Code(code), modifiers: if command { keyboard::Modifiers::CTRL } else { keyboard::Modifiers::empty() },
+                text: (!command).then(|| character.to_string().into()), location: keyboard::Location::Standard, repeat: false,
+            })).collect::<Vec<_>>();
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut messages = Vec::new();
+        {
+            let mut ui = UserInterface::build(app.chat_view(card), iced::Size::new(900.0, 650.0), Cache::new(), &mut renderer);
+            ui.operate(&renderer, &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(card, "chat-composer")));
+            let _ = ui.update(&events, iced::mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+        }
+        assert_eq!(chat_runtime(&app, card).composer.text(), "");
+        assert_eq!(messages.iter().filter(|message| matches!(message, Message::ChatUi(Action::ComposerHistory(..)))).count(), 3);
+        for message in messages { drop(app.update(message)); }
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "a");
+        assert_eq!(runtime.revision, initial_revision.wrapping_add(3));
+        assert!(runtime.is_draft());
+        assert!(!app.chat_start_pending(card));
     }
 
     #[test]
@@ -12149,7 +12214,7 @@ mod tests {
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&live) else {
             panic!("expected live chat runtime");
         };
-        runtime.replace_draft(text_editor::Content::new());
+        runtime.replace_draft(EditorContent::new());
         let saved = app.persistent_workspace();
         assert!(!saved.chat_drafts.contains_key(&live));
 
@@ -16868,7 +16933,7 @@ mod tests {
         let (card, target, _) = history_fixture(&mut app);
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.error = Some("Codex RPC error: Not logged in".into());
-        runtime.replace_draft(text_editor::Content::with_text("unsent recovery draft"));
+        runtime.replace_draft(EditorContent::with_text("unsent recovery draft"));
         let launch = runtime.session.launch.clone();
         let wrong = app.account_ui.add_managed_fixture(Provider::Codex, 9901);
         let wrong = app.known_account(&wrong).unwrap();
@@ -16911,7 +16976,7 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, _) = history_fixture(&mut app);
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.replace_draft(text_editor::Content::with_text("keep this unsent"));
+        runtime.replace_draft(EditorContent::with_text("keep this unsent"));
         let launch = runtime.session.launch.clone();
         drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
         assert!(app.chat_ui.attempt(card).is_none());
@@ -16968,7 +17033,7 @@ mod tests {
         let home = system.resolved_home().unwrap();
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.error = Some("Codex RPC error: Not logged in".into());
-        runtime.replace_draft(text_editor::Content::with_text("preserved account draft"));
+        runtime.replace_draft(EditorContent::with_text("preserved account draft"));
         let mut recipe = runtime.session.launch.recipe.clone();
         recipe
             .environment
@@ -17027,7 +17092,7 @@ mod tests {
             account.resolved_home().unwrap().display().to_string(),
         );
         runtime.error = Some("Codex RPC error: Not logged in".into());
-        runtime.replace_draft(text_editor::Content::with_text("keep expected login draft"));
+        runtime.replace_draft(EditorContent::with_text("keep expected login draft"));
         let now = crate::chat::now_ms().unwrap();
         for (email, changed) in [
             ("other-dummy@example.test".to_owned(), true),
@@ -17077,7 +17142,7 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot);
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.refresh();
-        runtime.replace_draft(text_editor::Content::with_text("unsent recovery draft"));
+        runtime.replace_draft(EditorContent::with_text("unsent recovery draft"));
         let launch = runtime.session.launch.clone();
         drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
         assert!(app.chat_ui.attempt(card).is_none());

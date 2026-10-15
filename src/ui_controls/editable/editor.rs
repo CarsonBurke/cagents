@@ -3,19 +3,72 @@
 //! key or pointer events.
 use super::*;
 use cosmic::iced::{advanced::text::highlighter::PlainText, widget::text_editor};
-use std::cell::RefCell;
+use std::{cell::{Cell, RefCell}, sync::{Arc, Mutex}};
+
+/// A form draft owns its identity independently of its address or widget ID.
+/// Replacing or cloning a draft cannot admit callbacks from the previous one.
+#[derive(Debug)]
+pub struct EditorContent {
+    native: text_editor::Content<Renderer>,
+    owner: Arc<()>,
+}
+impl EditorContent {
+    pub fn new() -> Self { Self::with_text("") }
+    pub fn with_text(text: &str) -> Self { Self { native: text_editor::Content::with_text(text), owner: Arc::new(()) } }
+    /// Normalize the just-accepted edit without replacing this draft identity.
+    pub(crate) fn normalize_text(&mut self, text: &str) { self.native = text_editor::Content::with_text(text); }
+}
+impl Default for EditorContent { fn default() -> Self { Self::new() } }
+impl Clone for EditorContent { fn clone(&self) -> Self { Self::with_text(&self.native.text()) } }
+impl std::ops::Deref for EditorContent { type Target = text_editor::Content<Renderer>; fn deref(&self) -> &Self::Target { &self.native } }
+impl std::ops::DerefMut for EditorContent { fn deref_mut(&mut self) -> &mut Self::Target { &mut self.native } }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryIntent { Observe, Undo, Redo }
+
+/// Dispatched after the native edit, then applied by the consumer reducer.
+/// Native UI.update batches events before reducers run; reading the view
+/// Content while interpreting Undo would observe the previous batch instead.
+#[derive(Clone)]
+pub struct EditorHistoryCommand {
+    owner: Arc<()>,
+    history: Arc<Mutex<EditHistory>>,
+    intent: HistoryIntent,
+}
+impl std::fmt::Debug for EditorHistoryCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("EditorHistoryCommand").field("intent", &self.intent).finish_non_exhaustive() }
+}
+impl PartialEq for EditorHistoryCommand { fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.owner, &other.owner) && Arc::ptr_eq(&self.history, &other.history) && self.intent == other.intent } }
+impl Eq for EditorHistoryCommand {}
+impl EditorHistoryCommand {
+    pub fn changes_text(&self) -> bool { !matches!(self.intent, HistoryIntent::Observe) }
+    /// Returns true only when an admitted Undo/Redo changed this same draft.
+    pub fn apply(&self, content: &mut EditorContent) -> bool {
+        if !Arc::ptr_eq(&self.owner, &content.owner) { return false; }
+        let mut history = self.history.lock().unwrap_or_else(|error| error.into_inner());
+        history.observe(content.text(), content.cursor());
+        let redo = match self.intent { HistoryIntent::Observe => return false, HistoryIntent::Undo => false, HistoryIntent::Redo => true };
+        let Some(snapshot) = history.restore(redo) else { return false; };
+        content.perform(text_editor::Action::SelectAll);
+        content.perform(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(snapshot.text.clone()))));
+        content.move_to(snapshot.cursor);
+        true
+    }
+}
+
 
 /// Bounded per-control history supplies the undo/redo operations absent from
 /// iced's form editor. Record text only on focused keyboard input, never on
 /// redraw, so an idle retained form does no cloning or history work.
+#[derive(Debug)]
 struct EditSnapshot {
     text: String,
     cursor: text_editor::Cursor,
 }
+#[derive(Debug)]
 struct EditHistory {
     entries: Vec<EditSnapshot>,
     current: usize,
-    restoring: Option<usize>,
     bytes: usize,
 }
 impl EditHistory {
@@ -24,18 +77,10 @@ impl EditHistory {
         Self {
             entries: vec![EditSnapshot { text, cursor }],
             current: 0,
-            restoring: None,
             bytes,
         }
     }
     fn observe(&mut self, text: String, cursor: text_editor::Cursor) {
-        if let Some(target) = self.restoring {
-            if text != self.entries[target].text {
-                return;
-            }
-            self.current = target;
-            self.restoring = None;
-        }
         if text == self.entries[self.current].text {
             self.entries[self.current].cursor = cursor;
             return;
@@ -51,9 +96,6 @@ impl EditHistory {
         self.current = self.entries.len() - 1;
     }
     fn restore(&mut self, redo: bool) -> Option<&EditSnapshot> {
-        if self.restoring.is_some() {
-            return None;
-        }
         let target = if redo {
             self.current
                 .checked_add(1)
@@ -61,7 +103,7 @@ impl EditHistory {
         } else {
             self.current.checked_sub(1)?
         };
-        self.restoring = Some(target);
+        self.current = target;
         self.entries.get(target)
     }
 }
@@ -82,26 +124,31 @@ impl Operation for EditorFocus {
 
 pub struct TextEditor<'a, Message> {
     inner: cosmic::iced::widget::TextEditor<'a, PlainText, Message, Theme, Renderer>,
-    content: &'a text_editor::Content<Renderer>,
+    content: &'a EditorContent,
     name: Cow<'a, str>,
     id: Option<Id>,
     on_action: Option<Rc<dyn Fn(text_editor::Action) -> Message + 'a>>,
     on_cursor: Option<Rc<dyn Fn(text_editor::Cursor) -> Message + 'a>>,
+    on_history: Option<Rc<dyn Fn(EditorHistoryCommand) -> Message + 'a>>,
+    emitted: Rc<Cell<bool>>,
 }
 struct EditorState {
     identity: State,
     lines: RefCell<Vec<Id>>,
-    history: EditHistory,
+    history: Arc<Mutex<EditHistory>>,
+    owner: Arc<()>,
 }
 impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
-    pub fn new(name: impl Into<Cow<'a, str>>, content: &'a text_editor::Content<Renderer>) -> Self {
+    pub fn new(name: impl Into<Cow<'a, str>>, content: &'a EditorContent) -> Self {
         Self {
-            inner: cosmic::iced::widget::text_editor(content),
+            inner: cosmic::iced::widget::text_editor(&content.native),
             content,
             name: name.into(),
             id: None,
             on_action: None,
             on_cursor: None,
+            on_history: None,
+            emitted: Rc::new(Cell::new(false)),
         }
     }
     pub fn id(mut self, id: Id) -> Self {
@@ -110,11 +157,22 @@ impl<'a, Message: Clone + 'static> TextEditor<'a, Message> {
         self
     }
     pub fn on_action(mut self, callback: impl Fn(text_editor::Action) -> Message + 'a) -> Self {
-        let callback: Rc<dyn Fn(text_editor::Action) -> Message + 'a> = Rc::new(callback);
+        let emitted = self.emitted.clone();
+        let callback: Rc<dyn Fn(text_editor::Action) -> Message + 'a> = Rc::new(move |action| { emitted.set(true); callback(action) });
         let action = callback.clone();
         self.inner = self.inner.on_action(move |value| action(value));
         self.on_action = Some(callback);
         self
+    }
+    pub fn on_history(mut self, callback: impl Fn(EditorHistoryCommand) -> Message + 'a) -> Self {
+        self.on_history = Some(Rc::new(callback));
+        self
+    }
+    fn publish_history(&self, tree: &Tree, intent: HistoryIntent, shell: &mut Shell<'_, Message>) {
+        if let Some(callback) = &self.on_history {
+            let state = tree.state.downcast_ref::<EditorState>();
+            shell.publish(callback(EditorHistoryCommand { owner: self.content.owner.clone(), history: state.history.clone(), intent }));
+        }
     }
     pub fn on_cursor(mut self, callback: impl Fn(text_editor::Cursor) -> Message + 'a) -> Self {
         self.on_cursor = Some(Rc::new(callback));
@@ -188,7 +246,8 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
         tree::State::new(EditorState {
             identity: State::new(self.id.clone(), &self.name),
             lines: RefCell::default(),
-            history: EditHistory::new(self.content.text(), self.content.cursor()),
+            history: Arc::new(Mutex::new(EditHistory::new(self.content.text(), self.content.cursor()))),
+            owner: self.content.owner.clone(),
         })
     }
     fn children(&self) -> Vec<Tree> {
@@ -200,9 +259,10 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
         let state = tree.state.downcast_mut::<EditorState>();
         let old = state.identity.id.clone();
         state.identity.bind(self.id.clone(), &self.name);
-        if old != state.identity.id {
+        if old != state.identity.id || !Arc::ptr_eq(&state.owner, &self.content.owner) {
             state.lines.get_mut().clear();
-            state.history = EditHistory::new(self.content.text(), self.content.cursor());
+            state.history = Arc::new(Mutex::new(EditHistory::new(self.content.text(), self.content.cursor())));
+            state.owner = self.content.owner.clone();
         }
         self.inner.set_id(state.identity.id.clone());
         tree.children[0].diff(&mut self.inner as &mut dyn Widget<Message, Theme, Renderer>);
@@ -365,20 +425,21 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        self.emitted.set(false);
+        let mut observe_key = false;
         if let cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
             key,
             physical_key,
             modifiers,
             ..
         }) = event
-            && let Some(action) = &self.on_action
+            && self.on_action.is_some() && self.on_history.is_some()
         {
             let mut focused = EditorFocus(false);
             self.inner
                 .operate(&mut tree.children[0], layout, renderer, &mut focused);
             if focused.0 {
-                let history = &mut tree.state.downcast_mut::<EditorState>().history;
-                history.observe(self.content.text(), self.content.cursor());
+                observe_key = true;
                 let command = if modifiers.command() && !modifiers.alt() {
                     match key
                         .to_latin(*physical_key)
@@ -392,17 +453,9 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
                     None
                 };
                 if let Some(redo) = command {
-                    if let Some(snapshot) = history.restore(redo) {
-                        shell.publish(action(text_editor::Action::SelectAll));
-                        shell.publish(action(text_editor::Action::Edit(text_editor::Edit::Paste(
-                            std::sync::Arc::new(snapshot.text.clone()),
-                        ))));
-                        if let Some(cursor) = &self.on_cursor {
-                            shell.publish(cursor(snapshot.cursor));
-                        }
-                        shell.invalidate_layout();
-                        shell.request_redraw();
-                    }
+                    self.publish_history(tree, if redo { HistoryIntent::Redo } else { HistoryIntent::Undo }, shell);
+                    shell.invalidate_layout();
+                    shell.request_redraw();
                     shell.capture_event();
                     return;
                 }
@@ -472,6 +525,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
                         _ => {}
                     }
                 }
+                if self.emitted.replace(false) { self.publish_history(tree, HistoryIntent::Observe, shell); }
                 shell.capture_event();
                 shell.request_redraw();
                 return;
@@ -487,6 +541,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
             shell,
             viewport,
         );
+        if self.emitted.replace(false) || observe_key { self.publish_history(tree, HistoryIntent::Observe, shell); }
     }
 }
 impl<'a, Message: Clone + 'static> From<TextEditor<'a, Message>> for Element<'a, Message> {
@@ -504,6 +559,7 @@ mod tests {
     enum Message {
         Edit(text_editor::Action),
         Cursor(text_editor::Cursor),
+        History(EditorHistoryCommand),
         Keyboard(
             cosmic::iced::keyboard::Event,
             bool,
@@ -521,7 +577,7 @@ mod tests {
             key::{Code, Physical},
         };
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut content = text_editor::Content::new();
+        let mut content = EditorContent::new();
         let id = Id::new("test.chat-composer");
         let trace = input_trace::InputTrace::default();
         let owning_card = crate::model::CardId::new();
@@ -557,6 +613,7 @@ mod tests {
                 let editor = TextEditor::new("Message", &content)
                     .id(id.clone())
                     .on_action(Message::Edit)
+                    .on_history(Message::History)
                     .on_cursor(Message::Cursor);
                 let mut element = input_trace::observe_keyboard_events(
                     editor,
@@ -600,6 +657,7 @@ mod tests {
                 match message {
                     Message::Edit(action) => content.perform(action),
                     Message::Cursor(cursor) => content.move_to(cursor),
+                    Message::History(command) => { command.apply(&mut content); }
                     Message::Keyboard(delivered, captured, region) => {
                         assert_eq!(delivered, event);
                         assert!(captured, "the text widget handles each tested edit chord");
@@ -626,6 +684,101 @@ mod tests {
         }
     }
 
+    fn batch_key(letter: char, control: bool) -> Event {
+        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        let code = match letter { 'a' => Code::KeyA, 'b' => Code::KeyB, 'c' => Code::KeyC, 'z' => Code::KeyZ, 'y' => Code::KeyY, _ => unreachable!() };
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(letter.to_string().into()),
+            modified_key: keyboard::Key::Character(letter.to_string().into()),
+            physical_key: Physical::Code(code), modifiers: if control { keyboard::Modifiers::CTRL } else { keyboard::Modifiers::empty() },
+            text: (!control).then(|| letter.to_string().into()), repeat: false, location: keyboard::Location::Standard,
+        })
+    }
+
+    fn native_batch(content: &EditorContent, events: &[Event]) -> Vec<Message> {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let id = Id::new("test.batch-composer");
+        let editor = TextEditor::new("Message", content).id(id.clone())
+            .on_action(Message::Edit).on_cursor(Message::Cursor).on_history(Message::History);
+        let mut ui = UserInterface::build(editor, Size::new(400.0, 180.0), Cache::new(), &mut renderer);
+        ui.operate(&renderer, &mut cosmic::iced::advanced::widget::operation::focusable::focus::<()>(id));
+        let mut messages = Vec::new();
+        // This is deliberately ONE native UI update, followed by the reducer.
+        // Rebuilding/reducing after each event hides the regression.
+        let _ = ui.update(events, mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+        messages
+    }
+
+    #[test]
+    fn one_native_event_batch_preserves_type_undo_redo_and_new_edit_order() {
+        for (keys, expected) in [
+            (vec![('a', false), ('z', true)], ""),
+            (vec![('a', false), ('b', false), ('z', true), ('z', true), ('y', true)], "a"),
+            (vec![('a', false), ('b', false), ('z', true), ('z', true), ('y', true), ('c', false), ('y', true)], "ac"),
+        ] {
+            let mut content = EditorContent::new();
+            let events = keys.into_iter().map(|(key, control)| batch_key(key, control)).collect::<Vec<_>>();
+            let messages = native_batch(&content, &events);
+            assert_eq!(content.text(), "", "widgets must not mutate the consumer's draft");
+            for message in messages {
+                match message {
+                    Message::Edit(action) => content.perform(action),
+                    Message::Cursor(cursor) => content.move_to(cursor),
+                    Message::History(command) => { command.apply(&mut content); }
+                    Message::Keyboard(..) => unreachable!(),
+                }
+            }
+            assert_eq!(content.text(), expected);
+        }
+    }
+
+    #[test]
+    fn batched_history_observes_accepted_normalized_or_refused_edits_only() {
+        for refuse in [false, true] {
+            let mut content = EditorContent::new();
+            let messages = native_batch(&content, &[batch_key('a', false), batch_key('z', true), batch_key('y', true)]);
+            for message in messages {
+                match message {
+                    Message::Edit(text_editor::Action::Edit(text_editor::Edit::Insert(character))) if !refuse => {
+                        content.perform(text_editor::Action::Edit(text_editor::Edit::Insert(character)));
+                        // Like a single-line commit subject, normalization is
+                        // accepted in this same draft, not a new draft owner.
+                        content.normalize_text(&content.text().to_ascii_uppercase());
+                    }
+                    Message::Edit(_) => {}
+                    Message::History(command) => { command.apply(&mut content); }
+                    Message::Cursor(cursor) => content.move_to(cursor),
+                    Message::Keyboard(..) => unreachable!(),
+                }
+            }
+            assert_eq!(content.text(), if refuse { "" } else { "A" });
+        }
+    }
+
+    #[test]
+    fn stale_history_callback_cannot_observe_or_restore_a_successor_draft() {
+        let mut original = EditorContent::new();
+        let messages = native_batch(&original, &[batch_key('a', false), batch_key('z', true), batch_key('y', true)]);
+        let mut successor = EditorContent::with_text("keep successor");
+        for message in messages {
+            match message {
+                Message::Edit(action) => original.perform(action),
+                Message::History(command) => {
+                    assert!(!command.apply(&mut successor));
+                    assert_eq!(successor.text(), "keep successor");
+                    // Refusal must precede history mutation: the same callback
+                    // still works for its actual original draft afterwards.
+                    command.apply(&mut original);
+                }
+                Message::Cursor(cursor) => original.move_to(cursor),
+                Message::Keyboard(..) => unreachable!(),
+            }
+        }
+        assert_eq!(original.text(), "a");
+        assert_eq!(successor.text(), "keep successor");
+    }
+
     #[test]
     fn editor_history_discards_redo_after_new_text_and_bounds_retention() {
         let cursor = text_editor::Cursor {
@@ -648,7 +801,7 @@ mod tests {
     #[test]
     fn multiline_selection_maps_unicode_bytes_and_replacement_uses_existing_edit_action() {
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut content = text_editor::Content::with_text("éclair\n👩‍💻 end");
+        let mut content = EditorContent::with_text("éclair\n👩‍💻 end");
         let id = Id::new("test.form.editor");
         let mut tree;
         let mut messages = Vec::new();
@@ -656,6 +809,7 @@ mod tests {
             let mut editor = TextEditor::new("Instructions", &content)
                 .id(id.clone())
                 .on_action(Message::Edit)
+                    .on_history(Message::History)
                 .on_cursor(Message::Cursor);
             tree = Tree::new(&editor as &dyn Widget<Message, Theme, Renderer>);
             assert!(
@@ -740,6 +894,7 @@ mod tests {
             let mut editor = TextEditor::new("Instructions", &content)
                 .id(id.clone())
                 .on_action(Message::Edit)
+                    .on_history(Message::History)
                 .on_cursor(Message::Cursor);
             editor.diff(&mut tree);
             let node = editor.layout(
