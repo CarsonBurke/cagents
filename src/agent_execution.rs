@@ -475,6 +475,38 @@ impl std::fmt::Debug for PresentationCloseObservation {
     }
 }
 
+/// Exact process identities observed through the authenticated native holder.
+/// This identifies the current cleanup owner; it makes no claim about the
+/// unverifiable historical terminal pane generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresentationCloseOwner {
+    pub version: u32,
+    pub native: bool,
+    pub terminal: TerminalId,
+    pub application: String,
+    pub boot: crate::model::BootId,
+    pub holder_pid: i32,
+    pub holder_start: u64,
+    pub provider_pid: i32,
+    pub provider_start: u64,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresentationCloseTarget {
+    pub observation: PresentationCloseObservation,
+    pub host: crate::model::HostSessionProof,
+    pub owner: PresentationCloseOwner,
+    pub actor_instance: Option<uuid::Uuid>,
+    pub paired_owner: Option<PresentationCloseOwner>,
+}
+impl std::fmt::Debug for PresentationCloseTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PresentationCloseTarget")
+            .field("agent", &self.observation.agent.id)
+            .field("pane", &self.observation.pane.id).finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Submit(Submit),
@@ -509,6 +541,10 @@ pub enum Operation {
     InspectPresentationRepair(AgentId),
     /// Explicit presentation-only consent, fenced by the exact observation.
     ConfirmPresentationRepair { observed: PresentationRepairTarget },
+    /// Observe exact current provider cleanup authority and unknown-history pane.
+    InspectPresentationClose(AgentId),
+    /// Explicitly stop the observed current provider and remove only this pane.
+    ConfirmPresentationClose { observed: PresentationCloseTarget },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -575,6 +611,7 @@ pub enum Reply {
     InboxAcknowledged,
     PresentationRepair(Option<PresentationRepairTarget>),
     PresentationRemoved { agent: AgentId, removed: bool },
+    PresentationClose(Option<PresentationCloseTarget>),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

@@ -3,6 +3,7 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 mod account_isolation_tests;
 mod execution_directory;
 mod native_cleanup;
+pub(in crate::host) mod presentation_close;
 mod native_recovery;
 mod owned_listener;
 pub(super) mod restart;
@@ -23,7 +24,9 @@ use crate::{
         ServerMessage, ServerResponse, validate_proof,
     },
 };
-pub(super) use native_cleanup::{NativeClose, close_retained as close_retained_native};
+pub(super) use native_cleanup::{NativeClose, close_retained as close_retained_native, close_with_presentation};
+#[cfg(test)]
+pub(super) use native_cleanup::before_presentation_close_commit;
 pub(super) use native_recovery::AdoptionFailures;
 pub(super) use native_recovery::restore_orphaned_native;
 use std::{

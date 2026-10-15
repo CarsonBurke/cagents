@@ -982,6 +982,30 @@ pub(super) fn process(
             if removed { announce(host, &registry); }
             Ok(Reply::PresentationRemoved { agent: id, removed })
         }
+        Operation::InspectPresentationClose(id) => {
+            let origin = origin(host, &authority)?;
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let registry = registry(host)?;
+            let observation = registry.lock().unwrap_or_else(|p| p.into_inner())
+                .inspect_presentation_close(&origin, id)?;
+            let target = observation.map(|observed| super::chat::presentation_close::capture(host, observed)).transpose()?;
+            Ok(Reply::PresentationClose(target))
+        }
+        Operation::ConfirmPresentationClose { observed } => {
+            let origin = origin(host, &authority)?;
+            let id = observed.observation.agent.id;
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let registry = registry(host)?;
+            registry.lock().unwrap_or_else(|p| p.into_inner())
+                .preflight_presentation_close(&origin, &observed.observation)?;
+            super::chat::close_with_presentation(host, &origin, &observed)?;
+            let agent = registry.lock().unwrap_or_else(|p| p.into_inner()).agent(id)?;
+            if !agent.closed { return Err("The exact provider cleanup did not commit agent retirement".into()); }
+            announce(host, &registry);
+            Ok(Reply::Closed(agent))
+        }
         Operation::Directory(scope) => {
             directory::read(host, &authority, scope).map(Reply::Directory)
         }
