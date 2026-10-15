@@ -1070,6 +1070,12 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Choosing attachments")
         } else if self.pending.is_some() {
             (Some(Icon::AgentWorking), "Sending")
+        } else if let Some(outcome) = snapshot.outcome.as_ref().filter(|outcome| outcome.reason().is_some()) {
+            (Some(Icon::Warning), outcome.label())
+        } else if matches!(&snapshot.outcome, Some(crate::agent::ActivityOutcome::Cancelled)) && (!snapshot.is_working() || snapshot.exited) {
+            (Some(Icon::Cancel), "Cancelled")
+        } else if matches!(&snapshot.outcome, Some(crate::agent::ActivityOutcome::Succeeded)) && (!snapshot.is_working() || snapshot.exited) {
+            (Some(Icon::Check), "Finished")
         } else if self.disconnected {
             (Some(Icon::Warning), "Disconnected")
         } else if snapshot.exited && self.session.owns_codex_listener() {
@@ -1096,6 +1102,10 @@ impl Runtime {
                     snapshot.detail.as_str()
                 },
             )
+        } else if let Some(crate::agent::ActivityOutcome::Cancelled) = &snapshot.outcome {
+            (Some(Icon::Cancel), "Cancelled")
+        } else if let Some(crate::agent::ActivityOutcome::Failed { .. }) = &snapshot.outcome {
+            (Some(Icon::Warning), "Failed")
         } else if snapshot.finished_at.is_some() {
             match snapshot.detail.as_str() {
                 "Turn interrupted" => (Some(Icon::Cancel), "Interrupted"),
@@ -1316,7 +1326,7 @@ impl Runtime {
                 }
             }
             if !snapshot.has_later
-                && snapshot.activity() == crate::agent::ActivityState::Idle
+                && (snapshot.activity() == crate::agent::ActivityState::Idle || (snapshot.outcome.is_some() && snapshot.exited))
                 && snapshot.queued_messages.is_empty()
                 && self.queued.is_none()
                 && self.followups.is_empty()
@@ -4840,6 +4850,29 @@ mod tests {
                 hovered.bounds, probe.bounds,
                 "hover controls must not move neighboring messages"
             );
+        }
+    }
+
+    #[test]
+    fn terminal_run_outcomes_have_distinct_footer_status() {
+        use crate::agent::ActivityOutcome;
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        for (outcome, label, glyph) in [
+            (ActivityOutcome::Succeeded, "Finished", Icon::Check),
+            (ActivityOutcome::Cancelled, "Cancelled", Icon::Cancel),
+            (ActivityOutcome::Failed { reason: "Provider exited with code 3".into() }, "Failed", Icon::Warning),
+            (ActivityOutcome::Interrupted { reason: "Provider exited before its final result".into() }, "Interrupted", Icon::Warning),
+        ] {
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.finished_at = Some(42);
+            snapshot.outcome = Some(outcome);
+            assert_eq!(runtime.conversation_status(false), (Some(glyph), label));
+            let mut next = (*runtime.snapshot).clone();
+            next.generation += 1;
+            _handle.replace_snapshot_for_test(next);
+            runtime.refresh();
+            assert!(runtime.finished_stamp.as_ref().unwrap().1.starts_with(label));
+            assert!(runtime.turns.iter().all(|turn| !turn.running));
         }
     }
 
