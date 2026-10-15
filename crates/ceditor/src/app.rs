@@ -66,6 +66,7 @@ struct PendingFile {
     request: u64,
     canonical: Option<PathBuf>,
     location: Option<(usize, usize)>,
+    location_epoch: u64,
 }
 
 struct Tab {
@@ -78,6 +79,7 @@ struct Tab {
     pending_fragment: Option<String>,
     owned_file: Option<PathBuf>,
     next_open: u64,
+    location_epoch: u64,
     files_loaded: bool,
     git: bool,
     diagnostics: Vec<LspDiagnostic>,
@@ -1178,6 +1180,7 @@ impl Editor {
                     canonical: Some(destination.clone()),
                     request: tab.next_open,
                     location: None,
+                    location_epoch: 0,
                 });
                 tab.next_open = tab.next_open.wrapping_add(1);
                 tab.files_loaded = false;
@@ -1480,6 +1483,7 @@ impl Editor {
             path,
             request: 0,
             location: None,
+            location_epoch: 0,
         });
         navigation.sync_active_worktree(
             &sidebar,
@@ -1518,6 +1522,7 @@ impl Editor {
             pending_fragment: None,
             owned_file: None,
             next_open: 1,
+            location_epoch: 0,
             files_loaded: false,
             git,
             diagnostics: Vec::new(),
@@ -1745,6 +1750,7 @@ impl Editor {
 
     fn request_file_at(&mut self, id: CardId, path: PathBuf, location: Option<(usize, usize)>) -> Task<Message> {
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        let location_epoch = self.selection_epoch;
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
         };
@@ -1760,12 +1766,14 @@ impl Editor {
         }
         let request = tab.next_open;
         tab.next_open = tab.next_open.wrapping_add(1);
+        tab.location_epoch = location_epoch;
         let absolute = tab.runtime.descriptor.worktree.join(&path);
         tab.pending_file = Some(PendingFile {
             path,
             request,
             canonical: None,
             location,
+            location_epoch,
         });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -1882,16 +1890,18 @@ impl Editor {
         for (id, canonical) in pending {
             let owner = self.file_owner(&canonical);
             if let Some(owner) = owner.filter(|owner| *owner != id) {
-                let location = self.tab_mut(id).and_then(|tab| tab.pending_file.take()).and_then(|pending| pending.location);
+                let location = self.tab_mut(id).and_then(|tab| tab.pending_file.take()).and_then(|pending| pending.location.map(|at| (at, pending.location_epoch)));
                 // A background initial open must not steal a later selection.
                 if self.active == Some(id) { self.active = Some(owner); }
-                if let Some((line, column)) = location {
+                if let Some(((line, column), epoch)) = location {
                     let foreground = self.active == Some(owner);
-                    if let Some(tab) = self.tab_mut(owner) {
+                    if let Some(tab) = self.tab_mut(owner).filter(|tab| epoch >= tab.location_epoch) {
+                        tab.location_epoch = epoch;
                         if let Some(pending) = tab.pending_file.as_mut().filter(|pending| pending.canonical.as_ref() == Some(&canonical)) {
                             // A reservation can still belong to an earlier
                             // buffer while its file list finishes loading.
                             pending.location = Some((line, column));
+                            pending.location_epoch = epoch;
                         } else if tab.owned_file.as_ref() == Some(&canonical)
                             && let Some(path) = tab.runtime.selected_path().map(Path::to_path_buf) {
                             let task = repository_task(tab.runtime.update(RepositoryAction::OpenLocation { card: owner, path, line, column }));
@@ -1908,7 +1918,8 @@ impl Editor {
                 continue;
             };
             if tab.owned_file.as_ref() == Some(&canonical) {
-                if let Some((line, column)) = pending.location {
+                if let Some((line, column)) = pending.location.filter(|_| pending.location_epoch >= tab.location_epoch) {
+                    tab.location_epoch = pending.location_epoch;
                     let task = repository_task(tab.runtime.update(RepositoryAction::OpenLocation { card: id, path: pending.path, line, column }));
                     if self.active == Some(id) { tasks.push(task); }
                 }
@@ -1929,7 +1940,7 @@ impl Editor {
                 file_name
             };
             tab.owned_file = Some(canonical);
-            let action = match pending.location {
+            let action = match pending.location.filter(|_| pending.location_epoch >= tab.location_epoch) {
                 Some((line, column)) => RepositoryAction::OpenLocation { card: id, path: pending.path, line, column },
                 None => RepositoryAction::OpenFile { card: id, path: pending.path },
             };
@@ -6449,6 +6460,29 @@ mod tests {
             run_tasks(&mut app, open);
             assert_eq!(app.tab(owner).unwrap().runtime.selected_path(), Some(Path::new("foo.rs")));
             assert_eq!(app.tab(owner).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 29_999, character: 4 }));
+        }
+    }
+
+    #[test]
+    fn newer_cross_tab_location_wins_when_an_older_canonical_lookup_finishes_later() {
+        for older_first in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            std::fs::write(root.join("foo.rs"), "abcdefgh\n".repeat(40)).unwrap();
+            let mut app = configured(&directory);
+            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            run_tasks(&mut app, task);
+            let old_card = app.active.unwrap();
+            let old = app.request_file_at(old_card, "foo.rs".into(), Some((9, 1)));
+            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            run_tasks(&mut app, task);
+            let new_card = app.active.unwrap();
+            let new = app.request_file_at(new_card, "foo.rs".into(), Some((29, 4)));
+            if older_first { run_tasks(&mut app, old); run_tasks(&mut app, new); }
+            else { run_tasks(&mut app, new); run_tasks(&mut app, old); }
+            let owner = app.file_owner(&root.join("foo.rs")).unwrap();
+            assert_eq!(app.tab(owner).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 29, character: 4 }));
+            assert_eq!(app.active, Some(owner));
         }
     }
 
