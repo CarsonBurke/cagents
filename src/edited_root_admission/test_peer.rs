@@ -125,6 +125,7 @@ impl ScriptedEditedRootPeer {
     /// finite read timeout, so a mistaken retained socket fails rather than hangs.
     pub(crate) fn finish(self) -> Vec<Event> {
         self.server.join().unwrap();
-        self.events.lock().unwrap().clone()
+        let events = self.events.lock().unwrap().clone();
+        events
     }
 }
