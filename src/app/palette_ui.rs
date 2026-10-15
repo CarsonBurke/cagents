@@ -32,7 +32,7 @@ pub enum Action {
     FilterKey,
     Open,
     OpenPanes,
-    ClosePane(CardId),
+    ClosePane(CardId, u64, Arc<PaletteOrigin>),
     MovePane(CardId),
     RunDiffMutation(Command, Box<RepositoryAction>),
     RunChatUser(chat_ui::RegisteredChatCommand),
@@ -506,7 +506,11 @@ impl Cagents {
                     }
                 }
             }
-            Action::ClosePane(card) => self.run_palette_command(Message::CloseCard(card)),
+            Action::ClosePane(card, generation, origin) => {
+                if self.palette.query.is_none() || !self.palette.panes_only || generation != self.palette.generation { return Task::none(); }
+                if self.pane_command_origin(card) != *origin { return self.stale_pane_command(); }
+                self.run_palette_command(Message::CloseCard(card))
+            }
             Action::Open | Action::OpenPanes => {
                 if self.workspace_inputs_blocked() {
                     return Task::none();
@@ -1487,7 +1491,7 @@ impl Cagents {
                         button,
                         crate::ui_controls::icon_button(Icon::Close, "Close pane")
                             .id(widget::Id::new(format!("pane-list.close.{card}")))
-                            .on_press(Message::Palette(Action::ClosePane(card)))
+                            .on_press(Message::Palette(Action::ClosePane(card, self.palette.generation, Arc::new(self.pane_command_origin(card)))))
                             .into(),
                     ])
                     .align_y(Alignment::Center)
@@ -3950,6 +3954,22 @@ mod tests {
             assert_eq!(runtime.selected_path(), Some(Path::new("second.md")));
             assert!(runtime.is_dirty(), "obsolete discard never changes the replacement buffer");
             assert!(app.palette.query.is_some());
+        }
+    }
+
+    #[test]
+    fn pane_list_close_button_retains_its_pane_generation_and_list_lifetime() {
+        for retire_list in [false, true] {
+            let mut app = settings_focus_fixture();
+            let card = app.workspace.focused().unwrap();
+            drop(app.update_palette(Action::OpenPanes));
+            let click = Action::ClosePane(card, app.palette.generation, Arc::new(app.pane_command_origin(card)));
+            if retire_list { drop(app.update_palette(Action::Record(SettingsField::ShortcutNewTerminal))); }
+            else { app.card_state_mut(card).unwrap().generation += 1; }
+            let recents = app.settings.palette_recents.clone();
+            drop(app.update_palette(click));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert_eq!(app.settings.palette_recents, recents);
         }
     }
 
