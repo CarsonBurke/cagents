@@ -168,6 +168,7 @@ pub enum Action {
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
+    RestoreDisconnected(Target),
     SignIn(Target, Account),
     ResumeAfterSignIn(Target),
     /// Starts a new conversation in the same session directory and working
@@ -448,6 +449,14 @@ impl Phase {
     }
 }
 
+#[derive(Default)]
+struct ReconnectBatch {
+    pending: HashMap<CardId, bool>,
+    reconnected: usize,
+    interrupted: usize,
+    failed: usize,
+}
+
 pub(super) struct State {
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
@@ -482,6 +491,7 @@ pub(super) struct State {
     /// start never produced one, so the failed card itself has to carry it.
     fresh_offers: HashSet<CardId>,
     removed_accounts: HashSet<CardId>,
+    reconnecting: Option<ReconnectBatch>,
     /// The model last chosen for each provider, and its effort, which a new
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
@@ -503,6 +513,7 @@ impl Default for State {
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
             removed_accounts: HashSet::new(),
+            reconnecting: None,
             last_models: HashMap::new(),
         }
     }
@@ -1474,6 +1485,9 @@ pub(super) struct Runtime {
     connection: Connection,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
+    /// An unsent composer submission waiting for an exact session restart.
+    restart_submit: Option<(u64, PromptMode)>,
+    reconnect_attempts: u8,
     /// Messages held here for the next turn, oldest first.
     followups: Vec<Followup>,
     next_followup: u64,
@@ -2067,6 +2081,8 @@ impl Runtime {
             finished_stamp: None,
             connection,
             queued: None,
+            restart_submit: None,
+            reconnect_attempts: 0,
             followups: Vec::new(),
             next_followup: 0,
             recalling: Vec::new(),
@@ -2608,7 +2624,11 @@ impl Runtime {
     /// hidden, since its provider becoming ready, and the models it lists,
     /// reach the card only through that snapshot.
     fn present(&self) -> Result<(), String> {
+        if self.disconnected {
+            return Ok(());
+        }
         let visible = self.visible.load(Ordering::Relaxed)
+            || self.restart_submit.is_some()
             || self.queued.is_some()
             || !self.followups.is_empty();
         self.handle()
@@ -2618,7 +2638,7 @@ impl Runtime {
         if let Err(error) = self.set_visible(visible) {
             self.error = Some(error);
         }
-        if visible {
+        if visible || self.restart_submit.is_some() || self.queued.is_some() {
             self.refresh();
         }
     }
@@ -5141,6 +5161,103 @@ impl Cagents {
         self.observe_listed_models(provider, snapshot.models.clone())
     }
 
+    /// Reconnect visible panes first, followed by other retained open chats.
+    pub(super) fn restore_disconnected_chats(&mut self) -> Task<Message> {
+        if self.daemon_health_ui.health.unavailable() {
+            return Task::none();
+        }
+        let mut chats: Vec<_> = self
+            .cards
+            .iter()
+            .filter_map(|(card, runtime)| {
+                let CardRuntime::Chat(runtime) = runtime else {
+                    return None;
+                };
+                (runtime.disconnected && !runtime.is_draft() && !self.chat_start_pending(*card))
+                    .then(|| (!runtime.visible.load(Ordering::Relaxed), runtime.target))
+            })
+            .collect();
+        chats.sort_by_key(|(hidden, _)| *hidden);
+        for (_, target) in &chats {
+            self.begin_chat_reconnect(*target);
+        }
+        Task::batch(chats.into_iter().enumerate().map(|(index, (_, target))| {
+            cosmic::task::future(async move {
+                tokio::time::sleep(Duration::from_millis(index as u64 * 50)).await;
+                Message::ChatUi(Action::RestoreDisconnected(target))
+            })
+        }))
+    }
+
+    fn begin_chat_reconnect(&mut self, target: Target) {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
+            return;
+        };
+        if runtime.target != target || runtime.is_draft() || !runtime.disconnected {
+            return;
+        }
+        self.chat_ui
+            .reconnecting
+            .get_or_insert_with(ReconnectBatch::default)
+            .pending
+            .entry(target.card)
+            .or_insert(runtime.snapshot.busy);
+    }
+
+    fn finish_chat_reconnect(&mut self, card: CardId, succeeded: bool, still_working: bool) {
+        let held = matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
+            if matches!(runtime.session.native_continuity, chat::NativeContinuity::Durable { .. }));
+        let Some(batch) = self.chat_ui.reconnecting.as_mut() else {
+            return;
+        };
+        let Some(was_working) = batch.pending.remove(&card) else {
+            return;
+        };
+        if succeeded {
+            batch.reconnected += 1;
+            batch.interrupted += usize::from(was_working && !still_working && !held);
+        } else {
+            batch.failed += 1;
+        }
+        if !batch.pending.is_empty() {
+            return;
+        }
+        let batch = self.chat_ui.reconnecting.take().unwrap();
+        let message = format!(
+            "Daemon reconnected {} chats; {} turns were interrupted; {} chats need attention.",
+            batch.reconnected, batch.interrupted, batch.failed
+        );
+        self.status = Some(if batch.failed == 0 && batch.interrupted == 0 {
+            TransientNotice::success(message)
+        } else {
+            TransientNotice::warning(message)
+        });
+    }
+
+    fn retry_chat_reconnect(&mut self, card: CardId, retryable: bool) -> Task<Message> {
+        if !self
+            .chat_ui
+            .reconnecting
+            .as_ref()
+            .is_some_and(|batch| batch.pending.contains_key(&card))
+        {
+            return Task::none();
+        }
+        if retryable
+            && let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+            && runtime.reconnect_attempts < 4
+        {
+            let target = runtime.target;
+            let wait = Duration::from_secs(1 << runtime.reconnect_attempts);
+            return cosmic::task::future(async move {
+                tokio::time::sleep(wait).await;
+                Message::ChatUi(Action::RestoreDisconnected(target))
+            });
+        }
+        self.finish_chat_reconnect(card, false, false);
+        Task::none()
+    }
+
     pub(super) fn start_chat(
         &mut self,
         card: CardId,
@@ -5150,6 +5267,9 @@ impl Cagents {
         terminate_source: bool,
     ) -> Task<Message> {
         let selection = None;
+        if self.chat_start_pending(card) {
+            return Task::none();
+        }
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
             card,
@@ -5340,6 +5460,14 @@ impl Cagents {
             return Task::none();
         }
         let latest = handle.snapshot();
+        if latest.ready
+            && !latest.busy
+            && !latest.exited
+            && let Some((revision, mode)) = runtime.restart_submit.take()
+            && runtime.revision == revision
+        {
+            return self.handle_chat_ui(Action::Submit(target, mode));
+        }
         if latest.ready && !latest.busy && !latest.exited && !runtime.followups.is_empty() {
             let (text, attachments) = runtime.combined_followups();
             // A queued message remains a prompt. Resolving it as an idle
@@ -6208,6 +6336,7 @@ impl Cagents {
                                 });
                             }
                         }
+                        self.finish_chat_reconnect(target.card, true, handle.snapshot().busy);
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_ui.removed_accounts.remove(&target.card);
                         let mut session = handle.session();
@@ -6230,6 +6359,7 @@ impl Cagents {
                             runtime.reasoning_picker = false;
                             runtime.session = session.clone();
                             runtime.disconnected = false;
+                            runtime.reconnect_attempts = 0;
                             runtime.pending = None;
                             // Request generations belong to the old handle. A
                             // restarted daemon can begin again at generation 1.
@@ -6335,6 +6465,7 @@ impl Cagents {
                     Err(failure)
                         if failure.recovery == chat::Recovery::Fresh
                             && attempt.session.launch.session_id.is_none()
+                            && attempt.session.proof.is_none()
                             && attempt.session.terminal.is_none()
                             && matches!(
                                 self.card_state(target.card).map(|state| &state.kind),
@@ -6361,6 +6492,10 @@ impl Cagents {
                         ]);
                     }
                     Err(failure) => {
+                        let retry = self.retry_chat_reconnect(
+                            target.card,
+                            failure.recovery == chat::Recovery::Retry,
+                        );
                         let terminal_switch = matches!(
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Terminal(_))
@@ -6401,6 +6536,7 @@ impl Cagents {
                             Task::none()
                         };
                         return Task::batch([
+                            retry,
                             self.drain_terminal(target.card, 0),
                             cleanup,
                             if terminal_switch {
@@ -6651,6 +6787,13 @@ impl Cagents {
                         }
                         runtime.disconnected = true;
                         runtime.error = Some(error);
+                        let session = runtime.session.clone();
+                        self.commit_chat_session(target.card, session);
+                        self.observe_agent_activity_for_card(target.card, None);
+                        return cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            Message::ChatUi(Action::RestoreDisconnected(target))
+                        });
                     }
                 }
                 let session = runtime.session.clone();
@@ -6660,6 +6803,21 @@ impl Cagents {
             Action::SignIn(target, account) => return self.sign_in_chat(target, account),
             Action::ResumeAfterSignIn(target) => {
                 return self.resume_after_sign_in(target);
+            }
+            Action::RestoreDisconnected(target) => {
+                if self.daemon_health_ui.health.unavailable()
+                    || self.chat_start_pending(target.card)
+                    || self
+                        .chat_runtime_mut(target)
+                        .is_none_or(|runtime| !runtime.disconnected || runtime.is_draft())
+                {
+                    return Task::none();
+                }
+                self.begin_chat_reconnect(target);
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.reconnect_attempts = runtime.reconnect_attempts.saturating_add(1);
+                }
+                return self.handle_chat_ui(Action::Reconnect(target));
             }
             Action::Reconnect(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -6994,6 +7152,17 @@ impl Cagents {
                 if runtime.is_draft() {
                     return self.start_chat_draft(target);
                 }
+                if runtime.snapshot.exited || runtime.disconnected {
+                    runtime.restart_submit = Some((runtime.revision, mode));
+                    let session = runtime.session.clone();
+                    return self.start_chat(
+                        target.card,
+                        session,
+                        chat::Intent::Restore,
+                        None,
+                        false,
+                    );
+                }
                 if (!runtime.followups.is_empty() && mode != PromptMode::Steer
                     || mode == PromptMode::Queue
                         && !runtime.snapshot.capabilities.queue
@@ -7319,7 +7488,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7414,7 +7584,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -10235,6 +10406,38 @@ mod tests {
     }
 
     #[test]
+    fn recovery_restart_preserves_composer_and_transcript_while_starting() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("unsent follow-up"));
+        Arc::make_mut(&mut runtime.snapshot).exited = true;
+        let items = runtime.snapshot.items.clone();
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        let first = app.chat_ui.attempt(card).unwrap().target;
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        assert_eq!(app.chat_ui.attempt(card).unwrap().target, first);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "unsent follow-up");
+        assert_eq!(runtime.snapshot.items, items);
+        assert!(!runtime.is_draft());
+    }
+
+    #[test]
+    fn recovery_health_event_restores_disconnected_chat_without_a_click() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.disconnected = true;
+        runtime.error = Some("daemon restarted".into());
+        assert!(runtime.set_visible(false).is_ok());
+        drop(app.handle_chat_ui(Action::RestoreDisconnected(target)));
+        assert!(app.chat_ui.attempt(card).is_some());
+        assert!(!chat_runtime(&app, card).is_draft());
+    }
+
+    #[test]
     fn history_reconnect_discards_old_request_generation_and_navigation() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, _) = history_fixture(&mut app);
@@ -11147,14 +11350,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11173,7 +11381,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);

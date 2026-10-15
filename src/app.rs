@@ -11272,8 +11272,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -16244,9 +16247,11 @@ impl Application for Cagents {
                 self.daemon_health_ui.health = health;
                 if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
                 {
-                    self.update_daemon_health_ui(daemon_health_ui::Action::Cancel)
+                    let cancel = self.update_daemon_health_ui(daemon_health_ui::Action::Cancel);
+                    let reconnect = self.restore_disconnected_chats();
+                    Task::batch([cancel, reconnect])
                 } else {
-                    Task::none()
+                    self.restore_disconnected_chats()
                 }
             }
             Message::AcknowledgeSessionRecovery => {

@@ -388,6 +388,9 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
+    if matches!(&update, Update::Ready) {
+        super::agent_execution::retain_chat_identity(&host, id);
+    }
     if matches!(&update, Update::Attention(_)) {
         // Scheduled outcomes belong to the accepted run, not its temporary
         // provider process. The scheduler publishes committed run evidence.
@@ -793,7 +796,9 @@ fn start_with_execution(
             return Ok(session_snapshot(record));
         }
     }
-    if !execution_environment.0.is_empty() && (source.is_some() || session.terminal.is_some()) {
+    if !execution_environment.0.is_empty()
+        && (source.is_some() || (session.terminal.is_some() && restart_launch.is_none()))
+    {
         return Err(error(
             "A terminal handoff must use the proven source environment, not a client override",
         ));
@@ -1039,7 +1044,6 @@ fn start_with_execution(
         .mailbox_seal
         .clone();
     let mut initial = adapter.initialize().map_err(error)?;
-    let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
     if terminate_source && source.is_none() {
         return Err(error("Source termination requires an exact host proof"));
     }
@@ -1156,8 +1160,14 @@ fn start_with_execution(
     };
     // Joining a completed actor must never happen while holding the host lock:
     // its final notification may still be acquiring that same lock.
-    drop(retired);
     let result = (|| {
+        let previous = retired.as_ref().map(|record| record.handle.clone());
+        let store = if let Some(previous) = previous.as_ref() {
+            chat::runtime::preflight_restart(&spec, &mut initial, previous)
+        } else {
+            chat::runtime::preflight(&spec, &mut initial)
+        }
+        .map_err(error)?;
         let mut pending_fresh = None;
         if let Some(handle) = source_handle {
             let (current_process, current_recipe, _, _, current_fresh, current_execution) =
@@ -1303,6 +1313,7 @@ fn start_with_execution(
             store,
             session.clone(),
             recovery_environment,
+            previous.as_ref(),
             move |update| {
                 if let Update::Execution { run, update } = update {
                     if let Some(host) = weak.upgrade() {
@@ -1361,6 +1372,23 @@ fn start_with_execution(
             .as_ref()
             .and_then(|source| state.terminals.get(&source.id))
             .map(|record| record.handle.clone());
+        let mut subscribers = retired
+            .as_ref()
+            .map(|record| record.subscribers.clone())
+            .unwrap_or_default();
+        subscribers.entry(client).or_insert(false);
+        let observations = subscribers
+            .keys()
+            .map(|client| {
+                (
+                    *client,
+                    Observation {
+                        after_generation: observation.after_generation,
+                        ..Observation::default()
+                    },
+                )
+            })
+            .collect();
         let record = Record {
             execution_instance,
             console_recipe: None,
@@ -1368,8 +1396,8 @@ fn start_with_execution(
             session,
             handle,
             source_process,
-            subscribers: BTreeMap::from([(client, false)]),
-            observations: BTreeMap::from([(client, observation)]),
+            subscribers,
+            observations,
             completion_observed: false,
             returning_terminal: false,
         };
@@ -1384,7 +1412,15 @@ fn start_with_execution(
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     state.chat_spawning.remove(&reservation_id);
+    if result.is_err()
+        && let Some(record) = retired.take()
+    {
+        state.chats.entry(reservation_id).or_insert(record);
+    }
     state.inventory_generation += 1;
+    drop(state);
+    // A final actor callback may still be acquiring the host lock.
+    drop(retired);
     result
 }
 
@@ -1947,6 +1983,93 @@ fn confirm_account_conversation(
     }
 }
 
+/// Reject an impossible recovery before accepting a CLI prompt for background
+/// delivery. Live actors retain their account lease until they actually exit.
+pub(super) fn check_restart_available(host: &SharedHost, source: &Session) -> Result<(), String> {
+    let launch = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state.chats.get(&source.id)
+            .ok_or("The exact hosted conversation is unavailable; reconnect the saved conversation before sending")?;
+        if record.session.proof != source.proof
+            || record.session.launch.recipe != source.launch.recipe
+        {
+            return Err(
+                "The agent conversation ownership changed; its prompt was not accepted".into(),
+            );
+        }
+        if !record.handle.is_completed() {
+            return Ok(());
+        }
+        if record.handle.session_id().is_none() {
+            return Err("The provider exited before confirming a session ID; select a saved conversation or start a new agent".into());
+        }
+        record.session.launch.clone()
+    };
+    check_launch_account(&launch).map_err(|error| error.message)
+}
+
+/// Resume only the exact completed actor. The start reservation serializes
+/// repeated attach/send attempts; an active actor is never replaced.
+pub(super) fn restart_completed(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+) -> Result<Option<ServerResponse>, ProtocolError> {
+    restart_completed_with_execution(host, client, source, None)
+}
+
+pub(super) fn restart_completed_with_execution(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    execution: Option<Arc<chat::protocol::ExecutionContext>>,
+) -> Result<Option<ServerResponse>, ProtocolError> {
+    let replacement = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(source.proof.as_ref(), state.proof())?;
+        let Some(record) = state.chats.get(&source.id) else {
+            return Ok(None);
+        };
+        if !record.handle.is_completed() {
+            return Ok(None);
+        }
+        let actual = record.handle.session_id();
+        if record.session.launch.provider != source.launch.provider
+            || record.session.launch.recipe != source.launch.recipe
+            || source
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| Some(id) != actual.as_ref())
+        {
+            return Err(error(
+                "Native chat recovery identity does not match the hosted conversation",
+            ));
+        }
+        let id = actual.ok_or_else(|| unavailable(
+            "This provider exited before confirming a session ID. Start a new conversation or select a saved conversation to recover."
+        ))?;
+        let mut session = record.session.clone();
+        session.proof = Some(state.proof().clone());
+        session.launch.session_id = Some(id);
+        (session, record.handle.restart_environment())
+    };
+    check_launch_account(&replacement.0.launch)?;
+    let launch = replacement.0.launch.clone();
+    start_with_execution(
+        host,
+        client,
+        replacement.0,
+        None,
+        false,
+        None,
+        replacement.1,
+        execution,
+        Some(&launch),
+    )
+    .map(Some)
+}
+
 pub(super) fn process(
     host: &SharedHost,
     client: ClientId,
@@ -2108,20 +2231,8 @@ fn process_inner(
             )
         }
         ClientRequest::ChatAttach { session } => {
-            // A live actor remains attachable after account removal. A stopped
-            // actor cannot resume with that home, so expose the same recovery
-            // choice without creating a replacement process.
-            let stopped_launch = {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                validate_proof(session.proof.as_ref(), state.proof())?;
-                state
-                    .chats
-                    .get(&session.id)
-                    .filter(|record| record.handle.is_completed())
-                    .map(|record| record.session.launch.clone())
-            };
-            if let Some(launch) = stopped_launch {
-                check_launch_account(&launch)?;
+            if let Some(response) = restart_completed(host, client, &session)? {
+                return Ok(response);
             }
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             validate_proof(session.proof.as_ref(), state.proof())?;
@@ -3985,6 +4096,72 @@ for line in sys.stdin:
         assert!(
             handle.failure().is_some(),
             "the rejected session remains diagnosed"
+        );
+    }
+
+    #[test]
+    fn recovery_attach_replaces_completed_actor_once_and_retains_identity() {
+        let (_directory, host, saved) = upgrade_fixture();
+        restore_upgrade(&host, &saved).unwrap();
+        let (session, previous) = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            let record = &state.chats[&saved.source.id];
+            (record.session.clone(), record.handle.clone())
+        };
+        previous.close().unwrap();
+        assert!(previous.is_completed());
+        let ServerResponse::ChatAttached {
+            session: restarted, ..
+        } = process(
+            &host,
+            1,
+            ClientRequest::ChatAttach {
+                session: session.clone(),
+            },
+        )
+        .unwrap()
+        else {
+            panic!("restart did not attach");
+        };
+        let replacement = host.lock().unwrap().chats[&session.id].handle.clone();
+        assert!(!replacement.same_actor(&previous));
+        assert_eq!(restarted.id, session.id);
+        assert_eq!(restarted.launch, session.launch);
+        assert_eq!(
+            restarted.launch.recipe.environment,
+            session.launch.recipe.environment
+        );
+        process(&host, 1, ClientRequest::ChatAttach { session }).unwrap();
+        assert!(
+            host.lock().unwrap().chats[&restarted.id]
+                .handle
+                .same_actor(&replacement)
+        );
+        replacement.close().unwrap();
+    }
+
+    #[test]
+    fn recovery_failed_restart_keeps_the_completed_actor_available() {
+        let (directory, host, saved) = upgrade_fixture();
+        restore_upgrade(&host, &saved).unwrap();
+        let (session, previous) = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            let record = &state.chats[&saved.source.id];
+            (record.session.clone(), record.handle.clone())
+        };
+        previous.close().unwrap();
+        std::fs::rename(
+            directory.path().join("omp"),
+            directory.path().join("parked-omp"),
+        )
+        .unwrap();
+        assert!(process(&host, 1, ClientRequest::ChatAttach { session }).is_err());
+        assert!(
+            host.lock().unwrap().chats[&saved.source.id]
+                .handle
+                .same_actor(&previous)
         );
     }
 

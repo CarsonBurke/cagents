@@ -149,6 +149,18 @@ pub(super) fn submit(
     {
         return Ok(previous);
     }
+    if let Destination::Existing(id) = &request.destination {
+        let agent = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent(*id)?;
+        if agent.origin != origin || agent.closed {
+            return Err("This caller does not own an open agent with that ID".into());
+        }
+        if let Some(HostedSession::Chat(session)) = &agent.session {
+            super::chat::check_restart_available(host, session)?;
+        }
+    }
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
         let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
@@ -327,6 +339,13 @@ fn dispatch(
         .agent_request(accepted.run.id)
         .map_err(before)?;
     let (session, handle) = if let Some(HostedSession::Chat(session)) = &accepted.agent.session {
+        super::chat::restart_completed_with_execution(
+            host,
+            EXECUTION_CLIENT,
+            session,
+            Some(context.clone()),
+        )
+        .map_err(|error| before(error.message))?;
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
@@ -532,6 +551,55 @@ fn dispatch(
     Ok(())
 }
 
+/// Save provider-confirmed identity even when no window has opened the chat.
+/// Presentation descriptors may be issued before the first init frame arrives.
+pub(super) fn retain_chat_identity(host: &SharedHost, id: TerminalId) {
+    let retained = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = state.chats.get(&id) else {
+            return;
+        };
+        let Some(identity) = record.handle.confirmed_session_id() else {
+            return;
+        };
+        if record.session.launch.session_id.as_ref() == Some(&identity) {
+            return;
+        }
+        let mut successor = record.session.clone();
+        successor.launch.session_id = Some(identity);
+        (record.session.clone(), successor, record.handle.clone())
+    };
+    let Ok(registry) = registry(host) else {
+        return;
+    };
+    let changed = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .adopt_authenticated_agent_session(
+            &[HostedSession::Chat(retained.0.clone())],
+            &HostedSession::Chat(retained.1.clone()),
+        );
+    match changed {
+        Ok(changed) => {
+            {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(record) = state.chats.get_mut(&id)
+                    && record.handle.same_actor(&retained.2)
+                    && record.session == retained.0
+                {
+                    record.session = retained.1;
+                }
+            }
+            if changed {
+                announce(host, &registry);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, %id, "cannot retain confirmed agent conversation identity")
+        }
+    }
+}
+
 pub(super) fn observed(
     host: &SharedHost,
     session: TerminalId,
@@ -539,6 +607,7 @@ pub(super) fn observed(
     run: RunId,
     update: Update,
 ) {
+    retain_chat_identity(host, session);
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state

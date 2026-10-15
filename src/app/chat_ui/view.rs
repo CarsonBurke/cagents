@@ -1107,7 +1107,7 @@ impl Runtime {
             }
         } else if self.error.is_some() || snapshot.error.is_some() {
             (Some(Icon::Warning), "Error")
-        } else if snapshot.ready {
+        } else if self.is_draft() || snapshot.ready {
             (None, "Ready")
         } else {
             (Some(Icon::AgentWorking), "Connecting")
@@ -1130,7 +1130,7 @@ impl Runtime {
         // Nothing is sent past a first message still waiting to go.
         let available = !transitioning
             && !self.disconnected
-            && !self.snapshot.exited
+            && (!self.snapshot.exited || self.session.launch.session_id.is_some())
             && self.pending.is_none()
             && self.queued.is_none();
         let snapshot = &self.snapshot;
@@ -1381,15 +1381,12 @@ impl Runtime {
             content.push(
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
-                        crate::ui_controls::field::search(
-                            "Find in conversation",
-                            query,
-                        )
-                        .id(card_control_id(target.card, "chat-find"))
-                        .on_input(move |query| action(Action::Find(target, query)))
-                        .on_focus(action(Action::FindFocused(target, true)))
-                        .on_unfocus(action(Action::FindFocused(target, false)))
-                        .width(Length::Fill),
+                        crate::ui_controls::field::search("Find in conversation", query)
+                            .id(card_control_id(target.card, "chat-find"))
+                            .on_input(move |query| action(Action::Find(target, query)))
+                            .on_focus(action(Action::FindFocused(target, true)))
+                            .on_unfocus(action(Action::FindFocused(target, false)))
+                            .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
@@ -1493,16 +1490,13 @@ impl Runtime {
                 })
                 .width(Length::Fill)
                 .into(),
-                icon(
-                    Icon::Refresh,
-                    if unresumable {
-                        "Resume this conversation again"
-                    } else {
-                        "Reconnect to this session"
-                    },
-                    enabled,
-                    Action::Reconnect(target),
-                ),
+                crate::ui_controls::button::quiet(if snapshot.exited {
+                    "Restart session"
+                } else if unresumable {
+                    "Resume conversation"
+                } else {
+                    "Reconnect"
+                }).on_press_maybe(enabled.then(|| action(Action::Reconnect(target)))).into(),
             ];
             if unresumable {
                 controls.push(icon(
@@ -2857,7 +2851,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+        let label = if self
+            .snapshot
+            .fast_mode
+            .as_ref()
+            .is_some_and(|mode| mode.enabled())
+        {
             Cow::Owned(format!("{label} · Fast"))
         } else {
             label
@@ -2947,14 +2946,18 @@ impl Runtime {
             crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
                 action(Action::Command(
                     self.target,
-                    Command::SetFastMode { enabled: !mode.enabled() },
+                    Command::SetFastMode {
+                        enabled: !mode.enabled(),
+                    },
                 ))
             })),
             fast_mode_tooltip(mode),
         );
-        Some(widget::column::with_children(vec![models, control])
-            .spacing(step::GAP_XS)
-            .into())
+        Some(
+            widget::column::with_children(vec![models, control])
+                .spacing(step::GAP_XS)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -4841,6 +4844,24 @@ mod tests {
                 "hover controls must not move neighboring messages"
             );
         }
+    }
+
+    #[test]
+    fn recovery_idle_draft_has_no_connecting_animation() {
+        let (mut runtime, _) = frame_cost::live_runtime(&[]);
+        runtime.connection = Connection::Draft;
+        Arc::make_mut(&mut runtime.snapshot).ready = false;
+        assert_eq!(runtime.conversation_status(false), (None, "Ready"));
+        runtime.queued = Some(Queued {
+            text: "first message".into(),
+            resolved_text: "first message".into(),
+            attachments: Vec::new(),
+            model: None,
+            draft: runtime.session.clone(),
+            since: None,
+            rechecking: false,
+        });
+        assert_eq!(runtime.conversation_status(false).1, "Starting");
     }
 
     #[test]
@@ -7349,8 +7370,14 @@ mod tests {
                 iced::mouse::Cursor::Unavailable,
             );
             assert!(
-                !accessible.root().iter().chain(accessible.children()).any(|node|
-                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                !accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
             for label in ["Send message", "Close"] {
@@ -7600,10 +7627,11 @@ mod tests {
                     message,
                     Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
                 )));
-                assert!(!messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChatUi(Action::Interrupt(..))
-                )));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(
