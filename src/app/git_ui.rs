@@ -2,7 +2,7 @@
 //! replace local rows, and filesystem events never schedule a GitHub process.
 use super::*;
 use crate::{git_watch, model::WorktreeId, repository::HeadState};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn local_workers() -> usize {
     std::thread::available_parallelism().map_or(2, |count| count.get().clamp(2, 8))
