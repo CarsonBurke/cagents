@@ -161,6 +161,7 @@ impl Handle {
 struct Inner {
     native_holder_identity: Option<crate::daemon::holder_registry::Record>,
     commands: crossbeam_channel::Sender<CommandRequest>,
+    session_stop: Arc<Mutex<Option<CommandRequest>>>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     close_state: Arc<Mutex<CloseState>>,
@@ -348,6 +349,7 @@ impl Handle {
         nonblocking(&wake)?;
         nonblocking(&reader)?;
         let (commands, incoming) = crossbeam_channel::bounded(64);
+        let session_stop=Arc::new(Mutex::new(None));
         let state = Arc::new(Mutex::new(Snapshot {
             session_id,
             ..Snapshot::default()
@@ -370,6 +372,7 @@ impl Handle {
         let inner = Arc::new(Inner {
             native_holder_identity: native_holder.as_ref().map(|holder| holder.record().clone()),
             commands,
+            session_stop:session_stop.clone(),
             wake: Mutex::new(wake),
             state: state.clone(),
             close_state: close_state.clone(),
@@ -427,6 +430,7 @@ impl Handle {
                     observe_next,
                     stop,
                     incoming,
+                    session_stop,
                     wake: reader,
                     notify,
                     output: Vec::new(),
@@ -713,8 +717,14 @@ impl Handle {
             return Err("Provider ownership is changing; refresh before stopping it".into());
         }
         let (reply, response) = crossbeam_channel::bounded(1);
-        self.0.commands.try_send((ActorCommand::StopSession {actor_id}, reply))
-            .map_err(|error| format!("Session stop could not be admitted: {error}"))?;
+        if Instant::now()>=deadline {return Err("Session stop admission deadline elapsed".into());}
+        {
+            let mut pending=self.0.session_stop.lock().unwrap_or_else(|p|p.into_inner());
+            if pending.is_some() {return Err("A session stop is already pending; retain its owner and refresh".into());}
+            // Whole-session consent includes already queued work. This owner
+            // control must not be starved behind a saturated provider stdin.
+            *pending=Some((ActorCommand::StopSession {actor_id},reply));
+        }
         match self.0.wake.try_lock() {
             Ok(mut wake) => { let _ = wake.write(&[1]); },
             Err(std::sync::TryLockError::Poisoned(p)) => { let _ = p.into_inner().write(&[1]); },
@@ -1730,6 +1740,7 @@ struct Actor {
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     incoming: crossbeam_channel::Receiver<CommandRequest>,
+    session_stop: Arc<Mutex<Option<CommandRequest>>>,
     wake: UnixStream,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     output: Vec<u8>,
@@ -2138,11 +2149,11 @@ impl Actor {
             // queued write: a provider that reads stdin only between turns keeps
             // `pending` non-empty for the whole turn, and refusing to drain there left
             // UI commands unacknowledged until the caller's 10 second timeout.
-            if self.queued > QUEUE_BACKPRESSURE {
-                break;
-            }
-            let Ok((command, reply)) = self.incoming.try_recv() else {
-                break;
+            let priority=self.session_stop.lock().unwrap_or_else(|p|p.into_inner()).take();
+            let (command,reply)=if let Some(request)=priority {request} else {
+                if self.queued > QUEUE_BACKPRESSURE {break;}
+                let Ok(request)=self.incoming.try_recv() else {break;};
+                request
             };
             if closing || self.stop.load(Ordering::Acquire) {
                 let _ = reply.send(Err("Chat is closing".into()));

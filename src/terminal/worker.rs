@@ -1508,17 +1508,22 @@ impl TerminalHandle {
     /// holder. Serialize with completion, then transfer any final retained
     /// screen; a live parser that cannot serialize is honestly screen-lost.
     pub(crate) fn preserve_for_restart(&self) -> Result<(), String> {
-        if self.inner.published.input_order.lock().unwrap_or_else(|p|p.into_inner()).closing {
-            return Err("Terminal session stop already owns cleanup".into());
+        {
+            let mut order=self.inner.published.input_order.lock().unwrap_or_else(|p|p.into_inner());
+            if order.closing || order.handoff {
+                return Err("Terminal session stop or ownership transition already owns admission".into());
+            }
+            order.handoff=true;
         }
         let (reply, result) = crossbeam_channel::bounded(1);
-        if self
-            .send_command(Command::PreserveForRestart(reply))
-            .is_ok()
-            && let Ok(result) = result.recv_timeout(WORKER_JOIN_TIMEOUT * 2)
-        {
-            result?;
+        if let Err(error)=self.send_command(Command::PreserveForRestart(reply)) {
+            // A failed enqueue is a known refusal. Once admitted, an unknown
+            // outcome must retain the handoff fence and its exact owner.
+            self.inner.published.input_order.lock().unwrap_or_else(|p|p.into_inner()).handoff=false;
+            return Err(error.to_string());
         }
+        result.recv_timeout(WORKER_JOIN_TIMEOUT * 2)
+            .map_err(|_|"Terminal preservation outcome is unknown; ownership remains fenced".to_string())??;
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
         if let Some(worker) = self
             .take_worker_until(deadline)

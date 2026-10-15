@@ -374,6 +374,16 @@ impl PendingStop {
                 else {HostedSession::Terminal(actor.terminal.as_ref().expect("resident actor").session.clone())};
             super::agent_execution::retired_hosted(host,&source)?;
             let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+            if let Some(native)=&actor.native {
+                if state.chats.get(&actor.token.session).is_none_or(|record|record.execution_instance!=native.execution_instance || !record.handle.same_actor(&native.handle)) {
+                    return Err("The native session changed during retirement; its replacement was preserved".into());
+                }
+            }
+            if let Some(terminal)=&actor.terminal {
+                if state.terminals.get(&actor.token.session).is_none_or(|record|record.handle.execution_instance()!=terminal.instance || !record.handle.same_worker(&terminal.handle)) {
+                    return Err("The terminal session changed during retirement; its replacement was preserved".into());
+                }
+            }
             if actor.native.is_some() {
                 state.chats.remove(&actor.token.session);
                 if let Some(notifications)=&state.notifications {notifications.retire(actor.token.session);}
