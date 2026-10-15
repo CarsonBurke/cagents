@@ -1,53 +1,68 @@
 // Owning HOST contracts for the bound-close positive disposition. These use
 // the real retained Claude facade/helper and protocol peer, not a synthetic
 // BackendFixture or fabricated Pending/claim/child. Native product is separate.
-struct BoundCloseCleanup {
+// One strong owner slot per exact owning subprocess. UNKNOWN retains its
+// original Host, lease, Broker and captured proxy until subprocess exit. The
+// outer originalChild/common guardian still must settle the entire family.
+static BOUND_CLOSE_OWNER: Mutex<Option<Arc<Mutex<BoundCloseOwner>>>> = Mutex::new(None);
+struct BoundCloseOwner {
     host: SharedHost,
-    attempted: bool,
     notifications: Option<crate::host::notifications::Broker>,
     lease: Option<crate::daemon::HostLease>,
-    // Keep the exact proxy/identity through teardown even after Return removes
-    // its Host record. Presence/absence never substitutes for retirement proof.
-    remote: Option<(
-        chat::runtime::Handle,
-        chat::runtime::ActorIdentity,
-        HostSessionProof,
-    )>,
+    remote: Option<(chat::runtime::Handle, chat::runtime::ActorIdentity, HostSessionProof)>,
+}
+struct BoundCloseCleanup {
+    owner: Arc<Mutex<BoundCloseOwner>>,
+    outcome: Option<Result<(), String>>,
 }
 impl BoundCloseCleanup {
-    fn finish(&mut self) {
-        if self.attempted {
-            return;
-        }
-        self.attempted = true;
+    fn reserve(host: &SharedHost) -> Self {
+        let mut retained = BOUND_CLOSE_OWNER.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(retained.is_none(), "a prior exact bound-close owner remains unconfirmed; no new owner may start");
+        let owner = Arc::new(Mutex::new(BoundCloseOwner {
+            host: host.clone(), notifications: None, lease: None, remote: None,
+        }));
+        *retained = Some(owner.clone());
+        Self { owner, outcome: None }
+    }
+    fn finish_result(&mut self) -> Result<(), String> {
+        if let Some(outcome) = &self.outcome { return outcome.clone(); }
+        let (host, remote) = {
+            let context = self.owner.lock().unwrap_or_else(|p| p.into_inner());
+            (context.host.clone(), context.remote.clone())
+        };
         let mut failures = Vec::new();
-        if let Err(error) = super::super::finish_chat_shutdown(&self.host) {
+        if let Err(error) = super::super::finish_chat_shutdown(&host) {
             failures.push(error);
         }
-        if let Some((_owner, identity, proof)) = &self.remote {
+        if let Some((_owner, identity, proof)) = &remote {
             match chat::runtime::Handle::retained_retirement_proved(&identity.record, proof) {
                 Ok(true) => {}
-                Ok(false) => {
-                    failures.push("Exact retained helper retirement is unconfirmed".into())
-                }
+                Ok(false) => failures.push("Exact retained helper retirement is unconfirmed".into()),
                 Err(error) => failures.push(error),
             }
         }
-        if !failures.is_empty() {
-            let error = failures.join("; ");
-            eprintln!("Exact bound-close fixture cleanup is unconfirmed: {error}");
-            // No timeout/Err is settlement. The bounded original Child and
-            // outer common guardian retain the remaining cleanup obligation.
-            if !std::thread::panicking() {
-                panic!("Unconfirmed bound-close cleanup: {error}");
-            }
+        let outcome = if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) };
+        self.outcome = Some(outcome.clone());
+        if outcome.is_ok() {
+            let retired = {
+                let mut retained = BOUND_CLOSE_OWNER.lock().unwrap_or_else(|p| p.into_inner());
+                assert!(retained.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, &self.owner)));
+                retained.take()
+            };
+            drop(retired);
+        }
+        outcome
+    }
+    fn finish(&mut self) {
+        if let Err(error) = self.finish_result() {
+            eprintln!("Exact bound-close cleanup UNKNOWN; strong original context retained until subprocess exit; outer family owner required: {error}");
+            if !std::thread::panicking() { panic!("Unconfirmed bound-close cleanup: {error}"); }
         }
     }
 }
 impl Drop for BoundCloseCleanup {
-    fn drop(&mut self) {
-        self.finish();
-    }
+    fn drop(&mut self) { self.finish(); }
 }
 struct BoundCloseFixture {
     host: SharedHost,
@@ -65,24 +80,18 @@ impl BoundCloseFixture {
         let (host, request, path) = fixture();
         // Armed BEFORE lease/notification/dispatch or a fallible assertion.
         // Keep both resources alive through every constructor panic/close.
-        let mut cleanup = BoundCloseCleanup {
-            host: host.clone(),
-            attempted: false,
-            notifications: None,
-            lease: None,
-            remote: None,
-        };
+        let cleanup = BoundCloseCleanup::reserve(&host);
         let proof = host.lock().unwrap().proof().clone();
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
-        cleanup.lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
-        cleanup.notifications = Some(
+        cleanup.owner.lock().unwrap().lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
+        cleanup.owner.lock().unwrap().notifications = Some(
             crate::host::notifications::Broker::start(
                 &host,
                 crate::notifications::Application::Cagents,
             )
             .unwrap(),
         );
-        host.lock().unwrap().notifications = Some(cleanup.notifications.as_ref().unwrap().handle());
+        host.lock().unwrap().notifications = Some(cleanup.owner.lock().unwrap().notifications.as_ref().unwrap().handle());
         host.lock().unwrap().enable_holder_recovery();
         let accepted = submit(&host, &Authority::default(), request).unwrap();
         let run = settled(&host, accepted.run.id);
@@ -98,7 +107,7 @@ impl BoundCloseFixture {
         let identity = handle
             .actor_identity()
             .expect("genuine retained Remote owner");
-        cleanup.remote = Some((handle.clone(), identity.clone(), proof.clone()));
+        cleanup.owner.lock().unwrap().remote = Some((handle.clone(), identity.clone(), proof.clone()));
         let binding =
             super::super::chat::source_binding::owning_binding_for_test(&host, id).unwrap();
         let inspection =
@@ -481,13 +490,7 @@ fn combined_close_retained_lifecycle_real_created_pair_stays_held_until_exact_co
         return;
     }
     let (host, mut request, path) = fixture();
-    let mut cleanup = BoundCloseCleanup {
-        host: host.clone(),
-        attempted: false,
-        notifications: None,
-        lease: None,
-        remote: None,
-    };
+    let cleanup = BoundCloseCleanup::reserve(&host);
     let root = path.parent().unwrap();
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -508,21 +511,21 @@ fn combined_close_retained_lifecycle_real_created_pair_stays_held_until_exact_co
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     let proof = host.lock().unwrap().proof().clone();
-    cleanup.lease = Some(
+    cleanup.owner.lock().unwrap().lease = Some(
         crate::daemon::HostLease::acquire(
             &crate::daemon::RuntimePaths::discover().unwrap(),
             &proof,
         )
         .unwrap(),
     );
-    cleanup.notifications = Some(
+    cleanup.owner.lock().unwrap().notifications = Some(
         crate::host::notifications::Broker::start(
             &host,
             crate::notifications::Application::Cagents,
         )
         .unwrap(),
     );
-    host.lock().unwrap().notifications = Some(cleanup.notifications.as_ref().unwrap().handle());
+    host.lock().unwrap().notifications = Some(cleanup.owner.lock().unwrap().notifications.as_ref().unwrap().handle());
     host.lock().unwrap().enable_holder_recovery();
     let Destination::New(spec) = &mut request.destination else {
         unreachable!()

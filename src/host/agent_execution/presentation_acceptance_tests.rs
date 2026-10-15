@@ -93,7 +93,7 @@ impl Drop for OwningCloseChild {
     }
 }
 
-fn owning_close_isolated(name: &str) -> Option<tempfile::TempDir> {
+fn owning_close_isolated(name: &str) -> Option<()> {
     use std::{
         os::{
             fd::FromRawFd,
@@ -105,15 +105,17 @@ fn owning_close_isolated(name: &str) -> Option<tempfile::TempDir> {
     if std::env::var(CHILD).as_deref() == Ok(name) {
         return None;
     }
-    let mut directory = OwningCloseDirectory(Some(
+    let directory = OwningCloseDirectory(Some(
         tempfile::Builder::new()
             .prefix("cagents-owning-close-")
             .tempdir()
             .unwrap(),
     ));
     let root = directory.0.as_ref().unwrap().path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
     for name in [
         "bin",
+        "home",
         "home/.claude",
         "home/.codex",
         "data",
@@ -124,6 +126,7 @@ fn owning_close_isolated(name: &str) -> Option<tempfile::TempDir> {
         "project",
     ] {
         std::fs::create_dir_all(root.join(name)).unwrap();
+        std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     install_claude(&root.join("bin/claude"));
     let open_log = |name| {
@@ -247,7 +250,9 @@ fn owning_close_isolated(name: &str) -> Option<tempfile::TempDir> {
         status.success() && one,
         "owning test did not execute exactly one passing named contract: {exact}; inspect private retained child.stdout.log/child.stderr.log"
     );
-    Some(directory.0.take().unwrap())
+    // Keep exact private receipts/runtime on nominal success too; child exit0
+    // and exact1pass do not prove outer-family settlement or authorize deletion.
+    Some(())
 }
 
 struct LocalCodexPresentationFixture {
