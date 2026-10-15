@@ -704,12 +704,17 @@ impl Handle {
     /// Fence one actor lifetime after explicit consent to stop all its work.
     /// This phase never joins cleanup and may run under control admission.
     pub(crate) fn fence_session_stop_until(&self, actor_id: uuid::Uuid, deadline: Instant) -> Result<(), String> {
-        let observed = self.close_observation();
-        if observed.actor_id != actor_id {
+        if Instant::now()>=deadline {return Err("Session stop admission deadline elapsed".into());}
+        let (observed_id,unobserved)=match self.0.close_state.try_lock() {
+            Ok(close)=>(close.actor_id,close.unobserved_native),
+            Err(std::sync::TryLockError::Poisoned(p))=>{let close=p.into_inner();(close.actor_id,close.unobserved_native)},
+            Err(std::sync::TryLockError::WouldBlock)=>return Err("Provider identity is updating; retain its owner and retry session stop".into()),
+        };
+        if observed_id != actor_id {
             return Err("The provider actor was replaced; its replacement was preserved".into());
         }
-        if observed.completed || self.0.stop.load(Ordering::Acquire) {
-            return if observed.owns_work && self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native {
+        if self.is_completed() || self.0.stop.load(Ordering::Acquire) {
+            return if unobserved {
                 Err("Retained provider ownership must be reattached before session stop".into())
             } else { Ok(()) };
         }
@@ -719,7 +724,11 @@ impl Handle {
         let (reply, response) = crossbeam_channel::bounded(1);
         if Instant::now()>=deadline {return Err("Session stop admission deadline elapsed".into());}
         {
-            let mut pending=self.0.session_stop.lock().unwrap_or_else(|p|p.into_inner());
+            let mut pending=match self.0.session_stop.try_lock() {
+                Ok(pending)=>pending,
+                Err(std::sync::TryLockError::Poisoned(p))=>p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock)=>return Err("Session stop admission is busy; retain its owner and retry".into()),
+            };
             if pending.is_some() {return Err("A session stop is already pending; retain its owner and refresh".into());}
             // Whole-session consent includes already queued work. This owner
             // control must not be starved behind a saturated provider stdin.
@@ -3343,6 +3352,20 @@ mod tests {
         context.observe_provider_directory(path).unwrap();
         context
     }
+    #[test]
+    fn session_stop_deadline_does_not_wait_for_resident_identity_publication() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        let identity=handle.0.close_state.lock().unwrap();
+        let started=Instant::now();
+        assert!(handle.fence_session_stop_until(identity.actor_id,started+Duration::from_millis(50)).is_err());
+        assert!(started.elapsed()<Duration::from_millis(250),"metadata contention must not extend the stop budget");
+        assert!(!handle.0.stop.load(Ordering::Acquire));drop(identity);
+        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+    }
+
     #[test]
     fn whole_session_stop_preempts_saturated_commands_and_blocked_provider_stdin() {
         struct Stalled {
