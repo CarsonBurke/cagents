@@ -34,6 +34,22 @@ pub(crate) fn resolve(
     discover(&from)
 }
 
+/// The explicit directory owns discovery. Inherited session Git redirects
+/// must not substitute another checkout or index for that selected path.
+fn discovery_git(directory: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "core.fsmonitor=false"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("LC_ALL", "C")
+        .current_dir(directory)
+        .stdin(Stdio::null());
+    command
+}
+
 /// Git projects use the common metadata directory; plain folders use their
 /// canonical directory. Only Git's specific no-repository answer permits the
 /// latter, and existing metadata must not be hidden by that fallback.
@@ -43,11 +59,8 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
     if !directory.is_dir() {
         return Err(format!("`{}` is not a directory", directory.display()));
     }
-    let output = Command::new("git")
+    let output = discovery_git(&directory)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .env("LC_ALL", "C")
-        .current_dir(&directory)
-        .stdin(Stdio::null())
         .output()
         .map_err(|error| format!("could not run git: {error}"))?;
     if output.status.success() {
@@ -89,9 +102,9 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
 }
 
 fn discover_checkout(directory: &Path) -> Result<Option<PathBuf>, String> {
-    let output = Command::new("git")
+    let output = discovery_git(directory)
         .args(["rev-parse", "--path-format=absolute", "--show-toplevel"])
-        .env("LC_ALL", "C").current_dir(directory).stdin(Stdio::null()).output()
+        .output()
         .map_err(|error| format!("could not discover checkout: {error}"))?;
     if !output.status.success() {
         // A bare or metadata-only open has no discoverable checkout. Do not
@@ -150,12 +163,6 @@ fn exists(path: &Path) -> Result<bool, String> {
 }
 
 fn has_git_metadata(directory: &Path) -> Result<bool, String> {
-    if ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some())
-    {
-        return Ok(true);
-    }
     for ancestor in directory.ancestors() {
         if ancestor.file_name().is_some_and(|name| name == ".git")
             || exists(&ancestor.join(".git"))?
@@ -253,6 +260,64 @@ fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_ignores_inherited_git_redirection() {
+        const FIXTURE: &str = "CAGENTS_TEST_DISCOVERY_REDIRECT";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = PathBuf::from(root);
+            let selected = root.join("selected").canonicalize().unwrap();
+            let project = discover(&selected).unwrap();
+            assert_eq!(project.key, selected.join(".git"));
+            assert_eq!(project.checkout.as_deref(), Some(selected.as_path()));
+            assert_eq!(project.primary_checkout.as_deref(), Some(selected.as_path()));
+            let plain = root.join("plain").canonicalize().unwrap();
+            let folder = discover(&plain).unwrap();
+            assert_eq!(folder.key, plain);
+            assert_eq!(folder.kind, ProjectKind::Folder);
+            return;
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = directory.path();
+        for name in ["selected", "foreign"] {
+            let output = discovery_git(root)
+                .args(["init", "--quiet"])
+                .arg(root.join(name))
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::create_dir(root.join("plain")).unwrap();
+        let foreign = root.join("foreign");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "project_location::tests::discovery_ignores_inherited_git_redirection",
+                "--nocapture",
+            ])
+            .env(FIXTURE, root)
+            .env("GIT_DIR", foreign.join(".git"))
+            .env("GIT_COMMON_DIR", foreign.join(".git"))
+            .env("GIT_WORK_TREE", &foreign)
+            .env("GIT_INDEX_FILE", foreign.join(".git/index"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
 
     #[test]
     fn plain_folders_have_canonical_folder_identity() {
