@@ -10637,7 +10637,7 @@ fn canonical_future_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-#[cfg(any(feature = "ui", test))]
+#[cfg(feature = "ui")]
 fn worktree_lease(path: &Path, create: bool) -> io::Result<fs::File> {
     worktree_lease_with_grace(path, create, Duration::ZERO)
 }
@@ -11188,7 +11188,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         finish_worktree_journal(store, &journal, &payload, created_at, &emit)
     }
 
-    #[cfg(any(feature = "ui", test))]
+    #[cfg(feature = "ui")]
     fn prepare_worktree_journal(
         &self,
         request: &CreateWorktreeRequest,
@@ -11421,7 +11421,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// Only the original live request may clean up its own Git lock. Startup
     /// reconciliation deliberately never calls this mutating helper.
-    #[cfg(any(feature = "ui", test))]
+    #[cfg(feature = "ui")]
     fn unlock_created_worktree(&self, journal: &mut WorktreeJournal) {
         let cleanup = (|| -> Result<(), RepositoryError> {
             let lease = worktree_lease_with_grace(&journal.lease_path, false, CLEANUP_GRACE)

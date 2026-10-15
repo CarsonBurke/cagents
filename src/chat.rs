@@ -50,17 +50,17 @@ pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
                 .any(|phrase| lower.contains(phrase)))
 }
 
-#[cfg(any(feature = "host", feature = "ui", test))]
+#[cfg(any(feature = "host", feature = "ui"))]
 const SIGN_IN_VERIFICATION_MARKER: &str = "\nSign-in verification: ";
 
-#[cfg(any(feature = "ui", test))]
+#[cfg(any(feature = "ui", all(feature = "host", test)))]
 pub(crate) fn sign_in_verification_detail(message: &str) -> Option<&str> {
     message
         .split_once(SIGN_IN_VERIFICATION_MARKER)
         .map(|(_, detail)| detail)
 }
 
-#[cfg(any(feature = "host", test))]
+#[cfg(any(feature = "host", all(feature = "ui", test)))]
 pub(crate) fn sign_in_verification_failure(failure: &str, detail: &str) -> String {
     let original = failure
         .split_once(SIGN_IN_VERIFICATION_MARKER)
@@ -189,7 +189,7 @@ pub struct Launch {
 impl Launch {
     /// Claude's exact saved transcript remains readable after its working
     /// directory is removed, without starting a provider in another directory.
-    #[cfg(any(feature = "host", feature = "ui", test))]
+    #[cfg(any(feature = "host", feature = "ui"))]
     pub(crate) fn needs_read_only_history(&self) -> bool {
         self.provider == Provider::Claude
             && self
@@ -458,9 +458,9 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 }
 
 /// Inline tool images are spooled to private files before entering a snapshot.
-#[cfg(any(feature = "host", feature = "ui", test))]
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
-#[cfg(any(feature = "host", feature = "ui", test))]
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

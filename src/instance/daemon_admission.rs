@@ -251,12 +251,12 @@ pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result
 
 /// Acquire before mutable daemon ownership/socket/store operations and keep
 /// through listener readiness. No live window can publish midway through admit.
-#[cfg(any(feature = "host", test))]
+#[cfg(feature = "host")]
 pub(crate) struct DaemonAdmissionGuard {
     _launch: LaunchFence,
     _legacy: OwnedLock,
 }
-#[cfg(any(feature = "host", test))]
+#[cfg(feature = "host")]
 impl DaemonAdmissionGuard {
     pub(crate) fn acquire() -> io::Result<Self> {
         let launch = if let Some((file, descriptor)) = inherited_fence()? {
@@ -279,7 +279,7 @@ impl DaemonAdmissionGuard {
     }
 }
 
-#[cfg(any(feature = "host", test))]
+#[cfg(feature = "host")]
 fn upgrade_fence(file: &File) -> io::Result<()> {
     // An SH→EX conversion is NOT atomic. On failure Linux can drop the
     // parent's SH lock: return immediately, before any startup mutation.

@@ -470,7 +470,7 @@ pub(crate) fn standalone_editor_protection_ready() -> io::Result<()> {
 /// An older independent editor has no interpretable directory inventory.
 /// Preserve all candidates while any local editor cannot prove readiness.
 /// Never inspect its buffers, environment, cwd or command arguments.
-#[cfg(any(feature = "host", test))]
+#[cfg(feature = "host")]
 pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
 }
@@ -597,7 +597,7 @@ pub(crate) fn window_is_initialized() -> bool {
     WINDOW_SLOT.get().is_some()
 }
 
-#[cfg(any(feature = "ui", test))]
+#[cfg(feature = "ui")]
 pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
     owned_lock(
         &runtime_directory()?.join(format!("{}.worktrees-ready", slot_lock_name(window_slot()))),
@@ -606,7 +606,7 @@ pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
 }
 
 /// Blocks new windows while automatic cleanup authenticates existing owners.
-#[cfg(any(feature = "host", test))]
+#[cfg(feature = "host")]
 pub(crate) fn worktree_mutation_launch_fence() -> io::Result<OwnedLock> {
     owned_lock(
         &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
@@ -623,7 +623,7 @@ pub(crate) struct VerifiedWindow {
 }
 
 impl VerifiedWindow {
-    #[cfg(any(feature = "host", test))]
+    #[cfg(feature = "host")]
     pub(crate) fn protects_worktrees(&self) -> io::Result<bool> {
         let name = self
             .lease_path
@@ -647,7 +647,7 @@ impl VerifiedWindow {
             )?)
     }
 
-    #[cfg(any(feature = "host", test))]
+    #[cfg(feature = "host")]
     pub(crate) fn pid(&self) -> u32 {
         self.pid
     }

@@ -3,7 +3,7 @@
 //! Locks live outside repositories and are never unlinked: every process must
 //! contend on the same file description, including across daemon restarts.
 use sha2::{Digest, Sha256};
-#[cfg(any(feature = "ui", test))]
+#[cfg(feature = "ui")]
 use std::collections::BTreeMap;
 use std::{
     io,
@@ -272,7 +272,7 @@ impl std::fmt::Debug for Protection {
 }
 
 impl Protection {
-    #[cfg(any(feature = "ui", test))]
+    #[cfg(feature = "ui")]
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
     }
@@ -429,14 +429,14 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
 #[derive(Default)]
-#[cfg(any(feature = "ui", test))]
+#[cfg(feature = "ui")]
 pub(crate) struct WindowProtections {
     directories: BTreeMap<PathBuf, Protection>,
     requested: std::collections::BTreeSet<PathBuf>,
     ready: Option<crate::instance::OwnedLock>,
 }
 
-#[cfg(any(feature = "ui", test))]
+#[cfg(feature = "ui")]
 impl WindowProtections {
     fn suspend_readiness(&mut self) {
         self.ready = None;
@@ -817,6 +817,7 @@ mod tests {
         acquire(runtime.path(), directory.path(), false).unwrap();
     }
 
+    #[cfg(feature = "ui")]
     #[test]
     fn device_switch_revokes_readiness_without_exposing_retained_local_editors() {
         let runtime = tempfile::tempdir().unwrap();
