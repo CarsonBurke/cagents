@@ -1012,6 +1012,7 @@ fn settings_layout<'a>(
     width: f32,
 ) -> Element<'a, Message> {
     let (feedback, invalid) = (context.feedback, context.invalid);
+    let content_max_width = if category == SettingsCategory::Keyboard { 960.0 } else { CONTENT_MAX_WIDTH };
     let narrow = width < RAIL_BREAKPOINT;
     let refused = |item: SettingsCategory| invalid.keys().any(|field| field.category() == item);
     let searching = !query.trim().is_empty();
@@ -1142,7 +1143,7 @@ fn settings_layout<'a>(
                 .spacing(space::S)
                 .width(Length::Fill),
         )
-        .max_width(CONTENT_MAX_WIDTH),
+        .max_width(content_max_width),
     )
     .padding(iced::Padding {
         top: space::M,
@@ -1156,7 +1157,7 @@ fn settings_layout<'a>(
             widget::column::with_children(results)
                 .spacing(5.0 * design::GRID_UNIT)
                 .width(Length::Fill)
-                .max_width(CONTENT_MAX_WIDTH),
+                .max_width(content_max_width),
         )
         .padding([space::M, gutter])
         .width(Length::Fill),
