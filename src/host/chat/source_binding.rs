@@ -420,11 +420,11 @@ mod tests {
         impl Adapter for Learns {
             fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
             fn receive(&mut self, value: serde_json::Value) -> Result<Step, String> {
-                Ok(Step { writes: vec![], events: vec![chat::Event::Session { id: value["thread"].as_str().unwrap().into(), title: None }] })
+                Ok(Step { events: vec![chat::Event::Session { id: value["thread"].as_str().unwrap().into(), title: None }], ..Step::default() })
             }
             fn command(&mut self, command: chat::Command) -> Result<Step, String> {
                 let chat::Command::SetModel { model, .. } = command else { return Ok(Step::default()); };
-                Ok(Step { writes: vec![format!("{{\"thread\":{}}}\n", serde_json::to_string(&model).unwrap())], events: vec![] })
+                Ok(Step { writes: vec![serde_json::json!({"thread": model})], ..Step::default() })
             }
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
