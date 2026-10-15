@@ -21105,13 +21105,19 @@ mod tests {
     fn success_notice_flood_preserves_unresolved_errors_and_warnings() {
         let mut log = NoticeLog::default();
         let now = Instant::now();
-        log.record_at(TransientNotice::error("Still disconnected").key("error"), now);
+        log.record_at(
+            TransientNotice::error("Still disconnected").key("error"),
+            now,
+        );
         log.record_at(
             TransientNotice::warning("Turn interrupted").key("warning"),
             now,
         );
         for index in 0..NOTICE_LOG_CAPACITY * 2 {
-            log.record_at(TransientNotice::success(format!("Information {index}")), now);
+            log.record_at(
+                TransientNotice::success(format!("Information {index}")),
+                now,
+            );
             assert!(log.len() <= NOTICE_LOG_CAPACITY);
         }
         log.expire(now + Duration::from_secs(7));
