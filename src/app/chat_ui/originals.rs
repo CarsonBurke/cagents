@@ -170,7 +170,8 @@ impl Runtime {
         if self.recovery.originals.context.as_ref()!=Some(&context) {
             self.recovery.originals.clear();self.recovery.originals.context=Some(context.clone());
         }
-        if self.snapshot.ready && !self.snapshot.busy && self.snapshot.read_only_reason.is_none()
+        if self.snapshot.ready && !self.snapshot.busy && !self.snapshot.waiting && self.snapshot.requests.is_empty()
+            && self.snapshot.read_only_reason.is_none()
             && self.pending.is_none() && self.queued.is_none() && self.selected_subagent.is_none()
             && !self.recovery.originals.attempted && self.recovery.originals.query.is_none()
             && let Some(handle)=self.handle().cloned() {
@@ -360,6 +361,16 @@ mod tests {
             assert!(runtime.original_retry_user().is_none(),"new unannotated input never falls back to an old original");
             assert_ne!(runtime.recovery.originals.query_id_for_test(),old_id);
         }
+    }
+    #[test]
+    fn pending_approval_does_not_offer_turn_recovery_or_probe_latest_original() {
+        let mut runtime=runtime();
+        Arc::make_mut(&mut runtime.snapshot).waiting=true;runtime.sync_original();
+        assert!(runtime.recovery.originals.query.is_none());
+        assert!(!runtime.recovery_available());
+        Arc::make_mut(&mut runtime.snapshot).waiting=false;runtime.sync_original();
+        assert!(runtime.recovery.originals.query.is_some());
+        assert!(runtime.recovery_available());
     }
     #[test]
     fn metadata_rejects_wrong_session_inexact_settings_and_partial_shape() {
