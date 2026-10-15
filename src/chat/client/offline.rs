@@ -5,7 +5,8 @@
 use super::*;
 mod sources;
 mod changes;
-use crate::chat::source_owners::ResidentChanges;
+mod raw;
+use crate::chat::source_owners::{ResidentChanges, ResidentRawCalls};
 use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -23,6 +24,7 @@ const MAX_VIEW_BYTES: u64 = 512 * 1024 * 1024;
 struct View {
     snapshot: Arc<Snapshot>,
     changes: ResidentChanges,
+    raw: ResidentRawCalls,
 }
 
 struct Publication {
@@ -31,6 +33,7 @@ struct Publication {
     epoch: u64,
     sources: sources::Manifest,
     changes: ResidentChanges,
+    raw: ResidentRawCalls,
 }
 struct Cached {
     file: File,
@@ -53,6 +56,7 @@ struct Data {
     rendered: bool,
     unavailable: bool,
     restored_changes: Option<ResidentChanges>,
+    restored_raw: Option<ResidentRawCalls>,
 }
 
 pub(super) struct State {
@@ -102,6 +106,10 @@ impl State {
     }
 
     pub(super) fn capture_changes(self: &Arc<Self>, snapshot: Arc<Snapshot>, clock: Option<SourceClock>, rendered: bool, changes: ResidentChanges) {
+        self.capture_sources(snapshot, clock, rendered, changes, ResidentRawCalls::default());
+    }
+
+    pub(super) fn capture_sources(self: &Arc<Self>, snapshot: Arc<Snapshot>, clock: Option<SourceClock>, rendered: bool, changes: ResidentChanges, raw: ResidentRawCalls) {
         // Rejected raw/control publications need no body/provenance census.
         // Recheck after capture: deletion or another rendered view can race
         // this short preflight without granting an obsolete view authority.
@@ -109,7 +117,7 @@ impl State {
             let data = self.data.lock().unwrap_or_else(|p| p.into_inner());
             if data.revoked || (!rendered && data.rendered) { return; }
         }
-        let sources = match sources::Manifest::capture_changes(&snapshot, &changes) {
+        let sources = match sources::Manifest::capture_all(&snapshot, &changes, &raw) {
             Ok(sources) => sources,
             Err(error) => {
                 tracing::warn!(target: "cagents::memory", %error, "Cannot capture an unqualified chat view");
@@ -124,7 +132,7 @@ impl State {
             data.unavailable = false;
             data.epoch = data.epoch.wrapping_add(1);
             let epoch = data.epoch;
-            data.pending = Some(Publication { snapshot, clock, epoch, sources, changes });
+            data.pending = Some(Publication { snapshot, clock, epoch, sources, changes, raw });
             data.fallback = None;
         }
         self.schedule();
@@ -133,6 +141,12 @@ impl State {
 
     pub(super) fn take_restored_changes(&self) -> Option<ResidentChanges> {
         let restored = self.data.lock().unwrap_or_else(|p| p.into_inner()).restored_changes.take();
+        self.trace();
+        restored
+    }
+
+    pub(super) fn take_restored_raw_calls(&self) -> Option<ResidentRawCalls> {
+        let restored = self.data.lock().unwrap_or_else(|p| p.into_inner()).restored_raw.take();
         self.trace();
         restored
     }
@@ -151,7 +165,7 @@ impl State {
         {
             let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
             if data.requested_show == show { return; }
-            if !show { data.restored_changes = None; }
+            if !show { data.restored_changes = None; data.restored_raw = None; }
             data.requested_show = show;
             data.request = data.request.wrapping_add(1);
             data.restore = show && !data.revoked;
@@ -180,6 +194,7 @@ impl State {
         data.rendered = false;
         data.unavailable = false;
         data.restored_changes = None;
+        data.restored_raw = None;
     }
 
     /// Content reset keeps the client usable but removes the previous view.
@@ -201,8 +216,9 @@ impl State {
     pub(super) fn metrics(&self) -> (usize, usize, usize, u64) {
         let data = self.data.lock().unwrap_or_else(|p| p.into_inner());
         let queued = data.pending.iter().chain(data.fallback.iter())
-            .map(|record| record.snapshot.transcript_bytes() + patch_bytes(&record.changes)).sum::<usize>()
-            + data.restored_changes.as_ref().map_or(0, patch_bytes);
+            .map(|record| record.snapshot.transcript_bytes() + patch_bytes(&record.changes) + raw_bytes(&record.raw)).sum::<usize>()
+            + data.restored_changes.as_ref().map_or(0, patch_bytes)
+            + data.restored_raw.as_ref().map_or(0, raw_bytes);
         (queued, self.in_flight_bytes.load(Ordering::Acquire) as usize,
          self.buffer_bytes.load(Ordering::Acquire) as usize,
          data.cached.as_ref().map_or(0, |cached| cached.bytes))
@@ -238,7 +254,7 @@ impl State {
         {
             let checked = CheckedWriter { state: self, epoch: record.epoch, file: &mut file, written: 0, limit: MAX_VIEW_BYTES };
             let mut writer = BufWriter::with_capacity(BUFFER, checked);
-            serde_json::to_writer(&mut writer, &View {snapshot: record.snapshot.clone(), changes: record.changes.clone()}).map_err(|e| e.to_string())?;
+            serde_json::to_writer(&mut writer, &View {snapshot: record.snapshot.clone(), changes: record.changes.clone(), raw: record.raw.clone()}).map_err(|e| e.to_string())?;
             writer.flush().map_err(|e| e.to_string())?;
         }
         let bytes = file.metadata().map_err(|e| e.to_string())?.len();
@@ -254,7 +270,7 @@ impl State {
             let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
             let record = data.pending.take();
             if let Some(record) = &record {
-                self.in_flight_bytes.store((record.snapshot.transcript_bytes() + patch_bytes(&record.changes)) as u64, Ordering::Release);
+                self.in_flight_bytes.store((record.snapshot.transcript_bytes() + patch_bytes(&record.changes) + raw_bytes(&record.raw)) as u64, Ordering::Release);
                 self.buffer_bytes.store(BUFFER as u64, Ordering::Release);
             }
             record
@@ -319,15 +335,15 @@ impl State {
             data.restore = false;
             let file = data.cached.as_ref().and_then(|cached| cached.file.try_clone().ok().map(|file|
                 (file, cached.epoch, cached.clock, cached.sources.clone())));
-            let fallback = data.fallback.as_ref().map(|record| (record.snapshot.clone(), record.epoch, record.clock, record.sources.clone(), record.changes.clone()));
+            let fallback = data.fallback.as_ref().map(|record| (record.snapshot.clone(), record.epoch, record.clock, record.sources.clone(), record.changes.clone(), record.raw.clone()));
             (data.request, data.epoch, file, fallback)
         };
         if owner.alive.load(Ordering::Acquire) || !owner.body_requested.load(Ordering::Acquire) { return; }
         // A disk reader must not keep the client alive after its pane closes.
         drop(owner);
-        let restored = if let Some((mut snapshot, record_epoch, clock, sources, changes)) = fallback {
+        let restored = if let Some((mut snapshot, record_epoch, clock, sources, changes, raw)) = fallback {
             // These original Item owners already carry their shared leases.
-            sources.normalize_changes(Arc::make_mut(&mut snapshot), &changes).map(|()| (snapshot, changes, record_epoch, clock))
+            sources.normalize_all(Arc::make_mut(&mut snapshot), &changes, &raw).map(|()| (snapshot, changes, raw, record_epoch, clock))
         } else if let Some((mut file, record_epoch, clock, sources)) = cached {
             self.buffer_bytes.store(BUFFER as u64, Ordering::Release);
             self.trace();
@@ -336,14 +352,14 @@ impl State {
                 let checked = CheckedReader { state: self, epoch, request, file: file.take(MAX_VIEW_BYTES + 1) };
                 serde_json::from_reader::<_, View>(BufReader::with_capacity(BUFFER, checked))
                     .map_err(|e| e.to_string()).and_then(|mut view| {
-                        sources.adopt_changes(Arc::make_mut(&mut view.snapshot), &view.changes, reservation)?;
-                        Ok((view.snapshot, view.changes, record_epoch, clock))
+                        sources.adopt_all(Arc::make_mut(&mut view.snapshot), &view.changes, &view.raw, reservation)?;
+                        Ok((view.snapshot, view.changes, view.raw, record_epoch, clock))
                     })
             });
             self.buffer_bytes.store(0, Ordering::Release);
             result
         } else { return; };
-        let (mut restored, mut restored_changes, record_epoch, _cached_clock) = match restored {
+        let (mut restored, mut restored_changes, mut restored_raw, record_epoch, _cached_clock) = match restored {
             Ok(restored) => restored,
             Err(error) => {
                 // Preserve the private file for a later reveal. Capacity denial
@@ -352,7 +368,7 @@ impl State {
                 return;
             }
         };
-        self.in_flight_bytes.store((restored.transcript_bytes() + patch_bytes(&restored_changes)) as u64, Ordering::Release);
+        self.in_flight_bytes.store((restored.transcript_bytes() + patch_bytes(&restored_changes) + raw_bytes(&restored_raw)) as u64, Ordering::Release);
         self.trace();
         #[cfg(test)]
         if let Some((ready, proceed)) = self.before_install.lock().unwrap_or_else(|p| p.into_inner()).take() {
@@ -398,7 +414,12 @@ impl State {
             }
         }
         publication.read_only_reason = Some("Connection lost; showing the last cached view. Reconnect to refresh history or send messages.".into());
+        // Raw call authority follows the latest qualified descriptors, not the
+        // prose revision or an older cached projection. A hidden removal or
+        // replacement must not be undone by disconnected history restoration.
+        raw::retain_current(&publication, &mut restored_raw);
         *snapshot = Arc::new(publication);
+        data.restored_raw = Some(restored_raw);
         data.restored_changes = Some(restored_changes);
         data.unavailable = false;
         data.error = None;
@@ -408,6 +429,10 @@ impl State {
         drop(snapshot);
         (owner.wake)(Wake::Changed);
     }
+}
+
+fn raw_bytes(view: &ResidentRawCalls) -> usize {
+    view.calls.iter().map(|(text, _)| text.len()).sum()
 }
 
 fn patch_bytes(view: &ResidentChanges) -> usize {
@@ -566,6 +591,54 @@ mod tests {
         handle.revoke_local_history();
         assert!(handle.take_restored_changes().is_none(), "DeleteFiles must drop even an unconsumed sidecar");
         assert_eq!(handle.offline_view_metrics().3, 0);
+    }
+
+    #[test]
+    fn original_call_spills_restores_once_and_delete_revokes_unconsumed_owner() {
+        let (mut snapshot, raw) = raw::tests::fixture();
+        snapshot.generation = 17;
+        snapshot.ready = true;
+        snapshot.session_id = Some("private-offline-original".into());
+        let handle = ClientHandle::fixture(super::super::tests::omp_card(None, None), snapshot);
+        let original = Arc::downgrade(&raw.calls[0].0);
+        handle.remember_visible_view_with_sources(handle.snapshot(), None, Default::default(), raw);
+        hidden_on_disk(&handle);
+        wait("original call remained in memory after spill", || original.upgrade().is_none());
+        handle.set_visible(true).unwrap();
+        wait("original call restore did not complete", || handle.resident_snapshot().is_some());
+        let restored = handle.take_restored_raw_calls().expect("decoded original call");
+        assert!(restored.calls[0].0.contains("complete original call"));
+        assert_eq!(crate::chat::source_owners::resident_raw(&restored.calls[0].0), Some(restored.calls[0].1.clone()));
+        assert!(handle.take_restored_raw_calls().is_none());
+        drop(restored);
+        handle.set_visible(false).unwrap();
+        handle.set_visible(true).unwrap();
+        wait("second original restore did not complete", || handle.resident_snapshot().is_some());
+        handle.revoke_local_history();
+        assert!(handle.take_restored_raw_calls().is_none());
+        assert_eq!(handle.offline_view_metrics().3, 0);
+    }
+
+    #[test]
+    fn hidden_raw_removal_with_unchanged_prose_revision_cannot_restore_old_call() {
+        let (mut snapshot, raw) = raw::tests::fixture();
+        snapshot.generation = 19;
+        snapshot.session_id = Some("private-offline-removed-original".into());
+        let handle = ClientHandle::fixture(super::super::tests::omp_card(None, None), snapshot);
+        handle.remember_visible_view_with_sources(handle.snapshot(), None, Default::default(), raw);
+        hidden_on_disk(&handle);
+        let prose_revision = handle.snapshot().source_revision;
+        {
+            let mut current = handle.inner.snapshot.lock().unwrap();
+            let next = Arc::make_mut(&mut current);
+            next.generation += 1;
+            next.raw_source_parts.clear();
+        }
+        handle.set_visible(true).unwrap();
+        wait("cached prose restoration did not settle", || handle.resident_snapshot().is_some());
+        assert_eq!(handle.snapshot().source_revision, prose_revision);
+        assert!(handle.snapshot().raw_source_parts.is_empty());
+        assert!(handle.take_restored_raw_calls().unwrap().calls.is_empty(), "latest Raw authority wins even without a prose revision change");
     }
 
     #[test]

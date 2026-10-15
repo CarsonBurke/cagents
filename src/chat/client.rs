@@ -1631,16 +1631,26 @@ impl ClientHandle {
     }
 
     pub(crate) fn remember_visible_view_with_changes(&self, view: Arc<Snapshot>, clock: Option<SourceClock>, changes: crate::chat::source_owners::ResidentChanges) {
+        self.remember_visible_view_with_sources(view, clock, changes, crate::chat::source_owners::ResidentRawCalls::default());
+    }
+
+    pub(crate) fn remember_visible_view_with_sources(&self, view: Arc<Snapshot>, clock: Option<SourceClock>, changes: crate::chat::source_owners::ResidentChanges, raw: crate::chat::source_owners::ResidentRawCalls) {
         let current = self.inner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         // A late UI view must not cross a reset/new native conversation.
         if current.session_id != view.session_id || self.inner.offline.revoked() { return; }
-        self.inner.offline.capture_changes(view, clock, true, changes);
+        self.inner.offline.capture_sources(view, clock, true, changes, raw);
     }
 
     /// Transfer admitted full patches only after installing this handle's
     /// current typed source projection. The Runtime validates it once more.
     pub(crate) fn take_restored_changes(&self) -> Option<crate::chat::source_owners::ResidentChanges> {
         self.inner.offline.take_restored_changes()
+    }
+
+    /// Transfer only currently authorized original-call sidecars. Runtime
+    /// revalidates them after syncing actual raw descriptors.
+    pub(crate) fn take_restored_raw_calls(&self) -> Option<crate::chat::source_owners::ResidentRawCalls> {
+        self.inner.offline.take_restored_raw_calls()
     }
 
     /// Account/history deletion must fence cached plaintext as well as the

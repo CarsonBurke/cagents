@@ -124,7 +124,7 @@ pub(super) mod tests {
         let (snapshot, original) = fixture();
         let header = super::super::sources::Manifest::capture_changes(&snapshot, &original).unwrap();
         let reservation = header.reserve().unwrap();
-        let encoded = serde_json::to_vec(&super::super::View {snapshot: Arc::new(snapshot), changes: original.clone()}).unwrap();
+        let encoded = serde_json::to_vec(&super::super::View {snapshot: Arc::new(snapshot), changes: original.clone(), raw: Default::default()}).unwrap();
         let mut decoded: super::super::View = serde_json::from_slice(&encoded).unwrap();
         assert!(!Arc::ptr_eq(&original.patches[0].0, &decoded.changes.patches[0].0));
         assert!(source_owners::resident_patch(&decoded.changes.patches[0].0).is_none());
