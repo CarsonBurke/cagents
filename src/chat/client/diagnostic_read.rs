@@ -587,7 +587,11 @@ impl ClientHandle {
             "Too many saved output requests; close another output panel and try again".to_owned()
         })?;
         let metadata = Charge::reserve_capacity(0)?;
-        let log = super::super::ProviderExitLog { id:log.id.as_str().to_owned(),bytes:log.bytes,omitted:log.omitted };
+        let log = super::super::ProviderExitLog {
+            id: log.id.as_str().to_owned(),
+            bytes: log.bytes,
+            omitted: log.omitted,
+        };
         let (cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
         let request = DiagnosticReadRequest(Arc::new(Job {
             source: DiagnosticSource {
@@ -1587,15 +1591,31 @@ mod tests {
     }
     #[test]
     fn short_log_id_cannot_import_arbitrary_input_capacity_into_queued_metadata() {
-        let _guard=diagnostic_test_guard();wait_capacity(0);
-        let handle=ClientHandle::fixture(super::super::tests::omp_card(None,None),Snapshot::default());
-        let mut id=String::with_capacity(8*1024*1024);id.push_str("short");
-        let log=super::super::super::ProviderExitLog { id,bytes:4,omitted:0 };
-        let request=handle.diagnostic_request(CardId::new(),1,1,&log,false,true,Arc::new(||true)).unwrap();
-        assert_eq!(request.source().log.id,"short");
-        assert!(request.source().log.id.capacity()<=256);
-        assert_eq!(log.id.capacity(),8*1024*1024,"the original remains caller-owned, never captured by queued request");
-        drop(log);drop(request);wait_capacity(0);
+        let _guard = diagnostic_test_guard();
+        wait_capacity(0);
+        let handle = ClientHandle::fixture(
+            super::super::tests::omp_card(None, None),
+            Snapshot::default(),
+        );
+        let mut id = String::with_capacity(8 * 1024 * 1024);
+        id.push_str("short");
+        let log = super::super::super::ProviderExitLog {
+            id,
+            bytes: 4,
+            omitted: 0,
+        };
+        let request = handle
+            .diagnostic_request(CardId::new(), 1, 1, &log, false, true, Arc::new(|| true))
+            .unwrap();
+        assert_eq!(request.source().log.id, "short");
+        assert!(request.source().log.id.capacity() <= 256);
+        assert_eq!(
+            log.id.capacity(),
+            8 * 1024 * 1024,
+            "the original remains caller-owned, never captured by queued request"
+        );
+        drop(log);
+        drop(request);
+        wait_capacity(0);
     }
-
 }
