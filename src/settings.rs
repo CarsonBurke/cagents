@@ -904,6 +904,8 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    #[serde(default)]
+    pub editor_replace_preserve_case: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -915,6 +917,8 @@ pub struct AppSettings {
     /// header would read as a key inside that table.
     #[serde(default = "default_language_servers")]
     pub language_servers: Vec<LanguageServerSettings>,
+    #[serde(default)]
+    pub editor_find_options: EditorFindOptions,
     #[serde(default, deserialize_with = "deserialize_keyboard_shortcuts")]
     pub keyboard_shortcuts: KeyboardShortcuts,
     #[serde(default)]
@@ -971,10 +975,21 @@ impl Default for AppSettings {
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
+            editor_find_options: EditorFindOptions::default(),
+            editor_replace_preserve_case: false,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+/// Persisted matching preferences shared by editor find surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorFindOptions {
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub whole_word: bool,
 }
 
 /// One language a server handles, and the file extensions that select it.
@@ -2807,6 +2822,18 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editor_find_options_round_trip_with_disabled_language_servers() {
+        let settings = AppSettings { language_servers: Vec::new(),
+            editor_find_options: EditorFindOptions { case_sensitive: true, regex: true, whole_word: true },
+            editor_replace_preserve_case: true, ..AppSettings::default() };
+        let serialized = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&serialized).unwrap();
+        assert!(restored.language_servers.is_empty());
+        assert_eq!(restored.editor_find_options, settings.editor_find_options);
+        assert!(restored.editor_replace_preserve_case);
+    }
+
     #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();

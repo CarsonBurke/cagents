@@ -1216,6 +1216,7 @@ dependencies = [
  "portable-pty",
  "postcard",
  "raw-window-handle",
+ "regex",
  "resvg",
  "roxmltree",
  "rusqlite",
