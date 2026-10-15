@@ -69,6 +69,20 @@ pub struct LspCommand {
     pub arguments: Vec<serde_json::Value>,
 }
 
+/// Lightweight original peer proof; retains no protocol/edit/command payload.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LspCodeActionContext {
+    origin_doc: Option<LspDocumentId>,
+    observed_documents: Arc<HashMap<Url, ObservedDocument>>,
+}
+
+impl std::fmt::Debug for LspCodeActionContext {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.debug_struct("LspCodeActionContext").field("origin_doc",&self.origin_doc)
+            .field("observed_peers",&self.observed_documents.len()).finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LspCodeAction {
     pub title: String,
@@ -80,10 +94,9 @@ pub struct LspCodeAction {
     pub needs_resolve: bool,
     raw: lsp_types::CodeActionOrCommand,
     origin_version: i32,
-    origin_doc: Option<LspDocumentId>,
-    // Retains original peer context across an opaque lazy resolve. Recapturing
-    // current versions would bless stale server data after close/reopen.
-    observed_documents: Arc<HashMap<Url, ObservedDocument>>,
+    // Retains original peer proof across lazy resolve, without adding copies
+    // of the potentially large protocol/workspace-edit payload to controllers.
+    context: LspCodeActionContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,23 +203,37 @@ impl LspManager {
     }
     pub fn request_resolve_code_action(&mut self,doc:LspDocumentId,item:LspCodeAction)->LspRequestId {
         if self.document_version(doc)!=Some(item.origin_version){return self.fail_feature(doc,LspError::StaleVersion{result:item.origin_version,current:self.document_version(doc).unwrap_or(-1)});}
-        let c=self.capabilities(doc);match item.raw {lsp_types::CodeActionOrCommand::CodeAction(raw)=>self.feature_request(doc,LspPosition::default(),RequestKind::ResolveCodeAction,RequestArgs::Resolve {action:raw,observed:item.observed_documents},Duration::from_secs(15),c.ready&&c.code_action_resolve),_=>self.fail_feature(doc,LspError::Unsupported("this action does not require resolution".into()))}
+        let c=self.capabilities(doc);match item.raw {lsp_types::CodeActionOrCommand::CodeAction(raw)=>self.feature_request(doc,LspPosition::default(),RequestKind::ResolveCodeAction,RequestArgs::Resolve {action:raw,observed:item.context.observed_documents},Duration::from_secs(15),c.ready&&c.code_action_resolve),_=>self.fail_feature(doc,LspError::Unsupported("this action does not require resolution".into()))}
     }
     /// Before executing an opaque previously offered action command, the UI
     /// must validate its original peer context. An edit-only action instead
     /// fences only its actual targets via observed_incarnation in the planner.
     pub fn validate_code_action_context(&self,item:&LspCodeAction)->Result<(),LspError> {
-        let Some(doc)=item.origin_doc else {return Ok(());};
+        self.validate_code_action_context_token(&item.context)
+    }
+
+    pub fn validate_code_action_context_token(&self,context:&LspCodeActionContext)->Result<(),LspError> {
+        let Some(doc)=context.origin_doc else {return Ok(());};
         let reference=self.documents.get(&doc).ok_or(LspError::UnknownDocument(doc.0))?;
+        // Discovery has not registered a snapshot yet, so the synchronized
+        // peer set below cannot account for these open editor buffers. Their
+        // exact session root is still unknown. Refuse only candidates for
+        // this worktree and configured server until synchronization finishes.
+        if self.pending_opens.values().any(|pending| {
+            pending.worktree.as_path()==reference.worktree.as_ref()
+                && pending.language.server_id.as_str()==reference.session.server_id.as_ref()
+        }) {
+            return Err(LspError::Unsupported("Wait for peer documents to synchronize, then request a fresh code action".into()));
+        }
         let inner=self.snapshots.lock();
         // Opaque commands do not disclose edited targets. A newly opened peer
         // therefore requires requesting a fresh action, just as conversion
         // rejects a newly opened target of a request-time workspace edit.
         let current=inner.uris.iter().filter(|(_,state)|state.session==reference.session);
-        if current.clone().count()!=item.observed_documents.len() || current.clone().any(|(uri,_)|!item.observed_documents.contains_key(&**uri)) {
+        if current.clone().count()!=context.observed_documents.len() || current.clone().any(|(uri,_)|!context.observed_documents.contains_key(&**uri)) {
             return Err(LspError::Unsupported("The open peer documents changed after the code action was requested".into()));
         }
-        for (uri,observed) in item.observed_documents.iter() {
+        for (uri,observed) in context.observed_documents.iter() {
             let Some(state)=inner.uris.get(uri) else {
                 return Err(LspError::Unsupported("A code-action peer document was closed after the action was requested".into()));
             };
@@ -365,7 +392,7 @@ fn convert_action(store:&SnapshotStore,req:&PendingRequest,raw:lsp_types::CodeAc
         lsp_types::CodeActionOrCommand::Command(c)=>(c.title.clone(),None,false,None,None,Some(command(c.clone())),false),
         lsp_types::CodeActionOrCommand::CodeAction(c)=>(c.title.clone(),c.kind.as_ref().map(|k|k.as_str().to_owned()),c.is_preferred.unwrap_or(false),c.disabled.as_ref().map(|d|d.reason.clone()),c.edit.clone().map(|e|convert_workspace_edit(store,e,Some(&req.observed_versions))).transpose()?,c.command.clone().map(command),(c.edit.is_none()||c.command.is_none())&&c.data.is_some()),
     };
-    Ok(LspCodeAction{title,kind,is_preferred,disabled,edit,command:cmd,needs_resolve,raw,origin_version:req.version,origin_doc:Some(req.doc),observed_documents:req.observed_versions.clone()})
+    Ok(LspCodeAction{title,kind,is_preferred,disabled,edit,command:cmd,needs_resolve,raw,origin_version:req.version,context:LspCodeActionContext{origin_doc:Some(req.doc),observed_documents:req.observed_versions.clone()}})
 }
 fn documentation(d:lsp_types::Documentation)->String{match d{lsp_types::Documentation::String(s)=>s,lsp_types::Documentation::MarkupContent(c)=>c.value}}
 fn utf16_byte(label:&str,offset:u32)->Option<usize>{let mut units=0;for (byte,ch) in label.char_indices(){if units==offset{return Some(byte);}units+=ch.len_utf16() as u32;if units>offset{return None;}}(units==offset).then_some(label.len())}
@@ -569,11 +596,11 @@ impl Drop for ServerEditGuard {
 }
 
 pub(super) fn apply_workspace_edit(state:&mut RouterState, params:lsp_types::ApplyWorkspaceEditParams)
-    -> impl std::future::Future<Output=Result<lsp_types::ApplyWorkspaceEditResponse,async_lsp::ResponseError>>+Send+'static {
+    -> impl std::future::Future<Output=Result<lsp_types::ApplyWorkspaceEditResponse,async_lsp::ResponseError>>+Send+'static+use<> {
     apply_workspace_edit_with_timeout(state, params, Duration::from_secs(120))
 }
 fn apply_workspace_edit_with_timeout(state:&mut RouterState, params:lsp_types::ApplyWorkspaceEditParams, timeout:Duration)
-    -> impl std::future::Future<Output=Result<lsp_types::ApplyWorkspaceEditResponse,async_lsp::ResponseError>>+Send+'static {
+    -> impl std::future::Future<Output=Result<lsp_types::ApplyWorkspaceEditResponse,async_lsp::ResponseError>>+Send+'static+use<> {
     let deadline = std::time::Instant::now() + timeout;
     let result=(||{
         if state.retired.load(Ordering::Acquire){return Err("language server retired".to_owned());}
@@ -643,10 +670,13 @@ pub(super) fn add_client_capabilities(caps:&mut lsp_types::ClientCapabilities){
 }
 
 impl LspCodeAction {
+    /// Cheap proof for an operation/preview after the action payload is consumed.
+    pub fn context(&self)->LspCodeActionContext {self.context.clone()}
+
     /// Constructs a local action without protocol resolution data.
     pub fn local(title:String,edit:Option<LspWorkspaceEdit>,command:Option<LspCommand>)->Self {
         let raw=lsp_types::CodeActionOrCommand::CodeAction(lsp_types::CodeAction{title:title.clone(),..Default::default()});
-        Self{title,kind:None,is_preferred:false,disabled:None,edit,command,needs_resolve:false,raw,origin_version:-1,origin_doc:None,observed_documents:Arc::new(HashMap::new())}
+        Self{title,kind:None,is_preferred:false,disabled:None,edit,command,needs_resolve:false,raw,origin_version:-1,context:LspCodeActionContext{origin_doc:None,observed_documents:Arc::new(HashMap::new())}}
     }
 }
 
@@ -688,8 +718,8 @@ mod tests {
         let raw:lsp_types::CodeActionOrCommand=serde_json::from_value(json!({"title":"Fix and run","command":{"title":"Run","command":"server.run"},"data":{"resolve_edit":true}})).unwrap();
         let item=convert_action(&store,&request,raw).unwrap();assert!(item.needs_resolve);assert!(item.command.is_some());assert!(item.edit.is_none());
         let sibling=convert_action(&store,&request,item.raw.clone()).unwrap();
-        assert!(Arc::ptr_eq(&item.observed_documents,&request.observed_versions));
-        assert!(Arc::ptr_eq(&item.observed_documents,&sibling.observed_documents));
+        assert!(Arc::ptr_eq(&item.context.observed_documents,&request.observed_versions));
+        assert!(Arc::ptr_eq(&item.context.observed_documents,&sibling.context.observed_documents));
     }
 
     #[test]

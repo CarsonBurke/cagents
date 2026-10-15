@@ -515,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_opaque_command_revalidates_actual_peer_context_on_choice() {
-        for change in 0..4 {
+        for change in 0..5 {
             let root = tempfile::tempdir().unwrap();
             let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
             let item = app.lsp.fixture_code_action(a_doc).await;
@@ -524,6 +524,14 @@ mod tests {
             if change == 1 || change == 2 { app.lsp.close(b_doc); }
             if change == 2 { app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn outside() {}\n").await; }
             if change == 3 { app.lsp.fixture_open_format_on_save_document(LspDocumentId(46), &root.path().join("unopened.rs"), root.path(), "fn old() {}\n").await; }
+            if change == 4 {
+                let pending = buffer(&mut app, root.path(), "unopened.rs", "fn pending_unsaved() {}\n");
+                let doc = LspDocumentId(46); let path = root.path().join("unopened.rs");
+                app.lsp_documents.insert(doc, pending); app.lsp_contexts.entry(pending).or_default().document = Some(doc);
+                let language = app.lsp.language_for(&path).unwrap();
+                app.lsp.open(doc, &path, root.path(), language, 1, "fn pending_unsaved() {}\n");
+                assert!(app.lsp.document_incarnation(doc).is_none());
+            }
             drop(app.update_editor_features(Action::ChooseCodeAction(a, 0)));
             if change == 0 {
                 assert_eq!(app.editor_features.requests.len(), 1);
@@ -542,7 +550,7 @@ mod tests {
         let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
         let item = app.lsp.fixture_code_action(a_doc).await;
         let mut operation = app.editor_operation(a, LspEditKind::CodeAction).unwrap();
-        operation.command = item.command.clone(); operation.command_context = Some(item); operation.open_files = app.editor_open_files();
+        operation.command = item.command.clone(); operation.command_context = Some(item.context()); operation.open_files = app.editor_open_files();
         let prepared = plan(&app, root.path(), &["a.rs"]);
         app.lsp.close(b_doc);
         app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn old() {}\n").await;
@@ -561,7 +569,7 @@ mod tests {
             let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
             let item = app.lsp.fixture_code_action(a_doc).await;
             let mut operation = app.editor_operation(a, LspEditKind::CodeAction).unwrap();
-            operation.command = item.command.clone(); operation.command_context = Some(item); operation.open_files = app.editor_open_files();
+            operation.command = item.command.clone(); operation.command_context = Some(item.context()); operation.open_files = app.editor_open_files();
             let prepared = plan(&app, root.path(), &["a.rs", "unopened.rs"]);
             let publishing = app.publish_editor_workspace_edit(822, operation, prepared);
             assert!(app.editor_features.publishing());
@@ -580,6 +588,49 @@ mod tests {
                 assert_eq!(app.editor_features.requests.len(), 1);
                 acknowledge_code_action_command(&mut app).await;
             }
+            app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_open_target_is_not_mistaken_for_a_genuinely_unopened_target() {
+        for pending_target in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut app, a, b, a_doc, b_doc) = code_action_fixture(root.path()).await;
+            app.lsp.close(b_doc); app.lsp_documents.remove(&b_doc); app.lsp_contexts.remove(&b); app.cards.remove(&b);
+            // This typed old response describes B while it was not open. An
+            // actual pending manager registration must not bless newer text.
+            let edit = LspWorkspaceEdit { documents: vec![LspDocumentEdits {
+                path: root.path().join("b.rs"), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Utf16,
+                edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }],
+            }], ..Default::default() };
+            let pending_card = if pending_target {
+                let card = buffer(&mut app, root.path(), "b.rs", "fn unsaved_outside() {}\n");
+                app.lsp_documents.insert(b_doc, card); app.lsp_contexts.entry(card).or_default().document = Some(b_doc);
+                let path = root.path().join("b.rs"); let language = app.lsp.language_for(&path).unwrap();
+                app.lsp.open(b_doc, &path, root.path(), language, 1, "fn unsaved_outside() {}\n");
+                assert_eq!(app.lsp.document_version(b_doc), Some(1));
+                assert!(app.lsp.document_incarnation(b_doc).is_none(), "discovery completion has not been delivered");
+                Some(card)
+            } else { None };
+            let operation = app.editor_operation(a, LspEditKind::Rename).unwrap();
+            let mut tasks = VecDeque::from([app.prepare_editor_workspace_edit(operation, edit)]);
+            while let Some(task) = tasks.pop_front() {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::EditorFeatures(action))) = action { tasks.push_back(app.update_editor_features(action)); }
+                    }
+                }
+            }
+            if let Some(card) = pending_card {
+                assert!(app.editor_features.preview.is_none() && !app.editor_features.publishing());
+                assert_eq!(text(&app, card), "fn unsaved_outside() {}\n");
+                assert!(app.lsp_contexts[&a].failure.as_ref().is_some_and(|message| message.contains("synchronize")));
+            } else {
+                assert!(app.editor_features.preview.is_some(), "a genuinely unopened target remains supported");
+            }
+            assert_eq!(std::fs::read_to_string(root.path().join("b.rs")).unwrap(), "fn old() {}\n");
+            assert_eq!(text(&app, a), "fn old() {}\n");
             app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
         }
     }
@@ -888,13 +939,13 @@ mod tests {
         let external_path = external.path().join("stdlib.rs");
         std::fs::write(&external_path, original).unwrap();
         let mut app = app();
-        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        app.lsp = LspManager::fixture_ready_format_on_save(LspDocumentId(1), &root.path().join("a.rs"), root.path(), original).await;
         let a = buffer(&mut app, root.path(), "a.rs", original);
         let read_only = buffer(&mut app, root.path(), external_path.to_str().unwrap(), original);
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&read_only) { runtime.set_external_source(external_path.clone()); }
         let b = buffer(&mut app, root.path(), "b.rs", original);
-        // Registration stays pending in this controller fixture: discovery
-        // events are not consumed, so no external server process can launch.
+        // Real framed synchronization supplies URI lifetime proof for every
+        // target. No external language server process is launched.
         for (card, doc, path) in [(a, LspDocumentId(1), root.path().join("a.rs")), (read_only, LspDocumentId(2), external_path.clone()), (b, LspDocumentId(3), root.path().join("b.rs"))] {
             app.lsp_documents.insert(doc, card);
             app.lsp_contexts.entry(card).or_default().document = Some(doc);
@@ -903,8 +954,9 @@ mod tests {
                 drop(runtime.take_lsp_edits());
                 runtime.set_lsp_document(Some(doc));
             }
-            let language = app.lsp.language_for(&path).unwrap();
-            app.lsp.open(doc, &path, root.path(), language, 1, original);
+            if doc != LspDocumentId(1) {
+                app.lsp.fixture_open_format_on_save_document(doc, &path, root.path(), original).await;
+            }
         }
         app.close_lsp_document(a);
         app.cards.remove(&a);
@@ -925,6 +977,7 @@ mod tests {
         assert!(!app.editor_features.modal_open());
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&b) { drop(runtime.update(RepositoryAction::Undo { card: b })); }
         assert_eq!(text(&app, b), original);
+        app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
     }
 
     #[test]
@@ -993,7 +1046,7 @@ struct Operation {
     kind: LspEditKind,
     save_after: bool,
     command: Option<LspCommand>,
-    command_context: Option<LspCodeAction>,
+    command_context: Option<LspCodeActionContext>,
     server_request: Option<LspServerEditId>,
     annotations: Vec<LspChangeAnnotation>,
     open_files: Vec<(CardId, PathBuf)>,
@@ -1210,7 +1263,7 @@ impl Cagents {
     fn validate_editor_feature_command(&self, operation: &Operation) -> Result<(), LspError> {
         if operation.command.is_none() { return Ok(()); }
         if let Some(context) = &operation.command_context {
-            self.lsp.validate_code_action_context(context)?;
+            self.lsp.validate_code_action_context_token(context)?;
         }
         Ok(())
     }
@@ -1267,7 +1320,7 @@ impl Cagents {
                 let Some(mut operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
                 if !self.editor_operation_current(&operation) { return Some(Task::none()); }
                 if let Some(reason) = &item.disabled { self.feature_failure(operation.card, reason.clone()); return Some(Task::none()); }
-                operation.command_context = Some(item.clone());
+                operation.command_context = Some(item.context());
                 operation.command = item.command.clone();
                 if let Some(edit) = &item.edit { Some(self.prepare_editor_workspace_edit(operation, edit.clone())) }
                 else {
@@ -1470,7 +1523,7 @@ impl Cagents {
                     self.editor_features.requests.insert(request, operation);
                     return Task::none();
                 }
-                operation.command_context = Some(item.clone());
+                operation.command_context = Some(item.context());
                 operation.command = item.command;
                 if let Some(edit) = item.edit { self.prepare_editor_workspace_edit(operation, edit) }
                 else if let Some(command) = operation.command.clone() { self.execute_editor_feature_command(&operation, command); Task::none() }
@@ -1696,6 +1749,9 @@ impl Cagents {
                     let Some((path, mut snapshot)) = runtime.workspace_edit_snapshot() else { return Err("Wait for the selected target to finish loading, or close its read-only view, before applying edits".into()); };
                     snapshot.protocol_version = self.lsp_document(*card).and_then(|doc| self.lsp.document_version(doc));
                     snapshot.protocol_incarnation = self.lsp_document(*card).and_then(|doc| self.lsp.document_incarnation(doc));
+                    if snapshot.protocol_incarnation.is_none() {
+                        return Err("Wait for the open target to synchronize with its language server, or close that target and prepare the edit again".into());
+                    }
                         if let Some(previous) = open.insert(path, snapshot.clone()) {
                             if previous.text != snapshot.text || previous.version != snapshot.version || previous.protocol_version != snapshot.protocol_version || previous.protocol_incarnation != snapshot.protocol_incarnation || previous.writable != snapshot.writable {
                                 return Err("Two open views of the same file disagree".into());

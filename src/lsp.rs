@@ -61,7 +61,7 @@ use crate::repository::{SIGKILL, SIGTERM, TERMINATION_GRACE, signal_process_grou
 use crate::settings::LanguageServerSettings;
 
 mod features;
-pub use features::{LspChangeAnnotation,LspCapabilities,LspCodeAction,LspCommand,LspDocumentEdits,LspEditKind,LspFormattingOptions,LspMessageLevel,LspParameter,LspServerEditId,LspServerEditLease,LspSignature,LspSignatureHelp,LspWorkspaceEdit};
+pub use features::{LspChangeAnnotation,LspCapabilities,LspCodeAction,LspCodeActionContext,LspCommand,LspDocumentEdits,LspEditKind,LspFormattingOptions,LspMessageLevel,LspParameter,LspServerEditId,LspServerEditLease,LspSignature,LspSignatureHelp,LspWorkspaceEdit};
 use features::RequestArgs;
 
 
@@ -9566,6 +9566,7 @@ mod tests {
         handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":pending.id,"result":[{"title":"Fix peer","data":{"opaque":7}}]}))).unwrap();
         let item=next_matching(&events,|event|match event {LspEvent::CodeActions{request:id,items,..}if *id==request=>items.first().cloned(),_=>None}).await;
         assert!(manager.validate_code_action_context(&item).is_ok());
+        let context=item.context();assert!(manager.validate_code_action_context_token(&context).is_ok());
         let added=file.with_file_name("added.rs");std::fs::write(&added,"new peer").unwrap();
         manager.open_for_test(LspDocumentId(4),&added,&worktree,rust_language(),1,"new peer");
         assert!(manager.validate_code_action_context(&item).is_err(),"opaque command must not bless a newly opened same-session peer");
@@ -9573,6 +9574,7 @@ mod tests {
         assert!(manager.validate_code_action_context(&item).is_ok());
         manager.close(LspDocumentId(2));manager.open_for_test(LspDocumentId(3),&peer,&worktree,rust_language(),1,"changed");
         assert!(manager.validate_code_action_context(&item).is_err());
+        assert!(manager.validate_code_action_context_token(&context).is_err());
         let request=manager.request_resolve_code_action(origin,item);let pending=handle.wait_for("codeAction/resolve").await;
         handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":pending.id,"result":{"title":"Fix peer","edit":{"changes":{peer_uri.as_str():[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"new"}]}}}}))).unwrap();
         next_matching(&events,|event|match event {LspEvent::RequestFailed{request:id,error:LspError::Unsupported(_),..}if *id==request=>Some(()),_=>None}).await;
@@ -9596,6 +9598,45 @@ mod tests {
         assert!(!manager.capabilities(doc).ready);
         manager.close(doc);
         assert_eq!(manager.capabilities(doc),LspCapabilities::default());
+        manager.begin_shutdown().await;
+    }); }
+
+    #[test]
+    fn opaque_code_actions_refuse_only_relevant_pending_peer_discovery() { block_on(async {
+        let (_guard,worktree,file)=workspace();
+        let origin=LspDocumentId(1);
+        let mut manager=ready_code_actions(origin,&file,&worktree,"foo").await;
+        let action=request_fixture_code_action(&mut manager,origin).await;
+        let context=action.context();
+        assert!(action.command.is_some());
+        assert!(manager.validate_code_action_context_token(&context).is_ok());
+
+        let peer=file.with_file_name("pending.rs");
+        std::fs::write(&peer,"unsynchronized peer").unwrap();
+        let pending=LspDocumentId(2);
+        assert_eq!(manager.open(pending,&peer,&worktree,rust_language(),1,"unsynchronized peer"),LspStatus::Starting);
+        assert!(manager.pending_opens.contains_key(&pending));
+        assert_eq!(manager.document_incarnation(pending),None);
+        assert!(matches!(manager.validate_code_action_context_token(&context),Err(LspError::Unsupported(message)) if message.contains("synchronize")));
+        manager.close(pending);
+        assert!(manager.validate_code_action_context_token(&context).is_ok());
+
+        // The same server's unrelated worktree does not belong to this
+        // action, and another server in this worktree cannot join its session.
+        let unrelated=worktree.join("unrelated-worktree");
+        std::fs::create_dir(&unrelated).unwrap();
+        let unrelated_file=unrelated.join("main.rs");
+        std::fs::write(&unrelated_file,"other project").unwrap();
+        assert_eq!(manager.open(pending,&unrelated_file,&unrelated,rust_language(),1,"other project"),LspStatus::Starting);
+        assert!(manager.validate_code_action_context_token(&context).is_ok());
+        manager.close(pending);
+        let mut other_server=manager.servers[0].clone();
+        other_server.id="other-server".into();
+        manager.servers.push(other_server);
+        let other_language=LspLanguage{server_id:"other-server".into(),language_id:"rust".into()};
+        assert_eq!(manager.open(pending,&peer,&worktree,other_language,1,"other server"),LspStatus::Starting);
+        assert!(manager.validate_code_action_context_token(&context).is_ok());
+        manager.close(pending);
         manager.begin_shutdown().await;
     }); }
 
