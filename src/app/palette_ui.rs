@@ -16,6 +16,7 @@ pub(super) struct State {
     move_origin: Option<Arc<PaletteOrigin>>,
     move_destinations: Vec<(crate::model::ChannelId, String)>,
     git_target: Option<sidebar::git_commands::GitTarget>,
+    group_target: Option<sidebar::commands::GroupTarget>,
     git_captured: bool,
     stash_picker: Option<Command>,
     stash_entries: Vec<crate::repository::StashEntry>,
@@ -37,6 +38,7 @@ pub enum Action {
     RunDiffMutation(Command, Box<RepositoryAction>),
     RunChatUser(chat_ui::RegisteredChatCommand),
     RunOriginCommand(Command, Arc<PaletteOrigin>),
+    RunGitGroup(Command, sidebar::commands::GroupTarget),
     RunGitStash(
         sidebar::git_commands::GitTarget,
         Command,
@@ -104,6 +106,7 @@ fn entry_category(message: &Message) -> char {
 
 fn entry_command(message: &Message) -> Option<Command> {
     match message {
+        Message::Palette(Action::RunGitGroup(command, _)) => Some(*command),
         Message::RunCommand(command)
         | Message::Palette(Action::RunOriginCommand(command, _) | Action::RunDiffMutation(command, _) | Action::RunGitStash(_, command, _)) => Some(*command),
         Message::Palette(Action::RunChatUser(request)) => Some(request.command),
@@ -113,6 +116,7 @@ fn entry_command(message: &Message) -> Option<Command> {
 
 fn entry_key(message: &Message) -> String {
     match message {
+        Message::Palette(Action::RunGitGroup(command, _)) => format!("command:{}", command.id()),
         Message::Palette(Action::RunOriginCommand(command, _)) => format!("command:{}", command.id()),
         Message::Palette(Action::RunChatUser(request)) => {
             format!("command:{}", request.command.id())
@@ -144,6 +148,7 @@ fn entry_key(message: &Message) -> String {
 /// Compare captured intent without formatting IDs or cloning target snapshots.
 fn same_palette_entry(left: &Message, right: &Message) -> bool {
     match (left, right) {
+        (Message::Palette(Action::RunGitGroup(lc, lt)), Message::Palette(Action::RunGitGroup(rc, rt))) => lc == rc && lt == rt,
         (Message::Palette(Action::RunOriginCommand(left, lo)), Message::Palette(Action::RunOriginCommand(right, ro))) => left == right && lo == ro,
         (
             Message::Palette(Action::RunChatUser(left)),
@@ -401,6 +406,7 @@ impl Cagents {
             Action::Record(field) => {
                 self.palette.generation = self.palette.generation.wrapping_add(1);
                 self.palette.git_target = None;
+                self.palette.group_target = None;
                 self.palette.git_captured = false;
                 self.palette.stash_picker = None;
                 self.palette.stash_entries.clear();
@@ -420,6 +426,7 @@ impl Cagents {
                 self.palette.selected_message = None;
                 self.palette.sidebar_target = None;
                 self.palette.git_target = None;
+                self.palette.group_target = None;
                 self.palette.git_captured = false;
                 self.palette.stash_picker = None;
                 self.palette.stash_entries.clear();
@@ -517,6 +524,7 @@ impl Cagents {
                     &self.sidebar_model,
                     &self.sidebar_state,
                 );
+                self.palette.group_target = sidebar::commands::GroupTarget::capture(&self.sidebar_model, &self.sidebar_state);
                 self.palette.git_captured = true;
                 self.palette.stash_picker = None;
                 self.palette.stash_entries.clear();
@@ -530,6 +538,10 @@ impl Cagents {
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
+            }
+            Action::RunGitGroup(command, target) => {
+                if self.focused_repository_is_saving() || self.workspace_inputs_blocked() || crate::device::is_remote() { return Task::none(); }
+                target.action(&self.sidebar_model, &self.sidebar_state, command, self.modal_is_open()).map_or_else(Task::none, |action| self.update(Message::Sidebar(action)))
             }
             Action::RunOriginCommand(command, origin) => {
                 if self.palette_origin() != *origin || !self.command_available(command) || self.workspace_inputs_blocked() {
@@ -650,6 +662,7 @@ impl Cagents {
             Action::Close => {
                 self.palette.generation = self.palette.generation.wrapping_add(1);
                 self.palette.git_target = None;
+                self.palette.group_target = None;
                 self.palette.git_captured = false;
                 self.palette.stash_picker = None;
                 self.palette.stash_entries.clear();
@@ -981,7 +994,7 @@ impl Cagents {
                 match message {
                     Message::FocusAttention(_) => "Needs attention",
                     Message::RunCommand(_)
-                    | Message::Palette(Action::RunDiffMutation(_, _) | Action::RunChatUser(_) | Action::RunOriginCommand(_, _)) => {
+                    | Message::Palette(Action::RunDiffMutation(_, _) | Action::RunChatUser(_) | Action::RunOriginCommand(_, _) | Action::RunGitGroup(_, _)) => {
                         "Commands"
                     }
                     Message::Palette(Action::FocusPane(_)) => "Panes",
@@ -1175,7 +1188,9 @@ impl Cagents {
                 .filter(|descriptor| descriptor.action != Command::CommandPalette)
                 .filter(|descriptor| descriptor.available(&context))
                 .filter_map(|descriptor| {
-                    let message = if workspace_widget::chat_user_command_bit(descriptor.action)
+                    let message = if workspace_widget::git_group_command_bit(descriptor.action).is_some() {
+                        Message::Palette(Action::RunGitGroup(descriptor.action, self.git_group_target()?))
+                    } else if workspace_widget::chat_user_command_bit(descriptor.action)
                         .is_some()
                     {
                         Message::Palette(Action::RunChatUser(self.workspace.focused().and_then(
@@ -1323,7 +1338,7 @@ impl Cagents {
                                 Message::FocusAttention(_) => 1,
                                 Message::RunCommand(_)
                                 | Message::Palette(
-                                    Action::RunDiffMutation(_, _) | Action::RunChatUser(_) | Action::RunOriginCommand(_, _),
+                                    Action::RunDiffMutation(_, _) | Action::RunChatUser(_) | Action::RunOriginCommand(_, _) | Action::RunGitGroup(_, _),
                                 ) => 2,
                                 Message::Palette(Action::FocusPane(_)) => 3,
                                 _ => 4,
@@ -1792,6 +1807,15 @@ impl Cagents {
         flags
     }
 
+    fn git_group_target(&self) -> Option<sidebar::commands::GroupTarget> {
+        if self.palette.query.is_some() { self.palette.group_target.clone() }
+        else { sidebar::commands::GroupTarget::capture(&self.sidebar_model, &self.sidebar_state) }
+    }
+    fn git_group_mask(&self) -> u8 {
+        let Some(target) = self.git_group_target() else { return 0; };
+        workspace_widget::GIT_GROUP_COMMANDS.into_iter().filter_map(|command| target.available(&self.sidebar_model, &self.sidebar_state, command, self.modal_is_open()).then(|| workspace_widget::git_group_command_bit(command)).flatten()).fold(0, |mask, bit| mask | bit)
+    }
+
     fn stale_pane_command(&mut self) -> Task<Message> {
         self.status = Some(TransientNotice::warning("The original pane or document changed; open its menu again"));
         Task::none()
@@ -1841,6 +1865,7 @@ impl Cagents {
             save_in_flight,
             sidebar_commands: self.sidebar_command_target().as_ref().map(|target| self.sidebar_command_mask(target)),
             git_commands: self.git_command_mask(),
+            git_group_commands: if remote_device { 0 } else { self.git_group_mask() },
             // The palette's search field owns native keyboard focus. Command
             // availability instead describes the originating pane's content.
             focused: match card.and_then(|id| self.cards.get(&id)) {
@@ -2199,6 +2224,9 @@ impl Cagents {
                 .map_or_else(Task::none, |action| {
                     self.update(Message::Repository(action))
                 });
+        }
+        if workspace_widget::git_group_command_bit(command).is_some() {
+            return self.git_group_target().and_then(|target| target.action(&self.sidebar_model, &self.sidebar_state, command, self.modal_is_open())).map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
         }
         if workspace_widget::git_command_bit(command).is_some() {
             let Some(target) = self.git_command_target() else {
@@ -2564,7 +2592,14 @@ impl Cagents {
             | Command::ChatTakeBackQueued
             | Command::ChatCancelQueued
             | Command::ChatToggleSteering
-            | Command::ChatToggleFastMode => self.run_registered_command(command),
+            | Command::ChatToggleFastMode
+            | Command::GitStageAllUnstaged
+            | Command::GitStageAllUntracked
+            | Command::GitStageAllConflicts
+            | Command::GitUnstageAllStaged
+            | Command::GitDiscardAllUnstaged
+            | Command::GitDiscardAllUntracked
+            => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
@@ -2891,6 +2926,12 @@ impl SettingsField {
             Self::ShortcutChatCancelQueued => Some(Command::ChatCancelQueued),
             Self::ShortcutChatToggleSteering => Some(Command::ChatToggleSteering),
             Self::ShortcutChatToggleFastMode => Some(Command::ChatToggleFastMode),
+            Self::ShortcutGitStageAllUnstaged => Some(Command::GitStageAllUnstaged),
+            Self::ShortcutGitStageAllUntracked => Some(Command::GitStageAllUntracked),
+            Self::ShortcutGitStageAllConflicts => Some(Command::GitStageAllConflicts),
+            Self::ShortcutGitUnstageAllStaged => Some(Command::GitUnstageAllStaged),
+            Self::ShortcutGitDiscardAllUnstaged => Some(Command::GitDiscardAllUnstaged),
+            Self::ShortcutGitDiscardAllUntracked => Some(Command::GitDiscardAllUntracked),
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
@@ -2946,6 +2987,72 @@ impl SettingsField {
 impl ShortcutDraft {
     pub(super) fn shortcut_values(&self) -> Vec<(Command, &str)> {
         vec![
+            (Command::NewTerminal, self.new_terminal.as_str()),
+            (Command::NewChannel, self.new_channel.as_str()),
+            (Command::ClonePane, self.clone_pane.as_str()),
+            (
+                Command::CloseFocusedCard,
+                self.close_focused_column.as_str(),
+            ),
+            (Command::FocusProjectSearch, self.search_projects.as_str()),
+            (Command::FindInPane, self.find_in_pane.as_str()),
+            (
+                Command::FocusAdjacent(crate::workspace::FocusDirection::Left),
+                self.previous_column.as_str(),
+            ),
+            (
+                Command::FocusAdjacent(crate::workspace::FocusDirection::Right),
+                self.next_column.as_str(),
+            ),
+            (Command::CyclePaneWidth, self.cycle_pane_width.as_str()),
+            (
+                Command::CycleWorkspace(crate::workspace::FocusDirection::Left),
+                self.previous_workspace.as_str(),
+            ),
+            (
+                Command::CycleWorkspace(crate::workspace::FocusDirection::Right),
+                self.next_workspace.as_str(),
+            ),
+            (Command::NextAttention, self.next_attention.as_str()),
+            (Command::PreviousAttention, self.previous_attention.as_str()),
+            (
+                Command::ReviewToggleViewed,
+                self.review_toggle_viewed.as_str(),
+            ),
+            (Command::ReviewNextFile, self.review_next_file.as_str()),
+            (
+                Command::ReviewPreviousFile,
+                self.review_previous_file.as_str(),
+            ),
+            (
+                Command::ReviewNextUnviewed,
+                self.review_next_unviewed.as_str(),
+            ),
+            (Command::ReviewNextChange, self.review_next_change.as_str()),
+            (
+                Command::ReviewPreviousChange,
+                self.review_previous_change.as_str(),
+            ),
+            (Command::CommandPalette, self.command_palette.as_str()),
+            (Command::NewThread, self.new_native_thread.as_str()),
+            (Command::ChatPermissions, self.chat_permissions.as_str()),
+            (Command::ChatModel, self.chat_model.as_str()),
+            (Command::ChatAccount, self.chat_account.as_str()),
+            (Command::ToggleInspector, self.toggle_inspector.as_str()),
+            (Command::OpenSettings, self.open_settings.as_str()),
+            (Command::MovePaneLeft, self.move_pane_left.as_str()),
+            (Command::MovePaneRight, self.move_pane_right.as_str()),
+            (Command::ReopenPane, self.reopen_pane.as_str()),
+            (Command::FocusPane1, self.focus_pane_1.as_str()),
+            (Command::FocusPane2, self.focus_pane_2.as_str()),
+            (Command::FocusPane3, self.focus_pane_3.as_str()),
+            (Command::FocusPane4, self.focus_pane_4.as_str()),
+            (Command::FocusPane5, self.focus_pane_5.as_str()),
+            (Command::FocusPane6, self.focus_pane_6.as_str()),
+            (Command::FocusPane7, self.focus_pane_7.as_str()),
+            (Command::FocusPane8, self.focus_pane_8.as_str()),
+            (Command::FocusPane9, self.focus_pane_9.as_str()),
+            (Command::FocusLastPane, self.focus_last_pane.as_str()),
             (Command::ToggleProjects, self.toggle_projects.as_str()),
             (Command::RenamePane, self.rename_pane.as_str()),
             (Command::NewBrowser, self.new_browser.as_str()),
@@ -3193,70 +3300,12 @@ impl ShortcutDraft {
                 Command::ChatToggleFastMode,
                 self.chat_toggle_fast_mode.as_str(),
             ),
-            (Command::NewTerminal, self.new_terminal.as_str()),
-            (Command::NewChannel, self.new_channel.as_str()),
-            (Command::ClonePane, self.clone_pane.as_str()),
-            (
-                Command::CloseFocusedCard,
-                self.close_focused_column.as_str(),
-            ),
-            (Command::FocusProjectSearch, self.search_projects.as_str()),
-            (Command::FindInPane, self.find_in_pane.as_str()),
-            (
-                Command::FocusAdjacent(crate::workspace::FocusDirection::Left),
-                self.previous_column.as_str(),
-            ),
-            (
-                Command::FocusAdjacent(crate::workspace::FocusDirection::Right),
-                self.next_column.as_str(),
-            ),
-            (Command::CyclePaneWidth, self.cycle_pane_width.as_str()),
-            (
-                Command::CycleWorkspace(crate::workspace::FocusDirection::Left),
-                self.previous_workspace.as_str(),
-            ),
-            (
-                Command::CycleWorkspace(crate::workspace::FocusDirection::Right),
-                self.next_workspace.as_str(),
-            ),
-            (
-                Command::ReviewToggleViewed,
-                self.review_toggle_viewed.as_str(),
-            ),
-            (Command::ReviewNextFile, self.review_next_file.as_str()),
-            (
-                Command::ReviewPreviousFile,
-                self.review_previous_file.as_str(),
-            ),
-            (
-                Command::ReviewNextUnviewed,
-                self.review_next_unviewed.as_str(),
-            ),
-            (Command::ReviewNextChange, self.review_next_change.as_str()),
-            (
-                Command::ReviewPreviousChange,
-                self.review_previous_change.as_str(),
-            ),
-            (Command::CommandPalette, self.command_palette.as_str()),
-            (Command::NewThread, self.new_native_thread.as_str()),
-            (Command::ChatPermissions, self.chat_permissions.as_str()),
-            (Command::ChatModel, self.chat_model.as_str()),
-            (Command::ChatAccount, self.chat_account.as_str()),
-            (Command::ToggleInspector, self.toggle_inspector.as_str()),
-            (Command::OpenSettings, self.open_settings.as_str()),
-            (Command::MovePaneLeft, self.move_pane_left.as_str()),
-            (Command::MovePaneRight, self.move_pane_right.as_str()),
-            (Command::ReopenPane, self.reopen_pane.as_str()),
-            (Command::FocusPane1, self.focus_pane_1.as_str()),
-            (Command::FocusPane2, self.focus_pane_2.as_str()),
-            (Command::FocusPane3, self.focus_pane_3.as_str()),
-            (Command::FocusPane4, self.focus_pane_4.as_str()),
-            (Command::FocusPane5, self.focus_pane_5.as_str()),
-            (Command::FocusPane6, self.focus_pane_6.as_str()),
-            (Command::FocusPane7, self.focus_pane_7.as_str()),
-            (Command::FocusPane8, self.focus_pane_8.as_str()),
-            (Command::FocusPane9, self.focus_pane_9.as_str()),
-            (Command::FocusLastPane, self.focus_last_pane.as_str()),
+            (Command::GitStageAllUnstaged, self.git_stage_all_unstaged.as_str()),
+            (Command::GitStageAllUntracked, self.git_stage_all_untracked.as_str()),
+            (Command::GitStageAllConflicts, self.git_stage_all_conflicts.as_str()),
+            (Command::GitUnstageAllStaged, self.git_unstage_all_staged.as_str()),
+            (Command::GitDiscardAllUnstaged, self.git_discard_all_unstaged.as_str()),
+            (Command::GitDiscardAllUntracked, self.git_discard_all_untracked.as_str()),
         ]
     }
 }
@@ -3625,6 +3674,30 @@ mod tests {
         assert!(app.command_available(Command::MarkAllRead));
         drop(app.update(Message::RunCommand(Command::MarkAllRead)));
         assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
+    fn whole_group_palette_result_never_retargets_a_later_row_selection() {
+        for click in [false, true] {
+            let mut app = settings_focus_fixture();
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            drop(app.update_palette(Action::Open));
+            let shown = app.palette_entries();
+            let index = shown.iter().position(|entry| entry_command(&entry.2) == Some(Command::GitStageAllUnstaged)).unwrap();
+            let message = shown[index].2.clone();
+            app.select_palette_entry(index, &shown);
+            let source = app.sidebar_model.source_control.as_ref().unwrap();
+            let key = source.key.clone();
+            let row = sidebar::change_selection_order(source, &app.sidebar_state).into_iter().find(|row| row.area == crate::repository::ChangeArea::Unstaged).unwrap();
+            app.sidebar_state.select_change_rows(row.clone(), sidebar::SelectionIntent::Toggle, &[row]);
+            app.sidebar_state.apply(&SidebarAction::ClearChangeSelection { key });
+            let before = app.settings.palette_recents.clone();
+            drop(app.update_palette(if click { Action::Run(app.palette.generation, MessageBox(Box::new(message))) } else { Action::Submit }));
+            assert_eq!(app.settings.palette_recents, before);
+            assert!(app.palette.query.is_some());
+            assert!(!app.sidebar_model.source_control.as_ref().unwrap().busy());
+        }
     }
 
     #[test]

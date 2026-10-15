@@ -161,7 +161,7 @@ impl Editor {
                     {
                         self.checkout_history_open = false;
                         self.selection_epoch = self.selection_epoch.wrapping_add(1);
-                        return Self::open(path, self.selection_epoch);
+                        return Self::open(path, self.selection_epoch, self.settings.git_status_limit);
                     }
                 }
             }
@@ -173,7 +173,7 @@ impl Editor {
                 {
                     self.checkout_dialog = None;
                     self.selection_epoch = self.selection_epoch.wrapping_add(1);
-                    return Self::open(path, self.selection_epoch);
+                    return Self::open(path, self.selection_epoch, self.settings.git_status_limit);
                 }
             }
             Action::Branch(value) => {

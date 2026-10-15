@@ -2238,6 +2238,7 @@ pub struct SourceControlModel {
     /// The most recent mutation failure, retained until the next attempt.
     pub error: Option<String>,
     pub output_expanded: bool,
+    pub undo_discard_until_unix_ms: Option<u64>,
     pub operation: Option<crate::repository::GitOperationState>,
     pub stashes: Vec<crate::repository::StashEntry>,
     pub last_fetch_unix_ms: Option<u64>,
@@ -2422,6 +2423,7 @@ impl SourceControlModel {
             mutation: None,
             error: None,
             output_expanded: false,
+            undo_discard_until_unix_ms: None,
             operation: None,
             stashes: Vec::new(),
             last_fetch_unix_ms: None,
@@ -2583,6 +2585,7 @@ impl SourceControlModel {
             mutation: None,
             error: None,
             output_expanded: false,
+            undo_discard_until_unix_ms: None,
             operation: snapshot.operation.clone(),
             stashes: snapshot.stashes.clone(),
             last_fetch_unix_ms: snapshot.last_fetch_unix_ms,
@@ -2821,6 +2824,7 @@ impl SourceControlModel {
         }
         next.error = self.error.clone();
         next.output_expanded = self.output_expanded;
+        next.undo_discard_until_unix_ms = self.undo_discard_until_unix_ms;
         next.stashes_expanded = self.stashes_expanded;
         next.pending_stash_drop = self.pending_stash_drop.clone();
         next.pending_marker_stage = self.pending_marker_stage.clone();
@@ -4498,6 +4502,7 @@ impl SidebarState {
             | SidebarAction::ToggleStashes { .. }
             | SidebarAction::RequestStashDrop { .. }
             | SidebarAction::ConfirmStageMarkers { .. }
+            | SidebarAction::UndoDiscard { .. }
             | SidebarAction::CancelGitMutation { .. }
             | SidebarAction::ToggleGitOutput { .. }
             | SidebarAction::Stage { .. }
@@ -4526,6 +4531,7 @@ impl SidebarState {
             | SidebarAction::DeleteSelectedRows
             | SidebarAction::RunCommand { .. }
             | SidebarAction::RunChangeCommand { .. }
+            | SidebarAction::RunChangeGroup { .. }
             | SidebarAction::DeleteRows(_)
             | SidebarAction::ClearRowSelection => {}
         }
@@ -4557,6 +4563,12 @@ pub enum ChangeGroupCommand {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    RunChangeGroup {
+        key: ActiveWorktreeKey,
+        area: ChangeArea,
+        command: ChangeGroupCommand,
+        selection_revision: u64,
+    },
     RunChangeCommand {
         command: crate::workspace_widget::GlobalShortcut,
         key: ActiveWorktreeKey,
@@ -4821,6 +4833,9 @@ pub enum SidebarAction {
     ConfirmStageMarkers {
         key: ActiveWorktreeKey,
         confirmed: bool,
+    },
+    UndoDiscard {
+        key: ActiveWorktreeKey,
     },
     CancelGitMutation {
         key: ActiveWorktreeKey,
@@ -8759,6 +8774,25 @@ fn source_control_notices<'a>(
             }
         }
     }
+    if source.undo_discard_until_unix_ms.is_some_and(|until| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            <= u128::from(until)
+    }) {
+        notices = notices.push(
+            widget::row::with_children(vec![
+                design::caption("Changes discarded. Backups kept.").into(),
+                widget::button::text("Undo discard")
+                    .on_press(SidebarAction::UndoDiscard {
+                        key: source.key.clone(),
+                    })
+                    .into(),
+            ])
+            .spacing(space::XS),
+        );
+    }
     if let Some(operation) = &source.operation {
         notices = notices.push(design::caption(format!(
             "{} in progress{}",
@@ -9849,24 +9883,25 @@ fn changes_section<'a>(
                 group_commands(source, group, modal_open)
                     .into_iter()
                     .map(|mut control| {
-                        if selected_change_group_anchor(source, state, group.area).is_some() {
-                            control.name = match control.action.as_ref() {
-                                Some(SidebarAction::ChangeGroup {
-                                    command: ChangeGroupCommand::Stage,
-                                    ..
-                                }) => "Stage selection",
-                                Some(SidebarAction::ChangeGroup {
-                                    command: ChangeGroupCommand::Unstage,
-                                    ..
-                                }) => "Unstage selection",
-                                Some(SidebarAction::ChangeGroup {
-                                    command: ChangeGroupCommand::Discard,
-                                    ..
-                                }) => "Discard selection…",
-                                _ => control.name,
+                        let mut label = Cow::Borrowed(control.name);
+                        if let Some(SidebarAction::ChangeGroup { key, area, command }) = control.action.take() {
+                            let registered = if let Some(row) = selected_change_group_anchor(source, state, area) {
+                                let id = commands::change_command_id(command);
+                                control.action = Some(SidebarAction::RunChangeCommand { command: id, key, row, selection_revision: state.change_selection_revision() });
+                                id
+                            } else {
+                                let id = commands::whole_group_command_id(area, command).expect("existing group control has a template");
+                                if whole_change_group_available_for(source, state, area, command, modal_open) {
+                                    control.action = Some(SidebarAction::RunChangeGroup { key, area, command, selection_revision: state.change_selection_revision() });
+                                }
+                                id
                             };
+                            let descriptor = crate::workspace_widget::shortcut_descriptor(registered);
+                            label = Cow::Borrowed(descriptor.label);
+                            let chords = crate::workspace_widget::shortcut_chords(registered, shortcuts);
+                            if !chords.is_empty() { label = Cow::Owned(format!("{} · {}", descriptor.label, chords)); }
                         }
-                        control.into_element()
+                        panel_icon_action(control.icon, label, control.action, control.id)
                     }),
             ))
             .align_right(Length::Fill)
@@ -10531,6 +10566,50 @@ pub fn change_selection_order(
         }
     }
     order
+}
+
+/// Whole-area availability never materializes selected or group paths. Stage
+/// and unstage remain queueable; discard waits for the active mutation.
+pub fn whole_change_group_available(
+    model: &SidebarModel,
+    state: &SidebarState,
+    area: ChangeArea,
+    command: ChangeGroupCommand,
+    modal_open: bool,
+) -> bool {
+    model.source_control.as_ref().is_some_and(|source| model.contains_worktree(&source.key) && whole_change_group_available_for(source, state, area, command, modal_open))
+}
+fn whole_change_group_available_for(source: &SourceControlModel, state: &SidebarState, area: ChangeArea, command: ChangeGroupCommand, modal_open: bool) -> bool {
+    if modal_open || state.active_worktree() != Some(&source.key)
+        || !matches!(source.data_state, SidebarDataState::Ready)
+        || state.change_rows.first_in_area(area).is_some()
+        || source.group(area).is_none_or(ChangeGroup::is_empty)
+        || (source.busy() && command == ChangeGroupCommand::Discard)
+    { return false; }
+    match command {
+        ChangeGroupCommand::Stage => area != ChangeArea::Staged,
+        ChangeGroupCommand::Unstage => area == ChangeArea::Staged,
+        ChangeGroupCommand::Discard => matches!(area, ChangeArea::Unstaged | ChangeArea::Untracked),
+    }
+}
+
+/// Revalidate the original whole-area intent before entering the existing
+/// fresh, uncapped mutation pipeline. A later row selection cannot retarget it.
+pub fn resolve_captured_change_group(
+    model: &SidebarModel,
+    state: &SidebarState,
+    key: &ActiveWorktreeKey,
+    area: ChangeArea,
+    command: ChangeGroupCommand,
+    selection_revision: u64,
+    modal_open: bool,
+) -> Option<SidebarAction> {
+    if state.active_worktree() != Some(key)
+        || model.source_control.as_ref().is_none_or(|source| source.key != *key)
+        || state.change_selection_revision() != selection_revision
+        || !whole_change_group_available(model, state, area, command, modal_open)
+    { return None; }
+    Some(SidebarAction::ChangeGroup { key: key.clone(), area, command })
 }
 
 pub fn selected_change_group_anchor(
@@ -11519,7 +11598,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             design::body(detail.join(". "))
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
-            design::caption("Discarded work is not recoverable from Git.").into(),
+            design::caption("Tracked contents are backed up in Git; new files move to the system Trash. Undo is available for one minute.").into(),
             widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("Cancel")
                     .id(discard_cancel_id())
@@ -13054,6 +13133,23 @@ mod row_interaction {
                             shell.capture_event();
                             return;
                         }
+                    }
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character(character),
+                        modifiers,
+                        ..
+                    }) if state.focused && modifiers.is_empty() && character.as_str() == " " => {
+                        shell.publish(SidebarAction::InvokeChangeRows {
+                            key: key.clone(),
+                            row: row.clone(),
+                            command: if row.area == super::ChangeArea::Staged {
+                                super::ChangeGroupCommand::Unstage
+                            } else {
+                                super::ChangeGroupCommand::Stage
+                            },
+                        });
+                        shell.capture_event();
+                        return;
                     }
                     Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(named),
@@ -17809,6 +17905,40 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn registered_whole_group_controls_keep_selection_revision_and_current_chords() {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let renderer = headless_renderer();
+        let mut model = panel_model();
+        let mut state = panel_state(&model);
+        let mut shortcuts = crate::settings::KeyboardShortcuts::default();
+        shortcuts.git_stage_all_unstaged = vec!["F9".into()];
+        let source = model.source_control.as_ref().unwrap();
+        let target = commands::GroupTarget::capture(&model, &state).unwrap();
+        let names = accessible_names(&renderer, changes_section(&state, source, false, &shortcuts));
+        assert!(names.iter().any(|name| name == "Stage all unstaged changes · F9"), "{names:?}");
+        let actions = frame_enter_presses(&renderer, changes_section(&state, source, false, &shortcuts));
+        let groups: Vec<_> = actions.into_iter().filter(|action| matches!(action, SidebarAction::RunChangeGroup { .. })).collect();
+        assert_eq!(groups.len(), 6);
+        for command in crate::workspace_widget::GIT_GROUP_COMMANDS {
+            let (area, mutation) = crate::workspace_widget::git_group_command_target(command).unwrap();
+            assert_eq!(commands::whole_group_command_id(area, mutation), Some(command));
+            assert!(target.available(&model, &state, command, false));
+            assert!(groups.iter().any(|action| matches!(action, SidebarAction::RunChangeGroup { key, area: actual, command: kind, selection_revision } if key == &target.key && *actual == area && *kind == mutation && *selection_revision == target.selection_revision)));
+            assert!(!target.available(&model, &state, command, true));
+        }
+        let row = ChangeSelectionRow { area: ChangeArea::Unstaged, path: repo_path("assets/logo.png") };
+        state.select_change_rows(row.clone(), SelectionIntent::Toggle, &[row]);
+        assert!(!target.available(&model, &state, Command::GitStageAllUnstaged, false));
+        state.apply(&SidebarAction::ClearChangeSelection { key: target.key.clone() });
+        assert!(!target.available(&model, &state, Command::GitStageAllUnstaged, false), "clearing a newer selection never revives the old payload");
+        let fresh = commands::GroupTarget::capture(&model, &state).unwrap();
+        model.source_control.as_mut().unwrap().set_mutation(Some(MutationKind::Stage));
+        assert!(fresh.available(&model, &state, Command::GitStageAllUnstaged, false));
+        assert!(fresh.available(&model, &state, Command::GitUnstageAllStaged, false));
+        assert!(!fresh.available(&model, &state, Command::GitDiscardAllUnstaged, false));
+    }
+
     /// The accessible names an element publishes, in tree order.
     fn accessible_names(
         renderer: &cosmic::Renderer,
@@ -20253,20 +20383,28 @@ pub(crate) mod tests {
                 .filter_map(|command| command.action)
                 .collect::<Vec<_>>();
             for actions in [&group_actions, &row_actions] {
-                assert!(actions.iter().any(|action| match area {
-                    ChangeArea::Staged => matches!(action, SidebarAction::Unstage { .. }),
-                    _ => matches!(action, SidebarAction::Stage { .. }),
-                }), "stage and unstage intentions must reach the serialized queue");
-                assert!(!actions.iter().any(|action| matches!(
-                    action, SidebarAction::RequestDiscard { .. }
-                )), "discard remains unavailable while a mutation runs");
+                assert!(
+                    actions.iter().any(|action| match area {
+                        ChangeArea::Staged => matches!(action, SidebarAction::Unstage { .. }),
+                        _ => matches!(action, SidebarAction::Stage { .. }),
+                    }),
+                    "stage and unstage intentions must reach the serialized queue"
+                );
+                assert!(
+                    !actions
+                        .iter()
+                        .any(|action| matches!(action, SidebarAction::RequestDiscard { .. })),
+                    "discard remains unavailable while a mutation runs"
+                );
             }
             for commands in [
                 group_commands(&source, group, true),
                 row_commands(&source, area, &group.rows()[0], true),
             ] {
-                assert!(commands.iter().all(|command| command.action.is_none()),
-                    "an open dialog still withholds every command");
+                assert!(
+                    commands.iter().all(|command| command.action.is_none()),
+                    "an open dialog still withholds every command"
+                );
             }
         }
     }
