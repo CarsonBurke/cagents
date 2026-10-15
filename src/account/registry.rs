@@ -936,7 +936,6 @@ impl Store {
     /// Forget and park under the same lifecycle lock as spawning. A failed
     /// deletion cannot make an unregistered home launchable again; the sweep
     /// finishes parked trees later. Linked aliases still protect their home.
-    #[cfg(test)]
     pub fn remove_home(
         &self,
         homes: &Homes,

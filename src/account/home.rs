@@ -213,7 +213,6 @@ impl Homes {
 
     /// Deletes the home of account `key`. A home that is already gone is not
     /// an error: removing an account twice leaves it just as removed.
-    #[cfg(test)]
     pub fn remove(&self, provider: Provider, key: Uuid) -> io::Result<()> {
         if let Some(parked) = self.park(provider, key)? {
             remove_parked(&parked)?;
@@ -223,7 +222,6 @@ impl Homes {
 
     /// Rename under the lifecycle/registry locks; delete the parked tree only
     /// after releasing them, since provider caches can be large.
-    #[cfg(test)]
     pub(crate) fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<PathBuf>> {
         let path = self.path(provider, key);
         match fs::symlink_metadata(&path) {
@@ -289,7 +287,6 @@ impl Homes {
     /// cagents, a reset configuration directory - and holds a login and its
     /// history. Sign-ins that never finished are the registry's pending
     /// entries, which the accounts view verifies before removing anything.
-    #[cfg(test)]
     pub fn finish_removals(&self) {
         for provider in super::Account::PROVIDERS {
             let directory = self.provider_directory(provider);
@@ -429,7 +426,6 @@ fn seed_claude_mcp(source: &Path, home: &Path) -> io::Result<()> {
 
 /// Deletes a home that has been renamed aside, after checking it is still a
 /// real directory of this user's.
-#[cfg(test)]
 fn remove_parked(parked: &Path) -> io::Result<()> {
     crate::secure_file::reject_symlink_components(parked)?;
     crate::secure_file::validate_owned_directory(parked)?;
