@@ -526,7 +526,7 @@ mod tests {
         let memory = scroll::Memory::default();
         let block = ToolText::update(None, &format!("{}\n{}", "x".repeat(6000), "short line\n".repeat(1000)), Language::Plain);
         let make = || block.view_logical_with_reader(crate::settings::EditorSyntaxTheme::Auto,
-            Some((120.0, false)), target, None, selectable_prose::Logical { identity: 42, start: 0 }, memory.clone(), None);
+            Some((120.0, false)), target, None, selectable_prose::Logical { identity: 42, start: 0, paint: None }, memory.clone(), None);
         let probe = |x, y| Probe {
             horizontal: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Horizontal)),
             vertical: scroll::block_id(target, None, scroll::reader_key(42, scroll::ReaderAxis::Vertical)),
