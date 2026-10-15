@@ -73,7 +73,7 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
         Operation::Remove { id }
         | Operation::MoveAndArchive { id, .. }
         | Operation::DeleteFiles { id } => registry
-            .accounts(Some(&homes))
+            .all_accounts(Some(&homes))
             .into_iter()
             .find(|account| account.id() == *id)
             .map(Some)
@@ -354,7 +354,7 @@ fn remove_account(
     };
     let registry = store.load().map_err(|error| error.to_string())?;
     let account = registry
-        .accounts(Some(homes))
+        .all_accounts(Some(homes))
         .into_iter()
         .find(|account| account.id() == id)
         .ok_or("The account was already removed from this device")?;
@@ -388,9 +388,18 @@ fn remove_account(
             // Explicit file deletion remains available without an installed
             // provider CLI. Report failed sign-out separately from deletion.
             let logout_error = logout(account.clone()).err();
+            let mut annotation_warning = None;
             let (registry, error) = store
-                .remove_home(homes, account.provider, key, true)
+                .remove_home_checked(homes, account.provider, key, true, || {
+                    annotation_warning = purge_deleted_account_annotations(&account)
+                        .map_err(std::io::Error::other)?;
+                    Ok(())
+                })
                 .map_err(|error| error.to_string())?;
+            let error = match (error, annotation_warning) {
+                (Some(error), Some(warning)) => Some(format!("{error}; {warning}")),
+                (error, warning) => error.or(warning),
+            };
             let error = match (error, logout_error) {
                 (Some(error), Some(logout)) => Some(format!(
                     "{error}; provider sign-out could not be confirmed: {logout}"
@@ -412,6 +421,35 @@ fn remove_account(
     };
 
     Ok((registry, error))
+}
+
+/// Physical home identity authorizes deletion of retained originals. A missing
+/// home can only use a previously persisted purge-only registration index.
+#[cfg(feature = "host")]
+fn purge_deleted_account_annotations(account: &super::Account) -> Result<Option<String>, String> {
+    use crate::chat::annotations::storage;
+    let home = account.resolved_home().ok_or("The account has no credential directory")?;
+    match std::fs::symlink_metadata(&home) {
+        Ok(_) => {
+            crate::secure_file::reject_symlink_components(&home).map_err(|error| error.to_string())?;
+            let variable = super::home_variable(account.provider)
+                .ok_or("This provider has no attested credential-directory scope")?;
+            let scope = super::scope::LaunchAccountScope::resolve(
+                account.provider,
+                &home,
+                |name| (name == variable).then(|| home.as_os_str().to_owned()),
+            )?;
+            storage::purge_account(&scope)?;
+            Ok(None)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match storage::purge_registered(&account.id())? {
+                Some(_) => Ok(None),
+                None => Ok(Some("The account home was already absent. No prior physical annotation association was available, so removal of older retained prompt data could not be verified".into())),
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[cfg(feature = "host")]
@@ -671,6 +709,63 @@ mod tests {
             created.home.is_dir(),
             "lost registration replies never remove the login"
         );
+        // Archive retains original command metadata and attachment bytes;
+        // explicit DeleteFiles purges them while the home is still provable.
+        use crate::chat::annotations::{OriginalPrompt, OriginalSettings, Setting, storage};
+        let account = super::super::Account::managed(Provider::Codex, created.key, created.home.clone());
+        let scope = super::super::scope::LaunchAccountScope::resolve(Provider::Codex, &root,
+            |name| (name == "CODEX_HOME").then(|| created.home.as_os_str().to_owned())).unwrap();
+        let mut annotations = storage::Store::installation(&scope, "provider-confirmed-fixture").unwrap();
+        let image = root.join("picked-image.png");
+        std::fs::write(&image, b"original fixture image").unwrap();
+        let attachment = annotations.retain_attachment(&image).unwrap();
+        let retained_image = attachment.path.clone();
+        let original = OriginalPrompt {
+            user_id: "confirmed-user".into(), turn_id: "confirmed-turn".into(),
+            text_bytes: 16, attachments: vec![attachment],
+            settings: OriginalSettings { model: Setting::Default, reasoning: Setting::Default,
+                fast: Setting::Unsupported, permission: Setting::Default },
+        };
+        annotations.accept(&original, "original request", &[]).unwrap();
+        drop(annotations);
+        let cache = crate::account::cache::Cache::installation().unwrap();
+        remove_account(Operation::Remove { id: account.id() }, &store, &homes, &cache, |_| Ok(())).unwrap();
+        assert!(created.home.is_dir());
+        assert!(retained_image.is_file());
+        let annotations = storage::Store::installation(&scope, "provider-confirmed-fixture").unwrap();
+        assert_eq!(annotations.original(Some("confirmed-user"), 0, 4096).unwrap().text, "original request");
+        drop(annotations);
+        let (registry, warning) = remove_account(Operation::DeleteFiles { id: account.id() }, &store, &homes, &cache, |_| Ok(())).unwrap();
+        assert!(warning.is_none(), "{warning:?}");
+        assert!(!created.home.exists());
+        assert!(!retained_image.exists());
+        assert!(registry.find(created.key).is_none());
+        assert!(storage::Store::installation(&scope, "provider-confirmed-fixture").is_err());
+        // A prior purge-only association also cleans retained bytes after
+        // external home loss, without inventing a new read authority.
+        for indexed in [true, false] {
+            let (key, home) = homes.create(Provider::Codex, None).unwrap();
+            let account = super::super::Account::managed(Provider::Codex, key, home.clone());
+            store.update(|registry| registry.register(crate::account::registry::Registered {
+                key, provider: Provider::Codex, linked_home: None, label: None,
+                email: Some(format!("absent-{indexed}@fixture.invalid")), organization: None, added_at: 0,
+            }, &[]).unwrap()).unwrap();
+            let retained = if indexed {
+                let scope = super::super::scope::LaunchAccountScope::resolve(Provider::Codex, &root,
+                    |name| (name == "CODEX_HOME").then(|| home.as_os_str().to_owned())).unwrap();
+                let annotations = storage::Store::installation(&scope, "confirmed-absent-session").unwrap();
+                Some(annotations.retain_attachment(&image).unwrap().path)
+            } else { None };
+            std::fs::remove_dir_all(&home).unwrap();
+            let (registry, warning) = remove_account(Operation::DeleteFiles { id: account.id() }, &store, &homes, &cache, |_| Ok(())).unwrap();
+            assert!(registry.find(key).is_none());
+            if let Some(retained) = retained {
+                assert!(!retained.exists());
+                assert!(warning.is_none());
+            } else {
+                assert!(warning.unwrap().contains("No prior physical annotation association"));
+            }
+        }
         let linked = root.join("home/linked-account");
         std::fs::create_dir_all(&linked).unwrap();
         std::fs::write(linked.join(&credential_file), "linked-private-login").unwrap();

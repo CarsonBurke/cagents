@@ -103,7 +103,7 @@ provider before sign-out. Divergent history is never overwritten. Saved
 conversation descriptors keep their original home until an explicit account
 switch confirms the same conversation on the replacement. **Delete files
 permanently** is a separate action requiring the account name; it deletes the
-home's conversations and caches and cannot be undone.
+home's conversations, caches, and app-retained original prompts and attachments, and cannot be undone. Archive and Move retain that original-prompt data. If the home was already removed externally, deletion uses a prior physical-home association where available; otherwise the result explicitly says that removal of older retained prompt data could not be verified.
 
 Pending sign-ins survive a window restart and are verified on the
 device before joining its account list.

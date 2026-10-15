@@ -866,22 +866,38 @@ impl Store {
         key: Uuid,
         registered: bool,
     ) -> io::Result<(Registry, Option<String>)> {
+        self.remove_home_checked(homes, provider, key, registered, || Ok(()))
+    }
+
+    /// Prepare deletion while both the spawn lifecycle lock and the latest
+    /// registry lock are held. A refusal leaves registration and files intact.
+    /// The callback is skipped if another registered alias retains this home.
+    pub(crate) fn remove_home_checked(
+        &self,
+        homes: &Homes,
+        provider: Provider,
+        key: Uuid,
+        registered: bool,
+        before_removal: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<(Registry, Option<String>)> {
         let (registry, error) = {
             let _lifecycle = homes.lifecycle_lock()?;
-            let (registry, ()) = self.update(|registry| {
+            let (registry, retained) = self.update_checked(|registry| {
                 if registered {
                     registry.unregister(key);
                 } else {
                     registry.abandon(key);
                 }
+                let retained = registry.contains_managed_home(homes, provider, key);
+                if !retained {
+                    before_removal()?;
+                }
+                Ok(retained)
             })?;
-            let error = if registry.contains_managed_home(homes, provider, key) {
-                None
+            let error = if retained {
+                Some("The files were retained because another account still uses this home".into())
             } else {
-                homes
-                    .park(provider, key)
-                    .err()
-                    .map(|error| error.to_string())
+                homes.park(provider, key).err().map(|error| error.to_string())
             };
             (registry, error)
         };
@@ -1089,6 +1105,33 @@ mod tests {
             .update(|registry| registry.set_automatic(Provider::Claude))
             .unwrap();
         assert!(store.load().unwrap().automatic(Provider::Claude));
+    }
+
+    #[test]
+    fn removal_preparation_refusal_keeps_registration_and_home_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, home) = store.create_pending(&homes, Provider::Claude, 1,
+            || homes.create(Provider::Claude, None)).unwrap();
+        let transcript = home.join("history.jsonl");
+        fs::write(&transcript, "original conversation").unwrap();
+        let before = store.load().unwrap();
+        let result = store.remove_home_checked(&homes, Provider::Claude, key, false, || {
+            assert!(home.is_dir(), "identity must still be provable before preparation");
+            Err(io::Error::other("retained prompt purge refused"))
+        });
+        assert!(result.unwrap_err().to_string().contains("purge refused"));
+        assert_eq!(store.load().unwrap(), before);
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), "original conversation");
+        let (_, warning) = store.remove_home_checked(&homes, Provider::Claude, key, false, || {
+            assert!(home.is_dir());
+            assert_eq!(fs::read_to_string(&transcript).unwrap(), "original conversation");
+            Ok(())
+        }).unwrap();
+        assert!(warning.is_none());
+        assert!(!home.exists());
+        assert!(store.load().unwrap().pending().is_empty());
     }
 
     #[test]
