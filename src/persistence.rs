@@ -6284,6 +6284,7 @@ mod tests {
         first.repository_navigation.insert(
             card,
             RepositoryNavigation {
+                external_source: None,
                 project: view.project,
                 worktree: view.worktree.clone(),
                 selected_file: Some(raw_path.clone()),

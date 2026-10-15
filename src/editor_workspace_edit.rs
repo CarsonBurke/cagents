@@ -5,7 +5,7 @@
 //! descriptor-relative compare-and-swap writer rather than unconditional saves.
 use std::{collections::HashMap, io::Read, ops::Range, path::{Path, PathBuf}, sync::Arc};
 
-use crate::{editor::{self, SaveOutcome}, fs_safety, lsp::{LspCoordinates, LspPosition, LspTextEdit}};
+use crate::{editor::{self, SaveOutcome, SaveDurability}, fs_safety, lsp::{LspCoordinates, LspPosition, LspTextEdit}};
 
 #[derive(Debug, Clone)]
 pub struct DocumentEdits {
@@ -35,12 +35,37 @@ pub struct DocumentPlan {
     pub before_hash: blake3::Hash,
     pub version: Option<i32>,
     pub open: bool,
+    /// Original selected-source spellings, captured by the preparation worker.
+    pub open_paths: Vec<PathBuf>,
     /// All spans address `before`; apply last-to-first as one buffer undo group.
     pub edits: Vec<ResolvedEdit>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Plan { pub worktree: PathBuf, pub documents: Vec<DocumentPlan> }
+
+#[derive(Debug, Clone)]
+pub struct ResolvedTargets {
+    pub worktree: PathBuf,
+    pub documents: Vec<DocumentEdits>,
+    pub open_paths: Vec<PathBuf>,
+}
+
+/// Resolve identities before capturing native text. A workspace with hundreds
+/// of open files copies only the buffers actually named by this operation.
+pub fn resolve_targets(worktree: PathBuf, documents: Vec<DocumentEdits>, open_paths: Vec<PathBuf>) -> Result<ResolvedTargets, String> {
+    if documents.len() > 512 { return Err("This workspace edit exceeds the 512-file preview limit".into()); }
+    let worktree = std::fs::canonicalize(worktree).map_err(|error| error.to_string())?;
+    let mut targets = std::collections::HashSet::new();
+    for document in &documents {
+        let path = if document.path.is_absolute() { document.path.clone() } else { worktree.join(&document.path) };
+        let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+        if !path.starts_with(&worktree) { return Err("The server tried to edit a file outside this worktree".into()); }
+        targets.insert(path);
+    }
+    let open_paths = open_paths.into_iter().filter(|path| std::fs::canonicalize(path).is_ok_and(|path| targets.contains(&path))).collect();
+    Ok(ResolvedTargets { worktree, documents, open_paths })
+}
 
 fn offset(text: &str, position: LspPosition, coordinates: LspCoordinates) -> Result<usize, String> {
     let mut starts = std::iter::once(0).chain(text.match_indices('\n').map(|(index, _)| index + 1));
@@ -59,9 +84,11 @@ fn offset(text: &str, position: LspPosition, coordinates: LspCoordinates) -> Res
 pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<PathBuf, OpenSnapshot>) -> Result<Plan, String> {
     let worktree = std::fs::canonicalize(worktree).map_err(|error| error.to_string())?;
     let mut canonical_open = HashMap::new();
+    let mut aliases: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     for (path, snapshot) in open {
-        let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
-        if let Some(previous) = canonical_open.insert(path, snapshot) {
+        let Ok(canonical) = std::fs::canonicalize(path) else { continue; };
+        aliases.entry(canonical.clone()).or_default().push(path.clone());
+        if let Some(previous) = canonical_open.insert(canonical, snapshot) {
             if previous.text != snapshot.text || previous.version != snapshot.version || previous.writable != snapshot.writable {
                 return Err("Two open views of the same file disagree; close the stale view before applying this edit".into());
             }
@@ -107,8 +134,9 @@ pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<Pa
         if after.len() as u64 > editor::MAX_EDITABLE_FILE_BYTES { return Err("A server edit would exceed the editable file size limit".into()); }
         total = total.checked_add(before.len() + after.len()).ok_or("The workspace edit is too large")?;
         if total > 64 * 1024 * 1024 { return Err("This workspace edit exceeds the 64 MiB preview budget".into()); }
+        let open_paths = aliases.remove(&path).unwrap_or_default();
         result.push(DocumentPlan { before_hash: blake3::hash(before.as_bytes()), path, relative,
-            before, after: after.into(), version: snapshot.map(|snapshot| snapshot.version), open: snapshot.is_some(), edits });
+            before, after: after.into(), version: snapshot.map(|snapshot| snapshot.version), open: snapshot.is_some(), open_paths, edits });
     }
     result.sort_by(|left, right| left.relative.cmp(&right.relative));
     Ok(Plan { worktree, documents: result })
@@ -117,12 +145,19 @@ pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<Pa
 /// Atomically publishes each unopened file. A later refusal rolls back earlier
 /// publications only while their exact written hash still matches, preserving
 /// concurrent outside edits and reporting any file that could not be restored.
-pub fn publish_unopened(plan: &Plan) -> Result<(), String> {
+#[derive(Debug, Clone, Default)]
+pub struct PublicationReport { pub durability_warnings: Vec<String> }
+
+pub fn publish_unopened(plan: &Plan) -> Result<PublicationReport, String> {
+    let mut report = PublicationReport::default();
     let mut published: Vec<&DocumentPlan> = Vec::new();
     for document in plan.documents.iter().filter(|document| !document.open && document.before != document.after) {
         let saved = editor::save_file(&plan.worktree, &document.relative, &document.after, document.before_hash, false);
         let failure = match saved {
-            Ok(SaveOutcome::Saved { .. }) => { published.push(document); continue; },
+            Ok(SaveOutcome::Saved { durability, .. }) => {
+                if let SaveDurability::Unconfirmed { error } = durability { report.durability_warnings.push(format!("{} was replaced, but durability is unconfirmed: {error}", document.relative.display())); }
+                published.push(document); continue;
+            },
             Ok(SaveOutcome::Conflict { .. }) => format!("{} changed on disk", document.relative.display()),
             Err(error) => format!("{}: {error}", document.relative.display()),
         };
@@ -135,7 +170,7 @@ pub fn publish_unopened(plan: &Plan) -> Result<(), String> {
         return Err(if unrestored.is_empty() { format!("The workspace edit was canceled: {failure}. Earlier writes were restored.") }
             else { format!("The workspace edit stopped: {failure}. These files could not be restored because they changed or could not be written: {}", unrestored.join(", ")) });
     }
-    Ok(())
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -145,6 +180,26 @@ mod tests {
     fn edit(start: u32, end: u32, new_text: &str) -> LspTextEdit {
         LspTextEdit { range: LspRange::new(LspPosition::new(0, start), LspPosition::new(0, end)), new_text: new_text.into() }
     }
+    #[test]
+    fn target_resolution_captures_only_changed_open_files_and_keeps_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..100 {
+            let path = directory.path().join(format!("file{index}.rs"));
+            std::fs::write(&path, "old()").unwrap();
+            paths.push(path);
+        }
+        let alias = directory.path().join("alias.rs");
+        std::os::unix::fs::symlink(&paths[7], &alias).unwrap();
+        paths.push(alias.clone());
+        let result = resolve_targets(directory.path().into(), vec![DocumentEdits { path: "file7.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], paths).unwrap();
+        assert_eq!(result.open_paths.len(), 2);
+        assert!(result.open_paths.contains(&alias));
+        let open = result.open_paths.iter().map(|path| (path.clone(), OpenSnapshot { text: "old()".into(), version: 1, writable: true })).collect();
+        let plan = prepare(&result.worktree, result.documents, &open).unwrap();
+        assert_eq!(plan.documents[0].open_paths.len(), 2);
+    }
+
     #[test]
     fn unicode_ranges_reject_surrogate_splits_and_handle_scalar_and_utf16() {
         assert_eq!(offset("a😀b\r\nnext", LspPosition::new(0, 3), LspCoordinates::Utf16), Ok(5));

@@ -220,6 +220,37 @@ pub fn validate_repo_path(path: &Path) -> Result<(), FileIoError> {
     Ok(())
 }
 
+/// Reads a dependency source explicitly selected through language-server
+/// navigation. The caller mounts it as read-only; it never enters the save
+/// path. A parent-directory descriptor fences the bounded regular-file read.
+pub fn load_external_source(path: &Path) -> Result<LoadedFile, FileIoError> {
+    if !path.is_absolute() { return Err(FileIoError::InvalidRepositoryPath); }
+    let canonical = std::fs::canonicalize(path).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let parent = canonical.parent().ok_or(FileIoError::InvalidRepositoryPath)?;
+    let name = canonical.file_name().ok_or(FileIoError::InvalidRepositoryPath)?;
+    let root = crate::fs_safety::Root::open(parent).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let file = crate::fs_safety::open_beneath(&root, Path::new(name)).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let metadata = file.metadata().map_err(|error| FileIoError::Io(error.to_string()))?;
+    let content = if !metadata.is_file() { FileContent::ReadOnly(ReadOnlyReason::NotRegularFile) }
+    else if metadata.len() > MAX_EDITABLE_FILE_BYTES {
+        FileContent::ReadOnly(ReadOnlyReason::Oversize { bytes: metadata.len(), limit: MAX_EDITABLE_FILE_BYTES, kind: OversizeKind::Editable })
+    } else {
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        file.take(MAX_EDITABLE_FILE_BYTES + 1).read_to_end(&mut bytes).map_err(|error| FileIoError::Io(error.to_string()))?;
+        if bytes.len() as u64 > MAX_EDITABLE_FILE_BYTES {
+            FileContent::ReadOnly(ReadOnlyReason::Oversize { bytes: bytes.len() as u64, limit: MAX_EDITABLE_FILE_BYTES, kind: OversizeKind::Editable })
+        } else if bytes.contains(&0) { FileContent::ReadOnly(ReadOnlyReason::Binary) }
+        else {
+            match String::from_utf8(bytes) {
+                Ok(text) => FileContent::Editable { content_hash: blake3::hash(text.as_bytes()), text, markdown: false },
+                Err(_) => FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8),
+            }
+        }
+    };
+    Ok(LoadedFile { source: path.to_path_buf(), content })
+}
+
 /// Whether the open file begins with a PDF header, leaving it rewound.
 ///
 /// The header is read through a reference and the descriptor seeked back to
@@ -1118,6 +1149,25 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn external_sources_are_bounded_regular_utf8_without_binary_or_directory_reads() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("stdlib.rs");
+        fs::write(&source, "pub fn example() { /* λ */ }\n").unwrap();
+        let loaded = load_external_source(&source).unwrap();
+        assert_eq!(loaded.source, source);
+        assert!(matches!(loaded.content, FileContent::Editable { text, markdown: false, .. } if text.contains("λ")));
+        fs::write(&source, b"binary\0bytes").unwrap();
+        assert!(matches!(load_external_source(&source).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::Binary)));
+        fs::write(&source, [0xff]).unwrap();
+        assert!(matches!(load_external_source(&source).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)));
+        let file = fs::File::create(&source).unwrap();
+        file.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
+        assert!(matches!(load_external_source(&source).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })));
+        assert!(matches!(load_external_source(directory.path()).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)));
+        assert!(load_external_source(Path::new("relative.rs")).is_err());
+    }
 
     #[test]
     fn raster_file_load_preserves_pixels_without_creating_editable_text() {
