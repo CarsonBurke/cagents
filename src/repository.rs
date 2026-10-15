@@ -4914,7 +4914,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .map_err(|error| ValidationError::Io(error.to_string()))?;
         let mut command = self.commit_command(request)?;
         if amend {
-            command = command.arg("--amend");
+            // A loaded message is already an existing commit's exact content.
+            // Whitespace cleanup would silently rewrite a verbatim original.
+            command = command.arg("--amend").arg("--cleanup=verbatim");
         }
         if !amend
             && !self.has_staged_changes(&request.worktree, cancellation)?
@@ -6958,14 +6960,18 @@ mod tests {
                 &[
                     "commit",
                     "-m",
-                    "Original subject\n\nMultiline body\nSecond line",
+                    "Original subject  \n\n\nMultiline body  \nSecond line\n\n",
+                    "--cleanup=verbatim",
                 ],
             );
             let cancel = CancellationToken::new();
             let service = service();
             let original = service.resolve_head(root, &cancel).unwrap().unwrap();
             let message = service.commit_message(root, &original, &cancel).unwrap();
-            assert_eq!(message, "Original subject\n\nMultiline body\nSecond line\n");
+            assert_eq!(
+                message,
+                "Original subject  \n\n\nMultiline body  \nSecond line\n\n"
+            );
             fs::write(root.join("file.txt"), "second\n").unwrap();
             git(root, &["add", "file.txt"]);
             let outcome = service
