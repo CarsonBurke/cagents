@@ -2484,6 +2484,8 @@ fn restart_completed_inner(
         replacement.1,
         execution,
         Some(&launch),
+        &[crate::agent_execution::HostedSession::Chat(source.clone())],
+        None,
     )
     .map(Some)
 }
