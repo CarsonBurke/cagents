@@ -139,6 +139,29 @@ pub(super) fn submit(
     authority: &Authority,
     request: Submit,
 ) -> Result<Accepted, String> {
+    submit_with_limits(host, authority, request).map_err(|error| error.to_string())
+}
+
+pub(super) fn concurrency_limits() -> Result<crate::agent_execution::ConcurrencyLimits, String> {
+    let Some(path) = crate::instance::settings_path() else {
+        return Ok(Default::default());
+    };
+    match crate::settings::load(path) {
+        Ok(settings) => Ok(settings.agent_concurrency),
+        Err(crate::settings::SettingsError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(Default::default())
+        }
+        Err(error) => Err(format!("Cannot read agent concurrency settings: {error}")),
+    }
+}
+
+fn submit_with_limits(
+    host: &SharedHost,
+    authority: &Authority,
+    request: Submit,
+) -> Result<Accepted, crate::agent_execution::AcceptanceError> {
     request.validate()?;
     let origin = origin(host, authority)?;
     let registry = registry(host)?;
@@ -149,6 +172,7 @@ pub(super) fn submit(
     {
         return Ok(previous);
     }
+    let limits = concurrency_limits()?;
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
         let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
@@ -167,7 +191,7 @@ pub(super) fn submit(
     let accepted = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())?;
+        .submit_agent_with_limits(&origin, &request, selected.as_ref(), limits, now())?;
     announce(host, &registry);
     dispatch_accepted(host, accepted.clone())?;
     Ok(accepted)
@@ -685,6 +709,15 @@ fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
 
 fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent, String> {
     let origin = origin(host, authority)?;
+    close_as_origin(host, &origin, id, false)
+}
+
+fn close_as_origin(
+    host: &SharedHost,
+    origin: &Origin,
+    id: AgentId,
+    interrupted_only: bool,
+) -> Result<Agent, String> {
     let gate = agent_gate(host, id);
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host)?;
@@ -692,8 +725,18 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agent(id)?;
-    if agent.origin != origin {
+    if &agent.origin != origin {
         return Err("This caller does not own the agent".into());
+    }
+    if interrupted_only
+        && registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .latest_agent_run(id)?
+            .state
+            != State::Interrupted
+    {
+        return Err("Agent is no longer interrupted; it was not closed".into());
     }
     if agent.closed {
         return Ok(agent);
@@ -793,7 +836,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
             now(),
         )?;
     }
-    let result = store.close_agent(&origin, id)?;
+    let result = store.close_agent(origin, id)?;
     drop(store);
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -807,6 +850,90 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     Ok(result)
 }
 
+pub(super) fn process_request(
+    host: &SharedHost,
+    authority: Authority,
+    operation: crate::agent_execution::Operation,
+) -> Result<crate::agent_execution::Reply, crate::agent_execution::AcceptanceError> {
+    match operation {
+        crate::agent_execution::Operation::Submit(request) => {
+            submit_with_limits(host, &authority, request)
+                .map(crate::agent_execution::Reply::Accepted)
+        }
+        other => process(host, authority, other).map_err(Into::into),
+    }
+}
+
+fn close_interrupted(
+    host: &SharedHost,
+    authority: &Authority,
+    all: bool,
+    after: Option<AgentId>,
+) -> Result<crate::agent_execution::CloseInterrupted, String> {
+    let caller = origin(host, authority)?;
+    if all && authority.token().is_some() {
+        return Err("Only a user may close interrupted agents across all callers".into());
+    }
+    let registry = registry(host)?;
+    let mut candidates = {
+        let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let report = store.agent_capacity(&caller, Default::default())?;
+        if all {
+            report.global.holders
+        } else {
+            report.caller.holders
+        }
+    };
+    candidates.retain(|holder| {
+        holder.state == State::Interrupted && after.is_none_or(|previous| holder.id > previous)
+    });
+    candidates.sort_unstable_by_key(|holder| holder.id);
+    let has_more = candidates.len() > crate::agent_execution::INTERRUPTED_CLEANUP_BATCH;
+    candidates.truncate(crate::agent_execution::INTERRUPTED_CLEANUP_BATCH);
+    let next = has_more.then(|| candidates.last().expect("nonempty cleanup batch").id);
+    let mut result = crate::agent_execution::CloseInterrupted {
+        closed: Vec::new(),
+        failed: Vec::new(),
+        next,
+    };
+    for holder in candidates {
+        if holder.state != State::Interrupted {
+            continue;
+        }
+        // Keep the authenticated caller as the gate-time authorization fence.
+        // A lineage migration between the census and close must not authorize
+        // this caller to close a newly reassigned conversation.
+        let owner = if all {
+            match registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent(holder.id)
+            {
+                Ok(agent) => agent.origin,
+                Err(message) => {
+                    result
+                        .failed
+                        .push(crate::agent_execution::CloseFailure::new(
+                            holder.id, message,
+                        ));
+                    continue;
+                }
+            }
+        } else {
+            caller.clone()
+        };
+        match close_as_origin(host, &owner, holder.id, true) {
+            Ok(closed) => result.closed.push(closed.id),
+            Err(message) => result
+                .failed
+                .push(crate::agent_execution::CloseFailure::new(
+                    holder.id, message,
+                )),
+        }
+    }
+    Ok(result)
+}
+
 pub(super) fn process(
     host: &SharedHost,
     authority: Authority,
@@ -814,6 +941,19 @@ pub(super) fn process(
 ) -> Result<crate::agent_execution::Reply, String> {
     use crate::agent_execution::{Operation, Reply, Summary};
     match operation {
+        Operation::Capacity => {
+            let origin = origin(host, &authority)?;
+            let limits = concurrency_limits()?;
+            let store = registry(host)?;
+            let result = store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent_capacity(&origin, limits)?;
+            Ok(Reply::Capacity(result))
+        }
+        Operation::CloseInterrupted { all, after } => {
+            close_interrupted(host, &authority, all, after).map(Reply::InterruptedClosed)
+        }
         Operation::Console { agent, command } => console(host, &authority, agent, command),
         Operation::Submit(request) => submit(host, &authority, request).map(Reply::Accepted),
         Operation::Status(id) => {

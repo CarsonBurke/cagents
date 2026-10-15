@@ -115,7 +115,19 @@ pub enum AgentCommand {
         including_subagents: bool,
     },
     /// Stop and close an agent, including its background subagents.
-    Close { agent: String },
+    Close {
+        #[arg(
+            required_unless_present = "interrupted",
+            conflicts_with = "interrupted"
+        )]
+        agent: Option<String>,
+        /// Close only interrupted agents owned by this caller's lineage.
+        #[arg(long)]
+        interrupted: bool,
+        /// Include other callers; available only to the user, never session agents.
+        #[arg(long, requires = "interrupted", conflicts_with = "agent")]
+        all: bool,
+    },
 }
 
 /// A prompt given as an argument, in a file, or on standard input.
@@ -365,7 +377,24 @@ impl ControlClient {
             authority,
             operation,
         };
-        let response = if closing {
+        let interrupted_cleanup = matches!(
+            &request,
+            ClientRequest::Agent {
+                operation: Operation::CloseInterrupted { .. },
+                ..
+            }
+        );
+        let response = if interrupted_cleanup {
+            let budget = RETAINED_CHAT_CLOSE_TIMEOUT
+                .saturating_add(CHAT_CLOSE_TIMEOUT)
+                .saturating_add(Duration::from_secs(35))
+                .saturating_mul(crate::agent_execution::INTERRUPTED_CLEANUP_BATCH as u32);
+            let maximum = Instant::now() + budget;
+            self.request_with_deadline(
+                request,
+                deadline.map_or(maximum, |requested| requested.min(maximum)),
+            )?
+        } else if closing {
             self.request_with_deadline(
                 request,
                 Instant::now() + CHAT_CLOSE_TIMEOUT + Duration::from_secs(35),
@@ -644,6 +673,74 @@ impl Session {
         self.client()?
             .agent(authority, operation)
             .map_err(protocol_error)
+    }
+
+    fn close_interrupted(&mut self, all: bool) -> Result<CommandOutput, AppError> {
+        let mut closed = Vec::new();
+        let mut failed = Vec::new();
+        let mut after = None;
+        loop {
+            let reply = match self.call(Operation::CloseInterrupted { all, after }) {
+                Ok(reply) => reply,
+                Err(mut error) => {
+                    let mut details = match error.details.take() {
+                        Some(Value::Object(details)) => details,
+                        _ => serde_json::Map::new(),
+                    };
+                    details.insert("closed".into(), json!(closed));
+                    details.insert("failed".into(), json!(failed));
+                    details.insert("attempts_complete".into(), json!(false));
+                    error.details = Some(Value::Object(details));
+                    error.message = format!(
+                        "Closed {} interrupted agents; remaining cleanup was not confirmed: {}",
+                        closed.len(),
+                        error.message
+                    );
+                    return Err(error);
+                }
+            };
+            let Reply::InterruptedClosed(result) = reply else {
+                return Err(AppError {
+                    kind: "agent.close",
+                    message: "Unexpected interrupted close response".into(),
+                    details: Some(
+                        json!({"closed":closed,"failed":failed,"attempts_complete":false}),
+                    ),
+                });
+            };
+            closed.extend(result.closed);
+            failed.extend(result.failed);
+            let Some(next) = result.next else {
+                break;
+            };
+            if after.is_some_and(|previous| next <= previous) {
+                return Err(AppError {
+                    kind: "protocol",
+                    message: "Interrupted cleanup did not advance its cursor".into(),
+                    details: Some(
+                        json!({"closed":closed,"failed":failed,"attempts_complete":false}),
+                    ),
+                });
+            }
+            after = Some(next);
+        }
+        let mut human = format!("Closed {} interrupted agents", closed.len());
+        for failure in &failed {
+            human.push_str(&format!("\n{}: {}", failure.id, failure.message));
+        }
+        let data = json!({"closed":closed,"failed":failed,"attempts_complete":true});
+        if !failed.is_empty() {
+            return Err(AppError {
+                kind: "agent.close",
+                message: human,
+                details: Some(data),
+            });
+        }
+        Ok(CommandOutput {
+            command: "agent.close",
+            human,
+            data,
+        })
     }
 
     /// Waits for `runs`; an agent's wait also ends when a message arrives
@@ -1093,8 +1190,17 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                 ),
             })
         }
-        AgentCommand::Close { agent } => {
-            let agent = session.agent(&agent)?;
+        AgentCommand::Close {
+            agent,
+            interrupted,
+            all,
+        } => {
+            if interrupted {
+                return session.close_interrupted(all);
+            }
+            let agent = session.agent(agent.as_deref().ok_or_else(|| {
+                AppError::new("agent.close", "Specify an agent or --interrupted")
+            })?)?;
             let Reply::Closed(agent) = session.call(Operation::Close(agent))? else {
                 return Err(AppError::new("agent.close", "Unexpected close response"));
             };
@@ -1346,6 +1452,176 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interrupted_cleanup_cli_continues_bounded_pages_and_preserves_confirmed_progress() {
+        for lose_final_reply in [false, true] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let closed = AgentId::new();
+            let server = thread::spawn(move || {
+                answer(&mut server_stream, |_| true, connected());
+                answer(
+                    &mut server_stream,
+                    |request| {
+                        matches!(
+                            request,
+                            ClientRequest::Agent {
+                                operation: Operation::CloseInterrupted {
+                                    all: false,
+                                    after: None
+                                },
+                                ..
+                            }
+                        )
+                    },
+                    ServerResponse::Agent(Reply::InterruptedClosed(
+                        crate::agent_execution::CloseInterrupted {
+                            closed: vec![closed],
+                            failed: vec![],
+                            next: Some(closed),
+                        },
+                    )),
+                );
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(
+                    matches!(request.request, ClientRequest::Agent { operation: Operation::CloseInterrupted { all: false, after: Some(cursor) }, .. } if cursor == closed)
+                );
+                if !lose_final_reply {
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Agent(Reply::InterruptedClosed(
+                                    crate::agent_execution::CloseInterrupted {
+                                        closed: vec![],
+                                        failed: vec![],
+                                        next: None,
+                                    },
+                                )),
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+            });
+            let client = ControlClient::from_stream(client_stream).unwrap();
+            let mut session = Session {
+                authority: Authority::default(),
+                connection: Some((client, PathBuf::from("/fixture"))),
+                summaries: None,
+            };
+            let result = session.close_interrupted(false);
+            if lose_final_reply {
+                let error = result.err().unwrap();
+                let details = error.details.unwrap();
+                assert_eq!(details["closed"][0], closed.to_string());
+                assert_eq!(details["attempts_complete"], false);
+            } else {
+                let output = result.unwrap();
+                assert_eq!(output.data["closed"][0], closed.to_string());
+                assert_eq!(output.data["attempts_complete"], true);
+            }
+            drop(session);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn interrupted_cleanup_cli_sends_exact_scope_and_reports_partial_failures() {
+        for all in [false, true] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let Reply::Status { agent, .. } = running().1 else {
+                unreachable!()
+            };
+            let closed_id = agent.id;
+            let failed_id = AgentId::new();
+            let server = thread::spawn(move || {
+                answer(&mut server_stream, |_| true, connected());
+                answer(
+                    &mut server_stream,
+                    |request| matches!(request, ClientRequest::Agent { operation: Operation::CloseInterrupted { all: actual, after: None }, .. } if *actual == all),
+                    ServerResponse::Agent(Reply::InterruptedClosed(
+                        crate::agent_execution::CloseInterrupted {
+                            closed: vec![agent.id],
+                            next: None,
+                            failed: if all {
+                                vec![crate::agent_execution::CloseFailure {
+                                    id: failed_id,
+                                    message: "Exact provider teardown is unconfirmed".into(),
+                                }]
+                            } else {
+                                vec![]
+                            },
+                        },
+                    )),
+                );
+            });
+            let client = ControlClient::from_stream(client_stream).unwrap();
+            let mut session = Session {
+                authority: Authority::default(),
+                connection: Some((client, PathBuf::from("/fixture"))),
+                summaries: None,
+            };
+            if all {
+                let error = session.close_interrupted(all).err().unwrap();
+                assert!(error.message.contains(&failed_id.to_string()));
+                assert_eq!(
+                    error.details.as_ref().unwrap()["closed"][0],
+                    closed_id.to_string()
+                );
+                assert_eq!(
+                    error.details.as_ref().unwrap()["failed"][0]["id"],
+                    failed_id.to_string()
+                );
+            } else {
+                let result = session.close_interrupted(all).unwrap();
+                assert_eq!(result.data["closed"][0], closed_id.to_string());
+                assert!(result.data["failed"].as_array().unwrap().is_empty());
+            }
+            drop(session);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn interrupted_close_is_explicit_and_defaults_to_caller_scope() {
+        assert!(matches!(
+            parse(&["close", "--interrupted"]),
+            AgentCommand::Close {
+                agent: None,
+                interrupted: true,
+                all: false
+            }
+        ));
+        assert!(matches!(
+            parse(&["close", "--interrupted", "--all"]),
+            AgentCommand::Close {
+                agent: None,
+                interrupted: true,
+                all: true
+            }
+        ));
+        assert!(matches!(
+            parse(&["close", "1234"]),
+            AgentCommand::Close {
+                agent: Some(_),
+                interrupted: false,
+                all: false
+            }
+        ));
+        for args in [
+            vec!["cagents", "agent", "close"],
+            vec!["cagents", "agent", "close", "1234", "--interrupted"],
+            vec!["cagents", "agent", "close", "1234", "--all"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args.clone()).is_err(),
+                "unexpectedly accepted {args:?}"
+            );
+        }
+    }
     use super::*;
 
     fn proof() -> HostSessionProof {

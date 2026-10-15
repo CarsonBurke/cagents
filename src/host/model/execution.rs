@@ -3,13 +3,17 @@
 use super::{Registry, repository_key, take_ordinal};
 use crate::{
     agent_execution::{
-        Accepted, Agent, Authority, Destination, HostedSession, Lineage, MAX_CHILDREN,
-        MAX_PARENT_DEPTH, MAX_PARENT_RUNNING, MAX_RUNNING, Origin, Placement, ResultSummary, Run,
-        State, Submit, Update,
+        AcceptanceError, Accepted, Agent, Authority, Capacity, CapacityHolder, CapacityReport,
+        CapacityScope, ConcurrencyLimits, Destination, HostedSession, LimitReached, Lineage,
+        MAX_CHILDREN, MAX_PARENT_DEPTH, Origin, Placement, ResultSummary, Run, State, Submit,
+        Update,
     },
     model::{AgentId, ChannelId, RunId},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+// Bound diagnostic presentation independently of configurable admission limits.
+const MAX_UPDATE_BLOCKERS: usize = 32;
 
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     // Version zero is the existing unversioned project/channel registry.
@@ -100,13 +104,15 @@ impl Registry {
              ) ORDER BY a.id LIMIT ?1",
         ).map_err(|error| error.to_string())?;
         let records = query
-            .query_map([MAX_RUNNING as u64 + 1], |row| row.get::<_, String>(0))
+            .query_map([MAX_UPDATE_BLOCKERS as u64 + 1], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|error| error.to_string())?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
         let mut blockers = records
             .iter()
-            .take(MAX_RUNNING)
+            .take(MAX_UPDATE_BLOCKERS)
             .map(|record| {
                 let agent: Agent = decode(record)?;
                 Ok(format!(
@@ -116,7 +122,7 @@ impl Registry {
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        if records.len() > MAX_RUNNING {
+        if records.len() > MAX_UPDATE_BLOCKERS {
             blockers.push("Additional agent launches must settle before updating".into());
         }
         Ok(blockers)
@@ -652,6 +658,7 @@ impl Registry {
 
     /// Durable acceptance precedes any process creation or prompt delivery.
     /// The caller authenticates `origin` and canonicalizes the target first.
+    #[cfg(test)]
     pub(crate) fn submit_agent(
         &mut self,
         origin: &Origin,
@@ -661,6 +668,7 @@ impl Registry {
         self.submit_agent_with_spec(origin, request, None, now_ms)
     }
 
+    #[cfg(test)]
     pub(crate) fn submit_agent_with_spec(
         &mut self,
         origin: &Origin,
@@ -668,24 +676,55 @@ impl Registry {
         selected: Option<&crate::agent_execution::Spec>,
         now_ms: u64,
     ) -> Result<Accepted, String> {
+        self.submit_agent_with_limits(
+            origin,
+            request,
+            selected,
+            ConcurrencyLimits::default(),
+            now_ms,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn submit_agent_with_limits(
+        &mut self,
+        origin: &Origin,
+        request: &Submit,
+        selected: Option<&crate::agent_execution::Spec>,
+        limits: ConcurrencyLimits,
+        now_ms: u64,
+    ) -> Result<Accepted, AcceptanceError> {
+        limits.validate()?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let accepted = Self::submit_agent_selected_in(&tx, origin, request, selected, now_ms)?;
+        let accepted =
+            Self::submit_agent_selected_in(&tx, origin, request, selected, limits, now_ms)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(accepted)
     }
 
     /// Shared with the scheduler's firing/revision claim. This performs no
     /// external I/O and never commits the transaction owned by its caller.
-    pub(super) fn submit_agent_in(
+    pub(super) fn submit_agent_in_with_limits(
         tx: &Transaction<'_>,
         origin: &Origin,
         request: &Submit,
+        limits: ConcurrencyLimits,
         now_ms: u64,
-    ) -> Result<Accepted, String> {
-        Self::submit_agent_selected_in(tx, origin, request, None, now_ms)
+    ) -> Result<Accepted, AcceptanceError> {
+        limits.validate()?;
+        Self::submit_agent_selected_in(tx, origin, request, None, limits, now_ms)
+    }
+
+    /// A single SQLite snapshot, also used by admission's IMMEDIATE transaction.
+    pub(crate) fn agent_capacity(
+        &self,
+        origin: &Origin,
+        limits: ConcurrencyLimits,
+    ) -> Result<CapacityReport, String> {
+        capacity_in(&self.db, origin, limits)
     }
 
     fn submit_agent_selected_in(
@@ -693,8 +732,9 @@ impl Registry {
         origin: &Origin,
         request: &Submit,
         selected: Option<&crate::agent_execution::Spec>,
+        limits: ConcurrencyLimits,
         now_ms: u64,
-    ) -> Result<Accepted, String> {
+    ) -> Result<Accepted, AcceptanceError> {
         request.validate()?;
         let origin_json = encode(origin)?;
         let request_json = encode(request)?;
@@ -722,18 +762,19 @@ impl Registry {
         }
         check_parent_depth(tx, origin)?;
 
-        let (running, owned): (usize, usize) = tx
-            .query_row(
-                "SELECT count(*), coalesce(sum(r.origin = ?1), 0)
-                 FROM agent_runs r JOIN agents a ON a.id = r.agent
-                 WHERE r.state IN ('accepted', 'running', 'waiting')
-                    OR (r.state = 'interrupted' AND a.closed = 0)",
-                [&origin_json],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|error| error.to_string())?;
-        if running >= MAX_RUNNING || owned >= MAX_PARENT_RUNNING {
-            return Err("Agent concurrency limit reached; wait for or close existing work".into());
+        let report = capacity_in(tx, origin, limits)?;
+        let full = if report.global.running >= report.global.limit {
+            Some(report.global)
+        } else if report.caller.running >= report.caller.limit {
+            Some(report.caller)
+        } else {
+            None
+        };
+        if let Some(capacity) = full {
+            return Err(AcceptanceError::LimitReached(LimitReached {
+                capacity,
+                retryable: true,
+            }));
         }
         let agent = match &request.destination {
             Destination::Existing(id) => {
@@ -770,7 +811,9 @@ impl Registry {
                         |row| row.get(0),
                     )
                     .map_err(|error| error.to_string())?;
-                if children >= MAX_CHILDREN {
+                // Raising concurrency must not leave a smaller open-child
+                // guard that makes the configured reservation cap unreachable.
+                if children >= MAX_CHILDREN.max(limits.caller) {
                     return Err("Agent child limit reached; close an existing child first".into());
                 }
                 if let Some(name) = &request.name {
@@ -779,7 +822,7 @@ impl Registry {
                         params![origin_json, name], |row| row.get(0),
                     ).map_err(|error| error.to_string())?;
                     if used {
-                        return Err(format!("You already have an open agent named {name}"));
+                        return Err(format!("You already have an open agent named {name}").into());
                     }
                 }
                 let repository = repository_key(&spec.target.repository)?;
@@ -1426,7 +1469,7 @@ mod tests {
     use super::*;
     use crate::{
         agent::Provider,
-        agent_execution::{Spec, Surface, Target},
+        agent_execution::{DEFAULT_CALLER_CONCURRENCY, Spec, Surface, Target},
         model::ProjectKind,
         workspace_model::ModelEdit,
     };
@@ -1454,6 +1497,192 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
         })
+    }
+
+    #[test]
+    fn configured_caller_budget_above_legacy_open_child_guard_is_reachable() {
+        let (mut registry, _directory, mut request) = fixture();
+        let limits = ConcurrencyLimits {
+            caller: 65,
+            global: 80,
+        };
+        for index in 0..65 {
+            request.idempotency_key = format!("large-caller-{index}");
+            registry
+                .submit_agent_with_limits(&Origin::User, &request, None, limits, index)
+                .unwrap();
+        }
+        let report = registry.agent_capacity(&Origin::User, limits).unwrap();
+        assert_eq!(report.caller.running, 65);
+        request.idempotency_key = "large-caller-rejected".into();
+        assert!(
+            matches!(registry.submit_agent_with_limits(&Origin::User, &request, None, limits, 66), Err(AcceptanceError::LimitReached(details)) if details.capacity.scope == CapacityScope::Caller && details.capacity.limit == 65)
+        );
+    }
+
+    #[test]
+    fn raised_limits_admit_more_than_the_former_hardcoded_budgets() {
+        let (mut registry, _directory, mut request) = fixture();
+        let limits = ConcurrencyLimits {
+            caller: 12,
+            global: 40,
+        };
+        let owners: Vec<_> = (0..4)
+            .map(|_| Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            })
+            .collect();
+        for index in 0..40 {
+            request.idempotency_key = format!("raised-{index}");
+            registry
+                .submit_agent_with_limits(&owners[index / 10], &request, None, limits, index as u64)
+                .unwrap();
+        }
+        let report = registry.agent_capacity(&owners[0], limits).unwrap();
+        assert_eq!(report.caller.running, 10);
+        assert_eq!(report.global.running, 40);
+        request.idempotency_key = "raised-rejected".into();
+        assert!(
+            matches!(registry.submit_agent_with_limits(&owners[0], &request, None, limits, 41), Err(AcceptanceError::LimitReached(error)) if error.capacity.scope == CapacityScope::Global && error.capacity.holders.len() == 40)
+        );
+    }
+
+    #[test]
+    fn simultaneous_acceptance_cannot_oversubscribe_the_last_slot() {
+        let (registry, directory, request) = fixture();
+        let path = directory.path().join("model.sqlite3");
+        drop(registry);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                let mut request = request.clone();
+                request.idempotency_key = format!("race-{index}");
+                std::thread::spawn(move || {
+                    let mut registry = Registry::at(&path).unwrap();
+                    barrier.wait();
+                    registry.submit_agent_with_limits(
+                        &Origin::User,
+                        &request,
+                        None,
+                        ConcurrencyLimits {
+                            caller: 1,
+                            global: 1,
+                        },
+                        1,
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AcceptanceError::LimitReached(_))))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn configured_capacity_is_atomic_scoped_and_keeps_interrupted_holders() {
+        let (mut registry, _directory, mut request) = fixture();
+        let limits = ConcurrencyLimits {
+            caller: 2,
+            global: 3,
+        };
+        let first = registry
+            .submit_agent_with_limits(&Origin::User, &request, None, limits, 1)
+            .unwrap();
+        request.idempotency_key = "second".into();
+        let second = registry
+            .submit_agent_with_limits(&Origin::User, &request, None, limits, 2)
+            .unwrap();
+        let retried = registry
+            .submit_agent_with_limits(&Origin::User, &request, None, limits, 3)
+            .unwrap();
+        assert!(!retried.created, "an idempotent retry is valid at capacity");
+        request.idempotency_key = "third".into();
+        let before = registry.model().unwrap();
+        let AcceptanceError::LimitReached(error) = registry
+            .submit_agent_with_limits(&Origin::User, &request, None, limits, 4)
+            .unwrap_err()
+        else {
+            panic!("typed capacity error required")
+        };
+        assert_eq!(error.capacity.scope, CapacityScope::Caller);
+        assert_eq!((error.capacity.running, error.capacity.limit), (2, 2));
+        assert!(error.retryable);
+        assert_eq!(
+            error
+                .capacity
+                .holders
+                .iter()
+                .map(|holder| holder.id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [first.agent.id, second.agent.id].into_iter().collect()
+        );
+        assert_eq!(
+            registry.model().unwrap(),
+            before,
+            "rejection is transactionally empty"
+        );
+        let other = Origin::Automation {
+            id: uuid::Uuid::new_v4(),
+        };
+        let third = registry
+            .submit_agent_with_limits(&other, &request, None, limits, 5)
+            .unwrap();
+        request.idempotency_key = "fourth".into();
+        let AcceptanceError::LimitReached(error) = registry
+            .submit_agent_with_limits(&other, &request, None, limits, 6)
+            .unwrap_err()
+        else {
+            panic!("typed capacity error required")
+        };
+        assert_eq!(error.capacity.scope, CapacityScope::Global);
+        assert_eq!((error.capacity.running, error.capacity.limit), (3, 3));
+        assert_eq!(error.capacity.holders.len(), 3);
+        registry.interrupt_unproven_agent_runs(7).unwrap();
+        let report = registry.agent_capacity(&Origin::User, limits).unwrap();
+        assert_eq!(report.caller.running, 2);
+        assert_eq!(report.global.running, 3);
+        assert!(
+            report
+                .global
+                .holders
+                .iter()
+                .all(|holder| holder.state == State::Interrupted)
+        );
+        registry.close_agent(&Origin::User, first.agent.id).unwrap();
+        let replacement = registry
+            .submit_agent_with_limits(&Origin::User, &request, None, limits, 8)
+            .unwrap();
+        assert_ne!(replacement.agent.id, first.agent.id);
+        assert_eq!(
+            registry
+                .agent_capacity(&other, limits)
+                .unwrap()
+                .caller
+                .holders[0]
+                .id,
+            third.agent.id
+        );
+        let raised = ConcurrencyLimits {
+            caller: 4,
+            global: 5,
+        };
+        request.idempotency_key = "raised".into();
+        assert!(
+            registry
+                .submit_agent_with_limits(&Origin::User, &request, None, raised, 9)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2084,7 +2313,7 @@ mod tests {
     #[test]
     fn rejected_capacity_and_missing_channel_leave_no_partial_acceptance() {
         let (mut registry, _directory, mut request) = fixture();
-        for index in 0..MAX_PARENT_RUNNING {
+        for index in 0..DEFAULT_CALLER_CONCURRENCY {
             request.idempotency_key = index.to_string();
             registry.submit_agent(&Origin::User, &request, 10).unwrap();
         }
@@ -2189,4 +2418,65 @@ mod tests {
                 .contains("own")
         );
     }
+}
+
+fn capacity_in(
+    db: &Connection,
+    origin: &Origin,
+    limits: ConcurrencyLimits,
+) -> Result<CapacityReport, String> {
+    // Run records may contain a MiB of result text. Capacity observes only
+    // indexed identity/state columns, never provider output or prompts.
+    let mut statement = db.prepare(
+        "SELECT r.agent, r.id, r.state, r.origin = ?1 FROM agent_runs r JOIN agents a ON a.id = r.agent
+         WHERE r.state IN ('accepted', 'running', 'waiting')
+            OR (r.state = 'interrupted' AND a.closed = 0) ORDER BY r.id"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([encode(origin)?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut global = Vec::new();
+    let mut caller = Vec::new();
+    for row in rows {
+        let (agent, run, state, owned) = row.map_err(|error| error.to_string())?;
+        let state = match state.as_str() {
+            "accepted" => State::Accepted,
+            "running" => State::Running,
+            "waiting" => State::Waiting,
+            "interrupted" => State::Interrupted,
+            _ => return Err("Invalid capacity reservation state".into()),
+        };
+        let holder = CapacityHolder {
+            id: agent
+                .parse::<AgentId>()
+                .map_err(|error| error.to_string())?,
+            run: run.parse::<RunId>().map_err(|error| error.to_string())?,
+            state,
+        };
+        if owned {
+            caller.push(holder.clone());
+        }
+        global.push(holder);
+    }
+    Ok(CapacityReport {
+        caller: Capacity {
+            running: caller.len(),
+            limit: limits.caller,
+            scope: CapacityScope::Caller,
+            holders: caller,
+        },
+        global: Capacity {
+            running: global.len(),
+            limit: limits.global,
+            scope: CapacityScope::Global,
+            holders: global,
+        },
+    })
 }

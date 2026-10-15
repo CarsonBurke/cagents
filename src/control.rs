@@ -412,6 +412,7 @@ pub enum ControlError {
         code: ProtocolErrorCode,
         message: String,
         retryable: bool,
+        details: Option<terminal::ipc::ProtocolErrorDetails>,
     },
     #[error("the daemon is dropping the connection ({code:?}): {message}")]
     ConnectionRejected {
@@ -648,6 +649,7 @@ impl ControlClient {
                         code: error.code,
                         message: error.message,
                         retryable: error.retryable,
+                        details: error.details,
                     });
                 }
                 _ => {}
@@ -760,6 +762,7 @@ impl ControlClient {
                         code: error.code,
                         message: error.message,
                         retryable: error.retryable,
+                        details: error.details,
                     });
                 }
                 _ => {}
@@ -810,6 +813,7 @@ impl ControlClient {
                         code: error.code,
                         message: error.message,
                         retryable: error.retryable,
+                        details: error.details,
                     });
                 }
                 _ => {}
@@ -1707,6 +1711,7 @@ impl HandshakeClient {
                 code: error.code,
                 message: error.message,
                 retryable: error.retryable,
+                details: error.details,
             }),
             message => Err(ControlError::UnexpectedMessage {
                 expected: "the connect response",
@@ -1740,6 +1745,7 @@ fn response_from_message(message: ServerMessage) -> Result<ServerResponse, Contr
             code: error.code,
             message: error.message,
             retryable: error.retryable,
+            details: error.details,
         }),
         message => Err(ControlError::UnexpectedMessage {
             expected: "a correlated response",
@@ -2956,6 +2962,10 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
 
 fn protocol_error(error: ControlError) -> AppError {
     let kind = match &error {
+        ControlError::Remote {
+            code: ProtocolErrorCode::LimitReached,
+            ..
+        } => "limit_reached",
         ControlError::WaitTimeout { .. } | ControlError::SnapshotTimeout => "timeout",
         ControlError::Connect(_)
         | ControlError::Configure(_)
@@ -2965,6 +2975,16 @@ fn protocol_error(error: ControlError) -> AppError {
         _ => "protocol",
     };
     let details = match &error {
+        ControlError::Remote {
+            details: Some(terminal::ipc::ProtocolErrorDetails::AgentLimitReached(details)),
+            ..
+        } => {
+            let mut value =
+                serde_json::to_value(&details.capacity).expect("capacity is serializable");
+            value["code"] = json!("limit_reached");
+            value["retryable"] = json!(true);
+            Some(value)
+        }
         ControlError::Remote {
             code, retryable, ..
         }
@@ -3549,6 +3569,77 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capacity_errors_keep_machine_details_and_human_holders() {
+        use crate::agent_execution::{
+            Capacity, CapacityHolder, CapacityScope, LimitReached, State,
+        };
+        let id = crate::model::AgentId::new();
+        let wire = terminal::ipc::ProtocolError::agent_limit_reached(LimitReached {
+            capacity: Capacity {
+                running: 1,
+                limit: 1,
+                scope: CapacityScope::Caller,
+                holders: vec![CapacityHolder {
+                    id,
+                    run: crate::model::RunId::new(),
+                    state: State::Interrupted,
+                }],
+            },
+            retryable: true,
+        });
+        let error = protocol_error(ControlError::Remote {
+            code: wire.code,
+            message: wire.message,
+            retryable: wire.retryable,
+            details: wire.details,
+        });
+        assert_eq!(error.kind, "limit_reached");
+        let details = error.details.unwrap();
+        assert_eq!(details["running"], 1);
+        assert_eq!(details["limit"], 1);
+        assert_eq!(details["scope"], "caller");
+        assert_eq!(details["retryable"], true);
+        assert_eq!(details["holders"][0]["id"], id.to_string());
+        assert!(error.message.contains(&id.to_string()));
+        assert!(error.message.contains("Interrupted"));
+        assert!(error.message.contains("close --interrupted"));
+    }
+    #[test]
+    fn large_capacity_errors_keep_all_machine_holders_with_bounded_human_output() {
+        use crate::agent_execution::{
+            Capacity, CapacityHolder, CapacityScope, LimitReached, State,
+        };
+        let holders: Vec<_> = (0..4096)
+            .map(|_| CapacityHolder {
+                id: crate::model::AgentId::new(),
+                run: crate::model::RunId::new(),
+                state: State::Waiting,
+            })
+            .collect();
+        let last = holders.last().unwrap().id;
+        let wire = terminal::ipc::ProtocolError::agent_limit_reached(LimitReached {
+            capacity: Capacity {
+                running: holders.len(),
+                limit: holders.len(),
+                scope: CapacityScope::Global,
+                holders,
+            },
+            retryable: true,
+        });
+        let error = protocol_error(ControlError::Remote {
+            code: wire.code,
+            message: wire.message,
+            retryable: wire.retryable,
+            details: wire.details,
+        });
+        let details = error.details.unwrap();
+        assert_eq!(details["holders"].as_array().unwrap().len(), 4096);
+        assert_eq!(details["holders"][4095]["id"], last.to_string());
+        assert!(error.message.len() < 2048);
+        assert!(error.message.contains("additional holders"));
+        assert!(!error.message.contains(&last.to_string()));
+    }
     #[test]
     fn rebuild_stop_requires_explicit_permission_before_touching_a_daemon() {
         let error = execute_daemon(DaemonCommand::StopForRebuild {
