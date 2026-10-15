@@ -46,10 +46,15 @@ fn terminal_decisions_are_bound_to_the_visible_exact_confirmation_instance() {
     drop(app.update(Message::CancelTerminalClose(old.clone())));
     request_active_close(&mut app, card);
     let current = app.terminal_close_target().unwrap();
-    assert_ne!(old, current, "reopening the same card, terminal and proof requires fresh consent");
-    for stale in [Message::ConfirmTerminalClose(old.clone()), Message::CancelTerminalClose(old.clone()),
-        Message::TerminalCloseDontAskChanged(old, true)]
-    {
+    assert_ne!(
+        old, current,
+        "reopening the same card, terminal and proof requires fresh consent"
+    );
+    for stale in [
+        Message::ConfirmTerminalClose(old.clone()),
+        Message::CancelTerminalClose(old.clone()),
+        Message::TerminalCloseDontAskChanged(old, true),
+    ] {
         drop(app.update(stale));
         assert_eq!(app.terminal_close_target(), Some(current.clone()));
         let intent = app.terminal_close.as_ref().unwrap();
@@ -60,9 +65,11 @@ fn terminal_decisions_are_bound_to_the_visible_exact_confirmation_instance() {
     app.resume_ui.open = true;
     drop(app.finish_modal_update(Task::none()));
     assert_eq!(app.top_modal(), Some(modal_ui::Modal::Resume));
-    for hidden in [Message::ConfirmTerminalClose(current.clone()), Message::CancelTerminalClose(current.clone()),
-        Message::TerminalCloseDontAskChanged(current.clone(), true)]
-    {
+    for hidden in [
+        Message::ConfirmTerminalClose(current.clone()),
+        Message::CancelTerminalClose(current.clone()),
+        Message::TerminalCloseDontAskChanged(current.clone(), true),
+    ] {
         drop(app.update(hidden));
         assert_eq!(app.terminal_close_target(), Some(current.clone()));
         let intent = app.terminal_close.as_ref().unwrap();
@@ -91,7 +98,9 @@ fn pointer_and_keyboard_close_preserve_live_card_until_confirmation() {
         assert!(app.terminal_close.is_some());
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(app.terminal_close_attempts.is_empty());
-        let _ = app.update(Message::CancelTerminalClose(app.terminal_close_target().unwrap()));
+        let _ = app.update(Message::CancelTerminalClose(
+            app.terminal_close_target().unwrap(),
+        ));
         assert!(app.terminal_close.is_none());
         assert_eq!(app.workspace.focused(), Some(card));
         assert!(app.terminal_close_attempts.is_empty());
@@ -137,7 +146,9 @@ fn exit_during_confirmation_releases_completed_holder_and_proof_change_keeps_car
         },
     };
     let terminal = session.id;
-    let _ = app.update(Message::ConfirmTerminalClose(app.terminal_close_target().unwrap()));
+    let _ = app.update(Message::ConfirmTerminalClose(
+        app.terminal_close_target().unwrap(),
+    ));
     assert!(app.terminal_close.as_ref().unwrap().pending);
     assert!(app.card_state(card).unwrap().existence.is_open());
     assert!(!app.closed_terminal_cards.contains(&card));
@@ -157,7 +168,9 @@ fn exit_during_confirmation_releases_completed_holder_and_proof_change_keeps_car
     {
         *host_incarnation = HostIncarnation::new("restarted");
     }
-    let _ = app.update(Message::ConfirmTerminalClose(app.terminal_close_target().unwrap()));
+    let _ = app.update(Message::ConfirmTerminalClose(
+        app.terminal_close_target().unwrap(),
+    ));
     assert!(app.terminal_close.as_ref().unwrap().detail.is_some());
     assert!(app.terminal_close_attempts.is_empty());
     assert!(app.card_state(card).unwrap().existence.is_open());
@@ -167,8 +180,12 @@ fn exit_during_confirmation_releases_completed_holder_and_proof_change_keeps_car
 fn unreachable_and_duplicate_completions_never_remove_or_resend() {
     let (mut app, card, terminal, proof) = live_app();
     let _ = app.update(Message::CloseCard(card));
-    let _pending = app.update(Message::ConfirmTerminalClose(app.terminal_close_target().unwrap())); // Not polled: never touches a real daemon.
-    let _duplicate = app.update(Message::ConfirmTerminalClose(app.terminal_close_target().unwrap()));
+    let _pending = app.update(Message::ConfirmTerminalClose(
+        app.terminal_close_target().unwrap(),
+    )); // Not polled: never touches a real daemon.
+    let _duplicate = app.update(Message::ConfirmTerminalClose(
+        app.terminal_close_target().unwrap(),
+    ));
     assert_eq!(app.terminal_close_attempts.len(), 1);
     let generation = app.terminal_close.as_ref().unwrap().generation;
     let _ = app.update(Message::TerminalCloseFinished {
@@ -185,7 +202,9 @@ fn unreachable_and_duplicate_completions_never_remove_or_resend() {
         generation,
         outcome: terminal_close::CloseOutcome::Closed,
     });
-    let _ = app.update(Message::ConfirmTerminalClose(app.terminal_close_target().unwrap()));
+    let _ = app.update(Message::ConfirmTerminalClose(
+        app.terminal_close_target().unwrap(),
+    ));
     assert!(app.card_state(card).unwrap().existence.is_open());
     assert!(!app.closed_terminal_cards.contains(&card));
     assert_eq!(app.terminal_close_attempts.len(), 1);
@@ -442,11 +461,15 @@ fn an_unanswered_close_can_be_asked_again_once_its_report_is_dismissed() {
     assert!(app.terminal_close_dialog().is_some());
 
     // A report is not a question: confirming it must do nothing at all.
-    let _ = app.update(Message::ConfirmTerminalClose(app.terminal_close_target().unwrap()));
+    let _ = app.update(Message::ConfirmTerminalClose(
+        app.terminal_close_target().unwrap(),
+    ));
     assert!(app.terminal_close.as_ref().unwrap().detail.is_some());
     assert!(app.card_state(card).unwrap().existence.is_open());
 
-    let _ = app.update(Message::CancelTerminalClose(app.terminal_close_target().unwrap()));
+    let _ = app.update(Message::CancelTerminalClose(
+        app.terminal_close_target().unwrap(),
+    ));
     assert!(app.terminal_close.is_none());
     assert!(
         app.terminal_close_attempts.is_empty(),
@@ -470,7 +493,9 @@ fn terminal_confirmation_owns_tab_navigation_and_restores_shell_setting() {
     assert!(!app.core.keyboard_nav());
     let _ = app.cycle_terminal_close_focus(false);
     assert!(!app.core.keyboard_nav());
-    let _ = app.update(Message::CancelTerminalClose(app.terminal_close_target().unwrap()));
+    let _ = app.update(Message::CancelTerminalClose(
+        app.terminal_close_target().unwrap(),
+    ));
     assert!(app.core.keyboard_nav());
 }
 
@@ -487,7 +512,9 @@ fn idle_inspection_closes_without_confirmation_and_stale_results_cannot_close_re
     let _ = app.update(Message::CloseCard(card));
     let old = app.terminal_close.as_ref().unwrap().clone();
     report_close(&mut app, terminal_close::CloseOutcome::Active);
-    let _ = app.update(Message::CancelTerminalClose(app.terminal_close_target().unwrap()));
+    let _ = app.update(Message::CancelTerminalClose(
+        app.terminal_close_target().unwrap(),
+    ));
     let _ = app.update(Message::CloseCard(card));
     let _ = app.update(Message::TerminalCloseFinished {
         card,
@@ -509,12 +536,20 @@ fn terminal_close_opt_out_persists_only_on_close_and_can_be_reenabled() {
     app.settings_path = Some(path.clone());
     app.settings_write_blocked = false;
     request_active_close(&mut app, card);
-    let _ = app.update(Message::TerminalCloseDontAskChanged(app.terminal_close_target().unwrap(), true));
-    let _ = app.update(Message::CancelTerminalClose(app.terminal_close_target().unwrap()));
+    let _ = app.update(Message::TerminalCloseDontAskChanged(
+        app.terminal_close_target().unwrap(),
+        true,
+    ));
+    let _ = app.update(Message::CancelTerminalClose(
+        app.terminal_close_target().unwrap(),
+    ));
     assert!(app.settings.confirm_terminal_close);
     assert!(!path.exists());
     request_active_close(&mut app, card);
-    let _ = app.update(Message::TerminalCloseDontAskChanged(app.terminal_close_target().unwrap(), true));
+    let _ = app.update(Message::TerminalCloseDontAskChanged(
+        app.terminal_close_target().unwrap(),
+        true,
+    ));
     // The process may finish while its confirmation is open. Keep this
     // preference test independent of any real daemon or process shutdown.
     let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
@@ -529,7 +564,9 @@ fn terminal_close_opt_out_persists_only_on_close_and_can_be_reenabled() {
     };
     // Drive only the preference writer; the exact owner receipt is supplied
     // below, without executing a real daemon close from this unit fixture.
-    drop(app.update(Message::ConfirmTerminalClose(app.terminal_close_target().unwrap())));
+    drop(app.update(Message::ConfirmTerminalClose(
+        app.terminal_close_target().unwrap(),
+    )));
     let save = app.save_settings_task(false);
     tests::settle_settings_task(&mut app, save);
     assert!(!settings::load(&path).unwrap().confirm_terminal_close);

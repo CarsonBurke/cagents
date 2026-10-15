@@ -451,7 +451,8 @@ pub(crate) fn modal_tabs<'a, Message: 'a>(
         kind: Kind::ModalTabs,
         tip: None,
         on_escape: None,
-    }.into()
+    }
+    .into()
 }
 
 /// Blocks click-through without hiding the child's accessibility tree.
@@ -1448,10 +1449,22 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         // copy of it for the clicks and drags that follow, and would be left
         // believing a modifier is still held.
         if matches!(self.kind, Kind::ModalTabs)
-            && matches!(event, Event::Keyboard(
-                cosmic::iced::keyboard::Event::KeyPressed { key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Tab), .. }
-                | cosmic::iced::keyboard::Event::KeyReleased { key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Tab), .. }
-            ))
+            && matches!(
+                event,
+                Event::Keyboard(
+                    cosmic::iced::keyboard::Event::KeyPressed {
+                        key: cosmic::iced::keyboard::Key::Named(
+                            cosmic::iced::keyboard::key::Named::Tab
+                        ),
+                        ..
+                    } | cosmic::iced::keyboard::Event::KeyReleased {
+                        key: cosmic::iced::keyboard::Key::Named(
+                            cosmic::iced::keyboard::key::Named::Tab
+                        ),
+                        ..
+                    }
+                )
+            )
         {
             // Repeats remain captured even when the app deliberately ignores
             // them, otherwise only Cosmic would move the focus on a repeat.

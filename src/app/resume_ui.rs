@@ -287,8 +287,12 @@ fn index(
                 // unless the reader renamed it here.
                 std::collections::hash_map::Entry::Occupied(mut occupied) => {
                     if let Some((card, untitled)) = occupied.get_mut().take() {
-                        if let Some(model) = found.model { models.push((card, model)); }
-                        if found.named || found.titled && untitled { titles.push((card, found.title)); }
+                        if let Some(model) = found.model {
+                            models.push((card, model));
+                        }
+                        if found.named || found.titled && untitled {
+                            titles.push((card, found.title));
+                        }
                     }
                 }
             }
@@ -531,10 +535,7 @@ impl Cagents {
         }))
         .abortable();
         self.resume_ui.indexer = Some(handle);
-        Some(Task::batch([
-            self.modal_focus(focus_id()),
-            indexer,
-        ]))
+        Some(Task::batch([self.modal_focus(focus_id()), indexer]))
     }
 
     pub(super) fn update_resume(&mut self, action: Action) -> Task<Message> {
@@ -557,10 +558,7 @@ impl Cagents {
             Action::Unscope => {
                 self.resume_ui.scope = None;
                 self.refilter_resume();
-                Task::batch([
-                    self.reveal_resume_selection(),
-                    self.modal_focus(focus_id()),
-                ])
+                Task::batch([self.reveal_resume_selection(), self.modal_focus(focus_id())])
             }
             Action::More => {
                 self.resume_ui.limit += PAGE;
@@ -675,7 +673,11 @@ impl Cagents {
                     if let Some(row) = state.rows.iter().find(|row| row.card == card)
                         && let Source::Saved(entry) = &row.source
                         && let Some(key) = chat_ui::closing::draft_key(&entry.session)
-                    { Arc::make_mut(&mut self.durable).conversation_models.insert(key, model); }
+                    {
+                        Arc::make_mut(&mut self.durable)
+                            .conversation_models
+                            .insert(key, model);
+                    }
                 }
                 for (card, title) in titles
                     .into_iter()
@@ -836,17 +838,26 @@ impl Cagents {
         // the previous strip just because selecting the intended one failed.
         let selected = match &destination {
             ResumeDestination::Channel(id) => self.durable.active_channel == Some(*id),
-            ResumeDestination::Worktree(path) => self.durable.active_channel.is_none()
-                && self.active_workspace.as_deref() == Some(path.as_path()),
+            ResumeDestination::Worktree(path) => {
+                self.durable.active_channel.is_none()
+                    && self.active_workspace.as_deref() == Some(path.as_path())
+            }
         };
-        if !selected { return scope; }
+        if !selected {
+            return scope;
+        }
         Task::batch([scope, self.commit_resumed_conversation(entry, replace)])
     }
 
     /// Called only once the exact destination has been selected. The async
     /// selection lane carries this continuation until its guard is installed.
-    pub(super) fn commit_resumed_conversation(&mut self, entry: SavedConversation, replace: Option<CardId>) -> Task<Message> {
-        self.recently_closed.retain(|(card, _)| card.id != entry.card);
+    pub(super) fn commit_resumed_conversation(
+        &mut self,
+        entry: SavedConversation,
+        replace: Option<CardId>,
+    ) -> Task<Message> {
+        self.recently_closed
+            .retain(|(card, _)| card.id != entry.card);
         let replace = replace.filter(|card| {
             self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
         });
@@ -857,7 +868,9 @@ impl Cagents {
             {
                 // A catalog cwd can be outside the current worktree when it
                 // was not known locally. Filing and executable cwd are distinct.
-                Arc::make_mut(&mut self.durable).card_scopes.insert(card, scope.clone());
+                Arc::make_mut(&mut self.durable)
+                    .card_scopes
+                    .insert(card, scope.clone());
                 self.worktree_owners.insert(card, scope);
             }
             self.apply_reported_title(card, entry.title);
@@ -869,37 +882,79 @@ impl Cagents {
         Task::batch([insert, discard])
     }
 
-    fn resumed_conversation_destination(&mut self, original: CardId, session: &chat::Session, title: &str) -> ResumeDestination {
-        if let Some(id) = self.durable.channels.iter().find(|channel| channel.cards.contains(&original)).map(|channel| channel.id) {
+    fn resumed_conversation_destination(
+        &mut self,
+        original: CardId,
+        session: &chat::Session,
+        title: &str,
+    ) -> ResumeDestination {
+        if let Some(id) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&original))
+            .map(|channel| channel.id)
+        {
             return ResumeDestination::Channel(id);
         }
-        if let Some(id) = chat_ui::closing::draft_key(session).and_then(|key| self.durable.conversation_channels.get(&key).copied())
+        if let Some(id) = chat_ui::closing::draft_key(session)
+            .and_then(|key| self.durable.conversation_channels.get(&key).copied())
             && self.durable.channels.iter().any(|channel| channel.id == id)
-        { return ResumeDestination::Channel(id); }
-        let directory = session.launch.recipe.working_directory.canonicalize()
+        {
+            return ResumeDestination::Channel(id);
+        }
+        let directory = session
+            .launch
+            .recipe
+            .working_directory
+            .canonicalize()
             .unwrap_or_else(|_| session.launch.recipe.working_directory.clone());
         // A known worktree is the precise owner, even when nested inside its
         // repository. Do not reduce it to its parent project's channel list.
-        if let Some(root) = self.known_worktree_roots.iter().chain(self.sidebar_model.projects.iter().flat_map(|project| project.worktrees.iter().map(|worktree| &worktree.path)))
-            .filter(|root| directory.starts_with(root)).max_by_key(|root| root.components().count())
+        if let Some(root) =
+            self.known_worktree_roots
+                .iter()
+                .chain(
+                    self.sidebar_model.projects.iter().flat_map(|project| {
+                        project.worktrees.iter().map(|worktree| &worktree.path)
+                    }),
+                )
+                .filter(|root| directory.starts_with(root))
+                .max_by_key(|root| root.components().count())
         {
             return ResumeDestination::Worktree(root.clone());
         }
-        let project = self.sidebar_model.projects.iter()
+        let project = self
+            .sidebar_model
+            .projects
+            .iter()
             .filter(|project| directory.starts_with(&project.repository))
-            .max_by_key(|project| project.repository.components().count()).map(|project| project.id);
+            .max_by_key(|project| project.repository.components().count())
+            .map(|project| project.id);
         if let Some(project) = project {
             let id = crate::model::ChannelId::new();
             let ordinal = self.next_provisional_ordinal();
-            Arc::make_mut(&mut self.durable).channels.push(crate::model::ProjectChannel {
-                id, project_id: project, title: title.to_owned(), title_source: crate::model::ChannelTitleSource::Prompt,
-                ordinal, shared: false, cards: Vec::new(), focused: None,
-            });
+            Arc::make_mut(&mut self.durable)
+                .channels
+                .push(crate::model::ProjectChannel {
+                    id,
+                    project_id: project,
+                    title: title.to_owned(),
+                    title_source: crate::model::ChannelTitleSource::Prompt,
+                    ordinal,
+                    shared: false,
+                    cards: Vec::new(),
+                    focused: None,
+                });
             self.publish_channel_creation(id, project);
             return ResumeDestination::Channel(id);
         }
-        if let Some(path) = &self.active_workspace { return ResumeDestination::Worktree(path.clone()); }
-        if let Some(id) = self.durable.active_channel { return ResumeDestination::Channel(id); }
+        if let Some(path) = &self.active_workspace {
+            return ResumeDestination::Worktree(path.clone());
+        }
+        if let Some(id) = self.durable.active_channel {
+            return ResumeDestination::Channel(id);
+        }
         ResumeDestination::Worktree(directory)
     }
 
@@ -1109,16 +1164,45 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let directory = tempfile::tempdir().unwrap();
         let project = ProjectId::new();
-        app.sidebar_model.projects.push(crate::sidebar::SidebarProject::new(project, crate::repository::RepositoryId::new(), "Recorded project".into(), directory.path().into(), Vec::new(), Vec::new()));
+        app.sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                project,
+                crate::repository::RepositoryId::new(),
+                "Recorded project".into(),
+                directory.path().into(),
+                Vec::new(),
+                Vec::new(),
+            ));
         let entry = saved(directory.path());
         drop(app.resume_saved_conversation(entry));
         let card = app.workspace.focused().unwrap();
-        let channel = app.durable.channels.iter().find(|channel| channel.cards.contains(&card)).unwrap();
+        let channel = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&card))
+            .unwrap();
         assert_eq!(channel.project_id, project);
         let channel = channel.id;
-        app.observe_agent_activity_for_card(card, Some(crate::agent::Activity { provider: Provider::Claude, state: crate::agent::ActivityState::Waiting }));
+        app.observe_agent_activity_for_card(
+            card,
+            Some(crate::agent::Activity {
+                provider: Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            }),
+        );
         app.refresh_sidebar_channels();
-        let row = app.sidebar_model.projects.iter().find(|row| row.id == project).unwrap().channels.iter().find(|row| row.id == channel).unwrap();
+        let row = app
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|row| row.id == project)
+            .unwrap()
+            .channels
+            .iter()
+            .find(|row| row.id == channel)
+            .unwrap();
         assert_eq!(row.activity, Some(crate::agent::ActivityState::Waiting));
         assert!(row.has_panes);
     }
@@ -1132,12 +1216,31 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         let project = ProjectId::new();
         let worktree = crate::model::WorktreeId::new();
-        app.sidebar_model.projects.push(crate::sidebar::SidebarProject::new(
-            project, crate::repository::RepositoryId::new(), "Recorded project".into(), directory.path().into(),
-            vec![crate::sidebar::SidebarWorktree::new(worktree, linked.clone(), Some("linked-branch".into()), false, false, None, None, None)], Vec::new()));
+        app.sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                project,
+                crate::repository::RepositoryId::new(),
+                "Recorded project".into(),
+                directory.path().into(),
+                vec![crate::sidebar::SidebarWorktree::new(
+                    worktree,
+                    linked.clone(),
+                    Some("linked-branch".into()),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                )],
+                Vec::new(),
+            ));
         let entry = saved(&nested);
         let launch = entry.session.launch.clone();
-        assert_eq!(app.resumed_conversation_destination(entry.card, &entry.session, &entry.title), ResumeDestination::Worktree(linked.clone()));
+        assert_eq!(
+            app.resumed_conversation_destination(entry.card, &entry.session, &entry.title),
+            ResumeDestination::Worktree(linked.clone())
+        );
         drop(app.resume_saved_conversation(entry));
         let card = app.workspace.focused().unwrap();
         assert_eq!(app.active_workspace.as_ref(), Some(&linked));
@@ -1145,10 +1248,21 @@ mod tests {
         assert!(app.durable.channels.is_empty());
         assert_eq!(app.durable.card_scopes.get(&card), Some(&linked));
         assert!(app.sidebar_state.worktree_has_panes(project, worktree));
-        let CardKind::Chat(resumed) = &app.card_state(card).unwrap().kind else { panic!("native chat"); };
+        let CardKind::Chat(resumed) = &app.card_state(card).unwrap().kind else {
+            panic!("native chat");
+        };
         assert_eq!(resumed.launch, launch);
-        app.observe_agent_activity_for_card(card, Some(crate::agent::Activity { provider: Provider::Claude, state: crate::agent::ActivityState::Waiting }));
-        assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(crate::agent::ActivityState::Waiting));
+        app.observe_agent_activity_for_card(
+            card,
+            Some(crate::agent::Activity {
+                provider: Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            }),
+        );
+        assert_eq!(
+            app.sidebar_state.agent_activity(project, worktree),
+            Some(crate::agent::ActivityState::Waiting)
+        );
     }
 
     #[test]
@@ -1158,10 +1272,21 @@ mod tests {
         let entry = saved(directory.path());
         let key = chat_ui::closing::draft_key(&entry.session).unwrap();
         let issued = entry.session.clone();
-        app.resume_indexed(Progress::Saved { entries: vec![entry.clone()], seeds: Vec::new().into(), error: None });
-        app.resume_indexed(Progress::Found { conversations: Vec::new(), titles: Vec::new(), models: vec![(entry.card, "catalog-model".into())], read: 1 });
+        app.resume_indexed(Progress::Saved {
+            entries: vec![entry.clone()],
+            seeds: Vec::new().into(),
+            error: None,
+        });
+        app.resume_indexed(Progress::Found {
+            conversations: Vec::new(),
+            titles: Vec::new(),
+            models: vec![(entry.card, "catalog-model".into())],
+            read: 1,
+        });
         assert_eq!(app.durable.conversation_models[&key], "catalog-model");
-        let Source::Saved(saved) = &app.resume_ui.rows[0].source else { panic!("saved descriptor"); };
+        let Source::Saved(saved) = &app.resume_ui.rows[0].source else {
+            panic!("saved descriptor");
+        };
         assert_eq!(saved.session, issued);
     }
 
@@ -1171,15 +1296,32 @@ mod tests {
         let current = tempfile::tempdir().unwrap();
         let foreign = tempfile::tempdir().unwrap();
         let project = ProjectId::new();
-        app.sidebar_model.projects.push(crate::sidebar::SidebarProject::new(project, crate::repository::RepositoryId::new(), "Current project".into(), current.path().into(), Vec::new(), Vec::new()));
+        app.sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                project,
+                crate::repository::RepositoryId::new(),
+                "Current project".into(),
+                current.path().into(),
+                Vec::new(),
+                Vec::new(),
+            ));
         app.active_workspace = Some(current.path().into());
         let entry = saved(foreign.path());
         let launch = entry.session.launch.clone();
-        assert_eq!(app.resumed_conversation_destination(entry.card, &entry.session, &entry.title), ResumeDestination::Worktree(current.path().into()));
+        assert_eq!(
+            app.resumed_conversation_destination(entry.card, &entry.session, &entry.title),
+            ResumeDestination::Worktree(current.path().into())
+        );
         drop(app.resume_saved_conversation(entry));
         let card = app.workspace.focused().unwrap();
-        assert_eq!(app.durable.card_scopes.get(&card).map(PathBuf::as_path), Some(current.path()));
-        let CardKind::Chat(resumed) = &app.card_state(card).unwrap().kind else { panic!("native chat"); };
+        assert_eq!(
+            app.durable.card_scopes.get(&card).map(PathBuf::as_path),
+            Some(current.path())
+        );
+        let CardKind::Chat(resumed) = &app.card_state(card).unwrap().kind else {
+            panic!("native chat");
+        };
         assert_eq!(resumed.launch, launch);
     }
 
@@ -1435,7 +1577,7 @@ mod tests {
                 Progress::Found {
                     conversations: vec![found(updated_at_unix_ms)],
                     titles: Vec::new(),
-                models: Vec::new(),
+                    models: Vec::new(),
                     read: 1,
                 },
             ));

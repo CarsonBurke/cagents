@@ -470,9 +470,7 @@ impl Cagents {
             Action::Cancel => {
                 if self.browser_import.busy() {
                     self.browser_import.confirm_cancel = true;
-                    return self.modal_focus(widget::Id::new(
-                        "browser-import.cancel",
-                    ));
+                    return self.modal_focus(widget::Id::new("browser-import.cancel"));
                 } else {
                     self.browser_import.phase = Phase::Closed;
                     self.browser_import.found.clear();

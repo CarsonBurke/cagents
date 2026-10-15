@@ -321,7 +321,9 @@ mod tests {
         let current = widget::Id::new("dialog.reset-settings.confirm");
         // Deliberately operate both surfaces: presence alone does not authorize
         // a lower feature to move focus out of the surviving modal.
-        let root = app.workspace.focused()
+        let root = app
+            .workspace
+            .focused()
             .map(|card| app.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
         let field = |id| -> Element<'_, Message> {
@@ -330,14 +332,19 @@ mod tests {
                 .on_input(|_| Message::DismissStatus)
                 .into()
         };
-        let content = widget::column::with_children(vec![field(root), field(current.clone())]).into();
+        let content =
+            widget::column::with_children(vec![field(root), field(current.clone())]).into();
         let feature = app.update_daemon_health_ui(Action::Finished(Ok(())));
         assert!(!app.daemon_health_ui.confirmation);
         assert_eq!(app.top_modal(), Some(modal_ui::Modal::SettingsReset));
         let completion = app.finish_modal_update(feature);
-        let task = iced::widget::operation::focus(current.clone()).map(cosmic::Action::App)
+        let task = iced::widget::operation::focus(current.clone())
+            .map(cosmic::Action::App)
             .chain(completion);
-        assert_eq!(super::super::tests::focused_element(content, task), Some(current));
+        assert_eq!(
+            super::super::tests::focused_element(content, task),
+            Some(current)
+        );
     }
 
     #[test]
@@ -353,40 +360,81 @@ mod tests {
         app.settings_reset_focus_confirm = false;
         app.core.set_keyboard_nav(false);
         let opening = app.finish_modal_update(Task::none());
-        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), opening),
-            Some(widget::Id::new("dialog.reset-settings.cancel")));
+        assert_eq!(
+            super::super::tests::focused_element(app.dialog().unwrap(), opening),
+            Some(widget::Id::new("dialog.reset-settings.cancel"))
+        );
         drop(app.update(Message::DaemonHealthUi(Action::Finished(Ok(())))));
-        assert!(app.core.keyboard_nav(), "the lower feature restored the ordinary Cosmic subscription");
+        assert!(
+            app.core.keyboard_nav(),
+            "the lower feature restored the ordinary Cosmic subscription"
+        );
         let renderer = super::super::tests::headless_renderer();
-        for (backwards, repeat, expected) in [(false, false, true), (true, false, false), (false, true, false)] {
+        for (backwards, repeat, expected) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
             let mut event = key(keyboard::key::Named::Tab);
-            if let keyboard::Event::KeyPressed { modifiers, repeat: repeated, .. } = &mut event {
-                *modifiers = if backwards { keyboard::Modifiers::SHIFT } else { keyboard::Modifiers::empty() };
+            if let keyboard::Event::KeyPressed {
+                modifiers,
+                repeat: repeated,
+                ..
+            } = &mut event
+            {
+                *modifiers = if backwards {
+                    keyboard::Modifiers::SHIFT
+                } else {
+                    keyboard::Modifiers::empty()
+                };
                 *repeated = repeat;
             }
             let captured = {
                 let mut dialog = app.dialog().unwrap();
                 let mut tree = Tree::new(&dialog);
                 let bounds = iced::Rectangle::with_size(iced::Size::new(800.0, 600.0));
-                let node = dialog.as_widget_mut().layout(&mut tree, &renderer,
-                    &layout::Limits::new(iced::Size::ZERO, bounds.size()));
+                let node = dialog.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+                );
                 let mut messages = Vec::new();
                 let mut shell = Shell::new(&mut messages);
-                dialog.as_widget_mut().update(&mut tree, &iced::Event::Keyboard(event.clone()),
-                    Layout::new(&node), mouse::Cursor::Unavailable, &renderer, &mut clipboard::Null, &mut shell, &bounds);
+                dialog.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Keyboard(event.clone()),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &bounds,
+                );
                 shell.is_event_captured()
             };
-            assert!(captured, "Cosmic's ignored-key subscription must not receive this Tab, including repeats");
+            assert!(
+                captured,
+                "Cosmic's ignored-key subscription must not receive this Tab, including repeats"
+            );
             let task = app.update(Message::KeyEvent { event, captured });
             assert_eq!(app.settings_reset_focus_confirm, expected);
             if !repeat {
-                assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), task),
-                    Some(widget::Id::new(if expected { "dialog.reset-settings.confirm" } else { "dialog.reset-settings.cancel" })));
+                assert_eq!(
+                    super::super::tests::focused_element(app.dialog().unwrap(), task),
+                    Some(widget::Id::new(if expected {
+                        "dialog.reset-settings.confirm"
+                    } else {
+                        "dialog.reset-settings.cancel"
+                    }))
+                );
             }
         }
         drop(app.update(Message::CancelResetSettings));
         assert!(!app.modal_is_open());
-        assert!(app.core.keyboard_nav(), "the final pop restores the original workspace choice, not the upper dialog's suppressed restore flag");
+        assert!(
+            app.core.keyboard_nav(),
+            "the final pop restores the original workspace choice, not the upper dialog's suppressed restore flag"
+        );
     }
 
     #[test]

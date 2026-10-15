@@ -4223,14 +4223,26 @@ impl Cagents {
         for (card, draft) in &chat_drafts {
             if let Some(CardKind::Chat(session)) = self.card_state(*card).map(|card| &card.kind)
                 && let Some(key) = closing::draft_key(session)
-            { conversation_drafts.insert(key, draft.clone()); }
+            {
+                conversation_drafts.insert(key, draft.clone());
+            }
         }
         for runtime in self.chat_ui.parked.values() {
             if let Some(key) = closing::draft_key(&runtime.session) {
-                if let Some(model) = runtime.snapshot.selected_model.as_ref().or(runtime.recorded_model.as_ref()) { conversation_models.insert(key.clone(), model.clone()); }
+                if let Some(model) = runtime
+                    .snapshot
+                    .selected_model
+                    .as_ref()
+                    .or(runtime.recorded_model.as_ref())
+                {
+                    conversation_models.insert(key.clone(), model.clone());
+                }
                 let draft = runtime.unsent_text();
-                if draft.is_empty() { conversation_drafts.remove(&key); }
-                else { conversation_drafts.insert(key, draft); }
+                if draft.is_empty() {
+                    conversation_drafts.remove(&key);
+                } else {
+                    conversation_drafts.insert(key, draft);
+                }
             }
         }
         for (card, state) in &self.cards {
@@ -4238,10 +4250,20 @@ impl Cagents {
                 && let Some(session) = self.chat_return_session(*card)
                 && let Some(key) = closing::draft_key(&session)
             {
-                if let Some(model) = runtime.snapshot.selected_model.as_ref().or(runtime.recorded_model.as_ref()) { conversation_models.insert(key.clone(), model.clone()); }
+                if let Some(model) = runtime
+                    .snapshot
+                    .selected_model
+                    .as_ref()
+                    .or(runtime.recorded_model.as_ref())
+                {
+                    conversation_models.insert(key.clone(), model.clone());
+                }
                 let draft = runtime.unsent_text();
-                if draft.is_empty() { conversation_drafts.remove(&key); }
-                else { conversation_drafts.insert(key, draft); }
+                if draft.is_empty() {
+                    conversation_drafts.remove(&key);
+                } else {
+                    conversation_drafts.insert(key, draft);
+                }
             }
         }
         let editors = self
@@ -4445,7 +4467,9 @@ impl Cagents {
         let card_id = CardId::new();
         if let Some(key) = closing::draft_key(&session)
             && let Some(draft) = self.durable.conversation_drafts.get(&key)
-        { self.chat_ui.drafts.insert(card_id, draft.clone()); }
+        {
+            self.chat_ui.drafts.insert(card_id, draft.clone());
+        }
         tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "chat");
         // A stopped terminal cannot be converted in place. If its chat had
         // been parked before a restart, the new conversation owns that text.
@@ -6299,7 +6323,9 @@ impl Cagents {
                             );
                             if let Some(key) = closing::draft_key(&session)
                                 && let Some(model) = self.durable.conversation_models.get(&key)
-                            { runtime.recorded_model = Some(model.clone()); }
+                            {
+                                runtime.recorded_model = Some(model.clone());
+                            }
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
@@ -7372,7 +7398,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7467,7 +7494,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -11200,14 +11228,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11226,7 +11259,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
@@ -12695,7 +12731,14 @@ mod tests {
     /// Explicitly end a conversation through its confirmation flow.
     fn request_end_chat(app: &mut Cagents, card: CardId) {
         drop(app.update(Message::ChatClose(closing::Action::End(card))));
-        if let Some(target) = app.chat_ui.close_dialog.as_ref().map(closing::Confirmation::target) { drop(app.update(Message::ChatClose(closing::Action::Confirm(target)))); }
+        if let Some(target) = app
+            .chat_ui
+            .close_dialog
+            .as_ref()
+            .map(closing::Confirmation::target)
+        {
+            drop(app.update(Message::ChatClose(closing::Action::Confirm(target))));
+        }
     }
 
     fn close_chat(app: &mut Cagents, card: CardId) {

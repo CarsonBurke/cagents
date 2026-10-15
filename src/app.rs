@@ -16796,7 +16796,11 @@ impl Application for Cagents {
         ))
         })();
         dialog.map(|dialog| {
-            let dialog = if top.owns_tab() { crate::interaction::modal_tabs(dialog) } else { dialog };
+            let dialog = if top.owns_tab() {
+                crate::interaction::modal_tabs(dialog)
+            } else {
+                dialog
+            };
             crate::interaction::observe_focus(dialog, self.modal_stack.focus_snapshot(top))
         })
     }
@@ -26877,7 +26881,17 @@ mod tests {
             "with nothing blocking it, the confirming button is offered: {labels:?}"
         );
 
-        let _ = app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete(match app.project_ui.modal_target(project_ui::ModalRole::WorktreeDelete).unwrap().request { project_ui::ModalRequest::Counter(request) => request, _ => unreachable!() })));
+        let _ = app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete(
+            match app
+                .project_ui
+                .modal_target(project_ui::ModalRole::WorktreeDelete)
+                .unwrap()
+                .request
+            {
+                project_ui::ModalRequest::Counter(request) => request,
+                _ => unreachable!(),
+            },
+        )));
         assert!(
             app.project_ui
                 .deleting_directory(Path::new("/repo/feature")),

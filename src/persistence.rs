@@ -6242,9 +6242,15 @@ mod tests {
         let database = directory.path().join("conversation-drafts.sqlite3");
         let boot_id = boot("conversation-drafts");
         let mut workspace = workspace_with_terminal(&boot_id);
-        workspace.conversation_drafts.insert("Codex:session-id".into(), "retained prompt".into());
-        workspace.conversation_models.insert("Codex:session-id".into(), "recorded-model".into());
-        workspace.conversation_channels.insert("Codex:session-id".into(), ChannelId::new());
+        workspace
+            .conversation_drafts
+            .insert("Codex:session-id".into(), "retained prompt".into());
+        workspace
+            .conversation_models
+            .insert("Codex:session-id".into(), "recorded-model".into());
+        workspace
+            .conversation_channels
+            .insert("Codex:session-id".into(), ChannelId::new());
         let store = StateStore::open(&database, boot_id).unwrap();
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
@@ -6253,12 +6259,31 @@ mod tests {
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.conversation_drafts, workspace.conversation_drafts);
         assert_eq!(restored.conversation_models, workspace.conversation_models);
-        assert_eq!(restored.conversation_channels, workspace.conversation_channels);
-        assert_eq!(store.load_workspace_manifest(workspace.id).unwrap().unwrap().conversation_drafts, workspace.conversation_drafts);
+        assert_eq!(
+            restored.conversation_channels,
+            workspace.conversation_channels
+        );
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .conversation_drafts,
+            workspace.conversation_drafts
+        );
         let mut legacy = serde_json::to_value(&workspace).unwrap();
-        legacy.as_object_mut().unwrap().remove("conversation_drafts");
-        legacy.as_object_mut().unwrap().remove("conversation_models");
-        legacy.as_object_mut().unwrap().remove("conversation_channels");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_drafts");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_models");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_channels");
         let legacy = serde_json::from_value::<WorkspaceState>(legacy).unwrap();
         assert!(legacy.conversation_drafts.is_empty());
         assert!(legacy.conversation_models.is_empty());
