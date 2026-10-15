@@ -2914,7 +2914,8 @@ impl RepositoryRuntime {
         document.content.restore_scroll_position(text_editor::ScrollPosition { line: version.mapping.map(scroll.line), ..scroll });
         document.external_version = None; document.external_deleted = false; document.external_check_pending = false; document.recreate_missing = false;
         self.disk_comparison = None;
-        self.diffs.retain(|(basis, _)| basis.is_immutable());
+        // The index baseline is unchanged by a file write. Keep it for the
+        // revision-aware working-diff worker instead of discarding the gutter.
         self.working_diff.applied = None;
         self.push_lsp_edits(edits);
         Task::batch([self.markdown_task(card), self.ensure_current_diff(card)])
