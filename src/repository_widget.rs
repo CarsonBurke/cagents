@@ -15,6 +15,8 @@ pub(crate) mod text_editor;
 
 mod diff_actions;
 mod diff_layout;
+mod diff_mutations;
+pub use diff_mutations::Request as DiffMutationRequest;
 mod preview;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
@@ -353,6 +355,70 @@ struct EditorLanguageState {
     hover_at: Option<text_editor::Position>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictChoice {
+    Current,
+    Incoming,
+    Both,
+}
+
+#[derive(Debug, Clone)]
+struct ConflictBlock {
+    start: usize,
+    end: usize,
+    current: String,
+    incoming: String,
+}
+
+fn conflict_blocks(text: &str) -> Vec<ConflictBlock> {
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    let mut blocks = Vec::new();
+    let mut start = None;
+    let mut ancestor = None;
+    let mut separator = None;
+    let mut invalid = false;
+    for (line, text) in lines.iter().enumerate() {
+        if text.starts_with("<<<<<<<") {
+            if start.is_some() {
+                invalid = true;
+            } else {
+                start = Some(line);
+                ancestor = None;
+                separator = None;
+                invalid = false;
+            }
+        } else if start.is_some() && text.starts_with("|||||||") {
+            if ancestor.is_some() || separator.is_some() {
+                invalid = true;
+            } else {
+                ancestor = Some(line);
+            }
+        } else if start.is_some() && text.starts_with("=======") {
+            if separator.is_some() {
+                invalid = true;
+            } else {
+                separator = Some(line);
+            }
+        } else if text.starts_with(">>>>>>>") && start.is_some() {
+            if let (Some(start_line), Some(separator_line)) = (start.take(), separator.take()) {
+                if !invalid {
+                    blocks.push(ConflictBlock {
+                        start: start_line,
+                        end: line,
+                        current: lines[start_line + 1..ancestor.unwrap_or(separator_line)].concat(),
+                        incoming: lines[separator_line + 1..line].concat(),
+                    });
+                }
+            }
+            start = None;
+            ancestor = None;
+            separator = None;
+            invalid = false;
+        }
+    }
+    blocks
+}
+
 #[derive(Debug, Clone)]
 pub enum RepositoryAction {
     Review {
@@ -495,6 +561,12 @@ pub enum RepositoryAction {
         before: Arc<str>,
         result: Result<Option<WorkingDiffOutput>, String>,
     },
+    ResolveConflictBlock {
+        card: CardId,
+        revision: u64,
+        index: usize,
+        choice: ConflictChoice,
+    },
     EditorAction {
         card: CardId,
         action: text_editor::Action,
@@ -551,6 +623,15 @@ pub enum RepositoryAction {
     StageSelected {
         card: CardId,
         stage: bool,
+    },
+    ApplyDiffSelection {
+        card: CardId,
+        kind: crate::git_patch::Kind,
+    },
+    ApplyDiffHunk {
+        card: CardId,
+        kind: crate::git_patch::Kind,
+        request: Arc<DiffMutationRequest>,
     },
     ApplySourceSurface {
         card: CardId,
@@ -754,6 +835,7 @@ impl RepositoryAction {
             | Self::OpenWorkingDiff { card, .. }
             | Self::OpenCommittedFile { card, .. }
             | Self::SelectBranchBase { card, .. }
+            | Self::ResolveConflictBlock { card, .. }
             | Self::EditorAction { card, .. }
             | Self::Language { card, .. }
             | Self::Clipboard { card, .. }
@@ -765,6 +847,8 @@ impl RepositoryAction {
             | Self::BackToFiles { card }
             | Self::OpenExternal { card, .. }
             | Self::StageSelected { card, .. }
+            | Self::ApplyDiffSelection { card, .. }
+            | Self::ApplyDiffHunk { card, .. }
             | Self::ApplySourceSurface { card, .. }
             | Self::ApplyMarkdownMode { card, .. }
             | Self::ApplyDiffMode { card, .. }
@@ -873,6 +957,9 @@ struct EditorDocument {
     lsp_version: i32,
     active_save: Option<SaveTicket>,
     conflict: bool,
+    merge_conflicts: Vec<ConflictBlock>,
+    conflict_marker_lines: Vec<usize>,
+    conflict_editing: bool,
     error: Option<String>,
     durability_warning: Option<String>,
     /// Undo and redo for this buffer. It lives exactly as long as the buffer:
@@ -911,6 +998,15 @@ impl EditorDocument {
     ) -> Self {
         let content = text_editor::Content::with_text(&text);
         let saved_snapshot = content.text_snapshot();
+        let merge_conflicts = conflict_blocks(&text);
+        let conflict_marker_lines = text
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                crate::repository::has_conflict_markers(line.as_bytes()).then_some(index)
+            })
+            .collect();
+        let conflict_editing = !merge_conflicts.is_empty();
         Self {
             path,
             source,
@@ -935,6 +1031,9 @@ impl EditorDocument {
             lsp_version: 1,
             active_save: None,
             conflict: false,
+            merge_conflicts,
+            conflict_marker_lines,
+            conflict_editing,
             error: None,
             durability_warning: None,
             history: History::default(),
@@ -1007,6 +1106,17 @@ impl EditorDocument {
         self.revision = self.revision.wrapping_add(1).max(1);
         self.refresh_dirty();
         self.markdown_stale = true;
+        if self.conflict_editing {
+            let text = self.content.text();
+            self.merge_conflicts = conflict_blocks(&text);
+            self.conflict_marker_lines = text
+                .lines()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    crate::repository::has_conflict_markers(line.as_bytes()).then_some(index)
+                })
+                .collect();
+        }
         if let Some(cancel) = &self.diagram_cancel {
             cancel.0.cancel();
         }
@@ -4545,6 +4655,8 @@ impl RepositoryRuntime {
         let ignore_whitespace = self.diff_ignore_whitespace;
         let font = self.editor_font;
         let present = [self.diff_model().is_none_or(|model| model.present[0]), true];
+        let source_head = self.diff_model().and_then(|model| model.source_head.clone());
+        let modes = self.diff_model().map_or([None; 2], |model| model.modes);
         self.working_diff.active = Some(WorkingDiffJob {
             identity: identity.clone(),
             revision,
@@ -4563,6 +4675,8 @@ impl RepositoryRuntime {
                 let model = if rich {
                     let mut model = build_document_diff_sources_with_font(Arc::clone(&baseline), Arc::clone(&after), &source, syntax_theme, ignore_whitespace, font, &cancellation)?;
                     model.present = present;
+                    model.source_head = source_head;
+                    model.modes = modes;
                     Some(model)
                 } else { None };
                 let additions = if let Some(model) = &model { added_source_lines(model) }
@@ -5212,7 +5326,9 @@ impl RepositoryRuntime {
             RepositoryAction::NewTerminal { .. }
             | RepositoryAction::DirectorySearchLoaded { .. } => Task::none(),
             RepositoryAction::Clipboard { card, op } => self.clipboard(card, op),
-            RepositoryAction::StageSelected { .. } => Task::none(),
+            RepositoryAction::StageSelected { .. }
+            | RepositoryAction::ApplyDiffSelection { .. }
+            | RepositoryAction::ApplyDiffHunk { .. } => Task::none(),
             RepositoryAction::FileListUnchanged { identity } => {
                 if !self.accepts_file_list(&identity) || identity.path != Path::new(".") {
                     return Task::none();
@@ -5665,6 +5781,59 @@ impl RepositoryRuntime {
                     }
                 }
                 Task::none()
+            }
+            RepositoryAction::ResolveConflictBlock {
+                card,
+                revision,
+                index,
+                choice,
+            } => {
+                if self.source_surface != SourceSurface::Editor {
+                    return Task::none();
+                }
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
+                if document.revision != revision {
+                    return Task::none();
+                }
+                let Some(block) = document.merge_conflicts.get(index).cloned() else {
+                    return Task::none();
+                };
+                let replacement = match choice {
+                    ConflictChoice::Current => block.current,
+                    ConflictChoice::Incoming => block.incoming,
+                    ConflictChoice::Both => format!("{}{}", block.current, block.incoming),
+                };
+                let start = text_editor::Position {
+                    line: block.start,
+                    column: 0,
+                };
+                let end = if block.end + 1 < document.content.line_count() {
+                    text_editor::Position {
+                        line: block.end + 1,
+                        column: 0,
+                    }
+                } else {
+                    text_editor::Position {
+                        line: block.end,
+                        column: document
+                            .content
+                            .line(block.end)
+                            .map_or(0, |line| line.text.len()),
+                    }
+                };
+                document.history.seal();
+                document.content.move_to(text_editor::Cursor {
+                    position: end,
+                    selection: Some(start),
+                });
+                document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+                    Arc::new(replacement),
+                )));
+                document.history.seal();
+                self.push_lsp_change(None);
+                self.markdown_task(card)
             }
             RepositoryAction::EditorAction { card, action } => {
                 // No buffer is mounted outside Edit, so an action arriving
@@ -7656,6 +7825,7 @@ fn resolve_basis(worktree: &Path, choice: CommittedChoice) -> Result<ResolvedBas
                 .snapshot_with_options(
                     worktree,
                     crate::repository::SnapshotOptions {
+                        status_limit: None,
                         untracked_changes: false,
                         untracked_files: false,
                     },
@@ -9410,6 +9580,45 @@ fn editable_document_view<'a>(
                 .padding(space::M)
                 .into(),
             )
+        } else if !document.merge_conflicts.is_empty() {
+            Some(
+                widget::container(
+                    widget::row::with_children(vec![
+                        widget::button::text("Accept current")
+                            .on_press(RepositoryAction::ResolveConflictBlock {
+                                card,
+                                revision: document.revision,
+                                index: 0,
+                                choice: ConflictChoice::Current,
+                            })
+                            .into(),
+                        widget::button::text("Accept incoming")
+                            .on_press(RepositoryAction::ResolveConflictBlock {
+                                card,
+                                revision: document.revision,
+                                index: 0,
+                                choice: ConflictChoice::Incoming,
+                            })
+                            .into(),
+                        widget::button::text("Accept both")
+                            .on_press(RepositoryAction::ResolveConflictBlock {
+                                card,
+                                revision: document.revision,
+                                index: 0,
+                                choice: ConflictChoice::Both,
+                            })
+                            .into(),
+                    ])
+                    .spacing(space::XS),
+                )
+                .class(crate::design::surface(
+                    Some(crate::design::raised),
+                    [crate::design::RADIUS_S; 4],
+                    true,
+                ))
+                .padding(space::XS)
+                .into(),
+            )
         } else {
             None
         };
@@ -9438,7 +9647,9 @@ fn editable_document_view<'a>(
             .line_height(iced::widget::text::LineHeight::Relative(
                 runtime.line_height,
             ))
-            .added_lines(if runtime.working_annotations_current() {
+            .added_lines(if !document.conflict_marker_lines.is_empty() {
+                &document.conflict_marker_lines
+            } else if runtime.working_annotations_current() {
                 &runtime.working_diff.additions
             } else {
                 &[]
@@ -9446,7 +9657,15 @@ fn editable_document_view<'a>(
             .diagnostics(&runtime.language.marks)
             .popup(
                 popup,
-                if runtime.language.completions.is_empty() {
+                if runtime.language.completions.is_empty() && runtime.language.hover.is_empty() {
+                    document
+                        .merge_conflicts
+                        .first()
+                        .map(|block| text_editor::Position {
+                            line: block.start,
+                            column: 0,
+                        })
+                } else if runtime.language.completions.is_empty() {
                     runtime.language.hover_at
                 } else {
                     None
@@ -9928,6 +10147,7 @@ fn no_text_view_height(
             new,
             old_label,
             new_label,
+            ..
         } => information_state_height(
             format!("No text diff between {old_label} and {new_label}"),
             [(old_label, old), (new_label, new)]
@@ -10039,11 +10259,10 @@ fn diff_model_view<'a>(
             let gutter =
                 (model.row_count(DiffMode::Inline).max(1).ilog10() + 1).max(4) as f32 * 8.0 + 12.0;
             let code_width = (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32
-                * runtime.editor_font_size
-                / DIFF_FONT_SIZE)
-                .max(1.0);
-            let geometry = DiffScrollGeometry::new(size.width, gutter, runtime.diff_mode);
-            let viewport_width = geometry.viewport_width;
+                * runtime.editor_font_size / DIFF_FONT_SIZE).max(1.0);
+            let mutation_gutter = if diff_mutations::local_basis(runtime) { diff_mutations::GUTTER_WIDTH } else { 0.0 };
+            let geometry = DiffScrollGeometry::new(size.width - mutation_gutter, gutter, runtime.diff_mode);
+            let viewport_width = geometry.viewport_width + mutation_gutter;
             let overflow = geometry.overflow(code_width);
             let horizontal = runtime.diff_horizontal.clamp(0.0, overflow);
             let layout = runtime
@@ -10142,6 +10361,11 @@ fn diff_model_view<'a>(
                         Some(diff_actions::RowContext { card, runtime, row }),
                     ),
                 };
+                let code = if mutation_gutter > 0.0 {
+                    widget::row::with_children([
+                        diff_mutations::gutter(card, runtime, model, row, runtime.diff_typography().line_height), code,
+                    ]).height(runtime.diff_typography().line_height).width(Length::Fill).into()
+                } else { code };
                 if let Some(ctx) =
                     context.filter(|ctx| ctx.review.has_annotation(ctx.path, old, new, false))
                 {
@@ -10225,7 +10449,10 @@ fn diff_model_view<'a>(
         })
         .into()
     };
-    rows
+    if diff_mutations::local_basis(runtime) {
+        widget::column::with_children([diff_mutations::selection_controls(card, runtime), rows])
+            .width(Length::Fill).height(Length::Fill).into()
+    } else { rows }
 }
 
 #[derive(Clone, Copy)]
@@ -11863,6 +12090,18 @@ mod tests {
     }
 
     #[test]
+    fn merge_marker_blocks_support_diff3_and_both_resolution() {
+        let blocks = conflict_blocks(
+            "before\n<<<<<<< HEAD\nours\n||||||| base\nold\n=======\ntheirs\n>>>>>>> incoming\nafter\n",
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].start, 1);
+        assert_eq!(blocks[0].end, 7);
+        assert_eq!(blocks[0].current, "ours\n");
+        assert_eq!(blocks[0].incoming, "theirs\n");
+    }
+
+    #[test]
     fn restored_editor_navigation_rejects_other_recipes_and_escaping_paths() {
         let card = CardId::new();
         let (runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "saved");
@@ -13279,6 +13518,8 @@ mod tests {
                     },
                     old_label: "old".into(),
                     new_label: "new".into(),
+                    source_head: None,
+                    modes: [None; 2],
                 },
                 Path::new("kernel.cu"),
                 crate::settings::EditorSyntaxTheme::Auto,
@@ -14768,6 +15009,8 @@ mod tests {
             DiffState::ready(staged_text_diff(DiffModel {
                 line_counts: [0; 2],
                 present: [true; 2],
+                source_head: None,
+                modes: [None; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
                 inline_rows: Vec::new(),
@@ -15650,6 +15893,8 @@ mod tests {
             DiffState::ready(staged_text_diff(DiffModel {
                 line_counts: [0; 2],
                 present: [true; 2],
+                source_head: None,
+                modes: [None; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
                 inline_rows: vec![inline; 100_000],
@@ -16206,6 +16451,8 @@ mod tests {
             DiffState::ready(staged_text_diff(DiffModel {
                 line_counts: [0; 2],
                 present: [true; 2],
+                source_head: None,
+                modes: [None; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
                 inline_rows: vec![
@@ -18542,6 +18789,8 @@ mod tests {
                     new,
                     old_label: "Index".into(),
                     new_label: "Working tree".into(),
+                    source_head: None,
+                    modes: [None; 2],
                 })),
             );
             assert_eq!(runtime.inspector_context().diff_state, Some(expected));
@@ -18598,6 +18847,8 @@ mod tests {
         DiffModel {
             line_counts: [0; 2],
             present: [true; 2],
+            source_head: None,
+            modes: [None; 2],
             before: Arc::from(""),
             after: Arc::from(""),
             inline_rows: Vec::new(),
@@ -20189,6 +20440,44 @@ mod tests {
             assert_ne!(adjusted, iced::Color::WHITE);
             assert_ne!(adjusted, iced::Color::BLACK);
             assert!(adjusted.b > adjusted.r && adjusted.r > adjusted.g);
+        }
+    }
+    #[test]
+    fn resolving_each_conflict_choice_is_one_undo_step() {
+        let original = "prefix\n<<<<<<< HEAD\nours\n||||||| base\nancestor\n=======\ntheirs\n>>>>>>> incoming\nsuffix\n";
+        for (choice, selected) in [
+            (ConflictChoice::Current, "ours\n"),
+            (ConflictChoice::Incoming, "theirs\n"),
+            (ConflictChoice::Both, "ours\ntheirs\n"),
+        ] {
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, original);
+            let revision = match &runtime.document {
+                DocumentState::Editable(document) => document.revision,
+                _ => panic!("editable fixture"),
+            };
+            drop(runtime.update(RepositoryAction::ResolveConflictBlock {
+                card,
+                revision,
+                index: 0,
+                choice,
+            }));
+            assert_eq!(buffer_text(&runtime), format!("prefix\n{selected}suffix\n"));
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(buffer_text(&runtime), original);
+            drop(runtime.update(RepositoryAction::Redo { card }));
+            assert_eq!(buffer_text(&runtime), format!("prefix\n{selected}suffix\n"));
+        }
+    }
+
+    #[test]
+    fn malformed_conflict_markers_never_produce_invalid_ranges() {
+        for text in [
+            "<<<<<<< ours\n=======\n||||||| misplaced\n>>>>>>> theirs\n",
+            "<<<<<<< ours\n=======\n=======\n>>>>>>> theirs\n",
+            "<<<<<<< outer\n<<<<<<< nested\n=======\n>>>>>>> theirs\n",
+        ] {
+            assert!(conflict_blocks(text).is_empty(), "{text}");
         }
     }
 }

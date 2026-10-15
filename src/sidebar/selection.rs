@@ -70,6 +70,10 @@ impl PartialEq for Selection {
 impl Eq for Selection {}
 
 impl Selection {
+    pub(super) fn iter(&self) -> impl Iterator<Item = Row> + '_ {
+        self.rows.iter().copied()
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
