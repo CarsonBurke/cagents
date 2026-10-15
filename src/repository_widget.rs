@@ -2892,7 +2892,7 @@ impl RepositoryRuntime {
     /// replacement and no-op touches are distinguished by the later hash.
     pub fn refresh_open_document(&mut self, card: CardId) -> Task<RepositoryAction> {
         let DocumentState::Editable(document) = &self.document else { return Task::none(); };
-        if document.active_save.is_some() || self.disk_poll.is_some_and(|(_, started)| started.elapsed() < Duration::from_secs(5)) { return Task::none(); }
+        if document.active_save.is_some() || self.disk_poll.is_some() { return Task::none(); }
         let source = document.source.clone();
         let identity = self.current_identity(card, document.path.clone());
         let worktree = identity.worktree.clone(); let path = identity.path.clone();
@@ -2903,6 +2903,8 @@ impl RepositoryRuntime {
             RepositoryAction::DiskMetadata { identity, ticket, result }
         })
     }
+
+    pub fn has_editable_document(&self) -> bool { matches!(&self.document, DocumentState::Editable(_)) }
 
     /// Whether a comparison reader already owns the single refresh slot.
     pub fn comparison_refresh_pending(&self) -> bool {
@@ -12350,6 +12352,18 @@ mod tests {
             text: after.into(), content_hash: blake3::hash(after.as_bytes()), source: path, markdown: false,
             mapping: crate::editor_reload::LineMap::between(before, after),
         }) }));
+    }
+
+    #[test]
+    fn slow_document_metadata_probe_keeps_its_slot_after_five_seconds() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", "body");
+        runtime.next_disk_poll = 7;
+        let started = Instant::now().checked_sub(Duration::from_secs(6)).unwrap();
+        runtime.disk_poll = Some((7, started));
+        drop(runtime.refresh_open_document(card));
+        assert_eq!(runtime.next_disk_poll, 7);
+        assert_eq!(runtime.disk_poll, Some((7, started)));
     }
 
     #[test]

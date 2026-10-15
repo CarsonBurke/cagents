@@ -173,18 +173,22 @@ pub enum Action {
 
 impl Cagents {
     pub(super) fn refresh_subscription(&self) -> Subscription<Message> {
-        if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared {
-            return Subscription::none();
-        }
+        let sidebar = if self.refresh_ui.focused && !self.modal_is_open() && !self.update_prepared {
+            cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::RefreshUi(Action::Tick))
+        } else { Subscription::none() };
+        let documents = if !self.update_prepared && !crate::device::is_remote()
+            && self.cards.values().any(|runtime| matches!(runtime, CardRuntime::Repository(runtime) if runtime.has_editable_document())) {
+            cosmic::iced::time::every(Duration::from_secs(1)).map(|_| Message::RefreshUi(Action::DocumentsTick))
+        } else { Subscription::none() };
         Subscription::batch([
-            cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::RefreshUi(Action::Tick)),
-            cosmic::iced::time::every(Duration::from_secs(1)).map(|_| Message::RefreshUi(Action::DocumentsTick)),
+            sidebar,
+            documents,
         ])
     }
 
     pub(super) fn update_refresh(&mut self, action: Action) -> Task<Message> {
         if matches!(action, Action::DocumentsTick) {
-            if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared || crate::device::is_remote() { return Task::none(); }
+            if self.update_prepared || crate::device::is_remote() { return Task::none(); }
             return Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| match runtime {
                 CardRuntime::Repository(runtime) => Some(repository_task(runtime.refresh_open_document(card))),
                 _ => None,
@@ -394,6 +398,39 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn open_document_refresh_runs_while_the_window_is_unfocused_and_a_modal_is_open() {
+        use cosmic::iced::futures::StreamExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.rs"), "before\n").unwrap();
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", "before\n");
+        runtime.descriptor.repository = root.path().to_path_buf();
+        runtime.descriptor.worktree = root.path().to_path_buf();
+        runtime.set_auto_save(false);
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.lsp = crate::lsp::LspManager::new(Vec::new());
+        app.cards.clear();
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.refresh_ui.focused = false;
+        app.settings_reset_confirm = true;
+        assert!(app.modal_is_open());
+        std::fs::write(root.path().join("file.rs"), "outside\n").unwrap();
+        let mut pending = vec![app.update_refresh(Action::DocumentsTick)];
+        while let Some(task) = pending.pop() {
+            if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                        pending.push(app.update(message));
+                    }
+                }
+            }
+        }
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.editor_text().as_deref() == Some("outside\n")));
+        assert!(!app.refresh_ui.focused);
+        assert!(app.modal_is_open());
+    }
 
     fn projects<const N: usize>() -> [ProjectId; N] {
         std::array::from_fn(|_| ProjectId::new())

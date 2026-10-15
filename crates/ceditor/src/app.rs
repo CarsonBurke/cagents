@@ -2312,12 +2312,12 @@ impl Editor {
     }
 
     fn refresh_documents(&mut self) -> Task<Message> {
-        if !self.can_refresh_visible() { return Task::none(); }
+        if !self.can_refresh_documents() { return Task::none(); }
         let mut tasks = Vec::new();
         for tab in &mut self.tabs {
             tasks.push(repository_task(tab.runtime.refresh_open_document(tab.id)));
             let basis = tab.runtime.selected_diff_basis();
-            if !tab.git || matches!(basis, DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. })
+            if !tab.git || (!tab.runtime.has_editable_document() && !tab.runtime.shows_diff()) || matches!(basis, DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. })
                 || tab.comparison_probe.is_some() { continue; }
             let Some(path) = tab.runtime.selected_path().map(Path::to_path_buf) else { continue; };
             let basis = basis.clone();
@@ -2334,6 +2334,11 @@ impl Editor {
             }));
         }
         Task::batch(tasks)
+    }
+
+    fn can_refresh_documents(&self) -> bool {
+        !self.exiting && self.tabs.iter().any(|tab| tab.runtime.has_editable_document()
+            || (tab.git && tab.runtime.shows_diff() && !matches!(tab.runtime.selected_diff_basis(), DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. })))
     }
 
     fn comparison_metadata(&mut self, card: CardId, request: u64, path: PathBuf, basis: DiffBasis, result: Result<cagents::repository::RepositoryMetadataStamp, String>) -> Task<Message> {
@@ -4596,7 +4601,7 @@ impl Application for Editor {
         } else {
             Subscription::none()
         };
-        let documents = if self.can_refresh_visible() {
+        let documents = if self.can_refresh_documents() {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::RefreshDocuments)
         } else { Subscription::none() };
         let frames = if self.sidebar_transition.is_some() {
@@ -7590,6 +7595,7 @@ mod tests {
         std::fs::write(input.path(), "staged one\nstaged two\nstaged three\n").unwrap();
         let blob = git(root, &["hash-object", "-w", input.path().to_str().unwrap()]);
         git(root, &["update-index", "--cacheinfo", "100644", &blob, "tracked.txt"]);
+        app.window_focused = false;
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
         let tab = app.tab(card).unwrap();
@@ -7664,10 +7670,13 @@ mod tests {
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
         assert!(matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &initial));
+        app.window_focused = false;
+        app.settings_open = true;
         git(root, &["update-ref", "refs/heads/main", head.as_str()]);
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
         assert!(matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &head));
+        app.settings_open = false;
         assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "topic one\ntopic two\n");
         let before_failure = app.tab(card).unwrap().comparison_stamp.as_ref().unwrap().2.clone();
         let resolve = app.tab_mut(card).unwrap().runtime.refresh_open_comparison(card);
@@ -7741,12 +7750,15 @@ mod tests {
         let dirty = app.tab(b).unwrap().runtime.editor_text().unwrap();
         std::fs::write(root.join("a.rs"), "outside a\n").unwrap();
         std::fs::write(root.join("b.rs"), "outside b\n").unwrap();
+        app.window_focused = false;
+        app.settings_open = true;
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
         assert_eq!(app.active, Some(b));
         assert_eq!(app.tab(a).unwrap().runtime.editor_text().as_deref(), Some("outside a\n"));
         assert_eq!(app.tab(b).unwrap().runtime.editor_text().as_deref(), Some(dirty.as_str()));
         assert_eq!(std::fs::read_to_string(root.join("b.rs")).unwrap(), "outside b\n");
+        app.settings_open = false;
         drop(app.update(Message::Repository(RepositoryAction::Undo { card: a })));
         assert_eq!(app.tab(a).unwrap().runtime.editor_text().as_deref(), Some("before a\n"));
     }
