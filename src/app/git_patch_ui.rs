@@ -130,7 +130,12 @@ impl Cagents {
         pending: Pending,
         result: Result<Option<repository_widget::PreparedDiffMutation>, String>,
     ) -> Task<Message> {
-        if self.exit.is_some() || self.publication_recovery_blocks(&key.canonical_path) { return Task::none(); }
+        // Completion must fill/settle its original reservation even when a
+        // later recovery or shutdown forbids the prepared effect.
+        let result = match self.git_effect_block_reason(&key.canonical_path) {
+            Some(reason) => Err(reason.into()),
+            None => result,
+        };
         if pending.buffer_only {
             if pending
                 .result
@@ -188,6 +193,13 @@ impl Cagents {
         if self.modal_is_open() || !self.prepared_diff_binding_current(&pending) {
             return Task::none();
         }
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&pending.card) else {
+            return Task::none();
+        };
+        if let Some(reason) = self.git_effect_block_reason(&runtime.descriptor.worktree) {
+            self.status = Some(TransientNotice::warning(reason));
+            return Task::none();
+        }
         let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&pending.card) else {
             return Task::none();
         };
@@ -235,6 +247,9 @@ impl Cagents {
             }
             Err(error) => return self.update(complete(Some(error.clone()))),
         };
+        if let Some(reason) = self.git_effect_block_reason(&key.canonical_path) {
+            return self.update(complete(Some(reason.into())));
+        }
         if self.modal_is_open() || !self.prepared_diff_binding_current(&pending) {
             return self.update(complete(Some(
                 "The original Git source changed. Retry the selected change.".into(),
@@ -379,6 +394,112 @@ mod tests {
             }
         }
         panic!("expected worker receipt");
+    }
+
+    fn git_text(root: &Path, arguments: &[&str]) -> String {
+        let output = super::super::git_binding::tests::git(root, arguments);
+        assert!(output.status.success(), "{arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn committed_base(root: &Path) {
+        std::fs::write(root.join("file.txt"), "original\nkeep\n").unwrap();
+        git_text(root, &["add", "file.txt"]);
+        git_text(root, &["commit", "-m", "base"]);
+        std::fs::write(root.join("file.txt"), "changed\nkeep\n").unwrap();
+    }
+
+    fn retain_recovery(app: &mut Cagents, root: &Path) -> crate::editor::RecoveryAuthority {
+        let authority = crate::editor::RecoverySlot::reserve().unwrap()
+            .retain("held publication cleanup".into(), || Ok(()));
+        drop(app.update(Message::EditorFeatures(editor_features::Action::Published {
+            ticket: u64::MAX,
+            result: Err(crate::editor_workspace_edit::PublicationFailure {
+                message: "publication cleanup remains pending".into(), recovery: Some(authority.clone()),
+                worktree: Some(root.to_owned()),
+            }),
+        })));
+        assert!(app.publication_recovery_blocks(root));
+        authority
+    }
+
+    #[tokio::test]
+    async fn actual_preparation_receipt_retires_its_reservation_after_recovery_or_exit() {
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        for shutdown in [false, true] {
+            let (temporary, mut app, card, key) = fixture();
+            let root = temporary.path();
+            committed_base(root);
+            let receipt = worker_message(app.start_diff_patch(card, git_patch::Kind::Stage, None),
+                |message| matches!(message, Message::DiffPatchPrepared { .. })).await;
+            let Message::DiffPatchPrepared { pending, result: Ok(Some(_)), .. } = &receipt else {
+                panic!("the actual preparation worker must complete before the new refusal");
+            };
+            let pending = pending.clone();
+            std::fs::write(root.join("queued.txt"), "must remain untracked\n").unwrap();
+            drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![
+                crate::repository::PathSelection::new(RepoPath::parse("queued.txt").unwrap())])));
+            assert_eq!(app.source_control_mutations[&key.canonical_path].pending.len(), 1);
+            let _recovery = if shutdown {
+                drop(app.exit_after_language_servers());
+                assert!(app.exit.is_some());
+                None
+            } else { Some(retain_recovery(&mut app, root)) };
+            drop(app.update(receipt));
+            assert!(matches!(pending.result.get(), Some(Err(_))), "the exact owned slot records refusal");
+            assert!(app.source_control_mutations.is_empty(), "completion must release the reserved turn");
+            assert_eq!(git_text(root, &["show", ":file.txt"]), "original\nkeep\n");
+            assert!(git_text(root, &["diff", "--cached", "--name-only"]).trim().is_empty());
+            assert_eq!(std::fs::read_to_string(root.join("queued.txt")).unwrap(), "must remain untracked\n");
+            assert!(git_text(root, &["ls-files", "--", "queued.txt"]).is_empty());
+            // A duplicate receipt cannot recreate or fill a newer reservation.
+            drop(app.finish_diff_patch(key, pending, Ok(None)));
+            assert!(app.source_control_mutations.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_successor_cannot_start_after_recovery_overtakes_an_earlier_actual_turn() {
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        let (temporary, mut app, card, key) = fixture();
+        let root = temporary.path();
+        committed_base(root);
+        std::fs::write(root.join("earlier.txt"), "completed earlier turn\n").unwrap();
+        let first = app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![
+            crate::repository::PathSelection::new(RepoPath::parse("earlier.txt").unwrap())]));
+        let prepared = worker_message(app.start_diff_patch(card, git_patch::Kind::Stage, None),
+            |message| matches!(message, Message::DiffPatchPrepared { .. })).await;
+        drop(app.update(prepared));
+        assert_eq!(app.source_control_mutations[&key.canonical_path].pending.len(), 1);
+        let completed = worker_message(first, |message| matches!(message, Message::SourceControlMutated { .. })).await;
+        assert!(matches!(&completed, Message::SourceControlMutated { report: None, committed: false, .. }),
+            "the earlier worker's successful facts remain true");
+        let _recovery = retain_recovery(&mut app, root);
+        drop(app.update(completed));
+        assert!(app.source_control_mutations.is_empty());
+        assert_eq!(git_text(root, &["diff", "--cached", "--name-only"]).trim(), "earlier.txt");
+        assert_eq!(git_text(root, &["show", ":file.txt"]), "original\nkeep\n");
+        let refused = app.enqueue_git_mutation(key, QueuedGitMutation::Unstage(Vec::new()));
+        assert!(iced::runtime::task::into_stream(refused).is_none(), "new admission is also refused");
+        assert!(app.source_control_mutations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delayed_native_buffer_preparation_records_refusal_without_editing_after_exit() {
+        let (_temporary, mut app, card, _key) = fixture();
+        let receipt = worker_message(app.start_diff_patch(card, git_patch::Kind::Revert, None),
+            |message| matches!(message, Message::DiffPatchPrepared { .. })).await;
+        let Message::DiffPatchPrepared { pending, result: Ok(Some(prepared)), .. } = &receipt else { panic!() };
+        assert!(prepared.applies_to_buffer());
+        let pending = pending.clone();
+        assert!(app.source_control_mutations.is_empty(), "native Undo reserves no Git turn");
+        drop(app.exit_after_language_servers());
+        assert!(app.exit.is_some());
+        drop(app.update(receipt));
+        assert!(matches!(pending.result.get(), Some(Err(_))));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!() };
+        assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
+        assert!(app.source_control_mutations.is_empty());
     }
 
     #[tokio::test]

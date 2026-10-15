@@ -15601,7 +15601,21 @@ impl Cagents {
     /// running: two `git add` runs against one index corrupt each other's
     /// `index.lock`, and the panel's own controls stand down while one is in
     /// flight, so this is the guard for a press that raced the frame.
+    fn git_effect_block_reason(&self, worktree: &Path) -> Option<&'static str> {
+        if self.exit.is_some() {
+            Some("The application is closing; the queued Git action was not applied.")
+        } else if self.publication_recovery_blocks(worktree) {
+            Some("Resolve retained file recovery before applying queued Git changes in this worktree.")
+        } else {
+            None
+        }
+    }
+
     fn git_mutation_unavailable(&mut self, key: &ActiveWorktreeKey) -> bool {
+        if let Some(reason) = self.git_effect_block_reason(&key.canonical_path) {
+            self.status = Some(TransientNotice::warning(reason));
+            return true;
+        }
         let reason = self
             .sidebar_model
             .source_control
@@ -15783,6 +15797,14 @@ impl Cagents {
         else {
             return Task::none();
         };
+        // A queued action can outlive the context in which it was admitted.
+        // Settle its exact turn without starting a worker when recovery or exit
+        // became active; the completion retires its not-started successors.
+        if let Some(reason) = self.git_effect_block_reason(&key.canonical_path) {
+            return self.update(Message::SourceControlMutated {
+                key, operation, report: Some(reason.into()), committed: false,
+            });
+        }
         let request = match request {
             QueuedGitMutation::PreparedDiff(pending) => {
                 return self.apply_prepared_diff_at_turn(key, operation, pending);
@@ -22866,6 +22888,14 @@ impl Application for Cagents {
                 if committed && (current_binding || self.sidebar_model.source_control.as_ref().is_none_or(|source| source.key != key))
                     && let Some(revision) = mutation.commit_revision {
                     self.sidebar_state.clear_submitted_commit(&key, revision);
+                }
+                if let Some(reason) = self.git_effect_block_reason(&key.canonical_path)
+                    && !mutation.pending.is_empty()
+                {
+                    // Preserve this completed turn's actual report/commit
+                    // facts. Only work that has not started is refused.
+                    mutation.pending.clear();
+                    self.notices.record(TransientNotice::warning(reason));
                 }
                 if let Some(next) = mutation.pending.pop_front() {
                     let operation = uuid::Uuid::new_v4();
