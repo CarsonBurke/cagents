@@ -284,3 +284,180 @@ fn provider_shutdown_failure_is_reported_while_healthy_owners_are_reaped() {
     assert!(!record.root.is_current());
     drop(cleanup);
 }
+
+
+// A real helper is retained by a LocalHandle whose ordinary actor was already
+// reaped. This reaches the contended teardown mutex, not a fabricated reply.
+fn retained_chat(
+    root: &Path,
+    proof: &HostSessionProof,
+    number: u128,
+) -> (crate::chat::Session, crate::chat::runtime::Handle, crate::daemon::holder_registry::Record) {
+    use crate::chat::{Launch, NativeContinuity, OwnedCodexListener, Session,
+        protocol::{ProcessSpec, TransportSpec}};
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let id = TerminalId::from_uuid(Uuid::from_u128(number));
+    let socket = root.join(format!("cagents-codex-{id}/control.sock"));
+    let source = Session {
+        id,
+        launch: Launch { provider: crate::agent::Provider::Codex, recipe: LaunchRecipe {
+            program: "codex".into(), arguments: vec!["--remote".into(), format!("unix://{}", socket.display())],
+            working_directory: root.to_owned(), environment: Default::default(), unset_environment: Default::default(),
+        }, session_id: None },
+        proof: Some(proof.clone()), terminal: None,
+        native_continuity: NativeContinuity::ReconnectOnly,
+        owned_codex_listener: Some(OwnedCodexListener {socket: socket.clone(), allocator: proof.clone()}),
+    };
+    let holder = crate::chat::native_holder::spawn(ProcessSpec {
+        execution: None, messages: None, unset_environment: Default::default(),
+        transport: TransportSpec::OwnedUnixWebSocket {socket}, program: "/bin/sleep".into(),
+        arguments: vec!["60".into()], working_directory: root.to_owned(), environment: Default::default(),
+    }, source.clone()).unwrap();
+    let directory = registry::directory(Kind::Native).unwrap();
+    let record = registry::evidence(&registry::socket(&directory, id), Kind::Native).unwrap().unwrap();
+    assert!(record.root.is_current());
+    let handle = quiet_chat(root);
+    handle.close().unwrap();
+    handle.fixture_retained_native_holder(holder, "Native teardown remains unconfirmed".into());
+    (source, handle, record)
+}
+
+struct RetainedOwners(Vec<crate::chat::runtime::Handle>);
+impl Drop for RetainedOwners {
+    fn drop(&mut self) {
+        for handle in &self.0 { let _ = handle.close(); }
+    }
+}
+
+#[test]
+fn two_contended_provider_owners_do_not_starve_a_healthy_chat_or_terminal() {
+    const TEST: &str = "host::provider_shutdown_tests::two_contended_provider_owners_do_not_starve_a_healthy_chat_or_terminal";
+    let Some(root) = private_runtime(TEST) else { return; };
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("fair-provider-shutdown"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("fair-provider-shutdown"),
+    };
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let mut cleanup = RetainedOwners(Vec::new());
+    let (first_source, first, first_record) = retained_chat(&root, &proof, 1);
+    cleanup.0.push(first.clone());
+    let (second_source, second, second_record) = retained_chat(&root, &proof, 2);
+    cleanup.0.push(second.clone());
+    let healthy = quiet_chat(&root);
+    cleanup.0.push(healthy.clone());
+    let healthy_process = healthy.provider_process().expect("actual healthy fixture child");
+    assert_eq!(fs::read_link(format!("/proc/{}/cwd", healthy_process.pid)).unwrap(), root);
+    let healthy_descriptor = unsafe {libc::syscall(libc::SYS_pidfd_open, healthy_process.pid, 0)};
+    assert!(healthy_descriptor >= 0);
+    let _healthy_pin = RootPin(unsafe {File::from_raw_fd(healthy_descriptor as i32)});
+    assert!(healthy_process.is_current());
+    let mut healthy_source = first_source.clone();
+    healthy_source.id = TerminalId::from_uuid(Uuid::from_u128(3));
+    healthy_source.owned_codex_listener = None;
+    healthy_source.launch.recipe.program = "/bin/cat".into();
+    healthy_source.launch.recipe.arguments.clear();
+    let terminal = TerminalHandle::spawn(session(4, &root), TerminalConfig::default(), |_| {}).unwrap();
+    let ready_by = Instant::now() + Duration::from_secs(5);
+    let terminal_pid: u32 = loop {
+        if let Ok(value) = fs::read_to_string(root.join("root-pid")) {
+            if let Ok(pid) = value.parse() { break pid; }
+        }
+        assert!(Instant::now() < ready_by);
+        thread::sleep(Duration::from_millis(5));
+    };
+    let terminal_start = start_time(terminal_pid).unwrap();
+    assert_eq!(fs::read_link(format!("/proc/{terminal_pid}/cwd")).unwrap(), root);
+    let descriptor = unsafe {libc::syscall(libc::SYS_pidfd_open, terminal_pid, 0)};
+    assert!(descriptor >= 0);
+    let _terminal_pin = RootPin(unsafe {File::from_raw_fd(descriptor as i32)});
+    assert_eq!(start_time(terminal_pid).unwrap(), terminal_start);
+    let mut state = HostState::new(proof);
+    state.register_client(1);
+    state.finish_spawn(1, session(4, &root), terminal.clone(), true).unwrap();
+    state.chats.insert(first_source.id, chat_record(first_source, first.clone()));
+    state.chats.insert(second_source.id, chat_record(second_source, second.clone()));
+    state.chats.insert(healthy_source.id, chat_record(healthy_source, healthy.clone()));
+    let (terminals, _) = state.graceful_shutdown();
+    let host: SharedHost = Arc::new(super::state::HostLock::new(state));
+    thread::scope(|scope| {
+        // These sender locals drop before scope joins on panic, releasing the
+        // two exact slot guards before any outer cleanup owner calls close.
+        let (release_first, wait_first) = crossbeam_channel::bounded::<()>(1);
+        let (release_second, wait_second) = crossbeam_channel::bounded::<()>(1);
+        let (ready, held) = crossbeam_channel::bounded(2);
+        let ready_first = ready.clone();
+        let first_copy = first.clone();
+        let expected_first = first_record.clone();
+        scope.spawn(move || first_copy.with_retained_native_locked(&expected_first, || {
+            ready_first.send(()).unwrap(); let _ = wait_first.recv();
+        }));
+        let second_copy = second.clone();
+        let expected_second = second_record.clone();
+        scope.spawn(move || second_copy.with_retained_native_locked(&expected_second, || {
+            ready.send(()).unwrap(); let _ = wait_second.recv();
+        }));
+        held.recv_timeout(Duration::from_secs(2)).unwrap();
+        held.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let error = finish_chat_shutdown_with_budget(&host, Duration::from_secs(2)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(3), "{error}");
+        for record in [&first_record, &second_record] {
+            assert!(record.root.is_current(), "uncertainty must preserve this exact retained child");
+            assert!(error.contains(&record.terminal.to_string()), "{error}");
+        }
+        assert!(!first.is_completed());
+        assert!(!second.is_completed());
+        assert!(healthy.is_completed(), "two contended owners prevented the third provider's close");
+        assert!(!healthy_process.is_current(), "the exact healthy provider child was not reaped");
+        assert_eq!(finish_terminal_shutdown(&terminals), vec![Ok(())]);
+        assert!(terminal.is_completed());
+        match start_time(terminal_pid) {
+            Ok(current) => assert_ne!(current, terminal_start, "the healthy terminal root was not reaped"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => panic!("inspect the healthy terminal root: {error}"),
+        }
+        assert!(first_record.root.is_current() && second_record.root.is_current());
+        drop(release_first);
+        drop(release_second);
+    });
+    // Retry only the original owned capabilities after the actual contention
+    // ends. No recipe, source proof, child identity or process is replaced.
+    first.close().unwrap();
+    second.close().unwrap();
+    assert!(first.is_completed() && second.is_completed());
+    assert!(!first_record.root.is_current() && !second_record.root.is_current());
+}
+
+#[test]
+fn semantic_batch_keeps_more_sources_than_its_ticket_capacity() {
+    const TEST: &str = "host::provider_shutdown_tests::semantic_batch_keeps_more_sources_than_its_ticket_capacity";
+    let Some(root) = private_runtime(TEST) else { return; };
+    // Construct 100 distinct closed presentation records sharing an already
+    // reaped test actor. This is backlog coverage, not 100-provider native/perf evidence.
+    let handle = quiet_chat(&root);
+    handle.close().unwrap();
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("semantic-backlog"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("semantic-backlog"),
+    };
+    let mut state = HostState::new(proof.clone());
+    for index in 1..=100 {
+        let id = TerminalId::from_uuid(Uuid::from_u128(index));
+        let source = crate::chat::Session { id,
+            launch: crate::chat::Launch { provider: crate::agent::Provider::Codex,
+                recipe: session(index, &root).launch, session_id: None },
+            proof: Some(proof.clone()), terminal: None,
+            native_continuity: crate::chat::NativeContinuity::ReconnectOnly,
+            owned_codex_listener: None,
+        };
+        state.chats.insert(id, chat_record(source, handle.clone()));
+    }
+    state.graceful_shutdown();
+    let host: SharedHost = Arc::new(super::state::HostLock::new(state));
+    finish_chat_shutdown_with_budget(&host, Duration::from_secs(5)).unwrap();
+    assert_eq!(host.lock().unwrap().chats.len(), 100);
+    assert!(host.lock().unwrap().chats.values().all(|record| record.handle.is_completed()));
+}

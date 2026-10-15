@@ -9,6 +9,7 @@ pub(crate) mod descriptor_limit;
 mod lock;
 mod model;
 mod notifications;
+mod provider_shutdown;
 #[cfg(test)]
 mod provider_shutdown_tests;
 mod service;
@@ -442,64 +443,72 @@ fn finish_terminal_shutdown(
 }
 
 fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
+    finish_chat_shutdown_with_budget(host, std::time::Duration::from_secs(5))
+}
+
+fn finish_chat_shutdown_with_budget(
+    host: &SharedHost,
+    budget: std::time::Duration,
+) -> Result<(), String> {
     let (chats, upgrading, pending_native_startups) = {
         let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (
-            state
-                .chats
-                .values()
+            state.chats.values()
                 .map(|record| (record.session.clone(), record.handle.clone()))
                 .collect::<Vec<_>>(),
             state.has_committed_upgrade(),
             state.native_actor_startups.len(),
         )
     };
+    // Checkpoint persistence keeps its existing ownership semantics. The finite
+    // provider wait budget starts after this IO; it cannot bound kernel/fsync.
     let mut result = state::finish_upgrade(host);
     if pending_native_startups != 0 && result.is_ok() {
-        // These contexts may own a real helper before a Record or discovery
-        // JSON exists. Snapshot only; explicit exact startup reconciliation
-        // owns cleanup and never runs under HostLock or a renewed loop budget.
+        // A real helper may precede a published Record. Preserve the existing
+        // startup ownership refusal; this phase never invents cleanup proof.
         result = Err(format!("{pending_native_startups} native helper startup ownership record(s) remain unconfirmed; exact startup cleanup must settle"));
     }
-    for (session, chat) in chats {
-        // A committed upgrade transfers ownership, including when the final
-        // checkpoint write fails. Explicit Stop/Close still tears down the
-        // provider; exiting the upgrading daemon must not undo preservation.
-        let closed = if upgrading && chat.native_continuity().retains_provider() {
-            chat.preserve_for_restart()
-        } else {
-            chat.close()
-        };
-        let closed = closed.and_then(|()| {
-            if upgrading {
-                Ok(())
+    let deadline = std::time::Instant::now() + budget;
+    let mut semantic = Vec::new();
+    let mut unconfirmed = Vec::new();
+    for (index, (session, chat)) in chats.iter().enumerate() {
+        let now = std::time::Instant::now();
+        // A contended owner gets only its fair share of the one immutable
+        // phase budget, leaving later owners time to receive their request.
+        let remaining = deadline.saturating_duration_since(now);
+        let divisor = u32::try_from(chats.len() - index).unwrap_or(u32::MAX);
+        let owner_deadline = now + remaining / divisor;
+        let closed = (|| {
+            let preserving = upgrading && chat.try_close_identity()?.native_continuity.retains_provider();
+            if preserving {
+                chat.preserve_for_restart_until(owner_deadline)
             } else {
-                chat::retained_actor::finish_close(host, &chat, &session)
+                chat.shutdown_provider_until(owner_deadline)
             }
-        });
+        })();
         match closed {
-            Ok(()) if !upgrading => {
-                // Ordinary shutdown proved this exact provider stopped. Retire
-                // its delegated record before a new daemon can resume the UI
-                // descriptor with another proof; absence alone cannot do this.
-                if let Err(error) = agent_execution::retired(host, &session) {
-                    tracing::warn!(%error, "delegated provider retirement was not saved");
-                    if result.is_ok() {
-                        result = Err(error);
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "provider shutdown was not confirmed");
-                if result.is_ok() {
-                    result = Err(format!(
-                        "Provider {} shutdown was not confirmed: {error}",
-                        session.id
-                    ));
-                }
-            }
+            Ok(()) if !upgrading => semantic.push(index),
             Ok(()) => {}
+            Err(error) => {
+                unconfirmed.push(session.id.to_string());
+                tracing::warn!(%error, provider = %session.id, "provider shutdown was not confirmed; exact owner retained");
+                if result.is_ok() {
+                    result = Err(format!("Provider {} shutdown was not confirmed: {error}", session.id));
+                }
+            }
         }
+    }
+    if !unconfirmed.is_empty() {
+        let owners = format!("Unconfirmed provider owners retained: {}", unconfirmed.join(", "));
+        result = Err(match result { Ok(()) => owners, Err(error) => format!("{error}; {owners}") });
+    }
+    // No semantic RPC/registry wait is allowed to postpone another provider's
+    // close admission. Pending work owns this complete exact snapshot.
+    if let Err(error) = provider_shutdown::finish_until(host.clone(), chats, semantic, deadline) {
+        result = match result {
+            Ok(()) => Err(error),
+            Err(previous) => Err(format!("{previous}; {error}")),
+        };
     }
     result
 }

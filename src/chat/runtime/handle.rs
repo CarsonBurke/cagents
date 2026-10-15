@@ -65,6 +65,16 @@ impl Handle {
             .fixture_retained_native_holder(holder, reason);
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_retained_native_locked(
+        &self,
+        expected: &crate::daemon::holder_registry::Record,
+        action: impl FnOnce(),
+    ) {
+        self.local_actor().expect("fixture requires the exact local owner")
+            .with_retained_native_locked(expected, action);
+    }
+
     pub(crate) fn start_owned(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,

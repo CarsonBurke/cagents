@@ -357,6 +357,17 @@ impl LocalHandle {
         self.0.completed.store(false, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_retained_native_locked(
+        &self,
+        expected: &crate::daemon::holder_registry::Record,
+        action: impl FnOnce(),
+    ) {
+        let owner = self.0.retained_native.lock().unwrap();
+        assert_eq!(owner.as_ref().expect("fixture owns a real holder").record(), expected);
+        action();
+    }
+
     pub(crate) fn start_owned(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
