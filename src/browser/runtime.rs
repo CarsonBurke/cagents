@@ -414,7 +414,7 @@ impl Engine {
         let Ok(command) = card.mailbox.receiver().try_recv() else {
             return;
         };
-        card.mailbox.refill_deferred_releases();
+        card.mailbox.refill_after_receive();
         if let Command::Import(request) = command {
             if self.import.is_some() {
                 let _ = request

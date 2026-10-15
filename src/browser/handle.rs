@@ -69,6 +69,14 @@ pub(crate) struct CoalescedCommands {
     pub touch_motion: Option<BrowserInput>,
 }
 
+impl CoalescedCommands {
+    fn is_empty(&self) -> bool {
+        self.viewport.is_none() && self.placement.is_none() && self.scale_factor.is_none()
+            && self.residency.is_none() && self.presented.is_none() && self.focused.is_none()
+            && self.pointer_motion.is_none() && self.wheel.is_none() && self.touch_motion.is_none()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CommandMailbox {
     tx: Sender<Command>,
@@ -128,9 +136,13 @@ impl CommandMailbox {
     }
 
     /// Called after each engine receive, before admitting later UI input.
-    pub(crate) fn refill_deferred_releases(&self) {
+    pub(crate) fn refill_after_receive(&self) {
         let mut pending = self.deferred_releases.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.refill_releases(&mut pending);
+        drop(pending);
+        // A full queue may have refused the blur wake. Every receive creates
+        // another opportunity, including when the originating tree is parked.
+        if !self.coalesced().is_empty() { let _ = self.wake_coalesced(); }
     }
 
     pub(crate) fn press_key(&self, physical: cosmic::iced::keyboard::key::Physical,
@@ -180,6 +192,10 @@ impl CommandMailbox {
     ) -> Result<(), BrowserError> {
         self.check_live()?;
         update(&mut self.coalesced());
+        self.wake_coalesced()
+    }
+
+    fn wake_coalesced(&self) -> Result<(), BrowserError> {
         if !self.wake_pending.swap(true, Ordering::AcqRel)
             && let Err(error) = self.tx.try_send(Command::WakeCoalesced)
         {
@@ -194,20 +210,9 @@ impl CommandMailbox {
         self.wake_pending.store(false, Ordering::Release);
         // A producer can race between the take and clearing `wake_pending`. Ensure
         // any values deposited during that window receive another wake packet.
-        let has_more = {
-            let state = self.coalesced();
-            state.viewport.is_some()
-                || state.placement.is_some()
-                || state.scale_factor.is_some()
-                || state.residency.is_some()
-                || state.presented.is_some()
-                || state.focused.is_some()
-                || state.pointer_motion.is_some()
-                || state.wheel.is_some()
-                || state.touch_motion.is_some()
-        };
-        if has_more && !self.wake_pending.swap(true, Ordering::AcqRel) {
-            let _ = self.tx.try_send(Command::WakeCoalesced);
+        let has_more = !self.coalesced().is_empty();
+        if has_more {
+            let _ = self.wake_coalesced();
         }
         drained
     }
@@ -698,6 +703,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn engine_receive_retries_a_blur_wake_refused_by_a_full_queue() {
+        let mailbox = CommandMailbox::new();
+        for _ in 0..COMMAND_CAPACITY { mailbox.send(Command::Reload).unwrap(); }
+        assert!(matches!(mailbox.update_coalesced(|state| state.focused = Some(false)), Err(BrowserError::CommandQueueFull)));
+        let mut observed = Vec::new();
+        while let Ok(command) = mailbox.receiver().try_recv() {
+            mailbox.refill_after_receive();
+            if matches!(command, Command::WakeCoalesced) {
+                observed.push(mailbox.drain_coalesced().focused);
+            }
+        }
+        assert_eq!(observed, vec![Some(false)]);
+        assert!(!mailbox.wake_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn blur_releases_stay_after_admitted_presses_under_backpressure() {
         use cosmic::iced::keyboard::{self, key::{Code, Physical}};
         use super::super::{ButtonState, input::iced_key};
@@ -715,7 +736,7 @@ mod tests {
         assert!(!mailbox.release_key(other, input(ButtonState::Released, false)).unwrap());
         let mut observed = Vec::new();
         while let Ok(command) = mailbox.receiver().try_recv() {
-            mailbox.refill_deferred_releases();
+            mailbox.refill_after_receive();
             if let Command::Input(input) = command { observed.push(input); }
         }
         assert_eq!(observed, vec![input(ButtonState::Pressed, false), input(ButtonState::Pressed, true), input(ButtonState::Released, false)]);
