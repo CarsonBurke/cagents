@@ -9095,7 +9095,10 @@ impl Cagents {
         // typing aimed at the dialog and write it into a shell, which runs
         // what it is given. An overlay inspector additionally hides the workspace, so
         // that shell would not even be on screen.
-        let card_focused = focused && self.refresh_ui.focused && !self.workspace_inputs_blocked();
+        let raw_input_blocked = self.workspace_inputs_blocked() || self.update_prepared;
+        let native_activation_allowed =
+            !raw_input_blocked && !self.focused_repository_is_saving();
+        let card_focused = focused && self.refresh_ui.focused && !raw_input_blocked;
         #[cfg(not(feature = "integrated-browser"))]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|_| {
             let address = chrome
@@ -9222,8 +9225,9 @@ impl Cagents {
                             self.window_scale_factor,
                             self.settings.ui_scale,
                         ))
-                        .model_focused(focused && !self.workspace_inputs_blocked() && !find.is_some_and(|find| find.focused))
+                        .model_focused(focused && !raw_input_blocked && !find.is_some_and(|find| find.focused))
                         .window_focused(self.refresh_ui.focused)
+                        .native_activation_allowed(native_activation_allowed)
                         .on_shortcut(move |event| {
                             let keyboard::Event::KeyPressed {
                                 key,
@@ -9279,10 +9283,11 @@ impl Cagents {
             #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
                 .id(card_control_id(id, "browser.content"))
-                .obscured(self.workspace_inputs_blocked())
+                .obscured(raw_input_blocked)
                 .on_shortcut(move |event| browser_shortcut(id, &event))
                 .model_focused(focused)
                 .window_focused(self.refresh_ui.focused)
+                .native_activation_allowed(native_activation_allowed)
                 .on_focus(Message::FocusCard(id))
                 .scale_factor(effective_surface_scale(
                     self.window_scale_factor,
@@ -13234,6 +13239,11 @@ impl Application for Cagents {
                 region,
                 widget,
             } => {
+                // Reconciliation below mutates selection before the ordinary
+                // KeyEvent guard. A prepared update freezes that mutation too.
+                if self.update_prepared {
+                    return Task::none();
+                }
                 let _focus = self.input_trace.scoped_keyboard_focus(region, widget);
                 if let Some(card) = region.card
                     && !self.workspace.order().any(|candidate| candidate == card)

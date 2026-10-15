@@ -32,7 +32,7 @@ enum Message {
     Paste,
     Edited(String),
 }
-struct Peer {
+pub(crate) struct Peer {
     _directory: tempfile::TempDir,
     handle: Option<HostedTerminalHandle>,
     release_ready: Arc<AtomicBool>,
@@ -44,7 +44,7 @@ struct Peer {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Peer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("review.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -182,10 +182,10 @@ impl Peer {
             worker: Some(worker),
         }
     }
-    fn handle(&self) -> &HostedTerminalHandle {
+    pub(crate) fn handle(&self) -> &HostedTerminalHandle {
         self.handle.as_ref().unwrap()
     }
-    fn fence(&self) -> Vec<ClientRequest> {
+    pub(crate) fn fence(&self) -> Vec<ClientRequest> {
         let marker = b"accessibility-test-fence".to_vec();
         self.handle().input(marker.clone()).unwrap();
         let mut requests = Vec::new();
@@ -235,6 +235,7 @@ fn widget(
     let mut widget = TerminalWidget::new(peer.handle().clone())
         .id(Id::new(name.to_owned()))
         .model_focused(focused)
+        .native_activation_allowed(true)
         .review_boundary(
             barrier,
             suppressed,

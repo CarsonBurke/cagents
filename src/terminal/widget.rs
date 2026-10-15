@@ -1,6 +1,6 @@
 mod accessibility;
 #[cfg(test)]
-mod accessibility_tests;
+pub(super) mod accessibility_tests;
 mod key_ownership;
 mod links;
 pub(crate) use accessibility::ReviewInputBarrier;
@@ -1425,6 +1425,7 @@ pub struct TerminalWidget<Message> {
     cursor_style: TerminalCursorStyle,
     scale_factor: f32,
     model_focused: bool,
+    native_activation_allowed: bool,
     window_focused: bool,
     on_focus: Option<Message>,
     on_read_only_submit: Option<Message>,
@@ -1482,6 +1483,7 @@ impl<Message> TerminalWidget<Message> {
             cursor_style: TerminalCursorStyle::default(),
             scale_factor: 1.0,
             model_focused: false,
+            native_activation_allowed: false,
             window_focused: true,
             on_focus: None,
             on_read_only_submit: None,
@@ -1715,7 +1717,8 @@ impl<Message> TerminalWidget<Message> {
         self
     }
     fn native_owner(&self, state: &WidgetState) -> bool {
-        self.model_focused || (state.activation_observed && self.on_focus.is_some())
+        self.model_focused
+            || (state.activation_observed && self.native_activation_allowed && self.on_focus.is_some())
     }
     fn keyboard_focused(&self, state: &WidgetState) -> bool {
         self.native_owner(state)
@@ -1727,6 +1730,13 @@ impl<Message> TerminalWidget<Message> {
             shell.request_redraw_at(Instant::now() + Duration::from_millis(16));
         }
     }
+    /// Whether the App currently permits selecting this inactive pane. The
+    /// callback alone is not permission: saving or an overlay can reject it.
+    pub(crate) fn native_activation_allowed(mut self, allowed: bool) -> Self {
+        self.native_activation_allowed = allowed;
+        self
+    }
+
     pub fn model_focused(mut self, focused: bool) -> Self {
         self.model_focused = focused;
         self

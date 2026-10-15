@@ -153,6 +153,7 @@ pub struct BrowserWidget<'a, Message> {
     scale_factor: f32,
     ui_scale: f32,
     model_focused: bool,
+    native_activation_allowed: bool,
     window_focused: bool,
     obscured: bool,
     virtual_offset: f32,
@@ -182,6 +183,7 @@ impl<'a, Message> BrowserWidget<'a, Message> {
             ui_scale: 1.0,
             virtual_offset: 0.0,
             model_focused: false,
+            native_activation_allowed: false,
             window_focused: true,
             obscured: false,
             on_focus: None,
@@ -227,6 +229,13 @@ impl<'a, Message> BrowserWidget<'a, Message> {
 
     pub fn input_method(mut self, ime: Option<InputMethodState>) -> Self {
         self.ime = ime;
+        self
+    }
+
+    /// Whether the App currently permits selecting this inactive pane. The
+    /// callback alone is not permission: saving or an overlay can reject it.
+    pub(crate) fn native_activation_allowed(mut self, allowed: bool) -> Self {
+        self.native_activation_allowed = allowed;
         self
     }
 
@@ -319,7 +328,8 @@ impl<'a, Message> BrowserWidget<'a, Message> {
     }
 
     fn native_owner(&self, state: &WidgetState) -> bool {
-        self.model_focused || (state.activation_observed && self.on_focus.is_some())
+        self.model_focused
+            || (state.activation_observed && self.native_activation_allowed && self.on_focus.is_some())
     }
     fn owns_keyboard(&self, state: &WidgetState) -> bool {
         self.native_owner(state)
@@ -1528,7 +1538,7 @@ mod tests {
         let samples = Rc::new(RefCell::new(Vec::new()));
         let make_view = || {
             let samples = samples.clone();
-            observe_keyboard_events(BrowserWidget::<()>::new(&handle).id(id.clone()).model_focused(false).on_focus(()), &trace, vec![(id.clone(), KeyboardRegion { pane: FocusedPane::Browser, card: Some(card) })], move |event, _, region, widget| {
+            observe_keyboard_events(BrowserWidget::<()>::new(&handle).id(id.clone()).model_focused(false).native_activation_allowed(true).on_focus(()), &trace, vec![(id.clone(), KeyboardRegion { pane: FocusedPane::Browser, card: Some(card) })], move |event, _, region, widget| {
                 if matches!(event, keyboard::Event::KeyPressed { .. }) { samples.borrow_mut().push((region, widget)); }
             })
         };

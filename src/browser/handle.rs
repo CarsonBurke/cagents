@@ -733,6 +733,14 @@ impl BrowserHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture_inputs(&self) -> Vec<BrowserInput> {
+        self.mailbox.receiver().try_iter().filter_map(|command| match command {
+            Command::Input(input) | Command::OwnedKey(OwnedKeyInput { input, .. }) => Some(input),
+            _ => None,
+        }).collect()
+    }
+
     pub fn import_cookies(&self, request: super::ImportRequest) -> Result<(), BrowserError> {
         self.mailbox.send(Command::Import(request))
     }

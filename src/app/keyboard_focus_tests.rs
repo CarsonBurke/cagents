@@ -596,3 +596,151 @@ fn actual_nontext_sidebar_find_focuses_project_search_instead_of_the_background_
     };
     assert!(!runtime.find_is_open());
 }
+
+
+fn add_inactive_native_card(app: &mut Cagents, kind: CardKind, runtime: CardRuntime) -> CardId {
+    let selected = app.workspace.focused().unwrap();
+    let mut card = app.card_state(selected).unwrap().clone();
+    card.id = CardId::new();
+    card.kind = kind;
+    let id = card.id;
+    Arc::make_mut(&mut app.durable).cards.push(card);
+    app.cards.insert(id, runtime);
+    app.workspace.add_card(
+        crate::workspace::WorkspaceCard::new(id, "Native sibling", crate::workspace::CardWidth::Fraction(0.4)).unwrap(),
+        1, false,
+    ).unwrap();
+    assert_eq!(app.workspace.focused(), Some(selected));
+    id
+}
+
+fn native_sibling_batch(app: &Cagents, card: CardId) -> (Cache, Vec<Message>) {
+    let mut renderer = super::tests::headless_renderer();
+    // Use the actual App builder, including its current save/modal/prepared
+    // permission. The sibling's FocusCard message remains unapplied for the
+    // complete native batch, just as in the actual event loop.
+    let mut ui = UserInterface::build(
+        app.card_view(card, false, false), Size::new(640.0, 320.0), Cache::new(), &mut renderer,
+    );
+    let mut messages = Vec::new();
+    let _ = ui.update(&[
+        iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        key("a", keyboard::key::Code::KeyA, keyboard::Modifiers::empty(), None),
+        iced::Event::Keyboard(keyboard::Event::KeyReleased {
+            key: keyboard::Key::Character("a".into()), modified_key: keyboard::Key::Character("a".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
+            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(),
+        }),
+        iced::Event::InputMethod(iced::advanced::input_method::Event::Commit("native-sibling-ime".into())),
+    ], mouse::Cursor::Available(iced::Point::new(80.0, 160.0)), &mut renderer, &mut clipboard::Null, &mut messages);
+    (ui.into_cache(), messages)
+}
+
+#[test]
+fn actual_app_inactive_terminal_native_admission_obeys_save_and_prepared_selection_refusal() {
+    use crate::terminal::ipc::ClientRequest;
+    for blocked in ["open", "saving", "prepared"] {
+        let peer = crate::terminal::WidgetTestPeer::new();
+        let (mut app, selected) = super::tests::editing_repository_app();
+        let mut session = fresh_terminal_session(LaunchRecipe {
+            program: "/bin/sh".into(), arguments: Vec::new(), working_directory: "/".into(),
+            environment: Default::default(), unset_environment: Default::default(),
+        });
+        session.id = peer.handle().terminal_id();
+        let sibling = add_inactive_native_card(&mut app, CardKind::Terminal(session),
+            CardRuntime::Terminal(peer.handle().clone().into()));
+        let _save = if blocked == "saving" {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&selected) else { unreachable!() };
+            let task = runtime.request_save(selected, false);
+            assert!(runtime.is_saving(), "actual save admission must precede native input");
+            Some(task)
+        } else { None };
+        app.update_prepared = blocked == "prepared";
+        prepare(&mut app);
+        assert_eq!(app.focused_repository_is_saving(), blocked == "saving");
+        let (_cache, messages) = native_sibling_batch(&app, sibling);
+        let requests = peer.fence();
+        let keys: Vec<_> = requests.iter().filter_map(|request| match request {
+            ClientRequest::Key { input, .. } => Some((input.key, input.action)), _ => None,
+        }).collect();
+        if blocked == "open" {
+            assert_eq!(keys, [(crate::terminal::TerminalKey::Character('a'), crate::terminal::KeyAction::Press),
+                (crate::terminal::TerminalKey::Character('a'), crate::terminal::KeyAction::Release)], "{requests:?}");
+            assert!(requests.iter().any(|request| matches!(request, ClientRequest::Input { bytes, .. } if bytes == b"native-sibling-ime")), "{requests:?}");
+        } else {
+            assert!(keys.is_empty(), "{blocked} accepted an inactive sibling key: {requests:?}");
+            assert!(!requests.iter().any(|request| matches!(request, ClientRequest::Input { .. } | ClientRequest::Paste { .. })), "{blocked} accepted inactive sibling IME: {requests:?}");
+        }
+        assert_eq!(app.workspace.focused(), Some(selected), "App callback deliberately unapplied during native input");
+        assert!(messages.iter().any(|message| matches!(message, Message::FocusCard(id) if *id == sibling)));
+        dispatch(&mut app, messages);
+        assert_eq!(app.workspace.focused(), Some(if blocked == "open" { sibling } else { selected }));
+    }
+}
+
+#[cfg(feature = "integrated-browser")]
+#[test]
+fn actual_app_inactive_browser_native_admission_obeys_save_and_prepared_selection_refusal() {
+    use crate::browser::{BrowserInput, ButtonState, ImeInput};
+    for blocked in ["open", "saving", "prepared"] {
+        let (mut app, selected) = super::tests::editing_repository_app();
+        let handle = BrowserHandle::fixture();
+        let url = url::Url::parse("https://native-sibling.invalid/").unwrap();
+        let sibling = add_inactive_native_card(&mut app, CardKind::Browser(BrowserSession {
+            id: BrowserId::new(), current_url: url.clone(), history: vec![url.clone()], history_index: 0,
+            scroll_x: 0.0, scroll_y: 0.0, fidelity: BrowserRestoreFidelity::ExactLive,
+        }), CardRuntime::Browser(BrowserRuntime {
+            handle, ime: None, lifecycle: BrowserLifecycle::Visible,
+            address: BrowserAddress::location(&url), address_focused: false, address_error: false,
+            progress_phase: 0.0, load_state: None,
+        }));
+        let _save = if blocked == "saving" {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&selected) else { unreachable!() };
+            let task = runtime.request_save(selected, false);
+            assert!(runtime.is_saving()); Some(task)
+        } else { None };
+        app.update_prepared = blocked == "prepared";
+        prepare(&mut app);
+        let (_cache, messages) = native_sibling_batch(&app, sibling);
+        let Some(CardRuntime::Browser(browser)) = app.cards.get(&sibling) else { unreachable!() };
+        let input = browser.handle.fixture_inputs();
+        let keys: Vec<_> = input.iter().filter_map(|input| match input {
+            BrowserInput::Key { state, code, .. } => Some((*state, code.as_str())), _ => None,
+        }).collect();
+        if blocked == "open" {
+            assert_eq!(keys, [(ButtonState::Pressed, "KeyA"), (ButtonState::Released, "KeyA")], "{input:?}");
+            assert!(input.iter().any(|input| matches!(input, BrowserInput::Ime(ImeInput::Commit(text)) if text == "native-sibling-ime")), "{input:?}");
+        } else {
+            assert!(keys.is_empty(), "{blocked} accepted inactive browser key: {input:?}");
+            assert!(!input.iter().any(|input| matches!(input, BrowserInput::Ime(_))), "{blocked} accepted inactive browser IME: {input:?}");
+        }
+        assert_eq!(app.workspace.focused(), Some(selected));
+        dispatch(&mut app, messages);
+        assert_eq!(app.workspace.focused(), Some(if blocked == "open" { sibling } else { selected }));
+    }
+}
+
+#[test]
+fn prepared_update_refuses_routed_sibling_reconciliation_before_any_workspace_mutation() {
+    let (mut app, selected) = super::tests::editing_repository_app();
+    let sibling = add_inactive_native_card(&mut app, CardKind::Settings, CardRuntime::Settings);
+    prepare(&mut app);
+    app.workspace.take_widget_focus_request();
+    app.update_prepared = true;
+    let before = app.workspace.order().collect::<Vec<_>>();
+    let durable_focus = app.durable.focused;
+    let task = app.update(Message::RoutedKeyEvent {
+        event: match key("a", keyboard::key::Code::KeyA, keyboard::Modifiers::empty(), None) {
+            iced::Event::Keyboard(event) => event, _ => unreachable!(),
+        }, captured: false,
+        region: crate::input_trace::KeyboardRegion { pane: workspace_widget::FocusedPane::Other, card: Some(sibling) },
+        widget: Some(app.card_header_widget_id(sibling)),
+    });
+    assert_eq!(app.workspace.focused(), Some(selected));
+    assert_eq!(app.durable.focused, durable_focus);
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), before);
+    assert!(app.workspace.take_widget_focus_request().is_none());
+    assert!(iced::runtime::task::into_stream(task).is_none(), "no viewport/native focus effect may escape prepared refusal");
+    assert!(app.update_prepared, "the update preparation acknowledgement remains active");
+}
