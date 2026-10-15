@@ -3,6 +3,7 @@
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
 mod restart;
+mod semantic_drain;
 pub(in crate::host) use self::restart::PreparedRestart;
 pub(super) use self::restart::{restart_completed, restart_failure_proved};
 use crate::host::model::NativeActorEvent;
@@ -137,6 +138,14 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             state.notifications.clone(),
         )
     };
+    // The same exact actor's close path may still be published while the
+    // background broker runs. Hold one gate across page capture, every durable
+    // destination, and helper ACK; a page captured outside it can become stale
+    // after notification deduplication's bounded history advances.
+    let lane = semantic_drain::lane(identity.instance)?;
+    let _drain = lane.try_lock().map_err(|_| {
+        "The exact retained actor's semantic journal is already being settled".to_string()
+    })?;
     let registry = super::super::agent_execution::registry(host)?;
     handle.refresh_retained_state()?;
     let loss = handle.continuity_loss();
@@ -540,6 +549,12 @@ pub(in crate::host) fn finish_close(
     let Some(identity) = handle.actor_identity() else {
         return Ok(());
     };
+    // Contention is uncertainty, not a completed close. The caller retains its
+    // original Handle/pending owner and retries after the other whole drain.
+    let lane = semantic_drain::lane(identity.instance)?;
+    let _drain = lane.try_lock().map_err(|_| {
+        "The exact retained actor's semantic journal is already being settled".to_string()
+    })?;
     if !identity.record.holder.is_current() {
         // A failed terminal spawn may retry after the previous close already
         // committed every outcome and retired the helper. Only its separate
