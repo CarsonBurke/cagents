@@ -18448,6 +18448,25 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_preserve_case_keeps_greek_context_and_one_undo() {
+        for replacement in ["ΟΣ","ΟΣ\u{301}"] {
+            let card=CardId::new();
+            let (mut runtime,_)=RepositoryRuntime::open_fixture(card,"greek.txt","foo foo");
+            drop(runtime.update(RepositoryAction::OpenFind {card}));
+            drop(runtime.update(RepositoryAction::FindQueryChanged {card,query:"foo".into()}));
+            drop(runtime.update(RepositoryAction::ReplaceQueryChanged {card,query:replacement.into()}));
+            drop(runtime.update(RepositoryAction::PreserveCaseChanged {card,enabled:true}));
+            drop(runtime.update(RepositoryAction::ReplaceMatch {card,all:true}));
+            let expected=replacement.to_lowercase();
+            assert_eq!(buffer_text(&runtime),format!("{expected} {expected}"));
+            drop(runtime.update(RepositoryAction::Undo {card}));
+            assert_eq!(buffer_text(&runtime),"foo foo");
+            drop(runtime.update(RepositoryAction::Redo {card}));
+            assert_eq!(buffer_text(&runtime),format!("{expected} {expected}"));
+        }
+    }
+
+    #[test]
     fn compact_dense_find_preserves_all_occurrences_wraps_and_one_undo_replace_all() {
         let card = CardId::new();
         let text = "a".repeat(16 * 1024);

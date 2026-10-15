@@ -107,18 +107,21 @@ pub fn find_in_lines<T: AsRef<str>>(
 
 /// Plain replacements preserve the matched word's all-upper, all-lower or title case.
 pub fn preserve_case(matched: &str, replacement: &str) -> String {
-    let mut result = String::with_capacity(replacement.len());
-    append_preserve_case(matched, replacement, &mut result);
-    result
+    convert_case(replacement, matched_case(matched))
 }
 
-fn append_preserve_case(matched: &str, replacement: &str, result: &mut String) {
-    let mut letters = matched
-        .chars()
-        .filter(|character| character.is_alphabetic());
+#[derive(Clone, Copy)]
+enum ReplacementCase {
+    Upper,
+    Lower,
+    Title,
+    Unchanged,
+}
+
+fn matched_case(matched: &str) -> ReplacementCase {
+    let mut letters = matched.chars().filter(|character| character.is_alphabetic());
     let Some(first) = letters.next() else {
-        result.push_str(replacement);
-        return;
+        return ReplacementCase::Unchanged;
     };
     let (mut upper, mut lower, mut title) = (
         first.is_uppercase(),
@@ -131,17 +134,32 @@ fn append_preserve_case(matched: &str, replacement: &str, result: &mut String) {
         title &= letter.is_lowercase();
     }
     if upper {
-        result.extend(replacement.chars().flat_map(char::to_uppercase));
+        ReplacementCase::Upper
     } else if lower {
-        result.extend(replacement.chars().flat_map(char::to_lowercase));
+        ReplacementCase::Lower
     } else if title {
-        let mut characters = replacement.chars();
-        if let Some(first) = characters.next() {
-            result.extend(first.to_uppercase());
-        }
-        result.extend(characters.flat_map(char::to_lowercase));
+        ReplacementCase::Title
     } else {
-        result.push_str(replacement);
+        ReplacementCase::Unchanged
+    }
+}
+
+fn convert_case(replacement: &str, case: ReplacementCase) -> String {
+    match case {
+        ReplacementCase::Upper => replacement.to_uppercase(),
+        // str conversion preserves contextual Unicode mappings, including
+        // final Sigma before case-ignorable combining marks.
+        ReplacementCase::Lower => replacement.to_lowercase(),
+        ReplacementCase::Title => {
+            let mut result = String::with_capacity(replacement.len());
+            let mut characters = replacement.chars();
+            if let Some(first) = characters.next() {
+                result.extend(first.to_uppercase());
+            }
+            result.extend(characters.flat_map(char::to_lowercase));
+            result
+        }
+        ReplacementCase::Unchanged => replacement.into(),
     }
 }
 
@@ -149,6 +167,9 @@ pub struct Replacement<'a> {
     regex: Option<regex::Regex>,
     text: &'a str,
     preserve: bool,
+    uppercase: std::sync::OnceLock<String>,
+    lowercase: std::sync::OnceLock<String>,
+    titlecase: std::sync::OnceLock<String>,
 }
 
 impl<'a> Replacement<'a> {
@@ -162,6 +183,9 @@ impl<'a> Replacement<'a> {
             regex: options.regex.then(|| pattern(query, options)).transpose()?,
             text,
             preserve,
+            uppercase: std::sync::OnceLock::new(),
+            lowercase: std::sync::OnceLock::new(),
+            titlecase: std::sync::OnceLock::new(),
         })
     }
 
@@ -197,7 +221,17 @@ impl<'a> Replacement<'a> {
                 .get(start..end)
                 .ok_or_else(|| "The selected match is outside the current line.".to_owned())?;
             if self.preserve {
-                append_preserve_case(matched, self.text, result);
+                // Each full-string case variant is computed at most once per
+                // replacement operation, preserving Unicode context without
+                // allocating an intermediate String for every match.
+                let case = matched_case(matched);
+                let replacement = match case {
+                    ReplacementCase::Upper => self.uppercase.get_or_init(|| convert_case(self.text, case)).as_str(),
+                    ReplacementCase::Lower => self.lowercase.get_or_init(|| convert_case(self.text, case)).as_str(),
+                    ReplacementCase::Title => self.titlecase.get_or_init(|| convert_case(self.text, case)).as_str(),
+                    ReplacementCase::Unchanged => self.text,
+                };
+                result.push_str(replacement);
             } else {
                 result.push_str(self.text);
             }
@@ -290,6 +324,25 @@ mod tests {
             assert!(result.is_none());
             assert_eq!(calls.get(), 3);
         }
+    }
+
+    #[test]
+    fn preserved_lowercase_keeps_contextual_sigma_and_reuses_each_variant() {
+        for (text,expected) in [("ΟΣ","ος"),("ΟΣ\u{301}","ος\u{301}")] {
+            assert_eq!(preserve_case("foo",text),expected);
+            let replacement=Replacement::new("foo",text,FindOptions::default(),true).unwrap();
+            let mut output=String::new();
+            replacement.append("foo foo",0,3,&mut output).unwrap();
+            let allocation=replacement.lowercase.get().unwrap().as_ptr();
+            output.push(' ');
+            replacement.append("foo foo",4,7,&mut output).unwrap();
+            assert_eq!(output,format!("{expected} {expected}"));
+            assert_eq!(replacement.lowercase.get().unwrap().as_ptr(),allocation);
+            assert!(replacement.uppercase.get().is_none());
+            assert!(replacement.titlecase.get().is_none());
+        }
+        assert_eq!(preserve_case("FOO","ος"),"ΟΣ");
+        assert_eq!(preserve_case("fOo","ΟΣ"),"ΟΣ");
     }
 
     #[test]
