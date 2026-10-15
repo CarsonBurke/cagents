@@ -22,6 +22,7 @@ struct AutomaticAttempt {
 struct RemovalProjection {
     request: crate::model::OperationId,
     repository_generation: Option<u64>,
+    device: Option<(String, String, String)>,
     target: Target,
     owners: Vec<RemovalCardOwner>,
 }
@@ -658,7 +659,11 @@ impl Cagents {
                 let reply = crate::device_service::request(crate::device_service::Operation::RemoveMergedWorktree { request }).map_err(|error| error.to_string())?;
                 let crate::device_service::Reply::MergedWorktreeRemoved(result) = reply else { return Err("The daemon returned an unexpected cleanup response".into()); };
                 let removed = result.map_err(|refusal| refusal.to_string())?;
-                let warnings = finish_creation_retirements(retirements, &removed);
+                let warnings = if device == stop_device_key() {
+                    finish_creation_retirements(retirements, &removed)
+                } else {
+                    creation_retirement_warning("the selected device changed while cleanup completed".into())
+                };
                 Ok((removed, warnings))
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
             let (result, warnings) = match result {
@@ -685,7 +690,7 @@ impl Cagents {
                 user_title: self.chrome_ui.user_titles.get(&card.id).cloned()})
             .collect();
         RemovalProjection {request: crate::model::OperationId::new(),
-            repository_generation: self.repository_generations.get(&target.project).copied(), target, owners}
+            repository_generation: self.repository_generations.get(&target.project).copied(), device: stop_device_key(), target, owners}
     }
 
     fn complete_automatic_cleanup(&mut self, completed: RemovalProjection) -> Task<Message> {
@@ -698,7 +703,8 @@ impl Cagents {
         let target = completed.target;
         // A Repository descriptor can retain its card/path through checkout
         // replacement. Any newer inventory intake invalidates old UI custody.
-        let same_inventory = self.repository_generations.get(&target.project).copied()
+        let same_device = completed.device == stop_device_key();
+        let same_inventory = same_device && self.repository_generations.get(&target.project).copied()
             == completed.repository_generation;
         let current = completed.owners.into_iter().filter(|owner| {
             same_inventory && self.removal_owner_is_current(owner)
@@ -747,7 +753,7 @@ impl Cagents {
         self.refresh_sidebar_worktree_panes();
         self.persist();
         let mut tasks = updates.into_iter().map(|update| self.apply_viewport(update, true, false)).collect::<Vec<_>>();
-        if self.sidebar_model.project(target.project).is_some_and(|project| project.repository == target.repository)
+        if same_device && self.sidebar_model.project(target.project).is_some_and(|project| project.repository == target.repository)
             && !self.project_ui.closing.contains_key(&target.project)
             && !self.project_ui.closed.contains(&target.repository)
         {
@@ -6025,6 +6031,25 @@ mod tests {
             }
             assert!(row(&app, linked.id).is_some(), "only the new inventory may remove a row");
         }
+    }
+
+    #[test]
+    fn removal_projection_from_other_device_context_cannot_retire_or_refresh_current_owners() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        drop(app.add_repository_card(project, repository.clone(), linked.path.clone()));
+        let original = app.durable.cards.last().unwrap().id;
+        let target = app.project_target(project, Some(linked.id)).unwrap();
+        let mut custody = app.capture_removal_projections(target);
+        custody.device = Some(("other".into(), "other-host".into(), "cagents".into()));
+        assert_ne!(custody.device, stop_device_key());
+        let generations = app.repository_generations.clone();
+        drop(app.complete_removal_projections(custody));
+        assert!(app.card_state(original).unwrap().existence.is_open());
+        assert_eq!(app.repository_generations, generations);
+        assert!(row(&app, linked.id).is_some());
     }
 
     #[test]
