@@ -449,8 +449,7 @@ mod tests {
             drop(app.update(completed));
             assert_eq!(git(root, &["show", ":file.txt"]).stdout, b"changed\nkeep\n");
             let old_git = if metadata_only { original } else { original.join(".git") };
-            let old_index = std::process::Command::new("git").arg("--git-dir").arg(old_git)
-                .args(["show", ":file.txt"]).output().unwrap();
+            let old_index = git(root, &["--git-dir", old_git.to_str().unwrap(), "show", ":file.txt"]);
             assert!(old_index.status.success());
             assert_eq!(old_index.stdout, b"original\nkeep\n");
         }
