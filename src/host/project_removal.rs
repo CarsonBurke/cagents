@@ -541,6 +541,42 @@ mod tests {
         assert!(observed.load(std::sync::atomic::Ordering::Acquire));
     }
     #[test]
+    fn rejected_original_adoption_settles_pre_effect_abort_and_releases_original_capacity() {
+        if isolated_custody("host::project_removal::tests::rejected_original_adoption_settles_pre_effect_abort_and_releases_original_capacity") {return;}
+        use crate::project_recovery::{ProjectOperationRequest,ProjectOperationAction,ProjectOperationOutcome};
+        let mut fixture=Fixture::new();let _healthy=fixture.spawn(crate::model::TerminalId::new());
+        let foreign=fixture._directory.path().join("foreign");std::fs::create_dir(&foreign).unwrap();
+        fixture.host.lock().unwrap().edit_model(1,ModelEdit::OpenProject{repository:foreign.clone(),checkout:Some(foreign.clone()),primary_checkout:None,name:"foreign".into(),kind:ProjectKind::Folder}).unwrap();
+        let old=fixture.root.clone();let moved=fixture._directory.path().join("moved");std::fs::rename(&old,&moved).unwrap();
+        // The selected original pin is valid, but complete foreign-root census
+        // cannot be obtained. This is a real issuer refusal before token/effect.
+        std::fs::remove_dir(&foreign).unwrap();
+        let request=ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:fixture.expected.clone(),action:ProjectOperationAction::Locate{relocation:crate::project_recovery::Relocation{repository:old.clone(),destination:moved.clone(),old_root:old,new_root:moved.clone()}}};
+        let before=fixture.host.lock().unwrap().read_model().unwrap();
+        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Aborted{operation,..} if operation==request.operation));
+        assert_eq!(fixture.host.lock().unwrap().read_model().unwrap(),before);
+        assert!(!fixture.handles[0].is_completed());
+        assert!(reservation::retained_operation(&fixture.host,request.operation).is_none());
+        assert_eq!(reservation::live_operation_count(&fixture.host),0);
+        let issuer=super::super::recovery_placement::current(&fixture.host,1,Instant::now()+Duration::from_secs(5)).unwrap();
+        let digest=super::super::model::project_operations::digest(&request).unwrap();
+        assert!(issuer.existing_operation_adoption(request.operation,&digest).unwrap().is_none());
+        let registry=super::super::agent_execution::registry(&fixture.host).unwrap();
+        assert_eq!(registry.lock().unwrap().project_operation(request.operation).unwrap().unwrap().phase,super::super::model::project_operations::Phase::Aborted);
+        assert!(pending_status(&fixture.host,1,request.project.registry).is_empty());
+        assert!(matches!(resume_original(&fixture.host,1,request.project.registry,request.operation),ProjectOperationOutcome::Aborted{..}));
+        // Fixing the foreign availability cannot revive an aborted operation.
+        // A fresh explicit UUID can acquire its own original plan/admission.
+        std::fs::create_dir(&foreign).unwrap();
+        let mut fresh=request;fresh.operation=uuid::Uuid::new_v4();
+        assert!(matches!(operation_reply(&fixture.host,fresh.clone()),ProjectOperationOutcome::Committed{..}));
+        assert!(fixture.host.lock().unwrap().read_model().unwrap().project(&moved).is_some());
+        assert_eq!(reservation::live_operation_count(&fixture.host),0);
+        assert!(pending_status(&fixture.host,1,fresh.project.registry).is_empty());
+        assert!(!fixture.handles[0].is_completed());
+    }
+
+    #[test]
     fn repaired_git_busy_retains_exact_operation_plan_and_restart_negative_scope() {
         if isolated_custody("host::project_removal::tests::repaired_git_busy_retains_exact_operation_plan_and_restart_negative_scope") {return;}
         use crate::project_recovery::{ProjectOperationRequest,ProjectOperationAction,ProjectOperationOutcome,ProjectOperationPhase};
