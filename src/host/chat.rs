@@ -866,8 +866,20 @@ fn start_with_execution(
             }
         }
         source_process = Some(process);
-        session.launch.recipe = recipe;
-        session.launch.session_id = fresh.is_none().then_some(id);
+        if let Some(restart) = restart_launch {
+            if fresh.is_some()
+                || restart.provider != session.launch.provider
+                || restart.session_id.as_deref() != Some(id.as_str())
+                || restart.terminal_recipe().as_ref() != Some(&recipe)
+            {
+                return Err(error(
+                    "Restored source differs from its exact confirmed restart recipe",
+                ));
+            }
+        } else {
+            session.launch.recipe = recipe;
+            session.launch.session_id = fresh.is_none().then_some(id);
+        }
         source_fresh = fresh;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(Some(proof), state.proof())?;

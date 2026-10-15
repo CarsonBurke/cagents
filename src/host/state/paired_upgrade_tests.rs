@@ -242,7 +242,7 @@ fn run_pair(mode: &str) {
     let exact = crate::model::agent_recovery::bind_session(&fresh, ID).unwrap();
     let issued = match mode {
         "exact" => exact.clone(),
-        "fresh" => fresh.clone(),
+        "fresh" | "fresh-chat" => fresh.clone(),
         "shell" => LaunchRecipe {
             program: "/bin/bash".into(),
             arguments: vec![
@@ -392,6 +392,18 @@ fn run_pair(mode: &str) {
     finish_upgrade(&original).unwrap();
     assert!(actor.is_completed());
     assert!(terminal.is_completed());
+    let mut source = saved;
+    if mode == "fresh-chat" {
+        // Compatibility input, not a claim that today's selected conversion
+        // emits this historical Chat recipe. Its source/pair/process are real;
+        // encode the old issued fresh Chat recipe separately from execution.
+        let store = Store::open(&store_path).unwrap();
+        let mut checkpoint = store.load().unwrap().unwrap();
+        checkpoint.chats[0].source.launch.recipe = fresh;
+        source = checkpoint.chats[0].source.clone();
+        assert_ne!(source.launch.recipe, checkpoint.chats[0].launch.recipe);
+        store.save(&checkpoint).unwrap();
+    }
     if mode == "shell" {
         // Older source daemons wrote the confirmed execution hint into the
         // terminal checkpoint while the chat retained its issued shell tuple.
@@ -424,7 +436,6 @@ fn run_pair(mode: &str) {
     }
     let proc_root = cwd.join("empty-proc");
     fs::create_dir(&proc_root).unwrap();
-    let mut source = saved;
     for generation in 1..=2 {
         let replacement = host(&format!("replacement-{generation}"));
         restore_upgrade_from(
@@ -434,6 +445,13 @@ fn run_pair(mode: &str) {
             None,
         ).unwrap();
         let resolved = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
+        let attached = super::super::chat::process(
+            &replacement, 1, ClientRequest::ChatAttach { session: source.clone() },
+        ).unwrap();
+        let ServerResponse::ChatAttached { session, .. } = attached else {
+            panic!("upgraded pair did not attach through the public dispatcher")
+        };
+        assert_eq!(session, resolved);
         assert!(crate::chat::is_upgrade_recovery(&source, &resolved));
         assert_eq!(resolved.launch.session_id.as_deref(), Some(ID));
         let mut paired = resolved.terminal.as_ref().unwrap().clone();
@@ -493,6 +511,14 @@ fn legacy_paired_exact_recipe_survives_checkpoint_restore_and_strict_client_iden
         return;
     }
     run_pair("exact");
+}
+
+#[test]
+fn legacy_paired_fresh_chat_checkpoint_preserves_both_issued_recipes() {
+    if isolated() {
+        return;
+    }
+    run_pair("fresh-chat");
 }
 
 #[test]
