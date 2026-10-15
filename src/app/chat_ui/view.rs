@@ -3093,7 +3093,7 @@ impl Runtime {
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
             (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
-            self.turn_outcome_markers.get(&item.id).hash(&mut hasher);
+            self.turn_outcome_markers.get(&item.id).map(|marker| marker.signature).hash(&mut hasher);
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
             self.copied
@@ -5129,6 +5129,14 @@ mod tests {
         runtime.refresh();
         assert!(runtime.turn_outcome_markers["input-A"].label.starts_with("Cancelled"));
         assert_eq!(runtime.conversation_status(false).1, "Finished");
+        let same_snapshot = runtime.snapshot.clone();
+        let expected_markers = runtime.turn_outcome_markers.clone();
+        runtime.release_turn_outcome_presentation();
+        assert!(runtime.turn_outcome_markers.is_empty());
+        runtime.refresh();
+        assert!(Arc::ptr_eq(&same_snapshot, &runtime.snapshot));
+        assert_eq!(runtime.turn_outcome_markers, expected_markers,
+            "revealing an evicted presentation rebuilds even with the exact same snapshot/projection Arc");
         let replay: Snapshot = postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
         let (mut reattached, new_handle) = frame_cost::live_runtime(&items);
         new_handle.replace_snapshot_for_test(replay);
