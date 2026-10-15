@@ -297,6 +297,7 @@ pub struct AsyncIdentity {
 /// equality compares the Arc identity without traversing diff text or rows.
 #[derive(Clone)]
 pub struct RepositoryCommandTarget {
+    incarnation: Arc<()>,
     identity: AsyncIdentity,
     editor_revision: Option<u64>,
     external_editors_generation: u64,
@@ -317,7 +318,7 @@ impl std::fmt::Debug for RepositoryCommandTarget {
 }
 impl PartialEq for RepositoryCommandTarget {
     fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity && self.external_editors_generation == other.external_editors_generation && self.editor_selection == other.editor_selection && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
+        Arc::ptr_eq(&self.incarnation, &other.incarnation) && self.identity == other.identity && self.external_editors_generation == other.external_editors_generation && self.editor_selection == other.editor_selection && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
             (Some(left), Some(right)) => Arc::ptr_eq(left, right), (None, None) => true, _ => false,
         }
     }
@@ -2172,6 +2173,9 @@ impl Drop for FindJob {
 
 pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
+    /// Retained command targets distinguish reconstruction under the same
+    /// card/path, even when document counters restart at zero.
+    command_incarnation: Arc<()>,
     worktree_protection: Option<crate::worktree_cleanup::Protection>,
     directory_only: bool,
     standalone: bool,
@@ -2403,6 +2407,7 @@ impl RepositoryRuntime {
     pub fn new(descriptor: RepositoryView) -> Self {
         let identity = descriptor.worktree.display().to_string();
         Self {
+            command_incarnation: Arc::new(()),
             directory_only: descriptor.selected_file.is_some(),
             descriptor,
             worktree_protection: None,
@@ -4372,6 +4377,7 @@ impl RepositoryRuntime {
             _ => (None, None),
         };
         RepositoryCommandTarget {
+            incarnation: Arc::clone(&self.command_incarnation),
             identity: self.current_identity(card, self.selected_path().unwrap_or(Path::new("")).to_owned()),
             external_editors_generation: self.external_editors.generation(),
             editor_selection: match &self.document {
@@ -18927,6 +18933,28 @@ mod tests {
             assert_eq!(runtime.editor_text().as_deref(), Some(captured.as_str()));
             assert!(!runtime.is_dirty());
         }
+    }
+
+    #[test]
+    fn captured_editor_commands_reject_clean_same_path_runtime_reconstruction() {
+        use widget::menu::Action as _;
+        let card = CardId::new();
+        let (original, _) = RepositoryRuntime::lsp_open_fixture(card, "original source");
+        let target = Arc::new(original.command_target(card));
+        let old_menu = EditorMenuCommand(EditorMenuOperation::Clipboard(card, ClipboardOp::SelectAll), &target).message();
+        let descriptor = original.descriptor.clone();
+        let generation = original.generation;
+        drop(original);
+        let (mut replacement, _) = RepositoryRuntime::lsp_open_fixture(card, "replacement source");
+        assert_eq!(replacement.descriptor, descriptor);
+        assert_eq!(replacement.generation, generation);
+        assert!(!replacement.is_dirty());
+        assert_ne!(*target, replacement.command_target(card), "retained incarnation disambiguates clean same-path counters");
+        drop(replacement.update(old_menu));
+        assert!(replacement.selected_text().is_none());
+        drop(replacement.update(RepositoryAction::PasteCaptured { target, text: Arc::new("STALE".into()) }));
+        assert_eq!(replacement.editor_text().as_deref(), Some("replacement source"));
+        assert!(!replacement.is_dirty());
     }
 
     #[test]
