@@ -15178,15 +15178,23 @@ impl Application for Cagents {
             }
             Message::Frame(frame) => {
                 let inspector_task = self.advance_context_inspector_transition(frame);
-                let Some(elapsed) = self.frame_clock.elapsed(frame) else {
+                if let Some(elapsed) = self.frame_clock.elapsed(frame) {
+                    if self.focused_repository_is_saving() {
+                        return inspector_task;
+                    }
+                    let update = self.workspace.tick(elapsed);
+                    Task::batch([inspector_task, self.apply_viewport(update, true, false)])
+                } else {
                     let deferred = self.release_deferred_navigation_if_unblocked();
-                    return Task::batch([inspector_task, deferred]);
-                };
-                if self.focused_repository_is_saving() {
-                    return inspector_task;
+                    let task = Task::batch([inspector_task, deferred]);
+                    if self.project_ui.activation.is_none() {
+                        return task;
+                    }
+                    // An idle frame may predate the clock start in this pass.
+                    // A ready CLI selection still needs the common admission
+                    // and binding tail, even when no animation can advance.
+                    task
                 }
-                let update = self.workspace.tick(elapsed);
-                Task::batch([inspector_task, self.apply_viewport(update, true, false)])
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
