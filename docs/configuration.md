@@ -309,6 +309,20 @@ becomes unavailable, its preference and provider policy remain saved. New launch
 refuse that path until it is repaired; they do not silently switch binaries or permissions. These options apply to native UI,
 CLI agent launches and automation launches through the shared daemon policy.
 
+For a new native conversation, the selected device's daemon resolves its own
+saved executable, extra arguments and environment. The window sends the account
+identity and its chosen model, effort and permission mode. These conversation
+choices stay with an unsent draft across saves and restarts; starting the draft
+records the daemon's actual launch recipe. Changing execution preferences does
+not replace a saved or already issued conversation's recipe.
+
+The Settings pane edits this window's local settings file. When connected to a
+remote device, its provider execution policy and terminal shell come from that
+remote installation's settings file. Editing local executable, argument,
+environment or shell preferences does not rewrite the remote file. Model,
+effort and permission choices in the window still apply to its new remote
+conversations.
+
 Environment names must start with a letter or underscore and contain only
 letters, digits and underscores. Provider account homes, credential overrides
 used for account isolation, and `CAGENTS_` variables are reserved. Custom
