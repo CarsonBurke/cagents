@@ -3679,7 +3679,6 @@ fn detected_executable_path(path: PathBuf) -> Result<String, String> {
     })
 }
 
-#[cfg(test)]
 fn settings_update(
     current: &AppSettings,
     field: SettingsField,
@@ -12823,12 +12822,16 @@ impl Cagents {
     /// window is about to save on its way out, without the live effects -
     /// lifecycle sweeps, theme changes, editor auto-saves - that applying
     /// them normally triggers, since nothing is left to show them.
+    // Only called by Drop, after the event loop has stopped dispatching to
+    // this window. That shutdown path already performs the blocking final
+    // save; validate each field there so one refused path cannot poison valid
+    // unrelated edits. Active reducers use worker checks instead.
     fn fold_settings_drafts(&mut self) {
         let mut pending: Vec<_> = self.settings_pending.drain().collect();
         pending.sort_by_key(|(_, (generation, _))| *generation);
         for (field, (_, value)) in pending {
             if let SettingsDecision::Persist(settings) =
-                settings_update_syntax(&self.settings, field, &value)
+                settings_update(&self.settings, field, &value)
             {
                 self.settings = settings;
             }
@@ -20041,6 +20044,25 @@ mod tests {
         let checked = task_app_message(settings::agents::without_executable_checks(|| app.apply_setting_input(shell, executable.to_str().unwrap().into())));
         settings::agents::without_executable_checks(|| { drop(app.update(checked)); });
         assert_eq!(app.settings.default_shell.as_deref(), executable.to_str());
+    }
+
+    #[test]
+    fn settings_shutdown_fold_preserves_valid_edits_beside_a_refused_path() {
+        let directory = tempfile::tempdir().unwrap();
+        for field in [SettingsField::DefaultShell, SettingsField::Agent(crate::agent::Provider::Claude, AgentSetting::Executable)] {
+            let path = directory.path().join(format!("{field:?}.toml"));
+            let mut app = context_inspector_test_app(false);
+            app.settings_path = Some(path.clone());
+            app.settings_write_blocked = false;
+            drop(app.queue_setting_input(SettingsField::TerminalFontSize, "23".into()));
+            drop(app.queue_setting_input(field, "/missing/unvalidated-program".into()));
+            app.fold_settings_drafts();
+            app.save_settings_now().unwrap();
+            let saved = settings::load(&path).unwrap();
+            assert_eq!(saved.terminal_font_size, 23.0);
+            assert!(saved.default_shell.is_none());
+            assert!(saved.agents.get("claude").is_none_or(|configuration| configuration.executable.is_none()));
+        }
     }
 
     #[test]
