@@ -1218,8 +1218,22 @@ fn private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr() 
         });
         let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed_hook = observed.clone();
+        let operation_root = fixture.root.clone();
         fixture.intercept(move |command| {
             if command.arguments.iter().any(|argument| argument == "fetch") {
+                let operation = fs::read_dir(operation_root.join(".git"))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .find(|entry| {
+                        entry.file_name().to_string_lossy().starts_with("cagents-pr-checkout-")
+                    })
+                    .unwrap()
+                    .path();
+                assert_eq!(
+                    fs::metadata(&operation).unwrap().mode() & 0o777,
+                    0o700,
+                    "operation must be private before transport or diagnostic capture"
+                );
                 assert!(
                     !command
                         .arguments
