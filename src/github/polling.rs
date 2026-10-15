@@ -8,9 +8,9 @@ pub struct RateLimit {
 }
 impl std::fmt::Display for RateLimit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let time = chrono::DateTime::from_timestamp(self.retry_at.min(i64::MAX as u64) as i64, 0)
-            .map(|date| date.with_timezone(&chrono::Local).format("%H:%M").to_string())
-            .unwrap_or_else(|| "the reset time".into());
+        // UTC is explicit so the reset time remains unambiguous without a
+        // platform-specific clock dependency in the shared CLI boundary.
+        let time = format!("{:02}:{:02} UTC", (self.retry_at / 3600) % 24, (self.retry_at / 60) % 60);
         write!(f, "GitHub rate limit reached. Retrying at {time}")
     }
 }
@@ -39,6 +39,11 @@ pub fn ready(host: &str, manual: bool) -> bool {
     BUDGETS.lock().unwrap_or_else(|e| e.into_inner()).get(&host.to_ascii_lowercase())
         .is_none_or(|b| b.due <= now() || (manual && !b.rate_limited))
 }
+pub fn rate_limit(host: &str) -> Option<RateLimit> {
+    BUDGETS.lock().unwrap_or_else(|e| e.into_inner()).get(&host.to_ascii_lowercase())
+        .filter(|budget| budget.rate_limited && budget.due > now()).map(|budget| RateLimit { retry_at: budget.due })
+}
+
 pub fn failed(host: &str, error: &GitHubError) {
     let mut budgets = BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
     let budget = budgets.entry(host.to_ascii_lowercase()).or_default();
