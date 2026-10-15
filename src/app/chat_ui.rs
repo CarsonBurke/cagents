@@ -9930,23 +9930,27 @@ mod tests {
             runtime.refresh();
         };
         publish(&mut app, &snapshot);
+        assert!(chat_runtime(&app, card).child_cache.is_empty());
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("finished-child".into()))));
+        assert!(chat_runtime(&app, card).child_cache["finished"].open.is_none());
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("running-child".into()))));
         let runtime = chat_runtime(&app, card);
         assert!(
-            runtime.cache["child-first"].open.is_some(),
+            runtime.child_cache["child-first"].open.is_some(),
             "an idle parent must not retire its running child's fence"
         );
         assert!(runtime.cache["parent"].open.is_none());
-        assert!(runtime.cache["finished"].open.is_none());
+        assert!(!runtime.child_cache.contains_key("finished"));
         // An unchanged snapshot must also preserve the child's continuation.
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
-        assert!(chat_runtime(&app, card).cache["child-first"].open.is_some());
+        assert!(chat_runtime(&app, card).child_cache["child-first"].open.is_some());
         let longer = format!("{body}fn second() {{}}\n");
         snapshot.subagents[0].items[0] = item("child-first", &longer);
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
         let expected = CachedItem::new(&text(&longer), chat_runtime(&app, card).syntax_theme);
-        let cached = &chat_runtime(&app, card).cache["child-first"];
+        let cached = &chat_runtime(&app, card).child_cache["child-first"];
         assert_eq!(parsed_codes(cached), parsed_codes(&expected));
         for (key, block) in &expected.blocks {
             for dark in [false, true] {
@@ -9964,8 +9968,8 @@ mod tests {
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
         let runtime = chat_runtime(&app, card);
-        assert!(runtime.cache["child-first"].open.is_none());
-        assert!(runtime.cache["child-new"].open.is_some());
+        assert!(runtime.child_cache["child-first"].open.is_none());
+        assert!(runtime.child_cache["child-new"].open.is_some());
         assert!(runtime.cache["parent"].open.is_none());
         assert!(runtime.cache["parent-new"].open.is_some());
         // Each terminal status retires an unchanged item. A resumed child
@@ -9983,12 +9987,12 @@ mod tests {
             snapshot.subagents[0].items.push(item(&id, body));
             snapshot.generation += 1;
             publish(&mut app, &snapshot);
-            assert!(chat_runtime(&app, card).cache[&id].open.is_some());
+            assert!(chat_runtime(&app, card).child_cache[&id].open.is_some());
             snapshot.subagents[0].status = status;
             snapshot.generation += 1;
             publish(&mut app, &snapshot);
             let runtime = chat_runtime(&app, card);
-            assert!(runtime.cache[&id].open.is_none());
+            assert!(runtime.child_cache[&id].open.is_none());
             assert!(runtime.cache["parent-new"].open.is_some());
             snapshot.subagents[0].status = chat::ToolStatus::Running;
             snapshot.generation += 1;
@@ -9996,7 +10000,7 @@ mod tests {
             *snapshot.subagents[0].items.last_mut().unwrap() = item(&id, &longer);
             snapshot.generation += 1;
             publish(&mut app, &snapshot);
-            let cached = &chat_runtime(&app, card).cache[&id];
+            let cached = &chat_runtime(&app, card).child_cache[&id];
             assert!(cached.open.is_some());
             assert_eq!(parsed_codes(cached), parsed_codes(&expected));
             for (key, block) in &expected.blocks {
@@ -10025,7 +10029,7 @@ mod tests {
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
         assert!(
-            chat_runtime(&app, card).cache["child-ending-2"]
+            chat_runtime(&app, card).child_cache["child-ending-2"]
                 .open
                 .is_none()
         );
@@ -10068,8 +10072,9 @@ mod tests {
                 runtime.refresh();
             };
             publish(&mut app, &snapshot);
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
             assert!(
-                chat_runtime(&app, card).cache["unfinished"]
+                chat_runtime(&app, card).child_cache["unfinished"]
                     .source
                     .provisional()
             );
@@ -10083,7 +10088,7 @@ mod tests {
             }
             snapshot.generation += 1;
             publish(&mut app, &snapshot);
-            let cached = &chat_runtime(&app, card).cache["unfinished"];
+            let cached = &chat_runtime(&app, card).child_cache["unfinished"];
             assert!(!cached.source.provisional());
             let expected =
                 CachedItem::new(&child_item.content, chat_runtime(&app, card).syntax_theme);
@@ -11233,6 +11238,7 @@ mod tests {
                 name: "fixture".into(),
                 input: "read".into(),
                 output,
+                status: chat::ToolStatus::Running,
             },
             at: None,
             started_at: None,
