@@ -2393,7 +2393,7 @@ mod tests {
 
     /// The live installation's own card: a native OMP conversation whose
     /// persisted launch names its session directory and nothing else.
-    fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
+    pub(super) fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
         Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,

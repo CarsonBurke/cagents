@@ -45,6 +45,10 @@ pub(super) struct State {
     queued: AtomicBool,
     in_flight_bytes: AtomicU64,
     buffer_bytes: AtomicU64,
+    #[cfg(test)]
+    fail_writes: AtomicBool,
+    #[cfg(test)]
+    before_install: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl State {
@@ -58,6 +62,10 @@ impl State {
             queued: AtomicBool::new(false),
             in_flight_bytes: AtomicU64::new(0),
             buffer_bytes: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_writes: AtomicBool::new(false),
+            #[cfg(test)]
+            before_install: Mutex::new(None),
         });
         let mut states = registry().lock().unwrap_or_else(|p| p.into_inner());
         states.retain(|state| state.strong_count() != 0);
@@ -168,6 +176,8 @@ impl State {
     }
 
     fn write(&self, record: &Publication) -> Result<Cached, String> {
+        #[cfg(test)]
+        if self.fail_writes.load(Ordering::Acquire) { return Err("injected disk write failure".into()); }
         let directory = self.directory.as_ref().ok_or("No private disk cache directory is available")?;
         fs::DirBuilder::new().recursive(true).mode(0o700).create(directory).map_err(|e| e.to_string())?;
         let metadata = fs::symlink_metadata(directory).map_err(|e| e.to_string())?;
@@ -260,6 +270,11 @@ impl State {
         let Ok((mut restored, record_epoch, clock)) = restored else { return; };
         self.in_flight_bytes.store(restored.transcript_bytes() as u64, Ordering::Release);
         self.trace();
+        #[cfg(test)]
+        if let Some((ready, proceed)) = self.before_install.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            ready.send(()).unwrap();
+            proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
         let Some(owner) = self.owner.get().and_then(Weak::upgrade) else {
             self.in_flight_bytes.store(0, Ordering::Release);
             return;
@@ -345,4 +360,107 @@ fn executor() -> &'static crossbeam_channel::Sender<Weak<State>> {
         }
         tx
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle() -> ClientHandle {
+        let mut snapshot = Snapshot { generation: 12, ready: true, session_id: Some("private-offline".into()), ..Snapshot::default() };
+        snapshot.items.push(Arc::new(super::super::super::Item {
+            id: "offline".into(), role: super::super::super::Role::Assistant,
+            content: super::super::super::ItemContent::Text {
+                text: "cached source".repeat(16384), thinking: false, phase: Default::default(),
+            }, started_at: None, at: None,
+        }));
+        ClientHandle::fixture(super::super::tests::omp_card(None, None), snapshot)
+    }
+
+    fn wait(description: &str, check: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !check() {
+            assert!(Instant::now() < deadline, "{description}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn pause(handle: &ClientHandle) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        *handle.inner.offline.before_install.lock().unwrap() = Some((ready_tx, proceed_rx));
+        (ready_rx, proceed_tx)
+    }
+
+    fn hidden_on_disk(handle: &ClientHandle) {
+        handle.set_visible(false).unwrap();
+        wait("disk spill did not finish", || handle.offline_view_metrics().3 > 0 && handle.offline_view_metrics().0 == 0);
+        handle.disconnect_for_test();
+    }
+
+    #[test]
+    fn revoked_account_cannot_install_a_completed_disk_read() {
+        let handle = handle();
+        hidden_on_disk(&handle);
+        let (ready, proceed) = pause(&handle);
+        handle.set_visible(true).unwrap();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.revoke_local_history();
+        proceed.send(()).unwrap();
+        wait("revoked reader did not settle", || !handle.inner.offline.queued.load(Ordering::Acquire));
+        assert_eq!(handle.snapshot().transcript_bytes(), 0);
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        assert_eq!(handle.offline_view_metrics().3, 0);
+    }
+
+    #[test]
+    fn late_disk_read_never_replaces_a_new_live_publication() {
+        let handle = handle();
+        hidden_on_disk(&handle);
+        let (ready, proceed) = pause(&handle);
+        handle.set_visible(true).unwrap();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.inner.alive.store(true, Ordering::Release);
+        let next = Snapshot { generation: 99, title: Some("New live publication".into()), ..Snapshot::default() };
+        handle.install_snapshot_for_test(next);
+        proceed.send(()).unwrap();
+        wait("stale reader did not settle", || !handle.inner.offline.queued.load(Ordering::Acquire));
+        assert_eq!(handle.snapshot().generation, 99);
+        assert_eq!(handle.snapshot().title.as_deref(), Some("New live publication"));
+        assert!(handle.snapshot().read_only_reason.is_none());
+    }
+
+    #[test]
+    fn hiding_again_fences_an_inflight_restore() {
+        let handle = handle();
+        hidden_on_disk(&handle);
+        let (ready, proceed) = pause(&handle);
+        handle.set_visible(true).unwrap();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.set_visible(false).unwrap();
+        proceed.send(()).unwrap();
+        wait("hidden reader did not settle", || !handle.inner.offline.queued.load(Ordering::Acquire));
+        assert_eq!(handle.snapshot().transcript_bytes(), 0);
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        handle.set_visible(true).unwrap();
+        wait("new reveal did not restore", || handle.resident_snapshot_with_clock().is_some());
+    }
+
+    #[test]
+    fn disk_failure_preserves_a_bounded_memory_fallback() {
+        let handle = handle();
+        handle.inner.offline.fail_writes.store(true, Ordering::Release);
+        let body = Arc::downgrade(&handle.snapshot().items[0]);
+        handle.set_visible(false).unwrap();
+        wait("failed write did not settle", || !handle.inner.offline.queued.load(Ordering::Acquire));
+        assert!(body.upgrade().is_some(), "failed I/O must not destroy the only readable body");
+        assert!(handle.offline_view_metrics().0 > 0);
+        assert_eq!(handle.offline_view_metrics().3, 0);
+        handle.disconnect_for_test();
+        handle.set_visible(true).unwrap();
+        wait("fallback did not restore", || handle.resident_snapshot_with_clock().is_some());
+        assert!(handle.snapshot().read_only_reason.is_some());
+        handle.revoke_local_history();
+        wait("revoked fallback did not release", || body.upgrade().is_none());
+    }
 }
