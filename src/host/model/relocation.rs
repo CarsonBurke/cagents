@@ -3,7 +3,7 @@
 use super::*;
 use crate::project_recovery::Relocation;
 
-pub(super) fn apply(tx: &rusqlite::Transaction<'_>, relocation: &Relocation) -> Result<bool, String> {
+pub(super) fn apply(tx: &rusqlite::Transaction<'_>, relocation: &Relocation, moves: &[super::agent_locations::AgentMove]) -> Result<bool, String> {
     relocation.validate()?;
     let old = repository_key(&relocation.repository)?;
     let new = repository_key(&relocation.destination)?;
@@ -24,7 +24,7 @@ pub(super) fn apply(tx: &rusqlite::Transaction<'_>, relocation: &Relocation) -> 
     let agents = tx.prepare("SELECT id,record FROM agents").map_err(|error| error.to_string())?.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|error| error.to_string())?;
     for (id, record) in agents {
         let mut agent: crate::agent_execution::Agent = serde_json::from_str(&record).map_err(|error| error.to_string())?;
-        if !super::agent_locations::relocate(tx, &agent, relocation)? { continue; }
+        if !super::agent_locations::relocate(tx, &agent, relocation, moves)? { continue; }
         relocation.agent(&mut agent);
         tx.execute("UPDATE agents SET record=?2 WHERE id=?1", params![id,serde_json::to_string(&agent).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
         // agent_policies.directory stores the approved device/inode proof,

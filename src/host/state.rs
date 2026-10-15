@@ -624,8 +624,8 @@ impl HostState {
 
     /// Provider evidence was prepared without this mutex. The caller owns
     /// exclusive control admission and publishes after actor-local completion.
-    pub(super) fn apply_session_relocation(&mut self, edit: &ModelEdit, moves: &[super::model::SessionMove]) -> Result<WorkspaceModel, ProtocolError> {
-        self.registry()?.apply_with_session_moves(edit, moves)
+    pub(super) fn apply_session_relocation(&mut self, edit: &ModelEdit, moves: &[super::model::SessionMove], agent_moves: &[super::model::AgentMove]) -> Result<WorkspaceModel, ProtocolError> {
+        self.registry()?.apply_with_location_moves(edit, moves, agent_moves)
             .map(|applied| applied.model).map_err(model_unavailable)
     }
 
