@@ -2,7 +2,57 @@
 //! creation dialog and journal remain the owners of new-worktree effects.
 use super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrCheckoutOrigin {
+    pub(super) card: CardId,
+    pub(super) project: ProjectId,
+    pub(super) generation: u64,
+    pub(super) target: pull_request_review::CheckoutTarget,
+    pub(super) consent: crate::repository::PrWorktreeCreationConsent,
+    pub(super) notice: String,
+}
+
 impl Cagents {
+    pub(super) fn review_checkout_blocker(&self, card: CardId) -> Option<String> {
+        if let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card)
+            && let Some(reason) = pane.review.restart_blocker()
+        {
+            return Some(reason);
+        }
+        self.worktree_operations
+            .values()
+            .any(|operation| operation.pr_creation_running(card))
+            .then(|| {
+                "Wait for the PR worktree creation to settle before closing its review.".into()
+            })
+    }
+
+    pub(super) fn pr_creation_origin_is_current(&self, origin: &PrCheckoutOrigin) -> bool {
+        !self.update_prepared
+            && !self.project_ui.closing.contains_key(&origin.project)
+            && self.sidebar_model.project(origin.project).is_some()
+            && matches!(self.cards.get(&origin.card), Some(CardRuntime::PullRequests(pane))
+                if pane.project(&self.sidebar_model) == Some(origin.project)
+                    && pane.review.selection_generation() == origin.generation
+                    && pane.review.checkout_target_is_current(&origin.target))
+    }
+
+    pub(super) fn cancel_stale_pr_creations(&mut self) {
+        let stale = self
+            .worktree_operations
+            .iter()
+            .filter_map(|(id, operation)| {
+                operation
+                    .pr_origin()
+                    .filter(|origin| !self.pr_creation_origin_is_current(origin))
+                    .map(|_| *id)
+            })
+            .collect::<Vec<_>>();
+        for id in stale {
+            drop(self.cancel_worktree_operation(id));
+        }
+    }
+
     pub(super) fn prepare_pr_checkout(
         &mut self,
         card: CardId,
@@ -80,6 +130,23 @@ impl Cagents {
                     }
                     return Task::none();
                 }
+                let Some(consent) = plan.creation_consent else {
+                    if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
+                        pane.review.report_checkout_error(
+                            "New PR checkout has no reviewed creation consent. Prepare it again."
+                                .into(),
+                        );
+                    }
+                    return Task::none();
+                };
+                let origin = PrCheckoutOrigin {
+                    card,
+                    project,
+                    generation,
+                    target,
+                    consent,
+                    notice: plan.notice.clone(),
+                };
                 let task = self.open_worktree_dialog(
                     project,
                     plan.repository,
@@ -87,7 +154,7 @@ impl Cagents {
                         branch: plan.branch_input,
                         base: plan.base,
                         destination: String::new(),
-                        ..Default::default()
+                        pr_checkout: Some(origin),
                     },
                     None,
                 );

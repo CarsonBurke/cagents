@@ -4,7 +4,8 @@
 use crate::{
     persistence::StateStore,
     repository::{
-        CancellationToken, CreateWorktreeRequest, RepositoryService, WorktreeOperationReport,
+        CancellationToken, CreateWorktreeRequest, PrWorktreeCreationConsent, RepositoryService,
+        WorktreeOperationReport,
     },
 };
 
@@ -13,16 +14,22 @@ use crate::{
 pub fn create(
     store: &StateStore,
     request: &CreateWorktreeRequest,
+    consent: Option<&PrWorktreeCreationConsent>,
     cancellation: &CancellationToken,
 ) -> WorktreeOperationReport {
     let (progress, _receiver) = async_channel::bounded(8);
-    RepositoryService::system("git").create_worktree_journaled(
-        store,
-        request,
-        1,
-        cancellation,
-        &progress,
-    )
+    let service = RepositoryService::system("git");
+    match consent {
+        Some(consent) => service.create_worktree_journaled_for_pr(
+            store,
+            request,
+            consent,
+            1,
+            cancellation,
+            &progress,
+        ),
+        None => service.create_worktree_journaled(store, request, 1, cancellation, &progress),
+    }
 }
 
 use crate::{
@@ -44,6 +51,7 @@ pub struct PreparedCheckout {
     pub existing_worktree: Option<PathBuf>,
     /// Existing checkouts are reconciled only after an explicit confirmation.
     pub reconciliation: Option<ExistingPrCheckoutPlan>,
+    pub creation_consent: Option<PrWorktreeCreationConsent>,
     existing_request: Option<ExistingPrCheckoutRequest>,
     pub notice: String,
 }
@@ -157,6 +165,7 @@ pub fn prepare(
             base: target.head.as_str().to_owned(),
             existing_worktree: None,
             reconciliation: None,
+            creation_consent: None,
             existing_request: None,
             notice: "Read-only commit checkout; no PR branch upstream is known.".into(),
         });
@@ -309,6 +318,7 @@ pub fn plan(
             base: String::new(),
             existing_worktree: Some(worktree.path.clone()),
             reconciliation: None,
+            creation_consent: None,
             existing_request: Some(ExistingPrCheckoutRequest {
                 repository: target.repository.clone(),
                 worktree: worktree.path.clone(),
@@ -339,11 +349,10 @@ pub fn plan(
         let worktree = worktrees.iter().find(|worktree| {
             worktree.branch.as_deref() == Some(format!("refs/heads/{branch}").as_str())
         });
-        if worktree.is_some() {
-            ensure_remote()?;
-        }
+        ensure_remote()?;
         return Ok(PreparedCheckout { repository: target.repository.clone(), branch_input: branch.clone(), base: target.head.as_str().to_owned(),
             existing_worktree: worktree.map(|worktree|worktree.path.clone()), reconciliation:None,
+            creation_consent: if worktree.is_none() { Some(PrWorktreeCreationConsent::new(head.repository.clone(), ValidatedBranchName::parse(&head.branch).map_err(|e|e.to_string())?, target.head.clone(), remote.clone(), false).map_err(|e|e.to_string())?) } else { None },
             existing_request: worktree.map(|worktree| Ok::<_,String>(ExistingPrCheckoutRequest {
                 repository:target.repository.clone(),worktree:worktree.path.clone(),
                 branch:ValidatedBranchName::parse(&branch).map_err(|e|e.to_string())?,
@@ -359,6 +368,16 @@ pub fn plan(
         base: String::new(),
         existing_worktree: None,
         reconciliation: None,
+        creation_consent: Some(
+            PrWorktreeCreationConsent::new(
+                head.repository.clone(),
+                ValidatedBranchName::parse(&head.branch).map_err(|e| e.to_string())?,
+                target.head.clone(),
+                remote.clone(),
+                true,
+            )
+            .map_err(|e| e.to_string())?,
+        ),
         existing_request: None,
         notice: format!(
             "Checks out {} tracking {remote}/{}. Commits can be pushed back to PR #{}.",
@@ -516,7 +535,10 @@ mod tests {
         assert_eq!(plan.branch_input, "pr/7");
         assert_eq!(plan.base, target.head.as_str());
         assert!(plan.notice.contains("do not have permission"));
-        assert!(git.added.borrow().is_empty());
+        assert_eq!(git.added.borrow().len(), 1);
+        let consent = plan.creation_consent.as_ref().unwrap();
+        assert_eq!(consent.expected_head(), &target.head);
+        assert!(!consent.tracks_remote());
     }
 
     #[test]

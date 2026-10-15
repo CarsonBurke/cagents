@@ -145,9 +145,7 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
-        if let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card)
-            && let Some(reason) = pane.review.restart_blocker()
-        {
+        if let Some(reason) = self.review_checkout_blocker(card) {
             self.status = Some(TransientNotice::warning(reason));
             return Task::none();
         }
@@ -336,9 +334,7 @@ impl Cagents {
             Option<(TerminalId, TerminalId)>,
         )>,
     ) -> Option<Task<Message>> {
-        if let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&id)
-            && let Some(reason) = pane.review.restart_blocker()
-        {
+        if let Some(reason) = self.review_checkout_blocker(id) {
             if self
                 .workspace
                 .pending_close()

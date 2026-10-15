@@ -389,6 +389,7 @@ impl Cagents {
         }
         self.project_has_unsaved_editors(project)
             .then(|| "Save or close this project's unsaved editor buffers first.".into())
+            .or_else(|| self.project_review_checkout_blocker(project))
     }
 
     pub(super) fn selected_worktree_deletion_blocker(
@@ -506,6 +507,7 @@ impl Cagents {
             .copied()
             .filter(|project| {
                 !self.project_has_unsaved_editors(*project)
+                    && self.project_review_checkout_blocker(*project).is_none()
                     && !self.project_ui.close_failed.contains(project)
                     && !self.project_ui.close_in_flight.contains(project)
                     && !self
@@ -560,6 +562,18 @@ impl Cagents {
                 Message::ProjectUi(Action::ProjectSessionsClosed(project, generation, result))
             })
         }))
+    }
+
+    fn project_review_checkout_blocker(&self, project: ProjectId) -> Option<String> {
+        let scope = self.project_session_scope(project);
+        self.cards.iter().find_map(|(id, runtime)| {
+            let belongs = matches!(runtime, CardRuntime::PullRequests(pane)
+                if pane.project(&self.sidebar_model) == Some(project))
+                || self
+                    .card_state(*id)
+                    .is_some_and(|card| self.project_owns_card(project, card, &scope));
+            belongs.then(|| self.review_checkout_blocker(*id)).flatten()
+        })
     }
 
     fn project_has_unsaved_editors(&self, project: ProjectId) -> bool {
@@ -666,6 +680,12 @@ impl Cagents {
         id: ProjectId,
         closure: ProjectSessionClosure,
     ) -> Task<Message> {
+        // An accepted checkout can begin after session census but before this
+        // callback. Keep its owner and the committed close pending until it settles.
+        if let Some(reason) = self.project_review_checkout_blocker(id) {
+            self.status = Some(TransientNotice::warning(reason));
+            return Task::none();
+        }
         let Some(repository) = self.project_ui.closing.remove(&id) else {
             return Task::none();
         };
@@ -1201,6 +1221,10 @@ impl Cagents {
                     self.status = Some(TransientNotice::warning(
                         "The project changed. Try removing it again.",
                     ));
+                    return self.project_dialog_closed();
+                }
+                if let Some(reason) = self.project_review_checkout_blocker(removal.project) {
+                    self.status = Some(TransientNotice::warning(reason));
                     return self.project_dialog_closed();
                 }
                 if self.project_has_unsaved_editors(removal.project) {
@@ -2384,6 +2408,81 @@ mod tests {
                     .existence
                     .is_open()
             );
+        }
+    }
+
+    #[test]
+    fn pending_pr_checkout_survives_local_and_inflight_shared_project_removal() {
+        for scoped in [false, true] {
+            let repository = PathBuf::from("/repo");
+            let primary = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.clone(),
+                Some("main".into()),
+            );
+            let linked = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.join("linked"),
+                Some("feature".into()),
+            );
+            let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+            let (card, task) = app.add_pull_requests_card(if scoped {
+                linked.path.clone()
+            } else {
+                repository.clone()
+            });
+            drop(task);
+            // Session closure may already have started before checkout acceptance.
+            drop(app.close_shared_project(&repository));
+            let generation = app.project_ui.close_generation[&project];
+            let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+                panic!("review");
+            };
+            let ticket = pane.review.fixture_existing_checkout_pending();
+            let review_generation = pane.review.selection_generation();
+            app.project_ui.remove_dialog = Some(ProjectRemoval {
+                project,
+                repository: repository.clone(),
+                kind: Default::default(),
+                name: "repo".into(),
+                worktrees: vec![repository.clone(), linked.path.clone()],
+                channels: 0,
+                project_sessions: ProjectSessionOwnership::default(),
+            });
+            drop(app.handle_project_action(Action::ConfirmRemove));
+            assert!(!app.project_ui.removing.contains_key(&repository));
+            assert!(app.cards.contains_key(&card));
+            drop(app.handle_project_action(Action::ProjectSessionsClosed(
+                project,
+                generation,
+                Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])),
+            )));
+            assert!(app.sidebar_model.project(project).is_some());
+            assert!(app.project_ui.closing.contains_key(&project));
+            assert!(app.cards.contains_key(&card));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.window_update_blocker().is_some());
+            drop(app.update(Message::PullRequestReview {
+                card,
+                action: pull_request_review::Action::ExistingCheckout(
+                    pull_request_review::checkout_ui::Action::Finished {
+                        generation: review_generation,
+                        ticket,
+                        result: Err("refused; no effect".into()),
+                    },
+                ),
+            }));
+            assert!(
+                app.project_ui.close_in_flight.contains(&project),
+                "settlement resumes the committed project close"
+            );
+            drop(app.handle_project_action(Action::ProjectSessionsClosed(
+                project,
+                generation,
+                Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])),
+            )));
+            assert!(app.sidebar_model.project(project).is_none());
+            assert!(!app.cards.contains_key(&card));
         }
     }
 

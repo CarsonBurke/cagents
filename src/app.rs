@@ -2676,6 +2676,7 @@ fn completion_navigates(message: &Message) -> bool {
                 result: Ok(_),
                 ..
             }
+            | Message::PrWorktreeCreated { .. }
             | Message::WorktreeCreated {
                 result: Ok(WorktreeCreationOutcome::Created { .. }),
                 ..
@@ -4261,6 +4262,11 @@ pub enum Message {
         result: Result<crate::repository::WorktreeOperationReport, String>,
     },
     WorktreeOperationsRehydrated(Result<Vec<crate::repository::WorktreeOperationReport>, String>),
+    PrWorktreeCreated {
+        origin: pr_checkout_ui::PrCheckoutOrigin,
+        repository: PathBuf,
+        outcome: WorktreeCreationOutcome,
+    },
     WorktreeCreated {
         project_id: ProjectId,
         repository: PathBuf,
@@ -6566,6 +6572,8 @@ impl Cagents {
         if let Some((project, target)) = checkout {
             tasks.push(self.prepare_pr_checkout(card, project, target));
         }
+        self.cancel_stale_pr_creations();
+        tasks.push(self.complete_closed_projects());
         Task::batch(tasks)
     }
 
@@ -8082,6 +8090,7 @@ impl Cagents {
         // Every focus move converges here, including tab cycling and closing a
         // pane. Also revoke ownership when the terminal runtime is replaced.
         self.reconcile_terminal_review_owner();
+        self.cancel_stale_pr_creations();
         let focus_changed = self.durable.focused != focused;
         let exposure_changed = exposure_update_pending(&self.durable, &update.transitions);
         if focus_changed || exposure_changed {
@@ -13138,6 +13147,7 @@ impl Application for Cagents {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         self.reconcile_terminal_review_owner();
+        self.cancel_stale_pr_creations();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
         }
@@ -15486,6 +15496,28 @@ impl Application for Cagents {
                 self.restore_worktree_operations(result)
             }
             Message::SubmitWorktree => self.submit_worktree_dialog(),
+            Message::PrWorktreeCreated {
+                origin,
+                repository,
+                outcome,
+            } => {
+                if !self.pr_creation_origin_is_current(&origin) {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "The PR checkout was created after its owning review changed. Its journal result is retained; inspect {} before opening.",
+                        match &outcome {
+                            WorktreeCreationOutcome::Created { worktree, .. } =>
+                                worktree.path.display().to_string(),
+                            _ => repository.display().to_string(),
+                        }
+                    )));
+                    return Task::none();
+                }
+                self.update(Message::WorktreeCreated {
+                    project_id: origin.project,
+                    repository,
+                    result: Ok(outcome),
+                })
+            }
             Message::WorktreeCreated {
                 project_id,
                 repository,
@@ -18798,6 +18830,16 @@ mod tests {
             .unwrap();
             prepared.branch_input = "origin/feature".into();
             prepared.base.clear();
+            prepared.creation_consent = Some(
+                crate::repository::PrWorktreeCreationConsent::new(
+                    target.head_repository.clone().unwrap(),
+                    crate::repository::ValidatedBranchName::parse(&target.head_ref_name).unwrap(),
+                    target.head.clone(),
+                    "origin".into(),
+                    true,
+                )
+                .unwrap(),
+            );
             app.update_prepared = changed == "update";
             drop(app.update(Message::PullRequestCheckoutReady {
                 card,

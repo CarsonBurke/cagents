@@ -530,6 +530,16 @@ impl Editor {
                 let Some(request) = dialog.request.clone() else {
                     return Task::none();
                 };
+                let consent = dialog
+                    .prepared
+                    .as_ref()
+                    .and_then(|plan| plan.creation_consent.clone());
+                if dialog.target.pull_request.is_some() && consent.is_none() {
+                    dialog.error = Some(
+                        "The reviewed creation consent is missing; prepare checkout again.".into(),
+                    );
+                    return Task::none();
+                }
                 dialog.accepted = true;
                 let cancellation = CancellationToken::new();
                 dialog.cancellation = Some(cancellation.clone());
@@ -540,6 +550,7 @@ impl Editor {
                         cagents::pull_request_review::checkout::create(
                             &journal.0,
                             &request,
+                            consent.as_ref(),
                             &cancellation,
                         )
                     })
