@@ -269,6 +269,29 @@ mod tests {
     }
 
     #[test]
+    fn later_page_changed_badge_survives_refresh_pending_mark_and_refusal() {
+        let mut state=thousand_files();
+        drop(state.page_action(PageAction::More));
+        let mut remote=remote_file("file-0105.rs",false);remote.viewer_viewed_state=FileViewedState::Dismissed;
+        answer(&mut state,vec![remote],"me");
+        assert!(state.files[105].changed_since_viewed);
+        let mut refresh=loaded(
+            (0..1000).map(|i|entry(&format!("file-{i:04}.rs"),ChangeKind::Modified)).collect(),
+            (0..100).map(|i|remote_file(&format!("file-{i:04}.rs"),true)).collect());
+        refresh.next_file_cursor=Some("page-2".into());
+        state.adopt(&refresh);
+        assert!(state.files[105].changed_since_viewed);
+        assert_eq!(state.files[105].sync,ViewedSync::Settled);
+        drop(state.set_viewed(vec![105],true));
+        state.adopt(&refresh);
+        assert!(state.files[105].changed_since_viewed);
+        assert_eq!(state.files[105].sync,ViewedSync::Pending);
+        drop(state.update(Action::ViewedApplied{generation:state.generation,authority_revision:state.authority_revision,results:vec![(state.files[105].entry.path.clone(),true,ViewedOutcome::NotApplied("denied".into()))]}));
+        assert!(!state.files[105].viewed);
+        assert!(state.files[105].changed_since_viewed);
+    }
+
+    #[test]
     fn thousand_file_review_loads_only_demanded_viewed_pages() {
         let mut state = thousand_files();
         assert_eq!(state.files.len(), 1000);
