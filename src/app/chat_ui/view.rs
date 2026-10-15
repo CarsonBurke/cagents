@@ -2328,6 +2328,12 @@ impl Runtime {
             .align_y(Alignment::Center)
             .into();
         if compact_footer {
+            // Model/reasoning/account popovers are anchored inside this
+            // overflow. Keyboard shortcuts can open them while More is closed.
+            let details_open = self.footer_picker
+                || self.model_picker.is_some()
+                || self.reasoning_picker
+                || self.account_picker;
             secondary.push(spend);
             footer.push(widget::Space::new().width(Length::Fill).into());
             footer.push(crate::ui_controls::popover(
@@ -2335,9 +2341,9 @@ impl Runtime {
                     Icon::More,
                     "Conversation details and settings",
                     true,
-                    Action::FooterPicker(target, !self.footer_picker),
+                    Action::FooterPicker(target, !details_open),
                 ),
-                self.footer_picker.then(|| {
+                details_open.then(|| {
                     widget::container(
                         widget::flex_row(secondary)
                             .spacing(step::GAP_S as u16)
@@ -2695,6 +2701,7 @@ impl Runtime {
                             .enumerate()
                             .map(|(index, reasoning)| {
                                 widget::button::custom(design::body(reasoning.as_str()))
+                                    .name(reasoning.as_str())
                                     .class(crate::ui_controls::control_style(
                                         Some(index) == selected,
                                         None,
@@ -5908,6 +5915,139 @@ mod tests {
             "footer wrapped: {bounds:?}"
         );
         assert!(bounds.width <= 450.0);
+    }
+
+    #[test]
+    fn compact_footer_keeps_nested_model_and_reasoning_pickers_interactive() {
+        use iced::advanced::clipboard;
+        use iced::runtime::{UserInterface, user_interface::Cache};
+
+        fn click(
+            app: &Cagents,
+            target: Target,
+            cache: Cache,
+            renderer: &mut cosmic::Renderer,
+            label: &str,
+        ) -> (Cache, Vec<Message>) {
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
+                panic!("chat");
+            };
+            let view = runtime.view(
+                None,
+                false,
+                true,
+                &app.settings.keyboard_shortcuts,
+                450.0,
+                Place {
+                    name: "fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut ui = UserInterface::build(view, iced::Size::new(450.0, 700.0), cache, renderer);
+            let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let bounds = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(label)
+                })
+                .and_then(|node| node.node().bounds())
+                .unwrap_or_else(|| panic!("missing visible button {label}"));
+            let pointer = iced::Point::new(
+                (bounds.x0 + bounds.x1) as f32 / 2.0,
+                (bounds.y0 + bounds.y1) as f32 / 2.0,
+            );
+            let mut messages = Vec::new();
+            ui.update(
+                &[
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    )),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )),
+                ],
+                iced::mouse::Cursor::Available(pointer),
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            (ui.into_cache(), messages)
+        }
+        fn apply(app: &mut Cagents, messages: Vec<Message>) {
+            for message in messages {
+                drop(app.update(message));
+            }
+        }
+
+        let (mut live, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut target = live.target;
+        target.card = app.workspace.focused().unwrap();
+        live.target = target;
+        let snapshot = Arc::make_mut(&mut live.snapshot);
+        snapshot.capabilities.model_selection = true;
+        snapshot.capabilities.reasoning_selection = true;
+        snapshot.models = vec![
+            chat::Model {
+                id: "model-a".into(),
+                label: "Fixture model A".into(),
+                reasoning: vec!["low".into(), "high".into()],
+            },
+            model("model-b", "Fixture model B"),
+        ];
+        snapshot.selected_model = Some("model-a".into());
+        snapshot.reasoning = Some("low".into());
+        app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(live)));
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut cache = Cache::new();
+        for picker in ["Choose a model", "Choose reasoning effort"] {
+            let (next, messages) = click(
+                &app,
+                target,
+                cache,
+                &mut renderer,
+                "Conversation details and settings",
+            );
+            cache = next;
+            apply(&mut app, messages);
+            let (next, messages) = click(&app, target, cache, &mut renderer, picker);
+            cache = next;
+            apply(&mut app, messages);
+            let label = if picker == "Choose a model" {
+                "Fixture model B"
+            } else {
+                "high"
+            };
+            let (next, messages) = click(&app, target, cache, &mut renderer, label);
+            cache = next;
+            assert!(
+                messages.iter().any(|message| match message {
+                    Message::ChatUi(Action::Model(actual, id)) =>
+                        *actual == target && id == "model-b",
+                    Message::ChatUi(Action::Reasoning(actual, id, effort)) =>
+                        *actual == target && id == "model-a" && effort == "high",
+                    _ => false,
+                }),
+                "nested picker must publish its selection"
+            );
+            drop(app.handle_chat_ui(Action::FooterPicker(target, false)));
+        }
+        // The keyboard command must mount More's anchor and the model popup
+        // even though the overflow has not been opened with the pointer.
+        drop(app.open_chat_control(crate::workspace_widget::GlobalShortcut::ChatModel));
+        let (_, messages) = click(&app, target, cache, &mut renderer, "Fixture model B");
+        assert!(messages.iter().any(|message| matches!(message,
+            Message::ChatUi(Action::Model(actual, id)) if *actual == target && id == "model-b")));
     }
 
     #[test]

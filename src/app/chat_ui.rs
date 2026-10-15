@@ -7244,6 +7244,9 @@ impl Cagents {
             Action::FooterPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.footer_picker = open;
+                    runtime.model_picker = None;
+                    runtime.reasoning_picker = false;
+                    runtime.account_picker = false;
                     runtime.permission_picker = false;
                     runtime.composer_actions = false;
                 }
