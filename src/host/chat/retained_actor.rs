@@ -178,6 +178,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         let semantic = match entry.update {
             Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
             Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
+            Update::AttentionContext {evidence,content} => NativeActorEvent::AttentionContext {evidence,content},
             _ => return Err("The retained semantic outbox contains an unsupported event".into()),
         };
         let (changed, automation) = {
@@ -201,20 +202,20 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         if changed {
             super::super::agent_execution::announce(host, &registry);
         }
-        if let NativeActorEvent::Attention(evidence) = semantic {
+        if let Some((evidence,content)) = semantic.attention() {
             // Scheduled notifications are produced from committed run outcomes.
             if !automation
                 && !(loss.is_some() && evidence.kind == crate::notifications::Kind::Succeeded)
             {
+                let mut event=crate::notifications::Event::session(id,source.launch.provider,source.launch.recipe.working_directory.clone(),evidence);
+                // This bounded immutable context belongs to this exact semantic
+                // event; neither a later snapshot nor a transcript page can
+                // replace it while the FULL notification commit is retried.
+                event.content=content;
                 let receipt = notifications
                     .as_ref()
                     .ok_or("The notification journal is unavailable; attention remains retained")?
-                    .record_committed(crate::notifications::Event::session(
-                        id,
-                        source.launch.provider,
-                        source.launch.recipe.working_directory.clone(),
-                        evidence,
-                    ))?;
+                    .record_committed(event)?;
                 receipt.recv_timeout(Duration::from_secs(10)).map_err(
                     |_| "The notification journal has not confirmed this attention outcome",
                 )??;
@@ -576,6 +577,7 @@ pub(in crate::host) fn finish_close(
             let event = match entry.update {
                 Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
                 Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
+            Update::AttentionContext {evidence,content} => NativeActorEvent::AttentionContext {evidence,content},
                 _ => {
                     return Err(
                         "Closing actor journal contains an unsupported semantic event".into(),
@@ -603,19 +605,16 @@ pub(in crate::host) fn finish_close(
             if changed {
                 super::super::agent_execution::announce(host, &registry);
             }
-            if let NativeActorEvent::Attention(evidence) = event
+            if let Some((evidence,content)) = event.attention()
                 && !automation
                 && !(loss.is_some() && evidence.kind == crate::notifications::Kind::Succeeded)
             {
+                let mut notification=crate::notifications::Event::session(source.id,source.launch.provider,source.launch.recipe.working_directory.clone(),evidence);
+                notification.content=content;
                 notifications
                     .as_ref()
                     .ok_or("Final attention journal is unavailable; helper is retained")?
-                    .record_committed(crate::notifications::Event::session(
-                        source.id,
-                        source.launch.provider,
-                        source.launch.recipe.working_directory.clone(),
-                        evidence,
-                    ))?
+                    .record_committed(notification)?
                     .recv_timeout(Duration::from_secs(10))
                     .map_err(|_| "Final attention has not committed; helper is retained")??;
             }

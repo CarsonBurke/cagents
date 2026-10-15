@@ -16,6 +16,20 @@ use uuid::Uuid;
 pub(in crate::host) enum NativeActorEvent {
     Execution { run: RunId, update: Update },
     Attention(crate::notifications::Evidence),
+    AttentionContext {
+        evidence: crate::notifications::Evidence,
+        content: Option<crate::notifications::Content>,
+    },
+}
+
+impl NativeActorEvent {
+    pub(in crate::host) fn attention(&self) -> Option<(crate::notifications::Evidence, Option<crate::notifications::Content>)> {
+        match self {
+            Self::Attention(evidence) => Some((evidence.clone(), None)),
+            Self::AttentionContext {evidence,content} => Some((evidence.clone(),content.clone())),
+            Self::Execution {..} => None,
+        }
+    }
 }
 
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
@@ -571,5 +585,16 @@ mod tests {
                 .is_err()
         );
         assert_eq!(registry.agent_run(accepted.run.id).unwrap(), done);
+        let evidence=crate::notifications::Evidence {key:"retained-exact-final-context".into(),kind:crate::notifications::Kind::Succeeded};
+        let content=crate::notifications::Content {conversation:"Original turn".into(),preview:"Exact provider result before daemon restart".into(),request:None};
+        let attention=NativeActorEvent::AttentionContext {evidence:evidence.clone(),content:Some(content.clone())};
+        assert!(!registry.commit_native_actor_event(actor,&owner,&source,3,&attention,6).unwrap());
+        drop(registry);
+        let mut registry=Registry::at(&path).unwrap();
+        assert!(!registry.commit_native_actor_event(actor,&owner,&source,3,&attention,7).unwrap());
+        let mut other=content.clone();other.preview="A later unrelated snapshot".into();
+        assert!(registry.commit_native_actor_event(actor,&owner,&source,3,&NativeActorEvent::AttentionContext {evidence,content:Some(other)},8).is_err(),"replay cannot replace the same semantic sequence's immutable context");
+        assert_eq!(attention.attention().unwrap().1,Some(content));
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(),done);
     }
 }

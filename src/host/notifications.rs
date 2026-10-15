@@ -810,7 +810,7 @@ mod tests {
     fn helper_attention_receipt_waits_for_the_actual_durable_journal_commit() {
         let (shared, _receiver) = shared();
         let handle = Handle(shared.clone());
-        let event = Event::session(
+        let mut event = Event::session(
             TerminalId::new(),
             crate::agent::Provider::Claude,
             "/repo".into(),
@@ -819,6 +819,7 @@ mod tests {
                 kind: crate::notifications::Kind::Succeeded,
             },
         );
+        event.content=Some(crate::notifications::Content {conversation:"Original turn".into(),preview:"Immutable response captured before daemon replacement".into(),request:None});
         let receipt = handle.record_committed(event.clone()).unwrap();
         assert!(
             matches!(
