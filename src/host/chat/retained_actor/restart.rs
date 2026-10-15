@@ -55,12 +55,12 @@ pub(in crate::host) fn restart_completed(
             return Ok(None);
         };
         let cached = state.native_actor_restarts.get(&source.id).cloned();
-        if cached.is_none() && !record.handle.is_completed() {
-            return Ok(None);
-        }
         // Coherent nonblocking metadata only; never hydrate presentation or
         // wait behind Store/confirmation publication while holding HostState.
         let observed = record.handle.try_close_identity().map_err(unavailable)?;
+        if cached.is_none() && !observed.completed {
+            return Ok(None);
+        }
         let mut session = record.session.clone();
         session.launch.session_id = observed.confirmed_session_id.clone();
         session.native_continuity = observed.native_continuity.clone();
@@ -230,8 +230,9 @@ pub(in crate::host) fn restart_completed(
     // Only a positive restart receipt permits fresh concrete helper evidence
     // to resolve Unknown. Lost/Accepted/error replies leave it fenced.
     super::super::source_binding::refresh(host, source.id, true)?;
-    if handle.is_completed()
-        || handle.confirmed_session_id().as_deref() != Some(prepared.expected_session_id.as_str())
+    let ready = handle.try_close_identity().map_err(unavailable)?;
+    if ready.completed
+        || ready.confirmed_session_id.as_deref() != Some(prepared.expected_session_id.as_str())
         || !handle.update_activity().1
     {
         return Err(unavailable(
@@ -247,7 +248,7 @@ pub(in crate::host) fn restart_completed(
             record.handle.same_actor(&handle) && record.execution_instance == identity.instance
         })
         .ok_or_else(|| unavailable("The retained actor changed before restart publication"))?;
-    record.session.native_continuity = handle.native_continuity();
+    record.session.native_continuity = ready.native_continuity;
     record.completion_observed = false;
     if client != 0 {
         record.subscribers.entry(client).or_insert(false);
