@@ -308,8 +308,17 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
 }
 
 #[cfg(feature = "host")]
-fn login_recipe(account: &super::Account, cli: super::probe::Cli) -> Result<crate::model::LaunchRecipe, String> {
-    cli.login_recipe(account, std::env::var_os("HOME").ok_or("Remote HOME is unavailable")?.into(), true)
+fn login_recipe(
+    account: &super::Account,
+    cli: super::probe::Cli,
+) -> Result<crate::model::LaunchRecipe, String> {
+    cli.login_recipe(
+        account,
+        std::env::var_os("HOME")
+            .ok_or("Remote HOME is unavailable")?
+            .into(),
+        true,
+    )
 }
 
 #[cfg(test)]

@@ -1585,11 +1585,20 @@ mod tests {
     fn captured_shell_pin_is_recorded_without_a_reducer_filesystem_probe() {
         let directory = tempfile::tempdir().unwrap();
         let pin = directory.path().join("unavailable-shell");
-        let settings = crate::settings::AppSettings { default_shell: Some(pin.to_str().unwrap().into()), ..Default::default() };
-        let launch = crate::settings::agents::without_executable_checks(|| LaunchRecipe::shell_with_settings(directory.path().into(), &settings)).unwrap();
+        let settings = crate::settings::AppSettings {
+            default_shell: Some(pin.to_str().unwrap().into()),
+            ..Default::default()
+        };
+        let launch = crate::settings::agents::without_executable_checks(|| {
+            LaunchRecipe::shell_with_settings(directory.path().into(), &settings)
+        })
+        .unwrap();
         assert_eq!(launch.program, pin.to_str().unwrap());
         assert!(launch.arguments.is_empty());
-        assert_eq!(terminal_shell_from_preference(settings.default_shell.as_deref()), Err(LoginShellError::ConfiguredUnavailable));
+        assert_eq!(
+            terminal_shell_from_preference(settings.default_shell.as_deref()),
+            Err(LoginShellError::ConfiguredUnavailable)
+        );
     }
 
     #[test]

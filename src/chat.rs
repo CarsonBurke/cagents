@@ -2700,7 +2700,15 @@ pub(crate) fn fresh_session_configured(
     configuration: &crate::settings::AgentLaunchSettings,
     overrides: crate::settings::agents::LaunchDefaults<'_>,
 ) -> Result<Session, String> {
-    fresh_session_from_policy(provider, id, working_directory, account, configuration, overrides, true)
+    fresh_session_from_policy(
+        provider,
+        id,
+        working_directory,
+        account,
+        configuration,
+        overrides,
+        true,
+    )
 }
 
 /// Draft construction checks policy syntax but grants no launch permission.
@@ -2708,30 +2716,53 @@ pub(crate) fn fresh_session_configured(
 /// Provider default-mode metadata keeps its existing lookup behavior.
 #[cfg(feature = "ui")]
 pub(crate) fn fresh_session_draft(
-    provider: Provider, id: crate::model::TerminalId,
-    working_directory: std::path::PathBuf, account: &crate::account::Account,
+    provider: Provider,
+    id: crate::model::TerminalId,
+    working_directory: std::path::PathBuf,
+    account: &crate::account::Account,
     configuration: &crate::settings::AgentLaunchSettings,
 ) -> Result<Session, String> {
-    fresh_session_from_policy(provider, id, working_directory, account, configuration, Default::default(), false)
+    fresh_session_from_policy(
+        provider,
+        id,
+        working_directory,
+        account,
+        configuration,
+        Default::default(),
+        false,
+    )
 }
 
 /// Read-only history can describe an unavailable binary. This helper does
 /// not grant permission to start it; activation validates on a worker.
 #[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn history_session_configured(
-    provider: Provider, id: crate::model::TerminalId,
-    working_directory: std::path::PathBuf, account: &crate::account::Account,
+    provider: Provider,
+    id: crate::model::TerminalId,
+    working_directory: std::path::PathBuf,
+    account: &crate::account::Account,
     configuration: &crate::settings::AgentLaunchSettings,
 ) -> Result<Session, String> {
-    fresh_session_from_policy(provider, id, working_directory, account, configuration, Default::default(), false)
+    fresh_session_from_policy(
+        provider,
+        id,
+        working_directory,
+        account,
+        configuration,
+        Default::default(),
+        false,
+    )
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
 fn fresh_session_from_policy(
-    provider: Provider, id: crate::model::TerminalId,
-    working_directory: std::path::PathBuf, account: &crate::account::Account,
+    provider: Provider,
+    id: crate::model::TerminalId,
+    working_directory: std::path::PathBuf,
+    account: &crate::account::Account,
     configuration: &crate::settings::AgentLaunchSettings,
-    overrides: crate::settings::agents::LaunchDefaults<'_>, availability: bool,
+    overrides: crate::settings::agents::LaunchDefaults<'_>,
+    availability: bool,
 ) -> Result<Session, String> {
     // Explicit conversation choices supersede saved defaults, including a
     // retained default from a newer build. Validate only the effective policy.
@@ -2745,7 +2776,11 @@ fn fresh_session_from_policy(
     if overrides.permission_mode.is_some() {
         effective.permission_mode = None;
     }
-    if availability { effective.validate(provider)?; } else { effective.validate_syntax(provider)?; }
+    if availability {
+        effective.validate(provider)?;
+    } else {
+        effective.validate_syntax(provider)?;
+    }
     for value in [overrides.model, overrides.effort, overrides.permission_mode]
         .into_iter()
         .flatten()

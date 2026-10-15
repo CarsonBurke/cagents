@@ -10,8 +10,16 @@ pub fn is_codex_browser(recipe: &LaunchRecipe) -> bool {
     // The cagents auth builder appends the exact subcommand after fixed
     // wrapper arguments. This is callback coordination, never account or
     // provider ownership authority.
-    if recipe.environment.get(super::SIGN_IN_MARKER).map(String::as_str) == Some("codex") {
-        return recipe.arguments.last().is_some_and(|argument| argument == "login");
+    if recipe
+        .environment
+        .get(super::SIGN_IN_MARKER)
+        .map(String::as_str)
+        == Some("codex")
+    {
+        return recipe
+            .arguments
+            .last()
+            .is_some_and(|argument| argument == "login");
     }
     std::path::Path::new(&recipe.program)
         .file_name()
@@ -70,15 +78,30 @@ mod tests {
     #[cfg(any(feature = "host", feature = "ui"))]
     #[test]
     fn configured_wrapper_auth_preserves_browser_callback_coordination() {
-        let account = super::super::Account::managed(crate::agent::Provider::Codex, uuid::Uuid::new_v4(), "/fixture/profile".into());
+        let account = super::super::Account::managed(
+            crate::agent::Provider::Codex,
+            uuid::Uuid::new_v4(),
+            "/fixture/profile".into(),
+        );
         let cli = super::super::probe::Cli {
             program: "/fixture/pinned-wrapper".into(),
-            configuration: crate::settings::AgentLaunchSettings { arguments: vec!["--fixture-fixed".into()], ..Default::default() },
+            configuration: crate::settings::AgentLaunchSettings {
+                arguments: vec!["--fixture-fixed".into()],
+                ..Default::default()
+            },
         };
-        let browser = cli.login_recipe(&account, "/fixture/home".into(), false).unwrap();
+        let browser = cli
+            .login_recipe(&account, "/fixture/home".into(), false)
+            .unwrap();
         assert!(is_codex_browser(&browser));
-        assert!(!is_codex_browser(&cli.login_recipe(&account, "/fixture/home".into(), true).unwrap()));
-        assert!(!is_codex_browser(&LaunchRecipe { environment: Default::default(), ..browser }));
+        assert!(!is_codex_browser(
+            &cli.login_recipe(&account, "/fixture/home".into(), true)
+                .unwrap()
+        ));
+        assert!(!is_codex_browser(&LaunchRecipe {
+            environment: Default::default(),
+            ..browser
+        }));
     }
 
     #[test]

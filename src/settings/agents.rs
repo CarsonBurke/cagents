@@ -96,7 +96,9 @@ thread_local! {
 pub(crate) fn without_executable_checks<T>(f: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
-        fn drop(&mut self) { EXECUTABLE_CHECKS_FORBIDDEN.set(self.0); }
+        fn drop(&mut self) {
+            EXECUTABLE_CHECKS_FORBIDDEN.set(self.0);
+        }
     }
     let _restore = Restore(EXECUTABLE_CHECKS_FORBIDDEN.replace(true));
     f()
@@ -104,7 +106,12 @@ pub(crate) fn without_executable_checks<T>(f: impl FnOnce() -> T) -> T {
 
 pub fn executable_available(path: &str) -> bool {
     #[cfg(test)]
-    EXECUTABLE_CHECKS_FORBIDDEN.with(|forbidden| assert!(!forbidden.get(), "filesystem availability check on reducer thread"));
+    EXECUTABLE_CHECKS_FORBIDDEN.with(|forbidden| {
+        assert!(
+            !forbidden.get(),
+            "filesystem availability check on reducer thread"
+        )
+    });
     let path = Path::new(path);
     path.is_absolute()
         && path.is_file()
@@ -182,12 +189,18 @@ impl AgentLaunchSettings {
         self.validate_execution_fields_with_availability(provider, true)
     }
 
-    fn validate_execution_fields_with_availability(&self, provider: Provider, availability: bool) -> Result<(), String> {
-        if self
-            .executable
-            .as_deref()
-            .is_some_and(|path| if availability { !executable_available(path) } else { !executable_path_syntax(path) })
-        {
+    fn validate_execution_fields_with_availability(
+        &self,
+        provider: Provider,
+        availability: bool,
+    ) -> Result<(), String> {
+        if self.executable.as_deref().is_some_and(|path| {
+            if availability {
+                !executable_available(path)
+            } else {
+                !executable_path_syntax(path)
+            }
+        }) {
             return Err(format!(
                 "{} executable must be an absolute path to an executable file.",
                 provider.label()
@@ -220,8 +233,15 @@ impl AgentLaunchSettings {
     /// Availability is checked by save/launch workers on the owning device.
     pub fn validate_syntax(&self, provider: Provider) -> Result<(), String> {
         self.validate_fields_with_availability(provider, false)?;
-        if self.executable.as_deref().is_some_and(|path| !executable_path_syntax(path)) {
-            return Err(format!("{} executable must be an absolute path to an executable file.", provider.label()));
+        if self
+            .executable
+            .as_deref()
+            .is_some_and(|path| !executable_path_syntax(path))
+        {
+            return Err(format!(
+                "{} executable must be an absolute path to an executable file.",
+                provider.label()
+            ));
         }
         self.validate_provider_path()
     }
@@ -235,7 +255,11 @@ impl AgentLaunchSettings {
         self.validate_fields_with_availability(provider, true)
     }
 
-    fn validate_fields_with_availability(&self, provider: Provider, availability: bool) -> Result<(), String> {
+    fn validate_fields_with_availability(
+        &self,
+        provider: Provider,
+        availability: bool,
+    ) -> Result<(), String> {
         self.validate_execution_fields_with_availability(provider, availability)?;
         for value in self.model.iter().chain(self.effort.iter()) {
             if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -263,11 +287,20 @@ impl AgentLaunchSettings {
         self.validate_changes_with_availability(previous, provider, true)
     }
 
-    pub fn validate_changes_syntax(&self, previous: &Self, provider: Provider) -> Result<(), String> {
+    pub fn validate_changes_syntax(
+        &self,
+        previous: &Self,
+        provider: Provider,
+    ) -> Result<(), String> {
         self.validate_changes_with_availability(previous, provider, false)
     }
 
-    fn validate_changes_with_availability(&self, previous: &Self, provider: Provider, availability: bool) -> Result<(), String> {
+    fn validate_changes_with_availability(
+        &self,
+        previous: &Self,
+        provider: Provider,
+        availability: bool,
+    ) -> Result<(), String> {
         Self {
             model: (self.model != previous.model)
                 .then(|| self.model.clone())
@@ -862,7 +895,8 @@ mod tests {
         assert!(configuration.validate(Provider::Claude).is_err());
         configuration.executable = Some("relative-wrapper".into());
         assert!(configuration.validate_syntax(Provider::Claude).is_err());
-        configuration.executable = Some(root.path().join("missing-wrapper").to_str().unwrap().into());
+        configuration.executable =
+            Some(root.path().join("missing-wrapper").to_str().unwrap().into());
         configuration.permission_mode = Some("unknown-mode".into());
         assert!(configuration.validate_syntax(Provider::Claude).is_err());
     }

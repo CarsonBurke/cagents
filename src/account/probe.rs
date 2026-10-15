@@ -182,7 +182,12 @@ impl Cli {
 
     /// The same immutable execution policy used for this discovery. This
     /// classifies an auth terminal; it grants no account or history authority.
-    pub fn login_recipe(&self, account: &Account, home: PathBuf, device: bool) -> Result<crate::model::LaunchRecipe, String> {
+    pub fn login_recipe(
+        &self,
+        account: &Account,
+        home: PathBuf,
+        device: bool,
+    ) -> Result<crate::model::LaunchRecipe, String> {
         let login: &[&str] = match (account.provider, device) {
             (Provider::Claude, _) => &["auth", "login", "--claudeai"],
             (Provider::Codex, false) => &["login"],
@@ -196,18 +201,38 @@ impl Cli {
         if let Some(path) = shell_search_path().and_then(|path| path.to_str().map(str::to_owned)) {
             environment.entry("PATH".into()).or_insert(path);
         }
-        environment.insert(super::SIGN_IN_MARKER.into(), account.provider.executable().into());
-        if let (Some(variable), Some(selected)) = (super::home_variable(account.provider), account.resolved_home()) {
+        environment.insert(
+            super::SIGN_IN_MARKER.into(),
+            account.provider.executable().into(),
+        );
+        if let (Some(variable), Some(selected)) = (
+            super::home_variable(account.provider),
+            account.resolved_home(),
+        ) {
             environment.insert(variable.into(), selected.display().to_string());
         }
         let mut arguments = self.configuration.arguments.clone();
         arguments.extend(login.iter().map(|value| (*value).to_owned()));
-        let unset_environment: std::collections::BTreeSet<String> = account.credential_overrides().iter().copied()
-            .chain(SCRUBBED_ENVIRONMENT.iter().copied()).map(str::to_owned).collect();
-        for variable in &unset_environment { environment.remove(variable); }
+        let unset_environment: std::collections::BTreeSet<String> = account
+            .credential_overrides()
+            .iter()
+            .copied()
+            .chain(SCRUBBED_ENVIRONMENT.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        for variable in &unset_environment {
+            environment.remove(variable);
+        }
         Ok(crate::model::LaunchRecipe {
-            program: self.program.to_str().ok_or("Provider executable is not UTF-8")?.into(),
-            arguments, working_directory: home, environment, unset_environment,
+            program: self
+                .program
+                .to_str()
+                .ok_or("Provider executable is not UTF-8")?
+                .into(),
+            arguments,
+            working_directory: home,
+            environment,
+            unset_environment,
         })
     }
 }
@@ -587,10 +612,18 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-fn command(account: &Account, program: &Path, configuration: &crate::settings::AgentLaunchSettings) -> Command {
+fn command(
+    account: &Account,
+    program: &Path,
+    configuration: &crate::settings::AgentLaunchSettings,
+) -> Command {
     let mut command = Command::new(program);
-    if let Some(path) = shell_search_path() { command.env("PATH", path); }
-    command.args(&configuration.arguments).envs(&configuration.environment);
+    if let Some(path) = shell_search_path() {
+        command.env("PATH", path);
+    }
+    command
+        .args(&configuration.arguments)
+        .envs(&configuration.environment);
     for variable in SCRUBBED_ENVIRONMENT {
         command.env_remove(variable);
     }
@@ -840,7 +873,8 @@ pub async fn logout(account: Account) -> Result<(), String> {
     let provider = account.provider;
     let search_path = search_path().await;
     let cli = tokio::task::spawn_blocking(move || Cli::capture(provider, search_path.as_deref()))
-        .await.map_err(|_| "The sign-out configuration could not be read".to_owned())?;
+        .await
+        .map_err(|_| "The sign-out configuration could not be read".to_owned())?;
     let cli = match cli {
         Ok(cli) => cli,
         Err(CliFailure::Unavailable(_)) => return Ok(()),
@@ -873,7 +907,11 @@ pub async fn logout(account: Account) -> Result<(), String> {
 /// slash commands and no session persistence: it only ever answers two
 /// control requests and never takes a turn, and that way it runs none of the
 /// user's hooks and leaves nothing behind in their history.
-async fn probe_claude(account: &Account, program: &Path, configuration: &crate::settings::AgentLaunchSettings) -> Result<Probed, String> {
+async fn probe_claude(
+    account: &Account,
+    program: &Path,
+    configuration: &crate::settings::AgentLaunchSettings,
+) -> Result<Probed, String> {
     let mut status = command(account, program, configuration);
     status.args(["auth", "status", "--json"]);
     let mut usage = command(account, program, configuration);
@@ -1029,7 +1067,11 @@ pub fn match_control_response(frame: &Value, request_id: &str) -> Option<Result<
 
 /// Codex: `codex app-server` over stdio, asked for the account and its
 /// limits and then closed.
-async fn probe_codex(account: &Account, program: &Path, configuration: &crate::settings::AgentLaunchSettings) -> Result<Probed, String> {
+async fn probe_codex(
+    account: &Account,
+    program: &Path,
+    configuration: &crate::settings::AgentLaunchSettings,
+) -> Result<Probed, String> {
     let mut command = command(account, program, configuration);
     command.arg("app-server");
     let mut session = Session::spawn(command).await?;
@@ -1339,7 +1381,9 @@ sleep 30
             identity,
             snapshot,
             models,
-        } = probe_claude(&account, &script, &Default::default()).await.unwrap();
+        } = probe_claude(&account, &script, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(identity.unwrap().email.as_deref(), Some("user@example.com"));
         assert_eq!(models.len(), 1, "initialize listed one model");
         assert_eq!(snapshot.windows.len(), 1);
@@ -1359,9 +1403,13 @@ sleep 30
         make_executable(&script);
         let Probed {
             identity, snapshot, ..
-        } = probe_claude(&Account::system(Provider::Claude), &script, &Default::default())
-            .await
-            .unwrap();
+        } = probe_claude(
+            &Account::system(Provider::Claude),
+            &script,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert!(identity.is_none());
         assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
     }
@@ -1400,9 +1448,13 @@ cat >/dev/null
             identity,
             snapshot,
             models,
-        } = probe_codex(&Account::system(Provider::Codex), &script, &Default::default())
-            .await
-            .unwrap();
+        } = probe_codex(
+            &Account::system(Provider::Codex),
+            &script,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(identity.unwrap().plan.as_deref(), Some("plus"));
         assert_eq!(models.len(), 1, "a signed-out Codex still lists its models");
         assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
@@ -1416,9 +1468,13 @@ cat >/dev/null
         std::fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
         make_executable(&script);
         assert!(
-            probe_codex(&Account::system(Provider::Codex), &script, &Default::default())
-                .await
-                .is_err()
+            probe_codex(
+                &Account::system(Provider::Codex),
+                &script,
+                &Default::default()
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -1536,38 +1592,76 @@ cat >/dev/null
     #[test]
     fn configured_account_discovery_captures_program_and_policy_without_launch_only_validation() {
         let root = tempfile::tempdir().unwrap();
-        let host_bin = root.path().join("host-bin"); let selected_bin = root.path().join("selected-bin");
+        let host_bin = root.path().join("host-bin");
+        let selected_bin = root.path().join("selected-bin");
         for directory in [&host_bin, &selected_bin] {
             std::fs::create_dir(directory).unwrap();
-            let program = directory.join("claude"); std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+            let program = directory.join("claude");
+            std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
             make_executable(&program);
         }
         let mut configuration = crate::settings::AgentLaunchSettings {
-            model: Some("retained\ninvalidmodel".into()), permission_mode: Some("retained-unknown-mode".into()),
+            model: Some("retained\ninvalidmodel".into()),
+            permission_mode: Some("retained-unknown-mode".into()),
             arguments: vec!["--fixture-fixed".into()],
             environment: std::collections::BTreeMap::from([
                 ("PATH".into(), selected_bin.display().to_string()),
                 ("FIXTURE_NETWORK".into(), "captured-private-value".into()),
-            ]), ..Default::default()
+            ]),
+            ..Default::default()
         };
         assert!(configuration.validate(Provider::Claude).is_err());
-        let cli = Cli::configured(Provider::Claude, Some(host_bin.as_os_str()), configuration.clone())
-            .unwrap_or_else(|_| panic!("auth validates execution without conversation defaults"));
+        let cli = Cli::configured(
+            Provider::Claude,
+            Some(host_bin.as_os_str()),
+            configuration.clone(),
+        )
+        .unwrap_or_else(|_| panic!("auth validates execution without conversation defaults"));
         assert_eq!(cli.program, selected_bin.join("claude"));
-        configuration.arguments.clear(); configuration.environment.clear();
+        configuration.arguments.clear();
+        configuration.environment.clear();
         assert_eq!(cli.configuration.arguments, ["--fixture-fixed"]);
-        assert_eq!(cli.configuration.environment.get("FIXTURE_NETWORK").map(String::as_str), Some("captured-private-value"));
-        let debug = format!("{cli:?}"); assert!(!debug.contains("captured-private-value")); assert!(!debug.contains("--fixture-fixed"));
+        assert_eq!(
+            cli.configuration
+                .environment
+                .get("FIXTURE_NETWORK")
+                .map(String::as_str),
+            Some("captured-private-value")
+        );
+        let debug = format!("{cli:?}");
+        assert!(!debug.contains("captured-private-value"));
+        assert!(!debug.contains("--fixture-fixed"));
         configuration.executable = Some(host_bin.join("claude").display().to_string());
-        configuration.environment.insert("PATH".into(), "relative-tools".into());
-        assert_eq!(Cli::configured(Provider::Claude, None, configuration.clone()).unwrap_or_else(|_| panic!("pin selects program independently of tool PATH")).program, host_bin.join("claude"));
+        configuration
+            .environment
+            .insert("PATH".into(), "relative-tools".into());
+        assert_eq!(
+            Cli::configured(Provider::Claude, None, configuration.clone())
+                .unwrap_or_else(|_| panic!("pin selects program independently of tool PATH"))
+                .program,
+            host_bin.join("claude")
+        );
         configuration.executable = Some(root.path().join("missing-pin").display().to_string());
-        assert!(matches!(Cli::configured(Provider::Claude, Some(selected_bin.as_os_str()), configuration), Err(CliFailure::Invalid(_))), "an unavailable pin never falls back");
+        assert!(
+            matches!(
+                Cli::configured(
+                    Provider::Claude,
+                    Some(selected_bin.as_os_str()),
+                    configuration
+                ),
+                Err(CliFailure::Invalid(_))
+            ),
+            "an unavailable pin never falls back"
+        );
     }
 
     #[test]
     fn configured_account_commands_and_login_recipes_apply_home_and_credential_isolation_last() {
-        let account = Account::managed(Provider::Claude, uuid::Uuid::new_v4(), "/fixture/selected-home".into());
+        let account = Account::managed(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            "/fixture/selected-home".into(),
+        );
         let configuration = crate::settings::AgentLaunchSettings {
             arguments: vec!["--fixture-fixed".into(), "space preserved".into()],
             environment: std::collections::BTreeMap::from([
@@ -1576,28 +1670,78 @@ cat >/dev/null
                 ("HOME".into(), "/wrong-reader-home".into()),
                 ("CLAUDE_CONFIG_DIR".into(), "/wrong-home".into()),
                 ("ANTHROPIC_API_KEY".into(), "synthetic-private-value".into()),
-            ]), ..Default::default()
+            ]),
+            ..Default::default()
         };
-        assert!(configuration.validate_execution(Provider::Claude).is_err(), "saved home/credential overrides are refused");
+        assert!(
+            configuration.validate_execution(Provider::Claude).is_err(),
+            "saved home/credential overrides are refused"
+        );
         // Exercise the final defensive construction too, independently of
         // settings admission, without starting any process.
         let command = command(&account, Path::new("/fixture/wrapper"), &configuration);
         let command = command.as_std();
-        let env = command.get_envs().collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(env.get(OsStr::new("PATH")).copied().flatten(), Some(OsStr::new("/fixture/tools")));
-        assert_eq!(env.get(OsStr::new("CLAUDE_CONFIG_DIR")).copied().flatten(), Some(OsStr::new("/fixture/selected-home")));
+        let env = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            env.get(OsStr::new("PATH")).copied().flatten(),
+            Some(OsStr::new("/fixture/tools"))
+        );
+        assert_eq!(
+            env.get(OsStr::new("CLAUDE_CONFIG_DIR")).copied().flatten(),
+            Some(OsStr::new("/fixture/selected-home"))
+        );
         assert_eq!(env.get(OsStr::new("ANTHROPIC_API_KEY")), Some(&None));
         let reader_home = std::env::var_os("HOME");
-        assert_eq!(env.get(OsStr::new("HOME")).copied().flatten(), reader_home.as_deref());
-        assert_eq!(command.get_args().collect::<Vec<_>>(), [OsStr::new("--fixture-fixed"), OsStr::new("space preserved")]);
-        let cli = Cli { program: "/fixture/custom-wrapper".into(), configuration };
-        let recipe = cli.login_recipe(&account, "/fixture/reader-home".into(), false).unwrap();
+        assert_eq!(
+            env.get(OsStr::new("HOME")).copied().flatten(),
+            reader_home.as_deref()
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [OsStr::new("--fixture-fixed"), OsStr::new("space preserved")]
+        );
+        let cli = Cli {
+            program: "/fixture/custom-wrapper".into(),
+            configuration,
+        };
+        let recipe = cli
+            .login_recipe(&account, "/fixture/reader-home".into(), false)
+            .unwrap();
         assert_eq!(recipe.program, "/fixture/custom-wrapper");
-        assert_eq!(recipe.arguments, ["--fixture-fixed", "space preserved", "auth", "login", "--claudeai"]);
-        assert_eq!(recipe.environment.get("PATH").map(String::as_str), Some("/fixture/tools"));
-        assert!(!recipe.environment.contains_key("HOME"), "auth inherits the original reader HOME");
-        assert_eq!(recipe.environment.get("CLAUDE_CONFIG_DIR").map(String::as_str), Some("/fixture/selected-home"));
-        assert_eq!(recipe.environment.get(super::super::SIGN_IN_MARKER).map(String::as_str), Some("claude"));
+        assert_eq!(
+            recipe.arguments,
+            [
+                "--fixture-fixed",
+                "space preserved",
+                "auth",
+                "login",
+                "--claudeai"
+            ]
+        );
+        assert_eq!(
+            recipe.environment.get("PATH").map(String::as_str),
+            Some("/fixture/tools")
+        );
+        assert!(
+            !recipe.environment.contains_key("HOME"),
+            "auth inherits the original reader HOME"
+        );
+        assert_eq!(
+            recipe
+                .environment
+                .get("CLAUDE_CONFIG_DIR")
+                .map(String::as_str),
+            Some("/fixture/selected-home")
+        );
+        assert_eq!(
+            recipe
+                .environment
+                .get(super::super::SIGN_IN_MARKER)
+                .map(String::as_str),
+            Some("claude")
+        );
         assert!(!recipe.environment.contains_key("ANTHROPIC_API_KEY"));
         assert!(recipe.unset_environment.contains("ANTHROPIC_API_KEY"));
         assert!(recipe.unset_environment.contains("CLAUDECODE"));

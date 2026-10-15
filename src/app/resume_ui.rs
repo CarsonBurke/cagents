@@ -501,7 +501,10 @@ impl Cagents {
                         }
                     }
                 }
-                if sender.send_blocking(Progress::LaunchErrors(resume_launch_errors(&agents))).is_err() {
+                if sender
+                    .send_blocking(Progress::LaunchErrors(resume_launch_errors(&agents)))
+                    .is_err()
+                {
                     return;
                 }
                 let seeds = resume_seeds(accounts, &directory, &agents);
@@ -577,12 +580,19 @@ impl Cagents {
                 if matches!(&row.source, Source::Found(_))
                     && let Some(reason) = self.resume_ui.launch_errors.get(&row.provider)
                 {
-                    let error = format!("Repair the {} settings in Agents before resuming: {reason}", row.provider.label());
+                    let error = format!(
+                        "Repair the {} settings in Agents before resuming: {reason}",
+                        row.provider.label()
+                    );
                     self.resume_error(&error);
                     return Task::none();
                 }
                 let configuration = matches!(&row.source, Source::Found(_)).then(|| {
-                    self.resume_ui.launch_settings.get(settings::agents::provider_key(row.provider)).cloned().unwrap_or_default()
+                    self.resume_ui
+                        .launch_settings
+                        .get(settings::agents::provider_key(row.provider))
+                        .cloned()
+                        .unwrap_or_default()
                 });
                 let entry = match &row.source {
                     // Resumed under the title it is listed by.
@@ -1041,31 +1051,59 @@ impl Cagents {
 /// Prepare history readers from one captured launch-policy snapshot. Keep
 /// path validation off the UI thread along with the provider history reads.
 fn resume_seeds(
-    accounts: Vec<crate::account::Account>, directory: &Path,
+    accounts: Vec<crate::account::Account>,
+    directory: &Path,
     agents: &std::collections::BTreeMap<String, settings::AgentLaunchSettings>,
 ) -> Vec<chat::Session> {
-    accounts.into_iter().filter_map(|account| {
-        let configuration = agents.get(settings::agents::provider_key(account.provider)).cloned().unwrap_or_default();
-        match chat::history_session_configured(account.provider, TerminalId::new(), directory.into(), &account, &configuration) {
-            Ok(session) => Some(session),
-            Err(_) => {
-                // A malformed launch preference cannot hide the account's
-                // history. Build only its normal typed account root, retain
-                // its pin, and keep the separate refusal for activation.
-                let mut seed = chat::history_session_configured(account.provider, TerminalId::new(), directory.into(), &account, &Default::default()).ok()?;
-                if let Some(executable) = &configuration.executable { seed.launch.recipe.program.clone_from(executable); }
-                Some(seed)
+    accounts
+        .into_iter()
+        .filter_map(|account| {
+            let configuration = agents
+                .get(settings::agents::provider_key(account.provider))
+                .cloned()
+                .unwrap_or_default();
+            match chat::history_session_configured(
+                account.provider,
+                TerminalId::new(),
+                directory.into(),
+                &account,
+                &configuration,
+            ) {
+                Ok(session) => Some(session),
+                Err(_) => {
+                    // A malformed launch preference cannot hide the account's
+                    // history. Build only its normal typed account root, retain
+                    // its pin, and keep the separate refusal for activation.
+                    let mut seed = chat::history_session_configured(
+                        account.provider,
+                        TerminalId::new(),
+                        directory.into(),
+                        &account,
+                        &Default::default(),
+                    )
+                    .ok()?;
+                    if let Some(executable) = &configuration.executable {
+                        seed.launch.recipe.program.clone_from(executable);
+                    }
+                    Some(seed)
+                }
             }
-        }
-    }).collect()
+        })
+        .collect()
 }
 
-fn resume_launch_errors(agents: &std::collections::BTreeMap<String, settings::AgentLaunchSettings>) -> HashMap<Provider, String> {
-    Provider::ALL.into_iter().filter_map(|provider| {
-        agents.get(settings::agents::provider_key(provider))
-            .and_then(|configuration| configuration.validate_syntax(provider).err())
-            .map(|error| (provider, error))
-    }).collect()
+fn resume_launch_errors(
+    agents: &std::collections::BTreeMap<String, settings::AgentLaunchSettings>,
+) -> HashMap<Provider, String> {
+    Provider::ALL
+        .into_iter()
+        .filter_map(|provider| {
+            agents
+                .get(settings::agents::provider_key(provider))
+                .and_then(|configuration| configuration.validate_syntax(provider).err())
+                .map(|error| (provider, error))
+        })
+        .collect()
 }
 
 /// Indices of the rows matching `query` within `scope`.
@@ -1461,17 +1499,29 @@ mod tests {
         for invalid in ["missing_pin", "retained_mode"] {
             let root = tempfile::tempdir().unwrap();
             let home = root.path().join("claude");
-            let account = crate::account::Account::managed(Provider::Claude, uuid::Uuid::new_v4(), home.clone());
-            let missing = root.path().join("removed-wrapper").to_str().unwrap().to_owned();
+            let account = crate::account::Account::managed(
+                Provider::Claude,
+                uuid::Uuid::new_v4(),
+                home.clone(),
+            );
+            let missing = root
+                .path()
+                .join("removed-wrapper")
+                .to_str()
+                .unwrap()
+                .to_owned();
             let configuration = settings::AgentLaunchSettings {
                 executable: (invalid == "missing_pin").then(|| missing.clone()),
-                permission_mode: (invalid == "retained_mode").then(|| "future-invalid-policy".into()),
+                permission_mode: (invalid == "retained_mode")
+                    .then(|| "future-invalid-policy".into()),
                 ..Default::default()
             };
             let agents = std::collections::BTreeMap::from([("claude".into(), configuration)]);
             let seeds = resume_seeds(vec![account], root.path(), &agents);
             assert_eq!(seeds.len(), 1, "history discovery survives {invalid}");
-            if invalid == "missing_pin" { assert_eq!(seeds[0].launch.recipe.program, missing); }
+            if invalid == "missing_pin" {
+                assert_eq!(seeds[0].launch.recipe.program, missing);
+            }
             let projects = provider_root(&seeds[0]).join("projects/project");
             std::fs::create_dir_all(&projects).unwrap();
             let id = uuid::Uuid::new_v4().to_string();
@@ -1482,24 +1532,41 @@ mod tests {
             app.resume_ui.open = true;
             app.resume_ui.launch_settings = agents.clone();
             app.resume_indexed(Progress::LaunchErrors(resume_launch_errors(&agents)));
-            index(Ok(vec![]), seeds, &catalog::Cache::default(), &AtomicBool::new(false), |progress| {
-                app.resume_indexed(progress); true
-            });
+            index(
+                Ok(vec![]),
+                seeds,
+                &catalog::Cache::default(),
+                &AtomicBool::new(false),
+                |progress| {
+                    app.resume_indexed(progress);
+                    true
+                },
+            );
             assert_eq!(app.resume_ui.rows.len(), 1);
             assert!(app.resume_ui.rows[0].title.contains("Existing history"));
             let card = app.resume_ui.rows[0].card;
             let cards = app.durable.cards.clone();
             let task = app.update_resume(Action::Resume(card));
-            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
-                    while let Some(action) = stream.next().await {
-                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::ResumeConversation(action @ Action::Prepared(_, _, _)))) = action {
-                            assert!(matches!(&action, Action::Prepared(_, _, Err(_))), "invalid policy never prepares an effectful launch");
-                            drop(app.update_resume(action));
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                        while let Some(action) = stream.next().await {
+                            if let iced::runtime::Action::Output(cosmic::Action::App(
+                                Message::ResumeConversation(action @ Action::Prepared(_, _, _)),
+                            )) = action
+                            {
+                                assert!(
+                                    matches!(&action, Action::Prepared(_, _, Err(_))),
+                                    "invalid policy never prepares an effectful launch"
+                                );
+                                drop(app.update_resume(action));
+                            }
                         }
                     }
-                }
-            });
+                });
             assert!(app.resume_ui.open);
             assert_eq!(app.resume_ui.rows.len(), 1);
             assert_eq!(app.durable.cards, cards);

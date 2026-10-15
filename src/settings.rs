@@ -1611,12 +1611,19 @@ impl AppSettings {
         self.validate_transition_with_availability(previous, false)
     }
 
-    fn validate_transition_with_availability(self, previous: &Self, availability: bool) -> Result<Self, SettingsError> {
+    fn validate_transition_with_availability(
+        self,
+        previous: &Self,
+        availability: bool,
+    ) -> Result<Self, SettingsError> {
         if self.default_shell != previous.default_shell
-            && self
-                .default_shell
-                .as_deref()
-                .is_some_and(|path| if availability { !agents::executable_available(path) } else { !agents::executable_path_syntax(path) })
+            && self.default_shell.as_deref().is_some_and(|path| {
+                if availability {
+                    !agents::executable_available(path)
+                } else {
+                    !agents::executable_path_syntax(path)
+                }
+            })
         {
             return Err(SettingsError::AgentLaunch(
                 "Default shell must be an absolute path to an executable file.".into(),
@@ -1631,7 +1638,7 @@ impl AppSettings {
                 } else {
                     configuration.validate_changes_syntax(&previous, provider)
                 })
-                    .map_err(SettingsError::AgentLaunch)?;
+                .map_err(SettingsError::AgentLaunch)?;
             }
         }
         self.validate_with_agent_launches(false)

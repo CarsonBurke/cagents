@@ -3687,11 +3687,20 @@ fn settings_update(
     settings_update_with_availability(current, field, raw_value, true)
 }
 
-fn settings_update_syntax(current: &AppSettings, field: SettingsField, raw_value: &str) -> SettingsDecision {
+fn settings_update_syntax(
+    current: &AppSettings,
+    field: SettingsField,
+    raw_value: &str,
+) -> SettingsDecision {
     settings_update_with_availability(current, field, raw_value, false)
 }
 
-fn settings_update_with_availability(current: &AppSettings, field: SettingsField, raw_value: &str, availability: bool) -> SettingsDecision {
+fn settings_update_with_availability(
+    current: &AppSettings,
+    field: SettingsField,
+    raw_value: &str,
+    availability: bool,
+) -> SettingsDecision {
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
@@ -4127,7 +4136,11 @@ fn settings_update_with_availability(current: &AppSettings, field: SettingsField
         return SettingsDecision::Invalid(refusal(field, &next).unwrap_or(message));
     }
     let attempted = next.clone();
-    let validated = if availability { next.validate_transition(current) } else { next.validate_transition_syntax(current) };
+    let validated = if availability {
+        next.validate_transition(current)
+    } else {
+        next.validate_transition_syntax(current)
+    };
     let next = match validated {
         Ok(next) => next,
         Err(error) => {
@@ -6261,14 +6274,21 @@ impl Cagents {
             return Self::open_external_url(session.current_url.clone());
         }
         let source_id = source.id;
-        let mut configured = if matches!(&source.kind, CardKind::Chat(session) if session.is_unstarted()) {
-            self.persistent_workspace().configured_chat_drafts.get(&source_id).cloned()
+        let mut configured = if matches!(&source.kind, CardKind::Chat(session) if session.is_unstarted())
+        {
+            self.persistent_workspace()
+                .configured_chat_drafts
+                .get(&source_id)
+                .cloned()
         } else {
             None
         };
         if let (Some(start), CardKind::Chat(session)) = (&configured, &source.kind)
-            && (!start.matches_draft(session) || start.validate().is_err()) {
-            self.status = Some(TransientNotice::error("The saved draft choices do not match this conversation. Choose its account again or start a new draft."));
+            && (!start.matches_draft(session) || start.validate().is_err())
+        {
+            self.status = Some(TransientNotice::error(
+                "The saved draft choices do not match this conversation. Choose its account again or start a new draft.",
+            ));
             return Task::none();
         }
         let user_title = self.chrome_ui.user_titles.get(&source_id).cloned();
@@ -7444,7 +7464,10 @@ impl Cagents {
         );
         let discarded_fresh_choices = !session.is_unstarted()
             && self.durable.configured_chat_drafts.contains_key(&card)
-            && Arc::make_mut(&mut self.durable).configured_chat_drafts.remove(&card).is_some();
+            && Arc::make_mut(&mut self.durable)
+                .configured_chat_drafts
+                .remove(&card)
+                .is_some();
         // A successful attachment completes hydration even when the provider
         // has not enriched the already-saved descriptor yet.
         self.lifecycle.remove(card);
@@ -12858,36 +12881,74 @@ impl Cagents {
     }
 
     fn settings_path_feedback(&self) -> Task<Message> {
-        let providers: Vec<_> = self.settings_draft.agents.iter().map(|(&provider, draft)| {
-            (provider, draft.executable_revision, draft.configuration.executable.clone())
-        }).collect();
+        let providers: Vec<_> = self
+            .settings_draft
+            .agents
+            .iter()
+            .map(|(&provider, draft)| {
+                (
+                    provider,
+                    draft.executable_revision,
+                    draft.configuration.executable.clone(),
+                )
+            })
+            .collect();
         let shell = self.settings_draft.default_shell.clone();
         cosmic::task::future(async move {
             tokio::task::spawn_blocking(move || {
-                let providers = providers.into_iter().map(|(provider, revision, path)| {
-                    (provider, revision, path.as_deref().is_some_and(|path| !settings::agents::executable_available(path)))
-                }).collect();
-                let shell_unavailable = !shell.is_empty() && !settings::agents::executable_available(&shell);
-                Message::SettingsPathFeedback { providers, shell, shell_unavailable }
-            }).await.unwrap_or_else(|_| Message::SettingsPathFeedback { providers: Vec::new(), shell: String::new(), shell_unavailable: false })
+                let providers = providers
+                    .into_iter()
+                    .map(|(provider, revision, path)| {
+                        (
+                            provider,
+                            revision,
+                            path.as_deref()
+                                .is_some_and(|path| !settings::agents::executable_available(path)),
+                        )
+                    })
+                    .collect();
+                let shell_unavailable =
+                    !shell.is_empty() && !settings::agents::executable_available(&shell);
+                Message::SettingsPathFeedback {
+                    providers,
+                    shell,
+                    shell_unavailable,
+                }
+            })
+            .await
+            .unwrap_or_else(|_| Message::SettingsPathFeedback {
+                providers: Vec::new(),
+                shell: String::new(),
+                shell_unavailable: false,
+            })
         })
     }
 
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_pending.remove(&field);
         self.settings_draft.set(field, value.clone());
-        if matches!(field, SettingsField::DefaultShell | SettingsField::Agent(_, AgentSetting::Executable)) {
+        if matches!(
+            field,
+            SettingsField::DefaultShell | SettingsField::Agent(_, AgentSetting::Executable)
+        ) {
             // Keep the edit pending until the filesystem-owning worker returns.
             // Its generation is replaced by another edit and cleared by reset.
             self.settings_generation = self.settings_generation.wrapping_add(1);
             let generation = self.settings_generation;
-            self.settings_pending.insert(field, (generation, value.clone()));
+            self.settings_pending
+                .insert(field, (generation, value.clone()));
             self.refresh_settings_feedback();
             return cosmic::task::future(async move {
                 let available = tokio::task::spawn_blocking(move || {
                     value.trim().is_empty() || settings::agents::executable_available(value.trim())
-                }).await.unwrap_or(false);
-                Message::SettingsPathChecked { field, generation, available }
+                })
+                .await
+                .unwrap_or(false);
+                Message::SettingsPathChecked {
+                    field,
+                    generation,
+                    available,
+                }
             });
         }
         self.commit_setting_input(field, value)
@@ -16498,7 +16559,11 @@ impl Application for Cagents {
                 self.settings_category = category;
                 Task::batch([
                     crate::settings_widgets::reveal_content_start(),
-                    if category == SettingsCategory::Agents { self.settings_path_feedback() } else { Task::none() },
+                    if category == SettingsCategory::Agents {
+                        self.settings_path_feedback()
+                    } else {
+                        Task::none()
+                    },
                 ])
             }
             Message::DetectAgentExecutable(provider) => {
@@ -16538,14 +16603,17 @@ impl Application for Cagents {
                 previous_executable,
                 previous_path,
                 ..
-            } if self.settings_draft.agents.get(&provider)
-                .is_none_or(|draft| draft.executable_revision != revision)
-                || self
+            } if self
                 .settings_draft
                 .agents
                 .get(&provider)
-                .and_then(|draft| draft.configuration.executable.as_ref())
-                != previous_executable.as_ref()
+                .is_none_or(|draft| draft.executable_revision != revision)
+                || self
+                    .settings_draft
+                    .agents
+                    .get(&provider)
+                    .and_then(|draft| draft.configuration.executable.as_ref())
+                    != previous_executable.as_ref()
                 || self
                     .settings_draft
                     .agents
@@ -16600,22 +16668,44 @@ impl Application for Cagents {
             Message::SettingsAutosave { field, generation } => {
                 self.autosave_setting(field, generation)
             }
-            Message::SettingsPathChecked { field, generation, available } => {
-                if !self.settings_pending.get(&field).is_some_and(|pending| pending.0 == generation) {
+            Message::SettingsPathChecked {
+                field,
+                generation,
+                available,
+            } => {
+                if !self
+                    .settings_pending
+                    .get(&field)
+                    .is_some_and(|pending| pending.0 == generation)
+                {
                     return Task::none();
                 }
-                let (_, value) = self.settings_pending.remove(&field).expect("matched path check");
+                let (_, value) = self
+                    .settings_pending
+                    .remove(&field)
+                    .expect("matched path check");
                 if !available {
-                    self.settings_invalid.insert(field, format!("{} must be an absolute path to an executable file.", field.label()));
+                    self.settings_invalid.insert(
+                        field,
+                        format!(
+                            "{} must be an absolute path to an executable file.",
+                            field.label()
+                        ),
+                    );
                     self.refresh_settings_feedback();
                     return Task::none();
                 }
                 self.commit_setting_input(field, value)
             }
-            Message::SettingsPathFeedback { providers, shell, shell_unavailable } => {
+            Message::SettingsPathFeedback {
+                providers,
+                shell,
+                shell_unavailable,
+            } => {
                 for (provider, revision, unavailable) in providers {
                     if let Some(draft) = self.settings_draft.agents.get_mut(&provider)
-                        && draft.executable_revision == revision {
+                        && draft.executable_revision == revision
+                    {
                         draft.executable_unavailable = unavailable;
                     }
                 }
@@ -19974,7 +20064,13 @@ mod tests {
         app.settings_draft = SettingsDraft::from_settings(&app.settings);
         let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
         let checked = task_app_message(app.update(message));
-        assert!(matches!(checked, Message::SettingsPathChecked { available: true, .. }));
+        assert!(matches!(
+            checked,
+            Message::SettingsPathChecked {
+                available: true,
+                ..
+            }
+        ));
         drop(app.update(checked));
         assert_eq!(
             app.settings.agents["claude"].executable.as_deref(),
@@ -20018,57 +20114,109 @@ mod tests {
         let field = SettingsField::Agent(provider, AgentSetting::Executable);
         let mut app = context_inspector_test_app(false);
         app.settings_path = Some(directory.path().join("settings.toml"));
-        app.settings.agents.insert("claude".into(), settings::AgentLaunchSettings {
-            executable: Some("/unavailable/retained-cli".into()), ..Default::default()
-        });
+        app.settings.agents.insert(
+            "claude".into(),
+            settings::AgentLaunchSettings {
+                executable: Some("/unavailable/retained-cli".into()),
+                ..Default::default()
+            },
+        );
         settings::agents::without_executable_checks(|| {
             app.settings_draft = SettingsDraft::from_settings(&app.settings);
-            app.settings_draft.set(SettingsField::Agent(provider, AgentSetting::Environment), "[[\"EXAMPLE\",\"value\"]]".into());
+            app.settings_draft.set(
+                SettingsField::Agent(provider, AgentSetting::Environment),
+                "[[\"EXAMPLE\",\"value\"]]".into(),
+            );
         });
         assert!(app.settings_draft.agents[&provider].launch_error.is_none());
         settings::agents::without_executable_checks(|| {
-            drop(app.apply_setting_input(SettingsField::Agent(provider, AgentSetting::Environment), "[[\"EXAMPLE\",\"latest\"]]".into()));
+            drop(app.apply_setting_input(
+                SettingsField::Agent(provider, AgentSetting::Environment),
+                "[[\"EXAMPLE\",\"latest\"]]".into(),
+            ));
         });
-        assert_eq!(app.settings.agents["claude"].environment["EXAMPLE"], "latest");
+        assert_eq!(
+            app.settings.agents["claude"].environment["EXAMPLE"],
+            "latest"
+        );
         let feedback = task_app_message(app.settings_path_feedback());
-        settings::agents::without_executable_checks(|| { drop(app.update(feedback)); });
+        settings::agents::without_executable_checks(|| {
+            drop(app.update(feedback));
+        });
         assert!(app.settings_draft.agents[&provider].executable_unavailable);
         for superseded in ["edit", "reset", "positive"] {
             let before = app.settings.clone();
-            let task = settings::agents::without_executable_checks(|| app.apply_setting_input(field, executable.to_str().unwrap().into()));
-            assert_eq!(app.settings, before, "no policy adoption before worker validation");
+            let task = settings::agents::without_executable_checks(|| {
+                app.apply_setting_input(field, executable.to_str().unwrap().into())
+            });
+            assert_eq!(
+                app.settings, before,
+                "no policy adoption before worker validation"
+            );
             let checked = task_app_message(task);
-            assert!(matches!(checked, Message::SettingsPathChecked { available: true, .. }));
+            assert!(matches!(
+                checked,
+                Message::SettingsPathChecked {
+                    available: true,
+                    ..
+                }
+            ));
             match superseded {
-                "edit" => { drop(app.queue_setting_input(field, String::new())); }
-                "reset" => { drop(app.reset_settings()); }
+                "edit" => {
+                    drop(app.queue_setting_input(field, String::new()));
+                }
+                "reset" => {
+                    drop(app.reset_settings());
+                }
                 "positive" => {}
                 _ => unreachable!(),
             }
             let before = app.settings.clone();
-            settings::agents::without_executable_checks(|| { drop(app.update(checked)); });
+            settings::agents::without_executable_checks(|| {
+                drop(app.update(checked));
+            });
             if superseded == "positive" {
-                assert_eq!(app.settings.agents["claude"].executable.as_deref(), executable.to_str());
+                assert_eq!(
+                    app.settings.agents["claude"].executable.as_deref(),
+                    executable.to_str()
+                );
             } else {
                 assert_eq!(app.settings, before);
             }
         }
         let before = app.settings.clone();
-        let checked = task_app_message(settings::agents::without_executable_checks(|| app.apply_setting_input(field, "/missing/new-cli".into())));
-        assert!(matches!(checked, Message::SettingsPathChecked { available: false, .. }));
-        settings::agents::without_executable_checks(|| { drop(app.update(checked)); });
+        let checked = task_app_message(settings::agents::without_executable_checks(|| {
+            app.apply_setting_input(field, "/missing/new-cli".into())
+        }));
+        assert!(matches!(
+            checked,
+            Message::SettingsPathChecked {
+                available: false,
+                ..
+            }
+        ));
+        settings::agents::without_executable_checks(|| {
+            drop(app.update(checked));
+        });
         assert_eq!(app.settings, before);
         assert!(app.settings_invalid[&field].contains("executable"));
         let shell = SettingsField::DefaultShell;
-        let checked = task_app_message(settings::agents::without_executable_checks(|| app.apply_setting_input(shell, executable.to_str().unwrap().into())));
-        settings::agents::without_executable_checks(|| { drop(app.update(checked)); });
+        let checked = task_app_message(settings::agents::without_executable_checks(|| {
+            app.apply_setting_input(shell, executable.to_str().unwrap().into())
+        }));
+        settings::agents::without_executable_checks(|| {
+            drop(app.update(checked));
+        });
         assert_eq!(app.settings.default_shell.as_deref(), executable.to_str());
     }
 
     #[test]
     fn settings_shutdown_fold_preserves_valid_edits_beside_a_refused_path() {
         let directory = tempfile::tempdir().unwrap();
-        for field in [SettingsField::DefaultShell, SettingsField::Agent(crate::agent::Provider::Claude, AgentSetting::Executable)] {
+        for field in [
+            SettingsField::DefaultShell,
+            SettingsField::Agent(crate::agent::Provider::Claude, AgentSetting::Executable),
+        ] {
             let path = directory.path().join(format!("{field:?}.toml"));
             let mut app = context_inspector_test_app(false);
             app.settings_path = Some(path.clone());
@@ -20080,7 +20228,12 @@ mod tests {
             let saved = settings::load(&path).unwrap();
             assert_eq!(saved.terminal_font_size, 23.0);
             assert!(saved.default_shell.is_none());
-            assert!(saved.agents.get("claude").is_none_or(|configuration| configuration.executable.is_none()));
+            assert!(
+                saved
+                    .agents
+                    .get("claude")
+                    .is_none_or(|configuration| configuration.executable.is_none())
+            );
         }
     }
 
@@ -20088,7 +20241,9 @@ mod tests {
     fn settings_detect_refuses_non_utf8_instead_of_selecting_a_lossy_path_alias() {
         use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
         let directory = tempfile::tempdir().unwrap();
-        let original = directory.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+        let original = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![0xff]));
         let alias = directory.path().join("\u{fffd}");
         for bin in [&original, &alias] {
             std::fs::create_dir(bin).unwrap();
@@ -20096,14 +20251,24 @@ mod tests {
             std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let found = settings::AgentLaunchSettings::default().resolve_executable(
-            crate::agent::Provider::Claude, Some(original.as_os_str()),
-        ).unwrap();
+        let found = settings::AgentLaunchSettings::default()
+            .resolve_executable(crate::agent::Provider::Claude, Some(original.as_os_str()))
+            .unwrap();
         assert_eq!(found, original.join("claude"));
-        assert_eq!(PathBuf::from(found.to_string_lossy().into_owned()), alias.join("claude"));
+        assert_eq!(
+            PathBuf::from(found.to_string_lossy().into_owned()),
+            alias.join("claude")
+        );
         assert!(alias.join("claude").is_file());
-        assert!(detected_executable_path(found).unwrap_err().contains("UTF-8"));
-        assert_eq!(detected_executable_path(alias.join("claude")).unwrap(), alias.join("claude").to_str().unwrap());
+        assert!(
+            detected_executable_path(found)
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+        assert_eq!(
+            detected_executable_path(alias.join("claude")).unwrap(),
+            alias.join("claude").to_str().unwrap()
+        );
     }
 
     #[test]
@@ -20115,20 +20280,35 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let provider = crate::agent::Provider::Claude;
         let field = SettingsField::Agent(provider, AgentSetting::Executable);
-        let environment = vec![("PATH".to_owned(), directory.path().to_str().unwrap().to_owned())];
+        let environment = vec![(
+            "PATH".to_owned(),
+            directory.path().to_str().unwrap().to_owned(),
+        )];
         for replaced in ["edit_clear", "reset_restore_path", "new_request"] {
             let mut app = context_inspector_test_app(false);
             app.settings_path = Some(directory.path().join("settings.toml"));
-            app.settings.agents.insert("claude".into(), settings::AgentLaunchSettings {
-                environment: environment.iter().cloned().collect(), ..Default::default()
-            });
+            app.settings.agents.insert(
+                "claude".into(),
+                settings::AgentLaunchSettings {
+                    environment: environment.iter().cloned().collect(),
+                    ..Default::default()
+                },
+            );
             app.settings_draft = SettingsDraft::from_settings(&app.settings);
             let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
-            assert!(matches!(&message, Message::AgentExecutableDetected { result: Ok(path), .. } if path == executable.to_str().unwrap()));
+            assert!(
+                matches!(&message, Message::AgentExecutableDetected { result: Ok(path), .. } if path == executable.to_str().unwrap())
+            );
             match replaced {
                 "edit_clear" => {
-                    drop(app.update(Message::SettingsDraftChanged { field, value: "/manual/choice".into() }));
-                    drop(app.update(Message::SettingsDraftChanged { field, value: String::new() }));
+                    drop(app.update(Message::SettingsDraftChanged {
+                        field,
+                        value: "/manual/choice".into(),
+                    }));
+                    drop(app.update(Message::SettingsDraftChanged {
+                        field,
+                        value: String::new(),
+                    }));
                 }
                 "reset_restore_path" => {
                     drop(app.update(Message::ResetSettings));
@@ -20140,7 +20320,9 @@ mod tests {
                         value: serde_json::to_string(&environment).unwrap(),
                     }));
                 }
-                "new_request" => { drop(app.update(Message::DetectAgentExecutable(provider))); }
+                "new_request" => {
+                    drop(app.update(Message::DetectAgentExecutable(provider)));
+                }
                 _ => unreachable!(),
             }
             let before = app.settings.clone();
@@ -20151,7 +20333,10 @@ mod tests {
             drop(app.update(message));
             assert_eq!(app.settings, before, "{replaced}");
             assert_eq!(app.settings_draft, draft, "{replaced}");
-            assert_eq!(app.settings_draft.agents[&provider].executable_revision, revision);
+            assert_eq!(
+                app.settings_draft.agents[&provider].executable_revision,
+                revision
+            );
             assert_eq!(app.settings_pending, pending);
             assert_eq!(app.settings_save_generation, generation);
             assert!(app.settings_invalid.is_empty());

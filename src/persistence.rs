@@ -1754,10 +1754,18 @@ impl StateStore {
         // Issued/closed/removed cards cannot retain a fresh-start intent.
         // Keep malformed metadata on an eligible draft for an explicit UI
         // refusal rather than silently falling back to its legacy recipe.
-        let fresh: HashSet<_> = state.cards.iter().filter_map(|card| {
-            (card.existence.is_open() && matches!(&card.kind, CardKind::Chat(session) if session.is_unstarted())).then_some(card.id)
-        }).collect();
-        state.configured_chat_drafts.retain(|card, _| fresh.contains(card));
+        let fresh: HashSet<_> = state
+            .cards
+            .iter()
+            .filter_map(|card| {
+                (card.existence.is_open()
+                    && matches!(&card.kind, CardKind::Chat(session) if session.is_unstarted()))
+                .then_some(card.id)
+            })
+            .collect();
+        state
+            .configured_chat_drafts
+            .retain(|card, _| fresh.contains(card));
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
         }
@@ -4372,8 +4380,10 @@ pub(crate) fn validate_workspace(state: &WorkspaceState) -> Result<()> {
     let mut ids = BTreeSet::new();
     let mut fresh = HashMap::new();
     for card in &state.cards {
-        if card.existence.is_open() && let CardKind::Chat(session) = &card.kind
-            && session.is_unstarted() {
+        if card.existence.is_open()
+            && let CardKind::Chat(session) = &card.kind
+            && session.is_unstarted()
+        {
             fresh.insert(card.id, session);
         }
         if !card.width_fraction.is_finite() || card.width_fraction <= 0.0 {
@@ -4390,8 +4400,13 @@ pub(crate) fn validate_workspace(state: &WorkspaceState) -> Result<()> {
         }
     }
     for (card, intent) in &state.configured_chat_drafts {
-        if !fresh.get(card).is_some_and(|session| intent.matches_draft(session)) {
-            return Err(StoreError::InvalidState(format!("configured choices do not belong to an open unstarted chat {card}")));
+        if !fresh
+            .get(card)
+            .is_some_and(|session| intent.matches_draft(session))
+        {
+            return Err(StoreError::InvalidState(format!(
+                "configured choices do not belong to an open unstarted chat {card}"
+            )));
         }
         intent.validate().map_err(StoreError::InvalidState)?;
     }
@@ -6254,28 +6269,55 @@ mod tests {
         let card = state.cards[0].id;
         let mut lane = SaveLane::default();
         lane.save(&store, &state).unwrap();
-        assert!(store.load_workspace(state.id, None).unwrap().unwrap().configured_chat_drafts.is_empty());
+        assert!(
+            store
+                .load_workspace(state.id, None)
+                .unwrap()
+                .unwrap()
+                .configured_chat_drafts
+                .is_empty()
+        );
         let intent = crate::chat::ConfiguredChatStart {
-            id: session.id, provider: session.launch.provider,
+            id: session.id,
+            provider: session.launch.provider,
             working_directory: session.launch.recipe.working_directory.clone(),
-            account: "claude/system".parse().unwrap(), model: Some("explicit-model".into()), effort: None,
-            permission_mode: Some("plan".into()), automatic: true,
+            account: "claude/system".parse().unwrap(),
+            model: Some("explicit-model".into()),
+            effort: None,
+            permission_mode: Some("plan".into()),
+            automatic: true,
         };
         state.configured_chat_drafts.insert(card, intent.clone());
         lane.save(&store, &state).unwrap();
         let reopened = StateStore::open(&database, boot_id).unwrap();
         let restored = reopened.load_workspace(state.id, None).unwrap().unwrap();
         assert_eq!(restored.configured_chat_drafts[&card], intent);
-        assert_eq!(reopened.load_workspace_manifest(state.id).unwrap().unwrap().configured_chat_drafts, state.configured_chat_drafts);
+        assert_eq!(
+            reopened
+                .load_workspace_manifest(state.id)
+                .unwrap()
+                .unwrap()
+                .configured_chat_drafts,
+            state.configured_chat_drafts
+        );
         let mut invalid = state.clone();
         invalid.configured_chat_drafts.get_mut(&card).unwrap().id = TerminalId::new();
         assert!(validate_workspace(&invalid).is_err());
         invalid = state.clone();
-        if let CardKind::Chat(session) = &mut invalid.cards[0].kind { session.launch.session_id = Some("issued-thread".into()); }
+        if let CardKind::Chat(session) = &mut invalid.cards[0].kind {
+            session.launch.session_id = Some("issued-thread".into());
+        }
         assert!(validate_workspace(&invalid).is_err());
         state.configured_chat_drafts.clear();
         lane.save(&store, &state).unwrap();
-        assert!(reopened.load_workspace(state.id, None).unwrap().unwrap().configured_chat_drafts.is_empty());
+        assert!(
+            reopened
+                .load_workspace(state.id, None)
+                .unwrap()
+                .unwrap()
+                .configured_chat_drafts
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1415,11 +1415,20 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
         })
         .ok_or("account is not registered on this device")?;
     let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all().build().map_err(|error| error.to_string())?;
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
     let search_path = runtime.block_on(probe::search_path());
     let cli = probe::Cli::discover(account.provider, search_path.as_deref())?;
-    Ok(Reply::Login(cli.login_recipe(&account,
-        std::env::var_os("HOME").map(PathBuf::from).ok_or("Remote HOME is unavailable")?, true)?))
+    Ok(Reply::Login(
+        cli.login_recipe(
+            &account,
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or("Remote HOME is unavailable")?,
+            true,
+        )?,
+    ))
 }
 
 #[cfg(feature = "host")]
