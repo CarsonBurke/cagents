@@ -702,6 +702,12 @@ pub enum ServerMessage {
         original: uuid::Uuid,
         conflicting: uuid::Uuid,
     },
+    /// Exact source authority was lost. Permanently revoke this attachment's
+    /// cached bodies without inventing a new epoch, clock or conflict proof.
+    ChatSourceAuthorityUnavailable {
+        chat_id: TerminalId,
+        cause: crate::chat::SourceAuthorityUnavailableCause,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

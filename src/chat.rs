@@ -863,6 +863,12 @@ impl PromptSuggestion {
     }
 }
 
+/// Source ordering was lost. Revoke cached bodies without granting any new
+/// source identity, semantic acknowledgement or process-cleanup authority.
+#[derive(Clone,Copy,Debug,Eq,PartialEq,Serialize,Deserialize)]
+#[serde(rename_all="snake_case")]
+pub enum SourceAuthorityUnavailableCause {ClockExhausted}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Daemon wall-clock milliseconds sampled for this publication. Clients

@@ -471,6 +471,7 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
             Update::SourceAuthorityConflict {generation,original,conflicting} => ServerMessage::ChatSourceAuthorityConflict {
                 chat_id:id,generation:*generation,original:*original,conflicting:*conflicting,
             },
+            Update::SourceAuthorityUnavailable {cause}=>ServerMessage::ChatSourceAuthorityUnavailable {chat_id:id,cause:*cause},
             Update::Presentation if visible => ServerMessage::ChatChanged { chat_id: id },
             &Update::Observed { generation } if !visible => {
                 let observation = record.observations.entry(client).or_default();
@@ -525,6 +526,14 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
 /// getter neither opens Store nor invokes a callback, and delivery is bounded.
 fn seed_source_authority(state:&HostState,id:TerminalId) {
     let Some(record)=state.chats.get(&id) else {return;};
+    if let Some(cause)=record.handle.source_authority_unavailable() {
+        for client in record.subscribers.keys() {
+            if let Some(delivery)=state.clients.get(client) {
+                let _=delivery.push(ServerEnvelope {version:PROTOCOL_VERSION,request_id:None,proof:state.proof().clone(),message:ServerMessage::ChatSourceAuthorityUnavailable {chat_id:id,cause}});
+            }
+        }
+        return;
+    }
     let Some(authority)=record.handle.source_authority() else {return;};
     let conflict=record.handle.source_authority_conflict();
     for client in record.subscribers.keys() {
@@ -4941,7 +4950,7 @@ done
 
     #[test]
     fn hidden_source_authority_reaches_framed_eof_after_actual_store_failure() {
-        for (intent,completed_reader) in [(false,false),(true,false),(false,true)] {
+        for (intent,completed_reader,clock_exhausted) in [(false,false,false),(true,false,false),(false,true,false),(false,true,true)] {
             struct ResetAdapter;
             impl Adapter for ResetAdapter {
                 fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
@@ -4985,19 +4994,27 @@ done
                 handle.close().unwrap();
                 // Actual SQLITE_DENY on ROLLBACK permanently poisons this
                 // completed Store. No live actor remains to emit the scalar.
-                handle.deny_source_release_for_test();
+                handle.deny_source_release_for_test(clock_exhausted);
                 let response=process(&host,1,ClientRequest::ChatCommand {chat_id:id,command:Command::LoadSource {query:chat::cache::SourceQuery {
                     source:chat::cache::SourceKey {agent_id:None,source_id:"private".into()},offset:0,limit:64,expected_epoch:None,until:None,
                 }}}).unwrap();
                 assert!(matches!(response,ServerResponse::ChatSource {result:Err(_),..}));
-                let pair=handle.source_authority().unwrap();
-                (pair.incarnation,pair.generation)
+                if clock_exhausted {
+                    assert!(handle.source_authority().is_none());
+                    assert_eq!(handle.source_authority_unavailable(),Some(chat::SourceAuthorityUnavailableCause::ClockExhausted));
+                    None
+                } else {
+                    let pair=handle.source_authority().unwrap();
+                    Some((pair.incarnation,pair.generation))
+                }
             } else {
                 assert!(process(&host,1,ClientRequest::ChatCommand {chat_id:id,command:Command::Interrupt}).is_err());
-                seeded.recv_timeout(Duration::from_secs(2)).unwrap()
+                Some(seeded.recv_timeout(Duration::from_secs(2)).unwrap())
             };
-            assert_ne!(revoked.0,original.0);
-            assert!(revoked.1>original.1);
+            if let Some(revoked)=revoked {
+                assert_ne!(revoked.0,original.0);
+                assert!(revoked.1>original.1);
+            }
             for queue in queues {
                 queue.close_after_drain();
                 let (mut writer,mut reader)=std::os::unix::net::UnixStream::pair().unwrap();
@@ -5012,7 +5029,10 @@ done
                     assert_eq!(frame.proof,proof);
                     match frame.message {
                         ServerMessage::ChatSourceAuthority {incarnation,generation,..}=> {
-                            assert_eq!((incarnation,generation),revoked);seen=true;
+                            assert_eq!(Some((incarnation,generation)),revoked);seen=true;
+                        }
+                        ServerMessage::ChatSourceAuthorityUnavailable {cause:chat::SourceAuthorityUnavailableCause::ClockExhausted,..}=> {
+                            assert!(clock_exhausted && revoked.is_none());seen=true;
                         }
                         ServerMessage::ChatActivity {..}|ServerMessage::ChatObserved {..}=>{}
                         other=>panic!("hidden reset hydrated a body: {other:?}"),

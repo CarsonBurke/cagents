@@ -123,6 +123,7 @@ pub(crate) enum Update {
     /// Two actually issued identities at the same clock permanently revoke
     /// this attachment, even if a newer scalar was observed first.
     SourceAuthorityConflict {generation:u64,original:uuid::Uuid,conflicting:uuid::Uuid},
+    SourceAuthorityUnavailable {cause:super::SourceAuthorityUnavailableCause},
 }
 
 #[derive(Clone)]
@@ -141,22 +142,38 @@ impl Drop for OwnedSocket {
 impl Handle {
     /// Exact actor-issued scalar, available without transcript or provider I/O.
     pub(crate) fn source_authority(&self)->Option<SourceAuthority> {
+        if self.source_authority_unavailable().is_some() {return None;}
         *self.0.source_authority.lock().unwrap_or_else(|p|p.into_inner())
     }
     #[cfg(test)]
-    pub(crate) fn deny_source_release_for_test(&self) {
-        self.0.store.lock().unwrap().deny_source_release_for_test();
+    pub(crate) fn deny_source_release_for_test(&self,exhaust_clock:bool) {
+        let mut store=self.0.store.lock().unwrap();
+        if exhaust_clock {
+            store.note_source_generation_floor(u64::MAX);
+            self.0.state.lock().unwrap().generation=u64::MAX;
+        }
+        store.deny_source_release_for_test();
+    }
+    pub(crate) fn source_authority_unavailable(&self)->Option<super::SourceAuthorityUnavailableCause> {
+        self.0.source_unavailable.load(Ordering::Acquire).then_some(super::SourceAuthorityUnavailableCause::ClockExhausted)
     }
     /// Local Store clocks cannot issue a contradiction. Remote facades retain
     /// and expose exact contradictions received from a helper.
     pub(crate) fn source_authority_conflict(&self)->Option<SourceAuthority> {None}
-    fn refresh_source_authority(&self) {
-        let authority={
+    pub(crate) fn refresh_source_authority(&self) {
+        let (authority,unavailable)={
             let mut store=self.0.store.lock().unwrap_or_else(|p|p.into_inner());
             let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
             store.publish_source_authority(&mut state);
-            store.source_authority()
+            (store.source_authority(),store.source_authority_unavailable())
         };
+        if unavailable.is_some() {
+            if !self.0.source_unavailable.swap(true,Ordering::AcqRel) {
+                self.0.source_dirty.store(true,Ordering::Release);
+                self.wake();
+            }
+            return;
+        }
         if let Some(authority)=authority {
             let changed={
                 let mut cached=self.0.source_authority.lock().unwrap_or_else(|p|p.into_inner());
@@ -181,6 +198,7 @@ struct Inner {
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
     source_dirty: Arc<AtomicBool>,
+    source_unavailable: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -353,8 +371,18 @@ impl Handle {
         adapter.bind_item_reader(store::adapter_item_reader(&store));
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
-        let source_authority = Arc::new(Mutex::new(None));
+        // Initialize from the actual installed Store before publishing Handle.
+        // This is metadata-only and makes startup clock changes precede any
+        // caller's baseline. Retained Store ports must seed after their swap.
+        let (initial_authority,initial_unavailable)={
+            let mut store=store.lock().unwrap_or_else(|p|p.into_inner());
+            let mut state=state.lock().unwrap_or_else(|p|p.into_inner());
+            store.publish_source_authority(&mut state);
+            (store.source_authority(),store.source_authority_unavailable())
+        };
+        let source_authority = Arc::new(Mutex::new(initial_authority));
         let source_dirty = Arc::new(AtomicBool::new(false));
+        let source_unavailable = Arc::new(AtomicBool::new(initial_unavailable.is_some()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -369,6 +397,7 @@ impl Handle {
             confirmed_session: confirmed_session.clone(),
             source_authority: source_authority.clone(),
             source_dirty: source_dirty.clone(),
+            source_unavailable: source_unavailable.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -417,7 +446,9 @@ impl Handle {
                     confirmed_session,
                     source_authority,
                     source_dirty,
+                    source_unavailable,
                     source_notified: None,
+                    source_unavailable_notified: false,
                     store,
                     visible,
                     observe_next,
@@ -1928,7 +1959,9 @@ struct Actor {
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
     source_dirty: Arc<AtomicBool>,
+    source_unavailable: Arc<AtomicBool>,
     source_notified: Option<SourceAuthority>,
+    source_unavailable_notified: bool,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -2694,12 +2727,21 @@ impl Actor {
         Ok(())
     }
     fn publish_source_authority(&mut self)->Result<(),String> {
-        let authority={
+        let (authority,unavailable)={
             let mut store=self.store.lock().unwrap_or_else(|p|p.into_inner());
             let mut state=self.state.lock().unwrap_or_else(|p|p.into_inner());
             store.publish_source_authority(&mut state);
-            store.source_authority().ok_or("Source authority could not be ordered")?
+            (store.source_authority(),store.source_authority_unavailable())
         };
+        if let Some(cause)=unavailable {
+            self.source_unavailable.store(true,Ordering::Release);
+            if !self.source_unavailable_notified {
+                self.source_unavailable_notified=true;
+                (self.notify)(Update::SourceAuthorityUnavailable {cause});
+            }
+            return Ok(());
+        }
+        let authority=authority.ok_or("Source authority could not be ordered")?;
         let authority={
             let mut cached=self.source_authority.lock().unwrap_or_else(|p|p.into_inner());
             if cached.is_none_or(|old|old.generation<=authority.generation) {*cached=Some(authority);}
@@ -6412,7 +6454,11 @@ mod tests {
         };
         let (notify, notified) = crossbeam_channel::bounded(8);
         let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
-            let _ = notify.try_send(update);
+            // These fixtures assert their original activity/report contracts;
+            // source authority has separate hidden-host delivery coverage.
+            if !matches!(update,Update::SourceAuthority {..}|Update::SourceAuthorityConflict {..}|Update::SourceAuthorityUnavailable {..}) {
+                let _ = notify.try_send(update);
+            }
         })
         .unwrap();
         let before = generation(&handle);
@@ -6521,7 +6567,11 @@ mod tests {
         let store = preflight(&spec, &mut initial).unwrap();
         let (notify, notified) = crossbeam_channel::bounded(8);
         let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
-            let _ = notify.try_send(update);
+            // These fixtures assert their original activity/report contracts;
+            // source authority has separate hidden-host delivery coverage.
+            if !matches!(update,Update::SourceAuthority {..}|Update::SourceAuthorityConflict {..}|Update::SourceAuthorityUnavailable {..}) {
+                let _ = notify.try_send(update);
+            }
         })
         .unwrap();
         assert!(matches!(
@@ -6708,7 +6758,11 @@ mod tests {
         let store = preflight(&spec, &mut initial).unwrap();
         let (notify, notified) = crossbeam_channel::bounded(8);
         let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
-            let _ = notify.try_send(update);
+            // These fixtures assert their original activity/report contracts;
+            // source authority has separate hidden-host delivery coverage.
+            if !matches!(update,Update::SourceAuthority {..}|Update::SourceAuthorityConflict {..}|Update::SourceAuthorityUnavailable {..}) {
+                let _ = notify.try_send(update);
+            }
         })
         .unwrap();
         until(&handle, |snapshot| {
@@ -6740,6 +6794,9 @@ mod tests {
                 Update::Presentation => panic!("hidden close must not request presentation"),
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
+                | Update::SourceAuthority {..}
+                | Update::SourceAuthorityConflict {..}
+                | Update::SourceAuthorityUnavailable {..}
                 | Update::Attention(_)
                 | Update::PastAttention(_)
                 | Update::Ready

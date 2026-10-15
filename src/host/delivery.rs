@@ -451,6 +451,18 @@ mod tests {
     }
 
     #[test]
+    fn source_authority_unavailable_is_not_superseded_by_any_scalar() {
+        let queue=DeliveryQueue::new(1,3);
+        let id=TerminalId::new();
+        let mut unavailable=source_authority(id,uuid::Uuid::new_v4(),1);
+        unavailable.message=ServerMessage::ChatSourceAuthorityUnavailable {chat_id:id,cause:crate::chat::SourceAuthorityUnavailableCause::ClockExhausted};
+        queue.push(unavailable).unwrap();
+        queue.push(source_authority(id,uuid::Uuid::new_v4(),u64::MAX)).unwrap();
+        assert!(matches!(queue.pop().unwrap().message,ServerMessage::ChatSourceAuthorityUnavailable {..}));
+        assert!(matches!(queue.pop().unwrap().message,ServerMessage::ChatSourceAuthority {generation:u64::MAX,..}));
+    }
+
+    #[test]
     fn source_authority_overflow_is_an_explicit_fatal_queue_error() {
         let queue=DeliveryQueue::new(1,1);
         let id=TerminalId::new();
