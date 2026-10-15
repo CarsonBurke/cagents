@@ -28,6 +28,7 @@ mod agent_locations;
 mod session_locations;
 pub(crate) use agent_locations::{AgentMove, Location as AgentLocation};
 pub(crate) use session_locations::{Location as SessionLocation, SessionDirectoryProof, SessionMove};
+mod automation_extensions_schema;
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -42,7 +43,7 @@ mod relocation;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 18;
+const SCHEMA_VERSION: u32 = 19;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
