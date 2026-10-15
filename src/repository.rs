@@ -14403,6 +14403,7 @@ mod worktree_journal_tests {
                 );
             };
             git(&["init", "-b", "main"]);
+            fs::create_dir_all(repository.join(".git/hooks")).unwrap();
             fs::write(repository.join("tracked.txt"), b"committed content\n").unwrap();
             git(&["add", "tracked.txt"]);
             git(&[
