@@ -2473,6 +2473,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.publish_review(false, shell);
             shell.request_redraw();
         }
+        // The authoritative view or focus refresh may have ended Review after
+        // the initial cleanup check. Pair old attachments in this event once
+        // every local, parent, and native barrier permits input again.
+        self.review_input_barrier.flush_orphans(
+            self.suppress_focus_reports || self.review_active || state.a11y.borrow().review,
+        );
         if let Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left)) = event {
             if state.review_control_pressed {
                 state.review_control_pressed = false;
