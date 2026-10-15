@@ -162,6 +162,23 @@ impl AuthenticatedCreationScopes {
         Ok(received)
     }
     pub(crate) fn requirement(&self) -> &crate::model::DirectoryStartRequirement { &self.requirement }
+    /// Short final registration check AFTER full worker revalidation, while
+    /// the owning dispatcher still holds its exact source/intent reservation.
+    /// This compares the immutable recipient/request/host and polls original
+    /// socket/pidfd/deadline/cancellation only: no proc census, filesystem,
+    /// SQLite, backlink validation or provider action runs at this point.
+    /// It is not a substitute for revalidate() and does not commit/retain a
+    /// grant or manufacture a Started receipt.
+    pub(crate) fn validate_final_envelope(
+        &self,
+        current_request: u64,
+        current_proof: &crate::model::HostSessionProof,
+        current_requirement: &crate::model::DirectoryStartRequirement,
+    ) -> Result<(), RepositoryError> {
+        self.origin.validate_final_envelope(current_request, current_proof, current_requirement)
+            .map_err(|error| invalid(&error.to_string()))
+    }
+
     pub(crate) fn source(&self) -> &WorktreeAuthority { self.scopes.source() }
     pub(crate) fn destination(&self) -> &WorktreeAuthority { self.scopes.destination() }
     pub(crate) fn record(&self) -> &WorktreeRecord { self.scopes.record() }
