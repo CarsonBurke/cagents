@@ -16192,7 +16192,7 @@ impl Application for Cagents {
                     }
                     Task::batch([
                         self.update_update_ui(update_ui::Action::InspectInstallation),
-                        self.update_review_requests(review_request_ui::Action::Tick),
+                        self.update_review_requests(review_request_ui::Action::FocusGained),
                     ])
                 } else {
                     Task::none()
