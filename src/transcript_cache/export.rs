@@ -7,6 +7,8 @@ mod index;
 mod lifetime;
 mod rights;
 mod sqlite;
+mod source;
+pub(crate) use source::StoreSourceReceipt;
 pub(crate) use sqlite::{VerifiedReadContext, Coverage};
 pub(crate) use lifetime::{RevocationEpoch as SourceRevocationEpoch, RevocationProbe as SourceRevocationProbe};
 pub(crate) use index::{InstallationIndex, Namespace, NamespaceRead, RegisteredBinding};
@@ -45,3 +47,9 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+
+/// Called only while creating a fresh cache under the creation gate and its
+/// actual Store owner EX lease. Existing/partial lifetimes are never repaired.
+pub(super) fn initialize_lifetime(directory: &std::path::Path) -> Result<()> {
+    lifetime::initialize(directory)
+}

@@ -70,6 +70,7 @@ pub(crate) fn create(root: &Path) -> io::Result<(PathBuf, File)> {
     let result = (|| {
         let lease = private_file(&directory.join(LEASE))?;
         lock(&lease, libc::LOCK_EX | libc::LOCK_NB)?;
+        export::initialize_lifetime(&directory).map_err(io::Error::other)?;
         Ok((directory.clone(), lease))
     })();
     if result.is_err() {

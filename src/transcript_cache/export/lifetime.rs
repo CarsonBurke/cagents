@@ -33,6 +33,10 @@ fn header(dir: &Directory) -> Result<Header> {
     }
     Ok(header)
 }
+pub(super) fn describe(dir: &Directory) -> Result<(Uuid, FileIdentity)> {
+    let header = header(dir)?;
+    Ok((header.nonce, header.readers))
+}
 pub(super) struct ReaderHold { _directory: Directory, _lock: Locked, header: Header }
 impl ReaderHold {
     pub(super) fn acquire(directory: &Path, deadline: Instant) -> Result<Self> {

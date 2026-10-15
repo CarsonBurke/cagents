@@ -69,7 +69,7 @@ pub(super) fn verify_open_connection(db: &Connection, directory: &Directory, dat
     }
     Ok(())
 }
-fn guard(db: &Connection, proof: &SourceReadProofData) -> Result<()> {
+pub(super) fn guard(db: &Connection, proof: &SourceReadProofData) -> Result<()> {
     if proof.raw_schema != 1 || proof.reset_schema != 1 || proof.text_schema != 1
         || proof.source_incarnation.is_nil() || proof.raw_owner_nonce.is_nil() {
         return Err(Error::Unsupported("Export source profile is unsupported"));
