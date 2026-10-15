@@ -121,6 +121,21 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
 }
 
 #[cfg(feature = "host")]
+fn cleanup_ref_storage_command(repository: &Path) -> crate::process::CommandSpec {
+    crate::repository::RepositoryService::system("git").git_base(repository, false)
+        .args(["config", "--get", "extensions.refStorage"])
+}
+
+#[cfg(feature = "host")]
+fn cleanup_removal_command(request: &RemovalRequest) -> crate::process::CommandSpec {
+    crate::repository::RepositoryService::system("git").git_base(&request.repository, false)
+        .args(["worktree", "remove", "--"])
+        .arg(request.path.as_os_str())
+        .timeout(std::time::Duration::from_secs(30))
+        .output_limits(64 * 1024, 64 * 1024)
+}
+
+#[cfg(feature = "host")]
 impl PreparedRemoval {
     /// GitHub is read afresh before taking exclusive lifecycle fences. Sidebar
     /// branch badges and cached archived PRs never authorize removal.
@@ -132,8 +147,7 @@ impl PreparedRemoval {
         // Files-backend locks do not fence a reftable repository. Preserve
         // unsupported ref storage rather than claiming the same guarantee.
         use crate::process::ProcessExecutor;
-        let command = service.git_base(&request.repository, false)
-            .args(["config", "--get", "extensions.refStorage"]);
+        let command = cleanup_ref_storage_command(&request.repository);
         let output = crate::process::SystemProcessExecutor
             .execute(&command, &cancellation)
             .map_err(|error| error.to_string())?;
@@ -229,11 +243,7 @@ impl PreparedRemoval {
         {
             return Err("Worktree administrative identity changed".into());
         }
-        let command = service.git_base(&self.request.repository, false)
-            .args(["worktree", "remove", "--"])
-            .arg(self.request.path.as_os_str())
-            .timeout(std::time::Duration::from_secs(30))
-            .output_limits(64 * 1024, 64 * 1024);
+        let command = cleanup_removal_command(&self.request);
         let result = crate::process::SystemProcessExecutor
             .execute(&command, &cancellation)
             .and_then(|output| output.require_success(&command.program));
@@ -562,6 +572,50 @@ mod tests {
             }
             assert!(!exact_merged_head(&request, &pr));
         }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn cleanup_commands_ignore_inherited_git_redirection() {
+        use crate::process::ProcessExecutor;
+        const FIXTURE: &str = "CAGENTS_CLEANUP_REDIRECT_FIXTURE";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = PathBuf::from(root);
+            let cancellation = crate::process::CancellationToken::new();
+            let output = crate::process::SystemProcessExecutor.execute(
+                &cleanup_ref_storage_command(&root.join("primary")), &cancellation).unwrap();
+            assert_eq!(output.exit_code, Some(1));
+            assert!(output.stdout.is_empty(), "foreign ref storage must not be read");
+            let mut removal = request(); removal.repository = root.join("primary"); removal.path = root.join("worktree");
+            let command = cleanup_removal_command(&removal);
+            let removed = crate::process::SystemProcessExecutor.execute(&command, &cancellation).unwrap();
+            assert!(removed.success, "{}", String::from_utf8_lossy(&removed.stderr));
+            std::fs::write(root.join("child-completed"), "ok").unwrap();
+            return;
+        }
+        let fixture = tempfile::tempdir_in("/var/tmp").unwrap(); let root = fixture.path();
+        for name in ["primary", "foreign"] {
+            let repository = root.join(name); std::fs::create_dir(&repository).unwrap();
+            for arguments in [vec!["init", "-b", "main"], vec!["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "initial"]] {
+                let output = fixture_git(&repository).args(arguments).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            }
+        }
+        let output = fixture_git(&root.join("primary")).args(["worktree", "add", "-b", "feature"]).arg(root.join("worktree")).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let foreign = root.join("foreign");
+        let output = fixture_git(&foreign).args(["config", "extensions.refStorage", "reftable"]).output().unwrap();
+        assert!(output.status.success());
+        let foreign_config = std::fs::read(foreign.join(".git/config")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "worktree_cleanup::tests::cleanup_commands_ignore_inherited_git_redirection", "--nocapture"])
+            .env(FIXTURE, root).env("GIT_DIR", foreign.join(".git"))
+            .env("GIT_WORK_TREE", &foreign).env("GIT_INDEX_FILE", foreign.join(".git/index"))
+            .env("GIT_COMMON_DIR", foreign.join(".git")).output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(root.join("child-completed").exists());
+        assert!(!root.join("worktree").exists());
+        assert_eq!(std::fs::read(foreign.join(".git/config")).unwrap(), foreign_config);
     }
 
     #[cfg(feature = "host")]
