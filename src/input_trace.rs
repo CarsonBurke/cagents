@@ -568,6 +568,21 @@ mod tests {
     }
 
     #[test]
+    fn queued_events_restore_their_own_focus_snapshot() {
+        let trace = InputTrace::default();
+        let editor = KeyboardRegion { pane: FocusedPane::Editor, card: Some(CardId::new()) };
+        let sidebar = KeyboardRegion::from(FocusedPane::TextInput);
+        trace.1.set(Some(sidebar));
+        {
+            let _event = trace.scoped_keyboard_region(editor);
+            assert_eq!(trace.keyboard_focus(), Some(FocusedPane::Editor));
+            assert_eq!(trace.keyboard_card(), editor.card);
+        }
+        assert_eq!(trace.keyboard_focus(), Some(FocusedPane::TextInput));
+        assert_eq!(trace.keyboard_card(), None);
+    }
+
+    #[test]
     fn a_motion_seen_twice_is_one_sample() {
         let trace = InputTrace::default();
         trace.record(&moved(1.0));

@@ -984,6 +984,24 @@ mod tests {
     }
 
     #[test]
+    fn send_to_terminal_setting_updates_live_policy_and_retained_controls() {
+        let mut app = settings_focus_fixture();
+        let action = "rename_pane";
+        assert!(app.settings.keyboard_shortcuts.terminal_passthrough_actions.iter().any(|name| name == action));
+        for enabled in [false, true] {
+            drop(app.update(Message::ShortcutTerminalPassthrough { action: action.into(), enabled }));
+            assert_eq!(app.settings.keyboard_shortcuts.terminal_passthrough_actions.iter().any(|name| name == action), enabled);
+            assert_eq!(app.settings_draft.keyboard_shortcuts.terminal_passthrough_actions, app.settings.keyboard_shortcuts.terminal_passthrough_actions);
+            let encoded = toml::to_string(&app.settings.keyboard_shortcuts).unwrap();
+            let restored: KeyboardShortcuts = toml::from_str(&encoded).unwrap();
+            assert_eq!(restored.terminal_passthrough_actions, app.settings.keyboard_shortcuts.terminal_passthrough_actions);
+        }
+        let previous = app.settings.keyboard_shortcuts.clone();
+        drop(app.update(Message::ShortcutTerminalPassthrough { action: "unknown-command".into(), enabled: true }));
+        assert_eq!(app.settings.keyboard_shortcuts, previous);
+    }
+
+    #[test]
     fn a_global_command_targets_the_pane_with_native_keyboard_focus() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;

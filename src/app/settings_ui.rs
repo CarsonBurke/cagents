@@ -1240,12 +1240,12 @@ fn keyboard_groups<'a>(draft: &'a SettingsDraft, invalid: &'a HashMap<SettingsFi
             let value = draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).expect("registered draft").1;
             shortcut_input(field.label(), value, field, &draft.keyboard_shortcuts, invalid)
         }).collect();
-        for fixed in settings::FIXED_SHORTCUTS.iter().filter(|fixed| fixed.scope == group) {
+        for fixed in settings::FIXED_SHORTCUTS.iter().chain(settings::TEXT_EDITING_SHORTCUTS).filter(|fixed| fixed.scope == group) {
             let keys = fixed.chords.join(", ");
             let row = widget::row::with_children(vec![design::body(fixed.label).width(Length::FillPortion(3)).into(), design::caption(keys.clone()).width(Length::FillPortion(4)).into(), design::caption("Fixed").width(64).into()]).spacing(space::S).align_y(Alignment::Center);
             rows.push(setting_field(fixed.label, "", row.into()).label_in_control().keywords(&keys).keywords("fixed"));
         }
-        if !rows.is_empty() { groups.push(settings_group(group, "Action · Keys · Source", rows).compact()); }
+        if !rows.is_empty() { groups.push(settings_group(group, "Action · Keys · Source · Terminal", rows).compact()); }
     }
     groups
 }
@@ -1288,16 +1288,35 @@ fn shortcut_input<'a>(
         design::body(format!("{label}{required}")).width(Length::FillPortion(3)).into(),
         widget::flex_row(controls).spacing(2).align_items(Alignment::Center).width(Length::FillPortion(4)).into(),
         design::caption(source).width(64).into(),
+        {
+            let action_key = KeyboardShortcuts::action_names()[index];
+            crate::ui_controls::field::checkbox(draft.terminal_passthrough_actions.iter().any(|name| name == action_key))
+                .label("Send to terminal")
+                .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough { action: action_key.to_owned(), enabled })
+                .into()
+        },
     ]).spacing(space::S).align_y(Alignment::Center);
     let mut children = vec![row.into()];
+    if let Some(reason) = chords.iter().filter_map(|chord| settings::parse_shortcut(chord).ok()).find_map(settings::text_editing_shortcut_conflict) {
+        children.push(design::caption(format!("Scoped conflict: {reason}")).into());
+    }
     if let Some(reason) = &error { children.push(design::caption(reason.clone()).class(cosmic::theme::Text::Custom(design::destructive_text)).into()); }
     let conflict = if error.is_some() { "conflicts unsaved" } else { "" };
-    setting_field(label, "", widget::column::with_children(children).spacing(2).into()).label_in_control().keywords(value).keywords(settings::shortcut_search_keywords(value)).keywords(format!("keyboard_shortcuts {source} {conflict}"))
+    setting_field(label, "", widget::column::with_children(children).spacing(2).into()).label_in_control().keywords(value).keywords(settings::shortcut_search_keywords(value)).keywords(format!("keyboard_shortcuts send to terminal {source} {conflict}"))
 }
 
 #[cfg(test)]
 mod keyboard_table_tests {
     use super::*;
+
+    #[test]
+    fn shortcut_rows_match_the_persisted_policy_registry() {
+        let settings = KeyboardShortcuts::default();
+        assert_eq!(SettingsField::SHORTCUTS.len(), KeyboardShortcuts::action_names().len());
+        for (field, values) in SettingsField::SHORTCUTS.into_iter().zip(settings.actions()) {
+            assert_eq!(workspace_widget::shortcut_keys(field.shortcut_action().unwrap(), &settings), values);
+        }
+    }
 
     #[test]
     fn key_filter_includes_fixed_rows_and_all_matching_registered_actions() {

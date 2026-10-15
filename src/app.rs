@@ -3038,6 +3038,7 @@ enum SettingsFeedback {
 /// typed it. The parsed form lives in `AppSettings`; this is only the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShortcutDraft {
+    terminal_passthrough_actions: Vec<String>,
     toggle_projects: String,
     rename_pane: String,
     command_palette: String,
@@ -3081,6 +3082,7 @@ struct ShortcutDraft {
 impl ShortcutDraft {
     fn from_shortcuts(shortcuts: &KeyboardShortcuts) -> Self {
         Self {
+            terminal_passthrough_actions: shortcuts.terminal_passthrough_actions.clone(),
             toggle_projects: settings::format_chords(&shortcuts.toggle_projects),
             rename_pane: settings::format_chords(&shortcuts.rename_pane),
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -6462,6 +6464,7 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
             }
+            _ if self.card_state(card).is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) => workspace_widget::FocusedPane::ChatPane,
             _ => workspace_widget::FocusedPane::Other,
         }
     }
@@ -15739,6 +15742,7 @@ impl Application for Cagents {
                 if enabled {
                     actions.push(action);
                 }
+                self.settings_draft.keyboard_shortcuts.terminal_passthrough_actions = actions.clone();
                 self.save_settings_task(false)
             }
             Message::RoutedKeyEvent { .. } => unreachable!("native keyboard events are normalized before dispatch"),
@@ -15788,6 +15792,7 @@ impl Application for Cagents {
                 }
                 if !captured
                     && !self.workspace_inputs_blocked()
+                    && !matches!(self.focused_pane(), workspace_widget::FocusedPane::TextInput | workspace_widget::FocusedPane::OutsideWorkspace)
                     && workspace_widget::global_shortcut(
                         &event,
                         &self.settings.keyboard_shortcuts,
@@ -16040,6 +16045,7 @@ impl Application for Cagents {
                     return task;
                 }
                 if is_save_press(&event)
+                    && !matches!(self.focused_pane(), workspace_widget::FocusedPane::TextInput | workspace_widget::FocusedPane::OutsideWorkspace)
                     && let Some(card) = self.workspace.focused()
                     && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
                 {

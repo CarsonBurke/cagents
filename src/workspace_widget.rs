@@ -703,10 +703,10 @@ pub fn global_shortcut(
     else {
         return None;
     };
-    if focused.is_text_editing() && text_editing_chord(key, *physical_key, *modifiers) {
+    let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts)?;
+    if focused.is_text_editing() && text_editing_conflict(descriptor.action, key, *physical_key, *modifiers) {
         return None;
     }
-    let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts)?;
     (shortcut_applies(descriptor, focused, shortcuts) && (!*repeat || descriptor.repeatable))
         .then_some(
             if focused == FocusedPane::Terminal
@@ -730,16 +730,21 @@ pub(crate) fn is_global_shortcut_chord(
     shortcuts: &KeyboardShortcuts,
     focused: FocusedPane,
 ) -> bool {
-    if focused.is_text_editing() && text_editing_chord(key, physical_key, modifiers) {
-        return false;
-    }
     crate::tab_history::is_chord(key, modifiers)
         || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts)
-            .is_some_and(|descriptor| shortcut_applies(descriptor, focused, shortcuts))
+            .is_some_and(|descriptor| {
+                !(focused.is_text_editing() && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
+                    && shortcut_applies(descriptor, focused, shortcuts)
+            })
 }
 
 /// Native text controls retain their editing vocabulary even when a global
 /// action is rebound to it. Find is context-dependent and handled by scope.
+fn text_editing_conflict(action: GlobalShortcut, key: &keyboard::Key, physical: keyboard::key::Physical, modifiers: keyboard::Modifiers) -> bool {
+    text_editing_chord(key, physical, modifiers)
+        || (action != GlobalShortcut::FindInPane && modifiers.control() && !modifiers.shift() && !modifiers.alt() && !modifiers.logo() && latin_key(key, physical) == Some('f'))
+}
+
 fn text_editing_chord(
     key: &keyboard::Key,
     physical: keyboard::key::Physical,
@@ -3185,6 +3190,17 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_custom_action_cannot_replace_find_in_a_focused_editor() {
+        use keyboard::key::Code;
+        let mut shortcuts = KeyboardShortcuts::default();
+        shortcuts.find_in_pane.clear();
+        shortcuts.rename_pane = vec!["Ctrl+F".into()];
+        let event = key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false);
+        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Editor), None);
+        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Other), Some(GlobalShortcut::RenamePane));
     }
 
     #[test]
