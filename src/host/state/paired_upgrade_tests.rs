@@ -196,14 +196,19 @@ fn run_pair(mode: &str) {
     let preview = super::super::chat::process(&original, 1, ClientRequest::ChatPreview { session: request.clone(), source: proof.clone() }).unwrap();
     let ServerResponse::ChatPreviewed { preview } = preview else { panic!("missing exact preview") };
     let attached = super::super::chat::process(&original, 1, ClientRequest::ChatStartSelected { session: request, source: proof, token: preview.token }).unwrap();
-    let ServerResponse::ChatAttached { session: saved, .. } = attached else { panic!("missing paired attachment") };
-    assert_eq!(saved.terminal.as_ref().unwrap().launch, original.lock().unwrap().terminals[&id].session.launch);
+    let ServerResponse::ChatAttached { session: initial, .. } = attached else { panic!("missing paired attachment") };
+    assert_eq!(initial.terminal.as_ref().unwrap().launch, original.lock().unwrap().terminals[&id].session.launch);
     let actor = original.lock().unwrap().chats[&id].handle.clone();
     let deadline = Instant::now() + Duration::from_secs(5);
     while actor.confirmed_session_id().as_deref() != Some(ID) {
         assert!(Instant::now() < deadline, "paired actor did not confirm its thread");
         thread::sleep(Duration::from_millis(10));
     }
+    // Observe the descriptor through the public attachment after the real
+    // confirmation, rather than inventing a learned identity in the fixture.
+    let attached = super::super::chat::process(&original, 1, ClientRequest::ChatAttach { session: initial }).unwrap();
+    let ServerResponse::ChatAttached { session: saved, .. } = attached else { panic!("missing confirmed pair") };
+    assert_eq!(saved.launch.session_id.as_deref(), Some(ID));
     let store_path = cwd.join("checkpoint");
     let capability = original.lock().unwrap().shutdown_preflight(Instant::now()).unwrap().capability;
     let prepared = prepare_upgrade_with_policy(&original, capability, false, None, || Store::open(&store_path));
@@ -233,7 +238,13 @@ fn run_pair(mode: &str) {
         assert_eq!(resolved.launch.session_id.as_deref(), Some(ID));
         let current_terminal = replacement.lock().unwrap().terminals[&id].handle.clone();
         let current_actor = replacement.lock().unwrap().chats[&id].handle.clone();
-        let snapshot = current_actor.snapshot(None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            let snapshot = current_actor.snapshot(None).unwrap();
+            if snapshot.ready && !snapshot.history_loading { break snapshot; }
+            assert!(Instant::now() < deadline, "restored paired history did not load");
+            thread::sleep(Duration::from_millis(10));
+        };
         assert!(snapshot.items.iter().any(|item| matches!(&item.content,
             crate::chat::ItemContent::Text { text, .. } if text == "existing paired answer")));
         super::super::chat::close_for_terminal(&replacement, id).unwrap();
