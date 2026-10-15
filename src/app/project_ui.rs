@@ -149,8 +149,12 @@ impl State {
 
     pub(super) fn focus_target(&self) -> widget::Id {
         if !self.force_branches.is_empty() { return widget::Id::new("dialog.branch.keep"); }
-        if self.cleanup_dialog.is_some() {
-            return widget::Id::new("dialog.project.cleanup.directories");
+        if let Some(dialog) = &self.cleanup_dialog {
+            return widget::Id::new(if dialog.loading {
+                "dialog.project.cleanup.cancel"
+            } else {
+                "dialog.project.cleanup.directories"
+            });
         }
         if self.remove_dialog.is_some() {
             return widget::Id::new("dialog.project.remove.cancel");
@@ -1043,7 +1047,7 @@ impl Cagents {
                     error: None,
                     request,
                 });
-                return cosmic::task::future(async move {
+                let read = cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         read_cleanup_policy(&repository)
                     })
@@ -1052,6 +1056,8 @@ impl Cagents {
                     .and_then(|result| result);
                     Message::ProjectUi(Action::CleanupPolicyRead { request, result })
                 });
+                return Task::batch([read, iced::widget::operation::focus(self.project_ui.focus_target())
+                    .map(cosmic::Action::App)]);
             }
             Action::CleanupPolicyRead { request, result } => {
                 let Some(dialog) = self
@@ -1106,7 +1112,7 @@ impl Cagents {
                 dialog.error = None;
                 let repository = dialog.repository.clone();
                 let request = dialog.request;
-                return cosmic::task::future(async move {
+                let save = cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         let reply = crate::device_service::request(crate::device_service::Operation::Worktree {
                             operation: crate::worktree_control::Operation::SetDisposableIgnoredDirectories {
@@ -1120,6 +1126,8 @@ impl Cagents {
                     .and_then(|result| result);
                     Message::ProjectUi(Action::CleanupPolicySaved { request, result })
                 });
+                return Task::batch([save, iced::widget::operation::focus(self.project_ui.focus_target())
+                    .map(cosmic::Action::App)]);
             }
             Action::CleanupPolicySaved { request, result } => {
                 let Some(dialog) = self
@@ -2223,6 +2231,7 @@ impl Cagents {
             }
             rows.push(super::dialog_ui::confirmation_actions(
                 crate::ui_controls::button::secondary("Cancel")
+                    .id(widget::Id::new("dialog.project.cleanup.cancel"))
                     .on_press(Message::ProjectUi(Action::Dismiss)),
                 crate::ui_controls::button::primary("Save policy").on_press_maybe(
                     (!dialog.loading).then_some(Message::ProjectUi(Action::SaveCleanupPolicy)),
@@ -3309,6 +3318,12 @@ mod tests {
             repository: PathBuf::from("/focus-repo"), name: "repo".into(),
             directories: String::new(), loading: true, error: None, request: 19,
         });
+        let loading_focus = iced::widget::operation::focus(app.project_ui.focus_target()).map(cosmic::Action::App);
+        assert_eq!(
+            super::super::tests::focused_element(app.project_dialog_view().unwrap(), loading_focus),
+            Some(widget::Id::new("dialog.project.cleanup.cancel")),
+            "the disabled loading field must not consume initial focus",
+        );
         let task = app.handle_project_action(Action::CleanupPolicyRead {
             request: 19, result: Ok(vec!["target".into()]),
         });
