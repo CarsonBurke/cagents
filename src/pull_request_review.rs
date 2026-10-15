@@ -3963,7 +3963,7 @@ pub(crate) mod tests {
         drop(state.update(Action::Loaded {
             generation: state.generation,
             load: state.load_generation,
-            result: Ok(refreshed),
+            result: Ok(Arc::new(refreshed)),
         }));
         let current = &state.target.as_ref().unwrap().pull_request;
         assert_eq!(current.head_ref_name, "renamed-feature");
