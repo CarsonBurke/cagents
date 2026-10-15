@@ -48,6 +48,7 @@ use crate::account::{
 use crate::agent::Provider;
 
 mod table;
+mod linear;
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
     operation: account::remote::Operation,
@@ -115,6 +116,7 @@ pub(super) struct State {
     /// Not before this is the daemon asked again.
     next_host_check: Millis,
     table: table::Table,
+    linear: linear::State,
     /// Accounts being signed out and deleted.
     removing: BTreeSet<AccountId>,
     /// Accounts whose home was found signed in to another login than the
@@ -249,6 +251,7 @@ impl State {
             asking_host: false,
             next_host_check: 0,
             table: table::Table::default(),
+            linear: linear::State::default(),
             removing: BTreeSet::new(),
             live_unsaved: BTreeSet::new(),
             login_changes_reported: BTreeMap::new(),
@@ -858,6 +861,7 @@ pub struct Restored {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    Linear(linear::Action),
     RemoteHomeReady(Provider, Result<crate::account::remote::Created, String>),
     RemoteLoaded(Result<crate::device_service::AccountSnapshot, String>),
     RemoteLogin(AccountId, u64, Result<LaunchRecipe, String>),
@@ -985,6 +989,7 @@ impl Action {
     /// Whether this is the reader acting on the account surfaces, which a
     /// dialog in front of them must stop. Closing a popup never is.
     pub(super) fn blocked_while_modal(&self) -> bool {
+        if let Self::Linear(action) = self { return action.blocked_while_modal(); }
         matches!(
             self,
             Self::Refresh(_)
@@ -2196,6 +2201,7 @@ impl Cagents {
 
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::Linear(action) => linear::update(&mut self.account_ui.linear, action),
             Action::RemoteHomeReady(provider, result) => match result {
                 Ok(created) => {
                     let task = self.begin_account_login(
