@@ -4695,6 +4695,16 @@ struct PendingLspJump {
 /// completion whose edit range describes characters the user has already
 /// replaced, are both silent corruptions, and neither is recoverable by
 /// looking at the answer alone.
+#[derive(Debug, Clone)]
+struct EditorDefinitionRequest {
+    request: crate::lsp::LspRequestId,
+    doc: LspDocumentId,
+    version: Option<i32>,
+    caret: Option<LspPosition>,
+    selection: Option<crate::lsp::LspRange>,
+    focus_revision: u64,
+}
+
 #[derive(Debug, Default)]
 struct LspInspectorState {
     context: inspector::LspInspectorContext,
@@ -4719,7 +4729,7 @@ struct LspInspectorState {
     progress: Option<String>,
     completion_request: Option<(crate::lsp::LspRequestId, LspPosition)>,
     editor_hover_request: Option<(crate::lsp::LspRequestId, LspPosition)>,
-    editor_navigation: Option<crate::lsp::LspRequestId>,
+    editor_navigation: Option<EditorDefinitionRequest>,
 }
 
 impl LspInspectorState {
@@ -10494,6 +10504,21 @@ impl Cagents {
         })
     }
 
+    fn definition_request_current(&self, card: CardId, origin: &EditorDefinitionRequest) -> bool {
+        !self.modal_is_open() && self.workspace.focused() == Some(card)
+            && self.workspace.focus_revision() == origin.focus_revision
+            && self.lsp_document(card) == Some(origin.doc)
+            && self.lsp.document_version(origin.doc) == origin.version
+            && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                if runtime.cursor_position() == origin.caret && runtime.editor_selection_range() == origin.selection)
+    }
+
+    fn retire_stale_definition_requests(&mut self) {
+        let stale = self.lsp_contexts.iter().filter_map(|(card, state)| state.editor_navigation.as_ref()
+            .filter(|origin| !self.definition_request_current(*card, origin)).map(|_| *card)).collect::<Vec<_>>();
+        for card in stale { if let Some(state) = self.lsp_contexts.get_mut(&card) { state.editor_navigation = None; } }
+    }
+
     fn update_lsp_message(&mut self, event: LspEvent) -> Task<Message> {
         if let Some(task) = self.editor_feature_event(&event) { return task; }
         let navigation = if let LspEvent::Locations {
@@ -10506,10 +10531,9 @@ impl Cagents {
         {
             self.lsp_documents.get(doc).copied().and_then(|card| {
                 let state = self.lsp_contexts.get_mut(&card)?;
-                if state.editor_navigation != Some(*request) {
-                    return None;
-                }
-                state.editor_navigation = None;
+                if !state.editor_navigation.as_ref().is_some_and(|origin| origin.request == *request && origin.doc == *doc) { return None; }
+                let origin = state.editor_navigation.take()?;
+                if !self.definition_request_current(card, &origin) { return None; }
                 Some((card, items.clone()))
             })
         } else {
@@ -11014,8 +11038,15 @@ impl Cagents {
                     _ => None,
                 });
                 if let Some(at) = at {
+                    if self.modal_is_open() || self.workspace.focused() != Some(card) { return Task::none(); }
+                    let (caret, selection) = match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => (runtime.cursor_position(), runtime.editor_selection_range()),
+                        _ => return Task::none(),
+                    };
                     let request = self.lsp.request_definition(doc, at);
-                    self.lsp_contexts.entry(card).or_default().editor_navigation = Some(request);
+                    self.lsp_contexts.entry(card).or_default().editor_navigation = Some(EditorDefinitionRequest {
+                        request, doc, version: self.lsp.document_version(doc), caret, selection, focus_revision: self.workspace.focus_revision(),
+                    });
                 }
                 Task::none()
             }
@@ -13365,6 +13396,7 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.retire_stale_definition_requests();
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -24292,6 +24324,55 @@ mod tests {
     }
 
     #[test]
+    fn delayed_definitions_cannot_override_newer_focus_caret_or_modal_intent() {
+        for change in ["focus", "away-back", "caret-back", "modal"] {
+            let root = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let path = root.path().join("main.rs");
+            let target = external.path().join("std.rs");
+            std::fs::write(&path, "fn main() {}\n").unwrap();
+            std::fs::write(&target, "fn target() {}\n").unwrap();
+            let (mut app, card) = editing_repository_app();
+            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", "fn main() {}\n");
+            runtime.descriptor.worktree = root.path().into(); runtime.descriptor.repository = root.path().into();
+            runtime.set_lsp_document(Some(LspDocumentId(1)));
+            drop(runtime.take_lsp_intents());
+            app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+            app.lsp = LspManager::new(AppSettings::default().language_servers);
+            let language = app.lsp.language_for(&path).unwrap();
+            // Discovery is not delivered: this is actual application request
+            // admission and queue-delay fencing, with no server process.
+            app.lsp.open(LspDocumentId(1), &path, root.path(), language, 1, "fn main() {}\n");
+            drop(app.update(Message::Repository(RepositoryAction::Language { card, action: repository_widget::EditorLspAction::Definition(None) })));
+            let request = app.lsp_contexts[&card].editor_navigation.as_ref().unwrap().request;
+            let other = CardId::new();
+            let (runtime, _) = RepositoryRuntime::open_fixture(other, "other.rs", "keep focus here");
+            app.cards.insert(other, CardRuntime::Repository(Box::new(runtime)));
+            app.workspace.add_card(WorkspaceCard::new(other, "Other", CardWidth::Fraction(0.7)).unwrap(), app.workspace.cards().len(), false).unwrap();
+            match change {
+                "focus" | "away-back" => {
+                    drop(app.update(Message::FocusCard(other)));
+                    if change == "away-back" { drop(app.update(Message::FocusCard(card))); }
+                }
+                "caret-back" => {
+                    for motion in [repository_widget::EditorMotion::Right, repository_widget::EditorMotion::Left] {
+                        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Move(motion) })));
+                    }
+                }
+                "modal" => app.resume_ui.open = true,
+                _ => unreachable!(),
+            }
+            let expected = app.workspace.focused(); let count = app.cards.len();
+            app.context_inspector_open = false;
+            drop(app.update(Message::Lsp(LspEvent::Locations { doc: LspDocumentId(1), request, kind: crate::lsp::LocationKind::Definition, items: vec![crate::lsp::LspLocation { target: crate::lsp::LspTarget::External { path: target }, range: crate::lsp::LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 1)), coordinates: LspCoordinates::Utf16 }] })));
+            assert_eq!(app.workspace.focused(), expected, "{change}");
+            assert_eq!(app.cards.len(), count, "{change}");
+            assert!(!app.context_inspector_open, "{change}");
+            assert!(!app.lsp_pending_jumps.contains_key(&card), "{change}");
+        }
+    }
+
+    #[test]
     fn editor_language_results_reveal_details_from_the_files_tab() {
         let mut app = lsp_test_app();
         let card = repository_card(&mut app, "/repo");
@@ -24315,7 +24396,9 @@ mod tests {
         let doc = LspDocumentId(1);
         let request = crate::lsp::LspRequestId(1);
         app.lsp_documents.insert(doc, card);
-        lsp_state(&mut app, card).editor_navigation = Some(request);
+        app.workspace.add_card(WorkspaceCard::new(card, "Repository", CardWidth::Fraction(0.7)).unwrap(), app.workspace.cards().len(), true).unwrap();
+        let origin = EditorDefinitionRequest { request, doc, version: None, caret: None, selection: None, focus_revision: app.workspace.focus_revision() };
+        let state = lsp_state(&mut app, card); state.document = Some(doc); state.editor_navigation = Some(origin);
         app.context_tab = ContextTab::Files;
         app.context_inspector_open = false;
         let _ = app.update(Message::Lsp(LspEvent::Locations {

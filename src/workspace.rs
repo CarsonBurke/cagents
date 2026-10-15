@@ -620,6 +620,7 @@ pub struct Workspace {
     cards: Vec<WorkspaceCard>,
     card_indices: Arc<HashMap<CardId, usize>>,
     focused: Option<CardId>,
+    focus_revision: u64,
     viewport_width: f32,
     geometry: StripGeometry,
     layout_transition: Option<LayoutTransition>,
@@ -644,6 +645,7 @@ impl Workspace {
             cards: Vec::new(),
             card_indices: Arc::default(),
             focused: None,
+            focus_revision: 0,
             viewport_width: 0.0,
             geometry: StripGeometry::build(&[], 0.0, config),
             layout_transition: None,
@@ -665,6 +667,14 @@ impl Workspace {
 
     pub fn order(&self) -> impl ExactSizeIterator<Item = CardId> + '_ {
         self.cards.iter().map(|card| card.id)
+    }
+
+    /// Monotonic focus intent, including switching away and back to a card.
+    pub fn focus_revision(&self) -> u64 { self.focus_revision }
+
+    fn set_focused(&mut self, focused: Option<CardId>) {
+        if self.focused != focused { self.focus_revision = self.focus_revision.wrapping_add(1); }
+        self.focused = focused;
     }
 
     pub fn focused(&self) -> Option<CardId> {
@@ -857,7 +867,7 @@ impl Workspace {
         );
         self.rebuild_card_indices();
         if self.focused.is_none() || focus {
-            self.focused = Some(id);
+            self.set_focused(Some(id));
             self.pending_widget_focus = Some(id);
         }
         self.rebuild_geometry();
@@ -976,7 +986,7 @@ impl Workspace {
         }
 
         // Retarget the running spring without restarting on held-key repeats.
-        self.focused = Some(id);
+        self.set_focused(Some(id));
         self.pending_widget_focus = Some(id);
         if reveal {
             self.reveal_focused();
@@ -989,7 +999,7 @@ impl Workspace {
         direction: FocusDirection,
     ) -> Result<ViewportUpdate, WorkspaceError> {
         if self.cards.is_empty() {
-            self.focused = None;
+            self.set_focused(None);
             return Ok(ViewportUpdate::unchanged());
         }
 
@@ -1071,7 +1081,7 @@ impl Workspace {
             self.pending_widget_focus = None;
         }
         if self.focused == Some(id) {
-            self.focused = match pending.handoff.target {
+            let focused = match pending.handoff.target {
                 FocusTarget::Card(next) if self.index_of(next).is_some() => Some(next),
                 FocusTarget::Unchanged => self.focused,
                 _ => self
@@ -1084,12 +1094,13 @@ impl Workspace {
                     })
                     .map(|card| card.id),
             };
+            self.set_focused(focused);
             if !matches!(pending.handoff.target, FocusTarget::Card(_)) {
                 self.pending_widget_focus = self.focused;
             }
         }
         if self.cards.is_empty() {
-            self.focused = None;
+            self.set_focused(None);
             self.pending_widget_focus = None;
         }
         self.rebuild_geometry();
