@@ -326,19 +326,7 @@ fn execute_with_commits(
                     )
                 })
             })?;
-            let account = Account::managed(provider, key, home.clone());
-            let recipe = match login_recipe(&account, &program) {
-                Ok(recipe) => recipe,
-                Err(error) => {
-                    // A launch recipe failure must not strand an unused home
-                    // and pending registry entry before the terminal opens.
-                    if let Ok((_, _, Some(parked))) = commits.park(&store,&homes,provider,key,false) {
-                        let _ = parked.finish();
-                    }
-                    return Err(error);
-                }
-            };
-            serde_json::to_value(Created { key, home, recipe }).map_err(|error| error.to_string())
+            created_login(provider, key, home, &program)
         }
         Operation::Link {
             provider,
@@ -726,6 +714,24 @@ fn purge_deleted_account_annotations_with(
     }
 }
 
+/// Registration is already committed here. Recipe failure is not proof that
+/// this home has no physical aliases, actors or initialized cache namespaces.
+/// Keep its original spelling and pending row for explicit recovery.
+#[cfg(feature = "host")]
+fn created_login(
+    provider: Provider,
+    key: uuid::Uuid,
+    home: std::path::PathBuf,
+    cli: &super::probe::Cli,
+) -> Result<serde_json::Value, String> {
+    let account = super::Account::managed(provider, key, home.clone());
+    let recipe = login_recipe(&account, cli).map_err(|error| format!(
+        "Account sign-in could not be prepared; the pending account and files were retained at {} for explicit recovery: {error}",
+        home.display(),
+    ))?;
+    serde_json::to_value(Created { key, home, recipe }).map_err(|error| error.to_string())
+}
+
 #[cfg(feature = "host")]
 pub(crate) fn login_recipe(
     account: &super::Account,
@@ -774,6 +780,33 @@ pub(crate) fn login_recipe(
 #[cfg(feature = "host")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_created_login_recipe_retains_pending_home_and_initialized_namespace() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let homes = super::super::home::Homes::at(root.path().join("homes"));
+        let store = super::super::registry::Store::at(root.path().join("registry"));
+        let (key, home) = store.create_pending(&homes, Provider::Claude, 1, || {
+            homes.create_with_config_initialized(
+                Provider::Claude, None, super::super::home::CodexConfig::Shared,
+                |receipt| std::fs::write(receipt.home().join("namespace-pointer-fixture"), "registered namespace"),
+            )
+        }).unwrap();
+        let before = store.load().unwrap();
+        let cli = super::super::probe::Cli {
+            program: std::ffi::OsString::from_vec(b"/private/non-utf8-\xff/claude".to_vec()).into(),
+            configuration: Default::default(),
+        };
+        let error = created_login(Provider::Claude, key, home.clone(), &cli).unwrap_err();
+        assert!(error.contains("Provider path is not UTF-8"), "{error}");
+        assert!(error.contains("pending account and files were retained"), "{error}");
+        assert!(home.is_dir(), "recipe refusal must not rename the original home");
+        assert_eq!(std::fs::read_to_string(home.join("namespace-pointer-fixture")).unwrap(), "registered namespace");
+        assert_eq!(store.load().unwrap(), before);
+        assert!(before.pending().iter().any(|pending| pending.key == key));
+        assert_eq!(std::fs::read_dir(home.parent().unwrap()).unwrap().count(), 1);
+    }
 
     #[test]
     fn deletion_preview_refuses_replaced_and_newly_created_homes_before_logout_or_registry_changes()
