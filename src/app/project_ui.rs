@@ -282,6 +282,15 @@ pub enum Action {
     Dismiss,
 }
 
+impl Action {
+    fn user_input(&self) -> bool {
+        matches!(self, Self::Command { .. } | Self::ConfirmDelete | Self::DeleteBranchChanged(_)
+            | Self::ForceDeleteBranch | Self::KeepBranch | Self::BusyAgentsConfirmed(_)
+            | Self::OpenCleanupPolicy(_) | Self::CleanupPolicyChanged(_) | Self::SaveCleanupPolicy
+            | Self::ConfirmRemove | Self::RetryDelete(_) | Self::Dismiss)
+    }
+}
+
 impl Cagents {
     #[cfg(test)]
     pub(super) fn confirm_worktree_delete_fixture(&mut self) {
@@ -990,7 +999,23 @@ impl Cagents {
         })
     }
 
+    fn project_dialog_on_top(&self) -> bool {
+        #[cfg(feature = "integrated-browser")]
+        if self.browser_import.open() { return false; }
+        self.project_ui.modal_open() && !self.update_prepared
+            && self.update_ui.confirmation.is_none() && !self.session_recovery.open()
+            && !self.daemon_health_ui.confirmation && !self.automation_approval_open()
+            && self.transient_work_close.is_none() && !self.automation_ui.draft_dialog_open()
+            && !self.device_ui.open && self.chat_ui.image_viewer.is_none()
+            && self.terminal_paste.is_none() && !self.terminal_close_dialog_visible()
+            && !self.settings_reset_confirm && self.sidebar_state.pending_discard().is_none()
+            && self.dirty_repository_close.is_none() && self.sidebar_selection_ui.dialog.is_none()
+    }
+
     pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
+        if action.user_input() && (self.update_prepared || (self.modal_is_open() && !self.project_dialog_on_top())) {
+            return Task::none();
+        }
         match action {
             Action::OpenCleanupPolicy(project) => {
                 if self.modal_is_open() {
@@ -1511,12 +1536,12 @@ impl Cagents {
                 }
             }
             Action::DeleteBranchChanged(value) => {
-                if let Some(dialog) = self.project_ui.dialog.as_mut().filter(|dialog| !dialog.branch_elsewhere && !dialog.options_loading) {
+                if let Some(dialog) = self.project_ui.dialog.as_mut().filter(|dialog| !dialog.branch_elsewhere && !dialog.options_loading && !dialog.loading) {
                     dialog.delete_branch = value; dialog.branch_choice_edited = true;
                 }
             }
             Action::BusyAgentsConfirmed(value) => {
-                if let Some(dialog) = self.project_ui.dialog.as_mut() { dialog.busy_confirmed = value.then(|| dialog.busy_agents.clone()); }
+                if let Some(dialog) = self.project_ui.dialog.as_mut().filter(|dialog| !dialog.loading && !dialog.options_loading) { dialog.busy_confirmed = value.then(|| dialog.busy_agents.clone()); }
             }
             Action::StaleUnlocked { request, result } => {
                 let Some(dialog) = self.project_ui.dialog.as_mut().filter(|dialog| dialog.request == request) else { return Task::none(); };
@@ -1565,6 +1590,7 @@ impl Cagents {
                 confirming,
                 result,
             } => {
+                let on_top = self.project_dialog_on_top();
                 let default_branch = self.project_ui.dialog.as_ref().filter(|dialog| dialog.request == request)
                     .and_then(|dialog| result.as_ref().ok().map(|(snapshot, _)| self.delete_branch_default(&dialog.target, snapshot))).unwrap_or(false);
                 let Some(dialog) = self
@@ -1587,6 +1613,11 @@ impl Cagents {
                         let agents_changed = dialog.busy_agents != agents;
                         dialog.busy_agents = agents;
                         let busy = dialog.busy_agents.len();
+                        if confirming && !on_top {
+                            dialog.safety = Some(snapshot); dialog.busy_confirmed = None;
+                            dialog.failure = Some("Confirmation was interrupted. Review this worktree again when the dialog is exposed.".into());
+                            return Task::none();
+                        }
                         let unchanged = dialog.safety.as_ref() == Some(&snapshot);
                         if !dialog.branch_choice_edited && !dialog.branch_elsewhere { dialog.delete_branch = default_branch; }
                         if confirming && (agents_changed || (busy > 0 && dialog.busy_confirmed.as_ref() != Some(&dialog.busy_agents))) {
@@ -1721,6 +1752,7 @@ impl Cagents {
                         .and_then(|id| self.project_ui.deletion_authorizations.remove(&id));
                     if let Some(id) = target.worktree {
                         self.project_ui.deletions.remove(&id);
+                        self.project_ui.deletion_busy_agents.remove(&id);
                     }
                     // The daemon has already closed every terminal and chat in
                     // the directory, so their cards are tombstoned here without
@@ -3287,6 +3319,32 @@ mod tests {
         assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::StaleLock { unlocked: false }).is_err());
         let agent = BusyAgent { session: TerminalId::new(), turn_generation: Some(1) };
         assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions { agents: vec![agent.clone(), agent] }).is_err());
+    }
+
+    #[test]
+    fn deletion_controls_and_late_confirmations_wait_for_their_exposed_dialog() {
+        for update in [false, true] {
+            let repository = PathBuf::from("/repo");
+            let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+            let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+            let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+            let target = app.project_target(project, Some(linked.id)).unwrap();
+            drop(app.open_worktree_delete_dialog(target));
+            let request = app.project_ui.dialog.as_ref().unwrap().request;
+            drop(app.handle_project_action(Action::DeleteOptionsRead { request, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
+            drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result: Ok((clean_snapshot(), vec![])) }));
+            app.update_prepared = update; app.settings_reset_confirm = !update;
+            drop(app.handle_project_action(Action::DeleteBranchChanged(true)));
+            assert!(!app.project_ui.dialog.as_ref().unwrap().delete_branch);
+            drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
+            assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_none());
+            drop(app.handle_project_action(Action::ConfirmDelete));
+            drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), vec![])) }));
+            assert!(!app.project_ui.is_deleting(linked.id));
+            assert!(app.project_ui.dialog.is_some());
+        }
+        assert!(user_message_blocked_during_update(&Message::ProjectUi(Action::ForceDeleteBranch)));
+        assert!(user_message_blocked_during_update(&Message::ProjectUi(Action::BusyAgentsConfirmed(true))));
     }
 
     #[test]
