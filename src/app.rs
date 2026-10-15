@@ -3902,7 +3902,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
         }
         SettingsField::ChatContentFraction
         | SettingsField::DefaultNativePaneFraction
-        | SettingsField::DefaultColumnFraction => "Width must be a number between 25% and 100%.".to_owned(),
+        | SettingsField::DefaultColumnFraction => {
+            "Width must be a number between 25% and 100%.".to_owned()
+        }
         SettingsField::TerminalFontFamily
             if attempted.terminal_font_family.len() > settings::MAX_TERMINAL_FONT_FAMILY_BYTES =>
         {
