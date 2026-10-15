@@ -100,9 +100,13 @@ fn installation_root() -> Result<PathBuf, String> {
 }
 /// Invoke while the lifecycle lock still protects the captured existing home.
 /// Archive and cache eviction deliberately do not call this function.
-pub(crate) fn purge_account(scope: &LaunchAccountScope) -> Result<(), String> {
+pub(crate) fn purge_account(permit:&crate::host::DeletionPermit<'_>,scope: &LaunchAccountScope) -> Result<(), String> {
+    permit.authorize_scope(scope)?;
     purge_account_at(&installation_root()?, scope)
 }
+// Production session deletion remains unavailable until a separate exact
+// native-session retirement permit exists. An account permit is not one.
+#[cfg(test)]
 pub(crate) fn purge_session(
     scope: &LaunchAccountScope,
     confirmed_session: &str,
@@ -144,8 +148,13 @@ fn purge_account_at(root: &Path, scope: &LaunchAccountScope) -> Result<(), Strin
 /// Purge-only historical association. `None` means this installation has no
 /// trustworthy prior association for the registered ID; it grants no read
 /// access and must not be used to reconstruct an absent credential home.
-pub(crate) fn purge_registered(id: &crate::account::AccountId) -> Result<Option<usize>, String> {
-    purge_registered_at(&installation_root()?, id)
+pub(crate) fn purge_registered(permit:&crate::host::DeletionPermit<'_>,id: &crate::account::AccountId) -> Result<Option<usize>, String> {
+    // Refuse before touching any namespace index or tombstone.
+    permit.authorize_registered(id)?;
+    purge_registered_with(&installation_root()?,id,|keys|{
+        permit.reserve_registered_namespaces(id,keys)?;
+        permit.authorize_registered(id)
+    })
 }
 const MAX_REGISTERED_NAMESPACES:usize=4096;
 fn registered_index_lease(root:&Path,id:&crate::account::AccountId,operation:i32)->Result<crate::instance::OwnedLock,String>{
