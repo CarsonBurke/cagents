@@ -96,6 +96,9 @@ impl DirectoryPreparation {
     pub fn diagnostic_path(&self) -> PathBuf { self.namespace.directory.path.join(&self.name) }
     pub fn is_resolved(&self) -> bool { !self.created }
     pub fn retry_cleanup(&mut self) -> Result<(), ResolveError> {
+        self.retry_cleanup_with_hook(|_| Ok(()))
+    }
+    fn retry_cleanup_with_hook(&mut self, mut after_acquire: impl FnMut(&Root) -> Result<(), ResolveError>) -> Result<(), ResolveError> {
         if !self.created { return Ok(()); }
         namespace_protected(&self.namespace.directory)
             .map_err(|e| ResolveError::io(&self.namespace.directory.path, &e))?;
@@ -111,26 +114,36 @@ impl DirectoryPreparation {
             }
             Err(error) => return Err(error),
         };
-        let metadata = outer.metadata().map_err(|e| ResolveError::io(&outer.path, &e))?;
         if let Some(held) = &self.outer {
             let expected = held.metadata().map_err(|e| ResolveError::io(&held.path, &e))?;
-            if (metadata.dev(), metadata.ino()) != (expected.dev(), expected.ino()) {
+            let actual = outer.metadata().map_err(|e| ResolveError::io(&outer.path, &e))?;
+            if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
                 return Err(ResolveError::message(&outer.path, "internal staging identity changed; replacement preserved"));
             }
         } else {
-            self.outer = Some(outer.try_clone().map_err(|e| ResolveError::io(&outer.path, &e))?);
+            // Store the first acquired capability before fstat, callbacks or
+            // any other fallible operation. Retrying cannot adopt a successor.
+            self.outer = Some(outer);
+            after_acquire(self.outer.as_ref().unwrap())?;
         }
+        let outer = self.outer.as_ref().unwrap();
+        outer.metadata().map_err(|e| ResolveError::io(&outer.path, &e))?;
         if self.payload_created {
-            match resolve_directory(&outer, Path::new("directory")) {
+            match resolve_directory(outer, Path::new("directory")) {
                 Ok(payload) => {
-                    let metadata = payload.metadata().map_err(|e| ResolveError::io(&payload.path, &e))?;
                     if let Some(held) = &self.payload {
                         let expected = held.metadata().map_err(|e| ResolveError::io(&held.path, &e))?;
-                        if (metadata.dev(), metadata.ino()) != (expected.dev(), expected.ino()) {
+                        let actual = payload.metadata().map_err(|e| ResolveError::io(&payload.path, &e))?;
+                        if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
                             return Err(ResolveError::message(&payload.path, "internal payload identity changed; replacement preserved"));
                         }
+                    } else {
+                        self.payload = Some(payload);
+                        after_acquire(self.payload.as_ref().unwrap())?;
                     }
-                    remove_directory_within(&outer, OsStr::new("directory"))?;
+                    let payload = self.payload.as_ref().unwrap();
+                    payload.metadata().map_err(|e| ResolveError::io(&payload.path, &e))?;
+                    remove_directory_within(outer, OsStr::new("directory"))?;
                 }
                 Err(error) if error.is_not_found() => {
                     if let Some(held) = &self.payload {
@@ -810,6 +823,42 @@ mod tests {
         assert!(!retained.is_resolved());
         assert_eq!(fs::read(old.join("foreign")).unwrap(),b"preserve");
         assert_eq!(fs::read(dir.path().join("original-stage/directory")).unwrap(),b"original");
+    }
+
+    #[test]
+    fn retry_first_acquisition_is_retained_before_fallible_metadata_boundary() {
+        for payload_failure in [false,true] {
+            let dir=tempfile::tempdir().unwrap();
+            fs::create_dir(dir.path().join("stage")).unwrap();
+            fs::create_dir(dir.path().join("stage/directory")).unwrap();
+            let root=Root::open(dir.path()).unwrap();
+            let mut preparation=DirectoryPreparation {
+                namespace:DirectoryNamespace::acquire(&root).unwrap(),name:OsString::from("stage"),
+                outer:None,payload:None,payload_created:true,created:true,cleanup_error:None,
+            };
+            let mut acquisitions=0;
+            let failed=preparation.retry_cleanup_with_hook(|held| {
+                acquisitions+=1;
+                if acquisitions==if payload_failure {2}else{1} {
+                    return Err(ResolveError::message(&held.path,"injected failure immediately after exact acquisition, before metadata"));
+                }
+                Ok(())
+            });
+            assert!(failed.is_err());
+            assert!(preparation.outer.is_some());
+            let original=if payload_failure {
+                assert!(preparation.payload.is_some());
+                dir.path().join("stage/directory")
+            }else{dir.path().join("stage")};
+            let retained=dir.path().join("retained");
+            fs::rename(&original,&retained).unwrap();
+            fs::create_dir(&original).unwrap();
+            fs::write(original.join("foreign"),b"preserve").unwrap();
+            assert!(preparation.retry_cleanup().is_err());
+            assert!(!preparation.is_resolved());
+            assert_eq!(fs::read(original.join("foreign")).unwrap(),b"preserve");
+            assert!(retained.is_dir());
+        }
     }
 
 }
