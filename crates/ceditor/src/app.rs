@@ -245,6 +245,9 @@ struct Tab {
     marker_authority: Option<WorktreeAuthority>,
     mutation_operation: u64,
     mutation_cancel: Option<CancellationToken>,
+    /// Frozen when the operation is admitted; current path aliases cannot
+    /// select a replacement actor when the worker completion is delivered.
+    mutation_read_source: Option<cagents::repository::GitReadSource>,
     git_mutation_revision: u64,
     discard_recovery: Option<Arc<cagents::repository::DiscardRecovery>>,
     /// The pull request review behind the sidebar's Pull requests panel. It
@@ -1841,6 +1844,7 @@ impl Editor {
             marker_authority: None,
             mutation_operation: 0,
             mutation_cancel: None,
+            mutation_read_source: None,
             git_mutation_revision: 0,
             discard_recovery: None,
             review,
@@ -3160,6 +3164,7 @@ impl Editor {
             return None;
         }
         let root = tab.runtime.descriptor.worktree.clone();
+        let operation_read_source = tab.git_read_source.clone();
         if self.git_groups.get(&root).is_some_and(|queue| {
             (queue.active.is_some() || !queue.pending.is_empty())
                 && !queue_turn.is_some_and(|operation| queue.active == Some(operation))
@@ -3190,6 +3195,7 @@ impl Editor {
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
                 tab.mutation_cancel = Some(cancellation.clone());
+                tab.mutation_read_source = operation_read_source.clone();
                 tab.mutation_operation = operation;
                 tab.mutation = Some(kind);
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
@@ -3224,7 +3230,7 @@ impl Editor {
         let mut advanced = BTreeSet::new();
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
-                if let Some(source) = &tab.git_read_source
+                if let Some(source) = tab.mutation_read_source.take()
                     && advanced.insert(source.id()) {
                     // Completion precedes every replacement read/refresh.
                     // Saturation permanently retires this actor instead of
@@ -9597,15 +9603,22 @@ mod tests {
         let action = app.tab(original).unwrap().runtime.diff_hunk_mutation_action(original, Kind::Stage)
             .expect("real original Ready model emits its actual hunk action");
         let reader = app.tab(original).unwrap().git_read_source.clone().unwrap();
+        let prepare = app.update(Message::Repository(action));
+        let ready = task_messages(prepare).into_iter().find(|message| matches!(message, Message::DiffPatchPrepared { .. }))
+            .expect("actual preparation receipt");
+        let held_effect = app.update(ready);
+        assert!(app.tab(original).unwrap().mutation.is_some(), "real first-effect task is admitted before replacement");
         let parked = root.with_extension("original-diff-reader");
         std::fs::rename(root, &parked).unwrap(); std::fs::rename(replacement.path(), root).unwrap();
         let newer = open_real_git(&mut app, root, None);
-        let new_reader = app.tab(newer).unwrap().git_read_source.as_ref().unwrap();
-        assert!(!reader.same_source(new_reader));
+        let new_reader = app.tab(newer).unwrap().git_read_source.clone().unwrap();
+        assert!(!reader.same_source(&new_reader));
         assert!(!reader.authority().same_scope(new_reader.authority()));
         assert!(reader.same_source(app.tab(original).unwrap().runtime.git_read_source().unwrap()),
             "new displayed worktree never retags the old model's runtime");
-        let task = app.update(Message::Repository(action)); run_tasks(&mut app, task);
+        run_tasks(&mut app, held_effect);
+        assert_eq!(new_reader.mutation_revision().load(std::sync::atomic::Ordering::Acquire), 0,
+            "A's late failed completion must not advance newly opened B's reader clock");
         assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
         assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "replacement working\n");
         std::fs::rename(root, replacement.path()).unwrap(); std::fs::rename(&parked, root).unwrap();

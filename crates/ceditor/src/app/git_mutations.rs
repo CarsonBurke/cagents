@@ -374,6 +374,7 @@ impl Editor {
             if tab.runtime.descriptor.worktree == root {
                 tab.mutation = None;
                 tab.mutation_cancel = None;
+                tab.mutation_read_source = None;
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
                     source.set_mutation(None);
                 }
