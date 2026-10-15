@@ -1699,6 +1699,8 @@ mod tests {
                     start: 0,
                     paint: None,
                 }),
+                None,
+                None,
             );
             let code = widget::scrollable(widget::container(text).width(50000))
                 .direction(iced::widget::scrollable::Direction::Horizontal(
