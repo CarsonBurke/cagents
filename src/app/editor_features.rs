@@ -248,6 +248,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signature_response_after_caret_movement_cannot_reopen_the_old_call() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("call.rs");
+        std::fs::write(&path, "call(").unwrap();
+        let mut app = app();
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        let card = buffer(&mut app, root.path(), "call.rs", "call(");
+        let doc = LspDocumentId(44);
+        app.lsp_documents.insert(doc, card);
+        app.lsp_contexts.entry(card).or_default().document = Some(doc);
+        let language = app.lsp.language_for(&path).unwrap();
+        app.lsp.open(doc, &path, root.path(), language, 1, "call(");
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
+            drop(runtime.take_lsp_intents());
+            runtime.set_lsp_document(Some(doc));
+            runtime.move_cursor_to(LspPosition::new(0, 5));
+        }
+        drop(app.update_editor_features(Action::Signature(card, None)));
+        let (request, _) = app.editor_features.signature_requests[&card];
+        if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) { runtime.move_cursor_to(LspPosition::new(0, 0)); }
+        drop(app.editor_feature_event(&LspEvent::SignatureHelp { request, doc, help: Some(LspSignatureHelp { signatures: Vec::new(), active_signature: 0, active_parameter: None }) }));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.editor_signature_visible()));
+        assert!(!app.editor_features.signature_requests.contains_key(&card));
+    }
+
+    #[tokio::test]
     async fn application_change_drain_keeps_signature_until_close_character_or_undo() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("call.rs");
@@ -427,7 +453,7 @@ pub(super) struct State {
     renames: HashMap<CardId, Rename>,
     code_actions: HashMap<CardId, (i32, Vec<LspCodeAction>)>,
     signatures: HashSet<CardId>,
-    signature_requests: HashMap<CardId, LspRequestId>,
+    signature_requests: HashMap<CardId, (LspRequestId, LspPosition)>,
     preview: Option<Preview>,
     publication: Option<Publication>,
 }
@@ -509,7 +535,7 @@ impl Cagents {
         self.editor_features.renames.remove(&card);
         self.editor_features.code_actions.remove(&card);
         self.editor_features.signatures.remove(&card);
-        if let Some(request) = self.editor_features.signature_requests.remove(&card) { self.lsp.cancel(request); }
+        if let Some((request, _)) = self.editor_features.signature_requests.remove(&card) { self.lsp.cancel(request); }
         let retired = self.editor_features.requests.iter().filter_map(|(request, operation)| (operation.card == card).then_some(*request)).collect::<Vec<_>>();
         for request in retired { self.editor_features.requests.remove(&request); self.lsp.cancel(request); }
     }
@@ -570,8 +596,8 @@ impl Cagents {
             }
             LspEvent::SignatureHelp { request, doc, help, .. } => {
                 let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
-                self.editor_features.signature_requests.remove(&operation.card);
-                if !self.editor_operation_current(&operation) { return Some(Task::none()); }
+                let expected = self.editor_features.signature_requests.remove(&operation.card);
+                if !self.editor_operation_current(&operation) || expected.is_none_or(|(expected, at)| expected != *request || !matches!(self.cards.get(&operation.card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(at))) { return Some(Task::none()); }
                 if help.is_some() { self.editor_features.signatures.insert(operation.card); } else { self.editor_features.signatures.remove(&operation.card); }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&operation.card) { runtime.set_editor_signature(help.clone()); }
                 Some(Task::none())
@@ -612,6 +638,7 @@ impl Cagents {
             },
             LspEvent::RequestFailed { request, doc, error, .. } => {
                 let operation = self.take_editor_feature_request(request, doc)?;
+                if self.editor_features.signature_requests.get(&operation.card).is_some_and(|(expected, _)| expected == request) { self.editor_features.signature_requests.remove(&operation.card); }
                 if !matches!(error, LspError::Cancelled) { self.feature_failure(operation.card, error.to_string()); }
                 Some(self.save_after_feature(&operation))
             }
@@ -773,19 +800,19 @@ impl Cagents {
                 let operation = Operation { card, doc, version, kind: LspEditKind::CodeAction, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return Task::none(); };
                 let Some(at) = runtime.cursor_position() else { return Task::none(); };
-                if let Some(previous) = self.editor_features.signature_requests.remove(&card) {
+                if let Some((previous, _)) = self.editor_features.signature_requests.remove(&card) {
                     self.editor_features.requests.remove(&previous);
                     self.lsp.cancel(previous);
                 }
                 let request = self.lsp.request_signature_help(operation.doc, at, trigger);
-                self.editor_features.signature_requests.insert(card, request);
+                self.editor_features.signature_requests.insert(card, (request, at));
                 self.editor_features.requests.insert(request, operation);
                 Task::none()
             }
             Action::Dismiss(card) => {
                 self.editor_features.signatures.remove(&card);
                 self.editor_features.code_actions.remove(&card);
-                if let Some(previous) = self.editor_features.signature_requests.remove(&card) { self.editor_features.requests.remove(&previous); self.lsp.cancel(previous); }
+                if let Some((previous, _)) = self.editor_features.signature_requests.remove(&card) { self.editor_features.requests.remove(&previous); self.lsp.cancel(previous); }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.dismiss_editor_results(); }
                 Task::none()
             }
