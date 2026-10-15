@@ -2515,9 +2515,13 @@ impl Cagents {
         // Destination metadata can change without changing this pane. The
         // daemon's model epoch retires an open menu before its Move payloads
         // could be replaced under the pointer, without cloning every channel.
-        let origin = self.pane_command_origin(id);
+        let document_identity = match self.cards.get(&id) {
+            Some(CardRuntime::Repository(runtime)) => Some(runtime.menu_identity()),
+            Some(CardRuntime::PullRequests(pane)) => Some(pane.runtime.menu_identity()),
+            _ => None,
+        };
         let menu_identity = (
-            origin.clone(),
+            document_identity,
             self.workspace_model.identity,
             self.workspace_model.sequence,
             id,
@@ -2528,6 +2532,9 @@ impl Cagents {
             },
         );
         crate::interaction::context_menu_lazy_keyed(tab, menu_identity, move || {
+            // A closed menu never clones source paths or examines native word
+            // selection. Materialize the owned action snapshot only on open.
+            let origin = self.pane_command_origin(id);
             let mut entries: Vec<widget::menu::Item<PaneMenu, String>> = vec![
                 widget::menu::Item::Button(
                     "Rename…".into(),

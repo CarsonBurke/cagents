@@ -292,6 +292,18 @@ pub struct AsyncIdentity {
     pub generation: u64,
 }
 
+/// Lightweight document epoch for a closed lazy pane menu. Captured actions
+/// still retain the full target when the menu is actually materialized.
+#[derive(Clone)]
+pub struct RepositoryMenuIdentity {
+    incarnation: Arc<()>,
+    generation: u64,
+}
+impl PartialEq for RepositoryMenuIdentity {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.incarnation, &other.incarnation) && self.generation == other.generation }
+}
+impl Eq for RepositoryMenuIdentity {}
+
 /// A palette action names the displayed document and native selection. Shared
 /// model ownership prevents pointer reuse from accepting a replacement source;
 /// equality compares the Arc identity without traversing diff text or rows.
@@ -4366,6 +4378,10 @@ impl RepositoryRuntime {
             _ => false,
         };
         available.then_some(action)
+    }
+
+    pub fn menu_identity(&self) -> RepositoryMenuIdentity {
+        RepositoryMenuIdentity { incarnation: self.command_incarnation.clone(), generation: self.generation }
     }
 
     pub fn command_target(&self, card: CardId) -> RepositoryCommandTarget {
