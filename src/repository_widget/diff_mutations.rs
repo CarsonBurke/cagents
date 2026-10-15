@@ -76,6 +76,9 @@ impl Prepared {
 }
 
 impl Capture {
+    /// This capture edits only the open document through native Undo.
+    pub fn applies_to_buffer(&self) -> bool { self.buffer_revision.is_some() }
+
     /// Build patch bytes and any minimal native buffer replacement off thread.
     pub fn prepare(self) -> Option<Prepared> {
         let model = self.model.clone();
@@ -218,7 +221,8 @@ impl RepositoryRuntime {
         // A hunk edit keeps the current document open. Unsaved working
         // text is a valid source while its annotations match that revision;
         // saving and unresolved durability still fence the operation.
-        if self.git_mutation_unavailable_reason.is_some()
+        let buffer_revert = kind == git_patch::Kind::Revert && self.editable_working_diff();
+        if self.git_mutation_unavailable_reason.is_some() && !buffer_revert
             || !self.shows_diff()
             || self.directory_only
             || self.mutation_refresh_pending
@@ -1111,12 +1115,18 @@ mod tests {
     }
 
     #[test]
-    fn read_only_git_runtime_disables_hunk_and_staging_but_keeps_native_edit_and_undo() {
+    fn read_only_git_runtime_disables_git_writes_but_keeps_buffer_revert_edit_and_undo() {
         let card = CardId::new();
         let mut runtime = selected_mutation_fixture(card);
         runtime.set_git_mutation_unavailable_reason(Some(Arc::from("Git writes unsupported")));
         assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
-        assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Revert));
+        assert!(runtime.can_apply_diff_hunk(git_patch::Kind::Revert));
+        let revert = runtime.capture_diff_mutation(card, git_patch::Kind::Revert, None).unwrap();
+        assert!(revert.applies_to_buffer());
+        assert!(revert.prepare().unwrap().apply(&mut runtime).unwrap().is_none());
+        assert_eq!(runtime.editor_text().unwrap(), "original\nkeep\n");
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), "changed\nkeep\n");
         assert!(runtime.selected_staging_selection(true).is_none());
         let request = runtime.diff_mutation_request(card, 0..2).unwrap();
         assert!(runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).is_none());

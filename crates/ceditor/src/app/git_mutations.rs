@@ -10,7 +10,7 @@ pub struct GroupOrigin {
     key: ActiveWorktreeKey,
     source_revision: u64,
     selection_revision: u64,
-    authority: WorktreeAuthority,
+    authority: Option<WorktreeAuthority>,
     operation: u64,
     mutation_revision: u64,
     cancellation: CancellationToken,
@@ -65,7 +65,7 @@ impl Editor {
     fn origin_current(&self, origin: &GroupOrigin) -> bool {
         !self.exiting && self.tab(origin.card).is_some_and(|tab| {
             tab.git && tab.runtime.descriptor.worktree == origin.key.canonical_path
-                && origin.authority.path() == origin.key.canonical_path
+                && origin.authority.as_ref().is_none_or(|authority| authority.path() == origin.key.canonical_path)
                 && tab.change_source_revision == origin.source_revision
                 && tab.navigation.active_worktree() == Some(&origin.key)
                 && tab.navigation.change_selection_revision() == origin.selection_revision
@@ -122,7 +122,7 @@ impl Editor {
             key: key.clone(),
             source_revision: tab.change_source_revision,
             selection_revision: tab.navigation.change_selection_revision(),
-            authority,
+            authority: Some(authority),
             operation: self.next_group_operation,
             mutation_revision: tab.git_mutation_revision,
             cancellation: CancellationToken::default(),
@@ -176,7 +176,7 @@ impl Editor {
             return Some(cosmic::task::future(async move {
                 let captured = request.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let service = RepositoryService::system("git").with_worktree_authority(captured.origin.authority.clone()).map_err(|error| error.to_string())?;
+                    let service = RepositoryService::system("git").with_worktree_authority(captured.origin.authority.clone().ok_or("The original worktree binding is unavailable.")?).map_err(|error| error.to_string())?;
                     // This is intentionally uncapped, unlike every display snapshot.
                     let status = service.status(&captured.origin.key.canonical_path, &cancellation)
                         .map_err(|error| error.to_string())?;
@@ -228,6 +228,9 @@ impl Editor {
             Ok(_) => return self.finish_mutation_root(root.clone(), None),
             Err(error) => return self.finish_mutation_root(root.clone(), Some(error)),
         };
+        if let Some(reason) = self.tab(request.origin.card).and_then(|tab| tab.sidebar.source_control.as_ref()).and_then(SourceControlModel::mutation_unavailable_reason).map(str::to_owned) {
+            return self.finish_mutation_root(root, Some(reason));
+        }
         // Transfer the reserved read turn to the existing mutation or exact
         // confirmation pipeline; no other queued intention can run in between.
         for tab in &mut self.tabs {
@@ -276,7 +279,7 @@ impl Editor {
         if !tab.sidebar.source_control.as_ref().is_some_and(SourceControlModel::mutations_available) { return self.refuse_git_mutation(card); }
         let Some(authority) = tab.worktree_authority.clone() else { return self.refuse_git_mutation(card); };
         let origin = GroupOrigin { card, key: key.clone(), source_revision: tab.change_source_revision,
-            selection_revision: tab.navigation.change_selection_revision(), authority,
+            selection_revision: tab.navigation.change_selection_revision(), authority: Some(authority),
             operation: self.next_group_operation, mutation_revision: tab.git_mutation_revision, cancellation: CancellationToken::default() };
         self.next_group_operation = self.next_group_operation.wrapping_add(1);
         let command = if stage { sidebar::ChangeGroupCommand::Stage } else { sidebar::ChangeGroupCommand::Unstage };
@@ -334,9 +337,10 @@ impl Editor {
         if self.modal_open() || self.exiting { return Task::none(); }
         let Some(tab) = self.tab(card) else { return Task::none(); };
         let Some(key) = tab.navigation.active_worktree().cloned() else { return Task::none(); };
-        let Some(authority) = tab.worktree_authority.clone() else { return self.refuse_git_mutation(tab.id); };
-        if !tab.sidebar.source_control.as_ref().is_some_and(SourceControlModel::mutations_available) { return self.refuse_git_mutation(card); }
         let Some(capture) = tab.runtime.capture_diff_mutation(card, kind, Some(&request)) else { return Task::none(); };
+        let buffer_only = capture.applies_to_buffer();
+        if !buffer_only && (tab.worktree_authority.is_none() || !tab.sidebar.source_control.as_ref().is_some_and(SourceControlModel::mutations_available)) { return self.refuse_git_mutation(card); }
+        let authority = tab.worktree_authority.clone();
         let origin = GroupOrigin {
             card, key: key.clone(), source_revision: tab.change_source_revision,
             selection_revision: tab.navigation.change_selection_revision(), authority,
@@ -357,7 +361,9 @@ impl Editor {
             let cancellation = origin.cancellation.clone();
             let result = tokio::task::spawn_blocking(move || {
                 if cancellation.is_cancelled() { return Err("Preparing the selected change was cancelled.".to_string()); }
-                authority.validate().map_err(|error| error.to_string())?;
+                if !buffer_only {
+                    authority.as_ref().ok_or("The original worktree binding is unavailable.")?.validate().map_err(|error| error.to_string())?;
+                }
                 let prepared = capture.prepare();
                 if cancellation.is_cancelled() { return Err("Preparing the selected change was cancelled.".to_string()); }
                 Ok(prepared)
@@ -394,7 +400,6 @@ impl Editor {
         let applies_to_buffer = prepared.applies_to_buffer();
         let index_only_stage = prepared.stages_live_buffer();
         if !applies_to_buffer && self.begin_mutation_with_buffer_policy(origin.card, MutationKind::Other, index_only_stage, Some(origin.operation)).is_none() {
-            self.notice = Some("Save open files before applying the selected Git change.".into());
             if let Some(queue) = self.git_groups.get_mut(&root) { queue.active = None; }
             return self.start_next_change_group(&root).unwrap_or_else(Task::none);
         }
@@ -416,7 +421,7 @@ impl Editor {
         let cancellation = self.mutation_cancellation(origin.card).expect("admitted patch has cancellation");
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git").with_worktree_authority(origin.authority)?;
+                let service = RepositoryService::system("git").with_worktree_authority(origin.authority.expect("admitted disk patch retains its authority"))?;
                 match operation {
                     cagents::repository::GitOperation::ApplyPatch { patch, cached: false, reverse, expected_head } => {
                         let result = service.apply_patch_recoverable(&root, &patch, reverse, expected_head.as_ref(), &cancellation)?;
