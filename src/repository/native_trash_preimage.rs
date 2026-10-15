@@ -78,8 +78,7 @@ impl NativePreimage {
     /// future authenticated transport-disposition phase can close custody.
     pub(super) fn payload(&self) -> Arc<fs::File> { Arc::clone(&self.payload) }
 
-    pub(super) fn verify_source(&self, cancellation: &CancellationToken) -> Result<(), String> {
-        if cancellation.is_cancelled() { return Err("Native Trash preparation cancelled".into()); }
+    fn verify_location(&self) -> Result<(), String> {
         let original_root = self.source.metadata().map_err(|error| error.to_string())?;
         let named_root = fs::symlink_metadata(self.source.path()).map_err(|error| error.to_string())?;
         if !named_root.is_dir() || (named_root.dev(), named_root.ino()) != (original_root.dev(), original_root.ino()) {
@@ -89,6 +88,16 @@ impl NativePreimage {
         if name != self.name || !same_directory(&parent, &self.parent)? {
             return Err("The original native Trash source parent was replaced".into());
         }
+        Ok(())
+    }
+
+    pub(super) fn verify_source(&self, cancellation: &CancellationToken) -> Result<(), String> {
+        self.verify_source_observing(cancellation, || Ok(()))
+    }
+
+    fn verify_source_observing(&self, cancellation: &CancellationToken, before_final: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        if cancellation.is_cancelled() { return Err("Native Trash preparation cancelled".into()); }
+        self.verify_location()?;
         let named = fs_safety::metadata_beneath(&self.parent, Path::new(&self.name)).map_err(|error| error.to_string())?;
         if !same_version(&self.metadata, &named) || !same_version(&self.metadata, &self.payload.metadata().map_err(|error| error.to_string())?) {
             return Err("The original native Trash source changed".into());
@@ -106,6 +115,9 @@ impl NativePreimage {
         }
         // Bracket the complete hash/access/target read without adopting a new
         // baseline. Future rename phases require explicit own-change witnesses.
+        before_final()?;
+        if cancellation.is_cancelled() { return Err("Native Trash preparation cancelled".into()); }
+        self.verify_location()?;
         let named = fs_safety::metadata_beneath(&self.parent, Path::new(&self.name)).map_err(|error| error.to_string())?;
         if !same_version(&self.metadata, &named) || !same_version(&self.metadata, &self.payload.metadata().map_err(|error| error.to_string())?) {
             return Err("Native Trash source changed during verification".into());
@@ -149,6 +161,33 @@ mod tests {
         fs::File::options().write(true).open(&path).unwrap().set_times(fs::FileTimes::new().set_modified(original_modified)).unwrap();
         assert!(proof.verify_source(&CancellationToken::default()).is_err());
         assert_eq!(fs::read(path).unwrap(), b"modified");
+    }
+
+    #[test]
+    fn native_preimage_final_check_refuses_root_or_nested_parent_replacement_during_read() {
+        for replace_root in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root_path = directory.path().join("source");
+            fs::create_dir_all(root_path.join("nested")).unwrap();
+            fs::write(root_path.join("nested/file"), b"original").unwrap();
+            let root = Arc::new(fs_safety::Root::open(&root_path).unwrap());
+            let proof = NativePreimage::capture(root, RepoPath::parse("nested/file").unwrap(), &CancellationToken::default()).unwrap();
+            let result = proof.verify_source_observing(&CancellationToken::default(), || {
+                if replace_root {
+                    fs::rename(&root_path, directory.path().join("retained")).unwrap();
+                    fs::create_dir_all(root_path.join("nested")).unwrap();
+                } else {
+                    fs::rename(root_path.join("nested"), root_path.join("retained")).unwrap();
+                    fs::create_dir(root_path.join("nested")).unwrap();
+                }
+                fs::write(root_path.join("nested/file"), b"foreign!").unwrap();
+                Ok(())
+            });
+            assert!(result.is_err(), "old leaf identity alone cannot prove the current source location");
+            let mut original = String::new(); proof.payload().as_ref().read_to_string(&mut original).unwrap();
+            assert_eq!(original, "original");
+            assert_eq!(fs::read(root_path.join("nested/file")).unwrap(), b"foreign!");
+        }
     }
 
     #[test]
