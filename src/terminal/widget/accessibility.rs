@@ -127,7 +127,7 @@ struct ConsumedInputs {
     keys: Vec<keyboard::key::Physical>,
     buttons: Vec<mouse::Button>,
     owned: Vec<OwnedKey>,
-    native_review: Option<crate::model::TerminalId>,
+    native_review: Option<uuid::Uuid>,
     retiring: Vec<RetiringKey>,
     failures: Vec<String>,
     exit_failures: Vec<String>,
@@ -250,7 +250,7 @@ impl ConsumedInputs {
 #[derive(Clone, Default)]
 pub(crate) struct ReviewInputBarrier(Arc<Mutex<ConsumedInputs>>);
 impl ReviewInputBarrier {
-    pub(crate) fn note_review(&self, terminal: crate::model::TerminalId, active: bool) {
+    pub(crate) fn note_review(&self, terminal: uuid::Uuid, active: bool) {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if shared.closing {
             return;
@@ -263,8 +263,8 @@ impl ReviewInputBarrier {
     }
     pub(crate) fn confirm_review(
         &self,
-        previous: Option<crate::model::TerminalId>,
-        current: Option<crate::model::TerminalId>,
+        previous: Option<uuid::Uuid>,
+        current: Option<uuid::Uuid>,
     ) {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if shared.closing {
@@ -543,9 +543,10 @@ impl ReviewInputBarrier {
 
 #[derive(Default)]
 pub(super) struct State {
-    identity: Option<(Id, crate::model::TerminalId)>,
+    identity: Option<(Id, uuid::Uuid)>,
     pub projection: Option<Projection>,
     pub row_ids: Vec<Id>,
+    pub root_id: Option<Id>,
     pub control_id: Option<Id>,
     generation: u64,
     view: Option<View>,
@@ -555,7 +556,7 @@ pub(super) struct State {
     pub barrier: ReviewInputBarrier,
 }
 impl State {
-    pub fn bind(&mut self, parent: &Id, terminal: crate::model::TerminalId) {
+    pub fn bind(&mut self, parent: &Id, terminal: uuid::Uuid) {
         if self
             .identity
             .as_ref()
@@ -577,6 +578,8 @@ impl State {
             || parent.to_string(),
             |(parent, terminal)| format!("{parent}-terminal-{terminal}"),
         );
+        self.root_id
+            .get_or_insert_with(|| Id::new(format!("{prefix}-surface")));
         self.control_id
             .get_or_insert_with(|| Id::new(format!("{prefix}-review")));
         while self.row_ids.len() < self.projection.as_ref().map_or(0, |p| p.rows.len()) {
@@ -938,7 +941,7 @@ mod tests {
         let now = Instant::now();
         let mut state = State::default();
         let card = Id::new("card-one");
-        let terminal = crate::model::TerminalId::new();
+        let terminal = uuid::Uuid::new_v4();
         state.bind(&card, terminal);
         state.refresh(&frame("old", 1), view(), now, true);
         state.ensure_ids(&card);
@@ -949,7 +952,7 @@ mod tests {
         state.bind(&Id::new("card-one"), terminal);
         assert!(state.review);
         assert_eq!(state.row_ids, old);
-        let replacement = crate::model::TerminalId::new();
+        let replacement = uuid::Uuid::new_v4();
         state.bind(&card, replacement);
         assert!(!state.review);
         assert!(state.projection.is_none());
@@ -1012,7 +1015,7 @@ mod tests {
         let now = Instant::now();
         let mut state = State::default();
         let parent = Id::new("card");
-        state.bind(&parent, crate::model::TerminalId::new());
+        state.bind(&parent, uuid::Uuid::new_v4());
         state.refresh(&frame("visible", 1), view(), now, true);
         state.ensure_ids(&parent);
         state.review = true;
@@ -1063,7 +1066,7 @@ mod tests {
             keyboard::key::Code::Escape,
             keyboard::Modifiers::empty()
         )));
-        state.bind(&Id::new("new-card"), crate::model::TerminalId::new());
+        state.bind(&Id::new("new-card"), uuid::Uuid::new_v4());
         assert!(!state.review);
         assert!(state.projection.is_none());
         assert!(state.review_input(&release(escape, keyboard::key::Code::Escape)));

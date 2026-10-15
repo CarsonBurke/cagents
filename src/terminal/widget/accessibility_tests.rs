@@ -482,7 +482,9 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     );
     // A key held during review may release after ordinary focus moves to the
     // other card. The shared app barrier must consume it there, then retire it.
-    let new_id = new_widget.id.clone().unwrap();
+    let new_id = new_widget.a11y_nodes(
+        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &new_tree, mouse::Cursor::Unavailable,
+    ).root()[0].id().clone();
     assert_eq!(
         dispatch(
             &mut new_widget,
@@ -684,7 +686,10 @@ fn same_card_cancellation_clears_pending_review_without_a_true_view_acknowledgme
 #[test]
 fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
     let peer = Peer::new();
-    let replacement = Peer::new();
+    let replacement = Peer::with_generation(
+        peer.surface().terminal_id(), uuid::Uuid::new_v4(), peer.surface().host_proof().unwrap(),
+    );
+    assert_ne!(peer.surface().execution_instance(), replacement.surface().execution_instance());
     let renderer = renderer();
     let barrier = ReviewInputBarrier::default();
     let mut widget = widget(&peer, "remount-card", barrier.clone(), true, true);
@@ -746,6 +751,14 @@ fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
             .is_some()
     );
     assert_no_pty_input(&peer.fence());
+    // Rebuilding the same actor must preserve its selected visible text, even
+    // when the App has not observed a new review revision.
+    let same = peer.surface();
+    assert_eq!(same.attachment_id(), peer.surface().attachment_id());
+    widget = self::widget(&peer, "remount-card", barrier.clone(), true, true);
+    widget.review_revision = 5;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(tree.state.downcast_ref::<WidgetState>().a11y.borrow().selection.is_some());
     widget = self::widget(&replacement, "remount-card", barrier, true, true);
     widget.review_revision = 5;
     tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
@@ -777,6 +790,66 @@ fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
     widget.review_revision = 6;
     tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
     assert!(!reviewing(&tree));
+}
+
+#[test]
+fn native_actions_from_replaced_same_id_tree_cannot_enter_successor_review() {
+    let old = Peer::new();
+    let new = Peer::with_generation(old.surface().terminal_id(), uuid::Uuid::new_v4(), old.surface().host_proof().unwrap());
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let old_widget = widget(&old, "same-card", barrier.clone(), true, false);
+    let mut tree = widget_tree(&old_widget);
+    let old_nodes = old_widget.a11y_nodes(
+        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &tree, mouse::Cursor::Unavailable,
+    );
+    let old_root = old_nodes.root()[0].id().clone();
+    let old_control = tree.state.downcast_ref::<WidgetState>().a11y.borrow().control_id.clone().unwrap();
+    let mut current = widget(&new, "same-card", barrier, true, false);
+    tree.diff(&mut current as &mut dyn Widget<Message, Theme, Renderer>);
+    let current_nodes = current.a11y_nodes(
+        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &tree, mouse::Cursor::Unavailable,
+    );
+    let current_root = current_nodes.root()[0].id().clone();
+    assert_ne!(old_root, current_root);
+    assert!(dispatch(&mut current, &mut tree, &renderer, action(old_root, Action::Focus, None)).is_empty());
+    assert!(dispatch(&mut current, &mut tree, &renderer, action(old_control, Action::Click, None)).is_empty());
+    assert!(!reviewing(&tree));
+    assert_eq!(dispatch(&mut current, &mut tree, &renderer, action(current_root, Action::Focus, None)), vec![Message::Review(true)]);
+    assert!(reviewing(&tree));
+    assert_no_pty_input(&new.fence());
+}
+
+#[test]
+fn temporary_detach_keeps_the_same_attachment_review_and_visible_selection() {
+    let mut peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut widget = widget(&peer, "detached-review-card", barrier.clone(), true, true);
+    let identity = widget.review_attachment;
+    let mut tree = widget_tree(&widget);
+    // Publish the real lazy visible projection before navigating it.
+    let _ = widget.a11y_nodes(
+        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &tree, mouse::Cursor::Unavailable,
+    );
+    // Move the visible review caret to create an actual retained selection.
+    dispatch(&mut widget, &mut tree, &renderer,
+        key(keyboard::key::Named::ArrowRight, keyboard::key::Code::ArrowRight, true));
+    assert!(reviewing(&tree));
+    let old_selection = tree.state.downcast_ref::<WidgetState>().a11y.borrow().selection.clone();
+    assert!(old_selection.is_some());
+    peer.stop.store(true, Ordering::Relaxed);
+    peer.worker.take().unwrap().join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while peer.surface().host_proof().is_some() {
+        assert!(Instant::now() < deadline, "private peer did not detach");
+        thread::sleep(Duration::from_millis(1));
+    }
+    let mut rebuilt = self::widget(&peer, "detached-review-card", barrier, true, true);
+    assert_eq!(rebuilt.review_attachment, identity);
+    tree.diff(&mut rebuilt as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(reviewing(&tree));
+    assert_eq!(tree.state.downcast_ref::<WidgetState>().a11y.borrow().selection, old_selection);
 }
 
 #[test]
@@ -1079,7 +1152,9 @@ fn key_released_during_review_pairs_after_exit_without_requiring_a_blur() {
             .count(),
         1
     );
-    let id = widget.id.clone().unwrap();
+    let id = widget.a11y_nodes(
+        Layout::new(&layout::Node::new(Size::new(640.0, 320.0))), &tree, mouse::Cursor::Unavailable,
+    ).root()[0].id().clone();
     dispatch(
         &mut widget,
         &mut tree,
@@ -1844,7 +1919,7 @@ fn bounded_window_exit_fences_unknown_delivery_without_killing_the_pty() {
         ),
         Err(TerminalSendError::Closed)
     );
-    barrier.note_review(surface.terminal_id(), true); // A late native action cannot reopen Review during committed exit.
+    barrier.note_review(surface.attachment_id(), true); // A late native action cannot reopen Review during committed exit.
     let failures = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

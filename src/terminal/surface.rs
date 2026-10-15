@@ -41,6 +41,12 @@ impl TerminalSurface {
         self.handle.terminal_id()
     }
 
+    /// Stable across first handshake and temporary detach, distinct for every
+    /// replacement client even when its terminal ID is reused.
+    pub(crate) fn attachment_id(&self) -> uuid::Uuid {
+        self.handle.attachment_id()
+    }
+
     pub(crate) fn same_attachment(&self, other: &Self) -> bool {
         self.handle.same_attachment(&other.handle)
     }
