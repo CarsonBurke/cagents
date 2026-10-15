@@ -7,6 +7,7 @@ use std::collections::HashSet;
 pub const MAX_TURN_ID_BYTES: usize = 4096;
 pub const MAX_TURN_ITEM_IDS: usize = 128;
 pub const MAX_TURN_REASON_BYTES: usize = 4096;
+pub const MAX_TURN_UPDATE_BYTES: usize = 64 * 1024;
 pub const MAX_PROJECTED_TURNS: usize = 128;
 pub const MAX_PROJECTION_BYTES: usize = 256 * 1024;
 
@@ -60,6 +61,9 @@ impl TurnUpdate {
                 if item_ids.iter().any(|id| !valid_id(id) || !seen.insert(id.as_str())) {
                     return Err("Invalid or duplicate turn item identity".into());
                 }
+                let bytes = 64 + self.identity().session_id.len() + self.identity().id.len()
+                    + item_ids.iter().map(|id| id.len() + 8).sum::<usize>();
+                if bytes > MAX_TURN_UPDATE_BYTES { return Err("Turn binding exceeds its byte budget; split the binding batch".into()); }
             }
             Self::Finish { outcome, .. } => validate_outcome(outcome)?,
         }
@@ -97,6 +101,21 @@ pub struct TurnOutcomeProjection {
     /// False includes old snapshots/unqualified identity and a bounded partial
     /// projection. Missing records never imply that a turn succeeded.
     pub complete: bool,
+}
+
+/// Constructed while paging the transcript, where the original item owning a
+/// native-part ID is still known. This is never inferred by a UI reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VisibleItemOrigin {
+    pub item_id: String,
+    pub source_item_id: String,
+}
+
+/// Local storage acknowledgement, deliberately absent from the producer wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnWriteReceipt {
+    pub revision: u64,
+    pub changed: bool,
 }
 
 impl TurnOutcomeProjection {
