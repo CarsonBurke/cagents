@@ -237,7 +237,7 @@ pub fn ensure_link_at(
 
 /// Creator authority belongs to the administrative directory retained during
 /// ownership verification, not whichever checkout a path later resolves to.
-#[cfg(any(feature = "ui", test))]
+#[cfg(any(feature = "ui", feature = "host", test))]
 pub(crate) fn ensure_link_for_creation(
     worktree: &Path,
     expected: &Root,
