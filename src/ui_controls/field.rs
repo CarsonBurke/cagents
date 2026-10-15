@@ -32,7 +32,9 @@ pub fn text<'a, Message: Clone + 'static>(
     TextInput::new(placeholder, value)
         .font(design::interface_font())
         .size(design::interface_size())
-        .line_height(iced::widget::text::LineHeight::Absolute((design::interface_size() + 5.0).into()))
+        .line_height(iced::widget::text::LineHeight::Absolute(
+            (design::interface_size() + 5.0).into(),
+        ))
         .padding([INSET_Y, space::S])
         .style(style())
 }
