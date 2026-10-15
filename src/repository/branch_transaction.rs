@@ -3,7 +3,7 @@
 //! The prepared hook binds consent while Git owns the reference lock. This is
 //! not a family-exit certificate: inherited lease retirement has narrower scope.
 use super::*;
-use std::{io::Write, os::{fd::RawFd, unix::fs::{MetadataExt, OpenOptionsExt}}};
+use std::{io::Write, os::{fd::RawFd, unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt}}};
 
 const PROBE: &[u8] = b"#!/bin/sh\nset -eu\n/bin/cat >/dev/null\nif [ \"$1\" = prepared ]; then printf prepared > \"$CAGENTS_BRANCH_PROOF\"; fi\n";
 
@@ -59,6 +59,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // Retain small private diagnostics even on uncertainty. Never remove a
         // hook's files merely because its direct parent returned or timed out.
         let directory = tempfile::Builder::new().prefix("cagents-branch-advance-")
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(session.common_operand()?).map_err(|error| invalid(error.to_string()))?;
         let directory = directory.keep();
         registry.write_proof(&directory).map_err(invalid)?;

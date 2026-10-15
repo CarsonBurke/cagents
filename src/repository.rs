@@ -14906,6 +14906,15 @@ mod worktree_journal_tests {
             let report = service.create_worktree_journaled(&fixture.store, &fixture.request,
                 7, &CancellationToken::new(), &sender);
             assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+            let common = fixture.service.common_dir(&fixture.request.repository, &CancellationToken::new()).unwrap();
+            let evidence = fs::read_dir(common).unwrap().map(Result::unwrap)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("cagents-branch-advance-")).collect::<Vec<_>>();
+            assert!(!evidence.is_empty());
+            for directory in evidence {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(directory.metadata().unwrap().mode() & 0o777, 0o700,
+                    "raw configuration diagnostics must stay inside a private operation directory");
+            }
             assert!(executor.attempted.load(Ordering::SeqCst));
             assert_eq!(fixture.git(&["rev-parse", "feature"]), new);
             assert_eq!(fixture.git(&["rev-parse", "feature@{upstream}"]), new);
