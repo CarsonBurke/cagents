@@ -1065,6 +1065,7 @@ impl StatusSnapshot {
     pub fn display_summary(&self) -> Self {
         Self {
             untracked_omitted: self.untracked_omitted,
+            listing_truncated: self.listing_truncated,
             head: self.head.clone(),
             tracking: self.tracking.clone(),
             dirty: self.dirty.clone(),
@@ -8627,11 +8628,13 @@ mod tests {
     #[test]
     fn snapshot_cache_distinguishes_status_failures_from_later_or_prepass_errors() {
         let options = SnapshotOptions {
+            status_limit: None,
             untracked_changes: true,
             untracked_files: false,
         };
         let failure = || {
             Ok(ProcessOutput {
+                stdout_truncated: false,
                 exit_code: Some(128),
                 signal: None,
                 success: false,
