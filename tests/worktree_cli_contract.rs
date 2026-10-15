@@ -204,3 +204,21 @@ fn inherited_git_redirects_cannot_change_the_selected_worktree_project() {
     assert!(path.join("tracked").is_file());assert!(!path.join("other").exists());
     assert!(!fixture.git(&unrelated,&["branch","--list","authority"]).contains("authority"));
 }
+
+#[test]
+fn removal_refuses_a_canonical_path_that_cannot_be_encoded_exactly() {
+    use std::os::unix::ffi::OsStringExt;
+    let fixture=Fixture::new();
+    let path=fixture.create("raw-path");
+    let raw=fixture.root.path().join("project/managed").join(std::ffi::OsString::from_vec(b"raw-\xff".to_vec()));
+    let output=Fixture::command(fixture.root.path(),Path::new("/usr/bin/git"))
+        .args([std::ffi::OsStr::new("worktree"),std::ffi::OsStr::new("move"),path.as_os_str(),raw.as_os_str()]).output().unwrap();
+    assert!(output.status.success(),"{output:?}");
+    let alias=fixture.root.path().join("project/raw-alias");
+    std::os::unix::fs::symlink(&raw,&alias).unwrap();
+    let output=fixture.output(&["worktree","remove","raw-alias","--force"]);
+    assert!(!output.status.success(),"{output:?}");
+    let value:Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value.to_string().contains("refusing a lossy removal target"),"{value}");
+    assert!(raw.join("tracked").is_file());
+}
