@@ -2818,6 +2818,10 @@ impl Runtime {
         self.history_stash = None;
         self.history = Vec::new();
         self.changes.close();
+        // A command issued by the old live reader may still answer after this
+        // transition. Its ACK cannot restore history, clear local notes, or
+        // run a queued-step failure against the archived presentation.
+        self.pending = None;
     }
 
     pub(super) fn release_transcript_presentation(&mut self) {

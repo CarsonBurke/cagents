@@ -846,6 +846,65 @@ mod tests {
     }
 
     #[test]
+    fn old_live_command_ack_cannot_mutate_an_archived_reader_or_its_unsent_notes() {
+        // chat_send_step creates the real pending ownership record. The command
+        // Task is held rather than dispatched; completion is injected into App.
+        for release in 0..3 {
+            for queued in [false, true] {
+                if release == 0 && queued { continue; }
+                for succeeded in [false, true] {
+                    let mut app = crate::app::tests::context_inspector_test_app(false);
+                    let card = super::super::tests::live_chat(&mut app, Some("11111111-1111-4111-8111-111111111111"));
+                    let target = {
+                        let runtime = match app.cards.get_mut(&card).unwrap() { CardRuntime::Chat(runtime) => runtime, _ => unreachable!() };
+                        runtime.replace_draft(EditorContent::with_text("Keep my typed unsent notes"));
+                        if queued {
+                            runtime.queued = Some(Queued {
+                                text: "original queued message".into(), resolved_text: "original queued message".into(),
+                                attachments: Vec::new(), model: None, draft: runtime.session.clone(), since: None, rechecking: false,
+                            });
+                        }
+                        runtime.target
+                    };
+                    let task = app.chat_send_step(target, Command::Prompt {
+                        text: "private sent prompt".into(), attachments: Vec::new(), mode: PromptMode::Send,
+                    }, true, queued.then_some(QueuedStep::Prompt));
+                    let id = {
+                        let runtime = app.chat_card_runtime_mut(target).unwrap();
+                        let pending = runtime.pending.as_ref().expect("actual pending command");
+                        assert_eq!(pending.draft_revision, Some(runtime.revision));
+                        assert_eq!(pending.sent.as_deref(), Some("private sent prompt"));
+                        pending.id
+                    };
+                    if release != 0 {
+                        Arc::make_mut(&mut app.durable).automation_archives.insert(card, crate::model::AgentId::new());
+                        app.mark_automation_archive(card);
+                        if release == 2 { app.chat_card_runtime_mut(target).unwrap().revoke_automation_archive_history(); }
+                        assert!(app.chat_card_runtime_mut(target).unwrap().pending.is_none());
+                    }
+                    drop(task);
+                    let result = if succeeded { Ok(()) } else { Err("late old-reader failure".into()) };
+                    drop(app.update(Message::ChatUi(Action::CommandFinished(target, id, result))));
+                    let runtime = app.chat_card_runtime_mut(target).unwrap();
+                    assert!(runtime.pending.is_none());
+                    if release != 0 {
+                        assert!(matches!(runtime.connection, Connection::Archived));
+                        assert_eq!(runtime.composer.text(), "Keep my typed unsent notes");
+                        assert!(runtime.history.is_empty() && runtime.error.is_none());
+                        assert_eq!(runtime.queued.is_some(), queued);
+                    } else if succeeded {
+                        assert!(runtime.composer.text().trim().is_empty());
+                        assert_eq!(runtime.history.last().map(String::as_str), Some("private sent prompt"));
+                    } else {
+                        assert_eq!(runtime.composer.text(), "Keep my typed unsent notes");
+                        assert_eq!(runtime.error.as_deref(), Some("late old-reader failure"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pending_edit_body_reply_cannot_restore_an_archived_or_revoked_reader() {
         for archived in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
