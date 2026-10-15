@@ -20,14 +20,19 @@ pub fn now() -> u64 {
 impl RateLimit {
     pub fn classify(text: &str, now: u64) -> Option<Self> {
         let lower = text.to_ascii_lowercase();
-        if !["rate limit", "rate_limit", "rate-limited", "retry-after", "abuse detection"].iter().any(|s| lower.contains(s))
-            && !lower.contains("x-ratelimit-remaining: 0") { return None; }
         let header = |name: &str| lower.lines().find_map(|line| {
             let (key, value) = line.trim().split_once(':')?;
             (key.trim() == name).then(|| value.trim().parse::<u64>().ok()).flatten()
         });
+        let retry_after = header("retry-after");
+        // Access-Control-Expose-Headers lists Retry-After on ordinary GitHub
+        // responses; only a real Retry-After header is a pacing instruction.
+        if !["rate limit", "rate_limit", "rate-limited", "abuse detection"].iter().any(|word| lower.contains(word))
+            && header("x-ratelimit-remaining") != Some(0) && retry_after.is_none() {
+            return None;
+        }
         Some(Self { retry_at: header("x-ratelimit-reset")
-            .or_else(|| header("retry-after").map(|seconds| now.saturating_add(seconds)))
+            .or_else(|| retry_after.map(|seconds| now.saturating_add(seconds)))
             .unwrap_or_else(|| now.saturating_add(60)).max(now.saturating_add(1)) })
     }
 }
@@ -74,6 +79,7 @@ mod tests {
             assert_eq!(RateLimit::classify(text, 100).unwrap().retry_at, 200, "{text}");
         }
         assert!(RateLimit::classify("network disconnected", 100).is_none());
+        assert!(RateLimit::classify("Access-Control-Expose-Headers: Retry-After, X-RateLimit-Remaining, X-RateLimit-Reset\nX-RateLimit-Remaining: 4000\nX-RateLimit-Reset: 200", 100).is_none());
     }
     #[test]
     fn one_host_budget_pauses_all_pollers_and_manual_bypasses_only_transient_failures() {
