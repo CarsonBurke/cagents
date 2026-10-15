@@ -321,6 +321,10 @@ impl Cagents {
 
     pub(super) fn cancel_source_read(&mut self) {
         if let Some(cancel) = self.refresh_ui.source_cancel.take() {
+            // A worker may have cached its result just before this generation
+            // was retired, without its model ever reaching the UI. The next
+            // reader must publish a model even if that cached status matches.
+            self.refresh_ui.source_invalidated.fetch_or(1, std::sync::atomic::Ordering::AcqRel);
             cancel.cancel();
         }
         self.refresh_ui.source_generation = self.refresh_ui.source_generation.wrapping_add(1);
@@ -382,6 +386,63 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_completed_but_unpublished_snapshot_is_rebuilt_after_cancellation() {
+        use cosmic::iced::futures::StreamExt;
+        use crate::repository::{ChangeArea, RepositoryService, SnapshotOptions};
+
+        async fn completion(task: Task<Message>) -> Message {
+            let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+            while let Some(action) = stream.next().await {
+                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                    return message;
+                }
+            }
+            panic!("source reader returned no completion");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(root.path())
+            .output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        std::fs::write(root.path().join("new.txt"), "one\n").unwrap();
+        let snapshot = RepositoryService::system("git").snapshot_with_options(
+            root.path(),
+            SnapshotOptions { untracked_files: false, ..SnapshotOptions::default() },
+            &CancellationToken::default(),
+        ).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let mut key = app.sidebar_state.active_worktree().unwrap().clone();
+        key.canonical_path = root.path().to_path_buf();
+        app.context_tab = ContextTab::Changes;
+        app.sidebar_model.source_control = Some(SourceControlModel::ready_for_tab(key.clone(), &snapshot, false));
+        std::fs::write(root.path().join("new.txt"), "one\ntwo\n").unwrap();
+
+        // Complete the worker but deliberately hold its delivery. The cache
+        // has the new bytes while the mounted model still has the old count.
+        let first = completion(app.source_control_snapshot_task(key.clone())).await;
+        let Message::SourceControlLoaded { request: old, result: Ok(Some(prepared)), .. } = first else {
+            panic!("first read must prepare the changed snapshot");
+        };
+        assert_eq!(prepared.0.status.entries[0].added_lines, Some(2));
+        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap()
+            .group(ChangeArea::Untracked).unwrap().rows()[0].entry.added_lines, Some(1));
+
+        // A same-options reload retires that undelivered generation without
+        // another filesystem change. It must not take the unchanged shortcut.
+        let replacement = completion(app.source_control_snapshot_task(key)).await;
+        let Message::SourceControlLoaded { request: current, result: Ok(Some(prepared)), .. } = replacement else {
+            panic!("replacement must publish the cached-but-unseen state");
+        };
+        assert_ne!(old, current);
+        assert_eq!(prepared.0.status.entries[0].added_lines, Some(2));
+        assert_eq!(prepared.1.group(ChangeArea::Untracked).unwrap().rows()[0].entry.added_lines, Some(2));
+    }
 
     fn projects<const N: usize>() -> [ProjectId; N] {
         std::array::from_fn(|_| ProjectId::new())
