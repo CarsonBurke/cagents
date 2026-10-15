@@ -14,7 +14,9 @@ struct RetainedCloseRaceFixture {
     _notifications: crate::host::notifications::Broker,
 }
 impl RetainedCloseRaceFixture {
-    fn start() -> Self {
+    fn start() -> Self { Self::start_with_schedule(false) }
+    fn scheduled() -> Self { Self::start_with_schedule(true) }
+    fn start_with_schedule(scheduled: bool) -> Self {
         let (host, request, path) = fixture();
         let root = path.parent().unwrap();
         let program = root.join("bin/claude");
@@ -29,6 +31,13 @@ while IFS= read -r frame; do"#, 1);
         let exit_anchor = "      ;;\n  esac\ndone\n";
         assert_eq!(script.matches(exit_anchor).count(), 1);
         script = script.replacen(exit_anchor, "      if [ \"$(wc -l < \"$HOME/../spawns\")\" -eq 1 ]; then exit 0; fi\n      ;;\n  esac\ndone\n", 1);
+        let hold_anchor = "        *ASK_PERMISSION*)";
+        assert_eq!(script.matches(hold_anchor).count(), 1);
+        script = script.replacen(hold_anchor, r#"        *HOLD_RECONCILIATION*)
+          printf 'held\n' > "$HOME/../reconciliation-turn-held"
+          continue
+          ;;
+        *ASK_PERMISSION*)"#, 1);
         std::fs::write(&program, script).unwrap();
         let proof = host.lock().unwrap().proof().clone();
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
@@ -37,7 +46,14 @@ while IFS= read -r frame; do"#, 1);
             crate::notifications::Application::Cagents).unwrap();
         host.lock().unwrap().notifications = Some(notifications.handle());
         host.lock().unwrap().enable_holder_recovery();
-        let accepted = submit(&host, &Authority::default(), request).unwrap();
+        let accepted = if scheduled {
+            let automation = automation_fixture(&host, &request);
+            let accepted = claim_fixture(&host, &automation);
+            dispatch_accepted(&host, accepted.clone()).unwrap();
+            accepted
+        } else {
+            submit(&host, &Authority::default(), request).unwrap()
+        };
         let run = settled(&host, accepted.run.id);
         assert_eq!(run.state, State::Succeeded, "{run:?}");
         let agent = registry(&host).unwrap().lock().unwrap().agent(accepted.agent.id).unwrap();
@@ -188,5 +204,97 @@ fn combined_close_retained_lifecycle_ordinary_receipt_lookup_keeps_host_census_r
     assert!(!fixture.identity.record.holder.is_current());
     assert_eq!(fixture.spawns(), 1);
     assert!(store.lock().unwrap().agent(fixture.agent.id).unwrap().closed);
+    assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
+}
+
+
+#[test]
+fn combined_close_retained_lifecycle_reconciliation_captures_busy_restart_after_claim() {
+    if owning_close_isolated("combined_close_retained_lifecycle_reconciliation_captures_busy_restart_after_claim").is_some() { return; }
+    let fixture = RetainedCloseRaceFixture::scheduled();
+    assert!(matches!(fixture.agent.origin, Origin::Automation {..}));
+    let store = registry(&fixture.host).unwrap();
+    let (entered, entering) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    before_reconciliation_transition(move || {
+        entered.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let host = fixture.host.clone(); let run = fixture.run.clone();
+    let reconciling = std::thread::spawn(move || reconcile_agent_run(&host, &run, true));
+    let reached = entering.recv_timeout(Duration::from_secs(2));
+    // A->B is a real public attach/restart in the SAME retained helper. Allow
+    // initialization, then send a real nonfinishing turn so B is positively
+    // working rather than assuming any backend change must always refuse.
+    fixture.release_restart();
+    let restarted = crate::host::client::process_request(&fixture.host, EXECUTION_CLIENT,
+        ClientRequest::ChatAttach {session:fixture.source.clone()});
+    let prompt = if restarted.is_ok() {
+        crate::host::client::process_request(&fixture.host, EXECUTION_CLIENT,
+            ClientRequest::ChatCommand {chat_id:fixture.source.id, command:Command::Prompt {
+                text:"HOLD_RECONCILIATION".into(), attachments:vec![], mode:PromptMode::Send}})
+    } else { Err(crate::terminal_ipc::ProtocolError::new(crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+        "actual restart failed before test prompt", true)) };
+    let marker = fixture.path.parent().unwrap().join("reconciliation-turn-held");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut busy = false;
+    while Instant::now() < deadline {
+        if fixture.handle.refresh_retained_state().is_ok()
+            && fixture.handle.snapshot(None).is_some_and(|snapshot| snapshot.busy) {
+            busy = marker.exists();
+            if busy {break;}
+        }
+        if Instant::now() >= deadline {break;}
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let before_refusal = store.lock().unwrap().agent(fixture.agent.id).unwrap();
+    let successor = fixture.handle.provider_process();
+    let _ = release.send(());
+    let result = reconciling.join().unwrap();
+    assert!(reached.is_ok()); restarted.unwrap(); prompt.unwrap();
+    assert!(busy, "actual restarted B must have received its held working turn before eligibility is captured");
+    let error = result.unwrap_err();
+    assert!(error.contains("not idle"), "fresh B eligibility must be checked after the lifecycle claim: {error}");
+    let successor = successor.expect("real current backend");
+    assert_ne!(successor, fixture.original); assert!(successor.is_current());
+    assert_eq!(fixture.handle.actor_identity().unwrap(), fixture.identity);
+    assert!(fixture.identity.record.holder.is_current());
+    assert_eq!(fixture.spawns(), 2);
+    assert_eq!(store.lock().unwrap().agent(fixture.agent.id).unwrap(), before_refusal);
+    assert_eq!(before_refusal.origin, fixture.agent.origin); assert!(!before_refusal.closed);
+    assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
+    assert!(!fixture.host.lock().unwrap().native_closing.contains_key(&fixture.source.id));
+}
+
+#[test]
+fn combined_close_retained_lifecycle_reconciliation_holds_claim_through_cleanup() {
+    if owning_close_isolated("combined_close_retained_lifecycle_reconciliation_holds_claim_through_cleanup").is_some() { return; }
+    let fixture = RetainedCloseRaceFixture::scheduled();
+    assert!(matches!(fixture.agent.origin, Origin::Automation {..}));
+    let store = registry(&fixture.host).unwrap();
+    let (entered, entering) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    crate::host::chat::before_ordinary_close_receipt(move || {
+        entered.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let host = fixture.host.clone(); let run = fixture.run.clone();
+    let reconciling = std::thread::spawn(move || reconcile_agent_run(&host, &run, true));
+    let reached = entering.recv_timeout(Duration::from_secs(2));
+    let (sent, returned) = std::sync::mpsc::channel();
+    let host = fixture.host.clone(); let source = fixture.source.clone();
+    let attaching = std::thread::spawn(move || {sent.send(crate::host::client::process_request(&host, EXECUTION_CLIENT,
+        ClientRequest::ChatAttach {session:source})).unwrap();});
+    let attach = returned.recv_timeout(Duration::from_secs(2));
+    let _ = release.send(()); fixture.release_restart();
+    let closed = reconciling.join().unwrap(); attaching.join().unwrap();
+    assert!(reached.is_ok(), "reconciliation must reach receipt cleanup without recursively acquiring its own claim");
+    let error = attach.expect("restart must promptly refuse the reconciliation lifecycle claim").unwrap_err();
+    assert!(error.message.contains("lifecycle transition"), "{error:?}");
+    assert_eq!(closed.unwrap(), Reconciliation::Closed);
+    assert!(!fixture.identity.record.holder.is_current());
+    assert_eq!(fixture.spawns(), 1);
+    let closed_agent = store.lock().unwrap().agent(fixture.agent.id).unwrap();
+    assert!(closed_agent.closed); assert_eq!(closed_agent.origin, fixture.agent.origin);
     assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
 }
