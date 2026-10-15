@@ -112,7 +112,10 @@ fn safe_url(text: &str) -> Option<url::Url> {
                 {
                     return None;
                 }
-                url.set_host(None).ok()?;
+                // An explicit empty file host clears both the serialization
+                // and the parsed host kind. In pinned url 2.5.8, set_host(None)
+                // leaves the previous domain kind and to_file_path rejects it.
+                url.set_host(Some("")).ok()?;
             }
             url.to_file_path().ok()?;
             Some(url)
@@ -399,6 +402,13 @@ mod tests {
                 .unwrap(),
             Path::new("/p")
         );
+        let escaped = safe_url(&format!("file://{}/two%20words?q=1#L2", local.to_uppercase()))
+            .expect("the exact local hostname is accepted case insensitively");
+        assert_eq!(escaped.host_str(), None);
+        assert_eq!(escaped.to_file_path().unwrap(), Path::new("/two words"));
+        assert_eq!(escaped.query(), Some("q=1"));
+        assert_eq!(escaped.fragment(), Some("L2"));
         assert!(safe_url("file://foreign-host.invalid/p").is_none());
+        assert!(safe_url(&format!("file://{local}.foreign.invalid/p")).is_none());
     }
 }
