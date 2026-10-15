@@ -145,7 +145,7 @@ fn confirmed_receipt(
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     Ok(receipt.family_reaped && receipt.record == *expected
         && receipt.record.kind == Kind::Terminal
-        && receipt.record.version == 4
+        && receipt.record.version == 5
         && receipt.record.application == crate::instance::APPLICATION_ID
         && receipt.record.boot == proof.boot_id
         && holder_exited(&receipt.record.holder)?
