@@ -52,6 +52,8 @@ pub fn file_row_focus_id(key: &ActiveWorktreeKey, path: &RepoPath) -> Id {
     stable_id(format!("panel.file.open.{}.{}", key.worktree_id, path_key(path)))
 }
 
+pub fn change_panel_focus_id() -> Id { Id::from("sidebar.changes-panel") }
+
 pub fn change_row_focus_id(key: &ActiveWorktreeKey, row: &ChangeSelectionRow) -> Id {
     stable_id(format!("panel.change.open.{}.{:?}.{}", key.worktree_id, row.area, path_key(&row.path)))
 }
@@ -7314,7 +7316,7 @@ fn context_controls<'a>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChangeContextAction { Open, Reveal, CopyPath, Ignore, Mutate(ChangeGroupCommand) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ChangeContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a ChangeRow, action: ChangeContextAction }
+struct ChangeContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a ChangeRow, selection_revision: u64, action: ChangeContextAction }
 impl widget::menu::Action for ChangeContextCommand<'_> {
     type Message = SidebarAction;
     fn message(&self) -> SidebarAction {
@@ -7324,23 +7326,27 @@ impl widget::menu::Action for ChangeContextCommand<'_> {
             ChangeContextAction::Reveal => SidebarAction::RevealChangeInFiles { key, path },
             ChangeContextAction::CopyPath => SidebarAction::FileCommand { key, path, command: FileCommand::CopyRelativePath },
             ChangeContextAction::Ignore => SidebarAction::IgnoreChangePath { key, path },
-            ChangeContextAction::Mutate(command) => SidebarAction::InvokeChangeRows { key, row: ChangeSelectionRow { area: self.row.entry.area, path }, command },
+            ChangeContextAction::Mutate(command) => SidebarAction::RunChangeCommand {
+                key, row: ChangeSelectionRow { area: self.row.entry.area, path },
+                selection_revision: self.selection_revision,
+                command: commands::change_command_id(command),
+            },
         }
     }
 }
-fn change_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a ChangeRow, blocked: bool) -> Element<'a, SidebarAction> {
+fn change_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a ChangeRow, selection_revision: u64, blocked: bool) -> Element<'a, SidebarAction> {
     if blocked { return content; }
     let mut entries = vec![
-        widget::menu::Item::Button("Open file".into(), None, ChangeContextCommand { key, row, action: ChangeContextAction::Open }),
-        widget::menu::Item::Button("Reveal in Files".into(), None, ChangeContextCommand { key, row, action: ChangeContextAction::Reveal }),
-        widget::menu::Item::Button("Copy path".into(), None, ChangeContextCommand { key, row, action: ChangeContextAction::CopyPath }),
+        widget::menu::Item::Button("Open file".into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Open }),
+        widget::menu::Item::Button("Reveal in Files".into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Reveal }),
+        widget::menu::Item::Button("Copy path".into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::CopyPath }),
     ];
     let ignore = if row.entry.area == ChangeArea::Untracked { widget::menu::Item::Button } else { widget::menu::Item::ButtonDisabled };
-    entries.push(ignore("Add to .gitignore".into(), None, ChangeContextCommand { key, row, action: ChangeContextAction::Ignore }));
-    let (label, command) = if row.entry.area == ChangeArea::Staged { ("Unstage selection (Space / Enter)", ChangeGroupCommand::Unstage) } else { ("Stage selection (Space / Enter)", ChangeGroupCommand::Stage) };
-    entries.push(widget::menu::Item::Button(label.into(), None, ChangeContextCommand { key, row, action: ChangeContextAction::Mutate(command) }));
+    entries.push(ignore("Add to .gitignore".into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Ignore }));
+    let command = if row.entry.area == ChangeArea::Staged { ChangeGroupCommand::Unstage } else { ChangeGroupCommand::Stage };
+    entries.push(widget::menu::Item::Button(commands::label(commands::change_command_id(command)).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Mutate(command) }));
     if matches!(row.entry.area, ChangeArea::Unstaged | ChangeArea::Untracked) {
-        entries.push(widget::menu::Item::Button("Discard selection… (Delete)".into(), None, ChangeContextCommand { key, row, action: ChangeContextAction::Mutate(ChangeGroupCommand::Discard) }));
+        entries.push(widget::menu::Item::Button(commands::label(commands::change_command_id(ChangeGroupCommand::Discard)).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Mutate(ChangeGroupCommand::Discard) }));
     }
     crate::interaction::context_menu(content, widget::menu::items(&std::collections::HashMap::new(), entries))
 }
@@ -8301,7 +8307,7 @@ fn source_control_panel<'a>(
     };
 
     let body = match tab {
-        ChangesTab::Changes => changes_section(state, source, modal_open),
+        ChangesTab::Changes => widget::container(changes_section(state, source, modal_open)).id(change_panel_focus_id()).into(),
         ChangesTab::Branch => branch_changes_section(state, source, modal_open),
         ChangesTab::History => history_section(state, source, modal_open),
     };
@@ -9418,7 +9424,7 @@ fn change_row_view<'a>(
     );
     let identity = crate::interaction::tooltip(identity, row.entry.path.display().into_owned());
     let identity = RowInteraction::change_row(identity, &source.key, ChangeSelectionRow { area, path: row.entry.path.clone() }, state, !modal_open);
-    let identity = change_context_controls(identity, &source.key, row, modal_open);
+    let identity = change_context_controls(identity, &source.key, row, state.change_selection_revision(), modal_open);
     let commands = row_commands(source, area, row, modal_open).into_iter().map(|mut control| {
         let command = match control.action.as_ref() {
             Some(SidebarAction::Stage { .. }) => Some(ChangeGroupCommand::Stage),
@@ -19398,6 +19404,25 @@ mod change_focus_identity_tests {
         }
         for invalid in ["bad%#4", "bad%GG#4", "bad#99", "bad%00#4"] {
             assert!(path_from_key(invalid).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod captured_change_menu_tests {
+    use super::*;
+    use widget::menu::Action as _;
+    #[test]
+    fn change_mutation_menu_carries_registry_identity_and_original_selection_revision() {
+        let model = super::tests::panel_model();
+        let source = model.source_control.as_ref().unwrap();
+        let row = source.groups().iter().flat_map(|group| group.rows()).next().unwrap();
+        for operation in [ChangeGroupCommand::Stage, ChangeGroupCommand::Unstage, ChangeGroupCommand::Discard] {
+            let intent = ChangeContextCommand { key: &source.key, row, selection_revision: 71,
+                action: ChangeContextAction::Mutate(operation) }.message();
+            assert!(matches!(intent, SidebarAction::RunChangeCommand { command, key, row: captured, selection_revision: 71 }
+                if command == commands::change_command_id(operation) && key == source.key
+                    && captured.path == row.entry.path && captured.area == row.entry.area));
         }
     }
 }
