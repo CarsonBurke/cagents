@@ -4,13 +4,8 @@
 // pidfd harness bounds this exact libtest child; outer B0 separately owns full
 // descendant-family settlement. Unknown keeps the strong original owner.
 fn capacity_isolated(name: &str) -> bool {
-    if let Some(directory) = owning_close_isolated(name) {
-        // Preserve capped logs and the exact scenario receipt on BOTH outcomes.
-        eprintln!("native capacity evidence retained at {}", directory.keep().display());
-        true
-    } else {
-        false
-    }
+    // The owning harness retains capped logs/private runtime on both outcomes.
+    owning_close_isolated(name).is_some()
 }
 
 fn capacity_receipt(path: &Path, scenario: &str, detail: serde_json::Value) {
@@ -199,7 +194,17 @@ fn native_capacity_genuine_retained_restart_refuses_without_starting_a_successor
     if capacity_isolated("native_capacity_genuine_retained_restart_refuses_without_starting_a_successor") { return; }
     let mut f = CapacityFixture::prepare();
     let program = f.path.parent().unwrap().join("bin/claude");
-    let script = std::fs::read_to_string(&program).unwrap();
+    let mut script = std::fs::read_to_string(&program).unwrap();
+    // Existing guarded peer records only the real received user and emitted
+    // assistant frames, with identity parsed from the provider's actual argv.
+    std::fs::write(f.path.parent().unwrap().join("bin/claude-history.py"),
+        include_str!("retained_close_history_peer.py")).unwrap();
+    let assistant_line = script.lines().filter(|line|
+        line.trim_start().starts_with("printf '{\"type\":\"assistant\""))
+        .last().unwrap().to_owned();
+    let index = script.rfind(&assistant_line).unwrap();
+    script.replace_range(index..index + assistant_line.len(),
+        &format!("{assistant_line} | python3 \"$HOME/../bin/claude-history.py\" \"$session\" \"$frame\""));
     let anchor = "      ;;\n  esac\ndone\n";
     assert_eq!(script.matches(anchor).count(), 1);
     let script = script.replacen(anchor,
@@ -220,6 +225,14 @@ fn native_capacity_genuine_retained_restart_refuses_without_starting_a_successor
     }
     let (_, _, source) = f.capture(id);
     assert!(source.launch.session_id.is_some(), "real protocol result confirms the restart identity");
+    let transcript = crate::agent::claude_transcript(
+        &f.path.parent().unwrap().join("home/.claude"),
+        &source.launch.recipe.working_directory.canonicalize().unwrap(),
+        source.launch.session_id.as_deref().unwrap()).unwrap();
+    let history = std::fs::read_to_string(transcript).unwrap();
+    assert_eq!(history.lines().count(), 2, "actual user/assistant frames form the real private resume history");
+    assert!(history.contains("SERVICE_RESULT_1"));
+    chat::protocol::create(&source.launch).expect("actual private history must satisfy the resume factory BEFORE pinning capacity");
     assert!(!original.is_current() && identity.record.holder.is_current());
     assert_eq!(f.starts(), 1);
     let pins = f.host.lock().unwrap().native_sources.pin_capacity_for_test();
@@ -232,6 +245,8 @@ fn native_capacity_genuine_retained_restart_refuses_without_starting_a_successor
     let refused = chat::runtime::Handle::inspect_remote(&identity.record, f.proof.clone()).unwrap();
     assert_eq!(refused.attachment_epoch, before.attachment_epoch);
     assert_eq!(refused.identity, identity);
+    assert_eq!(refused.source, before.source);
+    assert_eq!(refused.previous_sources, before.previous_sources);
     assert_eq!(f.host.lock().unwrap().native_sources.capacity_usage_for_test(), usage);
     assert!(f.host.lock().unwrap().chats[&id].handle.same_actor(&handle));
     assert!(handle.is_completed() && !original.is_current());
@@ -239,14 +254,22 @@ fn native_capacity_genuine_retained_restart_refuses_without_starting_a_successor
     assert_eq!(f.starts(), 1, "all-pinned refusal never reaches the actual helper restart spawn");
     drop(pins);
     let response = super::super::chat::process(&f.host, EXECUTION_CLIENT,
-        crate::terminal_ipc::ClientRequest::ChatAttach { session:source }).unwrap();
-    assert!(matches!(response, crate::terminal_ipc::ServerResponse::ChatAttached {..}));
+        crate::terminal_ipc::ClientRequest::ChatAttach { session:source.clone() }).unwrap();
+    let crate::terminal_ipc::ServerResponse::ChatRestarted { receipt, .. } = response else {
+        panic!("actual completed Attach must return its correlated restart receipt: {response:?}");
+    };
+    assert!(receipt.is_valid());
+    assert_eq!(receipt.source(), &source);
+    assert_eq!(receipt.replacement().id, id);
+    assert_eq!(receipt.replacement().launch, source.launch);
     handle.refresh_retained_state().unwrap();
     let successor = handle.provider_process().expect("actual second provider published by retained helper");
     assert_ne!(successor, original);
     assert!(successor.is_current() && identity.record.holder.is_current());
     assert_eq!(handle.actor_identity(), Some(identity.clone()));
     assert!(f.host.lock().unwrap().chats[&id].handle.same_actor(&handle));
+    assert_eq!(f.host.lock().unwrap().chats[&id].execution_instance, identity.instance);
+    assert_eq!(receipt.replacement(), &f.capture(id).2);
     assert_eq!(f.starts(), 2);
     f.cleanup.finish_result().unwrap();
     assert!(chat::runtime::Handle::retained_retirement_proved(&identity.record, &f.proof).unwrap());
