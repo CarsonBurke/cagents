@@ -365,24 +365,110 @@ fn signature_to_protocol(help:LspSignatureHelp)->lsp_types::SignatureHelp {
 
 static NEXT_SERVER_EDIT_ID:AtomicU64=AtomicU64::new(1);
 
+struct ServerEdit {
+    doc: LspDocumentId,
+    deadline: std::time::Instant,
+    // None means the publication lease owns the response. Its timeout and
+    // document-close paths no longer have authority to report failure.
+    reply: Option<tokio::sync::oneshot::Sender<lsp_types::ApplyWorkspaceEditResponse>>,
+}
+
 #[derive(Default)]
 pub(super) struct ServerEdits {
-    pending:Mutex<HashMap<LspServerEditId,(LspDocumentId,tokio::sync::oneshot::Sender<lsp_types::ApplyWorkspaceEditResponse>)>>,
+    pending: Mutex<HashMap<LspServerEditId, ServerEdit>>,
 }
 impl ServerEdits {
-    pub(super) fn close_doc(&self,doc:LspDocumentId){self.pending.lock().unwrap_or_else(|p|p.into_inner()).retain(|_,(d,_)|*d!=doc);}
-    pub(super) fn clear(&self){self.pending.lock().unwrap_or_else(|p|p.into_inner()).clear();}
-}
-impl LspManager {
-    pub fn respond_workspace_edit(&mut self,id:LspServerEditId,applied:bool,failure_reason:Option<String>){
-        if let Some((_,reply))=self.server_edits.pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id){let _=reply.send(lsp_types::ApplyWorkspaceEditResponse{applied,failure_reason,failed_change:None});}
+    pub(super) fn close_doc(&self, doc: LspDocumentId) {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner())
+            .retain(|_, entry| entry.doc != doc || entry.reply.is_none());
+    }
+    pub(super) fn clear(&self) {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner())
+            .retain(|_, entry| entry.reply.is_none());
+    }
+    fn remove_preview(&self, id: LspServerEditId) -> Option<ServerEdit> {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.get(&id).is_some_and(|entry| entry.reply.is_some()) {
+            pending.remove(&id)
+        } else { None }
     }
 }
 
-struct ServerEditGuard {id:LspServerEditId,edits:Arc<ServerEdits>}
-impl Drop for ServerEditGuard {fn drop(&mut self){self.edits.pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&self.id);}}
+/// Exclusive response and publication authority for an admitted server edit.
+/// Claim immediately before any buffer or filesystem mutation, then keep this
+/// non-cloneable lease until publication completes. Dropping an unused lease
+/// rejects the request; preview expiry cannot reject a claimed publication.
+#[must_use = "keep the server-edit lease until publication finishes"]
+pub struct LspServerEditLease {
+    id: LspServerEditId,
+    edits: Arc<ServerEdits>,
+    reply: Option<tokio::sync::oneshot::Sender<lsp_types::ApplyWorkspaceEditResponse>>,
+}
+impl std::fmt::Debug for LspServerEditLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LspServerEditLease").field("id", &self.id).finish_non_exhaustive()
+    }
+}
+impl LspServerEditLease {
+    pub fn respond(mut self, applied: bool, failure_reason: Option<String>) {
+        self.finish(applied, failure_reason);
+    }
+    fn finish(&mut self, applied: bool, failure_reason: Option<String>) {
+        if let Some(reply) = self.reply.take() {
+            self.edits.pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id);
+            let _ = reply.send(lsp_types::ApplyWorkspaceEditResponse { applied, failure_reason, failed_change: None });
+        }
+    }
+}
+impl Drop for LspServerEditLease {
+    fn drop(&mut self) {
+        self.finish(false, Some("workspace-edit publication was cancelled".into()));
+    }
+}
+impl LspManager {
+    /// Atomically claims an unexpired preview. Closing a document or timing
+    /// out before this point makes claiming fail without publication authority.
+    /// Once claimed, the lease owns the response across preview expiry and
+    /// manager shutdown; it must be acknowledged after the actual publication.
+    pub fn claim_workspace_edit(&mut self, id: LspServerEditId) -> Result<LspServerEditLease, String> {
+        let mut pending = self.server_edits.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = pending.get_mut(&id).ok_or("The server edit expired or its source was closed; request it again")?;
+        if entry.reply.is_none() { return Err("The server edit is already being published".into()); }
+        if std::time::Instant::now() >= entry.deadline {
+            let entry = pending.remove(&id).unwrap();
+            drop(pending);
+            if let Some(reply) = entry.reply {
+                let _ = reply.send(lsp_types::ApplyWorkspaceEditResponse { applied: false,
+                    failure_reason: Some("workspace-edit preview timed out before publication".into()), failed_change: None });
+            }
+            return Err("The server edit preview expired; request it again".into());
+        }
+        let reply = entry.reply.take();
+        Ok(LspServerEditLease { id, edits: Arc::clone(&self.server_edits), reply })
+    }
+    /// Completes an unclaimed preview, for rejection or a successful no-op.
+    /// Actual mutations must first claim and complete a publication lease.
+    pub fn respond_workspace_edit(&mut self, id:LspServerEditId, applied:bool, failure_reason:Option<String>) {
+        if let Some(entry) = self.server_edits.remove_preview(id) {
+            if let Some(reply) = entry.reply {
+                let _ = reply.send(lsp_types::ApplyWorkspaceEditResponse { applied, failure_reason, failed_change:None });
+            }
+        }
+    }
+}
 
-pub(super) fn apply_workspace_edit(state:&mut RouterState,params:lsp_types::ApplyWorkspaceEditParams)->impl std::future::Future<Output=Result<lsp_types::ApplyWorkspaceEditResponse,async_lsp::Error>>+Send+'static {
+struct ServerEditGuard { id: LspServerEditId, edits: Arc<ServerEdits> }
+impl Drop for ServerEditGuard {
+    fn drop(&mut self) { self.edits.remove_preview(self.id); }
+}
+
+pub(super) fn apply_workspace_edit(state:&mut RouterState, params:lsp_types::ApplyWorkspaceEditParams)
+    -> impl std::future::Future<Output=Result<lsp_types::ApplyWorkspaceEditResponse,async_lsp::Error>>+Send+'static {
+    apply_workspace_edit_with_timeout(state, params, Duration::from_secs(120))
+}
+fn apply_workspace_edit_with_timeout(state:&mut RouterState, params:lsp_types::ApplyWorkspaceEditParams, timeout:Duration)
+    -> impl std::future::Future<Output=Result<lsp_types::ApplyWorkspaceEditResponse,async_lsp::Error>>+Send+'static {
+    let deadline = std::time::Instant::now() + timeout;
     let result=(||{
         if state.retired.load(Ordering::Acquire){return Err("language server retired".to_owned());}
         let doc=state.snapshots.docs_for_session(&state.key).into_iter().next().ok_or("no open document owns this language server")?;
@@ -390,18 +476,33 @@ pub(super) fn apply_workspace_edit(state:&mut RouterState,params:lsp_types::Appl
         let edit=convert_workspace_edit(&state.snapshots,params.edit,Some(&versions)).map_err(|e|e.to_string())?;
         let id=LspServerEditId(NEXT_SERVER_EDIT_ID.fetch_add(1,Ordering::Relaxed));
         let (tx,rx)=tokio::sync::oneshot::channel();
-        {let mut pending=state.server_edits.pending.lock().unwrap_or_else(|p|p.into_inner());if pending.len()>=64{return Err("too many pending workspace-edit previews".to_owned());}pending.insert(id,(doc,tx));}
+        {let mut pending=state.server_edits.pending.lock().unwrap_or_else(|p|p.into_inner());if pending.len()>=64{return Err("too many pending workspace-edit previews".to_owned());}pending.insert(id,ServerEdit { doc, deadline, reply:Some(tx) });}
         state.events.emit_now(LspEvent::ApplyWorkspaceEdit{doc,id,label:params.label,edit});Ok((id,rx))
     })();
     let guard=result.as_ref().ok().map(|(id,_)|ServerEditGuard{id:*id,edits:Arc::clone(&state.server_edits)});
+    let server_edits = Arc::clone(&state.server_edits);
     async move {
         let _guard=guard;
         let failure=|message|lsp_types::ApplyWorkspaceEditResponse{applied:false,failure_reason:Some(message),failed_change:None};
         Ok(match result {
             Err(message)=>failure(message),
-            Ok((_id,rx))=>{
-                let response=match tokio::time::timeout(Duration::from_secs(120),rx).await {Ok(Ok(response))=>response,_=>failure("workspace-edit preview closed or timed out".into())};
-                response
+            Ok((id,mut rx))=>{
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, &mut rx).await {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(_)) => failure("workspace-edit preview closed".into()),
+                    Err(_) => {
+                        // Timeout and claim arbitrate under the same mutex.
+                        // Removing only Preview cannot defeat an already
+                        // admitted write or drop its receiver prematurely.
+                        if let Some(entry) = server_edits.remove_preview(id) {
+                            if let Some(reply) = entry.reply {
+                                let _ = reply.send(failure("workspace-edit preview timed out".into()));
+                            }
+                        }
+                        rx.await.unwrap_or_else(|_| failure("workspace-edit publication closed".into()))
+                    }
+                }
             }
         })
     }
@@ -496,6 +597,84 @@ mod tests {
         let mut missing=value.clone();missing["changeAnnotations"]=json!({});assert!(matches!(convert_workspace_edit(&store,serde_json::from_value(missing).unwrap(),None),Err(LspError::Unsupported(_))));
         let mut split=value;split["documentChanges"][0]["edits"][0]["range"]["start"]["character"]=json!(2);assert!(matches!(convert_workspace_edit(&store,serde_json::from_value(split).unwrap(),None),Err(LspError::SplitSurrogate{..})));
         let duplicate: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[]},{"textDocument":{"uri":uri.as_str(),"version":4},"edits":[]}]})).unwrap();assert!(matches!(convert_workspace_edit(&store,duplicate,None),Err(LspError::Unsupported(_))));
+    }
+
+    fn server_edit_fixture() -> (LspManager, RouterState) {
+        let manager = LspManager::new(Vec::new());
+        let uri = Arc::new(Url::parse("file:///repo/a.rs").unwrap());
+        let key = SessionKey { root:Arc::from(Path::new("/repo")), server_id:Arc::from("rust") };
+        manager.snapshots.register(LspDocumentId(1), &uri, &key, 1, Arc::from("foo"));
+        let router = RouterState { key, snapshots:Arc::clone(&manager.snapshots), events:manager.events.clone(),
+            retired:Arc::new(AtomicBool::new(false)), server_edits:Arc::clone(&manager.server_edits), configuration:serde_json::Value::Null };
+        (manager, router)
+    }
+    fn latest_server_edit(manager: &LspManager) -> LspServerEditId {
+        *manager.server_edits.pending.lock().unwrap().keys().max_by_key(|id|id.0).unwrap()
+    }
+    fn empty_server_edit() -> lsp_types::ApplyWorkspaceEditParams {
+        lsp_types::ApplyWorkspaceEditParams { label:None, edit:Default::default() }
+    }
+
+    #[test]
+    fn expired_server_edit_preview_cannot_claim_publication_authority() {
+        let (mut manager, mut router) = server_edit_fixture();
+        let request = apply_workspace_edit_with_timeout(&mut router, empty_server_edit(), Duration::ZERO);
+        let id = latest_server_edit(&manager);
+        assert!(manager.claim_workspace_edit(id).unwrap_err().contains("expired"));
+        let response = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(request).unwrap();
+        assert!(!response.applied);
+        assert!(manager.server_edits.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn claimed_server_edit_owns_reply_across_preview_timeout_close_and_shutdown() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (mut manager, mut router) = server_edit_fixture();
+            let mut request = Box::pin(apply_workspace_edit_with_timeout(&mut router, empty_server_edit(), Duration::from_millis(10)));
+            let id = latest_server_edit(&manager);
+            let lease = manager.claim_workspace_edit(id).unwrap();
+            assert!(manager.claim_workspace_edit(id).is_err());
+            manager.server_edits.close_doc(LspDocumentId(1));
+            manager.server_edits.clear();
+            manager.respond_workspace_edit(id, false, Some("stale preview cancellation".into()));
+            assert_eq!(manager.server_edits.pending.lock().unwrap().len(), 1);
+            assert!(tokio::time::timeout(Duration::from_millis(40), &mut request).await.is_err(),
+                "preview expiry/close cannot reject already admitted publication");
+            lease.respond(true, None);
+            assert!(request.await.unwrap().applied);
+            assert!(manager.server_edits.pending.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn dropped_publication_lease_rejects_without_leaking_pending_budget() {
+        let (mut manager, mut router) = server_edit_fixture();
+        let request = apply_workspace_edit(&mut router, empty_server_edit());
+        let id = latest_server_edit(&manager);
+        let lease = manager.claim_workspace_edit(id).unwrap();
+        drop(lease);
+        let response = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(request).unwrap();
+        assert!(!response.applied);
+        assert!(response.failure_reason.unwrap().contains("publication was cancelled"));
+        assert!(manager.server_edits.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelled_server_request_keeps_claimed_budget_until_publication_finishes() {
+        let (mut manager, mut router) = server_edit_fixture();
+        let request = apply_workspace_edit(&mut router, empty_server_edit());
+        let lease = manager.claim_workspace_edit(latest_server_edit(&manager)).unwrap();
+        drop(request);
+        assert_eq!(manager.server_edits.pending.lock().unwrap().len(), 1);
+        drop(lease);
+        assert!(manager.server_edits.pending.lock().unwrap().is_empty());
+        let request = apply_workspace_edit(&mut router, empty_server_edit());
+        manager.server_edits.close_doc(LspDocumentId(1));
+        let response = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(request).unwrap();
+        assert!(!response.applied, "document close still cancels an unclaimed preview");
     }
 
     #[test]
