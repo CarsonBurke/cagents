@@ -40,6 +40,7 @@ impl Authority {
         self.unconfirmed_commands.retain(|command|command!=id);Ok(())
     }
     pub(super) fn originals(&mut self,updates:Vec<annotations::OriginalUpdate>)->Option<String>{
+        let mut warning=None;
         for update in updates {
             let result=match update {
                 annotations::OriginalUpdate::Settings{command_id,settings}=>self.pending_store().and_then(|mut store|store.prepared_settings(&command_id,&settings).map_err(|error|format!("{error:?}"))),
@@ -53,9 +54,9 @@ impl Authority {
                     if self.session.as_deref()!=Some(session_id.as_str()){Err("Latest user belongs to another provider conversation".into())}else{self.latest_user(&user_id)}
                 },
             };
-            if let Err(error)=result{return self.warning(error);}
+            if let Err(error)=result && let Some(message)=self.warning(error){warning=Some(message);}
         }
-        None
+        warning
     }
     pub(super) fn original(&self,user:Option<&str>,offset:usize,limit:usize)->Result<OriginalPage,OriginalError>{
         let store=self.store.as_ref().ok_or_else(||OriginalError::Unavailable(self.notice.clone().or_else(||self.scope.as_ref().err().cloned()).unwrap_or_else(||"No qualified provider-confirmed original command is available".into())))?;
@@ -65,8 +66,13 @@ impl Authority {
     /// Call only with provider-proven current conversation ordering; history
     /// arrival and a persisted last annotation are not such evidence.
     pub(super) fn latest_user(&mut self,user:&str)->Result<(),String>{
-        self.store.as_mut().ok_or("Qualified annotation storage is unavailable")?.latest_user(user)?;
-        self.latest_proven=Some(user.to_owned());Ok(())
+        // Invalidate the old latest proof even when the new command cannot
+        // be annotated or the metadata database is temporarily unavailable.
+        self.latest_proven=None;
+        if user.is_empty() || user.len()>4096{return Err("Invalid latest user identity".into());}
+        self.latest_proven=Some(user.to_owned());
+        self.store.as_mut().ok_or("Qualified annotation storage is unavailable")?.latest_user(user)
+
     }
     pub(super) fn apply(&mut self,confirmed:Option<&Option<String>>,updates:Vec<ApprovalUpdate>,events:&mut Vec<Event>)->Option<String>{
         if let Some(identity)=confirmed && self.session.as_ref()!=identity.as_ref(){
@@ -274,6 +280,20 @@ mod tests {
         assert_eq!(authority.pending_store().unwrap().prepared(&id).unwrap().expected_session.as_deref(),Some("actual-session"));
         assert!(matches!(authority.original(Some("unknown-user"),0,32),Err(OriginalError::Unavailable(_))),"Lifecycle attribution does not grant original acceptance");drop(authority);
         let mut cold=annotations::storage::Store::for_test(&storage,&scope,"actual-session").unwrap();cold.purge_for_test().unwrap();assert!(!own.text.path.exists());assert!(other.text.path.exists());assert!(cold.prepared("other-command").is_ok());
+    }
+
+    #[test]
+    fn unavailable_new_acceptance_never_skips_latest_invalidation_or_later_rejection_cleanup(){
+        use annotations::{OriginalSettings,OriginalUpdate,Setting};
+        let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();
+        let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
+        let mut authority=Authority::new(Ok(scope));authority.root=Some(root.path().join("annotations"));authority.apply(Some(&Some("session".into())),vec![],&mut vec![]);
+        let mut command=Command::Prompt{text:"older".into(),attachments:vec![],mode:crate::chat::PromptMode::Send};let older=authority.prepare(&mut command,root.path()).unwrap().unwrap();
+        let settings=OriginalSettings{model:Setting::Value("reported".into()),reasoning:Setting::Value("low".into()),fast:Setting::Unsupported,permission:Setting::Value("ask".into())};
+        assert!(authority.originals(vec![OriginalUpdate::Settings{command_id:older.clone(),settings},OriginalUpdate::Accepted{command_id:older,session_id:"session".into(),user_id:"older-user".into(),turn_id:"older-turn".into(),aliases:vec![]},OriginalUpdate::Latest{session_id:"session".into(),user_id:"older-user".into()}]).is_none());assert_eq!(authority.original(None,0,32).unwrap().text,"older");
+        let newer=authority.prepare(&mut command,root.path()).unwrap().unwrap();let rejected=authority.prepare(&mut command,root.path()).unwrap().unwrap();let rejected_path=authority.pending_store().unwrap().prepared(&rejected).unwrap().text.path;
+        assert!(authority.originals(vec![OriginalUpdate::Accepted{command_id:newer,session_id:"session".into(),user_id:"newer-user".into(),turn_id:"newer-turn".into(),aliases:vec![]},OriginalUpdate::Latest{session_id:"session".into(),user_id:"newer-user".into()},OriginalUpdate::Rejected{command_id:rejected.clone()}]).is_some());
+        assert!(matches!(authority.original(None,0,32),Err(OriginalError::Unavailable(_))));assert_eq!(authority.latest_proven.as_deref(),Some("newer-user"));assert!(!rejected_path.exists());assert!(authority.pending_store().unwrap().prepared(&rejected).is_err());
     }
 
 }
