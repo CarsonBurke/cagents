@@ -1370,16 +1370,21 @@ impl TerminalHandle {
             order.handoff=true;
         }
         if !self.is_completed() {
-            let (reply, result) = crossbeam_channel::bounded(1);
-            if let Err(error)=self.send_command(Command::PreserveForRestart(reply)) {
-                // No command was accepted, so original ownership is known. Wake
-                // any deadline parked behind this provisional handoff fence.
+            let reopen = || {
                 self.inner.published.input_order.lock().unwrap_or_else(|p|p.into_inner()).handoff=false;
                 joins::ownership_changed();
+            };
+            let (reply, result) = crossbeam_channel::bounded(1);
+            if let Err(error)=self.send_command(Command::PreserveForRestart(reply)) {
+                // No command was accepted, so original ownership is known.
+                reopen();
                 return Err(error.to_string());
             }
-            result.recv_timeout(WORKER_JOIN_TIMEOUT * 2)
-                .map_err(|_|"Terminal preservation outcome is unknown; ownership remains fenced".to_string())??;
+            match result.recv_timeout(WORKER_JOIN_TIMEOUT * 2) {
+                Ok(Ok(())) => {},
+                Ok(Err(reason)) => {reopen();return Err(reason);},
+                Err(_) => return Err("Terminal preservation outcome is unknown; ownership remains fenced".into()),
+            }
         }
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
         if !self.join_worker_until(deadline, false) {
@@ -6789,6 +6794,18 @@ mod tests {
         let deadline=Instant::now()+Duration::from_secs(2);
         while published.worker_join.load(Ordering::Acquire)==1 {assert!(Instant::now()<deadline);thread::yield_now();}
         assert_eq!(published.worker_join.load(Ordering::Acquire),2);
+    }
+
+    #[test]
+    fn known_legacy_preservation_refusal_reopens_the_same_live_worker() {
+        let handle=TerminalHandle::spawn(shell_session("echo LEGACY_PRESERVE_READY; exec cat"),TerminalConfig::default(),|_|{}).unwrap();
+        wait_for_text(&handle,"LEGACY_PRESERVE_READY");
+        let error=handle.preserve_for_restart().unwrap_err();
+        assert!(error.contains("legacy terminal"),"{error}");
+        assert!(!handle.inner.published.input_order.lock().unwrap().handoff,"known no-transfer refusal restores original input ownership");
+        handle.input(b"LEGACY_PRESERVE_STILL_ALIVE\n".to_vec()).unwrap();
+        wait_for_text(&handle,"LEGACY_PRESERVE_STILL_ALIVE");
+        handle.shutdown().unwrap();
     }
 
     #[test]
