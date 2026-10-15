@@ -61,7 +61,10 @@ fn row_id(kind: &str, row: uuid::Uuid) -> widget::Id {
 }
 
 fn environment_id(row: uuid::Uuid, value: bool) -> widget::Id {
-    widget::Id::new(format!("settings.agent.environment.{}.{row}", if value { "value" } else { "name" }))
+    widget::Id::new(format!(
+        "settings.agent.environment.{}.{row}",
+        if value { "value" } else { "name" }
+    ))
 }
 
 fn argument_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a, Message> {
@@ -70,39 +73,44 @@ fn argument_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a, M
     let argument_owner = entry.argument_owner;
     for (index, argument) in configuration.arguments.iter().enumerate() {
         let row = entry.argument_rows[index];
-        arguments.push(widget::id_container(
-            widget::row::with_children(vec![
-                crate::ui_controls::field::text("Argument", argument)
-                    .id(argument_id(row))
-                    .on_input(move |value| Message::AgentListEdited {
-                        provider,
-                        owner: argument_owner,
-                        edit: AgentListEdit::Argument { row, value },
-                    })
-                    .width(Length::Fill)
-                    .into(),
-                crate::ui_controls::icon_button(Icon::Close, "Remove argument")
-                    .on_press(Message::AgentListEdited {
-                        provider,
-                        owner: argument_owner,
-                        edit: AgentListEdit::RemoveArgument(row),
-                    })
-                    .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Center),
-            row_id("arguments", row),
-        ).into());
+        arguments.push(
+            widget::id_container(
+                widget::row::with_children(vec![
+                    crate::ui_controls::field::text("Argument", argument)
+                        .id(argument_id(row))
+                        .on_input(move |value| Message::AgentListEdited {
+                            provider,
+                            owner: argument_owner,
+                            edit: AgentListEdit::Argument { row, value },
+                        })
+                        .width(Length::Fill)
+                        .into(),
+                    crate::ui_controls::icon_button(Icon::Close, "Remove argument")
+                        .on_press(Message::AgentListEdited {
+                            provider,
+                            owner: argument_owner,
+                            edit: AgentListEdit::RemoveArgument(row),
+                        })
+                        .into(),
+                ])
+                .spacing(space::S)
+                .align_y(Alignment::Center),
+                row_id("arguments", row),
+            )
+            .into(),
+        );
     }
-    arguments.push(widget::id_container(
-        crate::ui_controls::button::quiet("Add argument")
-            .on_press(Message::AgentListEdited {
+    arguments.push(
+        widget::id_container(
+            crate::ui_controls::button::quiet("Add argument").on_press(Message::AgentListEdited {
                 provider,
                 owner: argument_owner,
                 edit: AgentListEdit::AddArgument,
             }),
-        row_id("arguments.add", argument_owner),
-    ).into());
+            row_id("arguments.add", argument_owner),
+        )
+        .into(),
+    );
     // Named children use the patched core's exact identity reconciliation,
     // including a remove-plus-add batch with no change in list length.
     widget::column::with_children(arguments)
@@ -115,49 +123,56 @@ fn environment_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a
     let environment_owner = entry.environment_owner;
     for (index, (name, value)) in entry.environment.iter().enumerate() {
         let row = entry.environment_rows[index];
-        environment.push(widget::id_container(
-            widget::row::with_children(vec![
-                crate::ui_controls::field::text("NAME", name)
-                    .id(environment_id(row, false))
-                    .on_input(move |value| Message::AgentListEdited {
-                        provider,
-                        owner: environment_owner,
-                        edit: AgentListEdit::EnvironmentName { row, value },
-                    })
-                    .width(Length::FillPortion(2))
-                    .into(),
-                crate::ui_controls::field::text("Value", value)
-                    .id(environment_id(row, true))
-                    .secure(true)
-                    .on_input(move |value| Message::AgentListEdited {
-                        provider,
-                        owner: environment_owner,
-                        edit: AgentListEdit::EnvironmentValue { row, value },
-                    })
-                    .width(Length::FillPortion(3))
-                    .into(),
-                crate::ui_controls::icon_button(Icon::Close, "Remove environment variable")
-                    .on_press(Message::AgentListEdited {
-                        provider,
-                        owner: environment_owner,
-                        edit: AgentListEdit::RemoveEnvironment(row),
-                    })
-                    .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Center),
-            row_id("environment", row),
-        ).into());
+        environment.push(
+            widget::id_container(
+                widget::row::with_children(vec![
+                    crate::ui_controls::field::text("NAME", name)
+                        .id(environment_id(row, false))
+                        .on_input(move |value| Message::AgentListEdited {
+                            provider,
+                            owner: environment_owner,
+                            edit: AgentListEdit::EnvironmentName { row, value },
+                        })
+                        .width(Length::FillPortion(2))
+                        .into(),
+                    crate::ui_controls::field::text("Value", value)
+                        .id(environment_id(row, true))
+                        .secure(true)
+                        .on_input(move |value| Message::AgentListEdited {
+                            provider,
+                            owner: environment_owner,
+                            edit: AgentListEdit::EnvironmentValue { row, value },
+                        })
+                        .width(Length::FillPortion(3))
+                        .into(),
+                    crate::ui_controls::icon_button(Icon::Close, "Remove environment variable")
+                        .on_press(Message::AgentListEdited {
+                            provider,
+                            owner: environment_owner,
+                            edit: AgentListEdit::RemoveEnvironment(row),
+                        })
+                        .into(),
+                ])
+                .spacing(space::S)
+                .align_y(Alignment::Center),
+                row_id("environment", row),
+            )
+            .into(),
+        );
     }
-    environment.push(widget::id_container(
-        crate::ui_controls::button::quiet("Add environment variable")
-            .on_press(Message::AgentListEdited {
-                provider,
-                owner: environment_owner,
-                edit: AgentListEdit::AddEnvironment,
-            }),
-        row_id("environment.add", environment_owner),
-    ).into());
+    environment.push(
+        widget::id_container(
+            crate::ui_controls::button::quiet("Add environment variable").on_press(
+                Message::AgentListEdited {
+                    provider,
+                    owner: environment_owner,
+                    edit: AgentListEdit::AddEnvironment,
+                },
+            ),
+            row_id("environment.add", environment_owner),
+        )
+        .into(),
+    );
     widget::column::with_children(environment)
         .spacing(space::XS)
         .into()
@@ -268,14 +283,24 @@ pub(super) fn controls<'a>(
 mod tests {
     use super::*;
 
-    fn input_states(tree: &iced::advanced::widget::Tree) -> std::collections::BTreeMap<String, (bool, widget::text_input::Cursor)> {
+    fn input_states(
+        tree: &iced::advanced::widget::Tree,
+    ) -> std::collections::BTreeMap<String, (bool, widget::text_input::Cursor)> {
         let mut states = std::collections::BTreeMap::new();
-        fn visit(tree: &iced::advanced::widget::Tree, states: &mut std::collections::BTreeMap<String, (bool, widget::text_input::Cursor)>) {
+        fn visit(
+            tree: &iced::advanced::widget::Tree,
+            states: &mut std::collections::BTreeMap<String, (bool, widget::text_input::Cursor)>,
+        ) {
             if tree.tag == iced::advanced::widget::tree::Tag::of::<widget::text_input::State>() {
                 let state = tree.state.downcast_ref::<widget::text_input::State>();
-                states.insert(tree.id.as_ref().expect("explicit input ID").to_string(), (state.is_focused(), state.cursor()));
+                states.insert(
+                    tree.id.as_ref().expect("explicit input ID").to_string(),
+                    (state.is_focused(), state.cursor()),
+                );
             }
-            for child in &tree.children { visit(child, states); }
+            for child in &tree.children {
+                visit(child, states);
+            }
         }
         visit(tree, &mut states);
         states
@@ -283,9 +308,18 @@ mod tests {
 
     #[test]
     fn settings_agent_named_rows_preserve_native_state_across_actual_reducer_batches() {
-        use cosmic::iced::advanced::{Layout, layout, renderer::Headless, widget::Tree, widget::operation};
-        let renderer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-            .block_on(cosmic::Renderer::new(cosmic::iced::Font::MONOSPACE, iced::Pixels(14.0), Some("tiny-skia")))
+        use cosmic::iced::advanced::{
+            Layout, layout, renderer::Headless, widget::Tree, widget::operation,
+        };
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                cosmic::iced::Font::MONOSPACE,
+                iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
             .expect("headless renderer");
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(700.0, 500.0));
         // Cover each environment cell, with both focused-removal and focused-
@@ -299,23 +333,49 @@ mod tests {
                     let (kind, rows, owner) = if mode == 0 {
                         ("arguments", &draft.argument_rows, draft.argument_owner)
                     } else {
-                        ("environment", &draft.environment_rows, draft.environment_owner)
+                        (
+                            "environment",
+                            &draft.environment_rows,
+                            draft.environment_owner,
+                        )
                     };
                     let removed = rows[0];
                     let survivor = rows[1];
-                    let input = |row| if mode == 0 { argument_id(row) } else { environment_id(row, mode == 2) };
+                    let input = |row| {
+                        if mode == 0 {
+                            argument_id(row)
+                        } else {
+                            environment_id(row, mode == 2)
+                        }
+                    };
                     let focused = input(if remove_focused { removed } else { survivor });
-                    let mut before = if mode == 0 { argument_rows(provider, &draft) } else { environment_rows(provider, &draft) };
+                    let mut before = if mode == 0 {
+                        argument_rows(provider, &draft)
+                    } else {
+                        environment_rows(provider, &draft)
+                    };
                     let mut tree = Tree::new(before.as_widget());
                     let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
-                    before.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
-                        &mut operation::focusable::focus::<()>(focused.clone()));
+                    before.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(focused.clone()),
+                    );
                     // Assign distinguishable native caret state to every cell,
                     // not just the one whose focus survives a moved row.
                     for (index, row) in rows.iter().enumerate() {
-                        for id in if mode == 0 { vec![argument_id(*row)] } else { vec![environment_id(*row, false), environment_id(*row, true)] } {
-                            before.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
-                                &mut operation::text_input::move_cursor_to::<()>(id, index));
+                        for id in if mode == 0 {
+                            vec![argument_id(*row)]
+                        } else {
+                            vec![environment_id(*row, false), environment_id(*row, true)]
+                        } {
+                            before.as_widget_mut().operate(
+                                &mut tree,
+                                Layout::new(&node),
+                                &renderer,
+                                &mut operation::text_input::move_cursor_to::<()>(id, index),
+                            );
                         }
                     }
                     let original = input_states(&tree);
@@ -326,35 +386,90 @@ mod tests {
                         // owners even when all displayed values are equal.
                         app.settings_draft = SettingsDraft::from_settings(&app.settings);
                     } else {
-                        let edit = if mode == 0 { AgentListEdit::RemoveArgument(removed) } else { AgentListEdit::RemoveEnvironment(removed) };
-                        drop(app.update(Message::AgentListEdited { provider, owner, edit }));
+                        let edit = if mode == 0 {
+                            AgentListEdit::RemoveArgument(removed)
+                        } else {
+                            AgentListEdit::RemoveEnvironment(removed)
+                        };
+                        drop(app.update(Message::AgentListEdited {
+                            provider,
+                            owner,
+                            edit,
+                        }));
                         if mutation == 1 {
-                            let edit = if mode == 0 { AgentListEdit::AddArgument } else { AgentListEdit::AddEnvironment };
-                            drop(app.update(Message::AgentListEdited { provider, owner, edit }));
+                            let edit = if mode == 0 {
+                                AgentListEdit::AddArgument
+                            } else {
+                                AgentListEdit::AddEnvironment
+                            };
+                            drop(app.update(Message::AgentListEdited {
+                                provider,
+                                owner,
+                                edit,
+                            }));
                         }
                     }
                     let updated = &app.settings_draft.agents[&provider];
-                    let (new_rows, new_owner) = if mode == 0 { (&updated.argument_rows, updated.argument_owner) } else { (&updated.environment_rows, updated.environment_owner) };
+                    let (new_rows, new_owner) = if mode == 0 {
+                        (&updated.argument_rows, updated.argument_owner)
+                    } else {
+                        (&updated.environment_rows, updated.environment_owner)
+                    };
                     assert_eq!(new_rows.len(), if mutation == 0 { 1 } else { 2 });
-                    let mut after = if mode == 0 { argument_rows(provider, updated) } else { environment_rows(provider, updated) };
+                    let mut after = if mode == 0 {
+                        argument_rows(provider, updated)
+                    } else {
+                        environment_rows(provider, updated)
+                    };
                     after.as_widget_mut().diff(&mut tree);
                     let _ = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
-                    let expected_rows = new_rows.iter().map(|row| row_id(kind, *row).to_string())
-                        .chain(std::iter::once(row_id(&format!("{kind}.add"), new_owner).to_string())).collect::<Vec<_>>();
-                    assert_eq!(tree.children.iter().map(|child| child.id.as_ref().unwrap().to_string()).collect::<Vec<_>>(), expected_rows,
-                        "physical state order must equal current rendered row order");
+                    let expected_rows = new_rows
+                        .iter()
+                        .map(|row| row_id(kind, *row).to_string())
+                        .chain(std::iter::once(
+                            row_id(&format!("{kind}.add"), new_owner).to_string(),
+                        ))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        tree.children
+                            .iter()
+                            .map(|child| child.id.as_ref().unwrap().to_string())
+                            .collect::<Vec<_>>(),
+                        expected_rows,
+                        "physical state order must equal current rendered row order"
+                    );
                     let actual = input_states(&tree);
                     for (id, state) in &actual {
-                        if mutation != 2 && let Some(previous) = original.get(id) {
-                            assert_eq!(state, previous, "surviving input keeps its own focus AND caret: {id}");
+                        if mutation != 2
+                            && let Some(previous) = original.get(id)
+                        {
+                            assert_eq!(
+                                state, previous,
+                                "surviving input keeps its own focus AND caret: {id}"
+                            );
                         } else {
                             assert!(!state.0, "new row/list cannot inherit removed focus: {id}");
-                            assert_eq!(state.1, widget::text_input::Cursor::default(), "new row/list cannot inherit removed caret: {id}");
+                            assert_eq!(
+                                state.1,
+                                widget::text_input::Cursor::default(),
+                                "new row/list cannot inherit removed caret: {id}"
+                            );
                         }
                     }
                     assert!(!actual.contains_key(&input(removed).to_string()));
-                    let focused_ids = actual.iter().filter(|(_, state)| state.0).map(|(id, _)| id.clone()).collect::<Vec<_>>();
-                    assert_eq!(focused_ids, if mutation != 2 && !remove_focused { vec![input(survivor).to_string()] } else { Vec::new() });
+                    let focused_ids = actual
+                        .iter()
+                        .filter(|(_, state)| state.0)
+                        .map(|(id, _)| id.clone())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        focused_ids,
+                        if mutation != 2 && !remove_focused {
+                            vec![input(survivor).to_string()]
+                        } else {
+                            Vec::new()
+                        }
+                    );
                 }
             }
         }
