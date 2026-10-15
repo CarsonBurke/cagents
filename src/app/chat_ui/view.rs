@@ -6592,56 +6592,56 @@ mod tests {
         let answers = Answers::default();
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         for width in [160.0, 640.0] {
-        for surface in [RequestSurface::Transcript, RequestSurface::Permissions] {
-            let mut tree = Tree::empty();
-            for restoring in [false, true, false] {
-                let mut element = request_view_with_restore(
-                    target,
-                    &request,
-                    &answers,
-                    true,
-                    surface,
-                    Some(false),
-                    restoring,
-                );
-                tree.diff(element.as_widget_mut());
-                let node = element.as_widget_mut().layout(
-                    &mut tree,
-                    &renderer,
-                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0)),
-                );
-                let accessible = element.as_widget().a11y_nodes(
-                    Layout::new(&node),
-                    &tree,
-                    iced::mouse::Cursor::Unavailable,
-                );
-                for (label, disabled) in [
-                    ("allow", restoring),
-                    ("allow_session", restoring),
-                    ("deny", false),
-                ] {
-                    let control = accessible
-                        .root()
-                        .iter()
-                        .chain(accessible.children())
-                        .find(|node| {
-                            node.node().role() == iced_accessibility::accesskit::Role::Button
-                            && node.node().label().is_some_and(|name| {
-                                name == label
-                                    || name.strip_suffix(" (Enter)") == Some(label)
-                                    || name.strip_suffix(" (Esc)") == Some(label)
-                            })
-                        })
-                        .expect("mounted decision");
-                    assert_eq!(
-                        control.node().is_disabled(),
-                        disabled,
-                        "{width}px: {label} while restoring={restoring}"
+            for surface in [RequestSurface::Transcript, RequestSurface::Permissions] {
+                let mut tree = Tree::empty();
+                for restoring in [false, true, false] {
+                    let mut element = request_view_with_restore(
+                        target,
+                        &request,
+                        &answers,
+                        true,
+                        surface,
+                        Some(false),
+                        restoring,
                     );
+                    tree.diff(element.as_widget_mut());
+                    let node = element.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0)),
+                    );
+                    let accessible = element.as_widget().a11y_nodes(
+                        Layout::new(&node),
+                        &tree,
+                        iced::mouse::Cursor::Unavailable,
+                    );
+                    for (label, disabled) in [
+                        ("allow", restoring),
+                        ("allow_session", restoring),
+                        ("deny", false),
+                    ] {
+                        let control = accessible
+                            .root()
+                            .iter()
+                            .chain(accessible.children())
+                            .find(|node| {
+                                node.node().role() == iced_accessibility::accesskit::Role::Button
+                                    && node.node().label().is_some_and(|name| {
+                                        name == label
+                                            || name.strip_suffix(" (Enter)") == Some(label)
+                                            || name.strip_suffix(" (Esc)") == Some(label)
+                                    })
+                            })
+                            .expect("mounted decision");
+                        assert_eq!(
+                            control.node().is_disabled(),
+                            disabled,
+                            "{width}px: {label} while restoring={restoring}"
+                        );
+                    }
                 }
             }
         }
-    }
     }
 
     #[test]

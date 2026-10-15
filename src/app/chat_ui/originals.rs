@@ -342,9 +342,13 @@ impl Runtime {
         // metadata probe, then rearm it when the same context becomes idle.
         let eligible = self.original_metadata_available();
         if !eligible {
-            if self.recovery.originals.query.as_ref().is_some_and(|query| {
-                matches!(query.purpose, Purpose::Metadata)
-            }) {
+            if self
+                .recovery
+                .originals
+                .query
+                .as_ref()
+                .is_some_and(|query| matches!(query.purpose, Purpose::Metadata))
+            {
                 self.recovery.originals.query = None;
                 self.recovery.originals.attempted = false;
             }

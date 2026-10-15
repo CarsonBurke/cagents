@@ -1,9 +1,28 @@
+// Copyright 2019 Héctor Ramón, Iced contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 //! Message footers retain native hover behavior and expose their real controls.
 //!
 //! Based on iced_widget::helpers::hover (MIT, iced contributors). The pinned
 //! implementation omits a11y_nodes, so use this local forwarding correction.
-use cosmic::iced::{Element, Length, advanced as core, window};
 use core::{Widget, overlay, widget::operation};
+use cosmic::iced::{Element, Length, advanced as core, window};
 
 pub(super) fn hover<'a, Message, Theme, Renderer>(
     base: impl Into<Element<'a, Message, Theme, Renderer>>,
@@ -15,7 +34,10 @@ where
     Renderer: core::Renderer + 'a,
 {
     use cosmic::iced::advanced::{
-        Shell, layout::{self, Layout}, mouse, renderer, widget::tree::{self, Tree},
+        Shell,
+        layout::{self, Layout},
+        mouse, renderer,
+        widget::tree::{self, Tree},
     };
     use cosmic::iced::{Event, Rectangle, Size};
 
@@ -59,11 +81,10 @@ where
             renderer: &Renderer,
             limits: &layout::Limits,
         ) -> layout::Node {
-            let base = self.base.as_widget_mut().layout(
-                &mut tree.children[0],
-                renderer,
-                limits,
-            );
+            let base = self
+                .base
+                .as_widget_mut()
+                .layout(&mut tree.children[0], renderer, limits);
 
             let top = self.top.as_widget_mut().layout(
                 &mut tree.children[1],
@@ -107,8 +128,13 @@ where
 
                     renderer.with_layer(bounds, |renderer| {
                         self.top.as_widget().draw(
-                            top_tree, renderer, theme, style, top_layout.with_virtual_offset(layout.virtual_offset()),
-                            cursor, viewport,
+                            top_tree,
+                            renderer,
+                            theme,
+                            style,
+                            top_layout.with_virtual_offset(layout.virtual_offset()),
+                            cursor,
+                            viewport,
                         );
                     });
                 }
@@ -122,9 +148,12 @@ where
             renderer: &Renderer,
             operation: &mut dyn operation::Operation,
         ) {
-            let children = [&mut self.base, &mut self.top]
-                .into_iter()
-                .zip(layout.children().map(|node| node.with_virtual_offset(layout.virtual_offset())).zip(&mut tree.children));
+            let children = [&mut self.base, &mut self.top].into_iter().zip(
+                layout
+                    .children()
+                    .map(|node| node.with_virtual_offset(layout.virtual_offset()))
+                    .zip(&mut tree.children),
+            );
 
             for (child, (layout, tree)) in children {
                 child
@@ -150,8 +179,7 @@ where
 
             let is_hovered = cursor.is_over(layout.bounds());
 
-            if matches!(event, Event::Window(window::Event::RedrawRequested(_)))
-            {
+            if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
                 let mut count_focused = operation::focusable::count();
 
                 self.top.as_widget_mut().operate(
@@ -171,22 +199,24 @@ where
                 shell.request_redraw();
             }
 
-            let is_visible =
-                is_hovered || self.is_top_focused || self.is_top_overlay_active;
+            let is_visible = is_hovered || self.is_top_focused || self.is_top_overlay_active;
 
             if matches!(
                 event,
-                Event::Mouse(
-                    mouse::Event::CursorMoved { .. }
-                        | mouse::Event::ButtonReleased(_)
-                )
+                Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::ButtonReleased(_))
             ) || is_visible
             {
                 let redraw_request = shell.redraw_request();
 
                 self.top.as_widget_mut().update(
-                    top_tree, event, top_layout.with_virtual_offset(layout.virtual_offset()), cursor, renderer, clipboard,
-                    shell, viewport,
+                    top_tree,
+                    event,
+                    top_layout.with_virtual_offset(layout.virtual_offset()),
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
                 );
 
                 // Ignore redraw requests of invisible content
@@ -222,11 +252,17 @@ where
             [&self.base, &self.top]
                 .into_iter()
                 .rev()
-                .zip(layout.children().rev().map(|node| node.with_virtual_offset(layout.virtual_offset())).zip(tree.children.iter().rev()))
+                .zip(
+                    layout
+                        .children()
+                        .rev()
+                        .map(|node| node.with_virtual_offset(layout.virtual_offset()))
+                        .zip(tree.children.iter().rev()),
+                )
                 .map(|(child, (layout, tree))| {
-                    child.as_widget().mouse_interaction(
-                        tree, layout, cursor, viewport, renderer,
-                    )
+                    child
+                        .as_widget()
+                        .mouse_interaction(tree, layout, cursor, viewport, renderer)
                 })
                 .find(|&interaction| interaction != mouse::Interaction::None)
                 .unwrap_or_default()
@@ -239,11 +275,16 @@ where
             renderer: &Renderer,
             destinations: &mut core::clipboard::DndDestinationRectangles,
         ) {
-            for (child, (node, state)) in [&self.base, &self.top].into_iter()
+            for (child, (node, state)) in [&self.base, &self.top]
+                .into_iter()
                 .zip(layout.children().zip(&tree.children))
             {
-                child.as_widget().drag_destinations(state,
-                    node.with_virtual_offset(layout.virtual_offset()), renderer, destinations);
+                child.as_widget().drag_destinations(
+                    state,
+                    node.with_virtual_offset(layout.virtual_offset()),
+                    renderer,
+                    destinations,
+                );
             }
         }
 
@@ -256,11 +297,16 @@ where
             // Focusable actions remain in the accessibility tree while the
             // pointer is elsewhere, just as operate() keeps them focusable.
             iced_accessibility::A11yTree::join(
-                [&self.base, &self.top].into_iter()
+                [&self.base, &self.top]
+                    .into_iter()
                     .zip(layout.children().zip(&tree.children))
-                    .map(|(child, (node, state))| child.as_widget().a11y_nodes(
-                        node.with_virtual_offset(layout.virtual_offset()), state, cursor,
-                    )),
+                    .map(|(child, (node, state))| {
+                        child.as_widget().a11y_nodes(
+                            node.with_virtual_offset(layout.virtual_offset()),
+                            state,
+                            cursor,
+                        )
+                    }),
             )
         }
 
@@ -271,19 +317,19 @@ where
             renderer: &Renderer,
             viewport: &Rectangle,
             translation: cosmic::iced::Vector,
-        ) -> Option<core::overlay::Element<'b, Message, Theme, Renderer>>
-        {
+        ) -> Option<core::overlay::Element<'b, Message, Theme, Renderer>> {
             let mut overlays = [&mut self.base, &mut self.top]
                 .into_iter()
-                .zip(layout.children().map(|node| node.with_virtual_offset(layout.virtual_offset())).zip(tree.children.iter_mut()))
+                .zip(
+                    layout
+                        .children()
+                        .map(|node| node.with_virtual_offset(layout.virtual_offset()))
+                        .zip(tree.children.iter_mut()),
+                )
                 .map(|(child, (layout, tree))| {
-                    child.as_widget_mut().overlay(
-                        tree,
-                        layout,
-                        renderer,
-                        viewport,
-                        translation,
-                    )
+                    child
+                        .as_widget_mut()
+                        .overlay(tree, layout, renderer, viewport, translation)
                 });
 
             if let Some(base_overlay) = overlays.next()? {
@@ -305,4 +351,3 @@ where
         is_hovered: false,
     })
 }
-

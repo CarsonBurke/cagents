@@ -13,9 +13,8 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-mod auth_recovery;
 mod answer_row;
-mod message_hover;
+mod auth_recovery;
 mod changes;
 mod clipboard_image;
 mod clipboard_intent;
@@ -27,6 +26,7 @@ mod hover;
 mod images;
 mod layout;
 mod markdown_source;
+mod message_hover;
 mod monospace;
 mod originals;
 mod permissions;
