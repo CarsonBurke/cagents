@@ -3939,8 +3939,8 @@ mod memory_contracts {
             spans[2].color,
             Some(Color::from_rgba8(200, 100, 50, 128.0 / 255.0))
         );
-        assert!(spans[0].background.is_none());
-        assert!(spans[2].background.is_some());
+        assert!(spans[0].highlight.is_none());
+        assert!(spans[2].highlight.is_some());
     }
 }
 

@@ -6180,7 +6180,7 @@ impl RepositoryRuntime {
         basis: DiffBasis,
         old_path: Option<PathBuf>,
     ) -> Task<RepositoryAction> {
-        if self.mutation_refresh_pending && !basis.is_immutable() {
+        if !self.diff_surface_visible || (self.mutation_refresh_pending && !basis.is_immutable()) {
             return Task::none();
         }
         self.next_diff_request = self.next_diff_request.wrapping_add(1).max(1);
