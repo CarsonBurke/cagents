@@ -669,7 +669,7 @@ pub(super) fn process_request(
                             },
                         )
                     {
-                        warnings.push(format!("Worktree was created, but its project could not be opened in the sidebar: {error}"));
+                        warnings.push(format!("Worktree was created, but its project could not be opened in the sidebar: {}", error.message));
                     }
                 }
             }
@@ -716,8 +716,11 @@ pub(super) fn process_request(
                     match started {
                         Ok(session) => setup.terminal = Some(session),
                         Err(error) => {
-                            warnings.push(format!("Worktree was created, but its setup terminal could not start: {error}"));
-                            setup.error = Some(error.to_string());
+                            warnings.push(format!(
+                                "Worktree was created, but its setup terminal could not start: {}",
+                                error.message
+                            ));
+                            setup.error = Some(error.message);
                         }
                     }
                 }

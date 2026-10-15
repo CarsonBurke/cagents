@@ -880,7 +880,7 @@ impl Handle {
         let close = self.0.close_state.lock().unwrap_or_else(|p| p.into_inner());
         let activity = if close.unobserved_native {
             ActivityState::Unknown
-        } else if (close.admitted_work || close.compacting || !state.queued.is_empty())
+        } else if (close.admitted_work || close.compacting || !state.queued_messages.is_empty())
             && !state.exited
         {
             ActivityState::Working
@@ -1692,12 +1692,14 @@ fn preflight_inner(
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(holder) = self
-            .retained_native
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
+        let retained = match self.retained_native.try_lock() {
+            Ok(mut owner) => owner.take(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+            // The actor still owns this Arc/guard. Its existing owner remains
+            // responsible; final frontend destruction cannot wait for it.
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(holder) = retained {
             native_reconcile::retire_final(holder);
         }
         let _ = self
