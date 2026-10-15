@@ -2885,6 +2885,7 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            conversation_channels: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
