@@ -1,6 +1,8 @@
 //! Actual Store provenance borrowed only inside its owned source read lease.
 //! The codec receives no path/UUID constructor and never retains the owner's
 //! exclusive lease. Only its owned receipt may leave the finished snapshot.
+//! Namespace admission and reader SH locking happen later in codec order; this
+//! capture performs no namespace/flock wait while holding the Store snapshot.
 use super::*;
 use crate::transcript_cache::export::{SourceRevocationEpoch, StoreSourceReceipt};
 
@@ -16,7 +18,8 @@ impl StoreExportSeed<'_> {
     pub(crate) fn source_revocation(&self) -> &SourceRevocationEpoch { &self.store.source_revocation }
 }
 impl Store {
-    pub(in crate::chat::runtime) fn capture_export_source(&self) -> Result<StoreSourceReceipt, String> {
+    pub(in crate::chat::runtime) fn capture_export_source(&self, expires: std::time::Instant) -> Result<StoreSourceReceipt, String> {
+        if std::time::Instant::now() >= expires { return Err("Export source capture deadline expired".into()); }
         self.source_guard()?;
         self.with_source_read(|error| error, |store| {
             // This seed cannot escape: factory output is owned, and the read
@@ -27,7 +30,7 @@ impl Store {
             if probe.incarnation() != seed.source_incarnation() {
                 return Err("Export source revocation identity does not match the actual Store".into());
             }
-            StoreSourceReceipt::capture(&seed).map_err(|error| error.to_string())
+            StoreSourceReceipt::capture(&seed, expires).map_err(|error| error.to_string())
         })
     }
 }
@@ -38,21 +41,21 @@ mod tests {
     #[test]
     fn actual_store_seed_refuses_failed_reset_and_future_raw_schema() {
         let mut store=Store::new().unwrap();
-        assert!(store.capture_export_source().is_ok());
+        assert!(store.capture_export_source(std::time::Instant::now()+std::time::Duration::from_secs(1)).is_ok());
         store.refuse_source_reset_for_test(true);
         assert!(store.apply(Event::Reset {reason:"refused intent".into()}).is_err());
-        assert!(store.capture_export_source().is_err());
+        assert!(store.capture_export_source(std::time::Instant::now()+std::time::Duration::from_secs(1)).is_err());
         let store=Store::new().unwrap();
         store.db.execute("UPDATE raw_source_schema SET version=999",[]).unwrap();
-        assert!(store.capture_export_source().is_err());
+        assert!(store.capture_export_source(std::time::Instant::now()+std::time::Duration::from_secs(1)).is_err());
     }
     #[test]
     fn export_receipt_does_not_escape_denied_source_snapshot_release() {
         let store=Store::new().unwrap();
         let fault=super::super::read_lease::RollbackFault::install(&store);
-        assert!(store.capture_export_source().is_err());
+        assert!(store.capture_export_source(std::time::Instant::now()+std::time::Duration::from_secs(1)).is_err());
         drop(fault);
         store.db.execute_batch("ROLLBACK").unwrap();
-        assert!(store.capture_export_source().is_err(),"release failure remains poisoned");
+        assert!(store.capture_export_source(std::time::Instant::now()+std::time::Duration::from_secs(1)).is_err(),"release failure remains poisoned");
     }
 }
