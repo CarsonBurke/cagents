@@ -2062,6 +2062,15 @@ pub struct PullRequestDialog {
     retry_confirmation: Option<bool>,
 }
 
+impl PullRequestDialog {
+    fn can_submit(&self) -> bool {
+        !self.title.trim().is_empty()
+            && !self.head.trim().is_empty()
+            && !self.base.trim().is_empty()
+            && self.retry_confirmation != Some(false)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContextTab {
     #[default]
@@ -11942,7 +11951,7 @@ impl Cagents {
         if let Some(dialog) = &self.sidebar_selection_ui.dialog {
             Some(dialog.focus_target())
         } else if self.sidebar_state.pending_discard().is_some() {
-            Some(sidebar::discard_confirm_id())
+            Some(sidebar::discard_cancel_id())
         } else if self.project_ui.modal_open() {
             Some(self.project_ui.focus_target())
         } else if self.channel_ui.modal_open() {
@@ -11956,6 +11965,14 @@ impl Cagents {
         } else {
             None
         }
+    }
+
+    fn pull_request_submission_allowed(&self) -> bool {
+        self.pull_request_dialog.as_ref().is_some_and(|dialog| {
+            dialog.can_submit()
+                && self.github_availability.get(&dialog.project_id)
+                    .and_then(GitHubAvailability::repository_key) == Some(&dialog.repository)
+        })
     }
 
     fn restore_pull_request_dialog(
@@ -15574,7 +15591,7 @@ impl Application for Cagents {
                 if self
                     .pull_request_dialog
                     .as_ref()
-                    .is_some_and(|dialog| dialog.retry_confirmation == Some(false))
+                    .is_some_and(|dialog| !dialog.can_submit())
                 {
                     return Task::none();
                 }
@@ -15671,6 +15688,10 @@ impl Application for Cagents {
             Message::KeyEvent { event, captured } => {
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
+                }
+                #[cfg(feature = "integrated-browser")]
+                if is_escape_press(&event) && self.browser_import_on_top() {
+                    return self.update_browser_import(self.browser_import.escape_action());
                 }
                 if let Some(task) = self.session_recovery_key_event(&event, captured) {
                     return task;
@@ -15832,10 +15853,6 @@ impl Application for Cagents {
                     if let Some((card, _)) = &self.terminal_paste {
                         return self
                             .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
-                    }
-                    #[cfg(feature = "integrated-browser")]
-                    if self.browser_import.open() {
-                        return self.update_browser_import(self.browser_import.escape_action());
                     }
                     if self.update_ui.confirmation.is_some() {
                         return self.update_update_ui(update_ui::Action::CancelApply);
@@ -16883,7 +16900,7 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Title", &dialog.title)
                     .id(pull_request_dialog_focus_id())
                     .on_input(Message::PullRequestTitleChanged)
-                    .on_submit(Message::SubmitPullRequest)
+                    .on_submit_maybe(self.pull_request_submission_allowed().then_some(|_| Message::SubmitPullRequest))
                     .into(),
             ])
             .spacing(space::XS)
@@ -16893,7 +16910,7 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Head branch", &dialog.head)
                     .id(widget::Id::new("dialog.pull-request.head"))
                     .on_input(Message::PullRequestHeadChanged)
-                    .on_submit(Message::SubmitPullRequest)
+                    .on_submit_maybe(self.pull_request_submission_allowed().then_some(|_| Message::SubmitPullRequest))
                     .into(),
             ])
             .spacing(space::XS)
@@ -16903,7 +16920,7 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Base branch", &dialog.base)
                     .id(widget::Id::new("dialog.pull-request.base"))
                     .on_input(Message::PullRequestBaseChanged)
-                    .on_submit(Message::SubmitPullRequest)
+                    .on_submit_maybe(self.pull_request_submission_allowed().then_some(|_| Message::SubmitPullRequest))
                     .into(),
             ])
             .spacing(space::XS)
@@ -16941,16 +16958,7 @@ impl Application for Cagents {
         rows.push(dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel").on_press(Message::CancelDialog),
             crate::ui_controls::button::primary("Create").on_press_maybe(
-                (!head.is_empty()
-                    && !base.is_empty()
-                    && !dialog.title.trim().is_empty()
-                    && dialog.retry_confirmation != Some(false)
-                    && self
-                        .github_availability
-                        .get(&dialog.project_id)
-                        .and_then(GitHubAvailability::repository_key)
-                        == Some(&dialog.repository))
-                .then_some(Message::SubmitPullRequest),
+                self.pull_request_submission_allowed().then_some(Message::SubmitPullRequest),
             ),
         ));
         Some(dialog_ui::overlay(
@@ -20833,6 +20841,32 @@ mod tests {
         ] {
             let message = dialog_ui::tests::enter_control(app.dialog().unwrap(), id);
             assert!(matches!(message, Message::SubmitPullRequest));
+        }
+    }
+
+    #[test]
+    fn pull_request_enter_and_reducer_refuse_blank_fields_without_creator_task() {
+        for field in 0..3 {
+            for value in ["", "   ", "\t"] {
+                let mut app = context_inspector_test_app(false);
+                let mut dialog = pull_request_test_dialog();
+                authorize_pull_request_test(&mut app, &dialog);
+                match field {
+                    0 => dialog.title = value.into(),
+                    1 => dialog.head = value.into(),
+                    _ => dialog.base = value.into(),
+                }
+                app.pull_request_dialog = Some(dialog.clone());
+                assert!(!app.pull_request_submission_allowed());
+                for id in [pull_request_dialog_focus_id(), widget::Id::new("dialog.pull-request.head"), widget::Id::new("dialog.pull-request.base")] {
+                    let (messages, _) = dialog_ui::tests::key_control(app.dialog().unwrap(), id,
+                        dialog_ui::tests::key_press(keyboard::key::Named::Enter));
+                    assert!(!messages.iter().any(|message| matches!(message, Message::SubmitPullRequest)));
+                }
+                let task = app.update(Message::SubmitPullRequest);
+                assert_eq!(task.units(), 0, "invalid form must schedule no creator");
+                assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+            }
         }
     }
 
@@ -26919,6 +26953,29 @@ mod tests {
             Message::Sidebar(SidebarAction::CancelDiscard)
         ));
         drop(app.update(message));
+        assert!(app.sidebar_state.pending_discard().is_none());
+        assert!(app.source_control_mutations.is_empty());
+    }
+
+    #[test]
+    fn discard_reexposed_after_transient_close_still_focuses_cancel() {
+        let mut app = context_inspector_test_app(false);
+        drop(app.update(Message::Sidebar(SidebarAction::RequestDiscard {
+            key: discard_key(), request: discard_request(false),
+        })));
+        // The transient close owner is drawn above discard. Its actual Cancel
+        // reducer must restore the lower confirmation's safe focus target.
+        app.transient_work_close = Some(window::Id::unique());
+        let cancel_upper = dialog_ui::tests::enter_control(app.dialog().unwrap(),
+            widget::Id::new("dialog.transient-close.cancel"));
+        assert!(matches!(cancel_upper, Message::CancelTransientWorkClose));
+        let restoring = app.update(cancel_upper);
+        assert!(app.transient_work_close.is_none());
+        let cancel = sidebar::discard_cancel_id();
+        assert_eq!(focused_element(app.dialog().unwrap(), restoring), Some(cancel.clone()));
+        let enter = dialog_ui::tests::enter_control(app.dialog().unwrap(), cancel);
+        assert!(matches!(enter, Message::Sidebar(SidebarAction::CancelDiscard)));
+        drop(app.update(enter));
         assert!(app.sidebar_state.pending_discard().is_none());
         assert!(app.source_control_mutations.is_empty());
     }

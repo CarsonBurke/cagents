@@ -73,9 +73,34 @@ pub(super) mod tests {
     use super::*;
     /// Feed Enter to the real mounted native control after its focus operation.
     pub(in crate::app) fn enter_control(
-        mut element: Element<'_, Message>,
+        element: Element<'_, Message>,
         id: widget::Id,
     ) -> Message {
+        let (mut messages, _) = key_control(element, id, key_press(keyboard::key::Named::Enter));
+        assert_eq!(
+            messages.len(),
+            1,
+            "Enter must activate one focused native control"
+        );
+        messages.pop().unwrap()
+    }
+    pub(in crate::app) fn key_press(key: keyboard::key::Named) -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key.clone()),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }
+    }
+
+    pub(in crate::app) fn key_control(
+        mut element: Element<'_, Message>,
+        id: widget::Id,
+        event: keyboard::Event,
+    ) -> (Vec<Message>, bool) {
         use iced::advanced::{
             Layout, Shell, clipboard, layout,
             widget::{Tree, operation},
@@ -95,29 +120,19 @@ pub(super) mod tests {
             &mut operation::focusable::focus::<()>(id),
         );
         let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
         element.as_widget_mut().update(
             &mut tree,
-            &iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(keyboard::key::Named::Enter),
-                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
-                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
-                location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::empty(),
-                text: None,
-                repeat: false,
-            }),
+            &iced::Event::Keyboard(event),
             Layout::new(&node),
             iced::mouse::Cursor::Unavailable,
             &renderer,
             &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
+            &mut shell,
             &bounds,
         );
-        assert_eq!(
-            messages.len(),
-            1,
-            "Enter must activate one focused native control"
-        );
-        messages.pop().unwrap()
+        let captured = shell.is_event_captured();
+        (messages, captured)
     }
+
 }

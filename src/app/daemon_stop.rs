@@ -268,6 +268,8 @@ mod tests {
             super::super::tests::focused_element(view, initial),
             Some(widget::Id::new("daemon-stop.cancel"))
         );
+        let unpolled_refresh = app.update(StopMessage::Refresh);
+        assert!(app.pending);
         let task = app
             .update(StopMessage::Refreshed(Ok(app.capability.clone())))
             .map(|_| cosmic::Action::App(Message::DismissStatus));
@@ -275,6 +277,8 @@ mod tests {
             super::super::tests::focused_element(app.view().map(|_| Message::DismissStatus), task),
             Some(widget::Id::new("daemon-stop.cancel"))
         );
+        assert!(!app.pending);
+        drop(unpolled_refresh);
     }
 
     #[test]

@@ -58,6 +58,29 @@ mod tests {
     }
 
     #[test]
+    fn focused_import_filter_captured_escape_cancels_the_visible_import() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update(Message::BrowserImport(Action::Open)));
+        app.browser_import.phase = Phase::Selection;
+        let event = dialog_ui::tests::key_press(keyboard::key::Named::Escape);
+        let (messages, captured) = dialog_ui::tests::key_control(
+            app.dialog().unwrap(), widget::Id::new("dialog.browser-import.filter"), event.clone());
+        assert!(captured, "the actual focused COSMIC input captures Escape");
+        assert!(messages.is_empty());
+        drop(app.update(Message::KeyEvent { event, captured }));
+        assert!(!app.browser_import.open());
+
+        drop(app.update(Message::BrowserImport(Action::Open)));
+        app.browser_import.phase = Phase::Selection;
+        app.transient_work_close = Some(window::Id::unique());
+        drop(app.update(Message::KeyEvent {
+            event: dialog_ui::tests::key_press(keyboard::key::Named::Escape), captured: true,
+        }));
+        assert!(app.browser_import.open(), "an obscured import must not consume the upper owner's Escape");
+        assert!(app.transient_work_close.is_some());
+    }
+
+    #[test]
     fn settings_import_creates_browser_before_its_modal_can_block_creation() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         assert!(app.durable.cards.is_empty());
@@ -518,6 +541,18 @@ impl Cagents {
         }
     }
 
+    // Match the owners drawn above this surface in App::dialog. Captured
+    // Escape from its focused filter still belongs to this visible dialog.
+    pub(super) fn browser_import_on_top(&self) -> bool {
+        self.browser_import.open()
+            && !self.automation_approval_open()
+            && self.transient_work_close.is_none()
+            && !self.automation_ui.draft_dialog_open()
+            && !self.device_ui.open
+            && self.chat_ui.image_viewer.is_none()
+            && self.terminal_paste.is_none()
+    }
+
     pub(super) fn browser_import_dialog(&self) -> Option<Element<'_, Message>> {
         let state = &self.browser_import;
         if !state.open() {
@@ -584,6 +619,7 @@ impl Cagents {
                     content.push(notice_body("Choose sites to import. If profiles overlap, the first selected profile wins. Only SameSite=None cookies are supported; restricted, container, and partitioned cookies are skipped. Some logins may still need signing in."));
                     content.push(
                         crate::ui_controls::field::search("Filter sites or profiles", &state.query)
+                            .id(widget::Id::new("dialog.browser-import.filter"))
                             .on_input(|query| message(Action::Filter(query)))
                             .into(),
                     );
