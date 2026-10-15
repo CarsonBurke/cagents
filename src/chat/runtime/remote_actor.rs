@@ -1509,6 +1509,14 @@ struct Server {
     attachment_preserved: bool,
     source_reads: Option<source_reads::Service>,
 }
+fn metadata_lock<T>(mutex:&Mutex<T>)->Result<std::sync::MutexGuard<'_,T>,String> {
+    match mutex.try_lock() {
+        Ok(guard)=>Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(error))=>Ok(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock)=>Err("CAGENTS_ACTOR_METADATA_BUSY: Retained actor metadata is busy; retry observation".into()),
+    }
+}
+
 impl Server {
     fn start(startup: Startup, control: &UnixStream) -> Result<Self, String> {
         if startup.protocol != PROTOCOL
@@ -1683,98 +1691,64 @@ impl Server {
             changed.fetch_add(1, Ordering::Release);
         }
     }
-    fn revision(&self) -> u64 {
-        self.changed
-            .load(Ordering::Acquire)
-            .wrapping_add(self.actor.close_observation().close_revision)
+    fn revision(&self) -> Result<u64,String> {
+        let close=metadata_lock(&self.actor.0.close_state)?;
+        Ok(self.changed.load(Ordering::Acquire).wrapping_add(close.revision))
     }
     fn resident(&self) -> Result<Resident, String> {
         self.resident_after_copy(|| {})
     }
     fn resident_after_copy(&self, after_copy: impl FnOnce()) -> Result<Resident, String> {
-        // Sample before copying any metadata. A concurrent actor publication
-        // may make this conservative token old, which forces the next poll;
-        // stamping the newest token after copying could hide Ready forever.
-        let changed = self.revision();
-        // Clone resident metadata only. Do not hydrate the Store or serialize
-        // any growing parent/child tool body to service periodic observation.
-        let state = self.actor.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        let generation = state.generation;
-        let session_id = state.session_id.clone();
-        let title = state.title.clone();
-        let ready = state.ready;
-        let busy = state.busy;
-        let waiting = state.waiting;
-        let outcome = state.outcome.clone();
-        let usage = state.usage.clone();
-        let requests = state.requests.clone();
-        drop(state);
+        // Snapshot/presentation may hold resident state during a cache read.
+        // Control-loop observation must refuse contention rather than queue
+        // behind that disk IO and prevent a later explicit Stop admission.
+        let changed=self.revision()?;
+        let state=metadata_lock(&self.actor.0.state)?;
+        let generation=state.generation;
+        let session_id=state.session_id.clone();
+        let title=state.title.clone();
+        let mut ready=state.ready;
+        let mut busy=state.busy;
+        let waiting=state.waiting;
+        let outcome=state.outcome.clone();
+        let usage=state.usage.clone();
+        let requests=state.requests.clone();
+        let owner_failure=metadata_lock(&self.actor.0.failure)?.clone();
+        let actor_failure=owner_failure.clone().or_else(||state.error.clone());
+        let completed=self.actor.is_completed();
+        let owns_work=!self.actor.0.history_only && (!completed || owner_failure.is_some());
+        let close_state=metadata_lock(&self.actor.0.close_state)?;
+        let activity=if close_state.unobserved_native {
+            crate::agent::ActivityState::Unknown
+        } else if (close_state.admitted_work || close_state.compacting || !state.queued_messages.is_empty()) && !state.exited {
+            crate::agent::ActivityState::Working
+        } else {state.activity()};
+        let close=super::CloseObservation {
+            actor_id:close_state.actor_id,close_revision:close_state.revision,turn_generation:state.turn_generation,
+            activity,ready:state.ready && !close_state.unobserved_native,exited:state.exited && !close_state.unobserved_native,
+            completed,closing:!close_state.unobserved_native && (self.actor.0.stop.load(Ordering::Acquire) || self.actor.0.draining.load(Ordering::Acquire)),
+            owns_work:owns_work || close_state.unobserved_native,working_directory:close_state.working_directory.clone(),directory_identity:close_state.directory_identity,
+        };
+        let background_subagents=state.subagents.iter().filter(|agent|agent.background && agent.status==chat::ToolStatus::Running).map(|agent|agent.id.clone()).collect();
+        let interrupt_subagents=state.subagents.iter().filter(|agent|agent.stopped_by_interrupt(&state.capabilities)).map(|agent|agent.id.clone()).collect();
+        drop(close_state);drop(state);
         after_copy();
-        let close = self.actor.close_observation();
-        let activity = close.activity;
-        let working = activity == crate::agent::ActivityState::Working;
-        let busy = busy || working;
-        let ready = ready && close.ready;
-        let idle = activity == crate::agent::ActivityState::Idle && ready && !close.closing;
-        let owns_work = close.owns_work;
-        let completed = close.completed;
-        let provider_process = self.actor.provider_process();
-        let actor_failure = self.actor.failure();
-        let confirmed_session = self.actor.confirmed_session_id();
-        let background_subagents = self.actor.background_subagents();
-        let interrupt_subagents = self.actor.interrupt_subagents();
-        let account_reports = self
-            .account_reports
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        let journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
-        let continuity_loss = journal.continuity_loss()?;
-        let failure = continuity_loss
-            .as_ref()
-            .map(|loss| loss.reason.clone())
-            .or(actor_failure);
-        let outcome = continuity_loss
-            .as_ref()
-            .map(|loss| crate::agent::ActivityOutcome::Interrupted {
-                reason: loss.reason.clone(),
-            })
-            .or(outcome);
+        let working=activity==crate::agent::ActivityState::Working;
+        busy=busy || working;ready=ready && close.ready;
+        let idle=activity==crate::agent::ActivityState::Idle && ready && !close.closing;
+        let provider_process=metadata_lock(&self.actor.0.provider_process)?.clone();
+        let confirmed_session=metadata_lock(&self.actor.0.confirmed_session)?.clone();
+        let account_reports=metadata_lock(&self.account_reports)?.clone();
+        let journal=metadata_lock(&self.journal)?;
+        let continuity_loss=journal.continuity_loss()?;
+        let failure=continuity_loss.as_ref().map(|loss|loss.reason.clone()).or(actor_failure);
+        let outcome=continuity_loss.as_ref().map(|loss|crate::agent::ActivityOutcome::Interrupted {reason:loss.reason.clone()}).or(outcome);
         Ok(Resident {
-            provider_process,
-            generation,
-            session_id,
-            title,
-            ready,
-            busy,
-            waiting,
-            working,
-            activity,
-            outcome,
-            usage,
-            requests,
-            native_continuity: if self.installed {
-                chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
-            } else {
-                chat::NativeContinuity::ReconnectOnly
-            },
-            close,
-            installed: self.installed,
-            owns_work: owns_work || failure.is_some(),
-            completed,
-            idle,
-            failure,
-            confirmed_session,
-            background_subagents,
-            interrupt_subagents,
-            account_reports,
-            next_input: journal.next_input()?,
-            acknowledged_input_count: journal.acknowledged_input_count(),
-            continuity_loss,
-            retained_runs: journal.retained_runs()?,
-            outbox_ack: journal.acknowledged()?,
-            outbox_latest: journal.latest()?,
-            changed,
+            provider_process,generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,
+            native_continuity:if self.installed {chat::NativeContinuity::RetainedClaudeActor {protocol:PROTOCOL}} else {chat::NativeContinuity::ReconnectOnly},
+            owns_work:close.owns_work || failure.is_some(),completed,idle,failure,confirmed_session,background_subagents,interrupt_subagents,
+            close,installed:self.installed,account_reports,next_input:journal.next_input()?,acknowledged_input_count:journal.acknowledged_input_count(),
+            continuity_loss,retained_runs:journal.retained_runs()?,outbox_ack:journal.acknowledged()?,outbox_latest:journal.latest()?,changed,
         })
     }
 
@@ -1901,7 +1875,7 @@ impl Server {
             }
             "state" => {
                 let (after,) = decode!((u64,));
-                if after == self.revision() {
+                if after == self.revision()? {
                     Ok(Value::Null)
                 } else {
                     value!(Some(self.resident()?))
@@ -2853,7 +2827,7 @@ done"#;
             })
             .unwrap();
         assert!(!first.ready);
-        assert_ne!(first.changed, fixture.server.revision());
+        assert_ne!(first.changed, fixture.server.revision().unwrap());
         let response = fixture
             .server
             .invoke(Invocation {

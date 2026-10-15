@@ -197,6 +197,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cache_hydration_holding_resident_state_cannot_block_observation_or_stop_admission() {
+        // Snapshot/presentation acquire resident state after Store and may do
+        // cold SQLite reads while holding it. Model that later lock stage too,
+        // not only the worker waiting to acquire Store in the preceding test.
+        let fixture=super::super::tests::resident_fixture();
+        let actor=fixture.server.actor.clone();
+        let held=actor.0.state.lock().unwrap();
+        let (reply,read)=crossbeam_channel::bounded(1);
+        let worker=thread::spawn(move|| {
+            let mut fixture=fixture;
+            let server=&mut fixture.server;
+            let observation=server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"state".into(),args:json!([0])});
+            let actor_id=server.identity.instance;
+            let stop=server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"fence_session_stop".into(),args:json!([actor_id,100])});
+            let stopping=server.session_stopping;
+            let _=reply.send((observation,stop,stopping));
+        });
+        let result=read.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        worker.join().unwrap();
+        let (observation,stop,stopping)=result.expect("resident disk-read contention must not occupy the helper control loop");
+        assert!(observation.unwrap_err().contains("CAGENTS_ACTOR_METADATA_BUSY"));
+        assert!(stopping,"the authenticated helper must retain lifetime stop intent before its bounded actor acknowledgement wait");
+        if let Err(error)=stop {assert!(error.contains("acknowledgement"),"{error}");}
+        let deadline=Instant::now()+Duration::from_secs(1);
+        while !actor.0.stop.load(Ordering::Acquire) {
+            assert!(Instant::now()<deadline,"the original admitted Stop must complete after cache hydration releases metadata");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn query()->SourceQuery {
         SourceQuery {source:SourceKey {agent_id:Some("child".into()),source_id:"opaque:native-part:real-id".into()},
             offset:4,limit:16,expected_epoch:Some(SourceEpoch {incarnation:uuid::Uuid::new_v4(),revision:7}),until:Some(8)}
