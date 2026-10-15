@@ -211,3 +211,37 @@ fn blocked_launch_guard_keeps_old_strip_and_no_draft_until_both_leases_land() {
     assert_eq!(app.durable.active_channel, channel);
     assert_eq!(app.active_workspace.as_deref(), Some(filing.path()));
 }
+
+#[test]
+fn startup_initialization_does_not_race_an_explicit_chat_with_a_default_selection() {
+    for kind in 0..3 {
+        let runtime = tempfile::tempdir().unwrap();
+        let filing = tempfile::tempdir().unwrap();
+        let launch = tempfile::tempdir().unwrap();
+        let (mut app, _) = app(filing.path(), launch.path(), runtime.path(), false);
+        app.settings.default_worktree_pane = crate::settings::DefaultPane::NativeChat;
+        app.worktree_selection.initialize_runtimes = true;
+        let before = app.durable.cards.len();
+        let task = match kind {
+            0 => app.select_worktree_then(launch.path().to_owned(), false, Intent::Navigate),
+            1 => app.select_worktree_then(launch.path().to_owned(), false, Intent::NewNativeThread),
+            _ => app.new_native_chat(crate::agent::Provider::Claude, Some(launch.path().to_owned())),
+        };
+        let (generation, create, receipt) = prepared(task);
+        assert_eq!(app.durable.cards.len(), before);
+        drop(app.update(Message::WorktreeSelectionPrepared { generation, create, receipt }));
+        assert!(!app.worktree_selection.initialize_runtimes);
+        if kind==0 {
+            assert!(app.worktree_selection.pending, "ordinary startup navigation still requests its default pane");
+            assert_ne!(app.worktree_selection.generation, generation);
+            assert_eq!(app.durable.cards.len(), before);
+        } else {
+            assert_eq!(app.worktree_selection.generation, generation, "explicit continuation must not mint a second default receipt");
+            assert!(!app.worktree_selection.pending);
+            assert_eq!(app.durable.cards.len(), before+1);
+            assert_eq!(app.active_workspace.as_deref(), Some(launch.path()));
+            assert_eq!(app.durable.active_channel, None);
+            exclusive_refused(runtime.path(), launch.path());
+        }
+    }
+}

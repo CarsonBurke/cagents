@@ -106,6 +106,17 @@ fn chat_launch_directory(intent: &Intent) -> Option<&Path> {
     }
 }
 
+fn supplies_pane(intent: &Intent) -> bool {
+    match intent {
+        Intent::Channel { after, .. } => supplies_pane(after),
+        Intent::Navigate | Intent::Delete(_) => false,
+        // The continuation either supplies/reuses the requested pane or owns
+        // the explicit ensure-default operation. Initialization must not race
+        // it with a second, implicit default-draft selection.
+        _ => true,
+    }
+}
+
 struct Prepared {
     path: PathBuf,
     canonical: Vec<(PathBuf, PathBuf)>,
@@ -326,7 +337,7 @@ impl Cagents {
         // exact same commit path after off-thread preparation.
         if !local_window {
             let scope = self.commit_worktree_selection_scope(path, create, &intent, None);
-            let initialization = self.initialize_prepared_scope_runtimes();
+            let initialization = self.initialize_prepared_scope_runtimes_with_default(!supplies_pane(&intent));
             let after = self.finish_worktree_selection(intent);
             return Task::batch([
                 cancelled,
@@ -650,7 +661,7 @@ impl Cagents {
             &intent,
             prepared.resume.as_ref(),
         );
-        let initialization = self.initialize_prepared_scope_runtimes();
+        let initialization = self.initialize_prepared_scope_runtimes_with_default(!supplies_pane(&intent));
         let after = self.finish_worktree_selection_with_context(intent, context_scope);
         Task::batch([
             selected,
@@ -661,12 +672,17 @@ impl Cagents {
     }
 
     pub(in crate::app) fn initialize_prepared_scope_runtimes(&mut self) -> Task<Message> {
+        self.initialize_prepared_scope_runtimes_with_default(true)
+    }
+
+    fn initialize_prepared_scope_runtimes_with_default(&mut self, default_pane: bool) -> Task<Message> {
         if !self.worktree_selection.initialize_runtimes || self.worktree_selection.pending {
             return Task::none();
         }
         self.worktree_selection.initialize_runtimes = false;
         let initialize = self.initialize_runtimes();
-        Task::batch([initialize, self.ensure_default_pane()])
+        let pane = if default_pane { self.ensure_default_pane() } else { Task::none() };
+        Task::batch([initialize, pane])
     }
 
     fn commit_worktree_selection_scope(
