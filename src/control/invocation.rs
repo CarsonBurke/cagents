@@ -119,7 +119,7 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
             AgentCommand::Close { agent } => Kind::Act(Act::Close {
                 agents: vec![agent],
             }),
-            AgentCommand::Console { .. } => return None,
+            AgentCommand::Console { .. } | AgentCommand::Transcript { .. } => return None,
         },
         // The rest manage the application rather than other agents, and are
         // named by the subcommand words the agent typed.

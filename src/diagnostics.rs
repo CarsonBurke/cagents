@@ -641,7 +641,7 @@ impl Report {
             "Recorded evidence only; sibling versions and health are last observed, not a live check.".into()];
         for product in &self.products {
             match &product.last_observed {
-                Some(last) => lines.push(format!("{}: last observed {} (protocol {}), at_unix_ms={}, lifecycle={:?}, clean_shutdown={:?}, persistence={:?}, skipped_events={}, run={}", product.product.name(), last.version, last.protocol, last.at_unix_ms, last.lifecycle, last.clean_shutdown, last.persistence, last.skipped_events, last.run)),
+                Some(last) => lines.push(format!("{}: last observed {} (protocol {}), {}; lifecycle: {}; clean shutdown: {}; persistence: {}; skipped events: {}; run {}", product.product.name(), last.version, last.protocol, crate::control::format::relative_time(last.at_unix_ms), crate::control::format::label(last.lifecycle), match last.clean_shutdown { Some(true) => "yes", Some(false) => "no", None => "unknown" }, crate::control::format::label(last.persistence), last.skipped_events, last.run)),
                 None => lines.push(format!("{}: health unknown ({})", product.product.name(), if product.readable { "no retained evidence" } else { "evidence unavailable or invalid" })),
             }
             if let Some(failure) = product.records.iter().rev().find(|record| {
@@ -661,12 +661,29 @@ impl Report {
                 )
             }) {
                 lines.push(format!(
-                    "{}: latest retained failure at_unix_ms={}, run={}, event={:?} (historical record; may have recovered)",
-                    product.product.name(), failure.at_unix_ms, failure.run, failure.event
+                    "{}: latest retained failure {}, run {}, {} (historical record; may have recovered)",
+                    product.product.name(), crate::control::format::relative_time(failure.at_unix_ms), failure.run, event_label(failure.event)
                 ));
             }
         }
         lines.join("\n")
+    }
+}
+
+fn event_label(event: Event) -> String {
+    match event {
+        Event::Startup => "startup".into(), Event::Ready => "ready".into(),
+        Event::StartupFailed => "startup failed".into(),
+        Event::Exit { success } => if success { "clean exit" } else { "failed exit" }.into(),
+        Event::Panic { recovered } => if recovered { "panic (recovered)" } else { "panic (unrecovered)" }.into(),
+        Event::PersistenceStarted => "persistence started".into(),
+        Event::PersistenceFailed { category, exhausted } => format!("persistence failed: {}{}", crate::control::format::label(category), if exhausted { " (retries exhausted)" } else { "" }),
+        Event::PersistenceRecovered => "persistence recovered".into(),
+        Event::WriterUnavailable => "writer unavailable".into(),
+        Event::FinalFlush { complete, unsaved, refused, .. } => format!("final flush {}: {unsaved} unsaved, {refused} refused", if complete { "complete" } else { "incomplete" }),
+        Event::SettingsFailed { category } => format!("settings failed: {}", crate::control::format::label(category)),
+        Event::ProtocolMismatch => "protocol mismatch".into(),
+        Event::EventsSkipped { count } => format!("{count} skipped events"),
     }
 }
 
@@ -871,10 +888,11 @@ mod tests {
             Some(true)
         );
         let human = report.human();
-        assert!(human.contains("event=StartupFailed"));
-        assert!(human.contains(&format!("run={run}")));
+        assert!(human.contains("startup failed"));
+        for debug in ["Some(", "None", "at_unix_ms=", "event=", " { "] { assert!(!human.contains(debug), "{human}"); }
+        assert!(human.contains(&format!("run {run}")));
         assert!(human.contains("historical record; may have recovered"));
-        assert!(human.contains("at_unix_ms="));
+        assert!(human.contains("ago"));
     }
 
     #[test]

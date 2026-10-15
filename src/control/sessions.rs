@@ -54,11 +54,12 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
         Scope::Containing(current_directory()?)
     };
     let directory = read(scope)?;
-    let mut lines: Vec<_> = directory.caller.iter().map(Entry::line).collect();
-    lines.extend(directory.sessions.iter().map(Entry::line));
-    if lines.is_empty() {
-        lines.push("No live sessions".into());
-    }
+    let human = format::table(&["ID", "PROVIDER", "STATE", "DIRECTORY", "TITLE"],
+        directory.caller.iter().chain(directory.sessions.iter()).map(|entry| vec![entry.id.to_string(),
+            entry.provider.map(|provider| provider.executable()).unwrap_or("shell").into(), format::label(entry.state),
+            entry.directory.as_ref().map(|path| path.display().to_string()).unwrap_or_default(), entry.title.clone().unwrap_or_default(),
+        ]).collect(), "No live sessions");
+    let mut lines = vec![human];
     if let Scope::Project(project) = &directory.scope {
         lines.push(format!(
             "(project {}; --all for every project)",

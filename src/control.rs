@@ -18,6 +18,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 pub(crate) mod format;
+mod settings;
+pub use settings::SettingsCommand;
+mod completions;
 mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
@@ -78,7 +81,7 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 #[command(
     name = "cagents",
     version = crate::VERSION,
-    about = "Control cagents terminals and processes"
+    about = "Manage cagents agents, sessions, automations, projects, channels, terminals, messaging, Linear, accounts and settings"
 )]
 pub struct Cli {
     /// Backend device from devices.json; local is the default.
@@ -97,13 +100,24 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Generate a shell completion script without contacting services.
+    Completions {
+        /// Shell whose completion script should be generated.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Read, validate, change or open the application configuration.
+    Settings {
+        #[command(subcommand)]
+        command: SettingsCommand,
+    },
     /// Read bounded private diagnostics without starting services.
     Diagnostics,
     /// Read and update Linear tickets, or link a ticket to this Git worktree.
     Linear(LinearCommand),
     /// Show this session, its parent and agents, and peers in the same checkout.
     Whoami,
-    /// Inspect account plan allowances and the calling session’s context.
+    /// Manage provider accounts and defaults, and inspect plan allowances and context.
     Account {
         #[command(subcommand)]
         command: AccountCommand,
@@ -164,34 +178,44 @@ pub enum TopCommand {
     },
     /// Run the detached updater started by an explicit application Update action.
     #[command(hide = true)]
-    UpdateWorker { job_id: String },
+    UpdateWorker {
+        #[arg(help = "Detached update job ID.")]
+        job_id: String,
+    },
     /// Cooperatively fence application windows around an external installer.
     #[command(hide = true)]
     CoordinateInstall {
         #[arg(long)]
+        #[arg(help = "Installation destination prefix.")]
         prefix: PathBuf,
         #[arg(long)]
+        #[arg(help = "Installer executable to run.")]
         installer: PathBuf,
         /// Publish files while preserving running windows and the daemon.
         #[arg(long)]
         stage_only: bool,
         #[arg(last = true)]
+        #[arg(help = "Arguments passed to the installer after --.")]
         arguments: Vec<OsString>,
     },
     /// Validate a launch fence inherited from the update coordinator.
     #[command(hide = true)]
     VerifyInstallGuard {
         #[arg(long)]
+        #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
     },
     /// Record that staged files must retain windows on the running daemon's UI.
     #[command(hide = true)]
     RecordDeferredInstall {
         #[arg(long, requires_all = ["prefix", "version_root"])]
+        #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
         #[arg(long, requires = "stage_only")]
+        #[arg(help = "Installation destination prefix.")]
         prefix: Option<PathBuf>,
         #[arg(long, requires = "stage_only")]
+        #[arg(help = "Directory containing the staged executable version.")]
         version_root: Option<PathBuf>,
     },
     /// Save, close and reopen every window with this installation's executables.
@@ -229,8 +253,10 @@ pub enum DaemonCommand {
     /// Request daemon termination (use --confirm for a counted confirmation).
     Stop {
         #[arg(long, conflicts_with = "confirm")]
+        #[arg(help = "Refuse shutdown while hosted sessions remain.")]
         require_empty: bool,
         #[arg(long, conflicts_with = "confirm")]
+        #[arg(help = "Refuse shutdown if the observed session inventory generation changed.")]
         expected_generation: Option<u64>,
         /// Confirm termination of the counted hosted sessions. Bare, this
         /// prompts on the terminal. A service unit or script has no terminal,
@@ -273,8 +299,20 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum TerminalCommand {
-    /// List terminal descriptors known to the daemon.
-    List,
+    /// List live terminals; use --all to include retained completed sessions.
+    List {
+        /// Include running, hibernated and exited sessions.
+        #[arg(long, conflicts_with = "exited")]
+        all: bool,
+        /// Show only completed sessions.
+        #[arg(long)]
+        exited: bool,
+    },
+    /// Show one complete terminal descriptor, including its launch environment.
+    Show {
+        /// The daemon terminal ID.
+        terminal_id: TerminalId,
+    },
     /// Spawn a terminal with an optional argv-based command.
     Spawn {
         /// Working directory for the terminal (defaults to the current directory).
@@ -286,17 +324,27 @@ pub enum TerminalCommand {
     },
     /// Write UTF-8 text to a terminal.
     Write {
+        #[arg(help = "The daemon terminal ID.")]
         terminal_id: TerminalId,
+        #[arg(help = "UTF-8 text to write.")]
         text: String,
     },
     /// Explicitly terminate a terminal.
-    Close { terminal_id: TerminalId },
+    Close {
+        #[arg(help = "The daemon terminal ID.")]
+        terminal_id: TerminalId,
+    },
     /// Read a current immutable terminal snapshot.
-    Snapshot { terminal_id: TerminalId },
+    Snapshot {
+        #[arg(help = "The daemon terminal ID.")]
+        terminal_id: TerminalId,
+    },
     /// Wait until a current terminal snapshot contains text.
     Wait {
+        #[arg(help = "The daemon terminal ID.")]
         terminal_id: TerminalId,
         #[arg(long)]
+        #[arg(help = "Text that must appear in the terminal snapshot.")]
         text: String,
         /// Maximum time to wait, in seconds.
         #[arg(long, default_value_t = 30.0, value_parser = parse_positive_seconds)]
@@ -346,7 +394,10 @@ pub enum ChannelCommand {
         repository: Option<PathBuf>,
     },
     /// Delete a channel everywhere.
-    Close { channel_id: ChannelId },
+    Close {
+        #[arg(help = "The shared channel ID.")]
+        channel_id: ChannelId,
+    },
 }
 
 /// A `--project` value: a path, made absolute, or the name of an open
@@ -1918,6 +1969,9 @@ impl WaitOutcome {
 
 impl CommandOutput {
     fn exit_code(&self) -> ExitCode {
+        if !matches!(self.command, "agent.wait" | "agent.spawn" | "agent.send" | "automation.propose" | "automation.proposal") {
+            return ExitCode::SUCCESS;
+        }
         let code = match self.data.get("outcome").and_then(Value::as_str) {
             Some("pending" | "timed_out") => WaitOutcome::TimedOut.exit_code(),
             Some("failed") => WaitOutcome::Failed.exit_code(),
@@ -2014,6 +2068,11 @@ where
         .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
 
+    if let TopCommand::Completions { shell } = cli.command {
+        emit_success(cli.json, completions::execute(shell));
+        return ExitCode::SUCCESS;
+    }
+
     // Local evidence must remain readable when a staged owner, backend, or
     // daemon cannot start. Do not select/prepare a device or follow a route.
     if matches!(cli.command, TopCommand::Diagnostics) {
@@ -2037,6 +2096,13 @@ where
                 ExitCode::FAILURE
             }
         };
+    }
+
+    if matches!(&cli.command, TopCommand::Account { command: AccountCommand::Remove { .. } })
+        && Authority::from_environment().token().is_some()
+    {
+        emit_error(cli.json, &AppError::new("account_authority", "Account removal is refused under an agent capability; run it from your own shell"));
+        return ExitCode::FAILURE;
     }
 
     let _device_cleanup = crate::device::Cleanup;
@@ -2096,6 +2162,12 @@ where
             emit_error(cli.json, &AppError::new("device", error));
             return ExitCode::FAILURE;
         }
+    }
+    if let TopCommand::Agent { command: AgentCommand::Transcript { agent, follow, format } } = &cli.command {
+        return match agents::stream_transcript(agent, *follow, format, cli.json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => { emit_error(cli.json || format == "json", &error); ExitCode::FAILURE }
+        };
     }
     match execute(cli.command) {
         Ok(output) => {
@@ -2158,6 +2230,8 @@ pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
+        TopCommand::Completions { shell } => Ok(completions::execute(shell)),
+        TopCommand::Settings { command } => settings::execute(command),
         TopCommand::Diagnostics => {
             let report = crate::diagnostics::inspect().map_err(|_| {
                 AppError::new(
@@ -2944,16 +3018,21 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         client.authenticate(authority).map_err(protocol_error)?;
     }
     match command {
-        TerminalCommand::List => {
-            let terminals = client.list().map_err(protocol_error)?;
-            let human = format::table(&["ID", "ATTACHMENT", "PROGRAM", "DIRECTORY"],
-                terminals.iter().map(|terminal| descriptor_line(terminal).split('\t').map(str::to_owned).collect()).collect(),
-                "No terminals");
+        TerminalCommand::List { all, exited } => {
+            let terminals = client.list().map_err(protocol_error)?.into_iter()
+                .filter(|terminal| all || if exited { terminal.completed } else { !terminal.completed })
+                .collect::<Vec<_>>();
+            let human = format::table(&["ID", "STATE", "TITLE", "PROGRAM", "DIRECTORY"], terminals.iter().map(terminal_row).collect(), "No terminals");
             Ok(CommandOutput {
                 command: "terminal.list",
-                data: json!({ "terminals": terminals }),
+                data: json!({ "terminals": terminals.iter().map(terminal_list_value).collect::<Vec<_>>() }),
                 human,
             })
+        }
+        TerminalCommand::Show { terminal_id } => {
+            let terminal = client.list().map_err(protocol_error)?.into_iter().find(|terminal| terminal.session.id == terminal_id)
+                .ok_or_else(|| AppError::new("terminal_not_found", format!("No terminal {terminal_id}")))?;
+            Ok(CommandOutput { command: "terminal.show", human: format::table(&["ID", "STATE", "TITLE", "PROGRAM", "DIRECTORY"], vec![terminal_row(&terminal)], "No terminals"), data: json!({"terminal": terminal}) })
         }
         TerminalCommand::Spawn { cwd, argv } => {
             let cwd = absolute_working_directory(cwd)
@@ -3173,11 +3252,9 @@ fn project_output(
             // the sidebar renders.
             let mut projects = model.projects.iter().collect::<Vec<_>>();
             projects.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
-            let human = projects
-                .iter()
-                .map(|project| project_line(project))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = format::table(&["PATH", "NAME"], projects.iter().map(|project| vec![
+                project_display_path(&project.repository).display().to_string(), project.name.clone(),
+            ]).collect(), "No open projects");
             Ok(CommandOutput {
                 command: "project.list",
                 data: json!({ "projects": projects, "sequence": model.sequence }),
@@ -3264,8 +3341,12 @@ fn close_project(
 /// The key comes first, following `channel_line`, so the `cut -f1` that names a
 /// channel names a project - and names it in the spelling `project close`
 /// takes.
+fn project_display_path(path: &Path) -> &Path {
+    if path.file_name() == Some(OsStr::new(".git")) { path.parent().unwrap_or(path) } else { path }
+}
+
 fn project_line(project: &ModelProject) -> String {
-    format!("{}\t{}", project.repository.display(), project.name)
+    format!("{}\t{}", project_display_path(&project.repository).display(), project.name)
 }
 
 /// Runs a shared-channel verb against the daemon's registry.
@@ -3404,11 +3485,9 @@ fn channel_output(
                 })
                 .collect::<Vec<_>>();
             channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
-            let human = channels
-                .iter()
-                .map(|channel| channel_line(channel))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = format::table(&["ID", "PROJECT", "TITLE"], channels.iter().map(|channel| vec![
+                channel.id.to_string(), project_display_path(&channel.repository).display().to_string(), channel.title.clone(),
+            ]).collect(), "No channels");
             Ok(CommandOutput {
                 command: "channel.list",
                 data: json!({ "channels": channels, "sequence": model.sequence }),
@@ -3565,19 +3644,43 @@ pub fn repository_key(directory: &Path) -> Result<PathBuf, String> {
     canonical_repository(Path::new(key))
 }
 
-fn descriptor_line(terminal: &TerminalDescriptor) -> String {
-    format!(
-        "{}\t{}\t{}\t{}",
-        terminal.session.id,
-        if terminal.attached {
-            "attached"
-        } else {
-            "detached"
-        },
-        terminal.session.launch.program,
-        terminal.session.launch.working_directory.display(),
-    )
+fn terminal_state(terminal: &TerminalDescriptor) -> String {
+    if terminal.completed {
+        let exit = match &terminal.session.continuity {
+            TerminalContinuity::Exited { last_exit } => Some(last_exit),
+            TerminalContinuity::RelaunchAvailable { last_exit, .. } => last_exit.as_ref(),
+            _ => None,
+        };
+        match exit {
+            Some(exit) if exit.code.is_some() => format!("exited({})", exit.code.unwrap()),
+            Some(exit) if exit.signal.is_some() => format!("exited({})", exit.signal.as_deref().unwrap()),
+            _ => "exited".into(),
+        }
+    } else if terminal.visibility == TerminalVisibility::Hibernated { "hibernated".into() }
+    else { "running".into() }
 }
+
+fn terminal_row(terminal: &TerminalDescriptor) -> Vec<String> {
+    vec![terminal.session.id.to_string(), terminal_state(terminal), terminal.title.clone(),
+        terminal.session.launch.program.clone(), terminal.session.launch.working_directory.display().to_string()]
+}
+
+fn terminal_list_value(terminal: &TerminalDescriptor) -> Value {
+    let state = if terminal.completed { "exited" }
+        else if terminal.visibility == TerminalVisibility::Hibernated { "hibernated" }
+        else { "running" };
+    let exit = match &terminal.session.continuity {
+        TerminalContinuity::Exited { last_exit } => Some(last_exit),
+        TerminalContinuity::RelaunchAvailable { last_exit, .. } => last_exit.as_ref(),
+        _ => None,
+    };
+    json!({"id": terminal.session.id, "state": state, "title": terminal.title,
+        "exit_code": exit.and_then(|exit| exit.code), "signal": exit.and_then(|exit| exit.signal.as_deref()),
+        "attached": terminal.attached, "program": terminal.session.launch.program,
+        "directory": terminal.session.launch.working_directory, "generation": terminal.generation})
+}
+
+fn descriptor_line(terminal: &TerminalDescriptor) -> String { terminal_row(terminal).join("\t") }
 
 fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
     if crate::device::is_remote() {
@@ -3602,7 +3705,8 @@ fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
     })
 }
 
-fn emit_success(json_output: bool, output: CommandOutput) {
+fn emit_success(json_output: bool, mut output: CommandOutput) {
+    format::normalize(&mut output.data);
     if json_output {
         println!(
             "{}",
@@ -3633,6 +3737,32 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_list_json_is_lean_while_show_retains_recovery_detail() {
+        let mut recipe = LaunchRecipe { program: "bash".into(), arguments: Vec::new(),
+            working_directory: "/tmp".into(), environment: BTreeMap::new(), unset_environment: Default::default() };
+        recipe.environment.insert("FIXTURE_PRIVATE".into(), "retained only in show".into());
+        let mut terminal = TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None);
+        terminal.session.resume_hint = Some("fixture recipe".into());
+        let value = terminal_list_value(&terminal);
+        let text = value.to_string();
+        for forbidden in ["environment", "resume_hint", "continuity", "FIXTURE_PRIVATE"] { assert!(!text.contains(forbidden)); }
+        assert!(serde_json::to_value(&terminal).unwrap()["session"]["launch"]["environment"].get("FIXTURE_PRIVATE").is_some());
+        terminal.completed = false;
+        terminal.visibility = TerminalVisibility::Hidden;
+        assert_eq!(terminal_state(&terminal), "running");
+        terminal.visibility = TerminalVisibility::Hibernated;
+        assert_eq!(terminal_state(&terminal), "hibernated");
+        terminal.completed = true;
+        assert_eq!(terminal_state(&terminal), "exited");
+        terminal.session.continuity = TerminalContinuity::Exited { last_exit: crate::model::TerminalExit {
+            code: Some(3), signal: None, occurred_at_unix_ms: 0,
+        } };
+        assert_eq!(terminal_state(&terminal), "exited(3)");
+        assert_eq!(terminal_list_value(&terminal)["state"], "exited");
+        assert_eq!(terminal_list_value(&terminal)["exit_code"], 3);
+    }
+
     #[test]
     fn rebuild_stop_requires_explicit_permission_before_touching_a_daemon() {
         let error = execute_daemon(DaemonCommand::StopForRebuild {
@@ -4385,8 +4515,8 @@ mod tests {
         assert_eq!(output.data["sequence"], json!(4));
         assert_eq!(
             output.human,
-            format!("{}\t{name}", expected.display()),
-            "one tab-separated line: repository, name"
+            format!("{}\t{name}", project_display_path(&expected).display()),
+            "one tab-separated line: checkout path, name"
         );
     }
 
@@ -4440,8 +4570,8 @@ mod tests {
         server.join().unwrap();
         assert_eq!(output.command, "project.list");
         assert_eq!(
-            output.human, "/shell/.git\tshell\n/window/.git\twindow",
-            "newest first, one tab-separated line each, whoever opened them"
+            output.human, "PATH     NAME\n/shell   shell\n/window  window",
+            "newest first, with readable checkout paths and headers"
         );
         assert_eq!(output.data["projects"], json!([cli_opened, window_opened]));
     }
@@ -4571,7 +4701,7 @@ mod tests {
         assert_eq!(output.data["closed"], json!(true));
         assert_eq!(
             output.human,
-            format!("/repo/.git\trepo\n{newer}\t/repo/.git\tnewer\n{older}\t/repo/.git\tolder"),
+            format!("/repo\trepo\n{newer}\t/repo/.git\tnewer\n{older}\t/repo/.git\tolder"),
             "the project's line, then every channel it took, newest first"
         );
         let channels = output.data["channels"].as_array().unwrap();

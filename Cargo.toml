@@ -76,7 +76,6 @@ ui = [
     "dep:unicode-linebreak",
     "dep:unicode-casefold",
     "dep:yaml-rust",
-    "dep:unicode-width",
     "dep:unicode-segmentation",
 ]
 integrated-browser = [
@@ -134,7 +133,7 @@ cagents-browser-import = { path = "crates/browser-import", features = ["desktop-
 cookie = { version = "0.18", optional = true }
 net_traits = { package = "servo-net-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", optional = true }
 yaml-rust = { version = "0.4.5", optional = true }
-unicode-width = { version = "0.2.2", optional = true }
+unicode-width = "0.2.2"
 unicode-casefold = { version = "0.2", optional = true }
 unicode-linebreak = { version = "0.1", optional = true }
 unicode-segmentation = { version = "1.13.3", optional = true }
@@ -146,6 +145,7 @@ base64 = { version = "0.22", optional = true }
 bitflags = { version = "2.9", features = ["serde"] }
 blake3 = { version = "1.8", optional = true }
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5.61"
 crossbeam-channel = "0.5"
 dpi = { version = "=0.1.2", optional = true }
 directories = "6.0"

@@ -42,7 +42,9 @@ pub fn execute(path: &Path, operation: Operation) -> Result<Value, String> {
             }
             let value = parse_value(&value)?;
             replace(&mut document, &key, value)?;
-            let desired = decode(document)?.validate().map_err(|e| e.to_string())?;
+            let desired = decode(document)?;
+            // The shared save path validates the merged document against the
+            // actual current file, including transition-specific policies.
             save_merged(path, &base, &desired).map_err(|e| e.to_string())?;
             let saved = load_detailed(path).map_err(|e| e.to_string())?.settings;
             let saved = serde_json::to_value(saved).map_err(|e| e.to_string())?;

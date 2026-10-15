@@ -1,4 +1,9 @@
 use super::*;
+mod transcript;
+pub(super) fn stream_transcript(agent: &str, follow: bool, format: &str, json_output: bool) -> Result<(), AppError> {
+    transcript::stream(agent, follow, format, json_output)
+}
+
 use crate::{
     account::AccountId,
     agent::Provider,
@@ -11,9 +16,23 @@ use crate::{
 
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
+    /// Export the cached transcript, or follow new items until the agent closes.
+    Transcript {
+        /// Agent handle, ID, or unique ID prefix.
+        agent: String,
+        /// Stream appended items and exit when the agent closes.
+        #[arg(long)]
+        follow: bool,
+        /// Markdown text or JSON Lines pages with independent cursors.
+        #[arg(long, default_value = "md", value_parser = ["md", "json"])]
+        format: String,
+    },
     /// The terminal presentation of an already hosted execution agent.
     #[command(hide = true)]
-    Console { agent_id: AgentId },
+    Console {
+        #[arg(help = "The hosted agent ID.")]
+        agent_id: AgentId,
+    },
     /// Start a provider session on one prompt, accepted durably.
     ///
     /// The provider defaults to the calling session's, the directory to the
@@ -25,7 +44,7 @@ pub enum AgentCommand {
         #[arg(long)]
         name: Option<String>,
         /// claude, codex, or omp. Defaults to the calling session's provider.
-        #[arg(long, value_parser = parse_provider)]
+        #[arg(long, value_enum, ignore_case = true)]
         provider: Option<Provider>,
         /// The open project to work in, by any directory inside it.
         /// Defaults to the one containing the agent's directory.
@@ -41,12 +60,17 @@ pub enum AgentCommand {
         #[arg(long)]
         channel: Option<ChannelId>,
         #[arg(long)]
+        #[arg(help = "Stable account ID (provider/system or provider/UUID).")]
         account: Option<AccountId>,
-        #[arg(long, default_value = "chat", value_parser = ["chat", "terminal"])]
+        #[arg(long, default_value = "chat", value_parser = ["chat", "terminal"], ignore_case = true)]
+        #[arg(help = "Presentation surface for the provider session.")]
         surface: String,
         #[arg(long)]
+        #[arg(help = "Provider model ID (Claude: haiku/sonnet/opus; Codex/OMP: provider model catalog).")]
         model: Option<String>,
         #[arg(long)]
+        #[arg(help = "Permission policy (Claude: default/manual/auto/acceptEdits/plan/dontAsk/bypassPermissions; Codex: untrusted/on-failure/on-request/never; OMP: always-ask/write/yolo).",
+            value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
         permission_mode: Option<String>,
         /// The provider's effort name, such as low or high; omit for its default.
         #[arg(long)]
@@ -73,6 +97,7 @@ pub enum AgentCommand {
     },
     /// Read an owned agent and its latest run.
     Status {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         #[command(flatten)]
         show: ShowArgs,
@@ -89,19 +114,25 @@ pub enum AgentCommand {
     /// the first ready run; otherwise failure outranks input, then timeout.
     Wait {
         #[arg(required = true, value_name = "AGENT_OR_RUN")]
+        #[arg(help = "Agent or run handles to wait for.")]
         handles: Vec<String>,
         /// Return as soon as any of them is ready, rather than all.
         #[arg(long)]
         any: bool,
         #[arg(long, default_value = "60", value_parser = parse_positive_seconds)]
+        #[arg(help = "Maximum time to wait, in seconds.")]
         timeout: f64,
         #[command(flatten)]
         show: ShowArgs,
     },
     /// List the questions and approvals an owned agent is waiting on.
-    Requests { agent: String },
+    Requests {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        agent: String,
+    },
     /// Answer one of an owned agent's requests with one of its actions.
     Answer {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         /// The request ID `requests` lists.
         request: String,
@@ -113,13 +144,17 @@ pub enum AgentCommand {
     },
     /// Interrupt an owned agent's active run.
     Interrupt {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         /// Permit the interrupt to stop the provider's running background subagents.
         #[arg(long)]
         including_subagents: bool,
     },
     /// Stop and close an agent, including its background subagents.
-    Close { agent: String },
+    Close {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        agent: String,
+    },
 }
 
 /// A prompt given as an argument, in a file, or on standard input.
@@ -132,6 +167,7 @@ pub struct PromptArgs {
     /// Read the prompt from this file.
     #[arg(long, value_name = "FILE", conflicts_with = "text")]
     pub(super) prompt_file: Option<PathBuf>,
+    /// Prompt text (legacy spelling; prefer the positional prompt).
     #[arg(long = "prompt", hide = true, conflicts_with_all = ["text", "prompt_file"])]
     pub(super) flag: Option<String>,
 }
@@ -165,12 +201,6 @@ pub struct ShowArgs {
     tail: usize,
 }
 
-pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
-    Provider::ALL
-        .into_iter()
-        .find(|provider| provider.executable() == value)
-        .ok_or_else(|| "Choose omp, claude, or codex".into())
-}
 
 impl PromptArgs {
     fn read(self) -> Result<String, AppError> {
@@ -790,6 +820,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
     let mut session = Session::new();
     match command {
         AgentCommand::Console { .. } => unreachable!("handled console presentation"),
+        AgentCommand::Transcript { .. } => Err(AppError::new("agent.transcript", "Transcript output requires the streaming CLI path")),
         AgentCommand::Spawn {
             prompt,
             name,
@@ -931,7 +962,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                         directory,
                         placement,
                     },
-                    surface: if surface == "terminal" {
+                    surface: if surface.eq_ignore_ascii_case("terminal") {
                         Surface::Terminal
                     } else {
                         Surface::Chat
@@ -969,39 +1000,22 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
             let human = status_lines(&agent, &run, false, show);
             Ok(CommandOutput {
                 command: "agent.status",
-                data: json!({"agent": agent, "run": run, "timed_out": false}),
+                data: json!({"agent": agent, "run": run, "timed_out": false, "outcome": run_outcome(run.state), "reason": run.result.diagnostic}),
                 human,
             })
         }
         AgentCommand::List => {
             let summaries = session.summaries()?.to_vec();
-            let human = if summaries.is_empty() {
-                "No open agents".to_owned()
-            } else {
-                summaries
-                    .iter()
-                    .map(|summary| {
-                        format!(
-                            "{}  {:<6} {:<11} run {}  {}{}",
-                            short(summary.agent.id),
-                            summary.agent.spec.provider.executable(),
-                            format!("{:?}", summary.state),
-                            short(summary.run),
-                            summary.agent.spec.target.directory.display(),
-                            summary
-                                .agent
-                                .name
-                                .as_ref()
-                                .map(|name| format!("  {name}"))
-                                .unwrap_or_default()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            let human = format::table(&["ID", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"], summaries.iter().map(|summary| vec![
+                short(summary.agent.id), summary.agent.spec.provider.executable().into(), state_reason(summary.state, summary.reason.as_deref()),
+                short(summary.run), summary.agent.spec.target.directory.display().to_string(), summary.agent.name.clone().unwrap_or_default(),
+            ]).collect(), "No open agents");
             Ok(CommandOutput {
                 command: "agent.list",
-                data: json!({"agents": summaries}),
+                data: json!({"agents": summaries.iter().map(|summary| {
+                    let mut value = serde_json::to_value(summary).expect("agent summary serialization");
+                    value["outcome"] = json!(run_outcome(summary.state)); value
+                }).collect::<Vec<_>>()}),
                 human,
             })
         }
@@ -1286,13 +1300,24 @@ fn arrived_lines(messages: &[crate::agent_execution::mailbox::Message]) -> Strin
 
 /// An agent's latest run in a few lines: who and where, how the run stands,
 /// and the end of its result.
+fn state_reason(state: crate::agent_execution::State, reason: Option<&str>) -> String {
+    let label = format::label(state);
+    if matches!(state, crate::agent_execution::State::Failed | crate::agent_execution::State::Interrupted) {
+        if let Some(reason) = reason {
+            let reason: String = reason.chars().take(100).map(|c| if c.is_control() { ' ' } else { c }).collect();
+            return format!("{label} ({reason})");
+        }
+    }
+    label
+}
+
 fn status_lines(agent: &Agent, run: &Run, timed_out: bool, show: ShowArgs) -> String {
     let mut lines = format!(
-        "agent {} ({}) run {} {:?}{}",
+        "agent {} ({}) run {} {}{}",
         short(agent.id),
         agent.spec.provider.executable(),
         short(run.id),
-        run.state,
+        state_reason(run.state, run.result.diagnostic.as_deref()),
         if timed_out { " (wait timed out)" } else { "" }
     );
     if run.state == crate::agent_execution::State::Waiting {
@@ -1341,6 +1366,7 @@ pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
         Some(state) => (state, true),
         None => (state, false),
     };
+    let state = state.split_once(" (").map_or(state, |(state, _)| state);
     use crate::agent_execution::State;
     let state = [
         State::Accepted,
@@ -1352,7 +1378,7 @@ pub(super) fn read_run(output: &str) -> Option<crate::chat::coordination::Run> {
         State::Interrupted,
     ]
     .into_iter()
-    .find(|candidate| format!("{candidate:?}") == state)?;
+    .find(|candidate| format::label(candidate).eq_ignore_ascii_case(state))?;
     // The result follows the first blank line, up to any messages that
     // arrived during the wait.
     let status = output
@@ -2217,6 +2243,7 @@ mod tests {
             },
             run: run.parse().unwrap(),
             state: crate::agent_execution::State::Running,
+            reason: None,
         }
     }
 
