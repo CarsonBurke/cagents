@@ -157,6 +157,21 @@ fn current_agent_process(
         crate::model::CardKind::Chat(session) => HostedSession::Chat(session.clone()),
         _ => return false,
     };
+    // Equal absent or incomplete proofs do not authenticate a legacy record.
+    // Keep same_process comparison semantics separate from live admission.
+    let proven = match &source {
+        HostedSession::Chat(session) => session
+            .proof
+            .as_ref()
+            .is_some_and(crate::model::HostSessionProof::is_complete),
+        HostedSession::Terminal(session) => session
+            .continuity
+            .live_proof()
+            .is_some_and(|proof| proof.is_complete()),
+    };
+    if !proven {
+        return false;
+    }
     agent
         .session
         .as_ref()
@@ -823,6 +838,98 @@ mod tests {
         let moved = r.model().unwrap();
         assert!(!r.apply(&transfer).unwrap().changed);
         assert_eq!(r.model().unwrap(), moved);
+    }
+
+    #[test]
+    fn transfer_rejects_equal_unproved_managed_sessions_without_mutation() {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Destination, HostedSession, Origin, Spec, Submit, Surface, Target},
+            model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity, TerminalSession},
+        };
+        // Persisted legacy/malformed records can compare equal without carrying
+        // complete proof. Both preflight and the transaction must refuse them.
+        for (native_chat, proof_present) in [(true, false), (true, true), (false, true)] {
+            let (mut r, _directory, a, b) = setup();
+            let accepted = r.submit_agent(
+                &Origin::User,
+                &Submit {
+                    name: None,
+                    destination: Destination::New(Spec {
+                        provider: Provider::Claude,
+                        account: None,
+                        target: Target {
+                            repository: "/repo".into(),
+                            directory: "/repo".into(),
+                            placement: Some(Scope::Channel(a)),
+                        },
+                        surface: if native_chat { Surface::Chat } else { Surface::Terminal },
+                        model: None,
+                        permission_mode: None,
+                        reasoning_effort: None,
+                    }),
+                    prompt: "Work".into(),
+                    idempotency_key: "unproved-transfer".into(),
+                },
+                1,
+            ).unwrap();
+            let terminal = TerminalSession {
+                id: crate::model::TerminalId::new(),
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                launch: crate::model::LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: vec![],
+                    working_directory: "/repo".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                transcript_path: None,
+                resume_hint: None,
+                continuity: TerminalContinuity::Live {
+                    host_session_id: HostSessionId::new(""),
+                    boot_id: BootId::new(""),
+                    host_incarnation: HostIncarnation::new(""),
+                },
+            };
+            let source = if !native_chat {
+                HostedSession::Terminal(terminal)
+            } else {
+                HostedSession::Chat(crate::chat::Session {
+                    id: terminal.id,
+                    launch: crate::chat::Launch {
+                        provider: Provider::Claude,
+                        recipe: terminal.launch.clone(),
+                        session_id: None,
+                    },
+                    proof: if proof_present { terminal.continuity.live_proof() } else { None },
+                    terminal: None,
+                    owned_codex_listener: None,
+                    native_continuity: Default::default(),
+                })
+            };
+            r.bind_agent(accepted.agent.id, None, source.clone()).unwrap();
+            let p = Pane {
+                kind: match source {
+                    HostedSession::Chat(session) => CardKind::Chat(session),
+                    HostedSession::Terminal(session) => CardKind::Terminal(session),
+                },
+                ..pane()
+            };
+            seed(&mut r, a, vec![p.clone()]);
+            let change = Change::Transfer {
+                id: p.id,
+                destination: Scope::Channel(b),
+                before: None,
+            };
+            let transfer = edit(&mut r, a, change.clone());
+            let before = r.model().unwrap();
+            assert!(r.view_change_refusal(&Scope::Channel(a), &change).unwrap().is_some());
+            assert!(r.apply(&transfer).unwrap_err().contains("changed process"));
+            assert_eq!(r.model().unwrap(), before,
+                "equal unproved descriptors preserve both views, Agent and model sequence");
+        }
     }
 
     #[test]
