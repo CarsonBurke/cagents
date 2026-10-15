@@ -9,17 +9,14 @@ use iced::{Event, Point, Rectangle, Size, Vector};
 pub(super) fn pane<'a>(
     body: Element<'a, Message>,
     footer: Element<'a, Message>,
-    preferred: f32,
 ) -> Element<'a, Message> {
     Element::new(Pane {
         children: [body, footer],
-        preferred,
     })
 }
 
 struct Pane<'a> {
     children: [Element<'a, Message>; 2],
-    preferred: f32,
 }
 
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Pane<'_> {
@@ -42,10 +39,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Pane<'_> {
         // Both the transcript and composer are laid out at this exact width.
         // A permission request, resumed conversation or wider status label must
         // never move the column. The footer's flex row wraps within that room.
-        let width = self
-            .preferred
+        let width = limits
+            .max()
+            .width
             .min(design::READABLE_MEASURE + 2.0 * step::GAP_M)
-            .min(limits.max().width)
             .max(0.0);
         let mut footer = self.children[1].as_widget_mut().layout(
             &mut tree.children[1],
@@ -260,7 +257,6 @@ mod tests {
                         .height(Length::Fill)
                         .into(),
                     footer,
-                    available,
                 );
                 let mut tree = Tree::new(&element);
                 let node = element.as_widget_mut().layout(

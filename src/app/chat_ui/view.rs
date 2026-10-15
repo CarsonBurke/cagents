@@ -903,7 +903,11 @@ impl Cagents {
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
                     &self.settings.keyboard_shortcuts,
-                    self.workspace.viewport_width() * self.settings.chat_content_fraction,
+                    self.workspace
+                        .presentation_geometry()
+                        .card(card)
+                        .map_or(self.workspace.viewport_width(), |card| card.width())
+                        .min(design::READABLE_MEASURE + 2.0 * step::GAP_M),
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
@@ -1420,8 +1424,11 @@ impl Runtime {
                 .into(),
             );
         }
+        // The symmetric inset already exceeds the scrollbar rail. Reserving
+        // the rail a second time would make transcript rows narrower than the
+        // composer even though their outer column is shared.
         let transcript = widget::column::with_children(transcript.children)
-            .padding(design::with_vertical_rail(iced::Padding::new(step::GAP_M)))
+            .padding(iced::Padding::new(step::GAP_M))
             .width(Length::Fill);
         let transcript_index = content.len();
         content.push(selection::transcript(
@@ -2322,7 +2329,6 @@ impl Runtime {
                     iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
                 )
                 .into(),
-            content_width.max(1.0),
         ))
         .width(Length::Fill)
         .height(Length::Fill);
@@ -5786,6 +5792,7 @@ mod tests {
             transcript: widget::Id,
             editor: Option<iced::Rectangle>,
             viewport: Option<iced::Rectangle>,
+            answer: Option<iced::Rectangle>,
         }
         impl Operation for Probe {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -5799,6 +5806,11 @@ mod tests {
             ) {
                 if id == Some(&self.composer) {
                     self.editor = Some(bounds);
+                }
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                if id == Some(&scroll::item_id("0-answer")) {
+                    self.answer = Some(bounds);
                 }
             }
             fn scrollable(
@@ -5878,6 +5890,7 @@ mod tests {
                     transcript: card_control_id(runtime.target.card, "chat-transcript"),
                     editor: None,
                     viewport: None,
+                    answer: None,
                 };
                 element.as_widget_mut().operate(
                     &mut tree,
@@ -5887,6 +5900,14 @@ mod tests {
                 );
                 let editor = probe.editor.expect("composer");
                 let viewport = probe.viewport.expect("transcript");
+                if state != 0 {
+                    let answer = probe.answer.expect("answer row");
+                    assert_eq!(
+                        (answer.x, answer.width),
+                        (editor.x, editor.width),
+                        "transcript rows and composer share the same column in state {state}"
+                    );
+                }
                 let column_width = width.min(design::READABLE_MEASURE + 2.0 * step::GAP_M);
                 let geometry = (viewport.x, viewport.width, editor.x, editor.width);
                 assert_eq!(viewport.width, column_width, "state {state}");
