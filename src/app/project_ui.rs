@@ -501,7 +501,7 @@ impl Cagents {
         self.repository_generations.remove(&project);
         if self.project_has_unsaved_editors(project) {
             self.status = Some(TransientNotice::warning(
-                "Project closed in another window; save its open editor buffers before removing its local row.",
+                "Project closed in another window; save open buffers and resolve file recovery before removing its local row.",
             ));
         }
         let channels = self
@@ -1320,7 +1320,7 @@ impl Cagents {
                 removal.missing = self.project_missing(removal.project);
                 if self.project_has_unsaved_editors(removal.project) {
                     self.status = Some(TransientNotice::warning(
-                        "Save or close this project's unsaved editor buffers before removing it.",
+                        "Save unsaved buffers and resolve this project's file recovery before removing it.",
                     ));
                     return self.project_dialog_closed();
                 }
