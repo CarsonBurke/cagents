@@ -178,6 +178,15 @@ impl RecoveryPlacement {
     pub fn validate_payload_root(&self, payload: &Root) -> io::Result<()> {
         self.validate_payload_against_roots(payload, &[])
     }
+    /// Refuse a known missing enrollment capability BEFORE publication. The
+    /// real issuer still owns its pre-reserved payload capacity and admission
+    /// lease; this check does not manufacture an additional capacity promise.
+    pub fn require_payload_registration(&self) -> io::Result<()> {
+        if self.registry.register_payload.is_none() {
+            return Err(unsupported("Recovery payloads require an owned registration/adoption lease; no directory was created."));
+        }
+        self.validate()
+    }
     /// The holding already exists. On any failure, the producer must retain its
     /// exact publication AND this lease in its pre-reserved recovery slot;
     /// neither an error string nor a fresh pathname grants cleanup authority.
@@ -266,6 +275,7 @@ mod tests {
         let source = root(&tree.path().join("source"));
         let placement = RecoveryPlacement::acquire(root(&tree.path().join("outside")), source.clone(), vec![source].into(), registry()).unwrap();
         assert_eq!(placement.retained_descriptor_count(), 3);
+        assert!(placement.require_payload_registration().is_err(), "predicate-only fixture callback grants no payload creation capability");
         fs::rename(tree.path().join("outside"), tree.path().join("retired")).unwrap();
         fs::create_dir(tree.path().join("outside")).unwrap();
         placement.validate().unwrap();
@@ -363,6 +373,7 @@ mod tests {
         for path in ["source", "outside"] { fs::create_dir(tree.path().join(path)).unwrap(); }
         let lease = Arc::new(Lease { payload: std::sync::Mutex::new(None), uncertain: AtomicBool::new(true) });
         let placement = RecoveryPlacement::acquire(root(&tree.path().join("outside")), root(&tree.path().join("source")), Arc::from([]), RecoveryRegistryCheck::from_lease(lease.clone())).unwrap();
+        placement.require_payload_registration().unwrap();
         assert_eq!(placement.retained_descriptor_count(), 4, "future local enrollment descriptor is reserved before effects");
         let DirectoryCreation::Published(publication) = create_directory_in_namespace(placement.namespace(), placement.directory(), Path::new("holding"), 0o700).unwrap() else { panic!("fixture must own the holding"); };
         assert!(placement.register_payload_root(publication.directory()).is_err());
