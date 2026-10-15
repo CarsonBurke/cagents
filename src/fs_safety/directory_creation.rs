@@ -88,6 +88,7 @@ pub struct DirectoryPreparation {
     outer: Option<Root>,
     payload: Option<Root>,
     payload_created: bool,
+    pending_mode: Option<u32>,
     created: bool,
     cleanup_error: Option<String>,
 }
@@ -143,6 +144,10 @@ impl DirectoryPreparation {
                     }
                     let payload = self.payload.as_ref().unwrap();
                     payload.metadata().map_err(|e| ResolveError::io(&payload.path, &e))?;
+                    if let Some(mode)=self.pending_mode {
+                        restore_directory_mode(payload,mode).map_err(|e|ResolveError::io(&payload.path,&e))?;
+                        self.pending_mode=None;
+                    }
                     remove_directory_within(outer, OsStr::new("directory"))?;
                 }
                 Err(error) if error.is_not_found() => {
@@ -195,6 +200,7 @@ pub struct DirectoryPublication {
     namespace: DirectoryNamespace,
     identity: Metadata,
     publication_error: Option<String>,
+    pending_mode: Option<u32>,
     private_staging: Option<(Root,OsString)>,
     quarantined: Option<OsString>,
     removed: bool,
@@ -219,6 +225,14 @@ impl DirectoryPublication {
     }
     pub fn is_removed(&self) -> bool { self.removed }
 
+    fn restore_pending_mode(&mut self)->Result<(),ResolveError> {
+        if let Some(mode)=self.pending_mode {
+            restore_directory_mode(&self.directory,mode).map_err(|e|ResolveError::io(&self.directory.path,&e))?;
+            self.pending_mode=None;
+            if self.private_staging.is_none() {self.publication_error=None;}
+        }
+        Ok(())
+    }
     fn cleanup_private_staging(&mut self)->Result<(),ResolveError> {
         let Some((held,name))=&self.private_staging else {return Ok(());};
         namespace_protected(&self.namespace.directory).map_err(|e|ResolveError::io(&self.namespace.directory.path,&e))?;
@@ -241,6 +255,7 @@ impl DirectoryPublication {
     /// restored with no-clobber. A collision/error retains recovery ownership.
     /// OriginalRestored can still require user resolution of nonempty contents.
     pub fn resolve_recovery(&mut self)->Result<Option<DirectoryRecovery>,ResolveError> {
+        self.restore_pending_mode()?;
         self.cleanup_private_staging()?;
         let Some(name)=self.quarantined.clone() else {return Ok(None);};
         namespace_protected(&self.namespace.directory).map_err(|e|ResolveError::io(&self.namespace.directory.path,&e))?;
@@ -263,6 +278,7 @@ impl DirectoryPublication {
         self.cleanup_empty_with_hooks(|| {},|| {})
     }
     fn cleanup_empty_with_hooks(&mut self, before_acquire: impl FnOnce(),after_acquire:impl FnOnce()) -> Result<(), ResolveError> {
+        self.restore_pending_mode()?;
         self.cleanup_private_staging()?;
         if self.removed { return Ok(()); }
         if self.quarantined.is_some() {
@@ -369,7 +385,7 @@ fn prepare_private_stage(namespace:&DirectoryNamespace,mode:u32,
         namespace: DirectoryNamespace {directory: namespace.directory.try_clone()
             .map_err(|e| ResolveError::io(&namespace.directory.path, &e))?},
         name: unused_name(&namespace.directory)?, outer: None, payload: None,
-        payload_created: false, created: false, cleanup_error: None,
+        payload_created: false, pending_mode:None, created: false, cleanup_error: None,
     };
     let leaf = c_component(&preparation.name, &namespace.directory.path)?;
     if unsafe {libc::mkdirat(namespace.directory.descriptor(),leaf.as_ptr(),0o700)} !=0 {
@@ -451,7 +467,26 @@ impl DirectoryStage {
     }
     fn publish_to(self,parent:Root,name:OsString,after_publish:impl FnOnce(&Root,&OsStr))
         ->Result<DirectoryPublication,(DirectoryCreateError,bool)> {
+        self.publish_to_with_restore(parent,name,after_publish,restore_directory_mode)
+    }
+    fn publish_to_with_restore(self,parent:Root,name:OsString,after_publish:impl FnOnce(&Root,&OsStr),
+        restore_mode:impl FnOnce(&Root,u32)->io::Result<()>)->Result<DirectoryPublication,(DirectoryCreateError,bool)> {
         let DirectoryStage {mut preparation,identity}=self;
+    // Linux requires write permission on a directory when changing its '..'
+    // parent during rename. Widen only owner-write on the retained private
+    // payload, then restore its exact observed mode through the same descriptor.
+    // No group/other grants or POSIX ACL mask bits are widened.
+    let payload=preparation.payload.as_ref().unwrap();
+    let mode=match payload.metadata() {
+        Ok(metadata)=>metadata.mode()&0o7777,
+        Err(error)=>return Err((preparation.fail(ResolveError::io(&parent.path.join(&name),&error)),false)),
+    };
+    if mode&0o200==0 {
+        preparation.pending_mode=Some(mode);
+        if let Err(error)=set_directory_permissions(payload,mode|0o200) {
+            return Err((preparation.fail(ResolveError::io(&parent.path.join(&name),&error)),false));
+        }
+    }
     let outer=preparation.outer.as_ref().unwrap();
     if let Err(error)=rename_exclusive(outer,OsStr::new("directory"),&parent,&name) {
         let exists=error.kind()==io::ErrorKind::AlreadyExists;
@@ -466,15 +501,24 @@ impl DirectoryStage {
     let retained_namespace=preparation.namespace;
     directory.path=parent.path.join(&name);
     after_publish(&parent,&name);
+    let mode_restore=preparation.pending_mode.and_then(|mode|
+        restore_mode(&directory,mode).err().map(|error|(mode,error)));
+    let pending_mode=mode_restore.as_ref().map(|(mode,_)|*mode);
     // Nothing after successful publication can erase the known identity from
     // the returned receipt. Cleanup failure retains the private staging root.
     let cleanup=remove_directory_within(&retained_namespace.directory,&stage);
-    let (publication_error,private_staging)=match cleanup {
+    let (mut publication_error,private_staging)=match cleanup {
         Ok(())=>(None,None),
         Err(error)=>(Some(error.to_string()),Some((outer,stage))),
     };
+    if let Some((_,error))=mode_restore {
+        publication_error=Some(match publication_error {
+            Some(cleanup)=>format!("payload mode restoration failed: {error}; private staging cleanup failed: {cleanup}"),
+            None=>format!("payload mode restoration failed: {error}"),
+        });
+    }
     Ok(DirectoryPublication {
-        directory,parent,name,namespace:retained_namespace,identity,publication_error,private_staging,
+        directory,parent,name,namespace:retained_namespace,identity,publication_error,pending_mode,private_staging,
         quarantined:None,removed:false,
     })
     }
@@ -486,6 +530,14 @@ impl DirectoryStage {
 pub fn stage_directory_in_namespace(namespace:&DirectoryNamespace,mode:u32)->Result<DirectoryStage,DirectoryCreateError> {
     prepare_private_stage(namespace,mode,|_,_|{})?.ok_or_else(||
         ResolveError::message(&namespace.directory.path,"private directory staging could not preserve actual parent gid/SGID").into())
+}
+
+fn restore_directory_mode(directory:&Root,mode:u32)->io::Result<()> {
+    set_directory_permissions(directory,mode)?;
+    if directory.metadata()?.mode()&0o7777!=mode {
+        return Err(io::Error::other("kernel did not retain the original directory mode (including SGID)"));
+    }
+    Ok(())
 }
 
 fn existing_directory(root:&Root,relative:&Path)->Result<Option<Root>,ResolveError> {
@@ -910,7 +962,7 @@ mod tests {
             let root=Root::open(dir.path()).unwrap();
             let mut preparation=DirectoryPreparation {
                 namespace:DirectoryNamespace::acquire(&root).unwrap(),name:OsString::from("stage"),
-                outer:None,payload:None,payload_created:true,created:true,cleanup_error:None,
+                outer:None,payload:None,payload_created:true,pending_mode:None,created:true,cleanup_error:None,
             };
             let mut acquisitions=0;
             let failed=preparation.retry_cleanup_with_hook(|held| {
@@ -981,6 +1033,28 @@ mod tests {
         let preparation=error.take_recovery().unwrap();
         assert!(!preparation.is_resolved());
         assert_eq!(fs::read(preparation.payload.as_ref().unwrap().path.join("owned")).unwrap(),b"private data");
+    }
+
+    #[test]
+    fn mode_restore_failure_keeps_published_identity_and_explicit_retry() {
+        let dir=tempfile::tempdir().unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        let namespace=DirectoryNamespace::acquire(&root).unwrap();
+        let stage=stage_directory_in_namespace(&namespace,0o700).unwrap();
+        set_directory_permissions(stage.directory(),0).unwrap();
+        let original=stage.identity();
+        let mut receipt=stage.publish_to_with_restore(root.try_clone().unwrap(),OsString::from("target"),|_,_|{},
+            |_,_|Err(io::Error::from_raw_os_error(libc::EIO))).unwrap();
+        assert_eq!(receipt.identity(),original);
+        assert!(receipt.publication_error().unwrap().contains("mode restoration"));
+        assert_eq!(receipt.pending_mode,Some(0));
+        assert_eq!(receipt.directory().metadata().unwrap().mode()&0o777,0o200);
+        receipt.restore_pending_mode().unwrap();
+        assert_eq!(receipt.directory().metadata().unwrap().mode()&0o777,0);
+        assert!(receipt.pending_mode.is_none());
+        assert!(receipt.publication_error().is_none());
+        receipt.cleanup_empty().unwrap();
+        assert!(receipt.is_removed());
     }
 
 }
