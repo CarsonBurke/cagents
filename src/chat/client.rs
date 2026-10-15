@@ -209,6 +209,7 @@ struct ActivityObservation {
 }
 
 impl ActivityObservation {
+    #[cfg(test)]
     fn observe(&mut self, generation: u64, state: ActivityState) -> bool {
         self.observe_outcome(generation, state, None)
     }
