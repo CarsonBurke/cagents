@@ -86,6 +86,12 @@ fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> boo
 
 impl Cagents {
     pub(super) fn capture_terminal_close_binding(&mut self, card: CardId, spawned: bool) {
+        // A successful explicit spawn invalidates old authority even when the
+        // new attachment has not published authenticated metadata yet.
+        if spawned {
+            self.terminal_close_bindings.bound.remove(&card);
+            self.terminal_close_bindings.adoptions.remove(&card);
+        }
         let Some(CardRuntime::Terminal(surface)) = self.cards.get(&card) else { return };
         let Some(binding) = surface.worker_binding() else { return };
         let Some(proof) = surface.host_proof().filter(HostSessionProof::is_complete) else { return };
@@ -1026,6 +1032,19 @@ mod tests {
         assert!(app.settings.confirm_terminal_close);
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(!app.terminal_close.as_ref().unwrap().pending);
+    }
+
+    #[test]
+    fn explicit_spawn_without_confirmed_metadata_invalidates_old_close_authority() {
+        let (mut app,card,captured)=bound_fixture();
+        let _=app.begin_card_close(card);
+        let intent=app.terminal_close.as_ref().unwrap().clone();
+        app.terminal_close_bindings.removals.insert(card,captured);
+        app.cards.insert(card,CardRuntime::Loading);
+        app.capture_terminal_close_binding(card,true);
+        assert!(!app.terminal_close_bindings.bound.contains_key(&card));
+        assert!(!app.terminal_close_binding_current(&intent));
+        assert!(app.terminal_close_bindings.removals.contains_key(&card),"old commit must still fail closed until the replacement is bound");
     }
 
     #[test]
