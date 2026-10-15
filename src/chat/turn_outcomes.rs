@@ -1,5 +1,8 @@
 //! Terminal results have their own durable identity. A result for an earlier
 //! turn never borrows the identity of the currently running turn.
+mod observation;
+pub use observation::*;
+
 use crate::agent::ActivityOutcome;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -7,6 +10,7 @@ use std::collections::HashSet;
 pub const MAX_TURN_ID_BYTES: usize = 4096;
 pub const MAX_TURN_ITEM_IDS: usize = 128;
 pub const MAX_TURN_REASON_BYTES: usize = 4096;
+pub const MAX_TURN_UPDATE_BYTES: usize = 64 * 1024;
 pub const MAX_PROJECTED_TURNS: usize = 128;
 pub const MAX_PROJECTION_BYTES: usize = 256 * 1024;
 
@@ -109,11 +113,14 @@ pub struct TurnOutcomeProjection {
     /// False includes old snapshots/unqualified identity and a bounded partial
     /// projection. Missing records never imply that a turn succeeded.
     pub complete: bool,
+    /// Separate observational diagnostics; these never classify native fate.
+    #[serde(default)]
+    pub losses: Vec<VisibleInputObservationLost>,
 }
 
 impl TurnOutcomeProjection {
     pub fn validate(&self) -> Result<(), String> {
-        if self.records.len() > MAX_PROJECTED_TURNS {
+        if self.records.len().saturating_add(self.losses.len()) > MAX_PROJECTED_TURNS {
             return Err("Turn outcome projection exceeds its record budget".into());
         }
         let mut turns = HashSet::new();
@@ -142,6 +149,18 @@ impl TurnOutcomeProjection {
             }
             if bytes > MAX_PROJECTION_BYTES {
                 return Err("Turn outcome projection exceeds its byte budget".into());
+            }
+        }
+        let mut inputs = HashSet::new();
+        for loss in &self.losses {
+            loss.validate()?;
+            if !inputs.insert(&loss.accepted.input) {
+                return Err("Duplicate projected accepted-input observation loss".into());
+            }
+            for item in &loss.item_ids {
+                if !items.insert(item.as_str()) {
+                    return Err("A projected item has conflicting terminal/loss ownership".into());
+                }
             }
         }
         if postcard::to_stdvec(self)
@@ -218,6 +237,7 @@ mod tests {
     #[test]
     fn earlier_cancelled_turn_coexists_with_later_failure_without_rekeying() {
         let projection = TurnOutcomeProjection {
+            losses: Vec::new(),
             revision: 2,
             complete: true,
             records: vec![
@@ -250,6 +270,7 @@ mod tests {
     fn unqualified_legacy_projection_is_not_success_and_conflicting_joins_refuse() {
         assert!(!TurnOutcomeProjection::default().complete);
         let mut projection = TurnOutcomeProjection {
+            losses: Vec::new(),
             revision: 1,
             complete: true,
             records: vec![
@@ -274,6 +295,7 @@ mod tests {
             ..Default::default()
         };
         snapshot.turn_outcomes = std::sync::Arc::new(TurnOutcomeProjection {
+            losses: Vec::new(),
             revision: 3,
             complete: true,
             records: vec![record("A", "input-A", ActivityOutcome::Cancelled)],
