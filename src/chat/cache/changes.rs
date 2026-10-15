@@ -47,9 +47,11 @@ pub struct File {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestQuery {
     pub source: SourceKey,
+    /// Original zero-based file index, never a path-deduplicated row count.
     pub offset: usize,
     /// File count; serialized metadata also obeys the source page byte budget.
     pub limit: usize,
+    /// Required for continuation pages. The first page may discover the token.
     pub expected_epoch: Option<Epoch>,
 }
 
@@ -58,8 +60,12 @@ pub struct Manifest {
     pub source: SourceKey,
     pub epoch: Epoch,
     pub metadata: Metadata,
+    /// Matches the requested original file index.
     pub offset: usize,
+    /// The next original file index, equal to offset + files.len(). None means
+    /// all original files were described, or an explicit unavailable shortfall.
     pub next_offset: Option<usize>,
+    /// Contiguous original indices; duplicate paths remain separate entries.
     pub files: Vec<File>,
     /// Nonzero only when metadata could not be indexed exactly. A terminal
     /// manifest still states how many original files it cannot describe.
