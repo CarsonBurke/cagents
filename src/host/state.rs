@@ -3681,6 +3681,9 @@ fn start_terminal_view_owned(
         }
     };
     drop(setup_run_guard);
+    // The verified holder handshake transferred the same flock description.
+    // Its lifetime now fences execution independently of daemon callbacks.
+    drop(setup_execution_lease);
     let output_host = Arc::downgrade(shared);
     handle
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
@@ -3761,8 +3764,6 @@ fn start_terminal_view_owned(
     let event_thread = thread::Builder::new()
         .name(format!("cagentsd-events-{terminal_id}"))
         .spawn(move || {
-            // Keep cross-store Resume/Skip CAS fenced until this setup exits.
-            let _setup_execution_lease=setup_execution_lease;
             while let Ok(event) = event_rx.recv() {
                 let completed = matches!(event, TerminalEvent::Completed { .. });
                 record_event_from(&event_host, terminal_id, event, Some(&completion_handle));

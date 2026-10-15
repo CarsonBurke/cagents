@@ -360,6 +360,9 @@ fn daemon_setup_recovery_requires_fresh_review_and_retains_each_explicit_run() {
     fs::write(&configuration,"setup = [not valid TOML").unwrap();
     let device_service::Reply::Worktree(Reply::SetupIntent {plan_error,trusted,..})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntent {repository:repository.clone(),path:path.clone()}}).unwrap() else {panic!("wrong recovery metadata")};
     assert!(plan_error.is_some());assert!(!trusted);
+    assert!(client.device_operation(resume(Some(run),None,false,true)).is_err(),"retained setup holder must be explicitly cleaned up before retrying");
+    assert_eq!(fixture.setup_intent(&path)["run_id"],run.to_string());
+    assert_eq!(client.close_terminal_checked(session.id,false).unwrap(),cagents::terminal_ipc::TerminalCloseResult::Closed);
     let device_service::Reply::Worktree(Reply::SetupPrepared {setup:None,run_id:skipped_run,..})=client.device_operation(resume(Some(run),None,false,true)).unwrap() else {panic!("wrong skip result")};
     let skipped=fixture.setup_intent(&path);assert_eq!(skipped["skip"],true);assert_eq!(skipped["copy_done"],true);assert!(skipped["plan"].is_null());assert_ne!(skipped["run_id"],run.to_string());
     assert_eq!(skipped["run_id"],skipped_run.to_string());

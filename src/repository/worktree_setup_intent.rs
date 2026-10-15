@@ -237,7 +237,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let expected=journal.lease_identity.ok_or_else(||StoreError::InvalidState("Setup creation has no original lease identity".into()))?;
         // Do not wait on a starting/live setup after a caller's activity census.
         // A retry must obtain fresh activity and intent evidence.
-        let lease=worktree_lease(&journal.lease_path,false).map_err(|error|StoreError::InvalidState(format!("Setup creation is starting, running or unavailable; review again: {error}")))?;
+        let lease=worktree_lease(&journal.lease_path,false).map_err(|error|StoreError::InvalidState(format!("Close the previous Worktree setup terminal, including its completed card, before resuming; setup ownership is still held or unavailable: {error}")))?;
         let named=fs::symlink_metadata(&journal.lease_path)?;
         if lease_file_identity(&lease)?!=expected||!named.file_type().is_file()||(named.dev(),named.ino())!=expected {
             return Err(StoreError::InvalidState("Setup creation lease was replaced".into()));
