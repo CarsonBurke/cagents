@@ -1,6 +1,8 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
 mod file_changes;
+mod adapter_items;
+pub(super) use adapter_items::reader as adapter_item_reader;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;

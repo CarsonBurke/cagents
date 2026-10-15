@@ -231,7 +231,7 @@ impl Handle {
 
     fn start_inner(
         mut spec: ProcessSpec,
-        adapter: Box<dyn Adapter>,
+        mut adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
         session_id: Option<String>,
@@ -308,6 +308,7 @@ impl Handle {
         let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
+        adapter.bind_item_reader(store::adapter_item_reader(&store));
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
@@ -2665,6 +2666,9 @@ impl Actor {
                 return Err(message);
             }
         }
+        // Every source item in this Step is now canonical, including items
+        // that another block/result in the same frame refers back to.
+        self.adapter.committed();
         // An outcome is acted on as soon as it is published, and its reader
         // asks which conversation produced it. Answer before announcing.
         if let Some(confirmed) = confirmed {
