@@ -385,4 +385,20 @@ while True:
         }
     }
 
+    #[test]
+    fn original_store_recovery_without_presentation_events_advances_snapshot_generation(){
+        use super::super::Handle;
+        struct MetadataRecovery(bool);
+        impl Adapter for MetadataRecovery{
+            fn initialize(&mut self)->Result<Step,String>{Ok(Step::default())}
+            fn command(&mut self,_:Command)->Result<Step,String>{Ok(Step{writes:vec![json!({"tick":true})],..Step::default()})}
+            fn receive(&mut self,_:Value)->Result<Step,String>{if std::mem::replace(&mut self.0,false){Ok(Step{events:vec![Event::Session{id:"confirmed-session".into(),title:None}],..Step::default()})}else{Ok(Step::default())}}
+        }
+        fn wait(mut condition:impl FnMut()->bool){let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);while !condition(){assert!(std::time::Instant::now()<deadline);std::thread::sleep(std::time::Duration::from_millis(5));}}
+        let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
+        let spec=protocol::ProcessSpec{execution:None,messages:None,unset_environment:Default::default(),transport:protocol::TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:vec![],working_directory:root.path().to_owned(),environment:Default::default()};let mut initial=Step::default();let cache=super::super::preflight(&spec,&mut initial).unwrap();let handle=Handle::start_inner(spec,Box::new(MetadataRecovery(true)),initial,cache,None,None,Ok(scope),|_|{}).unwrap();let blocked=root.path().join("annotations");std::fs::write(&blocked,b"not a directory").unwrap();handle.0.annotations.lock().unwrap().root=Some(blocked.clone());
+        handle.command(Command::Compact).unwrap();wait(||handle.0.annotations.lock().unwrap().notice.is_some());let before=handle.snapshot(None).unwrap();std::fs::remove_file(blocked).unwrap();handle.0.annotations.lock().unwrap().retry_at=Some(std::time::Instant::now());handle.command(Command::Compact).unwrap();wait(||handle.0.annotations.lock().unwrap().store.is_some());
+        let after=handle.snapshot(Some(before.generation)).expect("Eligibility-only change must pass ChatRead generation gate");assert!(after.generation>before.generation);assert!(after.original_revision>before.original_revision);handle.close().unwrap();
+    }
+
 }
