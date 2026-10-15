@@ -175,13 +175,20 @@ struct Holding {
 }
 impl Holding {
     fn create(parent: &Root, source: &File, context: &RecoveryContext) -> Result<Self, FileIoError> {
+        Self::create_using(parent, source, context, |parent, name| fs_safety::create_directory_beneath(parent, name, 0o700))
+    }
+
+    fn create_using(
+        parent: &Root, source: &File, context: &RecoveryContext,
+        create: impl FnOnce(&Root, &Path) -> Result<fs_safety::DirectoryCreation, fs_safety::DirectoryCreateError>,
+    ) -> Result<Self, FileIoError> {
         let slot = context.reserve().map_err(FileIoError::Io)?;
         let retained_parent = parent.try_clone().map_err(io_error)?;
         // Duplicate the authenticated source BEFORE mkdir/acquisition. Even a
         // later verification error keeps this inode pinned in the result.
         let retained_source = source.try_clone().map_err(io_error)?;
         let name = OsString::from(format!(".cagents-save-{}", uuid::Uuid::new_v4()));
-        let creation = match fs_safety::create_directory_beneath(parent, Path::new(&name), 0o700) {
+        let creation = match create(parent, Path::new(&name)) {
             Ok(creation) => creation,
             Err(mut error) => {
                 let message = error.to_string();
@@ -1006,6 +1013,41 @@ mod tests {
         drop(exclusive);
         assert_eq!(fs::read(moved.join("file")).unwrap(), b"base");
         assert_eq!(fs::read(named.join("foreign")).unwrap(), b"new actor");
+    }
+
+    #[test]
+    fn save_acquisition_real_preparation_failure_keeps_exact_lease_and_source_until_cleanup() {
+        use std::sync::Arc;
+        let (directory, root) = fixture();
+        let runtime = tempfile::tempdir().unwrap();
+        let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), false).unwrap();
+        let context = recovery_context_at(&root, Arc::new(Some(protection))).unwrap();
+        let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
+        let mut staging = None;
+        let result = Holding::create_using(&root, &source, &context, |parent, _| {
+            let error = fs_safety::fixture_directory_preparation_failure(parent);
+            staging = Some(error.recovery().unwrap().diagnostic_path().to_owned());
+            Err(error)
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("actual producer fault must return a retained preparation"),
+        };
+        let authority = error.recovery_authority().expect("prepublication error must retain live authority").clone();
+        drop(error);
+        drop(context);
+        drop(source);
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).is_err());
+        assert!(authority.retry().is_err(), "unknown private contents must remain intact");
+        let staging = staging.unwrap();
+        assert_eq!(fs::read(staging.join("directory")).unwrap(), b"retained fixture artifact");
+        fs::remove_file(staging.join("directory")).unwrap();
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert!(!staging.exists());
+        let exclusive = crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).unwrap();
+        drop(exclusive);
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"base");
     }
 
     #[test]
