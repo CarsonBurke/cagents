@@ -2729,7 +2729,11 @@ fn provider_exit_diagnostic(
     };
     let lines: Vec<_> = output
         .lines()
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let line=line.trim();
+            let lower=line.to_lowercase();
+            !line.is_empty() && !lower.contains("tungstenite") && !lower.contains("inspect")
+        })
         .rev()
         .take(3)
         .collect();
@@ -3842,6 +3846,17 @@ mod tests {
                 .contains("8 consecutive invalid protocol lines. Last output: garbage"),
             "a status must not erase the bounded framing diagnosis"
         );
+    }
+
+    #[test]
+    fn compact_provider_notice_omits_transport_jargon_from_stderr_but_preserves_saved_details() {
+        use std::os::unix::process::ExitStatusExt;
+        let stderr="Authentication failed\ntungstenite: connection closed\ninspect the exact thread for raw output\n";
+        let diagnostic=provider_exit_diagnostic(Some(std::process::ExitStatus::from_raw(3<<8)),"socket closed",stderr);
+        assert!(diagnostic.summary.contains("Authentication failed"));
+        assert!(!diagnostic.summary.to_lowercase().contains("tungstenite"));
+        assert!(!diagnostic.summary.to_lowercase().contains("inspect"));
+        assert_eq!(diagnostic.output,stderr,"saved readable output must remain faithful to provider diagnostics");
     }
 
     #[test]
