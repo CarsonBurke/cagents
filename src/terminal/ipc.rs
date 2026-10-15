@@ -153,6 +153,10 @@ pub const PROTOCOL_VERSION: u16 = 90;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Client requests carry at most a one-MiB byte vector plus small scalars.
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
+/// Full immutable receipts are persisted as JSON as well as sent as postcard.
+/// The host preflights both representations before handoff effects; UI ledger
+/// reservations must use this independent escaped-JSON promise.
+pub const MAX_HANDOFF_RECEIPT_JSON_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
 /// Production full and browserless builds retain the runtime namespace; a
@@ -954,6 +958,29 @@ pub struct TerminalHandoffReceipt {
     /// A later terminal -> native -> retired transition invalidates this stamp.
     pub terminal_native_epoch: uuid::Uuid,
     pub terminal: TerminalDescriptor,
+}
+
+/// Count the actual persisted representation without allocating an oversized
+/// JSON string. Serialized control characters count their escaped byte length.
+pub fn terminal_handoff_json_bytes(receipt: &TerminalHandoffReceipt) -> io::Result<usize> {
+    bounded_json_bytes(receipt, MAX_HANDOFF_RECEIPT_JSON_BYTES)
+}
+
+pub(crate) fn bounded_json_bytes(value: &impl Serialize, maximum: usize) -> io::Result<usize> {
+    struct Counter { bytes: usize, maximum: usize }
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let required = self.bytes.checked_add(bytes.len())
+                .filter(|required| *required <= self.maximum)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "terminal handoff JSON exceeds its reserved byte limit"))?;
+            self.bytes = required;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    let mut counter = Counter { bytes: 0, maximum };
+    serde_json::to_writer(&mut counter, value).map_err(io::Error::other)?;
+    Ok(counter.bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
