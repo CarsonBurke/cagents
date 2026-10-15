@@ -295,7 +295,7 @@ impl Cagents {
                 self.automation_approval.error = None;
                 self.automation_approval.restore_keyboard_nav = Some(self.core.keyboard_nav());
                 self.core.set_keyboard_nav(false);
-                approval_focus(0)
+                approval_focus(self.automation_approval.generation, 0)
             }
             Action::Dismiss {
                 id,
@@ -395,7 +395,7 @@ impl Cagents {
                     Err(error) => {
                         state.error = Some(error.to_string());
                         state.focus = 0;
-                        approval_focus(0)
+                        approval_focus(state.generation, 0)
                     }
                 }
             }
@@ -430,7 +430,7 @@ impl Cagents {
             let backwards = *key == Named::ArrowLeft || (*key == Named::Tab && modifiers.shift());
             self.automation_approval.focus =
                 (self.automation_approval.focus + if backwards { 2 } else { 1 }) % 3;
-            return Some(approval_focus(self.automation_approval.focus));
+            return Some(approval_focus(self.automation_approval.generation, self.automation_approval.focus));
         }
         if *key == Named::Escape
             || (*key == Named::Enter
@@ -530,15 +530,15 @@ impl Cagents {
         });
         let controls = dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Not now")
-                .id(widget::Id::new("automation-approval.dismiss"))
+                .id(approval_control_id(state.generation, "dismiss"))
                 .on_press_maybe((!state.deciding).then(|| dismiss.clone())),
             widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("Decline")
-                    .id(widget::Id::new("automation-approval.decline"))
+                    .id(approval_control_id(state.generation, "decline"))
                     .on_press_maybe((!state.deciding).then(|| decision(false)))
                     .into(),
                 crate::ui_controls::button::primary("Approve and enable")
-                    .id(widget::Id::new("automation-approval.approve"))
+                    .id(approval_control_id(state.generation, "approve"))
                     .on_press_maybe((!state.deciding).then(|| decision(true)))
                     .into(),
             ])
@@ -551,19 +551,27 @@ impl Cagents {
             controls,
         ])
         .spacing(space::M);
-        Some(dialog_ui::overlay(
+        let overlay = dialog_ui::overlay(
             dialog_ui::surface(surface, 680.0),
             (!state.deciding).then_some(dismiss),
             1.0,
-        ))
+        );
+        // Reset unnamed pointer state for each review. Named button state is
+        // restored outside keyed diff, so those IDs also carry this generation.
+        Some(iced::widget::keyed::Column::with_children([(state.generation, overlay)])
+            .width(Length::Fill).height(Length::Fill).into())
     }
 }
 
-fn approval_focus(index: usize) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(match index {
-        0 => "automation-approval.dismiss",
-        1 => "automation-approval.decline",
-        _ => "automation-approval.approve",
+fn approval_control_id(generation: u64, role: &str) -> widget::Id {
+    widget::Id::new(format!("automation-approval.{generation}.{role}"))
+}
+
+fn approval_focus(generation: u64, index: usize) -> Task<Message> {
+    iced::widget::operation::focus(approval_control_id(generation, match index {
+        0 => "dismiss",
+        1 => "decline",
+        _ => "approve",
     }))
     .map(cosmic::Action::App)
 }
@@ -707,7 +715,7 @@ mod tests {
         assert!(!app.core.keyboard_nav());
         assert_eq!(
             super::super::tests::focused_element(app.automation_approval_dialog().unwrap(), task),
-            Some(widget::Id::new("automation-approval.dismiss"))
+            Some(approval_control_id(app.automation_approval.generation, "dismiss"))
         );
         app.automation_approval.deciding = true;
         let mut declined = proposal.clone();
@@ -752,63 +760,96 @@ mod tests {
         (app, proposal)
     }
 
-    // Deliver real pointer events to the production dialog, including its
-    // backdrop and all three buttons, rather than substituting reducer calls.
-    fn dialog_click(app: &Cagents, control: Option<&str>) -> Vec<Message> {
-        use cosmic::iced::advanced::{
-            Layout, Shell, clipboard, layout,
-            widget::{Operation, Tree, operation::Focusable},
-        };
-        use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
-        struct Bounds(HashMap<String, Rectangle>);
+    fn dialog_frame(
+        element: &mut Element<'_, Message>,
+        tree: &mut cosmic::iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+    ) -> (cosmic::iced::advanced::layout::Node, HashMap<String, cosmic::iced::Rectangle>) {
+        use cosmic::iced::advanced::{Layout, layout, widget::{Operation, operation::Focusable}};
+        struct Bounds(HashMap<String, cosmic::iced::Rectangle>);
         impl Operation for Bounds {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn focusable(
-                &mut self,
-                id: Option<&widget::Id>,
-                bounds: Rectangle,
-                _: &mut dyn Focusable,
-            ) {
-                if let Some(id) = id {
-                    self.0.insert(id.to_string(), bounds);
-                }
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn focusable(&mut self, id: Option<&widget::Id>, bounds: cosmic::iced::Rectangle, _: &mut dyn Focusable) {
+                if let Some(id) = id { self.0.insert(id.to_string(), bounds); }
             }
         }
+        let node = element.as_widget_mut().layout(tree, renderer, &layout::Limits::new(
+            cosmic::iced::Size::ZERO, cosmic::iced::Size::new(1000.0, 900.0)));
+        let mut bounds = Bounds(HashMap::new());
+        element.as_widget_mut().operate(tree, Layout::new(&node), renderer, &mut bounds);
+        (node, bounds.0)
+    }
+
+    fn dialog_pointer_event(
+        element: &mut Element<'_, Message>, tree: &mut cosmic::iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer, node: &cosmic::iced::advanced::layout::Node,
+        point: cosmic::iced::Point, event: cosmic::iced::mouse::Event,
+    ) -> Vec<Message> {
+        use cosmic::iced::{Event, Rectangle, Size, mouse, advanced::{Layout, Shell, clipboard}};
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(tree, &Event::Mouse(event), Layout::new(node),
+            mouse::Cursor::Available(point), renderer, &mut clipboard::Null,
+            &mut Shell::new(&mut messages), &Rectangle::with_size(Size::new(1000.0, 900.0)));
+        messages
+    }
+
+    // Deliver pointer events to the production dialog and its actual widgets.
+    fn dialog_click(app: &Cagents, control: Option<&str>) -> Vec<Message> {
+        use cosmic::iced::{Point, mouse, advanced::widget::Tree};
         let renderer = super::super::tests::headless_renderer();
         let mut element = app.automation_approval_dialog().unwrap();
         let mut tree = Tree::new(element.as_widget());
-        let viewport = Rectangle::with_size(Size::new(1000.0, 900.0));
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(Size::ZERO, viewport.size()),
-        );
-        let mut bounds = Bounds(HashMap::new());
-        element
-            .as_widget_mut()
-            .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
-        let point = control
-            .map(|id| bounds.0[id].center())
+        let (node, bounds) = dialog_frame(&mut element, &mut tree, &renderer);
+        let point = control.map(|role| bounds[&approval_control_id(app.automation_approval.generation, role).to_string()].center())
             .unwrap_or(Point::new(4.0, 4.0));
-        let mut messages = Vec::new();
-        for event in [
-            mouse::Event::ButtonPressed(mouse::Button::Left),
-            mouse::Event::ButtonReleased(mouse::Button::Left),
-        ] {
-            element.as_widget_mut().update(
-                &mut tree,
-                &Event::Mouse(event),
-                Layout::new(&node),
-                mouse::Cursor::Available(point),
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-        }
+        let mut messages = dialog_pointer_event(&mut element, &mut tree, &renderer, &node, point, mouse::Event::ButtonPressed(mouse::Button::Left));
+        messages.extend(dialog_pointer_event(&mut element, &mut tree, &renderer, &node, point, mouse::Event::ButtonReleased(mouse::Button::Left)));
         messages
+    }
+
+    #[test]
+    fn approval_native_press_does_not_transfer_to_a_reopened_review() {
+        use cosmic::iced::{mouse, advanced::widget::{Tree, tree}};
+        for role in ["dismiss", "decline", "approve"] {
+            let (mut app, proposal) = reviewing();
+            let old = app.automation_approval.generation;
+            let renderer = super::super::tests::headless_renderer();
+            let mut element = app.automation_approval_dialog().unwrap();
+            let mut state = Tree::new(element.as_widget());
+            let (node, bounds) = dialog_frame(&mut element, &mut state, &renderer);
+            let point = bounds[&approval_control_id(old, role).to_string()].center();
+            assert!(dialog_pointer_event(&mut element, &mut state, &renderer, &node, point, mouse::Event::ButtonPressed(mouse::Button::Left)).is_empty());
+            drop(element);
+            // No empty widget frame runs between the old press and new review.
+            drop(app.update(Message::KeyEvent { event:key(keyboard::key::Named::Escape), captured:false }));
+            assert!(!app.automation_approval_open());
+            assert_eq!(app.automation_approval.available, Some(proposal.clone()));
+            drop(app.update(Message::AutomationApproval(Action::Open { id:proposal.id, revision:proposal.revision })));
+            let current = app.automation_approval.generation;
+            assert_ne!(old, current);
+            let mut element = app.automation_approval_dialog().unwrap();
+            // The pinned iced runtime lifts named widget state before keyed diff
+            // and restores it afterward. A key alone cannot isolate these IDs.
+            tree::NAMED.with(|named| *named.borrow_mut() = state.take_all_named());
+            state.diff(element.as_widget_mut());
+            iced::runtime::user_interface::restore_cached_named_states(&mut state);
+            tree::NAMED.with(|named| named.borrow_mut().clear());
+            let (node, bounds) = dialog_frame(&mut element, &mut state, &renderer);
+            let current_point = bounds[&approval_control_id(current, role).to_string()].center();
+            assert_eq!(point, current_point);
+            assert!(dialog_pointer_event(&mut element, &mut state, &renderer, &node, current_point, mouse::Event::ButtonReleased(mouse::Button::Left)).is_empty());
+            assert!(dialog_pointer_event(&mut element, &mut state, &renderer, &node, current_point, mouse::Event::ButtonPressed(mouse::Button::Left)).is_empty());
+            let messages = dialog_pointer_event(&mut element, &mut state, &renderer, &node, current_point, mouse::Event::ButtonReleased(mouse::Button::Left));
+            assert_eq!(messages.len(), 1, "the current control still works");
+            assert!(match &messages[0] {
+                Message::AutomationApproval(Action::Dismiss { id, revision, generation }) if role == "dismiss" => *id==proposal.id && *revision==proposal.revision && *generation==current,
+                Message::AutomationApproval(Action::Decide { id, revision, generation, approved }) if role != "dismiss" => *id==proposal.id && *revision==proposal.revision && *generation==current && *approved==(role=="approve"),
+                _ => false,
+            });
+            drop(element);
+            for message in messages { drop(app.update(message)); }
+            assert_eq!(app.automation_approval.deciding, role != "dismiss");
+        }
     }
 
     #[test]
@@ -818,9 +859,9 @@ mod tests {
             assert_eq!(
                 super::super::tests::focused_element(
                     app.automation_approval_dialog().unwrap(),
-                    approval_focus(0)
+                    approval_focus(app.automation_approval.generation, 0)
                 ),
-                Some(widget::Id::new("automation-approval.dismiss"))
+                Some(approval_control_id(app.automation_approval.generation, "dismiss"))
             );
             drop(app.update(Message::KeyEvent {
                 event: key(named),
@@ -841,7 +882,7 @@ mod tests {
 
     #[test]
     fn approval_backdrop_and_not_now_emit_only_exact_neutral_dismissal() {
-        for control in [None, Some("automation-approval.dismiss")] {
+        for control in [None, Some("dismiss")] {
             let (mut app, proposal) = reviewing();
             let generation = app.automation_approval.generation;
             let messages = dialog_click(&app, control);
@@ -862,8 +903,8 @@ mod tests {
     #[test]
     fn approval_explicit_buttons_and_keyboard_decisions_keep_the_exact_review() {
         for (index, control, approved) in [
-            (1, "automation-approval.decline", false),
-            (2, "automation-approval.approve", true),
+            (1, "decline", false),
+            (2, "approve", true),
         ] {
             for use_keyboard in [false, true] {
                 let (mut app, proposal) = reviewing();
@@ -995,7 +1036,7 @@ mod tests {
         assert!(!app.automation_approval.deciding);
         assert_eq!(
             super::super::tests::focused_element(app.automation_approval_dialog().unwrap(), task),
-            Some(widget::Id::new("automation-approval.dismiss"))
+            Some(approval_control_id(app.automation_approval.generation, "dismiss"))
         );
         let unresolved = app.automation_approval.proposal.clone().unwrap();
         app.automation_approval.deciding = true;
