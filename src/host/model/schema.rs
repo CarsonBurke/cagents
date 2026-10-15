@@ -135,6 +135,23 @@ fn require_open_layout(db: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// The historical writer is unavailable in this tree. Admit the explicit
+/// compatibility shape consumed by the existing conversion, rather than drop
+/// unknown columns, indexes or triggers along with its three legacy tables.
+pub(super) fn require_legacy_views(db: &Connection) -> Result<(), String> {
+    let definitions = [
+        ("workspace_views", "CREATE TABLE workspace_views(channel TEXT PRIMARY KEY REFERENCES channels(id),revision INTEGER NOT NULL,panes TEXT NOT NULL,retired TEXT NOT NULL) STRICT"),
+        ("workspace_view_panes", "CREATE TABLE workspace_view_panes(id TEXT PRIMARY KEY,channel TEXT NOT NULL REFERENCES workspace_views(channel)) STRICT"),
+        ("workspace_view_edits", "CREATE TABLE workspace_view_edits(operation TEXT PRIMARY KEY,channel TEXT NOT NULL REFERENCES workspace_views(channel)) STRICT"),
+    ];
+    let mut expected = definitions.iter().map(|(name,sql)| Ok(("table".to_owned(),name.to_string(),name.to_string(),tokens(sql)?)))
+        .collect::<Result<Layout,String>>()?;
+    expected.sort();
+    let actual = inspect(db)?.objects.into_iter().filter(|o| definitions.iter().any(|(name,_)|o.2==*name)).collect::<Layout>();
+    if actual != expected { return Err("unsupported legacy workspace-view layout; the original store was not converted".into()); }
+    Ok(())
+}
+
 pub(super) fn require_current(db: &Connection) -> Result<(), String> {
     let actual = inspect(db)?;
     if actual.version != SCHEMA_VERSION { return Err(format!("workspace registry schema {} requires reopening before edits", actual.version)); }
@@ -270,6 +287,20 @@ mod tests {
         let malformed=dir.path().join("unknown7.sqlite3");legacy(&malformed,7);
         Connection::open(&malformed).unwrap().execute_batch("CREATE TABLE future_shape(secret TEXT) STRICT;").unwrap();
         let before=bytes(&malformed);assert!(Registry::at(&malformed).is_err());assert_eq!(bytes(&malformed),before);
+    }
+
+    #[test]
+    fn unknown_legacy_view_columns_and_indexes_are_not_dropped() {
+        for extra in ["ALTER TABLE workspace_views ADD COLUMN secret TEXT; UPDATE workspace_views SET secret='keep me';", "CREATE INDEX unknown_legacy_index ON workspace_views(revision);"] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("unknown-legacy.sqlite3");let (_,channel)=legacy(&path,6);
+            let db=Connection::open(&path).unwrap();
+            db.execute_batch("CREATE TABLE workspace_views(channel TEXT PRIMARY KEY REFERENCES channels(id),revision INTEGER NOT NULL,panes TEXT NOT NULL,retired TEXT NOT NULL) STRICT;
+                CREATE TABLE workspace_view_panes(id TEXT PRIMARY KEY,channel TEXT NOT NULL REFERENCES workspace_views(channel)) STRICT;
+                CREATE TABLE workspace_view_edits(operation TEXT PRIMARY KEY,channel TEXT NOT NULL REFERENCES workspace_views(channel)) STRICT;
+                PRAGMA user_version=7;").unwrap();
+            db.execute("INSERT INTO workspace_views VALUES(?1,9,'[]','[]')",[channel.to_string()]).unwrap();db.execute_batch(extra).unwrap();drop(db);
+            let before=bytes(&path);assert!(Registry::at(&path).err().unwrap().contains("unsupported legacy"));assert_eq!(bytes(&path),before);
+        }
     }
 
     #[test]
