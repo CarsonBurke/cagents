@@ -652,7 +652,10 @@ fn line<'a>(
             .spacing(0),
         )
         .width(Length::Fill)
-        .center_y(Length::Fill)
+        // The account caption establishes the row's intrinsic height. Making
+        // every cell Fill in the cross axis collapses a Shrink row to zero
+        // before iced can measure the wrapped caption.
+        .center_y(Length::Shrink)
         .into(),
     ];
     items.extend(cells.into_iter().map(|(width, cell)| {
@@ -1545,7 +1548,9 @@ mod tests {
             rendered
                 .0
                 .iter()
-                .any(|(text, _)| text.contains("Fixture provider could not connect"))
+                .any(|(text, _)| text.contains("Fixture provider could not connect")),
+            "the failure caption must have positive layout bounds: {:?}",
+            rendered.0
         );
         let account = app.account_ui.account_mut(&id).unwrap();
         account.failure = None;
