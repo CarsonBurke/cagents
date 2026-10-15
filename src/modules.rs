@@ -9,6 +9,7 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 pub const VERSION: &str = env!("CAGENTS_VERSION");
 
 mod names;
+pub mod search_match;
 
 pub mod account;
 pub mod agent;
