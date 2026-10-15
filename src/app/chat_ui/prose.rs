@@ -394,6 +394,7 @@ impl Renderer<'_> {
                     (markdown::Bullet::Point { items }, Some(start))
                     | (markdown::Bullet::Task { items, .. }, Some(start)) => (
                         iced::widget::text(format!("{}.", index as u64 + start))
+                            .font(settings.style.font)
                             .size(settings.text_size)
                             .align_x(iced::alignment::Horizontal::Right)
                             .width(
@@ -403,7 +404,10 @@ impl Renderer<'_> {
                         items,
                     ),
                     (markdown::Bullet::Point { items }, None) => (
-                        iced::widget::text("•").size(settings.text_size).into(),
+                        iced::widget::text("•")
+                            .font(settings.style.font)
+                            .size(settings.text_size)
+                            .into(),
                         items,
                     ),
                     (markdown::Bullet::Task { items, done }, None) => (
@@ -613,6 +617,54 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_chat_list_markers_follow_font_and_size_on_the_retained_markdown_tree() {
+        use iced::advanced::{layout, text::Paragraph as _, widget::{Tree, tree::Tag}};
+        type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        type TextState = iced::advanced::widget::text::State<Paragraph>;
+        fn markers(tree: &Tree, out: &mut Vec<(String, iced::Font, f32)>) {
+            if tree.tag == Tag::of::<TextState>() {
+                let state = tree.state.downcast_ref::<TextState>();
+                let content = state.paragraph.content();
+                if matches!(content, "•" | "1." | "2.") {
+                    out.push((content.to_owned(), state.paragraph.raw().font(), state.paragraph.raw().size().0));
+                }
+            }
+            for child in &tree.children { markers(child, out); }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        // Use the actual renderer's installed inventory, including private XDG
+        // lanes where user-only family names may not exist. No skipped path.
+        let families = design::installed_font_families(false);
+        assert!(families.len() >= 2, "two installed families required");
+        let fonts = [iced::Font::with_name(families[0].as_str()), iced::Font::with_name(families[1].as_str())];
+        assert_ne!(fonts[0].family, fonts[1].family);
+        let cached = CachedItem::new(&ItemContent::Text {
+            text: "- alpha\n- beta\n\n1. gamma\n2. delta".into(),
+            thinking: false,
+            phase: chat::Phase::Final,
+        }, crate::settings::EditorSyntaxTheme::Auto);
+        let target = Target { card: CardId::new(), generation: 17 };
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0));
+        let mut tree = None;
+        for (font, size) in fonts.into_iter().zip([13.0, 24.0]) {
+            let mut settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            settings.style.font = font;
+            settings.text_size = size.into();
+            let mut element = view(&cached, settings, target, None);
+            let tree = tree.get_or_insert_with(|| Tree::new(element.as_widget()));
+            element.as_widget_mut().diff(tree);
+            let _ = element.as_widget_mut().layout(tree, &renderer, &limits);
+            let mut actual = Vec::new();
+            markers(tree, &mut actual);
+            assert_eq!(actual.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(), ["•", "•", "1.", "2."]);
+            for (marker, actual_font, actual_size) in actual {
+                assert_eq!(actual_font, font, "rendered list marker {marker} must follow chat prose family");
+                assert_eq!(actual_size, size, "rendered list marker {marker} must follow chat prose size");
+            }
+        }
+    }
 
     #[test]
     fn markdown_images_keep_selectable_text_and_emit_scoped_source_actions() {
