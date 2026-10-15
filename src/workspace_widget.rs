@@ -3990,7 +3990,9 @@ mod tests {
             );
             for event in [
                 Event::Keyboard(key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false)),
-                Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit("input".into())),
+                Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit(
+                    "input".into(),
+                )),
             ] {
                 let mut messages = Vec::new();
                 let mut shell = Shell::new(&mut messages);
