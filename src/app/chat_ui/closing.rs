@@ -89,7 +89,14 @@ impl EndRequest {
         true
     }
     pub(super) fn current(&self, app: &Cagents, card: CardId) -> bool {
-        self.source_current(app, card) && app.pane_close_decision_current(card, self.batch)
+        let original_membership_current = match &self.shared_source {
+            Some(source) => source.current(&app.workspace_model),
+            None => !app.workspace_model.views.iter().any(|view| view.panes.iter().any(|pane| pane.id == card))
+                && !app.shared_views.attached.contains(&card)
+                && !app.shared_views.baseline.values().any(|panes| panes.iter().any(|pane| pane.id == card)),
+        };
+        self.source_current(app, card) && original_membership_current
+            && app.pane_close_decision_current(card, self.batch)
     }
 }
 
@@ -1021,7 +1028,9 @@ mod tests {
 
     #[test]
     fn a_failed_return_cannot_capture_a_new_shared_removal_basis_for_the_held_end() {
+        for retained_owner in [false, true] {
         let (mut app, card, directory) = fixture();
+        if retained_owner { attach_durable_owner(&mut app, card); }
         write(&mut app, card, "keep original failed-return draft", false);
         retain_in_channel(&mut app, directory.path(), vec![card]);
         shared_scope(&mut app, card, directory.path());
@@ -1041,6 +1050,7 @@ mod tests {
         assert!(app.recently_closed.is_empty());
         let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("original runtime kept"); };
         assert_eq!(runtime.unsent_text(), "keep original failed-return draft");
+        }
     }
 
     #[test]
