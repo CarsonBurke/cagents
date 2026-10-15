@@ -451,17 +451,31 @@ impl LspManager {
     /// Once claimed, the lease owns the response across preview expiry and
     /// manager shutdown; it must be acknowledged after the actual publication.
     pub fn claim_workspace_edit(&mut self, id: LspServerEditId) -> Result<LspServerEditLease, String> {
+        if self.stopping {
+            let reason = "The language manager is shutting down; the server edit cannot be published".to_owned();
+            self.respond_workspace_edit(id, false, Some(reason.clone()));
+            return Err(reason);
+        }
         let mut pending = self.server_edits.pending.lock().unwrap_or_else(|p| p.into_inner());
         let entry = pending.get_mut(&id).ok_or("The server edit expired or its source was closed; request it again")?;
         if entry.reply.is_none() { return Err("The server edit is already being published".into()); }
-        if std::time::Instant::now() >= entry.deadline {
+        // A protocol worker can finish admitting a request after the manager's
+        // close/clear pass. Reprove the original binding at the claim boundary.
+        let has_document = self.document_version(entry.doc).is_some()
+            || self.snapshots.lock().docs.contains_key(&entry.doc);
+        let refusal = if !has_document {
+            Some("The server edit source was closed; request it again")
+        } else if std::time::Instant::now() >= entry.deadline {
+            Some("The server edit preview expired; request it again")
+        } else { None };
+        if let Some(reason) = refusal {
             let entry = pending.remove(&id).unwrap();
             drop(pending);
             if let Some(reply) = entry.reply {
                 let _ = reply.send(lsp_types::ApplyWorkspaceEditResponse { applied: false,
-                    failure_reason: Some("workspace-edit preview timed out before publication".into()), failed_change: None });
+                    failure_reason: Some(reason.into()), failed_change: None });
             }
-            return Err("The server edit preview expired; request it again".into());
+            return Err(reason.into());
         }
         let reply = entry.reply.take();
         Ok(LspServerEditLease { id, edits: Arc::clone(&self.server_edits), reply })
@@ -646,6 +660,20 @@ mod tests {
     }
 
     #[test]
+    fn late_server_edit_admission_cannot_reopen_closed_or_stopping_authority() {
+        let (mut manager, _) = server_edit_fixture();
+        manager.snapshots.unregister(LspDocumentId(1));
+        let (id, mut response) = manager.server_edits.preview(LspDocumentId(1), std::time::Instant::now()+Duration::from_secs(120)).unwrap();
+        assert!(manager.claim_workspace_edit(id).unwrap_err().contains("source was closed"));
+        assert!(!response.try_recv().unwrap().applied);
+        manager.shutdown();
+        let (id, mut response) = manager.server_edits.preview(LspDocumentId(1), std::time::Instant::now()+Duration::from_secs(120)).unwrap();
+        assert!(manager.claim_workspace_edit(id).unwrap_err().contains("shutting down"));
+        assert!(!response.try_recv().unwrap().applied);
+        assert!(manager.server_edits.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn claimed_server_edit_owns_reply_across_preview_timeout_close_and_shutdown() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let (mut manager, mut router) = server_edit_fixture();
@@ -654,7 +682,7 @@ mod tests {
             let lease = manager.claim_workspace_edit(id).unwrap();
             assert!(manager.claim_workspace_edit(id).is_err());
             manager.server_edits.close_doc(LspDocumentId(1));
-            manager.server_edits.clear();
+            manager.shutdown();
             manager.respond_workspace_edit(id, false, Some("stale preview cancellation".into()));
             assert_eq!(manager.server_edits.pending.lock().unwrap().len(), 1);
             assert!(tokio::time::timeout(Duration::from_millis(40), &mut request).await.is_err(),
