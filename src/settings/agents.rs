@@ -124,6 +124,7 @@ impl AgentLaunchSettings {
             }
             return Ok(executable.into());
         }
+        self.validate_provider_path()?;
         let search_path = self
             .environment
             .get("PATH")
@@ -136,6 +137,25 @@ impl AgentLaunchSettings {
     /// Authentication and discovery consume execution policy without model,
     /// effort or permission defaults, which are conversation choices.
     pub fn validate_execution(&self, provider: Provider) -> Result<(), String> {
+        self.validate_execution_fields(provider)?;
+        self.validate_provider_path()
+    }
+
+    // A pin fixes program identity even when a provider needs relative PATH
+    // entries for its own tools. Without one, discovery cannot resolve a
+    // project-relative entry without knowing the eventual launch directory.
+    fn validate_provider_path(&self) -> Result<(), String> {
+        if self.executable.is_none()
+            && self.environment.get("PATH").is_some_and(|path| {
+                std::env::split_paths(path).any(|directory| !directory.is_absolute())
+            })
+        {
+            return Err("Set a provider executable or use only absolute directories in PATH; empty and relative entries depend on the launch directory.".into());
+        }
+        Ok(())
+    }
+
+    fn validate_execution_fields(&self, provider: Provider) -> Result<(), String> {
         if self
             .executable
             .as_deref()
@@ -170,7 +190,12 @@ impl AgentLaunchSettings {
     }
 
     pub fn validate(&self, provider: Provider) -> Result<(), String> {
-        self.validate_execution(provider)?;
+        self.validate_fields(provider)?;
+        self.validate_provider_path()
+    }
+
+    fn validate_fields(&self, provider: Provider) -> Result<(), String> {
+        self.validate_execution_fields(provider)?;
         for value in self.model.iter().chain(self.effort.iter()) {
             if value.trim().is_empty() || value.chars().any(char::is_control) {
                 return Err(
@@ -218,7 +243,16 @@ impl AgentLaunchSettings {
                 Default::default()
             },
         }
-        .validate(provider)
+        .validate_fields(provider)?;
+        if self.executable != previous.executable
+            || self.environment.get("PATH") != previous.environment.get("PATH")
+        {
+            // Use the effective pin, including an unchanged pin, rather than
+            // the field-only validation projection above. Unchanged invalid
+            // execution policy must not prevent unrelated repairs.
+            self.validate_provider_path()?;
+        }
+        Ok(())
     }
 
     /// Apply before account isolation. The selected home and credential
@@ -379,6 +413,87 @@ fn remove_config_key(arguments: &mut Vec<String>, key: &str) {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn ambiguous_provider_path_requires_a_pin_without_blocking_independent_repairs() {
+        let previous = AgentLaunchSettings {
+            environment: BTreeMap::from([("PATH".into(), "tools:/usr/bin".into())]),
+            ..Default::default()
+        };
+        assert!(previous.validate_execution(Provider::Claude).unwrap_err().contains("absolute"));
+        for path in ["", ":/usr/bin", "/usr/bin:", "/usr/bin:tools", "."] {
+            let mut ambiguous = previous.clone();
+            ambiguous.environment.insert("PATH".into(), path.into());
+            assert!(ambiguous.validate(Provider::Claude).is_err(), "{path:?}");
+        }
+        let mut repaired = previous.clone();
+        repaired.model = Some("fixture-model".into());
+        repaired.validate_changes(&previous, Provider::Claude).unwrap();
+        repaired.environment.insert("FIXTURE_TOOL".into(), "value".into());
+        repaired.validate_changes(&previous, Provider::Claude).unwrap();
+        repaired.executable = Some("/bin/sh".into());
+        repaired.validate_changes(&previous, Provider::Claude).unwrap();
+        repaired.validate_execution(Provider::Claude).unwrap();
+        let pinned = repaired.clone();
+        repaired.environment.insert("PATH".into(), "relative-tools".into());
+        repaired.validate_changes(&pinned, Provider::Claude).unwrap();
+        let pinned = repaired.clone();
+        repaired.executable = None;
+        assert!(repaired.validate_changes(&pinned, Provider::Claude).is_err());
+        repaired.environment.insert("PATH".into(), "/usr/bin".into());
+        repaired.validate_changes(&pinned, Provider::Claude).unwrap();
+        repaired.validate_execution(Provider::Claude).unwrap();
+
+        let missing_pin = AgentLaunchSettings {
+            executable: Some("/missing/provider".into()),
+            ..previous
+        };
+        let mut repair_environment = missing_pin.clone();
+        repair_environment.environment.insert("PATH".into(), "other-tools".into());
+        repair_environment.validate_changes(&missing_pin, Provider::Claude).unwrap();
+        assert!(repair_environment.validate_execution(Provider::Claude).is_err());
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn relative_provider_path_is_refused_before_launch_or_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = directory.path().join("host");
+        let tools = directory.path().join("tools");
+        for (root, marker) in [(&host, "host"), (&tools, "project")] {
+            std::fs::create_dir(root).unwrap();
+            let binary = root.join(Provider::Claude.executable());
+            std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{marker}'\n")).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = format!("tools:{}", host.display());
+        let mut configuration = AgentLaunchSettings {
+            environment: BTreeMap::from([("PATH".into(), path.clone())]),
+            ..Default::default()
+        };
+        // This is the mismatch that execution policy must refuse: launching
+        // a bare name sees the project CLI while discovery skips relative PATH.
+        let output = std::process::Command::new(Provider::Claude.executable())
+            .current_dir(directory.path()).env_clear().env("PATH", &path).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"project\n");
+        assert_eq!(
+            crate::account::probe::find_executable(Provider::Claude.executable(), Some(std::ffi::OsStr::new(&path))).unwrap(),
+            host.join(Provider::Claude.executable())
+        );
+        assert!(configuration.resolve_executable(Provider::Claude, Some(host.as_os_str())).is_err());
+        assert!(crate::chat::fresh_session_configured(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            directory.path().into(),
+            &crate::account::Account::system(Provider::Claude),
+            &configuration,
+            LaunchDefaults::default(),
+        ).is_err());
+        configuration.executable = Some(tools.join(Provider::Claude.executable()).to_str().unwrap().into());
+        configuration.validate_execution(Provider::Claude).unwrap();
+        assert_eq!(configuration.resolve_executable(Provider::Claude, Some(host.as_os_str())).unwrap(), tools.join(Provider::Claude.executable()));
+    }
 
     #[cfg(any(feature = "ui", feature = "host"))]
     #[test]

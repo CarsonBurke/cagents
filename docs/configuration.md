@@ -314,6 +314,11 @@ letters, digits and underscores. Provider account homes, credential overrides
 used for account isolation, and `CAGENTS_` variables are reserved. Custom
 variables are applied before the selected account's home and credential
 removals. Settings files retain their existing private permissions.
+An explicit provider `PATH` applies to launch, account discovery and sign-in.
+Without a pinned `executable`, every directory in that PATH must be absolute;
+empty or relative entries depend on the launch directory and are refused.
+Pinning the executable permits relative PATH entries for the provider's tools
+while keeping the provider CLI itself consistent.
 
 ## Language servers
 
