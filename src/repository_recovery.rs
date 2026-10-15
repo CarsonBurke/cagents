@@ -2150,7 +2150,11 @@ mod directory_frontier_tests {
                     let _ = self.0.wait();
                 }
             }
-            let capture = tempfile::tempdir().unwrap();
+            let capture = tempfile::Builder::new()
+                .prefix("frontier-fd-contract-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
             let output = capture.path().join("stdout");
             let errors = capture.path().join("stderr");
             let mut child = ChildGuard(
@@ -2174,8 +2178,11 @@ mod directory_frontier_tests {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             };
             let read_capture = |path: &std::path::Path| {
-                assert!(fs::metadata(path).unwrap().len() <= 1024 * 1024);
-                fs::read_to_string(path).unwrap()
+                let mut reader = std::io::Read::take(fs::File::open(path).unwrap(), 1024 * 1024 + 1);
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut reader, &mut text).unwrap();
+                assert!(text.len() <= 1024 * 1024);
+                text
             };
             let stdout = read_capture(&output);
             let stderr = read_capture(&errors);
