@@ -122,7 +122,7 @@ determine which models and permission modes are available.
   **Ctrl+W**, **Alt+1–9**, **Alt+R**, and **F2** remain available to shells
   and terminal applications. **Ctrl+Shift+F** searches terminal output;
   **Ctrl+Shift+W** closes its pane. Keyboard settings expose **Send to terminal**
-  for each action, including customized chords.
+  for actions that can run in terminals, including customized chords.
 - Shortcut routing follows keyboard focus. Editor, composer, sidebar and
   inspector text controls keep undo, redo, selection and word-navigation keys.
   **Ctrl+Shift+Z** redoes text while editing and reopens a closed pane outside
@@ -566,7 +566,10 @@ settings cover font family and size, line spacing, padding, cursor shape
 appears on the focused terminal when it has scrollback. The file format and
 every key are documented in [Configuration](configuration.md).
 
-Press Ctrl+F (or the contextual Ctrl+Shift+F project-search binding) in a terminal to search its output, including scrollback. Selection and find ranges follow retained output when old history is pruned.
+Press **Ctrl+Shift+F** in a live terminal to search its output, including
+scrollback; **Ctrl+F** remains available to the shell. In a completed terminal,
+use **Ctrl+F** or **Find in pane** from the command palette. Selection and find
+ranges follow retained output when old history is pruned.
 If selected text has left history, a short notice clears the selection and copy
 asks you to select again. Resetting the terminal or resizing its grid also
 invalidates ranges whose coordinates can no longer be proved.
@@ -977,14 +980,17 @@ the source for resumed history.
   browserless builds. Each window restores its selected file, caret, selection,
   and editor scroll position after reopening or an application update. This also
   applies to files selected inside a folder or repository pane.
-- Closing an idle shell needs no confirmation. A running agent, foreground
-  child, background job, or uncertain process state asks first, with Close
-  focused; Cancel or Escape keeps the pane. The close button and
-  `Ctrl+Shift+W` follow the same rule. An unfinished command also asks when
-  the shell supplies OSC 133 prompt markers; interactive fish receives this
-  integration automatically. Clearing that command restores an unconfirmed
-  idle close. Shells without prompt integration ask conservatively because an idle process alone cannot prove that the prompt is empty. **Don't ask me again** turns confirmation off; Settings → **Confirm
-  closing active processes** turns it back on.
+- An untouched empty shell prompt can close without confirmation when its
+  prompt integration proves that no input is pending. Interactive fish receives
+  this integration automatically. A running agent, foreground child, background
+  job, or uncertain process state asks first, with Close focused; Cancel or
+  Escape keeps the pane. The close button and `Ctrl+Shift+W` follow the same
+  rule. After input has been sent to a terminal, closing asks conservatively
+  even if you cleared the line: rendered prompt markers cannot prove that
+  every accepted byte has reached the shell's command-line editor. Shells
+  without prompt integration and adopted terminals also ask conservatively.
+  **Don't ask me again** turns confirmation off; Settings → **Confirm closing
+  active processes** turns it back on.
 - Every close, confirmed or not, first rechecks the terminal's identity with
   the daemon. If the daemon is unreachable, the pane is kept.
 - Worktree rows distinguish unread updates from **working** and **waiting**
