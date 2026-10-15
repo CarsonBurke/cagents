@@ -193,7 +193,7 @@ mod tests {
     fn locate_replacement_folder_retains_provider_and_returns_actionable_refusal() {
         let fixture = fixture(true);
         let retained = fixture._directory.path().join("actual-provider-folder");
-        std::fs::rename(&fixture.old, retained).unwrap();
+        std::fs::rename(&fixture.old, &retained).unwrap();
         std::fs::create_dir(&fixture.old).unwrap();
         std::fs::create_dir(&fixture.moved).unwrap();
         let model = locate(&fixture);
@@ -206,5 +206,17 @@ mod tests {
         assert!(fixture.calls.lock().unwrap().is_empty());
         assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, fixture.source);
         assert!(fixture.moved.is_dir());
+        // Restoring the positively identified original directory at the same
+        // located spelling allows Verify again without another logical move.
+        std::fs::rename(&fixture.moved, fixture._directory.path().join("unapproved-replacement")).unwrap();
+        std::fs::rename(&retained, &fixture.moved).unwrap();
+        let response = super::super::client::process_request(&fixture.host, 1, ClientRequest::EditWorkspaceModel {
+            edit: ModelEdit::RelocateProject { relocation: Relocation { repository: fixture.moved.clone(), destination: fixture.moved.clone(), old_root: fixture.moved.clone(), new_root: fixture.moved.clone() } },
+        }).unwrap().0;
+        let ServerResponse::WorkspaceModel { model: verified } = response else { panic!() };
+        assert!(verified.session_location_refusals.is_empty());
+        assert!(verified.sequence > model.sequence);
+        fixture.handle.command_for_run(crate::model::RunId::new(), chat::Command::Prompt { text: "follow-up after positive retry".into(), attachments: Vec::new(), mode: chat::PromptMode::Send }).unwrap();
+        assert_eq!(*fixture.calls.lock().unwrap(), vec![fixture.moved.clone()]);
     }
 }
