@@ -676,12 +676,19 @@ pub struct Report {
 }
 impl Report {
     pub fn human(&self) -> String {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| {
+            time.as_millis().min(u64::MAX as u128) as u64
+        });
+        self.human_at(now)
+    }
+
+    fn human_at(&self, now: u64) -> String {
         let mut lines = vec![format!("cagents {} (protocol {})", self.cli_version, self.cli_protocol),
             format!("Private diagnostics: {}", self.path.display()),
             "Recorded evidence only; sibling versions and health are last observed, not a live check.".into()];
         for product in &self.products {
             match &product.last_observed {
-                Some(last) => lines.push(format!("{}: last observed {} (protocol {}), at_unix_ms={}, lifecycle={:?}, clean_shutdown={:?}, persistence={:?}, skipped_events={}, run={}", product.product.name(), last.version, last.protocol, last.at_unix_ms, last.lifecycle, last.clean_shutdown, last.persistence, last.skipped_events, last.run)),
+                Some(last) => lines.push(format!("{}: last observed {} (protocol {}), {}; lifecycle {}; clean shutdown {}; persistence {}; skipped events {}; run {}", product.product.name(), last.version, last.protocol, relative_time(last.at_unix_ms, now), lifecycle_label(last.lifecycle), match last.clean_shutdown { Some(true) => "yes", Some(false) => "no", None => "unknown" }, persistence_label(last.persistence), last.skipped_events, last.run)),
                 None => lines.push(format!("{}: health unknown ({})", product.product.name(), if product.readable { "no retained evidence" } else { "evidence unavailable or invalid" })),
             }
             if let Some(failure) = product.records.iter().rev().find(|record| {
@@ -701,8 +708,8 @@ impl Report {
                 )
             }) {
                 lines.push(format!(
-                    "{}: latest retained failure at_unix_ms={}, run={}, event={:?} (historical record; may have recovered)",
-                    product.product.name(), failure.at_unix_ms, failure.run, failure.event
+                    "{}: latest retained failure {}, run {}, {} (historical record; may have recovered)",
+                    product.product.name(), relative_time(failure.at_unix_ms, now), failure.run, event_label(failure.event)
                 ));
             }
         }
@@ -713,18 +720,79 @@ impl Report {
         });
         for holder in &self.holders {
             lines.push(format!(
-                "{} holder {}: terminal={}, version={}, outdated={}, zombie_children={}",
+                "{} holder {}: terminal {}; version {}; build {}; zombie children {}",
                 holder.kind,
                 holder.pid,
                 holder.terminal,
                 holder.version.as_deref().unwrap_or("unknown"),
-                holder.outdated,
+                if holder.outdated { "outdated" } else { "current" },
                 holder
                     .zombie_children
                     .map_or_else(|| "unknown".into(), |count| count.to_string())
             ));
         }
         lines.join("\n")
+    }
+}
+
+fn relative_time(at: u64, now: u64) -> String {
+    let seconds = at.abs_diff(now) / 1000;
+    if seconds == 0 { return "just now".into(); }
+    let (amount, unit) = match seconds {
+        1..=59 => (seconds, "sec"),
+        60..=3599 => (seconds / 60, "min"),
+        3600..=86399 => (seconds / 3600, "hr"),
+        _ => (seconds / 86400, "day"),
+    };
+    let plural = if unit == "day" && amount != 1 { "s" } else { "" };
+    if at > now { format!("in {amount} {unit}{plural}") } else { format!("{amount} {unit}{plural} ago") }
+}
+
+fn lifecycle_label(value: Lifecycle) -> &'static str {
+    match value {
+        Lifecycle::Unknown => "unknown", Lifecycle::Started => "started",
+        Lifecycle::Ready => "ready", Lifecycle::StartupFailed => "startup failed",
+        Lifecycle::Panicked => "panicked", Lifecycle::Exited => "exited",
+    }
+}
+
+fn persistence_label(value: Persistence) -> &'static str {
+    match value {
+        Persistence::Unknown => "unknown", Persistence::Pending => "pending",
+        Persistence::Failed => "failed", Persistence::Recovered => "recovered",
+        Persistence::Complete => "complete",
+    }
+}
+
+fn failure_label(value: Failure) -> &'static str {
+    match value {
+        Failure::Busy => "busy", Failure::ReadOnly => "read only",
+        Failure::DiskFull => "disk full", Failure::PermissionDenied => "permission denied",
+        Failure::StorageUnavailable => "storage unavailable", Failure::Corrupt => "corrupt",
+        Failure::Conflict => "conflict", Failure::Serialization => "serialization",
+        Failure::InvalidData => "invalid data", Failure::Io => "I/O",
+        Failure::Database => "database", Failure::Unknown => "unknown",
+    }
+}
+
+fn event_label(value: Event) -> String {
+    match value {
+        Event::Startup => "startup".into(), Event::Ready => "ready".into(),
+        Event::StartupFailed => "startup failed".into(),
+        Event::Exit { success } => if success { "clean exit" } else { "failed exit" }.into(),
+        Event::Panic { recovered } => if recovered { "panic (recovered)" } else { "panic (unrecovered)" }.into(),
+        Event::PersistenceStarted => "persistence started".into(),
+        Event::PersistenceFailed { category, exhausted } => format!("persistence failed: {}{}", failure_label(category), if exhausted { " (retries exhausted)" } else { "" }),
+        Event::PersistenceRecovered => "persistence recovered".into(),
+        Event::WriterUnavailable => "writer unavailable".into(),
+        Event::FinalFlush { complete, unsaved, refused, category } => {
+            let mut label = format!("final flush {}: {unsaved} unsaved, {refused} refused", if complete { "complete" } else { "incomplete" });
+            if let Some(category) = category { label.push_str(&format!("; {}", failure_label(category))); }
+            label
+        }
+        Event::SettingsFailed { category } => format!("settings failed: {}", failure_label(category)),
+        Event::ProtocolMismatch => "protocol mismatch".into(),
+        Event::EventsSkipped { count } => format!("{count} skipped events"),
     }
 }
 
@@ -934,10 +1002,35 @@ mod tests {
             Some(true)
         );
         let human = report.human();
-        assert!(human.contains("event=StartupFailed"));
-        assert!(human.contains(&format!("run={run}")));
+        assert!(human.contains("startup failed"));
+        assert!(human.contains(&format!("run {run}")));
         assert!(human.contains("historical record; may have recovered"));
-        assert!(human.contains("at_unix_ms="));
+        assert!(human.contains("clean shutdown yes"));
+        assert!(!human.contains("at_unix_ms="));
+        assert!(!human.contains("Some("));
+        assert!(!human.contains("None"));
+    }
+
+    #[test]
+    fn human_diagnostics_keep_failure_details_and_exact_json_timestamps() {
+        let (_root, path) = fixture();
+        let mut recorder = Recorder::open(&path, Product::Daemon).unwrap();
+        recorder.append(Event::Startup).unwrap();
+        recorder.append(Event::FinalFlush { complete: false, unsaved: 3, refused: 2, category: Some(Failure::DiskFull) }).unwrap();
+        let report = inspect_at(path).unwrap();
+        let at = report.products[1].last_observed.as_ref().unwrap().at_unix_ms;
+        let human = report.human_at(at + 180_000);
+        assert!(human.contains("3 min ago"), "{human}");
+        assert!(human.contains("final flush incomplete: 3 unsaved, 2 refused; disk full"), "{human}");
+        for debug in ["Some(", "None", "FinalFlush", "at_unix_ms="] {
+            assert!(!human.contains(debug), "{human}");
+        }
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["products"][1]["last_observed"]["at_unix_ms"], at);
+        assert_eq!(relative_time(at + 120_000, at), "in 2 min");
+        assert_eq!(relative_time(at, at), "just now");
+        assert_eq!(relative_time(0, 86_400_000), "1 day ago");
+        assert_eq!(relative_time(0, 172_800_000), "2 days ago");
     }
 
     #[test]
