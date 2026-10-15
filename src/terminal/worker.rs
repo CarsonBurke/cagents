@@ -2837,7 +2837,8 @@ impl Worker {
         // executable check also protects an exec'd command.
         let idle_shell = interactive_shell_launch(&self.launch) && root.original_executable();
         Ok((
-            family.has_jobs()
+            !self.commands.is_empty()
+                || family.has_jobs()
                 || foreground != root.process.group
                 || !idle_shell
                 || prompt_input::has_prompt_input(&self.terminal)

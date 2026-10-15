@@ -658,7 +658,7 @@ impl Cagents {
             crate::design::body(intent.detail.as_deref().unwrap_or(if intent.pending {
                 "Checking terminal identity and closing…"
             } else {
-                "This terminal has running processes or an unfinished command. Closing stops its processes and discards any unsent input."
+                "Closing stops this terminal's processes and discards any unsent command. Confirm to close it."
             }))
             .into(),
         ];
