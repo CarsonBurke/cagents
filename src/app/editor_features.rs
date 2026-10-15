@@ -127,18 +127,24 @@ mod tests {
         assert_eq!(text(&app, b), original);
     }
 
-    #[test]
-    fn retired_server_edit_preview_cannot_freeze_buffers_or_publish_files() {
+    #[tokio::test]
+    async fn retired_server_edit_preview_cannot_freeze_buffers_or_publish_files() {
         let root = tempfile::tempdir().unwrap();
         let original = "fn old() {}\n";
         for path in ["a.rs", "b.rs"] { std::fs::write(root.path().join(path), original).unwrap(); }
         let mut app = app();
         let card = buffer(&mut app, root.path(), "a.rs", original);
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        let doc = LspDocumentId(44);
+        let path = root.path().join("a.rs");
+        let language = app.lsp.language_for(&path).unwrap();
+        app.lsp.open(doc, &path, root.path(), language, 1, original);
+        let (id, response) = app.lsp.fixture_workspace_edit_preview(doc, Duration::ZERO).unwrap();
         let plan = plan(&app, root.path(), &["a.rs", "b.rs"]);
         let mut operation = operation(&app, card);
-        // Expiry removes the pending protocol entry. The backend lease tests
-        // exercise the deadline; this tests the actual retired-preview UI arm.
-        operation.server_request = Some(LspServerEditId(u64::MAX));
+        // Same bounded backend preview admission, expired deterministically
+        // without sleeping or launching a process.
+        operation.server_request = Some(id);
         app.editor_features.preview = Some(Preview { ticket: 9, diff_ticket: 9, operation, plan, selected: 0, annotation_page: 0, card: CardId::new(), runtime: None, cancellation: crate::repository::CancellationToken::new(), error: None });
         let task = app.update_editor_features(Action::ApplyPreview);
         assert!(iced::runtime::task::into_stream(task).is_none());
@@ -148,6 +154,7 @@ mod tests {
         assert_eq!(text(&app, card), original);
         for path in ["a.rs", "b.rs"] { assert_eq!(std::fs::read_to_string(root.path().join(path)).unwrap(), original); }
         assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("expired")));
+        assert!(!response.await.unwrap().applied);
     }
 
     #[tokio::test]
@@ -434,7 +441,8 @@ mod tests {
         }
         app.close_lsp_document(a);
         app.cards.remove(&a);
-        let task = app.editor_feature_event(&LspEvent::ApplyWorkspaceEdit { doc: LspDocumentId(2), id: LspServerEditId(700), label: Some("Import quick fix".into()), edit: LspWorkspaceEdit { documents: vec![LspDocumentEdits { path: root.path().join("b.rs"), version: Some(1), observed_version: Some(1), coordinates: LspCoordinates::Scalar, edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }] }], ..Default::default() } }).unwrap();
+        let (id, response) = app.lsp.fixture_workspace_edit_preview(LspDocumentId(2), Duration::from_secs(120)).unwrap();
+        let task = app.editor_feature_event(&LspEvent::ApplyWorkspaceEdit { doc: LspDocumentId(2), id, label: Some("Import quick fix".into()), edit: LspWorkspaceEdit { documents: vec![LspDocumentEdits { path: root.path().join("b.rs"), version: Some(1), observed_version: Some(1), coordinates: LspCoordinates::Scalar, edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }] }], ..Default::default() } }).unwrap();
         let mut tasks = vec![task];
         while let Some(task) = tasks.pop() {
             if let Some(mut stream) = iced::runtime::task::into_stream(task) {
@@ -443,6 +451,7 @@ mod tests {
                 }
             }
         }
+        assert!(response.await.unwrap().applied);
         assert_eq!(text(&app, b), "fn renamed() {}\n");
         assert_eq!(text(&app, read_only), original);
         assert_eq!(std::fs::read_to_string(external_path).unwrap(), original);

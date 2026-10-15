@@ -24355,7 +24355,7 @@ mod tests {
                     if change == "away-back" { drop(app.update(Message::FocusCard(card))); }
                 }
                 "caret-back" => {
-                    for motion in [repository_widget::EditorMotion::Right, repository_widget::EditorMotion::Left] {
+                    for motion in [repository_widget::text_editor::Motion::Right, repository_widget::text_editor::Motion::Left] {
                         drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Move(motion) })));
                     }
                 }
