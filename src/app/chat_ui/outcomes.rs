@@ -1,6 +1,6 @@
 //! Durable terminal markers attach only to explicit, visible item bindings.
 use crate::{agent::ActivityOutcome, chat};
-use std::{collections::HashMap, hash::{Hash, Hasher}};
+use std::{collections::{HashMap, HashSet}, hash::{Hash, Hasher}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Tone {
@@ -49,11 +49,20 @@ impl Marker {
 /// Item identity and role decide marker placement. Content bodies and reason
 /// strings do not participate in this once-per-snapshot window fingerprint.
 pub(super) fn window_signature(snapshot: &chat::Snapshot) -> u64 {
+    window_signature_with_alias(snapshot, |_| None)
+}
+
+pub(super) fn window_signature_with_alias<'a>(snapshot: &chat::Snapshot, logical_item_id: impl Fn(&str) -> Option<&'a str>) -> u64 {
     if snapshot.turn_outcomes.records.is_empty() { return 0; }
     let mut hasher = std::hash::DefaultHasher::new();
     snapshot.items.len().hash(&mut hasher);
     for item in &snapshot.items {
         (&item.id, item.role as u8, matches!(item.content, chat::ItemContent::Delivery { .. })).hash(&mut hasher);
+    }
+    // Logical-source aliases can change while the displayed root and the
+    // outcome projection are unchanged. Their explicit proof is cache input.
+    for record in &snapshot.turn_outcomes.records {
+        for item in &record.item_ids { logical_item_id(item).hash(&mut hasher); }
     }
     hasher.finish()
 }
@@ -62,6 +71,13 @@ pub(super) fn window_signature(snapshot: &chat::Snapshot) -> u64 {
 /// exists. Otherwise its last explicitly bound item carries it. This is only
 /// placement: no presentation group or ID spelling grants turn ownership.
 pub(super) fn project(snapshot: &chat::Snapshot) -> HashMap<String, Marker> {
+    project_with_alias(snapshot, |_| None)
+}
+
+/// After logical-source projection, only its explicit reverse alias registry
+/// may join a transport part to a currently displayed root. Unknown spellings
+/// and aliases outside the visible window grant no fallback placement.
+pub(super) fn project_with_alias<'a>(snapshot: &chat::Snapshot, logical_item_id: impl Fn(&str) -> Option<&'a str>) -> HashMap<String, Marker> {
     let projection = &snapshot.turn_outcomes;
     if projection.records.is_empty() || projection.validate().is_err() {
         return HashMap::new();
@@ -73,15 +89,22 @@ pub(super) fn project(snapshot: &chat::Snapshot) -> HashMap<String, Marker> {
         .map(|(index, item)| (item.id.as_str(), (index, item.as_ref())))
         .collect::<HashMap<_, _>>();
     let mut markers = HashMap::new();
+    let mut conflicts = HashSet::new();
     for record in &projection.records {
         if record.outcome.identity.session_id != session { continue; }
-        let item = record.item_ids.iter().filter_map(|id| visible.get(id.as_str()))
+        let item = record.item_ids.iter().filter_map(|id| visible.get(id.as_str())
+            .or_else(|| logical_item_id(id).and_then(|root| visible.get(root))))
             .max_by_key(|(index, item)| (
                 item.role == chat::Role::User && !matches!(item.content, chat::ItemContent::Delivery { .. }),
                 *index,
             ));
         if let Some((_, item)) = item {
-            markers.insert(item.id.clone(), Marker::from_record(&record.outcome));
+            if conflicts.contains(&item.id) { continue; }
+            if markers.remove(&item.id).is_some() {
+                conflicts.insert(item.id.clone());
+            } else {
+                markers.insert(item.id.clone(), Marker::from_record(&record.outcome));
+            }
         }
     }
     markers
@@ -119,6 +142,27 @@ mod tests {
         step_only.items = snapshot.items;
         step_only.session_id = Some("another-native-session".into());
         assert!(project(&step_only).is_empty(), "saved results cannot cross native conversation identity");
+    }
+
+    #[test]
+    fn attention_turn_markers_follow_only_explicit_visible_logical_root_aliases() {
+        let mut snapshot = chat::Snapshot { session_id: Some("native-session".into()),
+            items: vec![item("opaque/root", chat::Role::User)],
+            turn_outcomes: Arc::new(TurnOutcomeProjection { revision: 1, complete: true,
+                records: vec![record("confirmed-input", &["later-transport-part"], ActivityOutcome::Cancelled)] }), ..Default::default() };
+        let alias = |raw: &str| (raw == "later-transport-part").then_some("opaque/root");
+        assert!(project(&snapshot).is_empty());
+        assert!(project_with_alias(&snapshot, alias).contains_key("opaque/root"));
+        assert_ne!(window_signature(&snapshot), window_signature_with_alias(&snapshot, alias),
+            "new alias proof invalidates placement even when root IDs/projection stay the same");
+        let unknown = |_: &str| None::<&str>;
+        assert!(project_with_alias(&snapshot, unknown).is_empty());
+        snapshot.items = vec![item("elsewhere/root", chat::Role::User)];
+        assert!(project_with_alias(&snapshot, alias).is_empty(), "proved aliases cannot target an off-page root");
+        snapshot.items = vec![item("opaque/root", chat::Role::User)];
+        Arc::make_mut(&mut snapshot.turn_outcomes).records.push(record("different-turn", &["other-part"], ActivityOutcome::Succeeded));
+        let ambiguous = |raw: &str| matches!(raw, "later-transport-part" | "other-part").then_some("opaque/root");
+        assert!(project_with_alias(&snapshot, ambiguous).is_empty(), "two terminal identities cannot claim one displayed root");
     }
 
     #[test]
