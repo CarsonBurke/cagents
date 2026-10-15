@@ -770,6 +770,19 @@ pub fn copy_extended_attributes(source: &File, destination: &File) -> Vec<Attrib
     lost
 }
 
+/// Reads the content/access attributes of one held file for a coherent
+/// metadata comparison. A caller must compare descriptor metadata before and
+/// after capture; a disappearing listed attribute is a concurrent change.
+pub fn content_attributes(file: &File) -> io::Result<std::collections::BTreeMap<OsString, Vec<u8>>> {
+    let mut attributes = std::collections::BTreeMap::new();
+    for name in attribute_names(file)? {
+        if !is_content_attribute(&name) { continue; }
+        let value = read_attribute(file, &name)?.ok_or_else(|| io::Error::other("file attributes changed while they were read"))?;
+        attributes.insert(OsString::from_vec(name.to_bytes().to_vec()), value);
+    }
+    Ok(attributes)
+}
+
 /// Preserves an existing file's owner and group on its temporary replacement.
 /// Apply this before access ACLs or content: the owner/group entries in those
 /// permissions must retain their original meaning. Every failure prevents

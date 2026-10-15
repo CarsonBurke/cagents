@@ -65,9 +65,17 @@ pub(crate) fn save_document_file(
         // permissions, rather than that later mode, own this Undo restoration.
         temporary.set_permissions(restoration.permissions.clone()).map_err(io_error)?;
         let lost = fs_safety::copy_extended_attributes(&restoration.source, &temporary);
+        if !lost.is_empty() {
+            return Err(FileIoError::Io(format!("Could not restore file metadata: {}", lost.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))));
+        }
+        let restored = temporary.metadata().map_err(io_error)?;
+        let template = restoration.source.metadata().map_err(io_error)?;
+        if restored.mode() != template.mode() || restored.uid() != template.uid() || restored.gid() != template.gid()
+            || fs_safety::content_attributes(&temporary).map_err(io_error)? != fs_safety::content_attributes(&restoration.source).map_err(io_error)? {
+            return Err(FileIoError::Io("The file's access metadata could not be restored exactly.".into()));
+        }
         temporary.sync_all().map_err(io_error)?;
         fs_safety::rename_new_within(&parent, &temporary_name, &name).map_err(resolve_error)?;
-        for attribute in lost { tracing::warn!(%attribute, "restored editor file did not receive an extended attribute"); }
         Ok(())
     })();
     if let Err(error) = result {
@@ -87,8 +95,8 @@ fn sync_durability(parent: &Root) -> SaveDurability {
 fn same_inode(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino() && left.is_file() && right.is_file()
 }
-fn version(metadata: &fs::Metadata) -> (u64, u32, i64, i64, i64, i64) {
-    (metadata.len(), metadata.mode(), metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec())
+fn version(metadata: &fs::Metadata) -> (u64, u32, u32, u32, i64, i64, i64, i64) {
+    (metadata.len(), metadata.mode(), metadata.uid(), metadata.gid(), metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec())
 }
 
 fn remove_document_file(
@@ -105,6 +113,7 @@ fn remove_document_file(
         || (original.mode() & 0o111 != 0) != (expected_mode == Some(0o100755)) {
         return Err(FileIoError::Io("The file identity or mode changed before Revert could remove it.".into()));
     }
+    let attributes = fs_safety::content_attributes(&source).map_err(io_error)?;
     let bytes = fs_safety::read_bounded(&mut source, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
     let disk_hash = blake3::hash(&bytes);
     if disk_hash != expected_hash { return Ok(SaveOutcome::Conflict { disk_hash }); }
@@ -124,13 +133,15 @@ fn remove_document_file(
     let verify = (|| {
         let acquired = fs_safety::metadata_beneath(&holding, Path::new(acquired_name)).map_err(resolve_error)?;
         if !same_inode(&original, &acquired) || original.mode() != acquired.mode()
+            || original.uid() != acquired.uid() || original.gid() != acquired.gid()
             || original.len() != acquired.len() || original.mtime() != acquired.mtime()
             || original.mtime_nsec() != acquired.mtime_nsec() { return Err(FileIoError::Io("The file was replaced while Revert acquired it.".into())); }
         let mut held = fs_safety::open_beneath(&holding, Path::new(acquired_name)).map_err(resolve_error)?;
         let before = held.metadata().map_err(io_error)?;
         let bytes = fs_safety::read_bounded(&mut held, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
         let after = held.metadata().map_err(io_error)?;
-        if !same_inode(&before, &after) || version(&before) != version(&after) || blake3::hash(&bytes) != expected_hash {
+        if !same_inode(&before, &after) || version(&before) != version(&after) || blake3::hash(&bytes) != expected_hash
+            || fs_safety::content_attributes(&held).map_err(io_error)? != attributes {
             return Err(FileIoError::Io("The file contents changed while Revert acquired it.".into()));
         }
         let (template, template_name) = fs_safety::create_temporary_in(&holding, 0o600).map_err(resolve_error)?;
@@ -141,11 +152,13 @@ fn remove_document_file(
             fs_safety::copy_access_acl(&held, &template).map_err(io_error)?;
             let lost = fs_safety::copy_extended_attributes(&held, &template);
             if !lost.is_empty() {
-                return Err(FileIoError::Io(format!("Could not retain file metadata for Undo: {}", lost.join(", "))));
+                return Err(FileIoError::Io(format!("Could not retain file metadata for Undo: {}", lost.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))));
             }
             template.sync_all().map_err(io_error)?;
             let captured = held.metadata().map_err(io_error)?;
-            if version(&before) != version(&captured) {
+            if version(&before) != version(&captured)
+                || fs_safety::content_attributes(&held).map_err(io_error)? != attributes
+                || fs_safety::content_attributes(&template).map_err(io_error)? != attributes {
                 return Err(FileIoError::Io("The source metadata changed while Revert captured it.".into()));
             }
             Ok(())
@@ -184,6 +197,66 @@ fn remove_document_file(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn acl(named: u16, mask: u16) -> Vec<u8> {
+        let mut bytes = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [(1_u16, 6_u16, u32::MAX), (2, named, 12345), (4, 0, u32::MAX), (16, mask, u32::MAX), (32, 0, u32::MAX)] {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&permissions.to_le_bytes());
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn install_acl(file: &File, bytes: &[u8]) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the held descriptor and bounded byte slice remain live for
+        // fsetxattr, and the static attribute name is NUL terminated.
+        let result = unsafe { libc::fsetxattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr(), bytes.as_ptr().cast(), bytes.len(), 0) };
+        if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    #[test]
+    fn editor_file_presence_keeps_original_acl_when_an_external_hard_link_changes_after_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("new.txt"), "original").unwrap();
+        let source = File::open(root.join("new.txt")).unwrap();
+        if let Err(error) = install_acl(&source, &acl(4, 4)) {
+            if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) { return; }
+            panic!("ACL fixture failed: {error}");
+        }
+        let original_mode = source.metadata().unwrap().mode();
+        let original_attributes = fs_safety::content_attributes(&source).unwrap();
+        fs::hard_link(root.join("new.txt"), root.join("outside-link")).unwrap();
+        let SaveOutcome::Absent { restoration, .. } = save_document_file(root, Path::new("new.txt"), "", blake3::hash(b"original"), false, PresenceSave { expected_mode: Some(0o100644), ..removal() }).unwrap() else { panic!("removed"); };
+        install_acl(&source, &acl(6, 6)).unwrap();
+        let newer_attributes = fs_safety::content_attributes(&source).unwrap();
+        assert_ne!(original_attributes, newer_attributes);
+        save_document_file(root, Path::new("new.txt"), "original", blake3::hash(b""), false, PresenceSave { expected_present: false, desired_present: true, expected_mode: None, restoration: Some(restoration) }).unwrap();
+        let restored = File::open(root.join("new.txt")).unwrap();
+        assert_eq!(restored.metadata().unwrap().mode(), original_mode);
+        assert_eq!(fs_safety::content_attributes(&restored).unwrap(), original_attributes);
+        assert_eq!(fs_safety::content_attributes(&source).unwrap(), newer_attributes, "Undo never changes the external hard link");
+    }
+
+    #[test]
+    fn editor_file_presence_refuses_same_mode_acl_changes_during_acquisition() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("new.txt"), "original").unwrap();
+        let source = File::open(directory.path().join("new.txt")).unwrap();
+        if let Err(error) = install_acl(&source, &acl(4, 4)) {
+            if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) { return; }
+            panic!("ACL fixture failed: {error}");
+        }
+        let before_mode = source.metadata().unwrap().mode();
+        let root = Root::open(directory.path()).unwrap();
+        let result = remove_document_file(&root, std::ffi::OsStr::new("new.txt"), blake3::hash(b"original"), Some(0o100644), || install_acl(&source, &acl(0, 4)));
+        assert!(result.is_err());
+        assert_eq!(source.metadata().unwrap().mode(), before_mode, "the ACL change deliberately keeps st_mode identical");
+        assert_eq!(fs::read_to_string(directory.path().join("new.txt")).unwrap(), "original");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     fn removal() -> PresenceSave {
         PresenceSave { expected_present: true, desired_present: false, expected_mode: Some(0o100755), restoration: None }
