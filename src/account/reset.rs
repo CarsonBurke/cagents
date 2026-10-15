@@ -8,10 +8,28 @@ use serde_json::Value;
 pub(crate) mod attempts;
 #[cfg(feature = "host")]
 pub(crate) mod transport;
+pub(crate) mod request;
 
 const MAX_BUCKETS: usize = 128;
 const MAX_CREDIT_ROWS: usize = 128;
 const MAX_IDENTIFIER_BYTES: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Outcome { Reset, AlreadyRedeemed, NothingToReset, NoCredit }
+
+impl Outcome {
+    pub(crate) fn parse(value: &Value) -> Result<Self, String> {
+        match value.get("outcome").and_then(Value::as_str) {
+            Some("reset") => Ok(Self::Reset),
+            Some("alreadyRedeemed") => Ok(Self::AlreadyRedeemed),
+            Some("nothingToReset") => Ok(Self::NothingToReset),
+            Some("noCredit") => Ok(Self::NoCredit),
+            _ => Err("Codex returned an unknown reset-credit outcome; reconcile this attempt before retrying".into()),
+        }
+    }
+}
+
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProviderAccount {

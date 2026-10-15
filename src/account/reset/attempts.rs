@@ -1,6 +1,6 @@
 //! Durable intent precedes every reset effect. An interrupted attempt never
 //! becomes a new attempt merely because a daemon or CLI restarted.
-use super::{Allowance, ProviderAccount, identifier_str};
+use super::{Allowance, ProviderAccount, Outcome, identifier_str};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fs::{self, File, OpenOptions}, io::{Read, Write}, os::unix::fs::OpenOptionsExt, path::{Path, PathBuf}};
@@ -8,22 +8,6 @@ use std::{fs::{self, File, OpenOptions}, io::{Read, Write}, os::unix::fs::OpenOp
 const VERSION: u8 = 1;
 const MAX_BYTES: u64 = 256 * 1024;
 const MAX_ATTEMPTS: usize = 128;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Outcome { Reset, AlreadyRedeemed, NothingToReset, NoCredit }
-
-impl Outcome {
-    pub(crate) fn parse(value: &serde_json::Value) -> Result<Self, String> {
-        match value.get("outcome").and_then(serde_json::Value::as_str) {
-            Some("reset") => Ok(Self::Reset),
-            Some("alreadyRedeemed") => Ok(Self::AlreadyRedeemed),
-            Some("nothingToReset") => Ok(Self::NothingToReset),
-            Some("noCredit") => Ok(Self::NoCredit),
-            _ => Err("Codex returned an unknown reset-credit outcome; reconcile this attempt before retrying".into()),
-        }
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
