@@ -447,8 +447,8 @@ impl Registry {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if decode::<Run>(&stored)? != accepted.run
-            || read_agent(&tx, accepted.agent.id)? != accepted.agent
+        let agent = read_agent(&tx, accepted.agent.id)?;
+        if decode::<Run>(&stored)? != accepted.run || !same_dispatch_agent(&agent, &accepted.agent)
         {
             return Err(
                 "The accepted agent run changed before dispatch; nothing was submitted".into(),
@@ -464,10 +464,11 @@ impl Registry {
         if already_claimed {
             return Ok(false);
         }
-        if !Self::automation_dispatch_allowed_in(&tx, accepted, now_ms)? {
+        if !Self::automation_dispatch_allowed_in(&tx, accepted, &agent, now_ms)? {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(false);
         }
+        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
         let claimed = tx
             .execute(
                 "INSERT OR IGNORE INTO agent_dispatches(run, claimed_at) VALUES (?1, ?2)",
@@ -912,7 +913,7 @@ impl Registry {
     pub(crate) fn validate_agent_dispatch(&self, accepted: &Accepted) -> Result<(), String> {
         let agent = self.agent(accepted.agent.id)?;
         let run = self.agent_run(accepted.run.id)?;
-        if agent.closed || run != accepted.run || agent != accepted.agent {
+        if agent.closed || run != accepted.run || !same_dispatch_agent(&agent, &accepted.agent) {
             return Err("The accepted execution changed before provider dispatch".into());
         }
         require_placement(&self.db, &agent.placement, &agent.spec.target.repository)
@@ -1316,6 +1317,14 @@ impl Registry {
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
+}
+
+/// Moving a pane changes presentation membership, not execution authority.
+/// Compare every other field, including the exact session, launch and owner.
+pub(super) fn same_dispatch_agent(current: &Agent, accepted: &Agent) -> bool {
+    let mut expected = accepted.clone();
+    expected.placement = current.placement.clone();
+    current == &expected
 }
 
 fn state_key(state: State) -> &'static str {

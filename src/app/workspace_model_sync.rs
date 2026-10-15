@@ -56,6 +56,12 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
+    PaneTransferFailed { operation: uuid::Uuid, error: String },
+    ViewRefused {
+        scope: crate::workspace_model::views::Scope,
+        operation: uuid::Uuid,
+        error: String,
+    },
     Ranked {
         channel: ChannelId,
         ordinal: u32,
@@ -206,6 +212,11 @@ fn publish(
                     ) {
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
+                    }
+                    if let ModelEdit::ChangeView { scope, operation, .. } = &request {
+                        let _ = updates.send_blocking(ModelUpdate::ViewRefused {
+                            scope: scope.clone(), operation: *operation, error: error.to_string(),
+                        });
                     }
                     if let ModelEdit::ReopenProject { repository, .. } = request {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
@@ -395,6 +406,20 @@ impl Cagents {
 
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::PaneTransferFailed { operation, error } => {
+                self.reject_pane_transfer(operation, error);
+                self.reconcile_shared_views()
+            }
+            ModelUpdate::ViewRefused { scope, operation, error } => {
+                tracing::warn!(?scope, %operation, %error, "the registry refused a view edit");
+                if self.shared_views.is_requested_transfer(operation) {
+                    self.reject_pane_transfer(operation, error);
+                } else {
+                    self.shared_views.refused(operation);
+                    self.status = Some(TransientNotice::warning(format!("The pane change was not applied: {error}")));
+                }
+                self.reconcile_shared_views()
+            }
             ModelUpdate::NavigationFailed(error) => {
                 self.status = Some(TransientNotice::warning(format!(
                     "Could not reorder the sidebar: {error}"

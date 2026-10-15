@@ -921,6 +921,8 @@ enum PaneMenuCommand {
     Fork(chat_ui::Target),
     ReviewChanges(chat_ui::Target),
     EndConversation,
+    MoveTo(crate::model::ChannelId),
+    MoveToChannel,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -938,6 +940,7 @@ impl PaneMenuCommand {
             Self::CloseToRight => Command::ClosePanesToRight,
             Self::Close => Command::CloseFocusedCard,
             Self::EndConversation => Command::EndConversation,
+            Self::MoveTo(_) | Self::MoveToChannel => Command::MovePaneToChannel,
             Self::Switch => Command::SwitchPane,
             Self::Fork(_) => Command::ForkConversation,
             Self::ReviewChanges(_) => Command::ReviewConversationChanges,
@@ -965,6 +968,8 @@ mod command_registry_tests {
             PaneMenuCommand::CloseToRight,
             PaneMenuCommand::Close,
             PaneMenuCommand::EndConversation,
+            PaneMenuCommand::MoveToChannel,
+            PaneMenuCommand::MoveTo(crate::model::ChannelId::new()),
             PaneMenuCommand::Switch,
             PaneMenuCommand::Fork(target),
             PaneMenuCommand::ReviewChanges(target),
@@ -977,6 +982,10 @@ mod command_registry_tests {
                     assert_eq!(id, card);
                     assert_eq!(command, menu.command());
                     assert!(!matches!(menu, PaneMenuCommand::Fork(_) | PaneMenuCommand::ReviewChanges(_)));
+                }
+                Message::Palette(palette_ui::Action::MovePaneToChannel(id, channel)) => {
+                    assert_eq!(id, card);
+                    assert!(menu == PaneMenuCommand::MoveTo(channel));
                 }
                 Message::Palette(palette_ui::Action::RunChatPane(actual, command)) => {
                     assert_eq!(actual, target, "retain the conversation generation captured by the menu");
@@ -993,6 +1002,7 @@ impl widget::menu::Action for PaneMenu {
     type Message = Message;
     fn message(&self) -> Message {
         let action = match self.1 {
+            PaneMenuCommand::MoveTo(channel) => palette_ui::Action::MovePaneToChannel(self.0, channel),
             PaneMenuCommand::Fork(target) | PaneMenuCommand::ReviewChanges(target) => palette_ui::Action::RunChatPane(target, self.1.command()),
             _ => palette_ui::Action::RunPane(self.0, self.1.command()),
         };
@@ -2220,6 +2230,7 @@ impl Cagents {
         );
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
+            _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.chat_start_pending(id) => Some(("Updating conversation", true)),
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
@@ -2386,6 +2397,26 @@ impl Cagents {
                     PaneMenu(id, PaneMenuCommand::ReviewChanges(target)),
                 ));
             }
+            let destinations = self.pane_move_destinations(id);
+            if !destinations.is_empty() {
+                entries.push(widget::menu::Item::Divider);
+            }
+            if destinations.len() <= 5 {
+                entries.extend(destinations.into_iter().map(|channel| {
+                    widget::menu::Item::Button(
+                        format!("Move to {}", self.pane_move_destination_label(channel)),
+                        None,
+                        PaneMenu(id, PaneMenuCommand::MoveTo(channel.id)),
+                    )
+                }));
+            }
+            if self.pane_has_move_destination(id) {
+                entries.push(widget::menu::Item::Button(
+                    "Move to channel…".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::MoveToChannel),
+                ));
+            }
             entries.retain(|entry| match entry {
                 widget::menu::Item::Button(_, _, action) => {
                     self.pane_command_available(id, action.1.command())
@@ -2398,6 +2429,7 @@ impl Cagents {
                     let widget::menu::Item::Button(_, _, action) = entry else {
                         return None;
                     };
+                    if matches!(action.1, PaneMenuCommand::MoveTo(_)) { return None; }
                     workspace_widget::menu_shortcut(
                         action.1.command(),
                         &self.settings.keyboard_shortcuts,
@@ -2407,6 +2439,7 @@ impl Cagents {
                 .collect::<HashMap<_, _>>();
             for entry in &mut entries {
                 if let widget::menu::Item::Button(label, _, action) = entry {
+                    if matches!(action.1, PaneMenuCommand::MoveTo(_)) { continue; }
                     *label = workspace_widget::shortcut_descriptor(action.1.command())
                         .label
                         .to_owned();

@@ -20,6 +20,7 @@ use thiserror::Error;
 mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
+mod channels;
 pub use agents::AgentCommand;
 mod automations;
 pub use automations::AutomationCommand;
@@ -324,6 +325,14 @@ pub enum ProjectCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ChannelCommand {
+    /// Move a live pane, hosted session or agent into another channel.
+    Move {
+        /// Full pane/session ID, agent ID or unique prefix, or unique agent name.
+        target: String,
+        /// Destination channel in the same project.
+        #[arg(long)]
+        to: ChannelId,
+    },
     /// Create a channel in a project, with or without a window running.
     Spawn {
         /// Folder or Git repository the channel belongs to (defaults to the
@@ -3215,6 +3224,10 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
 /// The output path consumes resolved keys; it never rediscovers a project or
 /// changes an open folder's identity.
 enum ResolvedChannel {
+    Move {
+        target: String,
+        to: ChannelId,
+    },
     Spawn {
         repository: PathBuf,
         title: String,
@@ -3239,6 +3252,7 @@ impl ChannelCommand {
         model: Option<&WorkspaceModel>,
     ) -> Result<ResolvedChannel, AppError> {
         Ok(match self {
+            Self::Move { target, to } => ResolvedChannel::Move { target, to },
             Self::Spawn { repository, title } => {
                 let location = resolve_project_location(repository, model)?;
                 ResolvedChannel::Spawn {
@@ -3265,6 +3279,7 @@ fn channel_output(
     command: ResolvedChannel,
 ) -> Result<CommandOutput, AppError> {
     match command {
+        ResolvedChannel::Move { target, to } => channels::move_pane(client, &target, to),
         ResolvedChannel::Spawn {
             repository,
             title,

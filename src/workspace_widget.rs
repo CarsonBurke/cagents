@@ -82,6 +82,8 @@ pub enum GlobalShortcut {
     SettingsAccounts,
     SettingsNotifications,
     SettingsAbout,
+    MovePaneToChannel,
+
     DiffCopy,
     DiffCopyOld,
     DiffCopyNew,
@@ -237,6 +239,8 @@ impl GlobalShortcut {
             Self::SettingsAccounts => "settings_accounts",
             Self::SettingsNotifications => "settings_notifications",
             Self::SettingsAbout => "settings_about",
+            Self::MovePaneToChannel => "move_pane_to_channel",
+
             Self::DiffCopy => "diff_copy",
             Self::DiffCopyOld => "diff_copy_old",
             Self::DiffCopyNew => "diff_copy_new",
@@ -420,6 +424,7 @@ pub struct CommandContext {
     pub pane_revealable: bool,
     pub pane_cloneable: bool,
     pub pane_external_editor: bool,
+    pub pane_moveable: bool,
     pub can_fork: bool,
     pub can_end_conversation: bool,
     pub chat_account: bool,
@@ -513,6 +518,7 @@ impl ShortcutDescriptor {
         let pane = context.pane_index.is_some();
         match self.action {
             GlobalShortcut::NextDiagnostic | GlobalShortcut::PreviousDiagnostic => context.can_navigate_diagnostics,
+            GlobalShortcut::MovePaneToChannel => context.pane_moveable,
             GlobalShortcut::OpenInExternalEditor => context.pane_external_editor,
             GlobalShortcut::NewWorktree => context.active_git_project,
             GlobalShortcut::EndConversation => context.can_end_conversation,
@@ -1021,6 +1027,13 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
+        action: GlobalShortcut::MovePaneToChannel,
+        label: "Move pane to channel…",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+
+    ShortcutDescriptor {
         action: GlobalShortcut::DiffCopy,
         label: "Copy",
         repeatable: false,
@@ -1212,6 +1225,8 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::SettingsAccounts => &shortcuts.settings_accounts,
         GlobalShortcut::SettingsNotifications => &shortcuts.settings_notifications,
         GlobalShortcut::SettingsAbout => &shortcuts.settings_about,
+        GlobalShortcut::MovePaneToChannel => &shortcuts.move_pane_to_channel,
+
         GlobalShortcut::DiffCopy => &shortcuts.diff_copy,
         GlobalShortcut::DiffCopyOld => &shortcuts.diff_copy_old,
         GlobalShortcut::DiffCopyNew => &shortcuts.diff_copy_new,

@@ -2509,6 +2509,8 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusCard(_)
         | Message::Palette(palette_ui::Action::FocusPane(_))
         | Message::FocusAttention(_)
+        | Message::MovePaneToChannel { .. }
+        | Message::PaneDropToChannel { .. }
         | Message::TerminalReviewMode { .. }
         | Message::TerminalDropped { .. }
         | Message::ResizeCard { .. }
@@ -2655,6 +2657,8 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                 pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
+            | Message::MovePaneToChannel { .. }
+            | Message::PaneDropToChannel { .. }
             | Message::FocusCard(_)
             | Message::Palette(palette_ui::Action::FocusPane(_))
         | Message::FocusAttention(_)
@@ -2873,6 +2877,8 @@ pub enum SettingsField {
     ShortcutSettingsAccounts,
     ShortcutSettingsNotifications,
     ShortcutSettingsAbout,
+    ShortcutMovePaneToChannel,
+
     ShortcutDiffCopy,
     ShortcutDiffCopyOld,
     ShortcutDiffCopyNew,
@@ -2920,7 +2926,7 @@ pub enum SettingsField {
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 112] = [
+    const SHORTCUTS: [Self; 113] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2995,6 +3001,8 @@ impl SettingsField {
         Self::ShortcutSettingsAccounts,
         Self::ShortcutSettingsNotifications,
         Self::ShortcutSettingsAbout,
+        Self::ShortcutMovePaneToChannel,
+
         Self::ShortcutDiffCopy,
         Self::ShortcutDiffCopyOld,
         Self::ShortcutDiffCopyNew,
@@ -3115,6 +3123,8 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => "Open settings: Accounts",
             Self::ShortcutSettingsNotifications => "Open settings: Notifications",
             Self::ShortcutSettingsAbout => "Open settings: About",
+            Self::ShortcutMovePaneToChannel => "Move pane to channel…",
+
             Self::ShortcutDiffCopy => "Copy",
             Self::ShortcutDiffCopyOld => "Copy old side",
             Self::ShortcutDiffCopyNew => "Copy new side",
@@ -3294,6 +3304,7 @@ impl SettingsField {
             | Self::ShortcutSettingsAccounts
             | Self::ShortcutSettingsNotifications
             | Self::ShortcutSettingsAbout
+            | Self::ShortcutMovePaneToChannel
             | Self::ShortcutDiffCopy
             | Self::ShortcutDiffCopyOld
             | Self::ShortcutDiffCopyNew
@@ -3428,6 +3439,8 @@ struct ShortcutDraft {
     settings_accounts: String,
     settings_notifications: String,
     settings_about: String,
+    move_pane_to_channel: String,
+
     diff_copy: String,
     diff_copy_old: String,
     diff_copy_new: String,
@@ -3554,6 +3567,8 @@ impl ShortcutDraft {
             settings_accounts: settings::format_chords(&shortcuts.settings_accounts),
             settings_notifications: settings::format_chords(&shortcuts.settings_notifications),
             settings_about: settings::format_chords(&shortcuts.settings_about),
+            move_pane_to_channel: settings::format_chords(&shortcuts.move_pane_to_channel),
+
             diff_copy: settings::format_chords(&shortcuts.diff_copy),
             diff_copy_old: settings::format_chords(&shortcuts.diff_copy_old),
             diff_copy_new: settings::format_chords(&shortcuts.diff_copy_new),
@@ -3892,6 +3907,8 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.settings_notifications = value
             }
             SettingsField::ShortcutSettingsAbout => self.keyboard_shortcuts.settings_about = value,
+            SettingsField::ShortcutMovePaneToChannel => self.keyboard_shortcuts.move_pane_to_channel = value,
+
             SettingsField::ShortcutDiffCopy => self.keyboard_shortcuts.diff_copy = value,
             SettingsField::ShortcutDiffCopyOld => self.keyboard_shortcuts.diff_copy_old = value,
             SettingsField::ShortcutDiffCopyNew => self.keyboard_shortcuts.diff_copy_new = value,
@@ -4166,6 +4183,11 @@ fn settings_update(
             next.keyboard_shortcuts.settings_about = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutMovePaneToChannel => {
+            next.keyboard_shortcuts.move_pane_to_channel = settings::parse_chords(value);
+            Ok(())
+        }
+
         SettingsField::ShortcutDiffCopy => {
             next.keyboard_shortcuts.diff_copy = settings::parse_chords(value);
             Ok(())
@@ -4936,6 +4958,8 @@ pub enum Message {
     },
     Sidebar(SidebarAction),
     FocusCard(CardId),
+    MovePaneToChannel { card: CardId, channel: crate::model::ChannelId },
+    PaneDropToChannel { generation: u64, card: CardId, channel: crate::model::ChannelId },
     TerminalReviewMode {
         card: CardId,
         terminal: crate::model::TerminalId,
@@ -16126,6 +16150,12 @@ impl Application for Cagents {
                 self.set_terminal_review_owner(None);
                 self.focus_workspace_card(id)
             }
+            Message::MovePaneToChannel { card, channel } => self.move_pane_to_channel(card, channel),
+            Message::PaneDropToChannel { generation, card, channel } => {
+                if generation == self.workspace_view_generation {
+                    self.move_pane_to_channel(card, channel)
+                } else { Task::none() }
+            }
             Message::TerminalReviewMode {
                 card,
                 terminal,
@@ -19004,6 +19034,11 @@ impl Application for Cagents {
             },
         );
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
+        let surface = crate::reorder::channel_scope(surface, widget::Id::new("workspace.tabs"),
+            self.workspace_view_generation,
+            !self.workspace_inputs_blocked(),
+            |card, channel| self.workspace.order().any(|id| id == card) && self.can_move_pane_to_channel(card, channel),
+            |card, channel| Message::PaneDropToChannel { generation: self.workspace_view_generation, card, channel });
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,

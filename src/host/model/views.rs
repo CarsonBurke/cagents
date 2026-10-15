@@ -70,6 +70,131 @@ fn exists(db: &Connection, scope: &Scope) -> Result<bool, String> {
     }
     .map_err(|error| error.to_string())
 }
+fn project(db: &Connection, scope: &Scope) -> Result<PathBuf, String> {
+    match scope {
+        Scope::Channel(id) => db
+            .query_row(
+                "SELECT repository FROM channels WHERE id=?1",
+                [id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("Channel {id} is no longer open")),
+        Scope::Worktree { repository, .. } if exists(db, scope)? => Ok(repository.clone()),
+        Scope::Worktree { .. } => Err("The pane's project is no longer open".into()),
+    }
+}
+
+/// Permanent transfer refusals are caller errors, distinct from storage
+/// failures. This same predicate runs before publication and inside the write
+/// transaction; a rejected edit never acknowledges an unchanged placement.
+pub(super) fn refusal(
+    db: &Connection,
+    scope: &Scope,
+    change: &Change,
+) -> Result<Option<String>, String> {
+    let Change::Transfer {
+        id, destination, ..
+    } = change
+    else {
+        return Ok(None);
+    };
+    if !exists(db, scope)? {
+        return Ok(Some("The source view is no longer open".into()));
+    }
+    let view = read(db, scope)?;
+    let Some(pane) = view.panes.iter().find(|pane| pane.id == *id) else {
+        return Ok(Some(format!("Pane {id} is not in the source view")));
+    };
+    if let Some(agent) = pane_agent(db, pane)? {
+        if !current_agent_process(&agent, pane) {
+            return Ok(Some(
+                "The agent pane changed process; refresh before moving it".into(),
+            ));
+        }
+        if agent.spec.target.repository != project(db, scope)? {
+            return Ok(Some("The agent pane belongs to another project".into()));
+        }
+    }
+    if !exists(db, destination)? {
+        return Ok(Some("The destination view is no longer open".into()));
+    }
+    Ok((project(db, scope)? != project(db, destination)?)
+        .then(|| "Panes can only move between views of the same project".into()))
+}
+
+/// The session index finds the owner, but does not authenticate a process:
+/// same-ID successor adoption can precede refreshing its shared pane.
+fn pane_agent(
+    db: &Connection,
+    pane: &crate::workspace_model::views::Pane,
+) -> Result<Option<crate::agent_execution::Agent>, String> {
+    let session = match &pane.kind {
+        crate::model::CardKind::Terminal(session) => session.id,
+        crate::model::CardKind::Chat(session) => session.id,
+        _ => return Ok(None),
+    };
+    db.query_row(
+        "SELECT record FROM agents WHERE closed=0 AND session_id=?1",
+        [session.to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .map(|record| serde_json::from_str(&record).map_err(|error| error.to_string()))
+    .transpose()
+}
+
+fn current_agent_process(
+    agent: &crate::agent_execution::Agent,
+    pane: &crate::workspace_model::views::Pane,
+) -> bool {
+    use crate::agent_execution::HostedSession;
+    let source = match &pane.kind {
+        crate::model::CardKind::Terminal(session) => HostedSession::Terminal(session.clone()),
+        crate::model::CardKind::Chat(session) => HostedSession::Chat(session.clone()),
+        _ => return false,
+    };
+    agent
+        .session
+        .as_ref()
+        .is_some_and(|session| session.same_process(&source))
+        || agent
+            .console
+            .as_ref()
+            .is_some_and(|console| HostedSession::Terminal(console.clone()).same_process(&source))
+}
+
+/// Pane ownership and agent adoption must agree after both commit and restart.
+/// Keep the original launch spec unchanged: it also identifies an idempotent
+/// submission, whereas placement is the agent's current durable location.
+fn transfer_agent(
+    db: &Connection,
+    pane: &crate::workspace_model::views::Pane,
+    destination: &Scope,
+    repository: &Path,
+) -> Result<(), String> {
+    if let Some(mut agent) = pane_agent(db, pane)? {
+        if !current_agent_process(&agent, pane) {
+            return Err("The agent pane changed process; refresh before moving it".into());
+        }
+        if agent.spec.target.repository != repository {
+            return Err("The agent pane belongs to another project".into());
+        }
+        agent.placement = destination.clone();
+        db.execute(
+            "UPDATE agents SET record=?2 WHERE id=?1",
+            params![
+                agent.id.to_string(),
+                serde_json::to_string(&agent).map_err(|error| error.to_string())?
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
 fn register(db: &Connection, scope: &Scope) -> Result<(), String> {
     let (channel, repository) = match scope {
         Scope::Channel(id) => (Some(id.to_string()), None),
@@ -130,6 +255,15 @@ pub(super) fn apply(
         _ => return Err("expected a workspace view edit".into()),
     };
     if !exists(transaction, scope)? {
+        if matches!(
+            edit,
+            ModelEdit::ChangeView {
+                change: Change::Transfer { .. },
+                ..
+            }
+        ) {
+            return Err("The source view is no longer open".into());
+        }
         return Ok(false);
     }
     register(transaction, scope)?;
@@ -181,18 +315,24 @@ pub(super) fn apply(
                     destination,
                     before,
                 } => {
+                    if let Some(reason) = refusal(transaction, scope, change)? {
+                        return Err(reason);
+                    }
+                    let pane = view
+                        .panes
+                        .iter()
+                        .find(|pane| pane.id == *id)
+                        .cloned()
+                        .ok_or_else(|| format!("Pane {id} is not in the source view"))?;
+                    let repository = project(transaction, scope)?;
                     if destination == scope {
                         false
-                    } else if !exists(transaction, destination)? {
-                        false
-                    } else if let Some(pane) =
-                        view.panes.iter().find(|pane| pane.id == *id).cloned()
-                    {
+                    } else {
                         register(transaction, destination)?;
                         let mut target = read(transaction, destination)?;
                         target.retired.retain(|retired| retired != id);
                         target.apply(&Change::Insert {
-                            pane,
+                            pane: pane.clone(),
                             before: *before,
                         })?;
                         target.revision = target
@@ -200,6 +340,7 @@ pub(super) fn apply(
                             .checked_add(1)
                             .ok_or("view revision exhausted")?;
                         write(transaction, &target)?;
+                        transfer_agent(transaction, &pane, destination, &repository)?;
                         transaction
                             .execute(
                                 "UPDATE shared_view_panes SET scope=?1 WHERE id=?2",
@@ -207,8 +348,6 @@ pub(super) fn apply(
                             )
                             .map_err(|error| error.to_string())?;
                         view.apply(&Change::Remove { id: *id })?
-                    } else {
-                        false
                     }
                 }
                 Change::Insert { pane, .. } | Change::InsertIfEmpty { pane }
@@ -275,6 +414,14 @@ pub(super) fn apply(
 }
 
 impl Registry {
+    pub(crate) fn view_change_refusal(
+        &self,
+        scope: &Scope,
+        change: &Change,
+    ) -> Result<Option<String>, String> {
+        refusal(&self.db, scope, change)
+    }
+
     pub(crate) fn view_revision(&self, scope: &Scope) -> Result<u64, String> {
         Ok(read(&self.db, scope)?.revision)
     }
@@ -565,6 +712,475 @@ mod tests {
                 owner(&r.db, p.id).unwrap(),
                 Some(Scope::Channel(destination))
             );
+        }
+    }
+
+    #[test]
+    fn transfer_rejects_missing_targets_and_foreign_projects_without_any_mutation() {
+        let (mut r, _, a, b) = setup();
+        let p = pane();
+        seed(&mut r, a, vec![p.clone()]);
+        let foreign = ChannelId::new();
+        r.apply(&ModelEdit::OpenProject {
+            repository: "/other".into(),
+            name: "other".into(),
+            kind: Default::default(),
+        })
+        .unwrap();
+        r.apply(&ModelEdit::CreateChannel {
+            id: foreign,
+            repository: "/other".into(),
+            title: "foreign".into(),
+            title_source: Default::default(),
+        })
+        .unwrap();
+        for (source, id, destination) in [
+            (a, p.id, Scope::Channel(ChannelId::new())),
+            (a, p.id, Scope::Channel(foreign)),
+            (a, CardId::new(), Scope::Channel(b)),
+            (a, CardId::new(), Scope::Channel(a)),
+            (ChannelId::new(), p.id, Scope::Channel(b)),
+            (
+                a,
+                p.id,
+                Scope::Worktree {
+                    repository: "/other".into(),
+                    path: "/other/tree".into(),
+                },
+            ),
+        ] {
+            let before = r.model().unwrap();
+            let transfer = edit(
+                &mut r,
+                source,
+                Change::Transfer {
+                    id,
+                    destination,
+                    before: None,
+                },
+            );
+            assert!(
+                r.apply(&transfer).is_err(),
+                "invalid transfer must report failure"
+            );
+            assert_eq!(
+                r.model().unwrap(),
+                before,
+                "failed transfer must roll back all views and metadata"
+            );
+        }
+        let same = edit(
+            &mut r,
+            a,
+            Change::Transfer {
+                id: p.id,
+                destination: Scope::Channel(a),
+                before: None,
+            },
+        );
+        let before = r.model().unwrap();
+        assert!(!r.apply(&same).unwrap().changed);
+        assert_eq!(r.model().unwrap(), before);
+    }
+
+    #[test]
+    fn transfer_fences_stale_edits_and_replays_without_moving_a_pane_twice() {
+        let (mut r, _, a, b) = setup();
+        let p = pane();
+        seed(&mut r, a, vec![p.clone()]);
+        let mut transfer = edit(
+            &mut r,
+            a,
+            Change::Transfer {
+                id: p.id,
+                destination: Scope::Channel(b),
+                before: None,
+            },
+        );
+        let update = edit(
+            &mut r,
+            a,
+            Change::Insert {
+                pane: pane(),
+                before: None,
+            },
+        );
+        r.apply(&update).unwrap();
+        let before = r.model().unwrap();
+        assert!(
+            r.apply(&transfer)
+                .unwrap_err()
+                .contains("revision conflict")
+        );
+        assert_eq!(r.model().unwrap(), before);
+        if let ModelEdit::ChangeView {
+            expected_revision, ..
+        } = &mut transfer
+        {
+            *expected_revision = r.view_revision(&Scope::Channel(a)).unwrap();
+        }
+        r.apply(&transfer).unwrap();
+        let moved = r.model().unwrap();
+        assert!(!r.apply(&transfer).unwrap().changed);
+        assert_eq!(r.model().unwrap(), moved);
+    }
+
+    #[test]
+    fn transfer_requires_the_current_process_after_same_id_successor_adoption() {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Destination, HostedSession, Origin, Spec, Submit, Surface, Target},
+        };
+        for (native_chat, console, changed_launch) in [
+            (false, false, false),
+            (false, false, true),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let (mut r, _directory, a, b) = setup();
+            let accepted = r
+                .submit_agent(
+                    &Origin::User,
+                    &Submit {
+                        name: None,
+                        destination: Destination::New(Spec {
+                            provider: Provider::Claude,
+                            account: None,
+                            target: Target {
+                                repository: "/repo".into(),
+                                directory: "/repo".into(),
+                                placement: Some(Scope::Channel(a)),
+                            },
+                            surface: if native_chat {
+                                Surface::Chat
+                            } else {
+                                Surface::Terminal
+                            },
+                            model: None,
+                            permission_mode: None,
+                            reasoning_effort: None,
+                        }),
+                        prompt: "Work".into(),
+                        idempotency_key: "successor-transfer".into(),
+                    },
+                    1,
+                )
+                .unwrap();
+            let terminal = crate::model::TerminalSession {
+                id: crate::model::TerminalId::new(),
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                launch: crate::model::LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: vec![],
+                    working_directory: "/repo".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                transcript_path: None,
+                resume_hint: None,
+                continuity: crate::model::TerminalContinuity::Live {
+                    host_session_id: crate::model::HostSessionId::new("live"),
+                    boot_id: crate::model::BootId::new("boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("host"),
+                },
+            };
+            let source = if native_chat {
+                HostedSession::Chat(crate::chat::Session {
+                    id: terminal.id,
+                    launch: crate::chat::Launch {
+                        provider: Provider::Claude,
+                        recipe: terminal.launch.clone(),
+                        session_id: Some(uuid::Uuid::new_v4().to_string()),
+                    },
+                    proof: terminal.continuity.live_proof(),
+                    terminal: Some(terminal.clone()),
+                    owned_codex_listener: None,
+                    native_continuity: Default::default(),
+                })
+            } else {
+                HostedSession::Terminal(terminal.clone())
+            };
+            let original = r
+                .bind_agent(accepted.agent.id, None, source.clone())
+                .unwrap();
+            if console {
+                r.bind_agent_console(original.id, &source, terminal.clone())
+                    .unwrap();
+            }
+            let presentation = |session: &HostedSession| match session {
+                HostedSession::Chat(session) if !console => CardKind::Chat(session.clone()),
+                HostedSession::Chat(session) => {
+                    CardKind::Terminal(session.terminal.clone().unwrap())
+                }
+                HostedSession::Terminal(session) => CardKind::Terminal(session.clone()),
+            };
+            let p = Pane {
+                kind: presentation(&source),
+                ..pane()
+            };
+            seed(&mut r, a, vec![p.clone()]);
+            let mut successor = source.clone();
+            match &mut successor {
+                HostedSession::Chat(session) => {
+                    if changed_launch {
+                        session.launch.recipe.arguments.push("successor".into());
+                    } else {
+                        session.proof.as_mut().unwrap().host_incarnation =
+                            crate::model::HostIncarnation::new("successor");
+                        session.terminal.as_mut().unwrap().continuity =
+                            crate::model::TerminalContinuity::Live {
+                                host_session_id: crate::model::HostSessionId::new("live"),
+                                boot_id: crate::model::BootId::new("boot"),
+                                host_incarnation: crate::model::HostIncarnation::new("successor"),
+                            };
+                    }
+                }
+                HostedSession::Terminal(session) => {
+                    if changed_launch {
+                        session.launch.arguments.push("successor".into());
+                    } else {
+                        session.continuity = crate::model::TerminalContinuity::Live {
+                            host_session_id: crate::model::HostSessionId::new("live"),
+                            boot_id: crate::model::BootId::new("boot"),
+                            host_incarnation: crate::model::HostIncarnation::new("successor"),
+                        };
+                    }
+                }
+            }
+            assert!(
+                r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                    .unwrap()
+            );
+            assert_eq!(
+                read(&r.db, &Scope::Channel(a)).unwrap().panes,
+                vec![p.clone()],
+                "adoption need not refresh shared panes atomically"
+            );
+            let change = Change::Transfer {
+                id: p.id,
+                destination: Scope::Channel(b),
+                before: None,
+            };
+            let transfer = edit(&mut r, a, change.clone());
+            let before = r.model().unwrap();
+            assert!(
+                r.view_change_refusal(&Scope::Channel(a), &change)
+                    .unwrap()
+                    .unwrap()
+                    .contains("changed process")
+            );
+            assert!(r.apply(&transfer).unwrap_err().contains("changed process"));
+            assert_eq!(
+                r.model().unwrap(),
+                before,
+                "stale proof/launch must preserve both views, agent and sequence"
+            );
+            let refreshed = Pane {
+                kind: presentation(&successor),
+                ..p.clone()
+            };
+            let refresh = edit(
+                &mut r,
+                a,
+                Change::Update {
+                    before: p,
+                    pane: refreshed.clone(),
+                },
+            );
+            assert!(r.apply(&refresh).unwrap().changed);
+            let transfer = edit(&mut r, a, change);
+            assert!(r.apply(&transfer).unwrap().changed);
+            let moved = r.agent(original.id).unwrap();
+            assert_eq!(moved.placement, Scope::Channel(b));
+            assert_eq!(moved.session, Some(successor));
+            assert_eq!(moved.spec, original.spec);
+            assert_eq!(
+                read(&r.db, &Scope::Channel(b)).unwrap().panes,
+                vec![refreshed]
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_commits_agent_placement_with_pane_ownership_and_preserves_the_live_session() {
+        use crate::{
+            agent::Provider,
+            agent_execution::{
+                Destination, HostedSession, Origin, Spec, State, Submit, Surface, Target, Update,
+            },
+        };
+        for native_chat in [false, true] {
+            let (mut r, dir, a, b) = setup();
+            let request = Submit {
+                name: Some("worker".into()),
+                destination: Destination::New(Spec {
+                    provider: Provider::Claude,
+                    account: None,
+                    target: Target {
+                        repository: "/repo".into(),
+                        directory: "/repo".into(),
+                        placement: Some(Scope::Channel(a)),
+                    },
+                    surface: if native_chat {
+                        Surface::Chat
+                    } else {
+                        Surface::Terminal
+                    },
+                    model: None,
+                    permission_mode: None,
+                    reasoning_effort: None,
+                }),
+                prompt: "Keep working".into(),
+                idempotency_key: "transfer-agent".into(),
+            };
+            let accepted = r.submit_agent(&Origin::User, &request, 1).unwrap();
+            let terminal = crate::model::TerminalSession {
+                id: crate::model::TerminalId::new(),
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                launch: crate::model::LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: vec![],
+                    working_directory: "/repo".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                transcript_path: None,
+                resume_hint: None,
+                continuity: crate::model::TerminalContinuity::Live {
+                    host_session_id: crate::model::HostSessionId::new("live"),
+                    boot_id: crate::model::BootId::new("boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("host"),
+                },
+            };
+            let live = if native_chat {
+                HostedSession::Chat(crate::chat::Session {
+                    id: terminal.id,
+                    launch: crate::chat::Launch {
+                        provider: Provider::Claude,
+                        recipe: terminal.launch.clone(),
+                        session_id: Some(uuid::Uuid::new_v4().to_string()),
+                    },
+                    proof: terminal.continuity.live_proof(),
+                    terminal: Some(terminal),
+                    owned_codex_listener: None,
+                    native_continuity: Default::default(),
+                })
+            } else {
+                HostedSession::Terminal(terminal)
+            };
+            let original = r.bind_agent(accepted.agent.id, None, live.clone()).unwrap();
+            let started = r
+                .update_agent_run(
+                    accepted.run.id,
+                    accepted.run.revision,
+                    Update::Started {
+                        provider_key: "initial-turn".into(),
+                    },
+                    2,
+                )
+                .unwrap();
+            r.update_agent_run(
+                started.id,
+                started.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: Default::default(),
+                },
+                3,
+            )
+            .unwrap();
+            let followup = r
+                .submit_agent(
+                    &Origin::User,
+                    &Submit {
+                        name: None,
+                        destination: Destination::Existing(original.id),
+                        prompt: "Continue working".into(),
+                        idempotency_key: "followup".into(),
+                    },
+                    4,
+                )
+                .unwrap();
+            let kind = match &live {
+                HostedSession::Chat(session) => CardKind::Chat(session.clone()),
+                HostedSession::Terminal(session) => CardKind::Terminal(session.clone()),
+            };
+            let p = Pane { kind, ..pane() };
+            seed(&mut r, a, vec![p.clone()]);
+            let transfer = edit(
+                &mut r,
+                a,
+                Change::Transfer {
+                    id: p.id,
+                    destination: Scope::Channel(b),
+                    before: None,
+                },
+            );
+            let before = r.model().unwrap();
+            r.db.execute_batch("CREATE TEMP TRIGGER fail_agent_move BEFORE UPDATE OF record ON agents BEGIN SELECT RAISE(ABORT, 'fixture agent placement failure'); END;").unwrap();
+            assert!(
+                r.apply(&transfer)
+                    .unwrap_err()
+                    .contains("fixture agent placement failure")
+            );
+            assert_eq!(
+                r.model().unwrap(),
+                before,
+                "agent failure must roll back target, source, operation and sequence"
+            );
+            r.db.execute_batch("DROP TRIGGER fail_agent_move;").unwrap();
+            r.apply(&transfer).unwrap();
+            drop(r);
+            let mut r = Registry::at(&dir.path().join("model.sqlite3")).unwrap();
+            let model = r.model().unwrap();
+            let agent = model
+                .agents
+                .iter()
+                .find(|agent| agent.id == original.id)
+                .unwrap();
+            assert_eq!(agent.placement, Scope::Channel(b));
+            assert_eq!(agent.session, Some(live));
+            assert_eq!(
+                agent.spec, original.spec,
+                "move must not rewrite the accepted launch request"
+            );
+            assert_eq!(owner(&r.db, p.id).unwrap(), Some(Scope::Channel(b)));
+            assert_eq!(
+                read(&r.db, &Scope::Channel(b)).unwrap().panes,
+                vec![p.clone()]
+            );
+            assert!(read(&r.db, &Scope::Channel(a)).unwrap().panes.is_empty());
+            assert!(!r.apply(&transfer).unwrap().changed);
+            r.validate_agent_dispatch(&followup).unwrap();
+            assert!(r.claim_agent_dispatch(&followup, 5).unwrap());
+            assert!(!r.claim_agent_dispatch(&followup, 6).unwrap());
+            let back = edit(
+                &mut r,
+                b,
+                Change::Transfer {
+                    id: p.id,
+                    destination: Scope::Channel(a),
+                    before: None,
+                },
+            );
+            r.apply(&back).unwrap();
+            r.validate_agent_dispatch(&followup).unwrap();
+            let mut replaced = followup.clone();
+            replaced.agent.session = None;
+            assert!(
+                r.validate_agent_dispatch(&replaced).is_err(),
+                "only placement may differ from the accepted execution"
+            );
+            assert!(r.claim_agent_dispatch(&replaced, 7).is_err());
+            let replay = r.submit_agent(&Origin::User, &request, 8).unwrap();
+            assert!(!replay.created);
+            assert_eq!(replay.run.id, accepted.run.id);
+            assert_eq!(replay.agent.placement, Scope::Channel(a));
         }
     }
 }

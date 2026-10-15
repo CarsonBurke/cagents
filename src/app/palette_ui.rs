@@ -11,6 +11,7 @@ pub(super) struct State {
     selected: usize,
     panes_only: bool,
     sidebar_target: Option<sidebar::commands::CommandTarget>,
+    move_pane: Option<CardId>,
 }
 impl State {
     pub(super) fn is_open(&self) -> bool {
@@ -25,6 +26,8 @@ pub enum Action {
     Open,
     OpenPanes,
     ClosePane(CardId),
+    MovePane(CardId),
+    MovePaneToChannel(CardId, crate::model::ChannelId),
     Close,
     Query(String),
     Run(MessageBox),
@@ -72,6 +75,7 @@ fn entry_category(message: &Message) -> char {
 fn entry_key(message: &Message) -> String {
     match message {
         Message::RunCommand(command) => format!("command:{}", command.id()),
+        Message::Palette(Action::MovePaneToChannel(card, channel)) => format!("move:{card}:{channel}"),
         Message::Palette(Action::FocusPane(id)) | Message::FocusCard(id) | Message::FocusAttention(id) => format!("pane:{id}"),
         Message::Sidebar(SidebarAction::OpenWorktree { worktree_id, .. }) => {
             format!("worktree:{worktree_id}")
@@ -350,9 +354,19 @@ impl Cagents {
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
                 self.palette.selected = 0;
+                self.palette.move_pane = None;
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
+            }
+            Action::MovePaneToChannel(card, channel) => self.update(Message::MovePaneToChannel { card, channel }),
+            Action::MovePane(card) => {
+                if self.workspace_inputs_blocked() || self.pane_move_destinations(card).is_empty() {
+                    return Task::none();
+                }
+                let task = self.update_palette(Action::Open);
+                self.palette.move_pane = Some(card);
+                task
             }
             Action::Close => {
                 self.palette.recording = None;
@@ -361,6 +375,7 @@ impl Cagents {
                 self.palette.sidebar_target = None;
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
+                self.palette.move_pane = None;
                 self.workspace.focused().map_or_else(Task::none, |card| {
                     iced::widget::operation::focus(self.card_keyboard_focus(card))
                         .map(cosmic::Action::App)
@@ -436,6 +451,7 @@ impl Cagents {
         self.settings.palette_recents.insert(0, key);
         self.settings.palette_recents.truncate(24);
         self.palette.query = None;
+        self.palette.move_pane = None;
         let command = self.update(message);
         self.palette.sidebar_target = None;
         let save = if self.settings_path.is_some() {
@@ -599,7 +615,7 @@ impl Cagents {
     }
 
     fn palette_section(&self, message: &Message) -> Option<&'static str> {
-        if self.palette.panes_only || !self.palette.query.as_deref().unwrap_or("").trim().is_empty() {
+        if self.palette.panes_only || self.palette.move_pane.is_some() || !self.palette.query.as_deref().unwrap_or("").trim().is_empty() {
             return None;
         }
         Some(if self.settings.palette_recents.contains(&entry_key(message)) {
@@ -670,6 +686,15 @@ impl Cagents {
     }
 
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
+        if let Some(card) = self.palette.move_pane {
+            let (_, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
+            let mut entries: Vec<_> = self.pane_move_destinations(card).into_iter().filter_map(|channel| {
+                let label = self.pane_move_destination_label(channel).into_owned();
+                match_score(&label, query).map(|score| (score, label, Message::Palette(Action::MovePaneToChannel(card, channel.id))))
+            }).collect();
+            if !query.is_empty() { entries.sort_by_key(|entry| entry.0); }
+            return entries.into_iter().map(|(_, label, message)| (label, String::new(), message)).collect();
+        }
         let (category, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
         let mut entries: Vec<_> = if !self.palette.panes_only && category.is_none_or(|category| category == '>') {
             let context = self.command_context(self.workspace.focused());
@@ -829,7 +854,9 @@ impl Cagents {
         }
         let query = self.palette.query.as_ref()?;
         let input = crate::ui_controls::field::search(
-            if self.palette.panes_only {
+            if self.palette.move_pane.is_some() {
+                "Move pane to channel…"
+            } else if self.palette.panes_only {
                 "Search open panes"
             } else {
                 "Search · > commands · @ panes · # workspaces"
@@ -913,7 +940,9 @@ impl Cagents {
             .collect();
         let rows = if rows.is_empty() {
             widget::column::with_children(vec![
-                design::caption(if self.palette.panes_only {
+                design::caption(if self.palette.move_pane.is_some() {
+                    "No matching channels"
+                } else if self.palette.panes_only {
                     "No matching panes"
                 } else {
                     "No matching commands"
@@ -1070,6 +1099,7 @@ impl Cagents {
                     && !state.kind.is_utility()
                     && !self.project_ui.deleting_card(state)
             }),
+            pane_moveable: card.is_some_and(|id| self.pane_has_move_destination(id)),
             pane_external_editor: state.is_some_and(|state| state.existence.is_open()) && card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.external_editor_command_available())),
             can_fork: card.and_then(|id| self.chat_fork_target(id)).is_some(),
             can_end_conversation: state.is_some_and(|state| state.existence.is_open() && matches!(state.kind, CardKind::Chat(_))),
@@ -1120,6 +1150,7 @@ impl Cagents {
             Command::ClonePane => Message::ChromeUi(chrome_ui::Action::Clone(id)),
             Command::CloseFocusedCard => Message::CloseCard(id),
             Command::EndConversation => Message::ChatClose(chat_ui::closing::Action::End(id)),
+            Command::MovePaneToChannel => Message::Palette(Action::MovePane(id)),
             Command::CloseOtherPanes => Message::ChromeUi(chrome_ui::Action::CloseOthers(id)),
             Command::ClosePanesToRight => Message::ChromeUi(chrome_ui::Action::CloseToRight(id)),
             Command::OpenInExternalEditor => Message::Repository(match self.cards.get(&id) {
@@ -1309,6 +1340,7 @@ impl Cagents {
             | Command::EditorPaste
             | Command::EditorSelectAll
             | Command::EndConversation
+            | Command::MovePaneToChannel
             | Command::DiffCopy
             | Command::DiffCopyOld
             | Command::DiffCopyNew
@@ -1542,6 +1574,7 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => Some(Command::SettingsAccounts),
             Self::ShortcutSettingsNotifications => Some(Command::SettingsNotifications),
             Self::ShortcutSettingsAbout => Some(Command::SettingsAbout),
+            Self::ShortcutMovePaneToChannel => Some(Command::MovePaneToChannel),
             Self::ShortcutDiffCopy => Some(Command::DiffCopy),
             Self::ShortcutDiffCopyOld => Some(Command::DiffCopyOld),
             Self::ShortcutDiffCopyNew => Some(Command::DiffCopyNew),
@@ -1692,6 +1725,7 @@ impl ShortcutDraft {
                 self.settings_notifications.as_str(),
             ),
             (Command::SettingsAbout, self.settings_about.as_str()),
+            (Command::MovePaneToChannel, self.move_pane_to_channel.as_str()),
             (Command::DiffCopy, self.diff_copy.as_str()),
             (Command::DiffCopyOld, self.diff_copy_old.as_str()),
             (Command::DiffCopyNew, self.diff_copy_new.as_str()),
