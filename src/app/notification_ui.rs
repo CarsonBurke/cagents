@@ -43,7 +43,8 @@ pub(super) struct State {
     wake: Option<crossbeam_channel::Sender<()>>,
     receiver: async_channel::Receiver<Action>,
     last_workspace: Weak<WorkspaceState>,
-    last_focus: Option<(Option<CardId>, bool)>,
+    last_focus: Option<(Option<CardId>, bool, bool)>,
+    visible_focus: Option<CardId>,
     acknowledged: BTreeSet<uuid::Uuid>,
     /// Whether a test notification is waiting on the desktop's answer.
     pub testing: bool,
@@ -65,6 +66,7 @@ impl Default for State {
             receiver: async_channel::bounded(32).1,
             last_workspace: Weak::new(),
             last_focus: None,
+            visible_focus: None,
             acknowledged: BTreeSet::new(),
             testing: false,
             inbox_activation: None,
@@ -100,6 +102,16 @@ impl State {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .preferences
+    }
+
+    #[cfg(test)]
+    pub(super) fn focused_session_for_test(&self) -> Option<TerminalId> {
+        self.presence.lock().unwrap_or_else(|p| p.into_inner()).focused
+    }
+
+    #[cfg(test)]
+    pub(super) fn acknowledged_for_test(&self, id: uuid::Uuid) -> bool {
+        self.acknowledged.contains(&id)
     }
 
     pub(super) fn acknowledge(&mut self, id: uuid::Uuid) {
@@ -282,8 +294,24 @@ impl Cagents {
         }
     }
 
+    /// Parent visibility, rather than keyboard ownership alone, fences dwell.
+    /// Child selection and modal transitions can change it without moving focus.
+    pub(super) fn sync_visible_attention(&mut self) -> Task<Message> {
+        let visible = self.workspace.focused().filter(|card| self.pane_is_active(*card));
+        if self.notification_ui.visible_focus == visible { return Task::none(); }
+        self.notification_ui.visible_focus = visible;
+        self.attention_focus_epoch = self.attention_focus_epoch.wrapping_add(1);
+        let epoch = self.attention_focus_epoch;
+        visible.map_or_else(Task::none, |card| cosmic::task::future(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            Message::AcknowledgeVisiblePane { card, epoch }
+        }))
+    }
+
     pub(super) fn sync_notification_presence(&mut self) {
-        let focus = (self.workspace.focused(), self.refresh_ui.focused);
+        let focused_card = self.workspace.focused();
+        let qualified = focused_card.is_some_and(|card| self.pane_is_active(card));
+        let focus = (focused_card, self.refresh_ui.focused, qualified);
         if self.notification_ui.last_focus == Some(focus)
             && self.notification_ui.last_workspace.as_ptr() == Arc::as_ptr(&self.durable)
         {
@@ -301,13 +329,13 @@ impl Cagents {
         sessions.sort_unstable();
         sessions.dedup();
         let focused = focus
-            .1
+            .2
             .then_some(focus.0)
             .flatten()
             .and_then(|id| self.card_state(id))
             .filter(|card| self.pane_is_active(card.id))
             .and_then(card_session);
-        let focused_target = focus.1.then_some(focus.0).flatten().and_then(|id| {
+        let focused_target = focus.2.then_some(focus.0).flatten().and_then(|id| {
             let CardRuntime::PullRequests(pane) = self.cards.get(&id)? else {
                 return None;
             };
@@ -1066,6 +1094,42 @@ mod tests {
                 .contains(&id)
         );
         drop(app.update_notifications(Action::Snapshot(snapshot)));
+        assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
+    fn attention_modal_visibility_updates_presence_and_invalidates_parent_dwell_without_card_changes() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        let card = app.workspace.focused().unwrap();
+        let session = card_session(app.card_state(card).unwrap()).unwrap();
+        drop(app.sync_visible_attention());
+        app.sync_notification_presence();
+        assert_eq!(app.notification_ui.focused_session_for_test(), Some(session));
+        let stale_epoch = app.attention_focus_epoch;
+        let unchanged = Arc::as_ptr(&app.durable);
+        app.settings_reset_confirm = true;
+        drop(app.sync_visible_attention());
+        app.sync_notification_presence();
+        assert_eq!(Arc::as_ptr(&app.durable), unchanged);
+        assert_eq!(app.notification_ui.focused_session_for_test(), None);
+        let id = uuid::Uuid::new_v4();
+        drop(app.update(Message::NotificationUi(Action::Snapshot(Snapshot { notices: vec![crate::notifications::Notice {
+            id, event: crate::notifications::Event { target: Target::Session(session), source_session: Some(session), provider: Some(Provider::Claude), directory: Some("/tmp".into()), destination: None,
+                evidence: crate::notifications::Evidence { key: "parent-waiting-behind-modal".into(), kind: crate::notifications::Kind::Waiting } },
+            delivered: true, acknowledged: false, window: None,
+        }], diagnostic: None }))));
+        assert!(app.sidebar_state.has_card_update(card));
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+        app.settings_reset_confirm = false;
+        drop(app.sync_visible_attention());
+        app.sync_notification_presence();
+        assert_eq!(app.notification_ui.focused_session_for_test(), Some(session));
+        let current_epoch = app.attention_focus_epoch;
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: stale_epoch }));
+        assert!(app.sidebar_state.has_card_update(card));
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: current_epoch }));
         assert!(!app.sidebar_state.has_card_update(card));
     }
 

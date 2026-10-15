@@ -7340,6 +7340,7 @@ impl Cagents {
             && self.workspace.focused() == Some(card)
             && self.workspace_surfaces_visible()
             && !self.modal_is_open()
+            && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.parent_transcript_selected())
     }
 
     pub(super) fn observe_agent_update_for_card(&mut self, card: CardId) {
@@ -16437,23 +16438,11 @@ impl Application for Cagents {
                 } else {
                     self.reconcile_shared_views()
                 };
-                let acknowledge = if account_focus.is_some_and(|(_, regained)| regained) {
-                    let epoch = self.attention_focus_epoch;
-                    self.workspace.focused().map_or_else(Task::none, |card| {
-                        cosmic::task::future(async move {
-                            tokio::time::sleep(Duration::from_millis(400)).await;
-                            Message::AcknowledgeVisiblePane { card, epoch }
-                        })
-                    })
-                } else {
-                    Task::none()
-                };
                 Task::batch([
                     refresh,
                     self.flush_document_tone(),
                     accounts,
                     shared,
-                    acknowledge,
                 ])
             }
             Message::DocumentToneStale => {
@@ -16740,7 +16729,8 @@ impl Application for Cagents {
             self.reconcile_agent_attention_owners();
         }
         let activation = self.retry_notification_activation();
-        let task = Task::batch([task, self.flush_settings_on_blur(), activation]);
+        let visibility = self.sync_visible_attention();
+        let task = Task::batch([task, self.flush_settings_on_blur(), activation, visibility]);
         self.sync_notification_presence();
         self.sync_worktree_protections();
         self.sync_popup_keyboard_nav();
