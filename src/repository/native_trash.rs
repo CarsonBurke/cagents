@@ -797,11 +797,17 @@ impl Owner {
             let parent = self
                 .restore_parent
                 .as_ref()
-                .unwrap_or(self.preimage.parent());
-            let name = self.restore_name.as_deref().unwrap_or(self.preimage.name());
-            verify_source_target(&self.preimage, parent, name)?;
+                .unwrap_or(self.preimage.parent())
+                .try_clone()
+                .map_err(error)?;
+            let name = self
+                .restore_name
+                .as_deref()
+                .unwrap_or(self.preimage.name())
+                .to_owned();
+            verify_source_target(&self.preimage, &parent, &name)?;
             self.preimage
-                .verify_at(parent, name, false, &CancellationToken::new())?;
+                .verify_at(&parent, &name, false, &CancellationToken::new())?;
         }
         if self.info_file.is_some() {
             self.remove_info()?;

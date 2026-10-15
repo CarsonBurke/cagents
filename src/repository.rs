@@ -9,6 +9,7 @@ mod authority;
 #[path = "repository_recovery.rs"]
 mod recovery;
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
+use recovery::TrashReceipt;
 pub use recovery::{DiscardRecovery, DiscardRecoveryResolution, RecoverableDiscard};
 
 mod worktree_setup_intent;
@@ -4854,9 +4855,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         native_batch: &mut Option<recovery::native_trash::Batch>,
         live: &recovery::LiveDiscardRecovery,
     ) -> Result<MutationOutcome, RepositoryError> {
-        // Keep the actual mutation protected even if its UI task is dropped.
-        let _protection = crate::worktree_cleanup::protect(&request.worktree)
-            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        // The caller already holds the original context/Protection in the
+        // nonserializable receipt; never reacquire a path-only substitute.
         if !request.confirmed {
             return Err(ValidationError::ConfirmationRequired.into());
         }
