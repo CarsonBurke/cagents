@@ -14194,6 +14194,11 @@ impl Application for Cagents {
                 }
                 self.source_control_mutations.remove(&key.canonical_path);
                 let same_origin = self.discard_ui.admits(slot.source_id());
+                let reload = self
+                    .discard_ui
+                    .source()
+                    .filter(|source| slot.same_physical_source(source))
+                    .map(|source| source.key.clone());
                 if let Some(source) = self
                     .sidebar_model
                     .source_control
@@ -14212,7 +14217,7 @@ impl Application for Cagents {
                     )));
                 }
                 self.discard_ui.prune();
-                if same_origin {
+                if let Some(key) = reload {
                     self.reload_source_control(&key)
                 } else {
                     Task::none()

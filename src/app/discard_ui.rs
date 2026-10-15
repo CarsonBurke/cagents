@@ -94,6 +94,15 @@ impl Slot {
     pub fn cancel_before_start(&self) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).running = false;
     }
+    pub fn same_physical_source(&self, active: &ReadSource) -> bool {
+        let original = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .source
+            .clone();
+        matches!((original.authority.get(),active.authority.get()),(Some(Ok(a)),Some(Ok(b))) if a.same_scope(b))
+    }
     pub fn key(&self) -> ActiveWorktreeKey {
         self.0
             .lock()
