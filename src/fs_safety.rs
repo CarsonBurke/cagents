@@ -150,6 +150,17 @@ impl Root {
         metadata_of_descriptor(&self.directory)
     }
 
+    /// Address this retained directory from a synchronous child without
+    /// inheriting a descriptor. The caller must keep this root alive until
+    /// that child exits; `/proc/self` would name the child's different FD table.
+    pub(crate) fn process_path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.descriptor()
+        ))
+    }
+
     fn descriptor(&self) -> RawFd {
         self.directory.as_raw_fd()
     }

@@ -6169,10 +6169,22 @@ impl GitFileLock {
         }
         let parent = index.parent().ok_or("Git reported no index parent")?;
         let parent = fs_safety::Root::open(parent).map_err(|error| error.to_string())?;
-        let mut name = index
-            .file_name()
-            .ok_or("Git reported no index name")?
-            .to_owned();
+        Self::acquire_at(
+            &parent,
+            index.file_name().ok_or("Git reported no index name")?,
+        )
+    }
+
+    /// Acquire through the same retained admin directory as the Git reader.
+    pub(crate) fn acquire_at(
+        parent: &fs_safety::Root,
+        index: &std::ffi::OsStr,
+    ) -> Result<Self, String> {
+        if Path::new(index).components().count() != 1 || index == "." || index == ".." {
+            return Err("Git reported an invalid index name".into());
+        }
+        let parent = parent.try_clone().map_err(|error| error.to_string())?;
+        let mut name = index.to_owned();
         name.push(".lock");
         let (file, temporary) =
             fs_safety::create_temporary_in(&parent, 0o600).map_err(|error| error.to_string())?;

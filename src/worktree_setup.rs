@@ -16,6 +16,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{Read, Write},
+    os::fd::AsRawFd,
     os::unix::{
         ffi::OsStringExt,
         fs::{MetadataExt, PermissionsExt},
@@ -109,6 +110,209 @@ impl CopyPermissions {
             .set_permissions(fs::Permissions::from_mode(self.metadata.mode() & 0o777))
             .map_err(error)
     }
+}
+
+/// Bind the index census to the exact checkout and admin directories used by
+/// the copy. Git discovery by pathname must not follow a subsequently retargeted
+/// `.git` file and prove a different repository's tracked-file set.
+struct SetupCheckout {
+    target: fs_safety::Root,
+    admin: fs_safety::Root,
+    common: fs_safety::Root,
+    gitfile: SetupGitFile,
+    commondir: SetupGitFile,
+    backlink: SetupGitFile,
+}
+
+struct SetupGitFile {
+    file: fs::File,
+    fingerprint: SourceFingerprint,
+    bytes: Vec<u8>,
+}
+
+impl SetupGitFile {
+    fn capture(root: &fs_safety::Root, name: &Path) -> Result<Self, SetupError> {
+        let mut file = fs_safety::open_beneath(root, name)?;
+        let metadata = file.metadata().map_err(error)?;
+        if !metadata.is_file() {
+            return Err(error(
+                "setup requires a linked checkout with regular Git identity files",
+            ));
+        }
+        let fingerprint = source_fingerprint(&metadata);
+        let bytes = fs_safety::read_bounded(&mut file, CONFIG_LIMIT).map_err(error)?;
+        if bytes.len() as u64 > CONFIG_LIMIT {
+            return Err(error("Git identity file exceeds 64 KiB"));
+        }
+        let result = Self {
+            file,
+            fingerprint,
+            bytes,
+        };
+        result.check(root, name)?;
+        Ok(result)
+    }
+
+    fn check(&self, root: &fs_safety::Root, name: &Path) -> Result<(), SetupError> {
+        if source_fingerprint(&self.file.metadata().map_err(error)?) != self.fingerprint
+            || source_fingerprint(&fs_safety::metadata_beneath(root, name)?) != self.fingerprint
+        {
+            return Err(error(
+                "checkout Git identity changed during setup; the worktree was kept",
+            ));
+        }
+        Ok(())
+    }
+
+    fn path(&self, prefix: &[u8]) -> Result<PathBuf, SetupError> {
+        let value = self
+            .bytes
+            .strip_prefix(prefix)
+            .ok_or_else(|| error("invalid Git identity file"))?;
+        let value = value.strip_suffix(b"\n").unwrap_or(value);
+        if value.is_empty() || value.contains(&0) || value.contains(&b'\n') {
+            return Err(error("invalid Git identity path"));
+        }
+        Ok(PathBuf::from(OsString::from_vec(value.to_vec())))
+    }
+}
+
+impl SetupCheckout {
+    fn capture(destination: &Path, expected_common: &Path) -> Result<Self, SetupError> {
+        let target = fs_safety::Root::open(destination).map_err(error)?;
+        let gitfile = SetupGitFile::capture(&target, Path::new(".git"))?;
+        let admin_path =
+            fs::canonicalize(destination.join(gitfile.path(b"gitdir: ")?)).map_err(error)?;
+        let admin = fs_safety::Root::open(&admin_path).map_err(error)?;
+        let commondir = SetupGitFile::capture(&admin, Path::new("commondir"))?;
+        let common_path =
+            fs::canonicalize(admin.path().join(commondir.path(b"")?)).map_err(error)?;
+        let common = fs_safety::Root::open(&common_path).map_err(error)?;
+        let expected = fs_safety::Root::open(expected_common).map_err(error)?;
+        if !same_directory(
+            &common.metadata().map_err(error)?,
+            &expected.metadata().map_err(error)?,
+        ) {
+            return Err(error(
+                "setup source and destination must be checkouts of the same repository",
+            ));
+        }
+        let backlink = SetupGitFile::capture(&admin, Path::new("gitdir"))?;
+        let backlink_path = backlink.path(b"")?;
+        if !backlink_path.is_absolute()
+            || backlink_path.file_name() != Some(std::ffi::OsStr::new(".git"))
+        {
+            return Err(error("invalid linked checkout backlink"));
+        }
+        let backlink_parent = fs_safety::Root::open(
+            &fs::canonicalize(backlink_path.parent().expect("absolute backlink")).map_err(error)?,
+        )
+        .map_err(error)?;
+        if !same_directory(
+            &target.metadata().map_err(error)?,
+            &backlink_parent.metadata().map_err(error)?,
+        ) || source_fingerprint(&fs::symlink_metadata(&backlink_path).map_err(error)?)
+            != gitfile.fingerprint
+        {
+            return Err(error(
+                "Git admin backlink does not identify the setup checkout",
+            ));
+        }
+        let result = Self {
+            target,
+            admin,
+            common,
+            gitfile,
+            commondir,
+            backlink,
+        };
+        result.check()?;
+        Ok(result)
+    }
+
+    fn check(&self) -> Result<(), SetupError> {
+        for root in [&self.target, &self.admin, &self.common] {
+            if !same_directory(
+                &root.metadata().map_err(error)?,
+                &fs::metadata(root.path()).map_err(error)?,
+            ) {
+                return Err(error(
+                    "checkout directory changed during setup; the worktree was kept",
+                ));
+            }
+        }
+        self.gitfile.check(&self.target, Path::new(".git"))?;
+        self.commondir.check(&self.admin, Path::new("commondir"))?;
+        self.backlink.check(&self.admin, Path::new("gitdir"))
+    }
+
+    fn tracked(
+        &self,
+        index: &SetupIndex,
+        args: Vec<OsString>,
+        cancel: &CancellationToken,
+    ) -> Result<crate::process::ProcessOutput, SetupError> {
+        self.check()?;
+        index.check(&self.admin)?;
+        check_cancel(cancel)?;
+        let spec = RepositoryService::system("git")
+            .git_base(&self.target.process_path(), true)
+            .arg(format!("--git-dir={}", self.admin.process_path().display()))
+            .arg(format!(
+                "--work-tree={}",
+                self.target.process_path().display()
+            ))
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .env("GIT_COMMON_DIR", self.common.process_path())
+            .env(
+                "GIT_INDEX_FILE",
+                format!("/proc/{}/fd/{}", std::process::id(), index.file.as_raw_fd()),
+            )
+            .args(args);
+        let result = SystemProcessExecutor
+            .execute(&spec, cancel)
+            .map_err(error)?;
+        self.check()?;
+        index.check(&self.admin)?;
+        Ok(result)
+    }
+}
+
+struct SetupIndex {
+    file: fs::File,
+    fingerprint: SourceFingerprint,
+}
+
+impl SetupIndex {
+    fn capture(admin: &fs_safety::Root) -> Result<Self, SetupError> {
+        let file = fs_safety::open_beneath(admin, Path::new("index"))?;
+        let metadata = file.metadata().map_err(error)?;
+        if !metadata.is_file() {
+            return Err(error("setup index must be a regular file"));
+        }
+        let result = Self {
+            file,
+            fingerprint: source_fingerprint(&metadata),
+        };
+        result.check(admin)?;
+        Ok(result)
+    }
+
+    fn check(&self, admin: &fs_safety::Root) -> Result<(), SetupError> {
+        if source_fingerprint(&self.file.metadata().map_err(error)?) != self.fingerprint
+            || source_fingerprint(&fs_safety::metadata_beneath(admin, Path::new("index"))?)
+                != self.fingerprint
+        {
+            return Err(error(
+                "checkout index changed during setup; the worktree was kept",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn same_directory(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.is_dir() && right.is_dir() && (left.dev(), left.ino()) == (right.dev(), right.ino())
 }
 
 fn check_cancel(cancel: &CancellationToken) -> Result<(), SetupError> {
@@ -387,6 +591,17 @@ pub fn prepare(
     skip: bool,
     cancel: &CancellationToken,
 ) -> Result<SetupPreparation, SetupError> {
+    prepare_with_checkpoint(primary, destination, plan, skip, cancel, || {})
+}
+
+fn prepare_with_checkpoint(
+    primary: &Path,
+    destination: &Path,
+    plan: &SetupPlan,
+    skip: bool,
+    cancel: &CancellationToken,
+    after_checkout_capture: impl FnOnce(),
+) -> Result<SetupPreparation, SetupError> {
     if skip {
         return Ok(SetupPreparation {
             skipped: true,
@@ -401,16 +616,15 @@ pub fn prepare(
     }
     let service = RepositoryService::system("git");
     let common = service.common_dir(primary, cancel).map_err(error)?;
-    if service.common_dir(destination, cancel).map_err(error)? != common
-        || fs::canonicalize(primary).map_err(error)?
-            == fs::canonicalize(destination).map_err(error)?
-    {
+    if fs::canonicalize(primary).map_err(error)? == fs::canonicalize(destination).map_err(error)? {
         return Err(error(
             "setup source and destination must be different checkouts of the same repository",
         ));
     }
     let source = fs_safety::Root::open(primary).map_err(error)?;
-    let target = fs_safety::Root::open(destination).map_err(error)?;
+    let checkout = SetupCheckout::capture(destination, &common)?;
+    after_checkout_capture();
+    let target = &checkout.target;
     let mut result = SetupPreparation::default();
     let mut found = BTreeSet::new();
     let mut scanned = 0;
@@ -432,8 +646,10 @@ pub fn prepare(
             return Err(error("copy matches exceed 10000 files"));
         }
     }
-    let admin = service.git_dir(destination, cancel).map_err(error)?;
-    let index_lock = GitFileLock::acquire(&admin.join("index")).map_err(error)?;
+    checkout.check()?;
+    let index_lock =
+        GitFileLock::acquire_at(&checkout.admin, std::ffi::OsStr::new("index")).map_err(error)?;
+    let index = SetupIndex::capture(&checkout.admin)?;
     let mut tracked = HashSet::new();
     // ls-files has no stdin pathspec support. Bound argv and output to the
     // selected candidates rather than reading an unrelated huge index.
@@ -453,7 +669,7 @@ pub fn prepare(
             size += length;
             pending.next();
         }
-        let output = git(destination, args, cancel)?;
+        let output = checkout.tracked(&index, args, cancel)?;
         if !output.success {
             return Err(error("could not read destination tracked files"));
         }
@@ -467,7 +683,9 @@ pub fn prepare(
     }
     for path in found {
         check_cancel(cancel)?;
+        checkout.check()?;
         index_lock.check().map_err(error)?;
+        index.check(&checkout.admin)?;
         if tracked.contains(&path) {
             result.skipped_paths.push(SkippedCopy {
                 path,
@@ -524,7 +742,9 @@ pub fn prepare(
             permissions.apply(&input, &output)?;
             output.sync_all().map_err(error)?;
             check_cancel(cancel)?;
+            checkout.check()?;
             index_lock.check().map_err(error)?;
+            index.check(&checkout.admin)?;
             permissions.check(&input)?;
             fs_safety::rename_new_within(
                 &parent,
@@ -556,6 +776,7 @@ pub fn prepare(
         }
     }
     check_cancel(cancel)?;
+    checkout.check()?;
     current(primary, plan)?;
     if !is_trusted(primary, plan, cancel)? {
         return Err(SetupError::TrustRequired);
@@ -713,6 +934,100 @@ mod tests {
             .git_dir(&fixture.destination, &CancellationToken::new())
             .unwrap();
         assert!(!admin.join("index.lock").exists());
+    }
+
+    #[test]
+    fn retargeted_gitfile_cannot_prove_another_index_before_copy() {
+        let fixture = Fixture::new();
+        let unrelated = Fixture::new();
+        let plan = fixture.config("copy = ['tracked']");
+        fs::write(
+            fixture.primary.join("tracked"),
+            "local source that must stay absent",
+        )
+        .unwrap();
+        fs::remove_file(fixture.destination.join("tracked")).unwrap();
+        // B's index has no candidate at all. The old discovery-by-path reader
+        // would prove B while its retained target still wrote into A.
+        unrelated.git(&["rm", "tracked"]);
+        let foreign = fs::read(unrelated.destination.join(".git")).unwrap();
+        let foreign_admin = RepositoryService::system("git")
+            .git_dir(&unrelated.destination, &CancellationToken::new())
+            .unwrap();
+        // Ensure the linked foreign index, too, lacks the candidate.
+        let foreign_index = fs::read(unrelated.primary.join(".git/index")).unwrap();
+        fs::write(foreign_admin.join("index"), foreign_index).unwrap();
+        let original_gitfile = fs::read(fixture.destination.join(".git")).unwrap();
+        let result = prepare_with_checkpoint(
+            &fixture.primary,
+            &fixture.destination,
+            &plan,
+            false,
+            &CancellationToken::new(),
+            || fs::write(fixture.destination.join(".git"), &foreign).unwrap(),
+        );
+        fs::write(fixture.destination.join(".git"), original_gitfile).unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Git identity changed")
+        );
+        assert!(!fixture.destination.join("tracked").exists());
+        assert_eq!(
+            fs::read(fixture.primary.join("tracked")).unwrap(),
+            b"local source that must stay absent"
+        );
+    }
+
+    #[test]
+    fn pinned_index_reads_original_tracked_set_and_refuses_replaced_index_or_backlink() {
+        let fixture = Fixture::new();
+        let cancel = CancellationToken::new();
+        let service = RepositoryService::system("git");
+        let common = service.common_dir(&fixture.primary, &cancel).unwrap();
+        let checkout = SetupCheckout::capture(&fixture.destination, &common).unwrap();
+        let _lock =
+            GitFileLock::acquire_at(&checkout.admin, std::ffi::OsStr::new("index")).unwrap();
+        let index = SetupIndex::capture(&checkout.admin).unwrap();
+        let output = checkout
+            .tracked(
+                &index,
+                ["ls-files", "--cached", "-z", "--", "tracked"]
+                    .map(OsString::from)
+                    .into(),
+                &cancel,
+            )
+            .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout, b"tracked\0");
+        let original_index = fs::read(checkout.admin.path().join("index")).unwrap();
+        fs::rename(
+            checkout.admin.path().join("index"),
+            checkout.admin.path().join("old-index"),
+        )
+        .unwrap();
+        fs::write(checkout.admin.path().join("index"), original_index).unwrap();
+        assert!(
+            checkout
+                .tracked(&index, vec!["ls-files".into()], &cancel)
+                .unwrap_err()
+                .to_string()
+                .contains("index changed")
+        );
+        fs::write(
+            checkout.admin.path().join("gitdir"),
+            fixture.primary.join(".git").as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        assert!(
+            checkout
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("Git identity changed")
+        );
+        assert!(!fixture.destination.join(".env").exists());
     }
 
     #[test]

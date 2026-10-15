@@ -1,4 +1,9 @@
-# Worktree setup
+# Worktree setup core
+
+This backend foundation provides configuration, copy preparation, trust and durable
+intent APIs. UI and CLI integration, interactive setup terminals, row status and
+explicit resume controls are pending companion changes. The examples below define
+the shared backend contract; they do not enable setup automatically.
 
 A project's primary checkout may contain `.cagents/worktree.toml`:
 
@@ -8,9 +13,9 @@ setup = ["pnpm install", "pnpm build"]
 ```
 
 `setup` also accepts one string. Each entry is a shell command; entries run in
-order and stop after the first failure. The UI and CLI use the same preparation
-service and launch commands in an interactive terminal for the new checkout.
-The worktree row reports the terminal's running, succeeded or failed state.
+order and stop after the first failure in the returned shell recipe. Planned UI
+and CLI consumers will use this preparation service, launch that recipe in an
+interactive terminal and display its running, succeeded or failed state.
 
 The first command launch requires explicit trust for the project. Trust is saved
 in this clone's local Git configuration and applies to the exact contents of the
@@ -25,9 +30,10 @@ Directory traversal and copies refuse symbolic links and do not cross into neste
 Git checkouts, including other managed worktrees or the destination itself. Glob patterns support
 `*`, `?`, character classes and recursive `**` directory components.
 
-Choose **Skip setup** for one creation, or use `cagents worktree create --no-setup`.
-Skipping bypasses both copies and commands. A failed or cancelled setup keeps the
-created worktree and any completed copies for inspection; it never automatically
+The preparation API accepts a per-creation Skip choice, which bypasses both
+copies and commands. The planned **Skip setup** UI and
+`cagents worktree create --no-setup` CLI flag are not available in this core PR.
+A failed or cancelled preparation keeps the created worktree and any completed copies for inspection; it never automatically
 deletes work. Callers expose progress, errors and terminal cancellation.
 
 Preparation bounds config files to 64 KiB, configurations to 128 copy patterns
