@@ -1819,17 +1819,30 @@ mod tests {
                     ServerResponse::Connected { proof: proof.clone(), resumed: vec![] });
             let attach: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
             let ClientRequest::ChatStart { session, .. } = attach.request else { panic!("start"); };
+            let chat_id = session.id;
             respond(&mut codec, &mut server, attach.request_id, ServerResponse::ChatAttached {
                 account_home: Some(crate::account::HomeIdentity { provider: crate::agent::Provider::Omp,
                     canonical_home: "/immutable/backend/home".into(), device: 11, inode: 22, purge_ids: vec![] }),
-                session, snapshot: Snapshot { generation: 77, session_id: Some("cached-exact-session".into()), ready: true,
+                session, snapshot: Snapshot { generation: 77, session_id: Some("cached-exact-session".into()),
+                    ready: true, busy: true, turn_generation: 7, sampled_at: Some(1000),
                     items: vec![Arc::new(super::super::Item { id: "offline-item".into(), role: super::super::Role::Assistant,
                         content: super::super::ItemContent::Text { text: "private cached words".repeat(8192), thinking: false, phase: Default::default() },
                         started_at: None, at: None })], ..Default::default() }
             });
             let hidden: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-            assert!(matches!(hidden.request, ClientRequest::ChatVisibility { visible: false, .. }));
+            assert!(matches!(hidden.request, ClientRequest::ChatVisibility { visible: true, .. }));
             respond(&mut codec, &mut server, hidden.request_id, ServerResponse::Accepted);
+            codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None,
+                proof: proof.clone(), message: ServerMessage::ChatChanged { chat_id } }).unwrap();
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(read.request, ClientRequest::ChatRead { after_generation: Some(77), .. }));
+            respond(&mut codec, &mut server, read.request_id, ServerResponse::ChatUpdate { chat_id,
+                update: super::super::presentation::Presentation { base_generation: 77,
+                    file_changes_unchanged: false, order: vec!["offline-item".into()], changes: vec![], children: vec![],
+                    metadata: Snapshot { generation: 78, session_id: Some("cached-exact-session".into()),
+                        ready: true, busy: false, turn_generation: 8, sampled_at: Some(2000),
+                        finished_at: Some(1900), error: Some("Latest qualified outcome".into()), ..Default::default() } }
+            });
             // Real transport EOF occurs only after the live client evicts its
             // body. No server remains to answer a reveal or start a provider.
         });
@@ -1843,11 +1856,12 @@ mod tests {
         presentation_recipe.launch.recipe.environment.insert("PI_CODING_AGENT_DIR".into(), "/different/current/path".into());
         assert_eq!(handle.account_home(), Some(&captured_home), "a recipe copy cannot rewrite backend provenance");
         let weak_body = Arc::downgrade(&handle.snapshot().items[0]);
-        handle.set_visible(false).unwrap();
+        handle.set_interest(true, false).unwrap();
         while !matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Disconnected(_)) {}
         assert!(handle.resident_snapshot_with_clock().is_none());
         assert!(handle.local_history_is_read_only());
         assert_eq!(handle.account_home(), Some(&captured_home));
+        assert_eq!(handle.snapshot().generation, 78);
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
         let deadline = Instant::now() + Duration::from_secs(5);
         while weak_body.upgrade().is_some() {
@@ -1861,7 +1875,12 @@ mod tests {
                 rx.recv_timeout(Duration::from_secs(5)).unwrap();
             }
             let snapshot = handle.snapshot();
-            assert_eq!(snapshot.generation, 77);
+            assert_eq!(snapshot.generation, 78, "cached body must not roll back hidden control metadata");
+            assert!(!snapshot.busy);
+            assert_eq!(snapshot.turn_generation, 8);
+            assert_eq!(snapshot.finished_at, Some(1900));
+            assert_eq!(snapshot.error.as_deref(), Some("Latest qualified outcome"));
+            assert!(handle.snapshot_with_clock().1.unwrap().sampled_at >= 2000);
             assert_eq!(snapshot.session_id.as_deref(), Some("cached-exact-session"));
             assert!(snapshot.transcript_bytes() > 0);
             assert!(snapshot.read_only_reason.as_deref().unwrap().contains("last cached view"));
