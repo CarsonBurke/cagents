@@ -851,28 +851,34 @@ mod tests {
         // complete proof. Both preflight and the transaction must refuse them.
         for (native_chat, proof_present) in [(true, false), (true, true), (false, true)] {
             let (mut r, _directory, a, b) = setup();
-            let accepted = r.submit_agent(
-                &Origin::User,
-                &Submit {
-                    name: None,
-                    destination: Destination::New(Spec {
-                        provider: Provider::Claude,
-                        account: None,
-                        target: Target {
-                            repository: "/repo".into(),
-                            directory: "/repo".into(),
-                            placement: Some(Scope::Channel(a)),
-                        },
-                        surface: if native_chat { Surface::Chat } else { Surface::Terminal },
-                        model: None,
-                        permission_mode: None,
-                        reasoning_effort: None,
-                    }),
-                    prompt: "Work".into(),
-                    idempotency_key: "unproved-transfer".into(),
-                },
-                1,
-            ).unwrap();
+            let accepted = r
+                .submit_agent(
+                    &Origin::User,
+                    &Submit {
+                        name: None,
+                        destination: Destination::New(Spec {
+                            provider: Provider::Claude,
+                            account: None,
+                            target: Target {
+                                repository: "/repo".into(),
+                                directory: "/repo".into(),
+                                placement: Some(Scope::Channel(a)),
+                            },
+                            surface: if native_chat {
+                                Surface::Chat
+                            } else {
+                                Surface::Terminal
+                            },
+                            model: None,
+                            permission_mode: None,
+                            reasoning_effort: None,
+                        }),
+                        prompt: "Work".into(),
+                        idempotency_key: "unproved-transfer".into(),
+                    },
+                    1,
+                )
+                .unwrap();
             let terminal = TerminalSession {
                 id: crate::model::TerminalId::new(),
                 owned_codex_listener: None,
@@ -903,13 +909,18 @@ mod tests {
                         recipe: terminal.launch.clone(),
                         session_id: None,
                     },
-                    proof: if proof_present { terminal.continuity.live_proof() } else { None },
+                    proof: if proof_present {
+                        terminal.continuity.live_proof()
+                    } else {
+                        None
+                    },
                     terminal: None,
                     owned_codex_listener: None,
                     native_continuity: Default::default(),
                 })
             };
-            r.bind_agent(accepted.agent.id, None, source.clone()).unwrap();
+            r.bind_agent(accepted.agent.id, None, source.clone())
+                .unwrap();
             let p = Pane {
                 kind: match source {
                     HostedSession::Chat(session) => CardKind::Chat(session),
@@ -925,10 +936,17 @@ mod tests {
             };
             let transfer = edit(&mut r, a, change.clone());
             let before = r.model().unwrap();
-            assert!(r.view_change_refusal(&Scope::Channel(a), &change).unwrap().is_some());
+            assert!(
+                r.view_change_refusal(&Scope::Channel(a), &change)
+                    .unwrap()
+                    .is_some()
+            );
             assert!(r.apply(&transfer).unwrap_err().contains("changed process"));
-            assert_eq!(r.model().unwrap(), before,
-                "equal unproved descriptors preserve both views, Agent and model sequence");
+            assert_eq!(
+                r.model().unwrap(),
+                before,
+                "equal unproved descriptors preserve both views, Agent and model sequence"
+            );
         }
     }
 
