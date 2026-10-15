@@ -48,6 +48,11 @@ impl Monitor {
     }
 
     #[cfg(test)]
+    pub(super) fn observed_for_test(&self, path: &Path) -> Option<PathBuf> {
+        self.observed.lock().unwrap().get(path).cloned()
+    }
+
+    #[cfg(test)]
     pub(super) fn force_unavailable_for_test(&self) {
         self.unavailable.store(true, Ordering::Release);
         self.failed.store(true, Ordering::Release);

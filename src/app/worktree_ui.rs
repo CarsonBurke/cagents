@@ -2962,6 +2962,13 @@ mod owner_path_cache_tests {
                 open_cards: false, project_id: project, generation: 5,
                 result: Ok(Box::new(loaded)),
             }));
+            let Message::WorktreeSelectionPrepared { generation, receipt, .. } = &prepared else {
+                panic!("expected a prepared physical selection receipt");
+            };
+            assert!(app.prepared_selection_navigates(*generation, receipt),
+                "reload must leave the held receipt valid before the deliberate retarget");
+            assert_eq!(app.worktree_owner_paths.watch.observed_for_test(&alias), Some(first.clone()),
+                "reload must retain the exact lexical-to-physical pending mapping");
             let epoch = app.worktree_owner_paths.watch.epoch();
             std::fs::remove_file(&alias).unwrap();
             std::os::unix::fs::symlink(&second, &alias).unwrap();
