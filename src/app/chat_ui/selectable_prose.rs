@@ -477,7 +477,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         bounds.x -= layout.virtual_offset().x;
         bounds.y -= layout.virtual_offset().y;
         let mut node = Node::new(Role::Label);
-        node.set_value(self.plain.to_string());
+        node.set_value(tree.state.downcast_ref::<State>().plain.to_string());
         node.set_bounds(Rect::new(
             bounds.x as f64,
             bounds.y as f64,
@@ -508,18 +508,21 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
         state.dirty = false;
-        state.target = Some(self.target);
-        state.logical = self.logical.clone();
-        #[cfg(test)]
-        {
-            state.search_paint = (self.matches.clone(), self.current.clone());
+        let same_target=state.target==Some(self.target);
+        let same_logical=state.logical.as_ref().map(|logical|(logical.identity,logical.start))
+            ==self.logical.as_ref().map(|logical|(logical.identity,logical.start));
+        let mut flow=self.flow.clone();
+        if same_target && same_logical
+            && let (Some(previous),Some(current))=(&state.flow,&self.flow)
+            && !std::rc::Rc::ptr_eq(previous,current)
+            && previous.borrow_mut().adopt(&current.borrow()) {
+            flow=Some(previous.clone());
         }
-        let same_flow = state.flow.as_ref().zip(self.flow.as_ref()).is_some_and(|(old, current)| std::rc::Rc::ptr_eq(old, current));
-        if !same_flow {
-            state.flow_ready = None;
-            state.flow_projection.borrow_mut().take();
-        }
-        state.flow = self.flow.clone();
+        let same_flow=state.flow.as_ref().zip(flow.as_ref()).is_some_and(|(old,current)|std::rc::Rc::ptr_eq(old,current));
+        state.target=Some(self.target);state.logical=self.logical.clone();
+        if !same_flow {state.flow_ready=None;state.flow_projection.borrow_mut().take();}
+        state.flow=flow;
+        #[cfg(test)] { state.search_paint = (self.matches.clone(), self.current.clone()); }
         if state
             .spans
             .as_ref()
@@ -531,10 +534,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 state.end = 0;
                 state.dragging = false;
             }
-            state.plain = self.plain.clone();
+            if state.flow.is_none() || !same_flow {state.plain = self.plain.clone();}
         }
         // Selection bytes cannot outlive a streamed paragraph's replacement.
-        state.validate_selection(&self.plain);
+        if state.flow.is_none() {state.validate_selection(&self.plain);}
         let shape = Shape {
             bounds: limits.max(),
             size: self.size,
@@ -546,8 +549,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             state.shape = Some(shape);
             let mut flow = flow.borrow_mut();
             flow.configure(shape.bounds.width, self.size, self.font);
-            state.flow_ready = self.flow_ready.clone().filter(|ready| flow.prepared().is_some_and(|current| Arc::ptr_eq(ready, &current)));
-            return layout::Node::new(limits.resolve(Length::Shrink, Length::Shrink, flow.bounds(self.plain.len())));
+            flow.bind_target(self.target);
+            state.flow_ready=flow.prepared();
+            if let Some(ready)=&state.flow_ready {
+                state.plain=ready.plain.clone();state.spans=Some(ready.spans.clone());
+            }
+            state.validate_selection(&state.plain.clone());
+            return layout::Node::new(limits.resolve(Length::Shrink,Length::Shrink,flow.bounds(state.plain.len())));
         }
         if state
             .spans
@@ -600,7 +608,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             if let Some(ready) = &state.flow_ready {
                 let top = (viewport.y - layout.bounds().y).max(0.0);
                 if let Some(projection) = ready.projection(top, top + viewport.height + self.size.0 * 1.3) {
-                    flow_layout::paint(renderer, &projection, &self.spans, &self.matches,
+                    flow_layout::paint(renderer, &projection, &ready.spans, &self.matches,
                         state.anchor.min(state.end)..state.anchor.max(state.end), self.size,
                         layout.position(), theme, defaults, viewport);
                     *state.flow_projection.borrow_mut() = Some(projection);
@@ -711,7 +719,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
             state.dragging = false;
         }
-        state.validate_selection(&self.plain);
+        let current_plain=state.plain.clone();
+        state.validate_selection(&current_plain);
         let position = cursor.position_in(layout.bounds());
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -763,13 +772,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 if key.eq_ignore_ascii_case("c") && state.anchor != state.end {
                     clipboard.write(
                         iced::advanced::clipboard::Kind::Standard,
-                        self.plain[state.anchor.min(state.end)..state.anchor.max(state.end)]
+                        state.plain[state.anchor.min(state.end)..state.anchor.max(state.end)]
                             .to_owned(),
                     );
                     shell.capture_event();
                 } else if key.eq_ignore_ascii_case("a") {
                     state.anchor = 0;
-                    state.end = self.plain.len();
+                    state.end = state.plain.len();
                     shell.capture_event();
                     shell.invalidate_layout();
                 }

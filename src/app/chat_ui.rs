@@ -6312,28 +6312,23 @@ impl Cagents {
         }
         match action {
             Action::FlowRequest(target, request) => {
-                let entry = self.chat_runtime_mut(target).and_then(|runtime| runtime.cache.values().find_map(|cached| cached.flow_cache.find(request.id)));
-                if let Some(entry) = entry {
-                    let valid = entry.borrow().accepts(&request);
-                    if valid {
-                        match flow_layout::run(target, request.clone()) {
-                            Ok(task) => return task,
-                            Err(epoch) => entry.borrow_mut().defer(&request, epoch),
-                        }
+                if self.chat_runtime_mut(target).is_some()
+                    && let Some(entry)=flow_layout::find(target,&request) {
+                    match flow_layout::run(target,request.clone()) {
+                        Ok(task)=>return task,
+                        Err(epoch)=>entry.borrow_mut().defer(&request,epoch),
                     }
                 }
             }
             Action::FlowReady(target, request, ready) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
+                if let Some(runtime)=self.chat_runtime_mut(target)
+                    && let Some(entry)=flow_layout::find(target,&request)
+                    && entry.borrow_mut().complete(&request,ready) {
                     for cached in runtime.cache.values_mut() {
-                        if let Some(entry) = cached.flow_cache.find(request.id) {
-                            if entry.borrow_mut().complete(&request, ready.clone()) {
-                                // Invalidate retained item factories/layouts without
-                                // reparsing or changing their stable logical IDs.
-                                cached.revision = CachedItem::next_revision();
-                            }
-                            break;
-                        }
+                        let owns=cached.flow_cache.find(request.id).is_some()
+                            || cached.tool_input.iter().chain(cached.tool_output.iter()).chain(cached.patches.iter())
+                                .any(|tool|tool.flow_cache.find(request.id).is_some());
+                        if owns {cached.revision=CachedItem::next_revision();}
                     }
                 }
             }
@@ -13563,6 +13558,69 @@ mod tests {
         }
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[tokio::test(flavor="current_thread")]
+    async fn flow_dispatch_prepares_cached_tools_and_recreated_temporary_contexts() {
+        use iced::advanced::{Layout,layout,mouse,Shell,widget::{Operation,Tree}};
+        use iced::futures::StreamExt;
+        #[derive(Default)] struct Read(Vec<Arc<str>>);
+        impl Operation for Read {
+            fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation)){visit(self);}
+            fn custom(&mut self,_:Option<&widget::Id>,_:iced::Rectangle,state:&mut dyn std::any::Any){
+                if let Some(state)=state.downcast_ref::<selectable_prose::State>() {self.0.push(state.plain.clone());}
+            }
+        }
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let card=live_chat(&mut app,Some(KNOWN_THREAD));
+        let target=chat_runtime(&app,card).target;
+        let theme=crate::settings::EditorSyntaxTheme::Auto;
+        let source="x".repeat(6000);
+        let renderer=crate::app::tests::headless_renderer();
+        let limits=layout::Limits::new(iced::Size::ZERO,iced::Size::new(400.0,200.0));
+        for temporary in [false,true] {
+            if !temporary {
+                let mut cached=CachedItem::updated(&text("tool"),theme,None,false,false,None);
+                cached.tool_output=Some(tool_text::ToolText::update(None,&source,tool_text::Language::Plain));
+                app.chat_runtime_mut(target).unwrap().cache.insert("tool".into(),cached);
+            }
+            let make=|app:&Cagents| {
+                if temporary {
+                    // Approval/reader contexts construct a temporary ToolText;
+                    // the actual native Tree is its surviving flow owner.
+                    tool_text::ToolText::update(None,&source,tool_text::Language::Plain).view(theme,None,target,None)
+                } else {
+                    chat_runtime(app,card).cache["tool"].tool_output.as_ref().unwrap().view_logical_with_reader(
+                        theme,None,target,None,selectable_prose::Logical{identity:42,start:0},scroll::Memory::default(),None)
+                }
+            };
+            let mut element=make(&app);let mut tree=Tree::new(&element);
+            let node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
+            let mut messages=Vec::new();
+            element.as_widget_mut().update(&mut tree,
+                &iced::Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now())),
+                Layout::new(&node),mouse::Cursor::Unavailable,&renderer,&mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),&iced::Rectangle::with_size(iced::Size::new(400.0,200.0)));
+            let action=messages.into_iter().find_map(|message|match message {
+                Message::ChatUi(action@Action::FlowRequest(..))=>Some(action),_=>None,
+            }).expect("visible native flow publishes its request");
+            let before=app.chat_runtime_mut(target).unwrap().cache.get("tool").map(|cached|cached.revision);
+            let task=app.handle_chat_action(action);
+            let mut outputs=iced::runtime::task::into_stream(task).expect("actual dispatch starts shaping");
+            let reply=tokio::time::timeout(Duration::from_secs(20),async {
+                while let Some(output)=outputs.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(action@Action::FlowReady(..))))=output {return action;}
+                }
+                panic!("flow task produced no completion");
+            }).await.expect("bounded fixture completion");
+            drop(app.handle_chat_action(reply));
+            if !temporary {assert_ne!(app.chat_runtime_mut(target).unwrap().cache["tool"].revision,before.unwrap());}
+            let mut refreshed=make(&app);refreshed.as_widget_mut().diff(&mut tree);
+            let node=refreshed.as_widget_mut().layout(&mut tree,&renderer,&limits);
+            let mut read=Read::default();
+            refreshed.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut read);
+            assert!(read.0.iter().any(|plain|plain.as_ref()==source),"completed glyph owner survives context recreation");
+        }
     }
 
     #[test]
