@@ -1,4 +1,6 @@
 //! Checked branch deletion shared by worktree removal surfaces.
+#[cfg(any(feature = "ui", feature = "host"))]
+mod force_delete;
 use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BranchDeleteFailureKind {
@@ -44,8 +46,8 @@ pub fn delete_branch_checked(
 
 /// `branch` is always an exact local branch name, never a full ref.
 /// A force confirmation can bind its consent to the branch commit it showed.
-/// The forced deletion uses Git's ref transaction compare-and-swap, rather than
-/// a second read followed by an unconditional `branch -D`.
+/// Forced deletion validates the shown OID inside Git's prepared reference
+/// transaction while preserving native checkout refusal and config cleanup.
 #[cfg(any(feature = "ui", feature = "host"))]
 pub fn delete_branch_checked_at(
     repository: &std::path::Path,
@@ -152,80 +154,48 @@ pub fn delete_branch_checked_at(
             .require_success(&command.program)
             .map_err(|error| other(error.reported_detail()))?;
     }
+    // Fence checkout transitions in all currently registered worktrees. Git's
+    // final native deletion still rechecks its complete checkout inventory.
+    let mut head_locks = Vec::new();
+    if force {
+        let records = service
+            .list_worktrees(repository, cancellation)
+            .map_err(|error| other(error.to_string()))?;
+        let mut heads = records
+            .iter()
+            .filter(|record| !record.bare)
+            .map(|record| {
+                service
+                    .git_dir(&record.path, cancellation)
+                    .map(|directory| directory.join("HEAD"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| other(error.to_string()))?;
+        heads.sort();
+        heads.dedup();
+        for head in heads {
+            head_locks.push(crate::repository::GitFileLock::acquire(&head).map_err(other)?);
+        }
+        for lock in &head_locks {
+            lock.check().map_err(other)?;
+        }
+    }
     checked_out()?;
-    let command = if force {
-        git_command(repository).args([
-            "update-ref",
-            "--no-deref",
-            "-d",
+    if force {
+        force_delete::delete(
+            repository,
+            branch.as_str(),
             &full_ref,
             observed.as_str(),
-        ])
+            cancellation,
+        )
+        .map_err(other)?;
     } else {
-        git_command(repository).args(["branch", "-d", "--", branch.as_str()])
-    };
-    SystemProcessExecutor
-        .execute(&command, cancellation)
-        .and_then(|output| output.require_success(&command.program))
-        .map_err(|error| other(error.reported_detail()))?;
-    if force {
-        // update-ref atomically deletes the ref and its reflog. Unlike branch
-        // -d, it does not remove the optional clone-local branch subsection.
-        let section = format!("branch.{}", branch.as_str());
-        let escaped: String = section
-            .chars()
-            .flat_map(|character| {
-                if "\\.^$|?*+()[]{}".contains(character) {
-                    vec!['\\', character]
-                } else {
-                    vec![character]
-                }
-            })
-            .collect();
-        let pattern = format!("^{escaped}\\.[^.]+$");
-        let query = git_command(repository).args(["config", "--local", "--get-regexp", &pattern]);
-        let output = SystemProcessExecutor
-            .execute(&query, cancellation)
-            .map_err(|error| {
-                other(format!(
-                    "Branch was deleted, but its configuration was retained: {}",
-                    error.reported_detail()
-                ))
-            })?;
-        if output.success {
-            // Preserve a same-named branch recreated concurrently by another Git
-            // caller. The ref deletion itself is already committed at this point.
-            let check =
-                git_command(repository).args(["show-ref", "--verify", "--quiet", &full_ref]);
-            let current = SystemProcessExecutor
-                .execute(&check, cancellation)
-                .map_err(|error| {
-                    other(format!(
-                        "Branch was deleted, but its configuration was retained: {}",
-                        error.reported_detail()
-                    ))
-                })?;
-            if current.exit_code == Some(1) {
-                let remove = git_command(repository).args([
-                    "config",
-                    "--local",
-                    "--remove-section",
-                    &section,
-                ]);
-                SystemProcessExecutor.execute(&remove, cancellation)
-                    .and_then(|output| output.require_success(&remove.program))
-                    .map_err(|error| other(format!("Branch was deleted; branch configuration cleanup could not be confirmed: {}", error.reported_detail())))?;
-            } else if current.success {
-                return Err(other("Branch was deleted, then a branch with the same name appeared; its configuration was preserved".into()));
-            } else {
-                return Err(other("Branch was deleted, but its current identity could not be confirmed; configuration was preserved".into()));
-            }
-        } else if output.exit_code != Some(1) {
-            return Err(other(
-                "Branch was deleted, but its configuration could not be inspected and was retained"
-                    .into(),
-            ));
-        }
+        let command = git_command(repository).args(["branch", "-d", "--", branch.as_str()]);
+        SystemProcessExecutor
+            .execute(&command, cancellation)
+            .and_then(|output| output.require_success(&command.program))
+            .map_err(|error| other(error.reported_detail()))?;
     }
     Ok(())
 }
@@ -363,5 +333,123 @@ mod branch_delete_tests {
             ),
             "preserved"
         );
+    }
+    #[test]
+    fn force_deletion_fences_checkout_and_changed_commit_during_final_effect() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            time::{Duration, Instant},
+        };
+        const MODE: &str = "CAGENTS_BRANCH_RACE_MODE";
+        if let Ok(mode) = std::env::var(MODE) {
+            let root =
+                std::path::PathBuf::from(std::env::var_os("CAGENTS_BRANCH_RACE_ROOT").unwrap());
+            let path = root.join("repo");
+            git(&path, &["init", "-q", "-b", "main"]);
+            fs::write(path.join("file"), "base").unwrap();
+            git(&path, &["add", "file"]);
+            git(&path, &["commit", "-qm", "base"]);
+            let base = git(&path, &["rev-parse", "HEAD"]);
+            git(&path, &["branch", "topic"]);
+            let other = root.join("other");
+            git(
+                &path,
+                &["worktree", "add", "-qb", "other", other.to_str().unwrap()],
+            );
+            // A different commit may become the branch head after confirmation.
+            fs::write(path.join("file"), "advance").unwrap();
+            git(&path, &["commit", "-qam", "advance"]);
+            let next = git(&path, &["rev-parse", "HEAD"]);
+            fs::write(root.join("advance-oid"), &next).unwrap();
+            git(
+                &path,
+                &[
+                    "config",
+                    "--local",
+                    "branch.topic.description",
+                    "retain on refusal",
+                ],
+            );
+            let policy = path.join(".git/hooks/reference-transaction");
+            fs::write(&policy,"#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' \"$1\" >> \"$CAGENTS_BRANCH_RACE_ROOT/policy-phases\"\n").unwrap();
+            fs::set_permissions(&policy, fs::Permissions::from_mode(0o700)).unwrap();
+            let result = delete_branch_checked_at(
+                &path,
+                "topic",
+                true,
+                Some(&base),
+                &CancellationToken::new(),
+            );
+            if mode == "checkout" {
+                result.unwrap();
+                assert_ne!(
+                    fs::read_to_string(root.join("checkout-status"))
+                        .unwrap()
+                        .trim(),
+                    "0"
+                );
+                assert_eq!(git(&other, &["symbolic-ref", "HEAD"]), "refs/heads/other");
+                assert!(git(&path, &["branch", "--list", "topic"]).is_empty());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(git(&path, &["rev-parse", "refs/heads/topic"]), next);
+                assert_eq!(
+                    git(
+                        &path,
+                        &["config", "--local", "--get", "branch.topic.description"]
+                    ),
+                    "retain on refusal"
+                );
+            }
+            // The capability probe must not invoke the user's policy hook.
+            // Actual deletion still invokes it once per native transaction phase.
+            let phases = fs::read_to_string(root.join("policy-phases")).unwrap();
+            assert!(phases.lines().any(|phase| phase == "prepared"));
+            return;
+        }
+        for mode in ["checkout", "advance"] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let root = directory.path();
+            fs::create_dir(root.join("repo")).unwrap();
+            fs::create_dir(root.join("bin")).unwrap();
+            let wrapper = root.join("bin/git");
+            fs::write(&wrapper,r##"#!/bin/sh
+set -u
+case " $* " in
+  *' branch -D -- topic '*|*' update-ref --no-deref -d refs/heads/topic '*)
+    if [ "$CAGENTS_BRANCH_RACE_MODE" = checkout ]; then
+      /usr/bin/git -C "$CAGENTS_BRANCH_RACE_ROOT/other" checkout -q topic
+      printf '%s\n' "$?" > "$CAGENTS_BRANCH_RACE_ROOT/checkout-status"
+    else
+      next=$(/bin/cat "$CAGENTS_BRANCH_RACE_ROOT/advance-oid")
+      /usr/bin/git -C "$CAGENTS_BRANCH_RACE_ROOT/repo" update-ref refs/heads/topic "$next" || exit 90
+    fi
+    ;;
+esac
+exec /usr/bin/git "$@"
+"##).unwrap();
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut path = std::ffi::OsString::from(root.join("bin"));
+            path.push(":");
+            path.push(std::env::var_os("PATH").unwrap_or_default());
+            let mut child=Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","worktree_branch::branch_delete_tests::force_deletion_fences_checkout_and_changed_commit_during_final_effect","--nocapture"])
+                .env(MODE,mode).env("CAGENTS_BRANCH_RACE_ROOT",root).env("PATH",path)
+                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_SYSTEM","/dev/null")
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!(
+                        "branch race child timed out: {:?}",
+                        child.wait_with_output()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{mode}: {output:?}");
+        }
     }
 }
