@@ -783,7 +783,7 @@ mod tests {
     fn dialog_observer_retains_captured_owner_and_native_focus_snapshot() {
         use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
         use cosmic::iced::{Size, keyboard::key::{Code, Physical}};
-        #[derive(Debug)]
+        #[derive(Debug, Clone)]
         enum Message {
             Edited,
             Key { owner: u64, captured: bool, region: KeyboardRegion, widget: Option<cosmic::iced::widget::Id> },
