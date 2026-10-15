@@ -130,13 +130,9 @@ impl Editor {
         let mutation_requested = matches!(action,
             SidebarAction::Commit { .. } | SidebarAction::CreateHistoryBranch { .. }
             | SidebarAction::HistoryCommand { command: HistoryCommand::NewWorktree | HistoryCommand::CreateBranch | HistoryCommand::Revert | HistoryCommand::CherryPick, .. });
-        if mutation_requested && origin.as_ref().is_some_and(|origin| origin.authority.is_none()) {
-            self.notice = Some(if WorktreeAuthority::supported() {
-                "The original worktree could not be retained. Reopen it before changing Git state."
-            } else {
-                "Git mutations require retained directory authority, which this platform does not support yet. Read-only history and files remain available."
-            }.into());
-            return Some(Task::none());
+        if mutation_requested && (origin.as_ref().is_some_and(|origin| origin.authority.is_none())
+            || !self.tab(card).and_then(|tab| tab.sidebar.source_control.as_ref()).is_some_and(SourceControlModel::mutations_available)) {
+            return Some(self.refuse_git_mutation(card));
         }
         self.tab_mut(card)?.navigation.apply(action);
         let Some(origin) = origin else { return Some(Task::none()); };
@@ -377,7 +373,7 @@ mod tests {
         let original_head = git(root, &["rev-parse", "HEAD"]);
         for command in [sidebar::HistoryCommand::CreateBranch, sidebar::HistoryCommand::Revert, sidebar::HistoryCommand::CherryPick, sidebar::HistoryCommand::NewWorktree] {
             sidebar_action(&mut app, SidebarAction::HistoryCommand { key: origin.key.clone(), oid: row.oid.clone(), mainline: row.mainline, message: row.message.clone(), command });
-            assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("retained")));
+            assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("unavailable") || notice.contains("supported")));
             assert!(app.checkout_dialog.is_none());
             assert_eq!(git(root, &["rev-parse", "HEAD"]), original_head);
         }
