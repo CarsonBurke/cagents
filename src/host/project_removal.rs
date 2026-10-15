@@ -50,17 +50,14 @@ pub(super) fn inventory(
                 "A native session is still starting; wait for it before removing the project",
             ));
         }
-        let chats = state
-            .chats
-            .values()
-            .filter(|record| record.handle.owns_work() || record.returning_terminal)
-            .map(|record| {
-                let mut session = record.session.clone();
-                session.launch.session_id = record.handle.session_id();
-                session.native_continuity = record.handle.native_continuity();
-                (session, record.execution_instance, record.handle.clone())
-            })
-            .collect::<Vec<_>>();
+        if state.chats.len().saturating_add(state.terminals.len())>MAX_SESSIONS {
+            return Err(error("Too many hosted sessions to inventory safely; close some panes and retry"));
+        }
+        // Clone only immutable Record fields here. Even apparently read-only
+        // actor metadata can wait behind its Store/presentation mutex or RPC.
+        let chats=state.chats.values().map(|record|(
+            record.session.clone(),record.execution_instance,record.handle.clone(),record.returning_terminal
+        )).collect::<Vec<_>>();
         let sessions = state
             .list(client)
             .into_iter()
@@ -72,10 +69,13 @@ pub(super) fn inventory(
             .collect::<Vec<_>>();
         (chats, sessions)
     };
-    for (session, instance, actor) in chats {
-        // Authenticated retained state refresh may perform IPC. Never do it
-        // under HostState; final teardown refreshes/rechecks under its lifecycle gate.
+    for (mut session, instance, actor, returning_terminal) in chats {
+        // Refresh, ownership and source projections all remain off HostState.
+        // Final teardown still checks exact actor/provider under lifecycle claim.
         actor.refresh_retained_state().map_err(error)?;
+        if !actor.owns_work()&&!returning_terminal {continue;}
+        session.launch.session_id=actor.session_id();
+        session.native_continuity=actor.native_continuity();
         sessions.push(SessionClose {
             source: HostedSession::Chat(session),
             execution_instance: Some(instance),
