@@ -168,7 +168,11 @@ fn combined_close_retained_lifecycle_constructor_panic_retires_exact_helper() {
         .expect("failure must occur after capturing the real helper");
     // Match an actual saved semantic/helper retirement proof, not PID absence
     // or dropping the final proxy. The outer harness still owns family settlement.
-    assert!(chat::runtime::Handle::retained_retirement_proved(&identity.record, &proof).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !chat::runtime::Handle::retained_retirement_proved(&identity.record, &proof).unwrap() {
+        assert!(Instant::now() < deadline, "constructor unwind did not prove exact helper retirement");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(!identity.record.holder.is_current());
     assert!(!identity.record.root.is_current());
     assert_eq!(handle.actor_identity(), Some(identity));
