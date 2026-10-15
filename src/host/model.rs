@@ -24,6 +24,8 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod agent_locations;
+pub(crate) use agent_locations::Location as AgentLocation;
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -31,10 +33,11 @@ mod execution;
 mod lineage;
 mod mailbox;
 mod navigation;
+mod relocation;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -212,6 +215,7 @@ impl Registry {
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
+            ModelEdit::RelocateProject { relocation } => relocation::apply(&transaction, relocation)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service".into());
             }
@@ -622,6 +626,9 @@ fn migrate(db: &Connection) -> Result<(), String> {
     }
     if version < 12 {
         mailbox::migrate_attention(db)?;
+    }
+    if version < 13 {
+        agent_locations::migrate(db)?;
     }
     Ok(())
 }

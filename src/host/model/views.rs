@@ -112,6 +112,31 @@ pub(super) fn all(db: &Connection) -> Result<Vec<View>, String> {
         .collect()
 }
 
+/// Move shared scopes without losing pane/operation IDs. Revision fencing
+/// refuses queued edits built against the pre-relocation descriptors.
+pub(super) fn relocate(db: &Connection, relocation: &crate::project_recovery::Relocation) -> Result<(), String> {
+    for mut view in all(db)? {
+        let belongs = match &view.scope {
+            Scope::Worktree { repository, .. } => *repository == relocation.repository,
+            Scope::Channel(channel) => db.query_row("SELECT EXISTS(SELECT 1 FROM channels WHERE id=?1 AND repository=?2)", params![channel.to_string(), repository_key(&relocation.repository)?], |row| row.get(0)).map_err(|error| error.to_string())?,
+        };
+        if !belongs { continue; }
+        let previous = key(&view.scope)?;
+        relocation.view(&mut view);
+        view.revision = view.revision.checked_add(1).ok_or("view revision exhausted")?;
+        let next = key(&view.scope)?;
+        register(db, &view.scope)?;
+        write(db, &view)?;
+        if previous != next {
+            for table in ["shared_view_panes", "shared_view_edits"] {
+                db.execute(&format!("UPDATE {table} SET scope=?2 WHERE scope=?1"), params![previous,next]).map_err(|error| error.to_string())?;
+            }
+            db.execute("DELETE FROM shared_view_scopes WHERE scope=?1", [previous]).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn operation_seen(db: &Connection, operation: Uuid) -> Result<bool, String> {
     db.query_row(
         "SELECT EXISTS(SELECT 1 FROM shared_view_edits WHERE operation = ?1)",
