@@ -137,7 +137,18 @@ mod tests {
     fn special_names_are_ignored_literally_without_hiding_neighboring_paths() {
         let directory = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
-            Command::new("git")
+            let mut command = Command::new("git");
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().starts_with("GIT_") {
+                    command.env_remove(name);
+                }
+            }
+            command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
                 .args(args)
                 .current_dir(directory.path())
                 .output()
