@@ -52,7 +52,7 @@ impl Cagents {
                         let request = StageRequest { worktree, selection };
                         match service.check_stage_markers(&request, &Default::default(), &cancellation) {
                             Ok(Some(markers)) => Message::SourceControlStageChecked {
-                                key: target, operation, selection: request.selection, markers,
+                                key: target.clone(), operation, selection: request.selection, markers,
                             },
                             Ok(None) => complete(mutation_report("Stage", service.stage(&request, &cancellation))),
                             Err(error) => complete(Some(format!("Stage could not run: {error}"))),
@@ -62,7 +62,7 @@ impl Cagents {
                         &UnstageRequest { worktree, selection }, &cancellation,
                     ))),
                     ChangeGroupCommand::Discard => Message::SourceControlGroupSelection {
-                        key: target, operation, area, command, result: Ok(selection),
+                        key: target.clone(), operation, area, command, result: Ok(selection),
                     },
                 }
             }).await.unwrap_or_else(|error| Message::SourceControlMutated {
@@ -121,7 +121,7 @@ mod tests {
     async fn run(task: Task<Message>) -> Message {
         let mut stream = iced::runtime::task::into_stream(task).unwrap();
         loop {
-            if let iced::runtime::Action::Output(message) = stream.next().await.expect("group result") { return message; }
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = stream.next().await.expect("group result") { return message; }
         }
     }
 
