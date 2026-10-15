@@ -1028,10 +1028,10 @@ fn revalidate_and_close_at(intent: &CloseIntent, allow_active: bool, path: &Path
         return run().unwrap_or_else(CloseOutcome::Unreachable);
     }
     if let Some(source) = &intent.live_source {
-        // Preserve the established exact current-daemon close route, including
-        // native returned terminals and accepted execution consoles.
-        let current = close_hosted_terminal_source_at(path, intent.terminal, &intent.proof, allow_active, Some(source));
-        if !matches!(current, CloseOutcome::Stale) { return current; }
+        // The daemon compares the complete source and closes under one
+        // exclusive gate, including already-hosted native/console workers.
+        // An inventory read followed by ID-only Close would leave a gap in
+        // which a same-ID relaunch could replace the inspected worker.
         let run = || -> Result<CloseOutcome, String> {
             let mut client = ControlClient::connect(path).map_err(|error| error.to_string())?;
             client.reconcile_terminal_close(source.clone(), allow_active).map_err(|error| error.to_string()).map(|outcome| match outcome {
@@ -1061,10 +1061,6 @@ pub(super) fn close_hosted_terminal(
 }
 
 fn close_hosted_terminal_at(path: &Path, terminal: TerminalId, proof: &HostSessionProof, allow_active: bool) -> CloseOutcome {
-    close_hosted_terminal_source_at(path, terminal, proof, allow_active, None)
-}
-
-fn close_hosted_terminal_source_at(path: &Path, terminal: TerminalId, proof: &HostSessionProof, allow_active: bool, source: Option<&TerminalSession>) -> CloseOutcome {
     let run = || -> Result<CloseOutcome, String> {
         let mut client = ControlClient::connect(path).map_err(|error| error.to_string())?;
         if client.proof() != proof || !proof.is_complete() {
@@ -1077,16 +1073,6 @@ fn close_hosted_terminal_source_at(path: &Path, terminal: TerminalId, proof: &Ho
         else {
             return Ok(CloseOutcome::Stale);
         };
-        if let Some(source) = source {
-            let mut current = descriptor.session.clone();
-            current.continuity = source.continuity.clone();
-            // The same root shell can gain a foreground agent observation.
-            // Recipe, account, listener and every worker identity stay exact.
-            current.resume_hint = source.resume_hint.clone();
-            if source.continuity.live_proof().as_ref() != Some(proof) || current != *source {
-                return Ok(CloseOutcome::Unreachable("The terminal's saved source changed. Its current process was preserved; reconnect before closing it.".into()));
-            }
-        }
         match &descriptor.session.continuity {
             TerminalContinuity::Exited { .. }
             | TerminalContinuity::RelaunchAvailable {
@@ -1123,7 +1109,7 @@ mod paired_close_regression {
     use super::*;
     use crate::terminal_ipc::{ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage, ServerResponse, TerminalDescriptor, read_frame, write_frame};
     #[test]
-    fn current_native_and_execution_console_close_keep_the_established_checked_route() {
+    fn current_native_and_execution_console_close_carry_exact_source_without_an_id_only_gap() {
         for (native_listener, stale_source) in [(true, false), (false, false), (true, true), (false, true)] {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("daemon.sock");
@@ -1148,20 +1134,23 @@ mod paired_close_regression {
                 let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
                 assert!(matches!(connect.request, ClientRequest::Connect { .. }));
                 send(&mut stream, connect.request_id, ServerResponse::Connected { proof: proof.clone(), resumed: vec![] });
-                let list: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-                assert_eq!(list.request, ClientRequest::List, "a known current console must not enter ordinary orphan adoption");
-                send(&mut stream, list.request_id, ServerResponse::Listed { terminals: vec![descriptor.clone()] });
-                if stale_source {
-                    assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None, "a mismatched source cannot issue Close or fall back to ID-only reconciliation");
-                    return;
-                }
-                let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-                assert!(matches!(attach.request, ClientRequest::Attach { terminal_id, .. } if terminal_id == id));
-                send(&mut stream, attach.request_id, ServerResponse::Attached { terminal: descriptor });
-                write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(), message: ServerMessage::Synchronized { terminal_id: id, generation: 0, event_sequence: 0 } }).unwrap();
                 let close: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-                assert!(matches!(close.request, ClientRequest::CloseTerminalChecked { terminal_id, allow_active: false } if terminal_id == id));
-                send(&mut stream, close.request_id, ServerResponse::TerminalCloseChecked { terminal_id: id, outcome: TerminalCloseResult::Active });
+                let ClientRequest::ReconcileTerminalClose { session, allow_active: false } = close.request else {
+                    panic!("live consoles must use the exact-source atomic close RPC");
+                };
+                assert_eq!(session.id, id);
+                assert_eq!(session.owned_codex_listener.is_some(), native_listener);
+                let mut observed = descriptor.session.clone();
+                observed.continuity = session.continuity.clone();
+                observed.resume_hint = session.resume_hint.clone();
+                if stale_source {
+                    assert_ne!(session, observed);
+                    write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(close.request_id), proof: proof.clone(),
+                        message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable, "source changed; current worker preserved", false)) }).unwrap();
+                } else {
+                    assert_eq!(session, observed);
+                    send(&mut stream, close.request_id, ServerResponse::TerminalCloseChecked { terminal_id: id, outcome: TerminalCloseResult::Active });
+                }
                 let detach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
                 assert_eq!(detach.request, ClientRequest::Detach { terminal_id: id });
                 send(&mut stream, detach.request_id, ServerResponse::Detached);
