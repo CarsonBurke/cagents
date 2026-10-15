@@ -776,3 +776,144 @@ fn actual_execution_console_roundtrips_to_the_same_saved_pane_without_provider_r
     );
     assert_eq!(before.lines().count(), 1);
 }
+
+
+#[test]
+fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provider_restart() {
+    use cagents::{
+        agent_execution::HostedSession,
+        automations::{Request, Response, archive::inspect_completed_automation_pane},
+        chat::NativeContinuity,
+        model::{BootId, CardId, CardKind, CardState, Existence, Exposure, Residency, WorkspaceState},
+        persistence::{SnapshotBase, StateStore},
+    };
+    // Even if an assertion fails after native confirmation, retire only this
+    // fixture's exact peer before the daemon guard is dropped. A durable peer
+    // may intentionally outlive its daemon; killing only the daemon is not cleanup.
+    struct PeerCleanup(std::path::PathBuf);
+    impl Drop for PeerCleanup {
+        fn drop(&mut self) {
+            let Ok(bytes) = fs::read(self.0.join("codex-process.json")) else { return; };
+            let Ok(identity) = serde_json::from_slice::<Value>(&bytes) else { return; };
+            let Some(pid) = identity["pid"].as_u64().and_then(|pid| i32::try_from(pid).ok()).filter(|pid| *pid > 1) else { return; };
+            let Some(start) = identity["start_ticks"].as_str() else { return; };
+            // Pin this process before the identity recheck: a PID recycled
+            // between a /proc read and kill must never receive our signal.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open,pid,0) };
+            if fd < 0 { return; }
+            let same = fs::read_to_string(format!("/proc/{pid}/stat")).ok().is_some_and(|stat|stat.rsplit_once(')').and_then(|(_,tail)|tail.split_whitespace().nth(19)) == Some(start));
+            if same {
+                // SAFETY: the owned pidfd pins the exact start-ticks-checked
+                // indirect child recorded by this private fixture.
+                unsafe { libc::syscall(libc::SYS_pidfd_send_signal,fd as i32,libc::SIGKILL,std::ptr::null::<libc::siginfo_t>(),0); }
+            }
+            unsafe { libc::close(fd as i32); }
+        }
+    }
+    let fixture = Fixture::new();
+    let root = fixture.root.path();
+    let _peer_cleanup = PeerCleanup(root.to_owned());
+    let project = root.join("project");
+    fixture.cli(&["project", "open", project.to_str().unwrap()]);
+    fs::write(root.join("automation-codex-fixture"), uuid::Uuid::new_v4().to_string()).unwrap();
+    fs::create_dir(root.join("home/.codex")).unwrap();
+    let provider = root.join("bin/codex");
+    fs::write(&provider, include_str!("fixtures/automation-codex.py")).unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let definition = json!({"name":"Delayed native archive","prompt":"Return the delayed fixture result","agent":{"provider":"Codex","account":null,"target":{"repository":project,"directory":project,"placement":null},"surface":"Chat","model":null,"permission_mode":null},"schedule":{"pattern":{"daily":{"hour":3,"minute":0}},"timezone":"UTC"},"session_mode":"fresh","visibility":"headfull","precheck":null});
+    let definition_path = root.join("delayed-native.json");
+    fs::write(&definition_path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    let created = fixture.cli(&["automation", "create", "--definition", definition_path.to_str().unwrap()]);
+    let automation = created["automation"]["id"].as_str().unwrap();
+    let revision = created["automation"]["execution_revision"].as_u64().unwrap().to_string();
+    let request = uuid::Uuid::new_v4().to_string();
+    let accepted = fixture.cli(&["automation", "run-now", automation, "--execution-revision", &revision, "--request-id", &request, "--confirm"]);
+    let firing = accepted["firing"]["id"].as_str().unwrap().parse().unwrap();
+    let socket = root.join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client = cagents::control::ControlClient::connect(&socket).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (owner, initial) = loop {
+        let Response::Detail(detail) = client.automation(Default::default(), Request::ShowFiring { id: firing }).unwrap() else { panic!("typed firing") };
+        if let Some(agent) = detail.agent
+            && let Some(HostedSession::Chat(source)) = agent.session.clone()
+            && root.join("codex-thread-requested.json").exists()
+        {
+            break (agent, source);
+        }
+        assert!(Instant::now() < deadline, "provider was not bound before its delayed Session frame: {}", fs::read_to_string(root.join("daemon.log")).unwrap());
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!owner.closed);
+    assert_eq!(initial.native_continuity, NativeContinuity::ReconnectOnly);
+    assert!(initial.launch.session_id.is_none());
+    assert!(!root.join("codex-thread-confirmed.json").exists());
+    assert!(!root.join("codex-turn-requested.json").exists(), "no prompt before readiness");
+    let process_before = fs::read(root.join("codex-process.json")).unwrap();
+    let process: Value = serde_json::from_slice(&process_before).unwrap();
+    let thread = process["thread"].as_str().unwrap();
+    let card = CardId::from_uuid(owner.id.as_uuid());
+    let pane_database = root.join("delayed-pane.sqlite3");
+    let registry = root.join("data").join(cagents::instance::STORAGE_NAME).join("workspace-model.sqlite3");
+    let store = StateStore::open(&pane_database, BootId::new("delayed-native-fixture")).unwrap();
+    let mut workspace = WorkspaceState::default();
+    workspace.cards.push(CardState { id:card,generation:0,title:"Delayed native result".into(),width_fraction:0.6,existence:Existence::Open,exposure:Exposure::Visible,residency:Residency::Cold,kind:CardKind::Chat(initial.clone()) });
+    workspace.focused = Some(card);
+    let first = store.save_workspace(&workspace, SnapshotBase { workspace:0,cards:&Default::default() }).unwrap();
+    assert!(inspect_completed_automation_pane(&pane_database,&registry,card,&workspace.cards[0].kind).unwrap().is_none(), "a pending live actor is not an archive");
+    // This file releases the actual app-server thread/start response. The
+    // production adapter, native peer proof and Holder perform promotion.
+    fs::write(root.join("release-codex-thread"),thread).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !root.join("codex-turn-requested.json").exists() || !root.join("codex-thread-confirmed.json").exists() {
+        assert!(Instant::now() < deadline,"confirmed provider never received its one prompt");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let confirmed: Value = serde_json::from_slice(&fs::read(root.join("codex-thread-confirmed.json")).unwrap()).unwrap();
+    let prompted: Value = serde_json::from_slice(&fs::read(root.join("codex-turn-requested.json")).unwrap()).unwrap();
+    assert_eq!(confirmed["thread"],process["thread"]);
+    assert_eq!(prompted["thread"],process["thread"]);
+    fs::write(root.join("release-codex-result"),thread).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let archived = loop {
+        let Response::Detail(detail) = client.automation(Default::default(),Request::ShowFiring{id:firing}).unwrap() else { panic!("typed completed firing") };
+        if detail.agent.as_ref().is_some_and(|agent|agent.closed)
+            && let Ok(Response::ArchivedConversation(archive)) = client.automation(Default::default(),Request::ArchivedConversation {agent:owner.id})
+        {
+            break archive;
+        }
+        assert!(Instant::now() < deadline,"confirmed completed provider was not retired");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(archived.snapshot.native_continuity,NativeContinuity::Durable {provider_version:"0.162.0".into()});
+    assert_eq!(archived.snapshot.session_id.as_deref(),Some(thread));
+    assert!(archived.agent.closed && archived.snapshot.exited && !archived.snapshot.ready);
+    assert!(archived.snapshot.items.iter().any(|item|matches!(&item.content,cagents::chat::ItemContent::Text{text,..} if text.contains("DELAYED_NATIVE_ARCHIVE_RESULT"))));
+    assert!(inspect_completed_automation_pane(&pane_database,&registry,card,&workspace.cards[0].kind).unwrap().is_some(),"cold pre-confirmation descriptor without saved archive map must qualify privately");
+    // Persist the identity a window learns from that same real private
+    // snapshot. Neither alias may force a new executable attachment on reopen.
+    let mut promoted = initial.clone();
+    promoted.launch.session_id = archived.snapshot.session_id.clone();
+    promoted.native_continuity = archived.snapshot.native_continuity.clone();
+    workspace.cards[0].kind = CardKind::Chat(promoted.clone());
+    workspace.automation_archives.insert(card,owner.id);
+    store.save_workspace(&workspace,SnapshotBase{workspace:first.generation,cards:&first.card_generations}).unwrap();
+    let restored = store.load_workspace(workspace.id,None).unwrap().unwrap();
+    assert_eq!(restored.cards[0].kind,CardKind::Chat(promoted.clone()));
+    assert!(inspect_completed_automation_pane(&pane_database,&registry,card,&restored.cards[0].kind).unwrap().is_some());
+    for source in [&initial,&promoted] {
+        assert!(cagents::automations::archive::ArchivedPaneReadiness::qualify(owner.id,source,&archived).unwrap().matches(owner.id,source));
+    }
+    assert!(client.list_chats().unwrap().is_empty(),"cold qualification has no live provider actor");
+    let pid = process["pid"].as_u64().unwrap();
+    let start = process["start_ticks"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let still_same_peer = fs::read_to_string(format!("/proc/{pid}/stat")).ok().is_some_and(|stat| stat.rsplit_once(')').and_then(|(_,tail)|tail.split_whitespace().nth(19)) == Some(start));
+        if !still_same_peer { break; }
+        assert!(Instant::now() < deadline,"fresh archive must retire the exact native peer process");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fs::read(root.join("codex-process.json")).unwrap(),process_before,"cold qualification cannot spawn a replacement peer");
+    let after_prompt:Value = serde_json::from_slice(&fs::read(root.join("codex-turn-requested.json")).unwrap()).unwrap();
+    assert_eq!(after_prompt,prompted,"cold qualification cannot replay a prompt");
+}
