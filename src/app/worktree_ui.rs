@@ -1598,7 +1598,10 @@ mod tests {
     async fn switching_workspace_preserves_the_hidden_diff_debounce_task() {
         use cosmic::iced::futures::StreamExt;
         let mut app = super::super::tests::context_inspector_test_app(true);
-        let card = app.workspace.focused().expect("fixture starts with a focused card");
+        let card = app
+            .workspace
+            .focused()
+            .expect("fixture starts with a focused card");
         let runtime = RepositoryRuntime::pending_working_diff_fixture(card);
         app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
         app.cards
