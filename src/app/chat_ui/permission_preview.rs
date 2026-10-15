@@ -33,8 +33,16 @@ impl Monitor {
     }
 
     fn with_resolver(
+        resolve: impl FnMut(&chat::Launch) -> Option<String> + Send + 'static,
+        watch_files: bool,
+    ) -> Self {
+        Self::with_resolver_and_canonicalize(resolve, watch_files, |path| path.canonicalize())
+    }
+
+    fn with_resolver_and_canonicalize(
         mut resolve: impl FnMut(&chat::Launch) -> Option<String> + Send + 'static,
         watch_files: bool,
+        mut canonicalize: impl FnMut(&Path) -> std::io::Result<PathBuf> + Send + 'static,
     ) -> Self {
         let desired = Arc::new(Mutex::new(Desired::new()));
         let dirty = Arc::new(AtomicBool::new(false));
@@ -81,42 +89,55 @@ impl Monitor {
                             )
                             .ok();
                         }
-                        let paths = next
+                        // Lexical paths contain no filesystem reads. Their
+                        // ancestor watches must precede the first target read.
+                        let lexical = next
                             .values()
                             .flat_map(|(launch, _)| config_paths(launch))
                             .collect::<HashSet<_>>();
-                        let directories = paths
-                            .iter()
-                            .filter_map(|path| {
-                                path.parent()?
-                                    .ancestors()
-                                    .find(|parent| parent.is_dir())
-                                    .map(Path::to_owned)
-                            })
-                            .collect::<HashSet<_>>();
-                        *candidates.lock().unwrap_or_else(|error| error.into_inner()) = paths;
-                        let mut failed = false;
-                        if let Some(watcher) = &mut watcher {
-                            for path in registered.difference(&directories) {
-                                let _ = watcher.unwatch(path);
+                        let mut failed = register_config_paths(
+                            &lexical, &candidates, &mut watcher, &mut registered,
+                        );
+                        let mut stable = false;
+                        for _ in 0..3 {
+                            let physical = lexical.iter().map(|path| {
+                                (path.clone(), canonicalize(path).ok())
+                            }).collect::<HashMap<_, _>>();
+                            let paths = lexical.iter().cloned()
+                                .chain(physical.values().flatten().cloned())
+                                .collect::<HashSet<_>>();
+                            failed |= register_config_paths(
+                                &paths, &candidates, &mut watcher, &mut registered,
+                            );
+                            let validated = lexical.iter().map(|path| {
+                                (path.clone(), canonicalize(path).ok())
+                            }).collect::<HashMap<_, _>>();
+                            if physical == validated {
+                                stable = true;
+                                break;
                             }
-                            registered.retain(|path| directories.contains(path));
-                            for path in directories
-                                .difference(&registered)
-                                .cloned()
-                                .collect::<Vec<_>>()
-                            {
-                                if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
-                                    registered.insert(path);
-                                } else {
-                                    failed = true;
-                                }
-                            }
-                        } else {
-                            failed = !directories.is_empty();
                         }
+                        failed |= !stable;
                         watch_changed =
                             worker_watch_failed.swap(failed, Ordering::AcqRel) != failed;
+                        if !stable {
+                            // Do not publish policy read through a changing
+                            // alias. A real event or the focused fallback will
+                            // retry; retain the last successfully read policy.
+                            worker_dirty.store(true, Ordering::Release);
+                            for (&target, (launch, _)) in &next {
+                                if replies.send_blocking(Reply {
+                                    target,
+                                    launch: launch.clone(),
+                                    mode: (current.get(&target) == next.get(&target))
+                                        .then(|| modes.get(&target).cloned().flatten())
+                                        .flatten(),
+                                }).is_err() {
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
                     }
                     modes.retain(|target, _| next.contains_key(target));
                     for (&target, entry) in &next {
@@ -245,6 +266,39 @@ impl Drop for Monitor {
     }
 }
 
+/// Register every existing lexical/physical ancestor. Watching only the
+/// nearest directory follows an intermediate symlink and misses its entry's
+/// later replacement in its own parent directory.
+fn register_config_paths(
+    paths: &HashSet<PathBuf>,
+    candidates: &Mutex<HashSet<PathBuf>>,
+    watcher: &mut Option<notify::RecommendedWatcher>,
+    registered: &mut HashSet<PathBuf>,
+) -> bool {
+    *candidates.lock().unwrap_or_else(|error| error.into_inner()) = paths.clone();
+    let directories = paths.iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|path| path.is_dir())
+        .map(Path::to_owned)
+        .collect::<HashSet<_>>();
+    let Some(watcher) = watcher else {
+        return !directories.is_empty();
+    };
+    let mut failed = false;
+    for path in directories.difference(registered).cloned().collect::<Vec<_>>() {
+        if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
+            registered.insert(path);
+        } else {
+            failed = true;
+        }
+    }
+    for path in registered.difference(&directories) {
+        let _ = watcher.unwatch(path);
+    }
+    registered.retain(|path| directories.contains(path));
+    failed
+}
+
 fn config_watcher(
     candidates: Arc<Mutex<HashSet<PathBuf>>>,
     dirty: Arc<AtomicBool>,
@@ -338,12 +392,7 @@ fn config_paths(launch: &chat::Launch) -> Vec<PathBuf> {
         }
         Provider::Omp => {}
     }
-    // Watch the target of linked account configuration as well as the link.
-    let targets = paths
-        .iter()
-        .filter_map(|path| path.canonicalize().ok())
-        .collect::<Vec<_>>();
-    paths.extend(targets);
+
     paths
 }
 
@@ -518,5 +567,80 @@ mod tests {
         assert_eq!(monitor.next_for_test().mode.as_deref(), Some("first"));
         std::fs::write(path, "second").unwrap();
         assert_eq!(monitor.next_for_test().mode.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn retarget_during_first_config_resolution_watches_the_validated_target() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let account = directory.path().join("account");
+        for path in [&first, &second, &account] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(first.join("config.toml"), "first").unwrap();
+        std::fs::write(second.join("config.toml"), "second").unwrap();
+        let path = account.join("config.toml");
+        symlink(first.join("config.toml"), &path).unwrap();
+        let source = path.clone();
+        let raced_path = path.clone();
+        let new_target = second.join("config.toml");
+        let mut retargeted = false;
+        let monitor = Monitor::with_resolver_and_canonicalize(
+            move |_| std::fs::read_to_string(&source).ok(),
+            true,
+            move |path| {
+                let result = path.canonicalize();
+                if path == raced_path && !retargeted {
+                    retargeted = true;
+                    let replacement = raced_path.with_extension("replacement");
+                    symlink(&new_target, &replacement).unwrap();
+                    std::fs::rename(replacement, &raced_path).unwrap();
+                }
+                result
+            },
+        );
+        let target = Target { card: CardId::new(), generation: 1 };
+        let mut launch = launch();
+        launch.recipe.working_directory = directory.path().into();
+        launch.recipe.environment.insert(
+            "CODEX_HOME".into(), account.to_string_lossy().into_owned(),
+        );
+        monitor.sync(std::iter::once((target, &launch)));
+        assert_eq!(monitor.next_for_test().mode.as_deref(), Some("second"));
+        std::fs::write(second.join("config.toml"), "changed target").unwrap();
+        assert_eq!(monitor.next_for_test().mode.as_deref(), Some("changed target"));
+    }
+
+    #[test]
+    fn intermediate_account_directory_symlink_retarget_keeps_parent_watch() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        for path in [&first, &second] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(first.join("config.toml"), "first").unwrap();
+        std::fs::write(second.join("config.toml"), "second").unwrap();
+        let alias = directory.path().join("account");
+        symlink(&first, &alias).unwrap();
+        let source = alias.join("config.toml");
+        let monitor = Monitor::with_resolver(move |_| std::fs::read_to_string(&source).ok(), true);
+        let target = Target { card: CardId::new(), generation: 1 };
+        let mut launch = launch();
+        launch.recipe.working_directory = directory.path().into();
+        launch.recipe.environment.insert(
+            "CODEX_HOME".into(), alias.to_string_lossy().into_owned(),
+        );
+        monitor.sync(std::iter::once((target, &launch)));
+        assert_eq!(monitor.next_for_test().mode.as_deref(), Some("first"));
+        let replacement = directory.path().join("replacement");
+        symlink(&second, &replacement).unwrap();
+        std::fs::rename(replacement, alias).unwrap();
+        assert_eq!(monitor.next_for_test().mode.as_deref(), Some("second"));
+        std::fs::write(second.join("config.toml"), "changed target").unwrap();
+        assert_eq!(monitor.next_for_test().mode.as_deref(), Some("changed target"));
     }
 }
