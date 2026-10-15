@@ -394,8 +394,8 @@ mod tests {
         // real original Root BEFORE returning unknown, as a daemon handoff can.
         let registry = Arc::new(UnknownEnrollment { attempts: std::sync::atomic::AtomicUsize::new(0),
             payload: std::sync::Mutex::new(None), _outside: outside, _runtime: runtime });
-        let placement = Arc::new(RecoveryPlacement::acquire(parent.clone(), source.clone(), Arc::from([source.clone()]),
-            RecoveryRegistryCheck::from_lease(registry.clone())).unwrap());
+        let placement = RecoveryPlacement::acquire(parent.clone(), source.clone(), Arc::from([source.clone()]),
+            RecoveryRegistryCheck::from_lease(registry.clone())).unwrap();
         let context = FilesystemRecoveryContext::new(&source, protection, placement).unwrap();
         let error = prepare_recovery_directory(context.reserve_directory().unwrap(), OsStr::new("holding"), || false).unwrap_err();
         let recovery = error.recovery().unwrap();
@@ -412,10 +412,14 @@ mod tests {
     fn restrictive_umask_holding_is_private_and_enrolled_before_payload_admission() {
         const CHILD: &str = "CAGENTS_FACTORY_RESTRICTIVE_UMASK_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "fs_safety::recovery_cache::tests::restrictive_umask_holding_is_private_and_enrolled_before_payload_admission", "--test-threads=1", "--nocapture"])
-                .env(CHILD, "1").status().unwrap();
-            assert!(status.success()); return;
+                .env(CHILD, "1").output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            assert!(stdout.contains("CAGENTS_FACTORY_UMASK_BODY_COMPLETED"));
+            assert!(stdout.contains("1 passed; 0 failed; 0 ignored"));
+            return;
         }
         let (_source, context) = context();
         let admission = context.reserve_directory().unwrap();
@@ -429,6 +433,7 @@ mod tests {
         let (mut publication, retained, _slot) = holding.into_parts();
         publication.cleanup_empty().unwrap(); sync_directory(retained.placement().directory()).unwrap();
         assert!(publication.is_removed());
+        println!("CAGENTS_FACTORY_UMASK_BODY_COMPLETED");
     }
 
 }
