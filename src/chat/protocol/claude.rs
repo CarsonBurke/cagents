@@ -27,6 +27,8 @@ const ATTACHMENTS: AttachmentRules = AttachmentRules::for_provider(Provider::Cla
 const MAX_IMAGE: u64 = ATTACHMENTS.max_image_bytes;
 const MAX_DOCUMENT: u64 = ATTACHMENTS.max_file_bytes.unwrap();
 const MAX_PAYLOAD: usize = 30 * 1024 * 1024;
+const MAX_RAW_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BLOCK_ID_BYTES: usize = 4096;
 const HISTORY_PAGE: u64 = 4 * 1024 * 1024;
 const MAX_TEXT: usize = 1024 * 1024;
 const MODES: &[&str] = &[
@@ -342,7 +344,10 @@ struct Claude {
     /// Blocks of the messages still streaming. Claude emits each block's
     /// assistant frame before that block stops, so a message's blocks are
     /// dropped at its `message_stop`, or when its stream starts another message.
-    blocks: HashMap<(String, u64), Item>,
+    blocks: HashMap<(String, String, u64), Item>,
+    /// Closed tool blocks retain identity/index only, never raw call bodies.
+    closed_blocks: HashSet<(String, String, u64)>,
+    raw_block_bytes: usize,
     stream_events: VecDeque<String>,
     carrier_offsets: HashMap<String, usize>,
     message_offsets: HashMap<String, usize>,
@@ -1271,8 +1276,9 @@ impl Claude {
                 let index = self
                     .blocks
                     .iter()
-                    .filter(|((message, block_index), item)| {
-                        message == id
+                    .filter(|((parent, message, block_index), item)| {
+                        parent == child.unwrap_or("")
+                            && message == id
                             && *block_index >= base as u64
                             && match (&item.content, string(block, "type")) {
                                 (
@@ -1301,7 +1307,7 @@ impl Claude {
                                 _ => false,
                             }
                     })
-                    .map(|((_, index), _)| *index as usize)
+                    .map(|((_, _, index), _)| *index as usize)
                     .min()
                     .unwrap_or(base + index);
                 match string(block, "type") {
@@ -1642,8 +1648,12 @@ impl Claude {
         for id in ids.iter().chain(child_ids.values().flatten()) {
             if ids.contains(id) {self.tools.remove(None,id);}
             for (parent,children) in &child_ids {if children.contains(id) {self.tools.remove(Some(parent),id);}}
-            self.blocks.retain(|_, item| &item.id != id);
         }
+        self.blocks.retain(|(parent,_,_),item| {
+            if parent.is_empty() {!ids.contains(&item.id)}
+            else {!child_ids.get(parent).is_some_and(|ids|ids.contains(&item.id))}
+        });
+        self.recount_blocks();
         if !ids.is_empty() {
             step.events.push(Event::ItemsRemoved { ids });
         }
@@ -2126,6 +2136,8 @@ impl Adapter for Claude {
                 self.retired.clear();
                 self.streams.clear();
                 self.blocks.clear();
+                self.closed_blocks.clear();
+                self.raw_block_bytes=0;
                 self.carrier_offsets.clear();
                 self.message_offsets.clear();
                 self.message_order.clear();
@@ -2479,7 +2491,7 @@ impl Adapter for Claude {
                     &mut step,
                 );
                 if let Some(stream) = self.streams.remove("") {
-                    self.settle(&stream.message);
+                    self.settle("",&stream.message);
                 }
                 // Result input totals span multiple API calls; they are not the
                 // context occupancy of the last individual model call.
@@ -3776,16 +3788,44 @@ fn encoded_len(value: &impl serde::Serialize) -> Result<usize, String> {
     Ok(counter.0)
 }
 
+fn raw_block_cost(item:&Item)->usize {
+    match &item.content {
+        ItemContent::Text{text,..}=>text.capacity(),
+        ItemContent::Tool{input,output,..}=>input.capacity().saturating_add(output.capacity()),
+        _=>0,
+    }
+}
+fn append_raw_block(body:&mut String,value:&str,total:&mut usize)->Result<(),String> {
+    if body.len().saturating_add(value.len())>MAX_PAYLOAD {return Err("Claude streamed body exceeds the 30 MiB item limit".into());}
+    let before=body.capacity();
+    let required=body.len()+value.len();
+    if required>before {
+        // Geometric growth keeps tiny deltas linear; reserve_exact is used
+        // only at capacity boundaries and caps spare space at the item limit.
+        let capacity=required.max(before.saturating_mul(2)).max(64).min(MAX_PAYLOAD);
+        body.try_reserve_exact(capacity-body.len()).map_err(|_|"Claude could not reserve its bounded streaming body")?;
+    }
+    let after=total.saturating_sub(before).saturating_add(body.capacity());
+    if after>MAX_RAW_BLOCK_BYTES {
+        *body=String::new();
+        *total=total.saturating_sub(before);
+        return Err("Claude simultaneous streaming bodies exceed the 64 MiB retained limit".into());
+    }
+    body.push_str(value);*total=after;Ok(())
+}
+
 impl Claude {
     fn stream(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
         let event = &frame["event"];
         let parent = string(frame, "parent_tool_use_id").to_owned();
+        if parent.len()>MAX_BLOCK_ID_BYTES {return Err("Claude streaming parent identity exceeds its bounded limit".into());}
         match string(event, "type") {
             "message_start" => {
                 if self.streams.len() >= MAX_PENDING && !self.streams.contains_key(&parent) {
                     return Err("Too many simultaneous Claude streams".into());
                 }
                 let id = required(&event["message"], "id")?.to_owned();
+                if id.len()>MAX_BLOCK_ID_BYTES {return Err("Claude streaming message identity exceeds its bounded limit".into());}
                 if self
                     .streams
                     .get(&parent)
@@ -3798,7 +3838,7 @@ impl Claude {
                     // A message interrupted before its `message_stop` is
                     // abandoned once its stream moves on.
                     if let Some(abandoned) = self.streams.insert(parent.clone(), stream) {
-                        self.settle(&abandoned.message);
+                        self.settle(&parent,&abandoned.message);
                     }
                 }
                 if parent.is_empty() {
@@ -3861,8 +3901,15 @@ impl Claude {
                         return Ok(());
                     }
                 };
+                if item.id.len()>MAX_BLOCK_ID_BYTES+32 || matches!(&item.content,ItemContent::Tool{name,..} if name.len()>MAX_BLOCK_ID_BYTES || item.id.len()>MAX_BLOCK_ID_BYTES) {return Err("Claude streaming block identity exceeds its bounded limit".into());}
+                let key=(parent.clone(),message,index);
+                let previous=self.blocks.get(&key).map_or(0,raw_block_cost);
+                let bytes=self.raw_block_bytes.saturating_sub(previous).saturating_add(raw_block_cost(&item));
+                if bytes>MAX_RAW_BLOCK_BYTES {return Err("Claude simultaneous streaming bodies exceed the 64 MiB retained limit".into());}
+                self.raw_block_bytes=bytes;
+                self.closed_blocks.remove(&key);
                 step.events.push(Event::Item(item.clone()));
-                self.blocks.insert((message, index), item);
+                self.blocks.insert(key, item);
             }
             "content_block_delta" => {
                 let stream = self
@@ -3874,7 +3921,12 @@ impl Claude {
                 if matches!(string(delta, "type"), "signature_delta" | "citations_delta") {
                     return Ok(());
                 }
-                let Some(item) = self.blocks.get_mut(&(stream.message.clone(), index)) else {
+                let key=(parent.clone(),stream.message.clone(),index);
+                if self.closed_blocks.contains(&key) {
+                    self.warn_unknown("delta after closed block",string(delta,"type"));
+                    return Ok(());
+                }
+                let Some(item) = self.blocks.get_mut(&key) else {
                     if stream.truncated {
                         return Ok(());
                     }
@@ -3886,10 +3938,7 @@ impl Claude {
                         let value = delta[if *thinking { "thinking" } else { "text" }]
                             .as_str()
                             .ok_or("Claude text delta has no string payload")?;
-                        if text.len().saturating_add(value.len()) > MAX_PAYLOAD {
-                            return Err("Claude streamed text exceeds the 30 MiB item limit".into());
-                        }
-                        text.push_str(value);
+                        append_raw_block(text,value,&mut self.raw_block_bytes)?;
                         step.events.push(Event::TextDelta {
                             id: item.id.clone(),
                             role: Role::Assistant,
@@ -3899,13 +3948,8 @@ impl Claude {
                     }
                     (ItemContent::Tool { input, .. }, "input_json_delta") => {
                         let value = string(delta, "partial_json");
-                        if input.len().saturating_add(value.len()) > MAX_PAYLOAD {
-                            return Err(
-                                "Claude streamed tool input exceeds the 30 MiB item limit".into()
-                            );
-                        }
                         let offset = input.len();
-                        input.push_str(value);
+                        append_raw_block(input,value,&mut self.raw_block_bytes)?;
                         step.events.push(Event::InputDelta {
                             id: item.id.clone(),
                             offset,
@@ -3925,7 +3969,15 @@ impl Claude {
                 let index = event["index"]
                     .as_u64()
                     .ok_or("Claude block stop has no index")?;
-                if let Some(mut item) = self.blocks.get(&(message, index)).cloned() {
+                let key=(parent.clone(),message,index);
+                if !self.blocks.contains_key(&key) || !self.closed_blocks.insert(key.clone()) {return Ok(());}
+                if let Some(mut item) = self.blocks.get(&key).cloned() {
+                    // Index matching for later assistant carriers needs the
+                    // tool ID/name, not another copy of its completed input.
+                    if let Some(Item {content:ItemContent::Tool {input,output,..},..})=self.blocks.get_mut(&key) {
+                        self.raw_block_bytes=self.raw_block_bytes.saturating_sub(input.capacity()).saturating_sub(output.capacity());
+                        *input=String::new();*output=String::new();
+                    }
                     if let ItemContent::Tool { name, input, .. } = &item.content {
                         let parsed = if input.is_empty() {
                             Value::Null
@@ -3962,7 +4014,7 @@ impl Claude {
             }
             "message_stop" => {
                 if let Some(stream) = self.streams.remove(&parent) {
-                    self.settle(&stream.message);
+                    self.settle(&parent,&stream.message);
                 }
             }
             "ping" => {}
@@ -3981,8 +4033,13 @@ impl Claude {
         Ok(())
     }
     /// Forget a message that will stream no further blocks.
-    fn settle(&mut self, message: &str) {
-        self.blocks.retain(|(id, _), _| id != message);
+    fn settle(&mut self, parent:&str,message: &str) {
+        self.blocks.retain(|(scope,id,_), _| scope!=parent || id!=message);
+        self.recount_blocks();
+    }
+    fn recount_blocks(&mut self) {
+        self.closed_blocks.retain(|key|self.blocks.contains_key(key));
+        self.raw_block_bytes=self.blocks.values().map(raw_block_cost).sum();
     }
 
     fn permission_denied(&self, frame: &Value, step: &mut Step) -> Result<(), String> {
@@ -7915,6 +7972,78 @@ mod tests {
         ));
         receive(frame(json!({"type":"message_stop"})));
         events
+    }
+
+    #[test]
+    fn closed_tool_blocks_keep_identity_without_retaining_or_regrowing_raw_input() {
+        let mut adapter=Claude::default();
+        let frame=|event:Value|json!({"type":"stream_event","event":event});
+        adapter.receive(frame(json!({"type":"message_start","message":{"id":"one-message"}}))).unwrap();
+        let input=json!({"file_path":"large.txt","content":"x".repeat(3*1024*1024)}).to_string();
+        for index in 0..3 {
+            let id=format!("write-{index}");
+            adapter.receive(frame(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":"Write"}}))).unwrap();
+            adapter.receive(frame(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":input}}))).unwrap();
+            assert!(adapter.raw_block_bytes>=input.len());
+            let stopped=adapter.receive(frame(json!({"type":"content_block_stop","index":index}))).unwrap();
+            assert!(stopped.events.iter().any(|event|matches!(event,Event::Item(Item {id:actual,content:ItemContent::Changes {changes,..},..}) if actual==&id && changes[0].diff.len()>3*1024*1024)),"full source is emitted before raw retention ends");
+            adapter.committed();
+            assert_eq!(adapter.raw_block_bytes,0,"closed blocks retain no raw input even before message_stop");
+            assert!(matches!(&adapter.blocks[&("".into(),"one-message".into(),index)].content,ItemContent::Tool {input,output,..} if input.capacity()==0 && output.capacity()==0));
+            let late=adapter.receive(frame(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":"do not regrow"}}))).unwrap();
+            assert!(late.events.is_empty());
+            assert_eq!(adapter.raw_block_bytes,0);
+        }
+        assert_eq!(adapter.blocks.len(),3);
+        adapter.receive(frame(json!({"type":"message_stop"}))).unwrap();
+        assert!(adapter.blocks.is_empty());assert!(adapter.closed_blocks.is_empty());assert_eq!(adapter.raw_block_bytes,0);
+    }
+
+    #[test]
+    fn streaming_blocks_with_equal_native_ids_remain_in_their_exact_child_scope() {
+        let mut adapter=Claude::default();
+        let frame=|parent:&str,event:Value|json!({"type":"stream_event","parent_tool_use_id":parent,"event":event});
+        for parent in ["one","two"] {
+            adapter.receive(frame(parent,json!({"type":"message_start","message":{"id":"shared-message"}}))).unwrap();
+            adapter.receive(frame(parent,json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"shared-tool","name":"Write"}}))).unwrap();
+            adapter.receive(frame(parent,json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":json!({"file_path":format!("{parent}.txt"),"content":parent}).to_string()}}))).unwrap();
+        }
+        let first=adapter.receive(frame("one",json!({"type":"content_block_stop","index":0}))).unwrap();
+        assert!(first.events.iter().any(|event|matches!(event,Event::SubagentItem {id,item:Item {content:ItemContent::Changes {changes,..},..}} if id=="one" && changes[0].path.ends_with("one.txt"))));
+        adapter.receive(frame("one",json!({"type":"message_stop"}))).unwrap();
+        assert_eq!(adapter.blocks.len(),1,"settling one child must retain another child's exact source");
+        let second=adapter.receive(frame("two",json!({"type":"content_block_stop","index":0}))).unwrap();
+        assert!(second.events.iter().any(|event|matches!(event,Event::SubagentItem {id,item:Item {content:ItemContent::Changes {changes,..},..}} if id=="two" && changes[0].path.ends_with("two.txt"))));
+        adapter.receive(frame("two",json!({"type":"message_stop"}))).unwrap();
+        assert!(adapter.blocks.is_empty());assert_eq!(adapter.raw_block_bytes,0);
+    }
+
+    #[test]
+    fn raw_stream_budget_counts_capacity_and_tiny_deltas_grow_geometrically() {
+        let mut body=String::new();let mut total=0;let mut growths=0;
+        for _ in 0..20_972 {
+            let before=body.capacity();append_raw_block(&mut body,&"x".repeat(50),&mut total).unwrap();
+            growths+=usize::from(body.capacity()!=before);
+            assert_eq!(total,body.capacity());
+        }
+        assert_eq!(body.len(),1_048_600);
+        assert!(growths<=20,"50-byte deltas must not reallocate every growing prefix");
+        let before=body.capacity();
+        total=MAX_RAW_BLOCK_BYTES-before+body.capacity();
+        let extra=body.capacity()-body.len()+1;
+        assert!(append_raw_block(&mut body,&"x".repeat(extra),&mut total).is_err());
+        assert_eq!(body.capacity(),0,"refused capacity growth cannot remain resident");
+        assert_eq!(total,MAX_RAW_BLOCK_BYTES-before);
+    }
+
+    #[test]
+    fn stream_block_indexes_and_text_correlation_survive_closed_tool_body_release() {
+        let mut adapter=Claude::default();
+        let blocks=[json!({"type":"text","text":"before"}),json!({"type":"tool_use","id":"write","name":"Write","input":{"file_path":"file.txt","content":"body"}}),json!({"type":"text","text":"after"})];
+        let events=stream_message(&mut adapter,None,"message",&blocks);
+        let ids:Vec<_>=events.iter().filter_map(|event|match event {Event::Item(Item {id,content:ItemContent::Text {text,..},..}) if !text.is_empty()=>Some(id.as_str()),_=>None}).collect();
+        assert!(ids.contains(&"message:0"));assert!(ids.contains(&"message:2"));
+        assert!(adapter.blocks.is_empty());assert_eq!(adapter.raw_block_bytes,0);
     }
 
     #[test]
