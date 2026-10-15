@@ -90,7 +90,8 @@ impl RepositoryRuntime {
         }
         let rows = self.selected_diff_range()?;
         let model = self.current_diff_model_snapshot()?;
-        (!rows.is_empty() && rows.end <= model.row_count(self.diff_mode)).then_some(rows)
+        (!rows.is_empty() && rows.end <= model.row_count(self.diff_mode)
+            && self.diff_interaction.selection?.has_changes(&model)).then_some(rows)
     }
 
     fn can_mutate_diff(&self, kind: git_patch::Kind) -> bool {
@@ -504,6 +505,23 @@ mod tests {
                 .capture_diff_mutation(card, kind, Some(&request))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn selection_mutation_commands_disable_unchanged_context_only_ranges() {
+        let card = CardId::new();
+        let mut runtime = selected_mutation_fixture(card);
+        let context_row = runtime.current_diff_model_snapshot().unwrap().row_count(runtime.diff_mode) - 1;
+        runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(
+            runtime.diff_mode, crate::diff_interaction::Side::New, context_row,
+        ));
+        for kind in [git_patch::Kind::Stage, git_patch::Kind::Revert] {
+            assert!(!runtime.can_apply_diff_selection(kind));
+            assert!(runtime.diff_selection_mutation_action(card, kind).is_none());
+        }
+        runtime.diff_interaction.selection.as_mut().unwrap().anchor = 0;
+        assert!(runtime.can_apply_diff_selection(git_patch::Kind::Stage));
+        assert!(runtime.can_apply_diff_selection(git_patch::Kind::Revert));
     }
 
     #[test]
