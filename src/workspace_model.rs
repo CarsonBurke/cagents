@@ -31,7 +31,8 @@ pub const PENDING_ORDINAL: u32 = u32::MAX;
 ///
 /// The canonical repository path is the key because a [`crate::model::ProjectId`]
 /// is minted per window and re-keying one would cascade through the `worktrees`
-/// foreign key. A path is the real identity of a project and needs no migration.
+/// foreign key. Explicit Locate edits migrate this key atomically while preserving
+/// channel, view and pane identities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelProject {
     pub repository: PathBuf,
@@ -236,6 +237,34 @@ impl WorkspaceModel {
                     }),
                 }
             }
+            ModelEdit::RelocateProject { relocation } => {
+                if self.projects.iter().any(|project| project.repository == relocation.destination) { return; }
+                for project in &mut self.projects {
+                    if project.repository == relocation.repository { project.repository = relocation.destination.clone(); }
+                }
+                let channels = self.channels.iter().filter(|channel| channel.repository == relocation.repository).map(|channel| channel.id).collect::<std::collections::HashSet<_>>();
+                for channel in &mut self.channels {
+                    if channel.repository == relocation.repository { channel.repository = relocation.destination.clone(); }
+                }
+                for order in &mut self.navigation_orders {
+                    if order.repository == relocation.repository {
+                        order.repository = relocation.destination.clone();
+                        for item in &mut order.items {
+                            if let NavigationItem::Worktree(path) = item { relocation.path(path); }
+                        }
+                    }
+                }
+                for view in &mut self.views {
+                    let owned = match &view.scope {
+                        views::Scope::Channel(channel) => channels.contains(channel),
+                        views::Scope::Worktree { repository, .. } => *repository == relocation.repository,
+                    };
+                    if owned { relocation.view(view); view.revision = view.revision.saturating_add(1); }
+                }
+                for agent in &mut self.agents { relocation.agent(agent); }
+                self.closed_projects.retain(|path| *path != relocation.destination);
+                if !self.closed_projects.contains(&relocation.repository) { self.closed_projects.push(relocation.repository.clone()); }
+            }
             ModelEdit::CloseProject { repository } => {
                 self.navigation_orders
                     .retain(|order| order.repository != *repository);
@@ -338,6 +367,8 @@ pub enum ModelEdit {
     /// Removes the project and every channel inside it. A project nobody has
     /// open cannot keep channels reachable.
     CloseProject { repository: PathBuf },
+    /// Atomically preserve project/channel/pane identity at a located path.
+    RelocateProject { relocation: crate::project_recovery::Relocation },
     /// Idempotent by id. The id is minted by the client, the rank by the
     /// registry.
     CreateChannel {
@@ -424,6 +455,15 @@ impl ModelEdit {
                 before,
                 fallback,
             },
+            Self::RelocateProject { relocation } => {
+                relocation.validate()?;
+                Self::RelocateProject { relocation: crate::project_recovery::Relocation {
+                    repository: canonical_repository(&relocation.repository)?,
+                    destination: canonical_repository(&relocation.destination)?,
+                    old_root: canonical_repository(&relocation.old_root)?,
+                    new_root: canonical_repository(&relocation.new_root)?,
+                } }
+            }
             Self::CloseProject { repository } => Self::CloseProject {
                 repository: canonical_repository(&repository)?,
             },

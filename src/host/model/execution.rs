@@ -1,6 +1,6 @@
 //! Execution acceptance shares the project/channel transaction boundary.
 
-use super::{Registry, repository_key, take_ordinal};
+use super::{Registry, agent_locations, repository_key, take_ordinal};
 use crate::{
     agent_execution::{
         Accepted, Agent, Authority, Destination, HostedSession, Lineage, MAX_CHILDREN,
@@ -385,7 +385,7 @@ impl Registry {
         if agent.closed || agent.session.is_some() {
             return Err("Agent already has a hosted session".into());
         }
-        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
+        require_agent_placement(&tx, &agent)?;
         tx.execute(
             "INSERT INTO agent_launches(agent, session_id, source) VALUES (?1, ?2, ?3)",
             params![id.to_string(), source.id().to_string(), encode(source)?],
@@ -447,9 +447,8 @@ impl Registry {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if decode::<Run>(&stored)? != accepted.run
-            || read_agent(&tx, accepted.agent.id)? != accepted.agent
-        {
+        let agent = read_agent(&tx, accepted.agent.id)?;
+        if decode::<Run>(&stored)? != accepted.run || !same_dispatch_agent(&agent, &accepted.agent) {
             return Err(
                 "The accepted agent run changed before dispatch; nothing was submitted".into(),
             );
@@ -468,6 +467,7 @@ impl Registry {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(false);
         }
+        require_agent_placement(&tx, &agent)?;
         let claimed = tx
             .execute(
                 "INSERT OR IGNORE INTO agent_dispatches(run, claimed_at) VALUES (?1, ?2)",
@@ -756,7 +756,7 @@ impl Registry {
                     return Err("The agent has unfinished or unverified work; inspect and close it before starting another run".into());
                 }
                 // A removed channel must never be resurrected by a follow-up.
-                require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
+                require_agent_placement(&tx, &agent)?;
                 agent
             }
             Destination::New(spec) => {
@@ -824,6 +824,7 @@ impl Registry {
                     params![agent.id.to_string(), origin_json, encode(&agent)?],
                 )
                 .map_err(|error| error.to_string())?;
+                agent_locations::insert_new(&tx, &agent)?;
                 agent
             }
         };
@@ -912,10 +913,10 @@ impl Registry {
     pub(crate) fn validate_agent_dispatch(&self, accepted: &Accepted) -> Result<(), String> {
         let agent = self.agent(accepted.agent.id)?;
         let run = self.agent_run(accepted.run.id)?;
-        if agent.closed || run != accepted.run || agent != accepted.agent {
+        if agent.closed || run != accepted.run || !same_dispatch_agent(&agent, &accepted.agent) {
             return Err("The accepted execution changed before provider dispatch".into());
         }
-        require_placement(&self.db, &agent.placement, &agent.spec.target.repository)
+        require_agent_placement(&self.db, &agent)
     }
 
     pub(crate) fn agent_request(&self, run: RunId) -> Result<Submit, String> {
@@ -987,7 +988,7 @@ impl Registry {
         {
             return Err("The provider does not match the committed launch intent".into());
         }
-        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
+        require_agent_placement(&tx, &agent)?;
         agent.session = Some(session);
         tx.execute(
             "DELETE FROM agent_launches WHERE agent = ?1",
@@ -1033,7 +1034,7 @@ impl Registry {
         {
             return Err("The provider session changed before its console was attached".into());
         }
-        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
+        require_agent_placement(&tx, &agent)?;
         agent.console = Some(console);
         tx.execute(
             "UPDATE agents SET record = ?2 WHERE id = ?1",
@@ -1318,6 +1319,14 @@ impl Registry {
     }
 }
 
+/// Moving a pane changes presentation membership, not execution authority.
+/// Compare every other field, including the exact session, launch and owner.
+fn same_dispatch_agent(current: &Agent, accepted: &Agent) -> bool {
+    let mut expected = accepted.clone();
+    expected.placement = current.placement.clone();
+    current == &expected
+}
+
 fn state_key(state: State) -> &'static str {
     match state {
         State::Accepted => "accepted",
@@ -1362,6 +1371,11 @@ fn read_agent(db: &Connection, id: AgentId) -> Result<Agent, String> {
         )
         .map_err(|error| error.to_string())?;
     decode(&record)
+}
+
+pub(super) fn require_agent_placement(db: &Connection, agent: &Agent) -> Result<(), String> {
+    let location = agent_locations::read(db, agent)?;
+    require_placement(db, &agent.placement, &location.repository)
 }
 
 pub(super) fn require_placement(
