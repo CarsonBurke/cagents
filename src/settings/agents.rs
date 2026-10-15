@@ -621,14 +621,19 @@ mod tests {
         let path = directory.path().join("settings.toml");
         let settings = super::super::AppSettings::default();
         let mut value = toml::Value::try_from(&settings).unwrap();
-        value["default_shell"] = toml::Value::String(
-            directory
-                .path()
-                .join("missing-shell")
-                .to_string_lossy()
-                .into_owned(),
+        // Optional keys are absent from the serialized defaults; Value's
+        // IndexMut only replaces an existing key rather than inserting one.
+        value.as_table_mut().unwrap().insert(
+            "default_shell".into(),
+            toml::Value::String(
+                directory
+                    .path()
+                    .join("missing-shell")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         );
-        value["agents"] = toml::Value::Table(toml::Table::from_iter([
+        value.as_table_mut().unwrap().insert("agents".into(), toml::Value::Table(toml::Table::from_iter([
             (
                 "claude".into(),
                 toml::Value::try_from(AgentLaunchSettings {
@@ -653,7 +658,7 @@ mod tests {
                 })
                 .unwrap(),
             ),
-        ]));
+        ])));
         std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
         let loaded = super::super::load(&path).unwrap();
         assert_eq!(

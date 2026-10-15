@@ -355,6 +355,10 @@ mod tests {
                         environment_rows(provider, &draft)
                     };
                     let mut tree = Tree::new(before.as_widget());
+                    // UserInterface::build diffs even a fresh tree before its
+                    // first layout. This initializes the native value paragraph
+                    // before focus/caret operations and later reconciliation.
+                    before.as_widget_mut().diff(&mut tree);
                     let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
                     before.as_widget_mut().operate(
                         &mut tree,
