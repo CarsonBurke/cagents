@@ -154,10 +154,12 @@ impl RecoverySlot {
 }
 impl Drop for RecoverySlot {
     fn drop(&mut self) {
-        // Close this slot's charged context before releasing its creation turn;
-        // the guard itself performs only local counter bookkeeping, never IO.
-        drop(self.context.take());
+        // The current issuer's creation guard is FD-free bookkeeping. The
+        // shared lease contract also permits already-accounted native owners:
+        // destroy that guard while its context is still charged, then release
+        // the context and private reservation. No budget mutex spans Drop.
         drop(self.creation_guard.take());
+        drop(self.context.take());
         self.budget.used.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -327,6 +329,27 @@ mod tests {
         assert!(authority.is_resolved());
         assert!(weak.upgrade().is_none());
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn creation_guard_destruction_cannot_outlive_its_charged_context() {
+        struct BlockingDrop { entered: Arc<std::sync::Barrier>, release: Arc<std::sync::Barrier> }
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) { self.entered.wait(); self.release.wait(); }
+        }
+        let used = Arc::new(Mutex::new(ContextUsage::default()));
+        let context = RecoveryContext::from_budget((), MAX_RECOVERY_CONTEXT_DESCRIPTORS, used.clone()).unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2)); let release = Arc::new(std::sync::Barrier::new(2));
+        let mut slot = RecoverySlot::from_budget(Arc::new(Budget { used: AtomicUsize::new(0), limit: 1 })).unwrap();
+        slot.context = Some(context);
+        let slot = slot.with_creation_guard(Arc::new(BlockingDrop { entered: entered.clone(), release: release.clone() }));
+        let worker = std::thread::spawn(move || drop(slot));
+        entered.wait();
+        let refused_while_guard_drops = RecoveryContext::from_budget((), 1, used.clone()).is_err();
+        // Always unblock/join before asserting, including the failing ordering.
+        release.wait(); worker.join().unwrap();
+        assert!(refused_while_guard_drops, "guard-held native owners remain charged until destruction completes");
+        assert!(RecoveryContext::from_budget((), 1, used).is_ok());
     }
 
     #[test]
