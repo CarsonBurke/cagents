@@ -8,10 +8,10 @@
 use super::{BUSY_TIMEOUT, FILE_MODE, SCHEMA_VERSION};
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, config::DbConfig};
 use std::{
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,31 +41,37 @@ fn connect(path: &Path, readonly: bool) -> Result<Connection, String> {
 }
 
 pub(super) fn open(path: &Path) -> Result<Connection, String> {
+    prepare_file(path)?;
+    open_existing(path)
+}
+
+fn prepare_file(path: &Path) -> Result<(), String> {
+    // POSIX close(any descriptor for an inode) releases the process's fcntl
+    // locks, even if another SQLite connection owns them. Never open/close an
+    // existing database outside SQLite. Serialize only the creation prelude so
+    // a new private file descriptor closes before another Registry constructor
+    // in this process can open that newly created inode through SQLite.
+    static CREATION: Mutex<()> = Mutex::new(());
+    let _creation = CREATION.lock().map_err(|_| "registry file creation lock was poisoned")?;
     if let Some(parent) = path.parent() {
         super::create_private_directory(parent).map_err(|e| e.to_string())?;
     }
-    let file = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(FILE_MODE)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|e| e.to_string())?,
-        Err(e) => return Err(e.to_string()),
-    };
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("workspace registry is not a regular file".into());
+    loop {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => return if metadata.is_file() { Ok(()) } else { Err("workspace registry is not a regular file".into()) },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        match OpenOptions::new().write(true).create_new(true).mode(FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path) {
+            Ok(created) => { drop(created); return Ok(()); }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
     }
-    open_existing(path, &file)
 }
 
-fn open_existing(path: &Path, file: &File) -> Result<Connection, String> {
+fn open_existing(path: &Path) -> Result<Connection, String> {
     // A read transaction pins rollback-journal inspection until writer
     // admission. A hot journal must fail here, before a RW connection can
     // recover it. WAL writers may still advance; the writer reread detects it.
@@ -119,7 +125,9 @@ fn open_existing(path: &Path, file: &File) -> Result<Connection, String> {
     // already-current store. No future writer can enter the conversion gap.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|e| e.to_string())?;
-    file.set_permissions(std::fs::Permissions::from_mode(FILE_MODE))
+    // Path-based chmod does not open/close an additional database descriptor.
+    // External namespace replacement is outside this same-file admission scope.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(FILE_MODE))
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     checkpoint("committed")?;
@@ -868,6 +876,50 @@ mod tests {
         assert_eq!(model.projects[0].name, "My project");
         assert_eq!(model.projects[0].kind, ProjectKind::Git);
         require_current(&restored.db).unwrap();
+    }
+
+    #[test]
+    fn failed_opener_cannot_release_another_connections_actual_writer_lock() {
+        use crate::process::{ProcessExecutor,CommandSpec,CancellationToken,SystemProcessExecutor};
+        let _clear=Clear;
+        let dir=tempfile::Builder::new().prefix("registry12-lock-").tempdir().unwrap();let root=dir.path().canonicalize().unwrap();
+        std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path=root.join("writer.sqlite3");let mut registry=Registry::at(&path).unwrap();
+        assert_eq!(registry.db.query_row("PRAGMA journal_mode=DELETE",[],|r|r.get::<_,String>(0)).unwrap(),"delete");
+        let tx=registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        tx.execute("INSERT INTO projects VALUES('/owner','Writer',1,'git')",[]).unwrap();
+        let prove=|busy:bool| {
+            let spec=CommandSpec::new(std::env::current_exe().unwrap()).args(["--exact","host::model::schema::tests::writer_lock_child","--nocapture"])
+                .env("CAGENTS_REGISTRY12_LOCK_CHILD",&root).env("CAGENTS_REGISTRY12_LOCK_BUSY",if busy {"1"}else{"0"})
+                .timeout(Duration::from_secs(20)).output_limits(8192,8192);
+            let out=SystemProcessExecutor.execute(&spec,&CancellationToken::new()).and_then(|out|out.require_success(&spec.program)).unwrap();
+            assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed; 0 failed"),"{}",String::from_utf8_lossy(&out.stdout));
+        };
+        prove(true);
+        hook(|stage|if stage=="inspected" {Err("forced second-opener refusal".into())}else{Ok(())});
+        assert!(Registry::at(&path).err().unwrap().contains("forced second-opener refusal"));
+        HOOK.with(|h|*h.borrow_mut()=None);
+        assert!(!tx.is_autocommit());
+        prove(true);
+        tx.rollback().unwrap();
+        prove(false);
+    }
+
+    #[test]
+    fn writer_lock_child() {
+        let Some(root)=std::env::var_os("CAGENTS_REGISTRY12_LOCK_CHILD") else { return; };
+        let root=std::path::PathBuf::from(root);assert!(root.is_absolute());assert_eq!(root.canonicalize().unwrap(),root);
+        assert!(root.file_name().unwrap().to_str().unwrap().starts_with("registry12-lock-"));
+        assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode()&0o777,0o700);
+        let mut db=connect(&root.join("writer.sqlite3"),false).unwrap();db.busy_timeout(Duration::ZERO).unwrap();
+        match std::env::var("CAGENTS_REGISTRY12_LOCK_BUSY").unwrap().as_str() {
+            "1"=> {
+                let error=db.transaction_with_behavior(TransactionBehavior::Immediate).err().expect("the original writer must remain excluded");
+                assert!(matches!(error,rusqlite::Error::SqliteFailure(ref code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseBusy|rusqlite::ErrorCode::DatabaseLocked)),"{error}");
+            }
+            "0"=>db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap().rollback().unwrap(),
+            _=>panic!("invalid child expectation"),
+        }
     }
 
     #[test]
