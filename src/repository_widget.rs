@@ -14,6 +14,8 @@ use std::{
 mod text_editor;
 
 mod diff_layout;
+mod diff_mutations;
+pub use diff_mutations::Request as DiffMutationRequest;
 mod preview;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
@@ -541,6 +543,15 @@ pub enum RepositoryAction {
         card: CardId,
         stage: bool,
     },
+    ApplyDiffSelection {
+        card: CardId,
+        kind: crate::git_patch::Kind,
+    },
+    ApplyDiffHunk {
+        card: CardId,
+        kind: crate::git_patch::Kind,
+        request: Arc<DiffMutationRequest>,
+    },
     ApplySourceSurface {
         card: CardId,
         diff: bool,
@@ -694,6 +705,8 @@ impl RepositoryAction {
             | Self::BackToFiles { card }
             | Self::OpenExternal { card, .. }
             | Self::StageSelected { card, .. }
+            | Self::ApplyDiffSelection { card, .. }
+            | Self::ApplyDiffHunk { card, .. }
             | Self::ApplySourceSurface { card, .. }
             | Self::ApplyMarkdownMode { card, .. }
             | Self::ApplyDiffMode { card, .. }
@@ -4721,7 +4734,9 @@ impl RepositoryRuntime {
             RepositoryAction::NewTerminal { .. }
             | RepositoryAction::DirectorySearchLoaded { .. } => Task::none(),
             RepositoryAction::Clipboard { card, op } => self.clipboard(card, op),
-            RepositoryAction::StageSelected { .. } => Task::none(),
+            RepositoryAction::StageSelected { .. }
+            | RepositoryAction::ApplyDiffSelection { .. }
+            | RepositoryAction::ApplyDiffHunk { .. } => Task::none(),
             RepositoryAction::FileListUnchanged { identity } => {
                 if !self.accepts_file_list(&identity) || identity.path != Path::new(".") {
                     return Task::none();
@@ -8996,8 +9011,9 @@ fn diff_model_view<'a>(
                 (model.row_count(DiffMode::Inline).max(1).ilog10() + 1).max(4) as f32 * 8.0 + 12.0;
             let code_width =
                 (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32).max(1.0);
-            let geometry = DiffScrollGeometry::new(size.width, gutter, runtime.diff_mode);
-            let viewport_width = geometry.viewport_width;
+            let mutation_gutter = if diff_mutations::local_basis(runtime) { diff_mutations::GUTTER_WIDTH } else { 0.0 };
+            let geometry = DiffScrollGeometry::new(size.width - mutation_gutter, gutter, runtime.diff_mode);
+            let viewport_width = geometry.viewport_width + mutation_gutter;
             let overflow = geometry.overflow(code_width);
             let horizontal = runtime.diff_horizontal.clamp(0.0, overflow);
             let layout = runtime
@@ -9092,6 +9108,11 @@ fn diff_model_view<'a>(
                         context.map(|ctx| (ctx.line_action(old, None), ctx.line_action(None, new))),
                     ),
                 };
+                let code = if mutation_gutter > 0.0 {
+                    widget::row::with_children([
+                        diff_mutations::gutter(card, runtime, model, row, DIFF_ROW_HEIGHT), code,
+                    ]).height(DIFF_ROW_HEIGHT).width(Length::Fill).into()
+                } else { code };
                 if let Some(ctx) =
                     context.filter(|ctx| ctx.review.has_annotation(ctx.path, old, new, false))
                 {
@@ -9173,7 +9194,10 @@ fn diff_model_view<'a>(
         })
         .into()
     };
-    rows
+    if diff_mutations::local_basis(runtime) {
+        widget::column::with_children([diff_mutations::selection_controls(card, runtime), rows])
+            .width(Length::Fill).height(Length::Fill).into()
+    } else { rows }
 }
 
 #[derive(Clone, Copy)]

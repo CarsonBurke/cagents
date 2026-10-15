@@ -21,6 +21,7 @@ mod browser_backend;
 mod browser_host;
 mod file_ui;
 mod git_ui;
+mod git_patch_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
@@ -3936,6 +3937,12 @@ fn grouped_digits(value: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    DiffPatchPrepared {
+        key: ActiveWorktreeKey,
+        identity: repository_widget::AsyncIdentity,
+        buffer_revision: Option<u64>,
+        result: Result<Option<crate::git_patch::Patch>, String>,
+    },
     Device(device_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
@@ -13853,6 +13860,9 @@ impl Application for Cagents {
                 };
                 path.map_or_else(Task::none, |path| self.open_file_in_editor(path, editor_id))
             }
+            Message::Repository(RepositoryAction::ApplyDiffSelection { card, kind }) => self.start_diff_patch(card, kind, None),
+            Message::Repository(RepositoryAction::ApplyDiffHunk { card, kind, request }) => self.start_diff_patch(card, kind, Some(request)),
+            Message::DiffPatchPrepared { key, identity, buffer_revision, result } => self.finish_diff_patch(key, identity, buffer_revision, result),
             Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
                 if self.modal_is_open() {
                     return Task::none();
@@ -14095,18 +14105,32 @@ impl Application for Cagents {
                     | SidebarAction::CommitEditorCursor { key, .. }
                     | SidebarAction::CommitSubjectEditorAction { key, .. }
                     | SidebarAction::CommitEditorAction { key, .. }
-                    | SidebarAction::AmendChanged { key, .. } if !self.source_control_is_bound(key))
+                    | SidebarAction::AmendChanged { key, .. }
+                    | SidebarAction::SelectChangeRows { key, .. }
+                    | SidebarAction::NavigateChangeRow { key, .. }
+                    | SidebarAction::RevealChangeInFiles { key, .. }
+                    | SidebarAction::IgnoreChangePath { key, .. }
+                    | SidebarAction::ClearChangeSelection { key }
+                    | SidebarAction::InvokeChangeRows { key, .. } if !self.source_control_is_bound(key))
                 {
                     return Task::none();
                 }
-                let action = if matches!(action, SidebarAction::ChangeGroup { .. }) {
+                let action = if let SidebarAction::InvokeChangeRows { key, row, command } = &action {
+                    let Some(source) = &self.sidebar_model.source_control else { return Task::none(); };
+                    let Some(resolved) = sidebar::resolve_change_command(source, &self.sidebar_state, key, row, *command) else { return Task::none(); };
+                    resolved
+                } else if matches!(action, SidebarAction::ChangeGroup { .. }) {
                     let Some(source) = &self.sidebar_model.source_control else {
                         return Task::none();
                     };
-                    let Some(resolved) = sidebar::resolve_group_command(source, &action) else {
-                        return Task::none();
-                    };
-                    resolved
+                    if let SidebarAction::ChangeGroup { key, area, command } = &action
+                        && let Some(row) = sidebar::selected_change_group_anchor(source, &self.sidebar_state, *area) {
+                        let Some(resolved) = sidebar::resolve_change_command(source, &self.sidebar_state, key, &row, *command) else { return Task::none(); };
+                        resolved
+                    } else {
+                        let Some(resolved) = sidebar::resolve_group_command(source, &action) else { return Task::none(); };
+                        resolved
+                    }
                 } else {
                     action
                 };
@@ -14361,6 +14385,39 @@ impl Application for Cagents {
                         };
                         Task::batch([Self::reset_files_scroll(&key), followup])
                     }
+                    SidebarAction::RevealChangeInFiles { key, path } => {
+                        self.sidebar_state.reveal_in_files(path);
+                        self.context_tab = ContextTab::Files;
+                        let open = self.set_context_inspector_open(true);
+                        Task::batch([open, self.reload_source_control(&key)])
+                    }
+                    SidebarAction::IgnoreChangePath { key, path } => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::IgnorePath { path } })),
+                    SidebarAction::SelectChangeRows { key, row, intent } => {
+                        let id = sidebar::change_row_focus_id(&key, &row);
+                        if let Some(source) = &self.sidebar_model.source_control {
+                            let order = sidebar::change_selection_order(source, &self.sidebar_state);
+                            self.sidebar_state.select_change_rows(row, intent, &order);
+                        }
+                        iced::widget::operation::focus(id).map(cosmic::Action::App)
+                    }
+                    SidebarAction::NavigateChangeRow { key, row, direction, extend } => {
+                        let Some(source) = &self.sidebar_model.source_control else { return Task::none(); };
+                        let order = sidebar::change_selection_order(source, &self.sidebar_state);
+                        let Some(position) = order.iter().position(|candidate| candidate == &row) else { return Task::none(); };
+                        use iced::keyboard::key::Named;
+                        let next = match direction {
+                            Named::ArrowUp => position.saturating_sub(1),
+                            Named::ArrowDown => (position + 1).min(order.len().saturating_sub(1)),
+                            Named::Home => 0,
+                            Named::End => order.len().saturating_sub(1),
+                            _ => return Task::none(),
+                        };
+                        let target = order[next].clone();
+                        self.sidebar_state.select_change_rows(target.clone(), if extend { sidebar::SelectionIntent::Range { extend: false } } else { sidebar::SelectionIntent::Navigate }, &order);
+                        self.sidebar_state.reveal_change_row(source, &target);
+                        iced::widget::operation::focus(sidebar::change_row_focus_id(&key, &target)).map(cosmic::Action::App)
+                    }
+                    SidebarAction::ClearChangeSelection { .. } | SidebarAction::InvokeChangeRows { .. } => Task::none(),
                     SidebarAction::OpenSettings => self.open_utility_card(CardKind::Settings),
                     SidebarAction::OpenAutomations => self.open_automations(),
                     // The handle clamps to its own rendered bounds, and the
@@ -16331,9 +16388,12 @@ impl Application for Cagents {
                 if let Some(previous) = self.sidebar_model.source_control.as_ref() {
                     previous.carry_mutation_into(&mut next);
                 }
+                self.sidebar_state.reconcile_change_rows(&next);
+                let reveal = self.sidebar_state.finish_reveal_in_files(&next)
+                    .map(|id| iced::widget::operation::focus(id).map(cosmic::Action::App)).unwrap_or_else(Task::none);
                 self.sidebar_model.source_control = Some(next);
                 match result {
-                    Ok(snapshot) => self.refresh_branch_changes(&snapshot),
+                    Ok(snapshot) => Task::batch([self.refresh_branch_changes(&snapshot), reveal]),
                     Err(_) => {
                         self.cancel_branch_changes();
                         Task::none()

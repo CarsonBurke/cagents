@@ -18,6 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod ignore_path;
+mod browse_reveal;
+pub(crate) use browse_reveal::include as include_revealed_path;
+
 use crate::fs_safety;
 use crate::model::{OperationId, WorktreeId};
 use crate::persistence::{PendingOperation, PendingOperationStatus, StateStore, StoreError};
@@ -842,6 +846,9 @@ pub struct WorkingFiles {
     /// Tracked and untracked paths together, excluding ignored ones,
     /// deduplicated and sorted: the file tree shows both.
     pub paths: Vec<RepoPath>,
+    /// Existing explicit directories, including a revealed empty parent.
+    #[serde(default)]
+    pub directories: Vec<RepoPath>,
     /// How many of `paths` Git tracks; the remainder are untracked. A count
     /// rather than a second list, because nothing needs the tracked paths on
     /// their own and duplicating the listing of a large worktree to answer one
@@ -3694,6 +3701,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 process: output,
             }),
         }
+    }
+
+    pub fn ignore_path(&self, worktree: &Path, path: &RepoPath, cancellation: &CancellationToken) -> Result<(), RepositoryError> {
+        let _protection = crate::worktree_cleanup::protect(worktree).map_err(|error| ValidationError::Io(error.to_string()))?;
+        if cancellation.is_cancelled() { return Err(ValidationError::Io("operation was cancelled".into()).into()); }
+        ignore_path::add(worktree, path).map_err(|error| ValidationError::Io(error).into())
     }
 
     pub fn status(
