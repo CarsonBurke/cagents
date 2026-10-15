@@ -175,7 +175,10 @@ fn inspect(request: Request) -> Result<(), String> {
         }
         if let Some(terminal) = &session.terminal {
             qualify_console_migration(terminal, &matched_cli).map_err(|reason| {
-                format!("Source conversation {}: {reason}. Source windows remain usable", session.id)
+                format!(
+                    "Source conversation {}: {reason}. Source windows remain usable",
+                    session.id
+                )
             })?;
         }
         validate_live_chat(session, request.require_resumable)
@@ -184,7 +187,10 @@ fn inspect(request: Request) -> Result<(), String> {
     for terminal in &terminals {
         if !terminal_ended(&terminal.session) {
             qualify_console_migration(&terminal.session, &matched_cli).map_err(|reason| {
-                format!("Source terminal {}: {reason}. Source windows remain usable", terminal.session.id)
+                format!(
+                    "Source terminal {}: {reason}. Source windows remain usable",
+                    terminal.session.id
+                )
             })?;
         }
     }
@@ -265,9 +271,13 @@ fn qualify_console_migration(
         return Ok(());
     }
     if Path::new(&terminal.launch.program) != matched_cli {
-        return Err("its accepted console belongs to a different matched CLI installation; this pairing cannot migrate yet");
+        return Err(
+            "its accepted console belongs to a different matched CLI installation; this pairing cannot migrate yet",
+        );
     }
-    Err("its accepted console has no qualified reconnection across daemon replacement; this pairing cannot migrate yet")
+    Err(
+        "its accepted console has no qualified reconnection across daemon replacement; this pairing cannot migrate yet",
+    )
 }
 
 // A foreground process hint is an observation of the retained PTY, not an
@@ -340,14 +350,18 @@ mod tests {
         let matched = Path::new("/installed/new/bin/cagents");
         let recipe = crate::model::LaunchRecipe {
             program: matched.to_string_lossy().into_owned(),
-            arguments: vec!["agent".into(), "console".into(), crate::model::AgentId::new().to_string()],
+            arguments: vec![
+                "agent".into(),
+                "console".into(),
+                crate::model::AgentId::new().to_string(),
+            ],
             working_directory: "/private-directory".into(),
             environment: [("PRIVATE_ACCOUNT".into(), "never-print-this".into())].into(),
             unset_environment: Default::default(),
         };
-        let mut terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(
-            TerminalId::new(), recipe, None,
-        ).session;
+        let mut terminal =
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None)
+                .session;
         let same_path = qualify_console_migration(&terminal, matched).unwrap_err();
         assert!(same_path.contains("no qualified reconnection"));
         terminal.launch.program = "/installed/old/bin/cagents".into();
@@ -360,7 +374,12 @@ mod tests {
         }
         terminal.launch.arguments = vec!["--login".into()];
         assert!(qualify_console_migration(&terminal, matched).is_ok());
-        terminal.launch.arguments = vec!["--remote".into(), "unix://owned-listener".into(), "resume".into(), "exact-thread".into()];
+        terminal.launch.arguments = vec![
+            "--remote".into(),
+            "unix://owned-listener".into(),
+            "resume".into(),
+            "exact-thread".into(),
+        ];
         assert!(qualify_console_migration(&terminal, matched).is_ok());
     }
 

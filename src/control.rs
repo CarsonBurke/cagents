@@ -4839,18 +4839,20 @@ mod tests {
             message_tag: u32,
             error: ExtendedError,
         }
-        let encode = |version| postcard::to_stdvec(&LegacyEnvelope {
-            version,
-            request_id: Some(1),
-            proof: proof("session", "boot", "incarnation"),
-            message_tag: 6,
-            error: LegacyError {
-                code: 1, // UnsupportedVersion in protocol 77.
-                message: "Unsupported protocol version".into(),
-                retryable: false,
-            },
-        })
-        .unwrap();
+        let encode = |version| {
+            postcard::to_stdvec(&LegacyEnvelope {
+                version,
+                request_id: Some(1),
+                proof: proof("session", "boot", "incarnation"),
+                message_tag: 6,
+                error: LegacyError {
+                    code: 1, // UnsupportedVersion in protocol 77.
+                    message: "Unsupported protocol version".into(),
+                    retryable: false,
+                },
+            })
+            .unwrap()
+        };
         let payload = encode(77);
         assert!(postcard::from_bytes::<ExtendedEnvelope>(&payload).is_err());
         assert!(matches!(
@@ -4865,7 +4867,9 @@ mod tests {
         let (client, mut server) = UnixStream::pair().unwrap();
         let worker = std::thread::spawn(move || {
             let _: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
-            server.write_all(&(payload.len() as u32).to_be_bytes()).unwrap();
+            server
+                .write_all(&(payload.len() as u32).to_be_bytes())
+                .unwrap();
             server.write_all(&payload).unwrap();
         });
         assert!(matches!(

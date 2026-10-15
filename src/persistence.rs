@@ -6471,39 +6471,71 @@ mod tests {
             drop(store);
             paths.push(path);
         }
-        let before = paths.iter().map(std::fs::read).collect::<std::io::Result<Vec<_>>>().unwrap();
-        let connection = Connection::open_with_flags(&paths[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        let descriptor_bytes: u64 = connection.query_row(
-            "SELECT length(CAST(content_json AS BLOB)) FROM cards WHERE kind_tag='chat'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let before = paths
+            .iter()
+            .map(std::fs::read)
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        let connection =
+            Connection::open_with_flags(&paths[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let descriptor_bytes: u64 = connection
+            .query_row(
+                "SELECT length(CAST(content_json AS BLOB)) FROM cards WHERE kind_tag='chat'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         drop(connection);
         for row_limited in [false, true] {
-            let mut budget = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+            let mut budget =
+                MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
             if row_limited {
                 budget.remaining_rows = 1;
             } else {
                 budget.remaining_bytes = descriptor_bytes;
             }
-            assert_eq!(read_open_migration_sessions_with_budget(&paths[0], &mut budget).unwrap().len(), 1);
-            assert!(read_open_migration_sessions_with_budget(&paths[1], &mut budget)
-                .unwrap_err().to_string().contains("inventory exceeds"));
+            assert_eq!(
+                read_open_migration_sessions_with_budget(&paths[0], &mut budget)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(
+                read_open_migration_sessions_with_budget(&paths[1], &mut budget)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inventory exceeds")
+            );
         }
         for (path, original) in paths.iter().zip(before) {
             assert_eq!(std::fs::read(path).unwrap(), original);
         }
 
         let connection = Connection::open(&paths[1]).unwrap();
-        connection.execute("UPDATE cards SET content_json='not valid JSON' WHERE kind_tag='chat'", []).unwrap();
+        connection
+            .execute(
+                "UPDATE cards SET content_json='not valid JSON' WHERE kind_tag='chat'",
+                [],
+            )
+            .unwrap();
         drop(connection);
         let mut budget = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
         budget.remaining_bytes = 0;
-        assert!(read_open_migration_sessions_with_budget(&paths[1], &mut budget)
-            .unwrap_err().to_string().contains("inventory exceeds"), "budget must refuse before decoding the oversized inventory");
+        assert!(
+            read_open_migration_sessions_with_budget(&paths[1], &mut budget)
+                .unwrap_err()
+                .to_string()
+                .contains("inventory exceeds"),
+            "budget must refuse before decoding the oversized inventory"
+        );
         let missing = directory.path().join("must-not-open.sqlite3");
         let mut expired = MigrationInspectionBudget::new(Instant::now());
-        assert!(read_open_migration_sessions_with_budget(&missing, &mut expired)
-            .unwrap_err().to_string().contains("bounded budget"));
+        assert!(
+            read_open_migration_sessions_with_budget(&missing, &mut expired)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded budget")
+        );
         assert!(!missing.exists());
     }
 
@@ -6516,12 +6548,16 @@ mod tests {
         SaveLane::default().save(&store, &workspace).unwrap();
         drop(store);
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1).unwrap();
+        connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
         drop(connection);
         let before = std::fs::read(&path).unwrap();
         let error = read_open_migration_sessions(&path).unwrap_err();
-        assert!(matches!(error, StoreError::UnsupportedSchema { found, supported }
-            if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION));
+        assert!(
+            matches!(error, StoreError::UnsupportedSchema { found, supported }
+            if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION)
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
