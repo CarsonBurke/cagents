@@ -3181,6 +3181,7 @@ enum ResolvedProject {
     Open {
         repository: PathBuf,
         kind: crate::model::ProjectKind,
+        checkout: Option<PathBuf>,
     },
     List,
     Close {
@@ -3205,6 +3206,7 @@ impl ProjectCommand {
                 ResolvedProject::Open {
                     repository: location.key,
                     kind: location.kind,
+                    checkout: location.checkout,
                 }
             }
             Self::List => ResolvedProject::List,
@@ -3221,7 +3223,7 @@ fn project_output(
     command: ResolvedProject,
 ) -> Result<CommandOutput, AppError> {
     match command {
-        ResolvedProject::Open { repository, kind } => {
+        ResolvedProject::Open { repository, kind, checkout } => {
             // The same upsert a window publishes when it opens a repository,
             // carrying the name derived from the same key, so a project opened
             // from a shell and one opened in a window are one row that no
@@ -3230,7 +3232,8 @@ fn project_output(
                 .edit_workspace_model(ModelEdit::ReopenProject {
                     kind,
                     repository: repository.clone(),
-                    name: repository_display_name(&repository),
+                    name: repository_display_name(checkout.as_deref().unwrap_or(&repository)),
+                    checkout,
                 })
                 .map_err(protocol_error)?;
             let project = model.project(&repository).cloned().ok_or_else(|| {
@@ -3253,7 +3256,7 @@ fn project_output(
             let mut projects = model.projects.iter().collect::<Vec<_>>();
             projects.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
             let human = format::table(&["PATH", "NAME"], projects.iter().map(|project| vec![
-                project_display_path(&project.repository).display().to_string(), project.name.clone(),
+                project_display_path(project), project.name.clone(),
             ]).collect(), "No open projects");
             Ok(CommandOutput {
                 command: "project.list",
@@ -3336,17 +3339,13 @@ fn close_project(
     })
 }
 
-/// One project per line: repository, name.
-///
-/// The key comes first, following `channel_line`, so the `cut -f1` that names a
-/// channel names a project - and names it in the spelling `project close`
-/// takes.
-fn project_display_path(path: &Path) -> &Path {
-    if path.file_name() == Some(OsStr::new(".git")) { path.parent().unwrap_or(path) } else { path }
+/// The verified checkout is presentation metadata, separate from Git identity.
+fn project_display_path(project: &ModelProject) -> String {
+    let path = project.checkout.as_deref().or_else(|| (project.kind==crate::model::ProjectKind::Folder).then_some(project.repository.as_path()));
+    path.map(|path|path.display().to_string()).unwrap_or_else(||"(checkout unavailable)".into())
 }
-
 fn project_line(project: &ModelProject) -> String {
-    format!("{}\t{}", project_display_path(&project.repository).display(), project.name)
+    format!("{}\t{}", project_display_path(project), project.name)
 }
 
 /// Runs a shared-channel verb against the daemon's registry.
@@ -3384,6 +3383,7 @@ enum ResolvedChannel {
         repository: PathBuf,
         title: String,
         kind: crate::model::ProjectKind,
+        checkout: Option<PathBuf>,
     },
     List {
         repository: Option<PathBuf>,
@@ -3409,6 +3409,7 @@ impl ChannelCommand {
                 ResolvedChannel::Spawn {
                     repository: location.key,
                     kind: location.kind,
+                    checkout: location.checkout,
                     title,
                 }
             }
@@ -3434,6 +3435,7 @@ fn channel_output(
             repository,
             title,
             kind,
+            checkout,
         } => {
             // The project comes first: a channel in a repository no project owns
             // is reachable from no window's sidebar. `OpenProject` is an upsert,
@@ -3442,7 +3444,8 @@ fn channel_output(
                 .edit_workspace_model(ModelEdit::OpenProject {
                     kind,
                     repository: repository.clone(),
-                    name: repository_display_name(&repository),
+                    name: repository_display_name(checkout.as_deref().unwrap_or(&repository)),
+                    checkout,
                 })
                 .map_err(protocol_error)?;
             // The id is minted here, exactly as `terminal spawn` mints its
@@ -3486,7 +3489,7 @@ fn channel_output(
                 .collect::<Vec<_>>();
             channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
             let human = format::table(&["ID", "PROJECT", "TITLE"], channels.iter().map(|channel| vec![
-                channel.id.to_string(), project_display_path(&channel.repository).display().to_string(), channel.title.clone(),
+                channel.id.to_string(), model.project(&channel.repository).map(project_display_path).unwrap_or_else(||"(checkout unavailable)".into()), channel.title.clone(),
             ]).collect(), "No channels");
             Ok(CommandOutput {
                 command: "channel.list",
@@ -3569,13 +3572,14 @@ fn resolve_project_location(
             return Ok(crate::project_location::ProjectLocation {
                 key: from,
                 kind: project.kind,
+                checkout: project.checkout.clone(),
             });
         }
         return match crate::device_service::request(crate::device_service::Operation::Discover {
             path: from,
         }) {
-            Ok(crate::device_service::Reply::Project { key, kind, .. }) => {
-                Ok(crate::project_location::ProjectLocation { key, kind })
+            Ok(crate::device_service::Reply::Project { key, kind, checkout, .. }) => {
+                Ok(crate::project_location::ProjectLocation { key, kind, checkout })
             }
             Ok(_) => Err(AppError::new(
                 "repository",
@@ -4195,6 +4199,7 @@ mod tests {
                     edit: ModelEdit::OpenProject {
                         kind: Default::default(),
                         repository: server_repository.clone(),
+                        checkout: server_repository.parent().map(Path::to_path_buf),
                         // The checkout's name, never the key's own last
                         // component, which is `.git` and names nothing.
                         name: expected_name.clone(),
@@ -4329,6 +4334,42 @@ mod tests {
     /// checkout one project per worktree the user ever ran the verb from, and
     /// the sidebar would fill with duplicates of the same repository.
     #[test]
+    fn separate_git_directory_open_and_list_show_verified_checkout() {
+        let root=tempfile::tempdir().unwrap();
+        let checkout=root.path().join("checkout");
+        let metadata=root.path().join("metadata");
+        std::fs::create_dir(&checkout).unwrap();
+        git(&checkout,&["init","--quiet","--separate-git-dir",metadata.to_str().unwrap()]);
+        let checkout=checkout.canonicalize().unwrap();
+        let metadata=metadata.canonicalize().unwrap();
+        let project=ModelProject{repository:metadata.clone(),checkout:Some(checkout.clone()),kind:crate::model::ProjectKind::Git,name:"checkout".into(),ordinal:1};
+        let (client_stream,mut server_stream)=UnixStream::pair().unwrap();
+        let peer_proof=proof("session","boot","incarnation");
+        let served=project.clone();
+        let server=thread::spawn(move || {
+            let _:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(&mut server_stream,&connected_envelope(1,peer_proof.clone(),peer_proof.clone())).unwrap();
+            let opened:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(opened.request,ClientRequest::EditWorkspaceModel{edit:ModelEdit::ReopenProject{repository:served.repository.clone(),checkout:served.checkout.clone(),kind:served.kind,name:served.name.clone()}});
+            let mut model=WorkspaceModel::default();model.projects.push(served);
+            write_frame(&mut server_stream,&model_envelope(opened.request_id,peer_proof.clone(),model.clone())).unwrap();
+            let listed:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(listed.request,ClientRequest::ReadWorkspaceModel);
+            write_frame(&mut server_stream,&model_envelope(listed.request_id,peer_proof,model)).unwrap();
+        });
+        let resolved=ProjectCommand::Open{path:Some(checkout.clone())}.resolved().unwrap();
+        let mut client=ControlClient::from_stream(client_stream).unwrap();
+        let opened=project_output(&mut client,resolved).unwrap();
+        let listed=project_output(&mut client,ResolvedProject::List).unwrap();
+        server.join().unwrap();
+        assert_eq!(opened.human,format!("{}\tcheckout",checkout.display()));
+        assert_eq!(listed.human,format::table(&["PATH","NAME"],vec![vec![checkout.display().to_string(),"checkout".into()]],"No open projects"));
+        assert_eq!(opened.data["project"]["repository"],json!(metadata));
+        assert_eq!(opened.data["project"]["checkout"],json!(checkout));
+        assert!(!opened.human.contains("metadata"));
+    }
+
+    #[test]
     fn project_open_keys_one_project_from_every_worktree_of_one_checkout() {
         let Some(checkout) = git_checkout() else {
             return;
@@ -4375,6 +4416,7 @@ mod tests {
         model.projects.push(ModelProject {
             kind: crate::model::ProjectKind::Folder,
             repository: root.clone(),
+            checkout: Some(root.clone()),
             name: "Folder".into(),
             ordinal: 0,
         });
@@ -4474,6 +4516,7 @@ mod tests {
                     edit: ModelEdit::ReopenProject {
                         kind: Default::default(),
                         repository: served.clone(),
+                        checkout: served.parent().map(Path::to_path_buf),
                         // The checkout's name, never the key's own last
                         // component, which is `.git` and names nothing.
                         name: served_name.clone(),
@@ -4487,6 +4530,7 @@ mod tests {
                 sequence: 4,
                 projects: vec![ModelProject {
                     kind: Default::default(),
+                    checkout: served.parent().map(Path::to_path_buf),
                     repository: served,
                     name: served_name,
                     ordinal: 2,
@@ -4515,7 +4559,7 @@ mod tests {
         assert_eq!(output.data["sequence"], json!(4));
         assert_eq!(
             output.human,
-            format!("{}\t{name}", project_display_path(&expected).display()),
+            format!("{}\t{name}", checkout.path().canonicalize().unwrap().display()),
             "one tab-separated line: checkout path, name"
         );
     }
@@ -4530,12 +4574,14 @@ mod tests {
         let window_opened = ModelProject {
             kind: Default::default(),
             repository: PathBuf::from("/window/.git"),
+            checkout: Some(PathBuf::from("/window")),
             name: "window".into(),
             ordinal: 1,
         };
         let cli_opened = ModelProject {
             kind: Default::default(),
             repository: PathBuf::from("/shell/.git"),
+            checkout: Some(PathBuf::from("/shell")),
             name: "shell".into(),
             ordinal: 2,
         };
@@ -4727,6 +4773,7 @@ mod tests {
             projects: vec![ModelProject {
                 kind: Default::default(),
                 repository: repository.to_path_buf(),
+                checkout: repository.parent().map(Path::to_path_buf),
                 name: repository_display_name(repository),
                 ordinal: 1,
             }],
