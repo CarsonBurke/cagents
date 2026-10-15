@@ -12,16 +12,63 @@ fn budget() -> Arc<Budget> {
     Arc::clone(BUDGET.get_or_init(|| Arc::new(Budget { used: AtomicUsize::new(0), limit: MAX_RECOVERIES })))
 }
 
+/// Shared already-acquired cleanup guards have their own measured FD budget,
+/// separate from each producer's <=16 private descriptors. Sharing a context
+/// across all leaves counts its native descriptors once, not once per clone.
+const MAX_RECOVERY_CONTEXTS: usize = 32;
+const MAX_RECOVERY_CONTEXT_DESCRIPTORS: usize = 128;
+#[derive(Default)]
+struct ContextUsage { contexts: usize, descriptors: usize }
+fn context_budget() -> Arc<Mutex<ContextUsage>> {
+    static BUDGET: OnceLock<Arc<Mutex<ContextUsage>>> = OnceLock::new();
+    Arc::clone(BUDGET.get_or_init(|| Arc::new(Mutex::new(ContextUsage::default()))))
+}
+struct ContextInner {
+    // Dropping an owned lease closes its FDs; no namespace mutation runs here.
+    _guard: Box<dyn Send + Sync>,
+    descriptors: usize,
+    budget: Arc<Mutex<ContextUsage>>,
+}
+impl Drop for ContextInner {
+    fn drop(&mut self) {
+        let mut used = self.budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        used.contexts -= 1; used.descriptors -= self.descriptors;
+    }
+}
+/// Pre-effect ownership of an exact cleanup lease. No path-based reacquisition
+/// occurs on failure. Callers supply the actual retained native FD count.
+#[derive(Clone)]
+pub(crate) struct RecoveryContext(Arc<ContextInner>);
+impl RecoveryContext {
+    pub(crate) fn with_guard(guard: impl Send + Sync + 'static, descriptors: usize) -> Result<Self, String> {
+        Self::from_budget(guard, descriptors, context_budget())
+    }
+    fn from_budget(guard: impl Send + Sync + 'static, descriptors: usize, budget: Arc<Mutex<ContextUsage>>) -> Result<Self, String> {
+        let mut used = budget.lock().map_err(|_| "Recovery cleanup-lease budget is unavailable".to_owned())?;
+        let total = used.descriptors.checked_add(descriptors).ok_or("Recovery cleanup-lease descriptor budget is exhausted")?;
+        if used.contexts >= MAX_RECOVERY_CONTEXTS || total > MAX_RECOVERY_CONTEXT_DESCRIPTORS {
+            return Err("Recovery cleanup-lease capacity is exhausted. Resolve earlier recovery before changing files.".into());
+        }
+        used.contexts += 1; used.descriptors = total; drop(used);
+        Ok(Self(Arc::new(ContextInner { _guard: Box::new(guard), descriptors, budget })))
+    }
+    /// Reserve before producer effects. The resulting unresolved leaf owns
+    /// this exact pre-acquired context until success or its final owner drop.
+    pub(crate) fn reserve(&self) -> Result<RecoverySlot, String> {
+        let mut slot = RecoverySlot::reserve()?; slot.context = Some(self.clone()); Ok(slot)
+    }
+}
+
 /// Reserve one bounded recovery payload before touching the filesystem.
 /// Producers must retain no more than MAX_RECOVERY_DESCRIPTORS descriptors.
-pub(crate) struct RecoverySlot { budget: Arc<Budget> }
+pub(crate) struct RecoverySlot { budget: Arc<Budget>, context: Option<RecoveryContext> }
 impl RecoverySlot {
     pub(crate) fn reserve() -> Result<Self, String> { Self::from_budget(budget()) }
     fn from_budget(budget: Arc<Budget>) -> Result<Self, String> {
         budget.used.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |used| (used < budget.limit).then_some(used + 1))
             .map_err(|_| "Recovery capacity is exhausted. Resolve an earlier recovery before changing files.".to_owned())?;
-        Ok(Self { budget })
+        Ok(Self { budget, context: None })
     }
     pub(crate) fn retain(self, description: String, retry: impl FnMut() -> Result<(), String> + Send + 'static) -> RecoveryAuthority {
         RecoveryAuthority(Arc::new(RecoveryInner {
@@ -130,6 +177,23 @@ mod tests {
         b.retry().unwrap();
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
+    #[test]
+    fn cleanup_context_is_shared_bounded_and_survives_parent_drop_until_resolution() {
+        struct Guard(Arc<AtomicUsize>);
+        impl Drop for Guard { fn drop(&mut self) { self.0.fetch_add(1, Ordering::AcqRel); } }
+        let budget = Arc::new(Mutex::new(ContextUsage::default()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let context = RecoveryContext::from_budget(Guard(drops.clone()), 3, budget.clone()).unwrap();
+        let a = context.reserve().unwrap().retain("a".into(), || Ok(()));
+        let b = context.reserve().unwrap().retain("b".into(), || Ok(()));
+        drop(context);
+        assert_eq!(budget.lock().unwrap().descriptors, 3); assert_eq!(drops.load(Ordering::Acquire), 0);
+        a.retry().unwrap(); assert_eq!(drops.load(Ordering::Acquire), 0);
+        b.retry().unwrap(); assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(budget.lock().unwrap().descriptors, 0);
+        assert!(RecoveryContext::from_budget((), 129, budget).is_err());
+    }
+
     #[test]
     fn editor_recovery_last_owner_drop_releases_budget_without_running_effects() {
         let budget = Arc::new(Budget { used: AtomicUsize::new(0), limit: 1 });
