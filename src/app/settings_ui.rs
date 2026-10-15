@@ -119,6 +119,18 @@ pub(super) fn number_setting_value(field: SettingsField, value: &str) -> String 
         .unwrap_or_else(|_| value.to_owned())
 }
 
+fn number_setting_current(value: &str, default: f64, min: f64, max: f64) -> f64 {
+    value.parse::<f64>().ok().filter(|value| value.is_finite()).unwrap_or(default).clamp(min, max)
+}
+
+fn number_setting_reset(field: SettingsField, value: &str, default: f64) -> Option<Message> {
+    if field == SettingsField::EditorFontSize {
+        return (!value.is_empty()).then(|| Message::SettingsChanged { field, value: String::new() });
+    }
+    let unchanged = value.parse::<f64>().is_ok_and(|value| value.is_finite() && (value - default).abs() < 0.000_001);
+    (!unchanged).then(|| Message::SettingsChanged { field, value: if field == SettingsField::HibernationDelayMs { format!("{default:.0}") } else { format!("{default:.3}") } })
+}
+
 fn setting_stepper<'a>(
     label: &'static str,
     detail: impl Into<Cow<'a, str>> + 'a,
@@ -138,7 +150,7 @@ fn setting_stepper<'a>(
         f64::from(step),
         f64::from(default),
     );
-    let current = value.parse::<f64>().unwrap_or(default).clamp(min, max);
+    let current = number_setting_current(value, default, min, max);
     let change = |next: f64| Message::SettingsChanged {
         field,
         value: if field == SettingsField::HibernationDelayMs {
@@ -174,7 +186,7 @@ fn setting_stepper<'a>(
             .on_press_maybe((current < max).then(|| change(current + step)))
             .into(),
         crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label}"))
-            .on_press_maybe((current != default).then(|| change(default)))
+            .on_press_maybe(number_setting_reset(field, value, default))
             .into(),
     ])
     .spacing(space::XS)
@@ -276,6 +288,7 @@ pub(super) struct SettingsContext<'a> {
     /// Refused values, by the field that refused them.
     pub invalid: &'a HashMap<SettingsField, String>,
     pub fonts: &'a FontChoices,
+    pub terminal_font_size: f32,
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
     pub updates: update_ui::UpdateSummary,
     pub testing_notification: bool,
@@ -657,7 +670,7 @@ fn settings_category_controls<'a>(
                         8.0,
                         40.0,
                         1.0,
-                        14.0,
+                        context.terminal_font_size,
                         " px",
                         invalid,
                         &draft.numeric_display,
@@ -1772,6 +1785,22 @@ mod typography_settings_tests {
             Some(family)
         );
         assert!(missing_font_warning("Example", &["example".into()], "system monospace").is_none());
+    }
+
+    #[test]
+    fn numeric_reset_restores_inheritance_and_repairs_invalid_text() {
+        let settings = AppSettings { terminal_font_size: 22.0, editor_font_size: Some(14.0), ..Default::default() };
+        let Some(Message::SettingsChanged { field, value }) = number_setting_reset(SettingsField::EditorFontSize, "14", 22.0) else { panic!("explicit editor size is resettable"); };
+        assert_eq!(value, "");
+        let SettingsDecision::Persist(reset) = settings_update(&settings, field, &value) else { panic!("reset is valid"); };
+        assert_eq!(reset.editor_font_size, None);
+        assert_eq!(reset.editor_font_size(), 22.0);
+        assert!(number_setting_reset(field, "", 22.0).is_none());
+        assert_eq!(number_setting_current("", 22.0, 8.0, 40.0) + 1.0, 23.0);
+        for value in ["invalid", "NaN", "100"] {
+            assert!(number_setting_reset(SettingsField::TerminalFontSize, value, 14.0).is_some());
+        }
+        assert!(number_setting_reset(SettingsField::TerminalLineHeight, "1.2", f64::from(1.2_f32)).is_none());
     }
 
     #[test]

@@ -3902,7 +3902,7 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
         }
         SettingsField::ChatContentFraction
         | SettingsField::DefaultNativePaneFraction
-        | SettingsField::DefaultColumnFraction => "Width must be between 25% and 100%.".to_owned(),
+        | SettingsField::DefaultColumnFraction => "Width must be a number between 25% and 100%.".to_owned(),
         SettingsField::TerminalFontFamily
             if attempted.terminal_font_family.len() > settings::MAX_TERMINAL_FONT_FAMILY_BYTES =>
         {
@@ -9340,6 +9340,7 @@ impl Cagents {
                     feedback: self.settings_feedback.as_ref(),
                     invalid: &self.settings_invalid,
                     fonts: &self.settings_font_choices,
+                    terminal_font_size: self.settings.terminal_font_size,
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
