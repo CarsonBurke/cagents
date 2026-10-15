@@ -94,8 +94,10 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     let mut reader = connect(path, true)?;
     let pin = reader.transaction().map_err(|e| e.to_string())?;
     let inspected = inspect(&pin)?;
-    if inspected.version == SCHEMA_VERSION {
-        require_open_layout(&pin)?;
+    // Published twelve remains an exact input format after thirteen.
+    // Refuse damage before opening a writer can recreate missing objects.
+    if inspected.version >= 12 {
+        require_open_layout(&pin, inspected.version)?;
     }
     checkpoint("inspected")?;
     let mut db = connect(path, false)?;
@@ -217,15 +219,21 @@ fn inspect(db: &Connection) -> Result<Inspection, String> {
 }
 
 type Layout = Vec<(String, String, String, Vec<String>)>;
-fn published_layouts() -> Result<&'static (Layout, Layout), String> {
+fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> {
+    static TWELVE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static CURRENT: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
-    CURRENT
+    let published = match version {
+        12 => &TWELVE,
+        SCHEMA_VERSION => &CURRENT,
+        _ => return Err(format!("unsupported published registry layout {version}")),
+    };
+    published
         .get_or_init(|| {
             let mut reference = Connection::open_in_memory().map_err(|e| e.to_string())?;
             let tx = reference.transaction().map_err(|e| e.to_string())?;
             // Derive the baseline from the same published bodies, without future
             // DDL. The unversioned project-kind upgrade predates header admission.
-            reference_migration(&tx)?;
+            reference_migration(&tx, version)?;
             let complete = inspect(&tx)?.objects;
             tx.execute_batch("ALTER TABLE projects DROP COLUMN kind;")
                 .map_err(|e| e.to_string())?;
@@ -235,19 +243,19 @@ fn published_layouts() -> Result<&'static (Layout, Layout), String> {
         .map_err(Clone::clone)
 }
 fn require_layout(db: &Connection) -> Result<(), String> {
-    if inspect(db)?.objects != published_layouts()?.0 {
+    if inspect(db)?.objects != published_layouts(SCHEMA_VERSION)?.0 {
         return Err(format!(
             "workspace registry layout does not match published schema {SCHEMA_VERSION}"
         ));
     }
     Ok(())
 }
-fn require_open_layout(db: &Connection) -> Result<(), String> {
+fn require_open_layout(db: &Connection, version: u32) -> Result<(), String> {
     let actual = inspect(db)?.objects;
-    let (complete, legacy_kind) = published_layouts()?;
+    let (complete, legacy_kind) = published_layouts(version)?;
     if &actual != complete && &actual != legacy_kind {
         return Err(format!(
-            "workspace registry layout does not match published schema {SCHEMA_VERSION}"
+            "workspace registry layout does not match published schema {version}"
         ));
     }
     Ok(())
@@ -378,10 +386,10 @@ fn tokens(sql: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn reference_migration(tx: &Transaction<'_>) -> Result<(), String> {
+fn reference_migration(tx: &Transaction<'_>, target: u32) -> Result<(), String> {
     #[cfg(test)]
     let previous = FAIL_STEP.with(|s| s.replace(None));
-    let result = super::migrate_through(tx, 0, SCHEMA_VERSION);
+    let result = super::migrate_through(tx, 0, target);
     #[cfg(test)]
     FAIL_STEP.with(|s| s.set(previous));
     result
@@ -455,6 +463,232 @@ mod tests {
             HOOK.with(|h| *h.borrow_mut() = None);
             FAIL_STEP.with(|s| s.set(None));
         }
+    }
+
+    fn refuse_damaged_twelve(damage: &str, object: &str) {
+        let _clear = Clear;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("damaged12.sqlite3");
+        legacy(&path, 12);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(damage).unwrap();
+        drop(db);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = bytes(&path);
+        let reached = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&reached);
+        hook(move |_| {
+            observed.set(true);
+            Ok(())
+        });
+        let error = Registry::at(&path)
+            .err()
+            .expect("published12 damage must refuse");
+        assert!(error.contains("published schema 12"), "{error}");
+        assert!(
+            !reached.get(),
+            "refusal must precede the pre-writer inspected checkpoint"
+        );
+        assert_eq!(
+            bytes(&path),
+            before,
+            "must not recreate objects or mint an identity"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(
+            !wal(&path).exists(),
+            "refusal must precede persistent WAL conversion"
+        );
+        let db = connect(&path, true).unwrap();
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name=?1",
+                [object],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='shared_view_terminal_sources'",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn published_twelve_missing_table_refuses_before_writable_admission() {
+        refuse_damaged_twelve("DROP TABLE navigation_orders;", "navigation_orders");
+    }
+
+    #[test]
+    fn published_twelve_missing_index_refuses_before_writable_admission() {
+        refuse_damaged_twelve(
+            "DROP INDEX channels_by_repository;",
+            "channels_by_repository",
+        );
+    }
+
+    #[test]
+    fn published_twelve_missing_metadata_table_cannot_mint_a_new_identity() {
+        refuse_damaged_twelve("DROP TABLE metadata;", "metadata");
+    }
+
+    #[test]
+    fn published_twelve_wal_damage_preserves_primary_wal_and_permissions() {
+        let _clear = Clear;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("damaged12-wal.sqlite3");
+        legacy(&path, 12);
+        let writer = connect(&path, false).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; DROP TABLE navigation_orders;")
+            .unwrap();
+        drop(writer);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = (bytes(&path), bytes(&wal(&path)));
+        assert!(!before.1.is_empty());
+        let error = Registry::at(&path)
+            .err()
+            .expect("published12 WAL damage must refuse");
+        assert!(error.contains("published schema 12"), "{error}");
+        assert_eq!((bytes(&path), bytes(&wal(&path))), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn published_twelve_migrates_to_thirteen_without_historical_terminal_proof() {
+        use crate::model::{
+            CardId, CardKind, LaunchRecipe, TerminalContinuity, TerminalExit, TerminalId,
+            TerminalSession,
+        };
+        use crate::workspace_model::views::{Pane, Scope};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonempty12.sqlite3");
+        let (identity, channel) = legacy(&path, 12);
+        let scope = Scope::Channel(channel);
+        let scope_key = serde_json::to_string(&scope).unwrap();
+        let recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: Vec::new(),
+            working_directory: "/kept".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let pane = Pane {
+            id: CardId::new(),
+            title: "Historical ended terminal".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.0,
+            scope: Some("/kept".into()),
+            kind: CardKind::Terminal(TerminalSession {
+                id: TerminalId::new(),
+                launch: recipe,
+                transcript_path: None,
+                resume_hint: None,
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                continuity: TerminalContinuity::Exited {
+                    last_exit: TerminalExit {
+                        code: Some(0),
+                        signal: None,
+                        occurred_at_unix_ms: 1,
+                    },
+                },
+            }),
+        };
+        let panes = serde_json::to_string(&vec![pane.clone()]).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO shared_view_scopes(scope,channel) VALUES(?1,?2)",
+            rusqlite::params![scope_key, channel.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO shared_views VALUES(?1,9,?2,'[]')",
+            rusqlite::params![scope_key, panes],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO shared_view_panes VALUES(?1,?2)",
+            rusqlite::params![pane.id.to_string(), scope_key],
+        )
+        .unwrap();
+        drop(db);
+        let registry = Registry::at(&path).unwrap();
+        require_current(&registry.db).unwrap();
+        let model = registry.model().unwrap();
+        assert_eq!(model.identity.to_string(), identity);
+        assert_eq!(model.sequence, 7);
+        assert_eq!(model.channels[0].id, channel);
+        let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+        assert_eq!(view.revision, 9);
+        assert_eq!(view.panes, vec![pane]);
+        assert_eq!(
+            registry
+                .db
+                .query_row(
+                    "SELECT count(*) FROM shared_view_terminal_sources",
+                    [],
+                    |r| r.get::<_, usize>(0)
+                )
+                .unwrap(),
+            0,
+            "old ended descriptors cannot invent source provenance"
+        );
+        assert_eq!(
+            registry
+                .db
+                .pragma_query_value(None, "foreign_keys", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            registry
+                .db
+                .pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(registry);
+        assert_eq!(Registry::at(&path).unwrap().model().unwrap(), model);
+    }
+
+    #[test]
+    fn current_thirteen_missing_provenance_is_not_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("damaged13.sqlite3");
+        legacy(&path, 13);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DROP TABLE shared_view_terminal_sources;")
+            .unwrap();
+        drop(db);
+        let before = bytes(&path);
+        assert!(
+            Registry::at(&path)
+                .err()
+                .unwrap()
+                .contains("published schema 13")
+        );
+        assert_eq!(bytes(&path), before);
+        assert!(!wal(&path).exists());
     }
 
     #[test]
