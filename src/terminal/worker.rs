@@ -74,10 +74,9 @@ const FOREGROUND_POLL_MAX: Duration = Duration::from_secs(30);
 const CHILD_HANGUP_GRACE: Duration = Duration::from_millis(500);
 /// Total budget for hangup, escalation and an authoritative holder exit report.
 const CHILD_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
-/// How long shutdown waits for the PTY reader to leave its blocking read
-/// before abandoning the thread. Closing its wake pipe releases the read
-/// immediately in every case we can construct; this only bounds the ones we
-/// cannot, because a hung join here wedges the daemon's dispatch thread.
+/// How long shutdown lets the PTY reader finish its reactor task. Closing its
+/// wake pipe releases readiness waits; aborting after this grace also bounds
+/// cleanup when unread output is waiting for inbox credit.
 const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// How long a synchronized update (DEC mode 2026) may withhold output from the
 /// published grid. A program brackets a frame it has to emit in several writes
@@ -2169,10 +2168,8 @@ impl Worker {
             transcript.finish();
         }
 
-        // Release the reader's blocking wait before waiting on it, then bound
-        // that wait: a reader still stuck on a descriptor a disowned
-        // grandchild holds open is abandoned rather than joined forever,
-        // because a hung join here wedges the daemon's dispatch thread.
+        // Release readiness waits first. Bound cleanup even if an in-flight
+        // output batch cannot get inbox credit during shutdown.
         drop(self.reader_wake.take());
         if let Some(reader) = self.reader.take() {
             match self.reader_done.recv_timeout(READER_SHUTDOWN_GRACE) {
