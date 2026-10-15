@@ -3955,10 +3955,11 @@ pub enum Message {
     /// whenever the focused card names a different worktree, so a result whose
     /// key is no longer the bound one is a read of a tree nobody is looking at
     /// and is dropped rather than rendered.
+    SourceControlReleased,
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Box<RepositorySnapshot>, String>,
+        result: Result<Option<Box<(RepositorySnapshot, SourceControlModel)>>, String>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -10051,9 +10052,57 @@ impl Cagents {
         }
     }
 
-    /// Rebinds the source-control panel to whatever worktree is now focused,
-    /// and loads a snapshot when that is a different worktree.
-    ///
+    /// Retires the old binding off the UI thread and releases large free arenas.
+    fn release_source_control(&mut self) -> Task<Message> {
+        let previous = self.sidebar_model.source_control.take();
+        let cache = self.refresh_ui.source_cache.take();
+        if previous.is_none() && cache.is_none() {
+            return Task::none();
+        }
+        // Old cancelled readers retain the old binding's invalidation flag.
+        self.refresh_ui.source_invalidated = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let large = previous.as_ref().is_some_and(|source| {
+            source.files.len() > 8192
+                || source
+                    .groups()
+                    .iter()
+                    .map(|group| group.rows().len())
+                    .sum::<usize>()
+                    > 8192
+        });
+        cosmic::task::future(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                // Wait for a cancelled old reader to drop its temporary model.
+                if let Some((_, cache)) = &cache {
+                    drop(
+                        cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    );
+                }
+                drop(previous);
+                drop(cache);
+            })
+            .await;
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            if large {
+                // Give the native view a frame to release its old widget tree.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = tokio::task::spawn_blocking(|| {
+                    // SAFETY: glibc's allocator trimming is thread-safe and
+                    // takes no application pointers. It never runs on the UI.
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
+                })
+                .await;
+            }
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            let _ = large;
+            Message::SourceControlReleased
+        })
+    }
+
     /// Runs at the tail of every update, beside the selection sync, because
     /// focus changes for reasons that are not sidebar actions: a card closing,
     /// a session restoring, a project list arriving. Rebinding drops the
@@ -10073,9 +10122,9 @@ impl Cagents {
                 self.history_ui.cancel();
                 self.history_ui.next_page_request();
             }
-            self.sidebar_model.source_control = None;
-            return Task::none();
+            return self.release_source_control();
         }
+        self.prioritize_git_watches();
         if !changed {
             return self.load_pending_history();
         }
@@ -10083,9 +10132,9 @@ impl Cagents {
         self.cancel_branch_changes();
         self.history_ui.cancel();
         self.history_ui.next_page_request();
+        let release = self.release_source_control();
         let Some(key) = self.sidebar_state.active_worktree().cloned() else {
-            self.sidebar_model.source_control = None;
-            return Task::none();
+            return release;
         };
         if self.folder_scope(&key)
             && matches!(
@@ -10102,7 +10151,7 @@ impl Cagents {
                 .map(|mutation| mutation.kind),
         );
         self.sidebar_model.source_control = Some(source);
-        self.source_control_snapshot_task(key)
+        Task::batch([release, self.source_control_snapshot_task(key)])
     }
 
     /// Asks for the first page of history once, and only once the `History`
@@ -10891,12 +10940,29 @@ impl Cagents {
         if let Some(source) = self.sidebar_model.source_control.as_mut() {
             source.set_reloading(true);
         }
+        self.refresh_ui.source_last_refresh = Instant::now();
         self.source_control_snapshot_task(key.clone())
     }
 
     fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
         if crate::device::is_remote() {
             return Task::none();
+        }
+        self.refresh_ui.source_last_refresh = Instant::now();
+        if self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .is_none_or(|source| source.data_state != sidebar::SidebarDataState::Ready)
+        {
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(3, std::sync::atomic::Ordering::AcqRel);
+        }
+        if self.refresh_ui.source_cancel.is_some() {
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
         }
         self.cancel_source_read();
         let request = self.refresh_ui.source_generation;
@@ -10941,10 +11007,11 @@ impl Cagents {
             });
         }
         let worktree = key.canonical_path.clone();
-        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
+        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked)
+            || self.context_tab == ContextTab::Files;
         let options = crate::repository::SnapshotOptions {
             untracked_changes,
-            untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
+            untracked_files: self.context_tab == ContextTab::Files,
         };
         let browse_files = self.context_tab == ContextTab::Files;
         let previous_errors = self
@@ -10959,16 +11026,59 @@ impl Cagents {
             .expanded_directory_paths()
             .cloned()
             .collect::<Vec<_>>();
+        if self
+            .refresh_ui
+            .source_cache
+            .as_ref()
+            .is_none_or(|(path, _)| path != &worktree)
+        {
+            self.refresh_ui.source_cache = Some((
+                worktree.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    crate::repository::SnapshotCache::default(),
+                )),
+            ));
+        }
+        if browse_files
+            && (self.refresh_ui.source_expanded != expanded
+                || self.refresh_ui.source_ignored_errors != previous_errors)
+        {
+            self.refresh_ui.source_expanded = expanded.clone();
+            self.refresh_ui.source_ignored_errors = previous_errors.clone();
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        let cache = self.refresh_ui.source_cache.as_ref().unwrap().1.clone();
+        let invalidated = self.refresh_ui.source_invalidated.clone();
+        let model_key = key.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
-                let mut snapshot = service
-                    .snapshot_with_options(&worktree, options, &cancellation)
-                    .map_err(|error| error.to_string())?;
+                let mut cache = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let invalidation = invalidated.swap(0, std::sync::atomic::Ordering::AcqRel);
+                if invalidation != 0 {
+                    cache.invalidate(invalidation & 2 != 0);
+                }
+                let Some(mut snapshot) = service
+                    .snapshot_cached(&worktree, options, &cancellation, &mut cache)
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(None);
+                };
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err("source-control read cancelled".to_owned());
+                }
                 if browse_files {
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| {
+                            cache.invalidate(false);
+                            error.to_string()
+                        })?;
                     snapshot.files.ignored = ignored.ignored;
                     snapshot.files.ignored_directories = ignored.ignored_directories;
                     repository_widget::expand_ignored_directories(
@@ -10977,14 +11087,20 @@ impl Cagents {
                         &expanded,
                         &previous_errors,
                         &cancellation,
-                    )?;
+                    )
+                    .inspect_err(|_| cache.invalidate(false))?;
+                    cache.observe_browse(&worktree, &snapshot.files);
                 }
-                Ok(snapshot)
+                let model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err("source-control read cancelled".to_owned());
+                }
+                Ok(Some(Box::new((snapshot, model))))
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
-            .and_then(|result| result)
-            .map(Box::new);
+            .and_then(|result| result);
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -13152,7 +13268,6 @@ impl Application for Cagents {
                 Message::ResumeConversation(_)
                 | Message::Repository(_)
                 | Message::ProjectUi(_)
-                | Message::GitUi(_)
                 | Message::SubmitWorktree => {
                     self.status = Some(TransientNotice::warning(
                         "Use Device files for remote files and Git operations",
@@ -16295,6 +16410,7 @@ impl Application for Cagents {
                 });
                 Task::none()
             }
+            Message::SourceControlReleased => Task::none(),
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -16306,7 +16422,13 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.refresh_ui.source_cancel = None;
-                if let Ok(snapshot) = &result
+                if matches!(result, Ok(None)) {
+                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                        source.set_reloading(false);
+                    }
+                    return Task::none();
+                }
+                if let Ok(Some(prepared)) = &result
                     && let Some(worktree) = self
                         .sidebar_model
                         .projects
@@ -16319,11 +16441,15 @@ impl Application for Cagents {
                                 .find(|worktree| worktree.id == key.worktree_id)
                         })
                 {
-                    worktree.apply_status(&snapshot.status);
+                    worktree.apply_status(&prepared.0.status);
                 }
-                let mut next = match &result {
-                    Ok(snapshot) => SourceControlModel::ready(key, snapshot),
-                    Err(error) => SourceControlModel::failed(key, error.clone()),
+                let (snapshot, mut next) = match result {
+                    Ok(Some(prepared)) => {
+                        let (snapshot, model) = *prepared;
+                        (Some(snapshot), model)
+                    }
+                    Ok(None) => unreachable!(),
+                    Err(error) => (None, SourceControlModel::failed(key, error)),
                 };
                 // The reload replaces the rows and nothing else: an in-flight
                 // mutation, its last failure, and the history already walked
@@ -16332,9 +16458,9 @@ impl Application for Cagents {
                     previous.carry_mutation_into(&mut next);
                 }
                 self.sidebar_model.source_control = Some(next);
-                match result {
-                    Ok(snapshot) => self.refresh_branch_changes(&snapshot),
-                    Err(_) => {
+                match snapshot {
+                    Some(snapshot) => self.refresh_branch_changes(&snapshot),
+                    None => {
                         self.cancel_branch_changes();
                         Task::none()
                     }
