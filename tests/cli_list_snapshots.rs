@@ -18,13 +18,14 @@ impl Fixture {
         let stop = Arc::new(AtomicBool::new(false)); let end = Arc::clone(&stop);
         let worker = thread::spawn(move || {
             let proof = HostSessionProof { host_session_id: HostSessionId::new("list-fixture"), boot_id: BootId::new("boot"), host_incarnation: HostIncarnation::new("incarnation") };
+            let mut registrations = 0;
             while !end.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() { Ok(client) => client, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => { thread::sleep(Duration::from_millis(2)); continue; }, Err(error) => panic!("{error}") };
                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 while let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) {
                     let response = if matches!(request.request, ClientRequest::Connect { .. }) {
                         ServerResponse::Connected { proof: proof.clone(), resumed: vec![] }
-                    } else { respond(request.request, populated) };
+                    } else { respond(request.request, populated, &mut registrations) };
                     write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(request.request_id), proof: proof.clone(), message: ServerMessage::Response { response } }).unwrap();
                 }
             }
@@ -40,14 +41,16 @@ impl Fixture {
             .current_dir(self.root.path()).stdin(Stdio::null()).arg("--no-start").args(args);
         if json_output { command.arg("--json"); }
         let result = command.output().unwrap();
-        assert!(result.status.success(), "{args:?}: {result:?}");
         result
     }
     fn json(&self, args: &[&str]) -> serde_json::Value {
-        serde_json::from_slice(&self.output(args, true).stdout).unwrap()
+        let output = self.output(args, true);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
     }
     fn human(&self, args: &[&str]) -> String {
         let result = self.output(args, false);
+        assert!(result.status.success(), "{args:?}: {result:?}");
         let output = String::from_utf8(result.stdout).unwrap();
         for debug in ["Some(", "None", "at_unix_ms", " { "] { assert!(!output.contains(debug), "{args:?}: {output}"); }
         output.trim_end().into()
@@ -55,7 +58,7 @@ impl Fixture {
 }
 impl Drop for Fixture { fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); let _ = UnixStream::connect(&self.socket); if let Some(worker) = self.worker.take() { let _ = worker.join(); } } }
 
-fn respond(request: ClientRequest, populated: bool) -> ServerResponse {
+fn respond(request: ClientRequest, populated: bool, registrations: &mut usize) -> ServerResponse {
     let terminal_id: TerminalId = ID.parse().unwrap();
     let recipe = LaunchRecipe { program: "bash".into(), arguments: vec![], working_directory: "/work/repo".into(), environment: Default::default(), unset_environment: Default::default() };
     match request {
@@ -95,6 +98,29 @@ fn respond(request: ClientRequest, populated: bool) -> ServerResponse {
             finished_ms: None, agent: None, run: None, skip: Some(automations::SkipReason::Capacity), diagnostic: None,
         }] } else { vec![] }, next: None })),
         ClientRequest::DeviceOperation { operation: cagents::device_service::Operation::AccountsRead } => ServerResponse::DeviceOperation { reply: cagents::device_service::Reply::Accounts(json!({"installed":{"Claude":populated},"registry":{"revision":1,"account":[]}})) },
+        ClientRequest::DeviceOperation { operation: cagents::device_service::Operation::AccountsUpdate { expected_revision, registry } } => {
+            assert_eq!(expected_revision, 1);
+            assert!(registry["defaults"].is_object());
+            ServerResponse::DeviceOperation { reply: cagents::device_service::Reply::AccountRegistry(json!({"revision":2})) }
+        }
+        ClientRequest::DeviceOperation { operation: cagents::device_service::Operation::AccountLifecycle { operation } } => {
+            use cagents::account::remote::Operation;
+            let value = match operation {
+                Operation::Create { .. } => json!({"key":ID,"home":"/tmp", "recipe":LaunchRecipe {
+                    program: "/bin/sh".into(), arguments: vec!["-c".into(), "printf 'official login fixture\\n'".into()],
+                    working_directory: "/tmp".into(), environment: Default::default(), unset_environment: Default::default(),
+                }}),
+                Operation::Register { provider:Provider::Codex, .. } => json!({"Abandoned":null}),
+                Operation::Register { .. } => {
+                    *registrations += 1;
+                    if *registrations > 1 { json!({"Duplicate":{"existing":"claude/system","registry":null}}) }
+                    else { json!({"Registered":{"registry":{},"identity":null,"snapshot":null}}) }
+                },
+                Operation::Remove { id } => { assert_eq!(id.as_str(), format!("claude/{ID}")); json!({"revision":2}) },
+                other => panic!("Unexpected account lifecycle request: {other:?}"),
+            };
+            ServerResponse::DeviceOperation { reply: cagents::device_service::Reply::AccountLifecycle(value) }
+        }
         other => panic!("Unexpected list fixture request: {other:?}"),
     }
 }
@@ -142,4 +168,30 @@ fn actual_cli_json_normalizes_typed_values_and_keeps_terminal_lists_lean() {
     let show = fixture.json(&["terminal", "show", ID]);
     assert!(show["data"]["terminal"]["session"]["launch"]["environment"].is_object());
     assert!(show["data"]["terminal"]["session"].get("resume_hint").is_some());
+}
+
+#[test]
+fn account_commands_use_the_shared_service_and_keep_login_progress_off_json_stdout() {
+    let fixture = Fixture::new(true);
+    let default = fixture.json(&["account", "default", "Claude", "system"]);
+    assert_eq!(default["data"]["account"], "claude/system");
+    assert_eq!(default["data"]["revision"], 2);
+    let automatic = fixture.json(&["account", "default", "claude", "automatic"]);
+    assert_eq!(automatic["data"]["automatic"], true);
+    let signed_in = fixture.output(&["account", "sign-in", "claude"], true);
+    assert!(signed_in.status.success(), "{signed_in:?}");
+    let reply: serde_json::Value = serde_json::from_slice(&signed_in.stdout).unwrap();
+    assert_eq!(reply["data"]["account"], format!("claude/{ID}"));
+    assert_eq!(reply["data"]["state"], "signed_in");
+    assert!(String::from_utf8_lossy(&signed_in.stderr).contains("official login fixture"));
+    let duplicate = fixture.json(&["account", "sign-in", "claude"]);
+    assert_eq!(duplicate["data"]["state"], "already_registered");
+    assert_eq!(duplicate["data"]["account"], "claude/system");
+    let removed = fixture.json(&["account", "remove", &format!("claude/{ID}")]);
+    assert_eq!(removed["data"]["transcript_files_retained"], true);
+    let abandoned = fixture.output(&["account", "sign-in", "codex"], true);
+    assert_eq!(abandoned.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&abandoned.stderr).lines().last().unwrap()).unwrap();
+    assert_eq!(error["error"]["kind"], "account_sign_in");
+    assert!(abandoned.stdout.is_empty(), "an unverified login must not emit success");
 }
