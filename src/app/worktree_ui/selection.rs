@@ -395,6 +395,66 @@ mod tests {
     }
 
     #[test]
+    fn pr_agent_context_waits_for_the_committed_physical_scope_before_creating_a_draft() {
+        let runtime = tempfile::tempdir().unwrap();
+        let old = tempfile::tempdir().unwrap();
+        let next = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.known_worktree_roots.extend([old.path().to_owned(), next.path().to_owned()]);
+        drop(app.select_worktree_inner(old.path().to_owned(), false));
+        app.worktree_protections.install_prepared(Some(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), old.path(), false).unwrap(),
+        ));
+        app.worktree_selection.cancel();
+        app.worktree_selection.pending = true;
+        let generation = app.worktree_selection.generation;
+        let epoch = app.worktree_owner_paths.invalidate_watched();
+        let monitor = app.worktree_owner_paths.watch.clone();
+        let roots = vec![(old.path().to_owned(), None, true), (next.path().to_owned(), None, true)];
+        let worker_runtime = runtime.path().to_owned();
+        let before = app.durable.cards.len();
+        let (entered, entered_rx) = crossbeam_channel::bounded(1);
+        let (release, release_rx) = crossbeam_channel::bounded(1);
+        let intent = Intent::PrAgentContext {
+            worktree: next.path().to_owned(), card: None,
+            prompt: "Review these selected pull request threads".into(),
+            provider: crate::agent::Provider::Codex,
+        };
+        let task = app.prepare_worktree_selection(generation, next.path().to_owned(), false, intent, epoch, move |path| {
+            prepare_target(path, roots, None, &monitor, |path| path.canonicalize(), |physical| {
+                entered.send(()).unwrap();
+                release_rx.recv().unwrap();
+                crate::worktree_cleanup::fixture_protection(&worker_runtime, physical, false).map(Some)
+            })
+        });
+        let worker = std::thread::spawn(move || crate::app::tests::task_app_message(task));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(app.active_workspace.as_deref(), Some(old.path()));
+        assert_eq!(app.durable.cards.len(), before);
+        assert!(matches!(crate::worktree_cleanup::fixture_protection(runtime.path(), old.path(), true),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        release.send(()).unwrap();
+        let Message::WorktreeSelectionPrepared { generation, create, receipt } = worker.join().unwrap()
+            else { panic!("unexpected PR context receipt") };
+        assert_eq!(app.durable.cards.len(), before, "a prepared receipt has not committed its destination");
+        drop(app.worktree_selection_prepared(generation, create, receipt.clone()));
+        assert_eq!(app.active_workspace.as_deref(), Some(next.path()));
+        assert_eq!(app.worktree_selection.generation, generation, "staging must not select again");
+        assert!(!app.worktree_selection.pending);
+        let card = app.workspace.focused().unwrap();
+        let CardKind::Chat(session) = &app.card_state(card).unwrap().kind else { panic!("context was not staged in a chat") };
+        assert_eq!(session.launch.recipe.working_directory, next.path());
+        assert_eq!(session.launch.provider, crate::agent::Provider::Codex);
+        assert_eq!(app.persistent_workspace().chat_drafts[&card], "Review these selected pull request threads");
+        assert!(!app.chat_start_pending(card));
+        let count = app.durable.cards.len();
+        drop(app.worktree_selection_prepared(generation, create, receipt));
+        assert_eq!(app.durable.cards.len(), count, "a duplicate receipt must not create another draft");
+        assert!(matches!(crate::worktree_cleanup::fixture_protection(runtime.path(), next.path(), true),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
     fn failed_watch_does_not_invalidate_every_prepared_selection_receipt() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.worktree_owner_paths.watch.force_unavailable_for_test();

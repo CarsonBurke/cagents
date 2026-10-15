@@ -4078,42 +4078,16 @@ impl Cagents {
         // A hydrated older transcript must not outrank a newer draft merely
         // because the draft has not received a timestamped provider item.
         let existing = candidates.max_by_key(|(index, _)| *index).map(|(_, card)| card.id);
-        let (card, open) = match existing {
-            Some(card) => {
-                let channel = self.durable.channels.iter().find(|channel| channel.cards.contains(&card)).map(|channel| channel.id);
-                let open = match channel {
-                    Some(channel) => self.select_channel(channel),
-                    None => self.select_worktree(worktree.clone(), false),
-                };
-                (card, open)
-            }
-            None => {
-                let open = self.new_native_chat(self.preferred_chat_provider(), Some(worktree.clone()));
-                let Some(card) = self.workspace.focused().filter(|card| matches!(self.card_state(*card).map(|state| &state.kind),
-                    Some(CardKind::Chat(session)) if session.launch.recipe.working_directory == worktree)) else { return open; };
-                (card, open)
-            }
+        let provider = self.preferred_chat_provider();
+        let channel = existing.and_then(|card| self.durable.channels.iter()
+            .find(|channel| channel.cards.contains(&card)).map(|channel| channel.id));
+        let intent = worktree_ui::selection::Intent::PrAgentContext {
+            worktree: worktree.clone(), card: existing, prompt, provider,
         };
-        self.chat_ui.default_chats.remove(&card);
-        let runtime = match self.cards.get_mut(&card) {
-            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_mut()),
-            _ => self.chat_ui.parked.get_mut(&card).map(Box::as_mut),
-        };
-        if let Some(runtime) = runtime {
-            let mut draft = runtime.unsent_text();
-            if !draft.trim().is_empty() { draft.push_str("\n\n"); }
-            draft.push_str(&prompt);
-            runtime.history_cursor = None;
-            runtime.history_stash = None;
-            runtime.replace_draft(text_editor::Content::with_text(&draft));
-        } else {
-            let draft = self.chat_ui.drafts.entry(card).or_default();
-            if !draft.trim().is_empty() { draft.push_str("\n\n"); }
-            draft.push_str(&prompt);
+        match channel {
+            Some(channel) => self.select_channel_then(channel, intent),
+            None => self.select_worktree_then(worktree, false, intent),
         }
-        self.persist();
-        let focus = self.focus_workspace_card(card);
-        Task::batch([open, focus, iced::widget::operation::focus(card_control_id(card, "chat-composer")).map(cosmic::Action::App)])
     }
 
     /// Stage prepared forge context after the owning scope and physical lease
