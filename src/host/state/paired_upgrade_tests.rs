@@ -925,7 +925,7 @@ fn restore_missing_native_with_carried_scope(
     };
     let unattached = Store::open(&store_root).unwrap().unattached().unwrap();
     assert_eq!(unattached.len(), 1);
-    assert_eq!(unattached[0].summary.id, native_id);
+    assert_eq!(unattached[0].id, native_id);
     let selected = PathBuf::from(&effective.environment["CODEX_HOME"]);
     let account = crate::account::Account::linked(Provider::Codex, uuid::Uuid::new_v4(), selected);
     let account_store = crate::account::registry::Store::at(root.join("account-registry"));
