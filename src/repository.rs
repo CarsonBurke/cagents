@@ -9249,6 +9249,67 @@ mod tests {
             (entry.added_lines, entry.removed_lines)
         }
 
+        fn assert_numstat_child(mut command: std::process::Command, evidence: tempfile::TempDir) {
+            struct OriginalChild {
+                child: std::process::Child,
+                reaped: bool,
+            }
+            impl Drop for OriginalChild {
+                fn drop(&mut self) {
+                    if !self.reaped {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                    }
+                }
+            }
+            let stdout_path = evidence.path().join("stdout.log");
+            let stderr_path = evidence.path().join("stderr.log");
+            command.stdin(std::process::Stdio::null())
+                .stdout(fs::File::create(&stdout_path).unwrap())
+                .stderr(fs::File::create(&stderr_path).unwrap());
+            let child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    let path = evidence.keep();
+                    panic!("could not spawn numstat child: {error}; private evidence: {}", path.display());
+                }
+            };
+            let mut original = OriginalChild { child, reaped: false };
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let result = loop {
+                match original.child.try_wait() {
+                    Ok(Some(status)) => {
+                        original.reaped = true;
+                        break Ok(status);
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) => break Err("numstat child exceeded its 30-second deadline".to_owned()),
+                    Err(error) => break Err(format!("could not observe numstat child: {error}")),
+                }
+            };
+            if !original.reaped {
+                let _ = original.child.kill();
+                original.reaped = original.child.wait().is_ok();
+            }
+            let read_output = |path: &Path| {
+                let file = fs::File::open(path).unwrap();
+                assert!(file.metadata().unwrap().is_file());
+                let mut output = Vec::new();
+                file.take(64 * 1024).read_to_end(&mut output).unwrap();
+                String::from_utf8_lossy(&output).into_owned()
+            };
+            let stdout = read_output(&stdout_path);
+            let stderr = read_output(&stderr_path);
+            if !result.as_ref().is_ok_and(|status| status.success())
+                || !stdout.contains("test result: ok. 1 passed;")
+            {
+                let path = evidence.keep();
+                panic!("numstat child failed: {result:?}; private evidence: {}\nstdout (first 64 KiB):\n{stdout}\nstderr (first 64 KiB):\n{stderr}", path.display());
+            }
+        }
+
         #[test]
         fn cached_numstat_reads_only_changed_literal_paths_and_repairs_missed_events() {
             let directory = tempfile::tempdir().unwrap();
@@ -9783,16 +9844,11 @@ mod tests {
                 cached_numstat_observes_loose_and_packed_replacement_objects();
                 return;
             }
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "repository::tests::git_contracts::cached_numstat_custom_replacement_prefix_reconciles_in_isolated_process", "--nocapture"])
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "repository::tests::git_contracts::cached_numstat_custom_replacement_prefix_reconciles_in_isolated_process", "--nocapture"])
                 .env(CHILD, "1").env("GIT_REPLACE_REF_BASE", "refs/replacement-")
-                .env_remove("GIT_NO_REPLACE_OBJECTS").output().unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success() && stdout.contains("1 passed"),
-                "replacement namespace child failed: {stdout}\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+                .env_remove("GIT_NO_REPLACE_OBJECTS");
+            assert_numstat_child(command, tempfile::tempdir().unwrap());
         }
 
         #[test]
@@ -9915,22 +9971,15 @@ mod tests {
                 let directory = tempfile::tempdir().unwrap();
                 let home = directory.path().join(OsString::from_vec(b"home-\xff".to_vec()));
                 fs::create_dir(&home).unwrap();
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args([
                         "--exact",
                         "repository::tests::git_contracts::cached_numstat_expands_missing_includes_with_a_non_utf8_home",
                         "--nocapture",
                     ])
                     .env(CHILD, "1")
-                    .env("HOME", &home)
-                    .output()
-                    .unwrap();
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                assert!(
-                    output.status.success() && stdout.contains("1 passed"),
-                    "non-UTF8 home child failed: {stdout}\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                    .env("HOME", &home);
+                assert_numstat_child(command, directory);
                 return;
             }
             let directory = tempfile::tempdir().unwrap();
