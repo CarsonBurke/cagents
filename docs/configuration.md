@@ -317,6 +317,11 @@ the daemon resolves the current saved execution policy and records the actual
 launch recipe. Changing execution preferences does not replace an already
 issued conversation's recorded recipe.
 
+Configured unsent drafts stay private to their window. **New Window** copies
+these choices into a separate draft; starting one copy does not replace the
+other. After the daemon starts a conversation, it follows ordinary shared-pane
+behavior.
+
 The Settings pane edits this window's local settings file. When connected to a
 remote device, its provider execution policy and terminal shell come from that
 remote installation's settings file. Editing local executable, argument,
