@@ -360,9 +360,18 @@ impl Cagents {
                     .project(&canonical)
                     .map(|project| project.kind)
             });
+        let known_checkout = self.known_project_checkout(&canonical, project_id);
+        let expected_repository = known_checkout.as_ref().map(|(_, repository)| repository.clone());
+        let path = known_checkout.map_or(path, |(checkout, _)| checkout);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                load_project(&path, Some(project_id), cancellation, kind)
+                let loaded = load_project(&path, Some(project_id), cancellation, kind)?;
+                if let Some(expected) = expected_repository
+                    && loaded.project.repository != expected
+                {
+                    return Err(format!("Checkout {} belongs to {}, expected {}", path.display(), loaded.project.repository.display(), expected.display()));
+                }
+                Ok(loaded)
             })
             .await
             .map_err(|error| format!("repository loader join failed: {error}"))
