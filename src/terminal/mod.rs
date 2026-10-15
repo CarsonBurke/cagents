@@ -66,7 +66,9 @@ pub(crate) use widget::ReviewInputBarrier;
 #[cfg(all(test, feature = "ui"))]
 pub(crate) use widget::accessibility_tests::Peer as TerminalTestPeer;
 #[cfg(all(test, feature = "ui"))]
-pub(crate) use widget::accessibility_tests::{HeldKeyPeer as TerminalHeldKeyTestPeer, hold_key_in_widget};
+pub(crate) use widget::accessibility_tests::{
+    HeldKeyPeer as TerminalHeldKeyTestPeer, hold_key_in_widget,
+};
 #[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};
 #[cfg(feature = "host")]

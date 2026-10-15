@@ -1085,7 +1085,9 @@ struct WidgetState {
 
 impl Drop for WidgetState {
     fn drop(&mut self) {
-        if let Some((barrier,surface))=&self.key_owner { barrier.unmounted(surface); }
+        if let Some((barrier, surface)) = &self.key_owner {
+            barrier.unmounted(surface);
+        }
     }
 }
 
@@ -1619,7 +1621,8 @@ impl<Message> TerminalWidget<Message> {
         }
     }
     fn publish_review(&self, active: bool, shell: &mut Shell<'_, Message>) {
-        self.review_input_barrier.note_review(self.terminal_identity,active);
+        self.review_input_barrier
+            .note_review(self.terminal_identity, active);
         if let Some(callback) = &self.on_review {
             shell.publish(callback(active));
         }
@@ -1768,7 +1771,10 @@ impl<Message> TerminalWidget<Message> {
 
     /// Window activation gates input without destroying the native widget's
     /// logical focus while an inactive-window view is rebuilt.
-    pub fn window_focused(mut self, focused: bool) -> Self { self.window_focused=focused; self }
+    pub fn window_focused(mut self, focused: bool) -> Self {
+        self.window_focused = focused;
+        self
+    }
 
     pub fn model_focused(mut self, focused: bool) -> Self {
         self.model_focused = focused;
@@ -1861,26 +1867,52 @@ impl<Message> TerminalWidget<Message> {
         if self.read_only || self.suppress_focus_reports || state.a11y.borrow().review {
             return;
         }
-        state.input_keys.retain(|(physical,_)| self.review_input_barrier.owns_admitted(*physical,&self.handle));
-        state.released_during_review.retain(|(physical,_)| state.input_keys.iter().any(|(key,_)| key==physical));
+        state.input_keys.retain(|(physical, _)| {
+            self.review_input_barrier
+                .owns_admitted(*physical, &self.handle)
+        });
+        state
+            .released_during_review
+            .retain(|(physical, _)| state.input_keys.iter().any(|(key, _)| key == physical));
         let mut index = 0;
         while index < state.input_keys.len() {
             let (physical, mut input) = state.input_keys[index].clone();
-            let pending = state.released_during_review.iter().position(|(key, _)| key == &physical);
-            if self.keyboard_focused(state) && pending.is_none() { index += 1; continue; }
-            if let Some(pending) = pending { input.modifiers = state.released_during_review[pending].1; }
+            let pending = state
+                .released_during_review
+                .iter()
+                .position(|(key, _)| key == &physical);
+            if self.keyboard_focused(state) && pending.is_none() {
+                index += 1;
+                continue;
+            }
+            if let Some(pending) = pending {
+                input.modifiers = state.released_during_review[pending].1;
+            }
             input.action = KeyAction::Release;
             input.text = None;
-            match self.review_input_barrier.release(physical, &self.handle, input) {
+            match self
+                .review_input_barrier
+                .release(physical, &self.handle, input)
+            {
                 Ok(()) => {
                     state.input_keys.swap_remove(index);
-                    if let Some(pending) = pending { state.released_during_review.swap_remove(pending); }
-                    if !state.released_on_blur.contains(&physical) { state.released_on_blur.push(physical); }
+                    if let Some(pending) = pending {
+                        state.released_during_review.swap_remove(pending);
+                    }
+                    if !state.released_on_blur.contains(&physical) {
+                        state.released_on_blur.push(physical);
+                    }
                 }
-                Err(error) => { self.publish_error(error, shell); index += 1; shell.request_redraw(); }
+                Err(error) => {
+                    self.publish_error(error, shell);
+                    index += 1;
+                    shell.request_redraw();
+                }
             }
         }
-        if state.input_keys.is_empty() { state.key_owner=None; }
+        if state.input_keys.is_empty() {
+            state.key_owner = None;
+        }
     }
 
     fn synchronize_focus(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
@@ -2271,7 +2303,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
 
     fn diff(&mut self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<WidgetState>();
-        if !self.model_focused { state.input_focused = false; state.preedit = None; }
+        if !self.model_focused {
+            state.input_focused = false;
+            state.preedit = None;
+        }
         if self.on_review.is_some() {
             self.reconcile_review(state);
         }
@@ -2330,24 +2365,45 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.padding,
         );
         let state = tree.state.downcast_mut::<WidgetState>();
-        if state.key_owner.as_ref().is_some_and(|(_,surface)| !surface.same_attachment(&self.handle)) {
-            if let Some((barrier,surface))=state.key_owner.take() { barrier.unmounted(&surface); }
-            state.input_keys.clear(); state.released_during_review.clear(); state.released_on_blur.clear();
+        if state
+            .key_owner
+            .as_ref()
+            .is_some_and(|(_, surface)| !surface.same_attachment(&self.handle))
+        {
+            if let Some((barrier, surface)) = state.key_owner.take() {
+                barrier.unmounted(&surface);
+            }
+            state.input_keys.clear();
+            state.released_during_review.clear();
+            state.released_on_blur.clear();
         }
         if self.read_only && !state.input_keys.is_empty() {
-            if let Some((barrier,surface))=state.key_owner.take() { barrier.unmounted(&surface); }
-            state.input_keys.clear(); state.released_during_review.clear();
+            if let Some((barrier, surface)) = state.key_owner.take() {
+                barrier.unmounted(&surface);
+            }
+            state.input_keys.clear();
+            state.released_during_review.clear();
         }
-        self.review_input_barrier.flush_orphans(self.suppress_focus_reports || self.review_active || state.a11y.borrow().review);
-        if !self.model_focused { state.input_focused = false; state.preedit = None; }
+        self.review_input_barrier.flush_orphans(
+            self.suppress_focus_reports || self.review_active || state.a11y.borrow().review,
+        );
+        if !self.model_focused {
+            state.input_focused = false;
+            state.preedit = None;
+        }
         match event {
-            Event::Window(window::Event::Unfocused) => { state.window_unfocused = true; state.preedit = None; }
+            Event::Window(window::Event::Unfocused) => {
+                state.window_unfocused = true;
+                state.preedit = None;
+            }
             Event::Window(window::Event::Focused) => state.window_unfocused = false,
             _ => {}
         }
         if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
             state.input_focused = cursor.is_over(bounds);
-            if !state.input_focused { state.preedit = None; }
+            if !state.input_focused {
+                state.preedit = None;
+            }
         }
         {
             let mut a11y = state.a11y.borrow_mut();
@@ -2529,13 +2585,22 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         let was_review = state.a11y.borrow().review;
         let consumed_review_input = review_target && state.a11y.borrow_mut().review_input(event);
         if consumed_review_input {
-            if let Event::Keyboard(keyboard::Event::KeyReleased { physical_key, modifiers, .. }) = event
+            if let Event::Keyboard(keyboard::Event::KeyReleased {
+                physical_key,
+                modifiers,
+                ..
+            }) = event
                 && state.input_keys.iter().any(|(key, _)| key == physical_key)
-                && !state.released_during_review.iter().any(|(key, _)| key == physical_key)
+                && !state
+                    .released_during_review
+                    .iter()
+                    .any(|(key, _)| key == physical_key)
             {
                 // Review emits no PTY commands. Remember releases belonging to
                 // previously admitted presses and pair them after mode exit.
-                state.released_during_review.push((*physical_key, map_iced_modifiers(*modifiers)));
+                state
+                    .released_during_review
+                    .push((*physical_key, map_iced_modifiers(*modifiers)));
             }
             self.review_active = state.a11y.borrow().review;
             if was_review && !state.a11y.borrow().review {
@@ -2734,10 +2799,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 );
                 input.key = map_key_location(input.key, key, *location);
                 input.scroll_to_bottom_on_input = self.scroll_to_bottom_on_input;
-                match self.review_input_barrier.press(*physical_key, &self.handle, input.clone()) {
+                match self
+                    .review_input_barrier
+                    .press(*physical_key, &self.handle, input.clone())
+                {
                     Ok(()) => {
-                        state.key_owner=Some((self.review_input_barrier.clone(),self.handle.clone()));
-                        if let Some(index) = state.input_keys.iter().position(|(key, _)| key == physical_key) {
+                        state.key_owner =
+                            Some((self.review_input_barrier.clone(), self.handle.clone()));
+                        if let Some(index) = state
+                            .input_keys
+                            .iter()
+                            .position(|(key, _)| key == physical_key)
+                        {
                             state.input_keys[index].1 = input;
                         } else {
                             state.input_keys.push((*physical_key, input));
@@ -2756,9 +2829,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             }) if self.keyboard_focused(state)
                 || state.input_keys.iter().any(|(key, _)| key == physical_key)
                 || state.released_on_blur.contains(physical_key)
-                || state.shortcut_keys.contains(physical_key) => {
+                || state.shortcut_keys.contains(physical_key) =>
+            {
                 state.modifiers = map_iced_modifiers(*modifiers);
-                if let Some(index) = state.released_on_blur.iter().position(|key| key == physical_key) {
+                if let Some(index) = state
+                    .released_on_blur
+                    .iter()
+                    .position(|key| key == physical_key)
+                {
                     state.released_on_blur.swap_remove(index);
                     shell.capture_event();
                     return;
@@ -2793,17 +2871,28 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
-                let Some(index) = state.input_keys.iter().position(|(key, _)| key == physical_key) else { return; };
+                let Some(index) = state
+                    .input_keys
+                    .iter()
+                    .position(|(key, _)| key == physical_key)
+                else {
+                    return;
+                };
                 let mut input = state.input_keys[index].1.clone();
                 input.action = KeyAction::Release;
                 input.text = None;
                 input.modifiers = map_iced_modifiers(*modifiers);
-                match self.review_input_barrier.release(*physical_key, &self.handle, input) {
+                match self
+                    .review_input_barrier
+                    .release(*physical_key, &self.handle, input)
+                {
                     Ok(()) => {
                         state.input_keys.swap_remove(index);
-                        if state.input_keys.is_empty() { state.key_owner=None; }
+                        if state.input_keys.is_empty() {
+                            state.key_owner = None;
+                        }
                         shell.capture_event();
-                    },
+                    }
                     Err(error) => self.publish_error(error, shell),
                 }
             }
@@ -3120,38 +3209,40 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 // one, so exactly one card claims the composition target.
                 shell.request_input_method(&self.input_method(state, geometry));
             }
-            Event::InputMethod(event) if self.keyboard_focused(state) && !self.read_only => match event {
-                input_method::Event::Opened => {
-                    state.preedit = Some(input_method::Preedit::new());
-                    shell.request_redraw();
-                }
-                input_method::Event::Closed => {
-                    state.preedit = None;
-                    shell.request_redraw();
-                }
-                input_method::Event::Preedit(content, selection) => {
-                    state.preedit = Some(input_method::Preedit {
-                        content: content.clone(),
-                        selection: selection.clone(),
-                        text_size: Some(Pixels(self.font_size)),
-                    });
-                    shell.request_redraw();
-                }
-                input_method::Event::Commit(text) => {
-                    state.preedit = None;
-                    // Composition is over, so the child receives exactly the
-                    // bytes a keyboard able to type this would have sent. It
-                    // deliberately bypasses key encoding: composed text has no
-                    // key of its own to encode.
-                    if !text.is_empty()
-                        && let Err(error) = self.handle.input(text.clone().into_bytes())
-                    {
-                        self.publish_error(error, shell);
+            Event::InputMethod(event) if self.keyboard_focused(state) && !self.read_only => {
+                match event {
+                    input_method::Event::Opened => {
+                        state.preedit = Some(input_method::Preedit::new());
+                        shell.request_redraw();
                     }
-                    shell.capture_event();
-                    shell.request_redraw();
+                    input_method::Event::Closed => {
+                        state.preedit = None;
+                        shell.request_redraw();
+                    }
+                    input_method::Event::Preedit(content, selection) => {
+                        state.preedit = Some(input_method::Preedit {
+                            content: content.clone(),
+                            selection: selection.clone(),
+                            text_size: Some(Pixels(self.font_size)),
+                        });
+                        shell.request_redraw();
+                    }
+                    input_method::Event::Commit(text) => {
+                        state.preedit = None;
+                        // Composition is over, so the child receives exactly the
+                        // bytes a keyboard able to type this would have sent. It
+                        // deliberately bypasses key encoding: composed text has no
+                        // key of its own to encode.
+                        if !text.is_empty()
+                            && let Err(error) = self.handle.input(text.clone().into_bytes())
+                        {
+                            self.publish_error(error, shell);
+                        }
+                        shell.capture_event();
+                        shell.request_redraw();
+                    }
                 }
-            },
+            }
             _ => {}
         }
     }
@@ -3356,7 +3447,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     .filter(|cursor| {
                         !self.read_only
                             && cursor.visible
-                            && !(self.keyboard_focused(state) && cursor.blinking && state.cursor_dark)
+                            && !(self.keyboard_focused(state)
+                                && cursor.blinking
+                                && state.cursor_dark)
                     })
                     .and_then(|cursor| {
                         geometry

@@ -159,30 +159,62 @@ struct KeyAuthority {
 }
 impl KeyAuthority {
     fn capture(surface: &super::TerminalSurface) -> Option<Self> {
-        let worker = surface.execution_instance().filter(|worker| !worker.is_nil())?;
+        let worker = surface
+            .execution_instance()
+            .filter(|worker| !worker.is_nil())?;
         let host = surface.host_proof().filter(|host| host.is_complete())?;
-        Some(Self { terminal: surface.terminal_id(), worker, host })
+        Some(Self {
+            terminal: surface.terminal_id(),
+            worker,
+            host,
+        })
     }
-    fn receipt(surface: &super::TerminalSurface, binding: &crate::terminal::HostedTerminalBinding, host: crate::model::HostSessionProof) -> Option<Self> {
+    fn receipt(
+        surface: &super::TerminalSurface,
+        binding: &crate::terminal::HostedTerminalBinding,
+        host: crate::model::HostSessionProof,
+    ) -> Option<Self> {
         // This proof was captured by the transport at matched Accepted, before
         // publishing the immutable result. A live getter can be None after a
         // subsequent disconnect and cannot erase the admitted press.
-        if binding.source.id != surface.terminal_id() || binding.execution_instance.is_nil() || !host.is_complete() { return None; }
-        if surface.execution_instance().filter(|worker| !worker.is_nil()).is_some_and(|worker| worker != binding.execution_instance) { return None; }
-        Some(Self { terminal: binding.source.id, worker: binding.execution_instance, host })
+        if binding.source.id != surface.terminal_id()
+            || binding.execution_instance.is_nil()
+            || !host.is_complete()
+        {
+            return None;
+        }
+        if surface
+            .execution_instance()
+            .filter(|worker| !worker.is_nil())
+            .is_some_and(|worker| worker != binding.execution_instance)
+        {
+            return None;
+        }
+        Some(Self {
+            terminal: binding.source.id,
+            worker: binding.execution_instance,
+            host,
+        })
     }
 }
 impl ConsumedInputs {
     fn failure(&mut self, reason: String) {
         tracing::warn!(%reason, "terminal key admission failed or was not confirmed");
-        if self.closing && self.exit_failures.len() < 8 && !self.exit_failures.contains(&reason) { self.exit_failures.push(reason.clone()); }
-        if self.failures.len() < 8 && !self.failures.contains(&reason) { self.failures.push(reason); }
+        if self.closing && self.exit_failures.len() < 8 && !self.exit_failures.contains(&reason) {
+            self.exit_failures.push(reason.clone());
+        }
+        if self.failures.len() < 8 && !self.failures.contains(&reason) {
+            self.failures.push(reason);
+        }
     }
     fn reap(&mut self) {
         let mut failures = Vec::new();
         self.retiring.retain(|key| match key.receipt.try_recv() {
             Ok(Ok(_)) => false,
-            Ok(Err(reason)) => { failures.push(reason); false }
+            Ok(Err(reason)) => {
+                failures.push(reason);
+                false
+            }
             Err(_) => true,
         });
         self.owned.retain_mut(|key| {
@@ -205,9 +237,13 @@ impl ConsumedInputs {
                 true
             }
         }});
-        for reason in failures { self.failure(reason); }
+        for reason in failures {
+            self.failure(reason);
+        }
     }
-    fn occupied(&self) -> usize { self.owned.len() + self.retiring.len() }
+    fn occupied(&self) -> usize {
+        self.owned.len() + self.retiring.len()
+    }
 }
 /// One barrier per application window, shared across mounted cards and retained
 /// while cards unmount. A review key-up must not become input to a new focus.
@@ -215,51 +251,107 @@ impl ConsumedInputs {
 pub(crate) struct ReviewInputBarrier(Arc<Mutex<ConsumedInputs>>);
 impl ReviewInputBarrier {
     pub(crate) fn note_review(&self, terminal: crate::model::TerminalId, active: bool) {
-        let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
-        if shared.closing { return; }
-        if active { shared.native_review=Some(terminal); }
-        else if shared.native_review==Some(terminal) { shared.native_review=None; }
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if shared.closing {
+            return;
+        }
+        if active {
+            shared.native_review = Some(terminal);
+        } else if shared.native_review == Some(terminal) {
+            shared.native_review = None;
+        }
     }
-    pub(crate) fn confirm_review(&self, previous: Option<crate::model::TerminalId>, current: Option<crate::model::TerminalId>) {
-        let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
-        if shared.closing { return; }
-        if current.is_some() || shared.native_review==previous { shared.native_review=current; }
+    pub(crate) fn confirm_review(
+        &self,
+        previous: Option<crate::model::TerminalId>,
+        current: Option<crate::model::TerminalId>,
+    ) {
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if shared.closing {
+            return;
+        }
+        if current.is_some() || shared.native_review == previous {
+            shared.native_review = current;
+        }
     }
     /// Queues both initial presses and repeats under the window ownership
     /// budget. Repeats depend on the original press and never replace its
     /// admission evidence, including when a repeat itself is refused.
-    pub(super) fn press(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface, input: super::KeyInput) -> Result<(), super::TerminalSendError> {
+    pub(super) fn press(
+        &self,
+        physical: keyboard::key::Physical,
+        surface: &super::TerminalSurface,
+        input: super::KeyInput,
+    ) -> Result<(), super::TerminalSendError> {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         shared.reap();
-        if shared.closing { return Err(super::TerminalSendError::Closed); }
-        if shared.occupied() >= MAX_OWNED_KEYS { return Err(super::TerminalSendError::Full); }
+        if shared.closing {
+            return Err(super::TerminalSendError::Closed);
+        }
+        if shared.occupied() >= MAX_OWNED_KEYS {
+            return Err(super::TerminalSendError::Full);
+        }
         if let Some(key) = shared.owned.iter().find(|key| key.physical == physical) {
-            if key.orphaned || !key.surface.same_attachment(surface) { return Err(super::TerminalSendError::Full); }
+            if key.orphaned || !key.surface.same_attachment(surface) {
+                return Err(super::TerminalSendError::Full);
+            }
             let receipt = surface.key_after_receipt(input, &key.press)?;
-            shared.retiring.push(RetiringKey { _surface: surface.clone(), receipt });
+            shared.retiring.push(RetiringKey {
+                _surface: surface.clone(),
+                receipt,
+            });
             return Ok(());
         }
         let authority = KeyAuthority::capture(surface);
         let press = surface.key_with_receipt(input.clone())?;
-        shared.owned.push(OwnedKey { physical, surface: surface.clone(), authority, press, confirmed: false, input, orphaned: false });
+        shared.owned.push(OwnedKey {
+            physical,
+            surface: surface.clone(),
+            authority,
+            press,
+            confirmed: false,
+            input,
+            orphaned: false,
+        });
         Ok(())
     }
-    pub(super) fn owns_admitted(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface) -> bool {
+    pub(super) fn owns_admitted(
+        &self,
+        physical: keyboard::key::Physical,
+        surface: &super::TerminalSurface,
+    ) -> bool {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         shared.reap();
-        shared.owned.iter().any(|key| key.physical == physical && key.surface.same_attachment(surface))
+        shared
+            .owned
+            .iter()
+            .any(|key| key.physical == physical && key.surface.same_attachment(surface))
     }
     /// Local enqueue moves a lease to retiring, rather than declaring it
     /// delivered. The transport retains the actor until the exact worker ACKs
     /// or permanently fails. A later press of this physical key is independent.
-    pub(super) fn release(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface, input: super::KeyInput) -> Result<(), super::TerminalSendError> {
+    pub(super) fn release(
+        &self,
+        physical: keyboard::key::Physical,
+        surface: &super::TerminalSurface,
+        input: super::KeyInput,
+    ) -> Result<(), super::TerminalSendError> {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         shared.reap();
-        let Some(index) = shared.owned.iter().position(|key| key.physical == physical && key.surface.same_attachment(surface)) else { return Ok(()); };
+        let Some(index) = shared
+            .owned
+            .iter()
+            .position(|key| key.physical == physical && key.surface.same_attachment(surface))
+        else {
+            return Ok(());
+        };
         let key = &shared.owned[index];
         match surface.key_after_receipt(input, &key.press) {
             Ok(receipt) => {
-                shared.retiring.push(RetiringKey { _surface: surface.clone(), receipt });
+                shared.retiring.push(RetiringKey {
+                    _surface: surface.clone(),
+                    receipt,
+                });
                 shared.owned.swap_remove(index);
                 Ok(())
             }
@@ -286,14 +378,17 @@ impl ReviewInputBarrier {
         shared.closing = true;
         shared.native_review = None;
         shared.reap();
-        for key in &mut shared.owned { key.orphaned = true; }
+        for key in &mut shared.owned {
+            key.orphaned = true;
+        }
         shared.occupied() != 0
     }
     /// One bounded task per closing window, never one thread per key. The
     /// short retry exists only during exit: an ordinary untracked command can
     /// fill the client inbox without producing a key receipt to await.
     pub(crate) async fn drain_window_exit(&self) -> Vec<String> {
-        self.drain_window_exit_until(Instant::now() + Duration::from_secs(6)).await
+        self.drain_window_exit_until(Instant::now() + Duration::from_secs(6))
+            .await
     }
     #[cfg(test)]
     pub(super) async fn drain_window_exit_for_test(&self, budget: Duration) -> Vec<String> {
@@ -305,12 +400,22 @@ impl ReviewInputBarrier {
             let pending = {
                 let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
                 shared.reap();
-                if shared.occupied() == 0 { return std::mem::take(&mut shared.exit_failures); }
-                if Instant::now() < deadline { None } else {
+                if shared.occupied() == 0 {
+                    return std::mem::take(&mut shared.exit_failures);
+                }
+                if Instant::now() < deadline {
+                    None
+                } else {
                     let mut surfaces = Vec::<super::TerminalSurface>::new();
-                    for surface in shared.owned.iter().map(|key| &key.surface)
-                        .chain(shared.retiring.iter().map(|key| &key._surface)) {
-                        if !surfaces.iter().any(|old| old.same_attachment(surface)) { surfaces.push(surface.clone()); }
+                    for surface in shared
+                        .owned
+                        .iter()
+                        .map(|key| &key.surface)
+                        .chain(shared.retiring.iter().map(|key| &key._surface))
+                    {
+                        if !surfaces.iter().any(|old| old.same_attachment(surface)) {
+                            surfaces.push(surface.clone());
+                        }
                     }
                     Some(surfaces)
                 }
@@ -319,7 +424,9 @@ impl ReviewInputBarrier {
                 let reason = "terminal key releases were not confirmed before window exit; the original attachments were disconnected without claiming delivery";
                 // This disconnects only the original UI actors, never the
                 // daemon-owned PTYs. No old command can replay after failure.
-                for surface in surfaces { surface.abandon_key_delivery(reason); }
+                for surface in surfaces {
+                    surface.abandon_key_delivery(reason);
+                }
                 let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
                 shared.reap();
                 shared.owned.clear();
@@ -336,23 +443,37 @@ impl ReviewInputBarrier {
         std::mem::take(&mut shared.failures)
     }
     pub(super) fn unmounted(&self, surface: &super::TerminalSurface) {
-        let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
-        let ConsumedInputs { owned,keys,.. }=&mut *shared;
-        for key in owned.iter_mut().filter(|key| key.surface.same_attachment(surface)) {
-            key.orphaned=true;
-            if !keys.contains(&key.physical) { keys.push(key.physical); }
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let ConsumedInputs { owned, keys, .. } = &mut *shared;
+        for key in owned
+            .iter_mut()
+            .filter(|key| key.surface.same_attachment(surface))
+        {
+            key.orphaned = true;
+            if !keys.contains(&key.physical) {
+                keys.push(key.physical);
+            }
         }
     }
     /// Runs at the window keyboard boundary too, so releases remain owned even
     /// when no terminal widget is mounted. Existing mounted widgets retire
     /// their own pairs before this application message is dispatched.
     pub(crate) fn observe_key_event(&self, event: &keyboard::Event) {
-        if let keyboard::Event::KeyReleased { physical_key,modifiers,.. }=event {
-            let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
-            shared.keys.retain(|key| key!=physical_key);
-            if let Some(key)=shared.owned.iter_mut().find(|key| key.orphaned && key.physical==*physical_key) {
-                key.orphaned=true;
-                key.input.modifiers=super::map_iced_modifiers(*modifiers);
+        if let keyboard::Event::KeyReleased {
+            physical_key,
+            modifiers,
+            ..
+        } = event
+        {
+            let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            shared.keys.retain(|key| key != physical_key);
+            if let Some(key) = shared
+                .owned
+                .iter_mut()
+                .find(|key| key.orphaned && key.physical == *physical_key)
+            {
+                key.orphaned = true;
+                key.input.modifiers = super::map_iced_modifiers(*modifiers);
             }
         }
     }
@@ -362,19 +483,31 @@ impl ReviewInputBarrier {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         // Completion is reaped during Review too; reaping never emits input.
         shared.reap();
-        if review_active || shared.native_review.is_some() { return; }
+        if review_active || shared.native_review.is_some() {
+            return;
+        }
         let mut index = 0;
         while index < shared.owned.len() {
             let key = &shared.owned[index];
-            if !key.orphaned { index += 1; continue; }
-            let mut input = key.input.clone(); input.action = super::KeyAction::Release; input.text = None;
+            if !key.orphaned {
+                index += 1;
+                continue;
+            }
+            let mut input = key.input.clone();
+            input.action = super::KeyAction::Release;
+            input.text = None;
             match key.surface.key_after_receipt(input, &key.press) {
                 Ok(receipt) => {
                     let surface = key.surface.clone();
-                    shared.retiring.push(RetiringKey { _surface: surface, receipt });
+                    shared.retiring.push(RetiringKey {
+                        _surface: surface,
+                        receipt,
+                    });
                     shared.owned.swap_remove(index);
                 }
-                Err(super::TerminalSendError::Full) => { index += 1; }
+                Err(super::TerminalSendError::Full) => {
+                    index += 1;
+                }
                 Err(error) => {
                     shared.owned.swap_remove(index);
                     shared.failure(format!("could not pair an unmounted terminal key: {error}"));

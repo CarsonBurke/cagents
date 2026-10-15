@@ -1106,7 +1106,9 @@ impl HostedTerminalHandle {
     }
 
     #[cfg(feature = "ui")]
-    pub(crate) fn same_attachment(&self, other: &Self) -> bool { Arc::ptr_eq(&self.inner, &other.inner) }
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 
     pub fn terminal_id(&self) -> TerminalId {
         self.inner.terminal_id
@@ -2153,9 +2155,14 @@ async fn serve_connection(
     let mut ready_turns = 0usize;
 
     loop {
-        if published.key_deadline().is_some_and(|deadline| deadline <= Instant::now()) {
+        if published
+            .key_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
             stop.request();
-            published.fail_keys("terminal key admission was not confirmed before its five-second deadline");
+            published.fail_keys(
+                "terminal key admission was not confirmed before its five-second deadline",
+            );
             return ConnectionEnd::Stop;
         }
         // A busy decoded inbox can be immediately ready indefinitely. Bound
@@ -3791,11 +3798,20 @@ mod tests {
     #[test]
     fn abandoning_key_delivery_never_waits_for_socket_metadata() {
         let directory = tempfile::tempdir().unwrap();
-        let handle = HostedTerminalHandle::connect_at(directory.path().join("absent.sock"), TerminalId::new(), None, |_| {}).unwrap();
+        let handle = HostedTerminalHandle::connect_at(
+            directory.path().join("absent.sock"),
+            TerminalId::new(),
+            None,
+            |_| {},
+        )
+        .unwrap();
         let metadata = handle.inner.stop.connection.lock().unwrap();
         handle.abandon_key_delivery("fixture unconfirmed exit");
         assert!(handle.inner.stop.is_requested());
-        assert_eq!(handle.key(receipt_key(super::super::KeyAction::Release)), Err(TerminalSendError::Closed));
+        assert_eq!(
+            handle.key(receipt_key(super::super::KeyAction::Release)),
+            Err(TerminalSendError::Closed)
+        );
         drop(metadata);
     }
 
@@ -3941,20 +3957,48 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let proof = proof("late-key");
         let source = session();
-        let handle = HostedTerminalHandle::connect_at(socket, source.id, Some(proof.clone()), |_| {}).unwrap();
+        let handle =
+            HostedTerminalHandle::connect_at(socket, source.id, Some(proof.clone()), |_| {})
+                .unwrap();
         let mut stream = accept_connection(&listener);
         receipt_connect(&mut stream, &proof, source);
-        let receipt = handle.key_with_receipt(receipt_key(super::super::KeyAction::Press)).unwrap();
+        let receipt = handle
+            .key_with_receipt(receipt_key(super::super::KeyAction::Press))
+            .unwrap();
         let key: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
         assert!(matches!(key.request, ClientRequest::Key { .. }));
         // Expire the exact in-flight ticket without waking the outer timer.
         // The already-ready response path must independently enforce its bound.
-        handle.inner.published.key_deliveries.lock().unwrap().pending.values_mut().next().unwrap().deadline = Instant::now();
-        receipt_response(&mut stream, &proof, key.request_id, ServerResponse::Accepted);
-        assert!(receipt.recv_timeout(Duration::from_secs(2)).unwrap().unwrap_err().contains("deadline"));
+        handle
+            .inner
+            .published
+            .key_deliveries
+            .lock()
+            .unwrap()
+            .pending
+            .values_mut()
+            .next()
+            .unwrap()
+            .deadline = Instant::now();
+        receipt_response(
+            &mut stream,
+            &proof,
+            key.request_id,
+            ServerResponse::Accepted,
+        );
+        assert!(
+            receipt
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .contains("deadline")
+        );
         assert_eq!(receipt.admission_host_proof(), None);
         assert!(read_frame::<ClientEnvelope>(&mut stream).unwrap().is_none());
-        assert_eq!(handle.key(receipt_key(super::super::KeyAction::Release)), Err(TerminalSendError::Closed));
+        assert_eq!(
+            handle.key(receipt_key(super::super::KeyAction::Release)),
+            Err(TerminalSendError::Closed)
+        );
     }
 
     #[test]

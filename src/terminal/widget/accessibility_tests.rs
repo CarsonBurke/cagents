@@ -40,14 +40,24 @@ pub(crate) struct Peer {
 }
 impl Peer {
     pub(crate) fn new() -> Self {
-        Self::with_generation(TerminalId::new(),uuid::Uuid::new_v4(),HostSessionProof {
-            host_session_id: HostSessionId::new("review-test-session"),
-            boot_id: BootId::new("review-test-boot"),
-            host_incarnation: HostIncarnation::new("review-test-host"),
-        })
+        Self::with_generation(
+            TerminalId::new(),
+            uuid::Uuid::new_v4(),
+            HostSessionProof {
+                host_session_id: HostSessionId::new("review-test-session"),
+                boot_id: BootId::new("review-test-boot"),
+                host_incarnation: HostIncarnation::new("review-test-host"),
+            },
+        )
     }
-    pub(crate) fn surface(&self) -> TerminalSurface { self.handle.clone().into() }
-    pub(crate) fn with_generation(id:TerminalId,worker:uuid::Uuid,proof:HostSessionProof) -> Self {
+    pub(crate) fn surface(&self) -> TerminalSurface {
+        self.handle.clone().into()
+    }
+    pub(crate) fn with_generation(
+        id: TerminalId,
+        worker: uuid::Uuid,
+        proof: HostSessionProof,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("review.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -63,9 +73,11 @@ impl Peer {
             },
             None,
         );
-        descriptor.execution_instance=worker;
-        descriptor.session.continuity=crate::model::TerminalContinuity::Live {
-            host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone(),
+        descriptor.execution_instance = worker;
+        descriptor.session.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
         };
         let handle =
             HostedTerminalHandle::connect_at(socket, id, Some(proof.clone()), |_| {}).unwrap();
@@ -220,7 +232,9 @@ fn widget_tree(widget: &TerminalWidget<Message>) -> Tree {
     let mut tree = Tree::new(widget as &dyn Widget<Message, Theme, Renderer>);
     // These direct-widget fixtures model the native focus handoff performed by
     // the application after selecting a pane. Model selection alone is not it.
-    if widget.model_focused { operation::Focusable::focus(tree.state.downcast_mut::<WidgetState>()); }
+    if widget.model_focused {
+        operation::Focusable::focus(tree.state.downcast_mut::<WidgetState>());
+    }
     tree
 }
 fn dispatch(
@@ -854,7 +868,6 @@ fn configured_review_shortcut_toggles_both_ways_without_reaching_the_pty() {
     assert_no_pty_input(&peer.fence());
 }
 
-
 #[test]
 fn actual_sidebar_text_focus_owns_ignored_control_keys_and_terminal_pairs_held_releases() {
     use cosmic::iced::widget::{row, text_input};
@@ -862,199 +875,512 @@ fn actual_sidebar_text_focus_owns_ignored_control_keys_and_terminal_pairs_held_r
     let renderer = renderer();
     let terminal_id = Id::new("focus-terminal");
     let field_id = Id::new("sidebar-rename");
-    let mut terminal = widget(&peer, "focus-terminal", ReviewInputBarrier::default(), true, false)
-        .review_shortcuts(&["Ctrl+F".into()]);
+    let mut terminal = widget(
+        &peer,
+        "focus-terminal",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    )
+    .review_shortcuts(&["Ctrl+F".into()]);
     terminal.on_shortcut = None;
     let mut root: Element<'_, Message> = row![
-        text_input("Rename", "").id(field_id.clone()).on_input(|_| Message::Focus).width(180),
+        text_input("Rename", "")
+            .id(field_id.clone())
+            .on_input(|_| Message::Focus)
+            .width(180),
         terminal
-    ].into();
+    ]
+    .into();
     let mut tree = Tree::new(&root);
-    let layout = root.as_widget_mut().layout(&mut tree, &renderer,
-        &layout::Limits::new(Size::ZERO, Size::new(800.0, 320.0)));
+    let layout = root.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(800.0, 320.0)),
+    );
     let focus = |root: &mut Element<'_, Message>, tree: &mut Tree, id: Id| {
         let mut operation = operation::focusable::focus::<()>(id);
-        root.as_widget_mut().operate(tree, Layout::new(&layout), &renderer, &mut operation);
+        root.as_widget_mut()
+            .operate(tree, Layout::new(&layout), &renderer, &mut operation);
     };
     let dispatch = |root: &mut Element<'_, Message>, tree: &mut Tree, event: Event| {
         let mut messages = Vec::new();
-        root.as_widget_mut().update(tree, &event, Layout::new(&layout), mouse::Cursor::Unavailable,
-            &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &Rectangle::with_size(Size::new(800.0, 320.0)));
+        root.as_widget_mut().update(
+            tree,
+            &event,
+            Layout::new(&layout),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &Rectangle::with_size(Size::new(800.0, 320.0)),
+        );
         messages
     };
-    let control = |value: &str, code, down: bool| Event::Keyboard(if down {
-        keyboard::Event::KeyPressed { key: keyboard::Key::Character(value.into()), modified_key: keyboard::Key::Character(value.into()),
-            physical_key: keyboard::key::Physical::Code(code), location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false }
-    } else {
-        keyboard::Event::KeyReleased { key: keyboard::Key::Character(value.into()), modified_key: keyboard::Key::Character(value.into()),
-            physical_key: keyboard::key::Physical::Code(code), location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL }
-    });
+    let control = |value: &str, code, down: bool| {
+        Event::Keyboard(if down {
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(value.into()),
+                modified_key: keyboard::Key::Character(value.into()),
+                physical_key: keyboard::key::Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat: false,
+            }
+        } else {
+            keyboard::Event::KeyReleased {
+                key: keyboard::Key::Character(value.into()),
+                modified_key: keyboard::Key::Character(value.into()),
+                physical_key: keyboard::key::Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+            }
+        })
+    };
     // Actual native focus enables a freshly mounted terminal.
     focus(&mut root, &mut tree, terminal_id.clone());
-    dispatch(&mut root, &mut tree, control("t", keyboard::key::Code::KeyT, true));
+    dispatch(
+        &mut root,
+        &mut tree,
+        control("t", keyboard::key::Code::KeyT, true),
+    );
     let admitted = peer.fence();
     assert_eq!(admitted.iter().filter(|request| matches!(request, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)).count(), 1);
     // A programmatic sidebar handoff must release that held key even if the
     // parent withholds future raw keyboard events from the terminal subtree.
     focus(&mut root, &mut tree, field_id);
-    dispatch(&mut root, &mut tree, Event::Window(window::Event::RedrawRequested(Instant::now())));
+    dispatch(
+        &mut root,
+        &mut tree,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
     let blurred = peer.fence();
     assert_eq!(blurred.iter().filter(|request| matches!(request, ClientRequest::Key { input, .. } if input.action == KeyAction::Release)).count(), 1);
-    for (value, code) in [("f", keyboard::key::Code::KeyF), ("t", keyboard::key::Code::KeyT), ("y", keyboard::key::Code::KeyY)] {
+    for (value, code) in [
+        ("f", keyboard::key::Code::KeyF),
+        ("t", keyboard::key::Code::KeyT),
+        ("y", keyboard::key::Code::KeyY),
+    ] {
         let messages = dispatch(&mut root, &mut tree, control(value, code, true));
-        assert!(!messages.iter().any(|message| matches!(message, Message::Review(_))), "review chord cannot escape sidebar focus");
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::Review(_))),
+            "review chord cannot escape sidebar focus"
+        );
         dispatch(&mut root, &mut tree, control(value, code, false));
     }
-    dispatch(&mut root, &mut tree, Event::InputMethod(input_method::Event::Commit("sidebar composition".into())));
-    assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key { .. } | ClientRequest::Input { .. } | ClientRequest::Paste { .. })));
+    dispatch(
+        &mut root,
+        &mut tree,
+        Event::InputMethod(input_method::Event::Commit("sidebar composition".into())),
+    );
+    assert!(!peer.fence().iter().any(|request| matches!(
+        request,
+        ClientRequest::Key { .. } | ClientRequest::Input { .. } | ClientRequest::Paste { .. }
+    )));
     focus(&mut root, &mut tree, terminal_id);
-    dispatch(&mut root, &mut tree, control("t", keyboard::key::Code::KeyT, true));
-    dispatch(&mut root, &mut tree, control("t", keyboard::key::Code::KeyT, false));
+    dispatch(
+        &mut root,
+        &mut tree,
+        control("t", keyboard::key::Code::KeyT, true),
+    );
+    dispatch(
+        &mut root,
+        &mut tree,
+        control("t", keyboard::key::Code::KeyT, false),
+    );
     let resumed = peer.fence();
     assert_eq!(resumed.iter().filter(|request| matches!(request, ClientRequest::Key { input, .. } if input.action == KeyAction::Press)).count(), 1);
     assert_eq!(resumed.iter().filter(|request| matches!(request, ClientRequest::Key { input, .. } if input.action == KeyAction::Release)).count(), 1);
     // Native window activation preserves the selected widget, while the
     // pointer outside the terminal explicitly transfers native focus.
-    dispatch(&mut root, &mut tree, Event::Window(window::Event::Unfocused));
+    dispatch(
+        &mut root,
+        &mut tree,
+        Event::Window(window::Event::Unfocused),
+    );
     dispatch(&mut root, &mut tree, Event::Window(window::Event::Focused));
-    dispatch(&mut root, &mut tree, control("t", keyboard::key::Code::KeyT, true));
-    dispatch(&mut root, &mut tree, control("t", keyboard::key::Code::KeyT, false));
-    assert_eq!(peer.fence().iter().filter(|request| matches!(request, ClientRequest::Key { .. })).count(), 2);
+    dispatch(
+        &mut root,
+        &mut tree,
+        control("t", keyboard::key::Code::KeyT, true),
+    );
+    dispatch(
+        &mut root,
+        &mut tree,
+        control("t", keyboard::key::Code::KeyT, false),
+    );
+    assert_eq!(
+        peer.fence()
+            .iter()
+            .filter(|request| matches!(request, ClientRequest::Key { .. }))
+            .count(),
+        2
+    );
     let mut messages = Vec::new();
-    root.as_widget_mut().update(&mut tree, &Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left)),
-        Layout::new(&layout), mouse::Cursor::Available(Point::new(30.0, 10.0)), &renderer,
-        &mut clipboard::Null, &mut Shell::new(&mut messages), &Rectangle::with_size(Size::new(800.0, 320.0)));
-    dispatch(&mut root, &mut tree, control("t", keyboard::key::Code::KeyT, true));
-    dispatch(&mut root, &mut tree, control("t", keyboard::key::Code::KeyT, false));
-    assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key { .. })));
+    root.as_widget_mut().update(
+        &mut tree,
+        &Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left)),
+        Layout::new(&layout),
+        mouse::Cursor::Available(Point::new(30.0, 10.0)),
+        &renderer,
+        &mut clipboard::Null,
+        &mut Shell::new(&mut messages),
+        &Rectangle::with_size(Size::new(800.0, 320.0)),
+    );
+    dispatch(
+        &mut root,
+        &mut tree,
+        control("t", keyboard::key::Code::KeyT, true),
+    );
+    dispatch(
+        &mut root,
+        &mut tree,
+        control("t", keyboard::key::Code::KeyT, false),
+    );
+    assert!(
+        !peer
+            .fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. }))
+    );
 }
-
 
 #[test]
 fn key_released_during_review_pairs_after_exit_without_requiring_a_blur() {
     let peer = Peer::new();
     let renderer = renderer();
-    let mut widget = widget(&peer, "held-review-key", ReviewInputBarrier::default(), true, false);
+    let mut widget = widget(
+        &peer,
+        "held-review-key",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    );
     widget.on_shortcut = None;
     let mut tree = widget_tree(&widget);
-    dispatch(&mut widget, &mut tree, &renderer,
-        key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, true));
-    assert_eq!(peer.fence().iter().filter(|request| matches!(request,
-        ClientRequest::Key { input, .. } if input.action == KeyAction::Press)).count(), 1);
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            true,
+        ),
+    );
+    assert_eq!(
+        peer.fence()
+            .iter()
+            .filter(|request| matches!(request,
+        ClientRequest::Key { input, .. } if input.action == KeyAction::Press))
+            .count(),
+        1
+    );
     let id = widget.id.clone().unwrap();
-    dispatch(&mut widget, &mut tree, &renderer, action(id, Action::Focus, None));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        action(id, Action::Focus, None),
+    );
     widget.review_active = true;
     widget.suppress_focus_reports = true;
     widget.review_revision = 1;
-    dispatch(&mut widget, &mut tree, &renderer,
-        key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, false));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            false,
+        ),
+    );
     assert_no_pty_input(&peer.fence());
     // This is the app's confirmed Review-off view; native keyboard focus stays
     // on the terminal, so an ordinary blur alone cannot repair the release.
     widget.review_active = false;
     widget.suppress_focus_reports = false;
     widget.review_revision = 2;
-    dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::RedrawRequested(Instant::now())));
-    assert_eq!(peer.fence().iter().filter(|request| matches!(request,
-        ClientRequest::Key { input, .. } if input.action == KeyAction::Release)).count(), 1);
-    dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::RedrawRequested(Instant::now())));
-    assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key { .. })));
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
+    assert_eq!(
+        peer.fence()
+            .iter()
+            .filter(|request| matches!(request,
+        ClientRequest::Key { input, .. } if input.action == KeyAction::Release))
+            .count(),
+        1
+    );
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
+    assert!(
+        !peer
+            .fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. }))
+    );
 }
-
 
 #[test]
 fn unmounted_pressed_keys_remain_owned_across_review_and_replacement_widgets() {
-    let original=Peer::new(); let replacement=Peer::new(); let renderer=renderer();
-    let shared=ReviewInputBarrier::default();
-    let mut old=widget(&original,"same-card",shared.clone(),true,false);
-    old.on_shortcut=None;
-    let mut old_tree=widget_tree(&old);
-    dispatch(&mut old,&mut old_tree,&renderer,key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,true));
+    let original = Peer::new();
+    let replacement = Peer::new();
+    let renderer = renderer();
+    let shared = ReviewInputBarrier::default();
+    let mut old = widget(&original, "same-card", shared.clone(), true, false);
+    old.on_shortcut = None;
+    let mut old_tree = widget_tree(&old);
+    dispatch(
+        &mut old,
+        &mut old_tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            true,
+        ),
+    );
     assert_eq!(original.fence().iter().filter(|request| matches!(request,ClientRequest::Key { input,.. } if input.action==KeyAction::Press)).count(),1);
-    drop(old_tree); drop(old);
-    assert!(!original.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })),"tree Drop must not emit PTY input");
+    drop(old_tree);
+    drop(old);
+    assert!(
+        !original
+            .fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. })),
+        "tree Drop must not emit PTY input"
+    );
     shared.flush_orphans(true);
-    let release=key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,false);
-    let Event::Keyboard(released)=&release else { unreachable!() };
+    let release = key(
+        keyboard::key::Named::Enter,
+        keyboard::key::Code::Enter,
+        false,
+    );
+    let Event::Keyboard(released) = &release else {
+        unreachable!()
+    };
     shared.observe_key_event(released);
     shared.flush_orphans(true);
-    assert!(!original.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })),"Review keeps orphan cleanup deferred");
-    let mut current=widget(&replacement,"same-card",shared.clone(),true,true);
-    current.on_shortcut=None;
-    let mut current_tree=widget_tree(&current);
-    dispatch(&mut current,&mut current_tree,&renderer,Event::Window(window::Event::RedrawRequested(Instant::now())));
-    assert!(!original.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })));
-    current.suppress_focus_reports=false; current.review_active=false; current.review_revision=1;
-    dispatch(&mut current,&mut current_tree,&renderer,Event::Window(window::Event::RedrawRequested(Instant::now())));
+    assert!(
+        !original
+            .fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. })),
+        "Review keeps orphan cleanup deferred"
+    );
+    let mut current = widget(&replacement, "same-card", shared.clone(), true, true);
+    current.on_shortcut = None;
+    let mut current_tree = widget_tree(&current);
+    dispatch(
+        &mut current,
+        &mut current_tree,
+        &renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
+    assert!(
+        !original
+            .fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. }))
+    );
+    current.suppress_focus_reports = false;
+    current.review_active = false;
+    current.review_revision = 1;
+    dispatch(
+        &mut current,
+        &mut current_tree,
+        &renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
     assert_eq!(original.fence().iter().filter(|request| matches!(request,ClientRequest::Key { input,.. } if input.action==KeyAction::Release)).count(),1);
-    dispatch(&mut current,&mut current_tree,&renderer,release);
-    assert!(!replacement.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })),"an old physical release cannot target a replacement attachment");
+    dispatch(&mut current, &mut current_tree, &renderer, release);
+    assert!(
+        !replacement
+            .fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. })),
+        "an old physical release cannot target a replacement attachment"
+    );
     shared.flush_orphans(false);
-    assert!(!original.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })),"cleanup is admitted once");
+    assert!(
+        !original
+            .fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. })),
+        "cleanup is admitted once"
+    );
 }
 
 #[test]
 fn window_activation_property_survives_a_real_inactive_window_diff() {
-    let peer=Peer::new(); let renderer=renderer();
-    let mut widget=widget(&peer,"window-focus",ReviewInputBarrier::default(),true,false);
-    widget.on_shortcut=None;
-    let mut tree=widget_tree(&widget);
-    dispatch(&mut widget,&mut tree,&renderer,Event::Window(window::Event::Unfocused));
-    widget.window_focused=false;
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(
+        &peer,
+        "window-focus",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    );
+    widget.on_shortcut = None;
+    let mut tree = widget_tree(&widget);
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::Unfocused),
+    );
+    widget.window_focused = false;
     widget.diff(&mut tree);
-    dispatch(&mut widget,&mut tree,&renderer,Event::Window(window::Event::RedrawRequested(Instant::now())));
-    assert!(operation::Focusable::is_focused(tree.state.downcast_ref::<WidgetState>()),"window activation must not erase native widget focus");
-    dispatch(&mut widget,&mut tree,&renderer,key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,true));
-    assert!(!peer.fence().iter().any(|request| matches!(request,ClientRequest::Key { .. })));
-    widget.window_focused=true; widget.diff(&mut tree);
-    dispatch(&mut widget,&mut tree,&renderer,Event::Window(window::Event::Focused));
-    dispatch(&mut widget,&mut tree,&renderer,key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,true));
-    dispatch(&mut widget,&mut tree,&renderer,key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,false));
-    assert_eq!(peer.fence().iter().filter(|request| matches!(request,ClientRequest::Key { .. })).count(),2);
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
+    assert!(
+        operation::Focusable::is_focused(tree.state.downcast_ref::<WidgetState>()),
+        "window activation must not erase native widget focus"
+    );
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            true,
+        ),
+    );
+    assert!(
+        !peer
+            .fence()
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Key { .. }))
+    );
+    widget.window_focused = true;
+    widget.diff(&mut tree);
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::Focused),
+    );
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            true,
+        ),
+    );
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            false,
+        ),
+    );
+    assert_eq!(
+        peer.fence()
+            .iter()
+            .filter(|request| matches!(request, ClientRequest::Key { .. }))
+            .count(),
+        2
+    );
 }
 
 #[test]
 fn window_key_ownership_has_a_fixed_admission_budget() {
-    let peer=Peer::new(); let surface=TerminalSurface::from(peer.handle.clone());
-    let barrier=ReviewInputBarrier::default();
-    let input=key_press(&keyboard::Key::Named(keyboard::key::Named::Enter),&keyboard::Key::Named(keyboard::key::Named::Enter),
-        keyboard::key::Physical::Code(keyboard::key::Code::Enter),keyboard::Modifiers::empty(),None,false);
+    let peer = Peer::new();
+    let surface = TerminalSurface::from(peer.handle.clone());
+    let barrier = ReviewInputBarrier::default();
+    let input = key_press(
+        &keyboard::Key::Named(keyboard::key::Named::Enter),
+        &keyboard::Key::Named(keyboard::key::Named::Enter),
+        keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+        keyboard::Modifiers::empty(),
+        None,
+        false,
+    );
     for code in 0..512 {
-        let physical=keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Xkb(code));
-        barrier.press(physical,&surface,input.clone()).unwrap();
+        let physical = keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Xkb(code));
+        barrier.press(physical, &surface, input.clone()).unwrap();
         // Drain each receipt so this measures the window's 512 held leases,
         // independently of the transport's 256 in-flight admission budget.
         peer.fence();
     }
-    let extra=keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Xkb(513));
-    assert_eq!(barrier.press(extra,&surface,input.clone()),Err(TerminalSendError::Full));
-    let first=keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Xkb(0));
-    let mut release=input.clone();release.action=KeyAction::Release;release.text=None;
-    barrier.release(first,&surface,release).unwrap();
+    let extra = keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Xkb(513));
+    assert_eq!(
+        barrier.press(extra, &surface, input.clone()),
+        Err(TerminalSendError::Full)
+    );
+    let first = keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Xkb(0));
+    let mut release = input.clone();
+    release.action = KeyAction::Release;
+    release.text = None;
+    barrier.release(first, &surface, release).unwrap();
     // Completion must actually be observed before its bounded slot is reusable.
     peer.fence();
-    barrier.press(extra,&surface,input).unwrap();
+    barrier.press(extra, &surface, input).unwrap();
 }
-
 
 #[test]
 fn native_release_observation_cannot_clear_a_newer_review_press_from_an_old_app_message() {
-    let peer=Peer::new(); let renderer=renderer(); let shared=ReviewInputBarrier::default();
-    let trace=crate::input_trace::InputTrace::default(); trace.bind_terminal_keys(shared.clone());
-    let mut old=widget(&peer,"batched-old",shared.clone(),true,false); old.on_shortcut=None;
-    let mut old_tree=widget_tree(&old);
-    dispatch(&mut old,&mut old_tree,&renderer,key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,true));
-    peer.fence(); drop(old_tree); drop(old);
-    let release=key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,false);
+    let peer = Peer::new();
+    let renderer = renderer();
+    let shared = ReviewInputBarrier::default();
+    let trace = crate::input_trace::InputTrace::default();
+    trace.bind_terminal_keys(shared.clone());
+    let mut old = widget(&peer, "batched-old", shared.clone(), true, false);
+    old.on_shortcut = None;
+    let mut old_tree = widget_tree(&old);
+    dispatch(
+        &mut old,
+        &mut old_tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            true,
+        ),
+    );
+    peer.fence();
+    drop(old_tree);
+    drop(old);
+    let release = key(
+        keyboard::key::Named::Enter,
+        keyboard::key::Code::Enter,
+        false,
+    );
     trace.record(&release);
     // A later native press can run before the queued message for the release.
-    let mut current=widget(&peer,"batched-new",shared.clone(),true,true);
-    let mut tree=widget_tree(&current);
-    let press=key(keyboard::key::Named::Enter,keyboard::key::Code::Enter,true);
+    let mut current = widget(&peer, "batched-new", shared.clone(), true, true);
+    let mut tree = widget_tree(&current);
+    let press = key(
+        keyboard::key::Named::Enter,
+        keyboard::key::Code::Enter,
+        true,
+    );
     trace.record(&press);
-    dispatch(&mut current,&mut tree,&renderer,press.clone());
+    dispatch(&mut current, &mut tree, &renderer, press.clone());
     assert!(shared.owns_keyboard(&press));
     // App update only attempts deferred cleanup. It never re-observes an old
     // physical release after the newer native press has already been seen.
@@ -1062,7 +1388,6 @@ fn native_release_observation_cannot_clear_a_newer_review_press_from_an_old_app_
     assert!(shared.owns_keyboard(&press));
     assert_no_pty_input(&peer.fence());
 }
-
 
 /// A real framed peer whose key ACKs are controlled by the test. It owns no
 /// client handle, so last-owner tests cannot accidentally pass because a
@@ -1077,7 +1402,9 @@ pub(crate) struct HeldKeyPeer {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl HeldKeyPeer {
-    pub(crate) fn connect() -> (TerminalSurface, Self) { Self::connect_mode(false) }
+    pub(crate) fn connect() -> (TerminalSurface, Self) {
+        Self::connect_mode(false)
+    }
     fn connect_mode(reconnect: bool) -> (TerminalSurface, Self) {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = directory.path().join("held-key.sock");
@@ -1089,7 +1416,8 @@ impl HeldKeyPeer {
             boot_id: BootId::new("held-key-boot"),
             host_incarnation: HostIncarnation::new("held-key-host"),
         };
-        let handle = HostedTerminalHandle::connect_at(socket, id, Some(proof.clone()), |_| {}).unwrap();
+        let handle =
+            HostedTerminalHandle::connect_at(socket, id, Some(proof.clone()), |_| {}).unwrap();
         let (keys_tx, keys) = crossbeam_channel::unbounded();
         let (acknowledge, acks) = crossbeam_channel::bounded(8);
         let (resume, resume_rx) = crossbeam_channel::bounded(1);
@@ -1100,91 +1428,182 @@ impl HeldKeyPeer {
             let instance = uuid::Uuid::new_v4();
             let mut reconnecting = false;
             'connections: loop {
-            let mut stream = loop {
-                if stopping.load(Ordering::Relaxed) { return; }
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(1)),
-                    Err(error) => panic!("held-key accept: {error}"),
-                }
-            };
-            stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
-            while !stopping.load(Ordering::Relaxed) {
-                let envelope: ClientEnvelope = match codec.read(&mut stream) {
-                    Ok(Some(value)) => value,
-                    Ok(None) => { let _ = closed_tx.send(()); return; }
-                    Err(FrameError::Io(error)) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
-                    Err(error) => panic!("held-key frame: {error}"),
+                let mut stream = loop {
+                    if stopping.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(error) => panic!("held-key accept: {error}"),
+                    }
                 };
-                let disconnect_after_ack = reconnect && !reconnecting && matches!(&envelope.request, ClientRequest::Key { input, .. } if input.action == KeyAction::Press);
-                let message = match envelope.request {
-                    ClientRequest::Connect { .. } => {
-                        if reconnecting {
-                            loop {
-                                match resume_rx.recv_timeout(Duration::from_millis(50)) {
-                                    Ok(()) => break,
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .unwrap();
+                let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+                while !stopping.load(Ordering::Relaxed) {
+                    let envelope: ClientEnvelope = match codec.read(&mut stream) {
+                        Ok(Some(value)) => value,
+                        Ok(None) => {
+                            let _ = closed_tx.send(());
+                            return;
+                        }
+                        Err(FrameError::Io(error))
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => panic!("held-key frame: {error}"),
+                    };
+                    let disconnect_after_ack = reconnect
+                        && !reconnecting
+                        && matches!(&envelope.request, ClientRequest::Key { input, .. } if input.action == KeyAction::Press);
+                    let message = match envelope.request {
+                        ClientRequest::Connect { .. } => {
+                            if reconnecting {
+                                loop {
+                                    match resume_rx.recv_timeout(Duration::from_millis(50)) {
+                                        Ok(()) => break,
+                                        Err(_) if stopping.load(Ordering::Relaxed) => return,
+                                        Err(_) => continue,
+                                    }
+                                }
+                            }
+                            let mut descriptor = TerminalDescriptor::relaunchable(
+                                id,
+                                LaunchRecipe {
+                                    program: "/bin/sh".into(),
+                                    arguments: Vec::new(),
+                                    working_directory: "/".into(),
+                                    environment: Default::default(),
+                                    unset_environment: Default::default(),
+                                },
+                                None,
+                            );
+                            descriptor.execution_instance = instance;
+                            descriptor.attached = true;
+                            descriptor.session.continuity =
+                                crate::model::TerminalContinuity::Live {
+                                    host_session_id: proof.host_session_id.clone(),
+                                    boot_id: proof.boot_id.clone(),
+                                    host_incarnation: proof.host_incarnation.clone(),
+                                };
+                            ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof: proof.clone(),
+                                    resumed: vec![descriptor],
+                                },
+                            }
+                        }
+                        ClientRequest::Key { input, .. } => {
+                            keys_tx.send(input).unwrap();
+                            let accepted = loop {
+                                match acks.recv_timeout(Duration::from_millis(50)) {
+                                    Ok(accepted) => break accepted,
                                     Err(_) if stopping.load(Ordering::Relaxed) => return,
                                     Err(_) => continue,
                                 }
+                            };
+                            if accepted {
+                                ServerMessage::Response {
+                                    response: ServerResponse::Accepted,
+                                }
+                            } else {
+                                ServerMessage::Error(crate::terminal::ipc::ProtocolError::new(
+                                    crate::terminal::ipc::ProtocolErrorCode::QueueFull,
+                                    "held-key fixture refusal",
+                                    true,
+                                ))
                             }
                         }
-                        let mut descriptor = TerminalDescriptor::relaunchable(id, LaunchRecipe {
-                            program: "/bin/sh".into(), arguments: Vec::new(), working_directory: "/".into(),
-                            environment: Default::default(), unset_environment: Default::default(),
-                        }, None);
-                        descriptor.execution_instance = instance;
-                        descriptor.attached = true;
-                        descriptor.session.continuity = crate::model::TerminalContinuity::Live {
-                            host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone(),
-                        };
-                        ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: vec![descriptor] } }
+                        _ => ServerMessage::Response {
+                            response: ServerResponse::Accepted,
+                        },
+                    };
+                    if write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(envelope.request_id),
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .is_err()
+                    {
+                        return;
                     }
-                    ClientRequest::Key { input, .. } => {
-                        keys_tx.send(input).unwrap();
-                        let accepted = loop {
-                            match acks.recv_timeout(Duration::from_millis(50)) {
-                                Ok(accepted) => break accepted,
-                                Err(_) if stopping.load(Ordering::Relaxed) => return,
-                                Err(_) => continue,
-                            }
-                        };
-                        if accepted { ServerMessage::Response { response: ServerResponse::Accepted } }
-                        else { ServerMessage::Error(crate::terminal::ipc::ProtocolError::new(crate::terminal::ipc::ProtocolErrorCode::QueueFull, "held-key fixture refusal", true)) }
+                    if disconnect_after_ack {
+                        reconnecting = true;
+                        continue 'connections;
                     }
-                    _ => ServerMessage::Response { response: ServerResponse::Accepted },
-                };
-                if write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(envelope.request_id), proof: proof.clone(), message }).is_err() { return; }
-                if disconnect_after_ack { reconnecting = true; continue 'connections; }
-            }
-            return;
+                }
+                return;
             }
         });
         handle.wait_until_attached(Duration::from_secs(3)).unwrap();
-        (handle.into(), Self { _directory: directory, keys, acknowledge, resume, closed, stop, worker: Some(worker) })
+        (
+            handle.into(),
+            Self {
+                _directory: directory,
+                keys,
+                acknowledge,
+                resume,
+                closed,
+                stop,
+                worker: Some(worker),
+            },
+        )
     }
     pub(crate) fn next(&self, action: KeyAction) {
-        assert_eq!(self.keys.recv_timeout(Duration::from_secs(3)).unwrap().action, action);
+        assert_eq!(
+            self.keys
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .action,
+            action
+        );
     }
-    pub(crate) fn ack(&self, accepted: bool) { self.acknowledge.send(accepted).unwrap(); }
+    pub(crate) fn ack(&self, accepted: bool) {
+        self.acknowledge.send(accepted).unwrap();
+    }
 }
 impl Drop for HeldKeyPeer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() { worker.join().unwrap(); }
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
     }
 }
 fn held_input(action: KeyAction) -> KeyInput {
-    let mut input = key_press(&keyboard::Key::Character("a".into()), &keyboard::Key::Character("a".into()),
-        keyboard::key::Physical::Code(keyboard::key::Code::KeyA), keyboard::Modifiers::empty(), Some("a"), false);
+    let mut input = key_press(
+        &keyboard::Key::Character("a".into()),
+        &keyboard::Key::Character("a".into()),
+        keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
+        keyboard::Modifiers::empty(),
+        Some("a"),
+        false,
+    );
     input.action = action;
-    if action == KeyAction::Release { input.text = None; }
+    if action == KeyAction::Release {
+        input.text = None;
+    }
     input
 }
 fn wait_key_counts(barrier: &ReviewInputBarrier, expected: (usize, usize)) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while barrier.pending_counts() != expected {
-        assert!(Instant::now() < deadline, "key ownership did not reach {expected:?}");
+        assert!(
+            Instant::now() < deadline,
+            "key ownership did not reach {expected:?}"
+        );
         thread::sleep(Duration::from_millis(1));
     }
 }
@@ -1193,19 +1612,30 @@ fn key_owner_keeps_the_last_surface_until_release_is_acknowledged() {
     let (surface, peer) = HeldKeyPeer::connect();
     let barrier = ReviewInputBarrier::default();
     let physical = keyboard::key::Physical::Code(keyboard::key::Code::KeyA);
-    barrier.press(physical, &surface, held_input(KeyAction::Press)).unwrap();
-    peer.next(KeyAction::Press); peer.ack(true);
+    barrier
+        .press(physical, &surface, held_input(KeyAction::Press))
+        .unwrap();
+    peer.next(KeyAction::Press);
+    peer.ack(true);
     barrier.unmounted(&surface);
     drop(surface); // Only the window owner now retains this exact attachment.
     barrier.flush_orphans(true);
-    assert!(peer.keys.try_recv().is_err(), "Review cannot emit orphan input");
+    assert!(
+        peer.keys.try_recv().is_err(),
+        "Review cannot emit orphan input"
+    );
     barrier.flush_orphans(false);
     peer.next(KeyAction::Release);
     assert_eq!(barrier.pending_counts(), (0, 1));
-    assert!(peer.closed.try_recv().is_err(), "local queue admission cannot retire the last surface");
+    assert!(
+        peer.closed.try_recv().is_err(),
+        "local queue admission cannot retire the last surface"
+    );
     peer.ack(true);
     wait_key_counts(&barrier, (0, 0));
-    peer.closed.recv_timeout(Duration::from_secs(3)).expect("final actor retires after exact worker ACK");
+    peer.closed
+        .recv_timeout(Duration::from_secs(3))
+        .expect("final actor retires after exact worker ACK");
     assert!(barrier.take_failures().is_empty());
 }
 #[test]
@@ -1213,16 +1643,28 @@ fn pending_release_allows_a_new_press_and_keeps_original_fifo() {
     let (surface, peer) = HeldKeyPeer::connect();
     let barrier = ReviewInputBarrier::default();
     let physical = keyboard::key::Physical::Code(keyboard::key::Code::KeyA);
-    barrier.press(physical, &surface, held_input(KeyAction::Press)).unwrap();
-    barrier.release(physical, &surface, held_input(KeyAction::Release)).unwrap();
-    barrier.press(physical, &surface, held_input(KeyAction::Press)).unwrap();
+    barrier
+        .press(physical, &surface, held_input(KeyAction::Press))
+        .unwrap();
+    barrier
+        .release(physical, &surface, held_input(KeyAction::Release))
+        .unwrap();
+    barrier
+        .press(physical, &surface, held_input(KeyAction::Press))
+        .unwrap();
     assert_eq!(barrier.pending_counts(), (1, 1));
-    peer.next(KeyAction::Press); peer.ack(true);
-    peer.next(KeyAction::Release); peer.ack(true);
-    peer.next(KeyAction::Press); peer.ack(true);
+    peer.next(KeyAction::Press);
+    peer.ack(true);
+    peer.next(KeyAction::Release);
+    peer.ack(true);
+    peer.next(KeyAction::Press);
+    peer.ack(true);
     wait_key_counts(&barrier, (1, 0));
-    barrier.release(physical, &surface, held_input(KeyAction::Release)).unwrap();
-    peer.next(KeyAction::Release); peer.ack(true);
+    barrier
+        .release(physical, &surface, held_input(KeyAction::Release))
+        .unwrap();
+    peer.next(KeyAction::Release);
+    peer.ack(true);
     wait_key_counts(&barrier, (0, 0));
     assert!(barrier.take_failures().is_empty());
 }
@@ -1231,29 +1673,59 @@ fn refused_repeat_does_not_erase_original_press_authority() {
     let (surface, peer) = HeldKeyPeer::connect();
     let barrier = ReviewInputBarrier::default();
     let physical = keyboard::key::Physical::Code(keyboard::key::Code::KeyA);
-    barrier.press(physical, &surface, held_input(KeyAction::Press)).unwrap();
-    barrier.press(physical, &surface, held_input(KeyAction::Repeat)).unwrap();
-    barrier.release(physical, &surface, held_input(KeyAction::Release)).unwrap();
-    peer.next(KeyAction::Press); peer.ack(true);
-    peer.next(KeyAction::Repeat); peer.ack(false);
-    peer.next(KeyAction::Release); peer.ack(true);
+    barrier
+        .press(physical, &surface, held_input(KeyAction::Press))
+        .unwrap();
+    barrier
+        .press(physical, &surface, held_input(KeyAction::Repeat))
+        .unwrap();
+    barrier
+        .release(physical, &surface, held_input(KeyAction::Release))
+        .unwrap();
+    peer.next(KeyAction::Press);
+    peer.ack(true);
+    peer.next(KeyAction::Repeat);
+    peer.ack(false);
+    peer.next(KeyAction::Release);
+    peer.ack(true);
     wait_key_counts(&barrier, (0, 0));
-    assert!(barrier.take_failures().iter().any(|reason| reason.contains("fixture refusal")));
+    assert!(
+        barrier
+            .take_failures()
+            .iter()
+            .any(|reason| reason.contains("fixture refusal"))
+    );
 }
 #[test]
 fn refused_press_skips_its_release_and_reports_failure() {
     let (surface, peer) = HeldKeyPeer::connect();
     let barrier = ReviewInputBarrier::default();
     let physical = keyboard::key::Physical::Code(keyboard::key::Code::KeyA);
-    barrier.press(physical, &surface, held_input(KeyAction::Press)).unwrap();
-    barrier.release(physical, &surface, held_input(KeyAction::Release)).unwrap();
-    barrier.press(physical, &surface, held_input(KeyAction::Press)).unwrap();
-    peer.next(KeyAction::Press); peer.ack(false);
-    peer.next(KeyAction::Press); peer.ack(true);
+    barrier
+        .press(physical, &surface, held_input(KeyAction::Press))
+        .unwrap();
+    barrier
+        .release(physical, &surface, held_input(KeyAction::Release))
+        .unwrap();
+    barrier
+        .press(physical, &surface, held_input(KeyAction::Press))
+        .unwrap();
+    peer.next(KeyAction::Press);
+    peer.ack(false);
+    peer.next(KeyAction::Press);
+    peer.ack(true);
     wait_key_counts(&barrier, (1, 0));
-    assert!(barrier.take_failures().iter().any(|reason| reason.contains("paired press")));
-    barrier.release(physical, &surface, held_input(KeyAction::Release)).unwrap();
-    peer.next(KeyAction::Release); peer.ack(true);
+    assert!(
+        barrier
+            .take_failures()
+            .iter()
+            .any(|reason| reason.contains("paired press"))
+    );
+    barrier
+        .release(physical, &surface, held_input(KeyAction::Release))
+        .unwrap();
+    peer.next(KeyAction::Release);
+    peer.ack(true);
     wait_key_counts(&barrier, (0, 0));
 }
 
@@ -1262,25 +1734,40 @@ fn acknowledged_press_retains_historical_authority_across_detach_before_reap() {
     let (surface, peer) = HeldKeyPeer::connect_mode(true);
     let barrier = ReviewInputBarrier::default();
     let physical = keyboard::key::Physical::Code(keyboard::key::Code::KeyA);
-    barrier.press(physical, &surface, held_input(KeyAction::Press)).unwrap();
-    peer.next(KeyAction::Press); peer.ack(true);
+    barrier
+        .press(physical, &surface, held_input(KeyAction::Press))
+        .unwrap();
+    peer.next(KeyAction::Press);
+    peer.ack(true);
     // The peer closes immediately after its ACK and withholds the reconnect
     // descriptor. No UI ownership reap occurs before transient proof is gone.
     let deadline = Instant::now() + Duration::from_secs(3);
     while surface.host_proof().is_some() {
-        assert!(Instant::now() < deadline, "fixture did not detach after the acknowledged press");
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not detach after the acknowledged press"
+        );
         thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(barrier.pending_counts(), (1, 0), "a live getter becoming unknown must not erase historical admission");
-    barrier.release(physical, &surface, held_input(KeyAction::Release)).unwrap();
+    assert_eq!(
+        barrier.pending_counts(),
+        (1, 0),
+        "a live getter becoming unknown must not erase historical admission"
+    );
+    barrier
+        .release(physical, &surface, held_input(KeyAction::Release))
+        .unwrap();
     assert_eq!(barrier.pending_counts(), (0, 1));
-    assert!(peer.keys.try_recv().is_err(), "release waits for reattachment to the original worker");
+    assert!(
+        peer.keys.try_recv().is_err(),
+        "release waits for reattachment to the original worker"
+    );
     peer.resume.send(()).unwrap();
-    peer.next(KeyAction::Release); peer.ack(true);
+    peer.next(KeyAction::Release);
+    peer.ack(true);
     wait_key_counts(&barrier, (0, 0));
     assert!(barrier.take_failures().is_empty());
 }
-
 
 /// Retains the real mounted widget/tree while an App lifecycle fixture drives
 /// close. It avoids creating an artificial orphan before exit commits.
@@ -1294,32 +1781,87 @@ impl HeldKeyWidget {
         self._widget.review_active = true;
         self._widget.suppress_focus_reports = true;
         self._widget.review_revision += 1;
-        dispatch(&mut self._widget, &mut self._tree, &self._renderer,
-            Event::Window(window::Event::RedrawRequested(Instant::now())));
-        assert!(self._tree.state.downcast_ref::<WidgetState>().a11y.borrow().review);
+        dispatch(
+            &mut self._widget,
+            &mut self._tree,
+            &self._renderer,
+            Event::Window(window::Event::RedrawRequested(Instant::now())),
+        );
+        assert!(
+            self._tree
+                .state
+                .downcast_ref::<WidgetState>()
+                .a11y
+                .borrow()
+                .review
+        );
     }
 }
-pub(crate) fn hold_key_in_widget(surface: &TerminalSurface, barrier: ReviewInputBarrier) -> HeldKeyWidget {
+pub(crate) fn hold_key_in_widget(
+    surface: &TerminalSurface,
+    barrier: ReviewInputBarrier,
+) -> HeldKeyWidget {
     let renderer = renderer();
-    let mut widget = TerminalWidget::<Message>::new(surface.clone()).id(Id::new("window-exit-key")).model_focused(true)
+    let mut widget = TerminalWidget::<Message>::new(surface.clone())
+        .id(Id::new("window-exit-key"))
+        .model_focused(true)
         .review_boundary(barrier, false, false, 0, Message::Review);
     let mut tree = widget_tree(&widget);
-    dispatch(&mut widget, &mut tree, &renderer, key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, true));
-    HeldKeyWidget { _tree: tree, _widget: widget, _renderer: renderer }
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::Enter,
+            keyboard::key::Code::Enter,
+            true,
+        ),
+    );
+    HeldKeyWidget {
+        _tree: tree,
+        _widget: widget,
+        _renderer: renderer,
+    }
 }
 #[test]
 fn bounded_window_exit_fences_unknown_delivery_without_killing_the_pty() {
     let (surface, peer) = HeldKeyPeer::connect();
     let barrier = ReviewInputBarrier::default();
-    barrier.press(keyboard::key::Physical::Code(keyboard::key::Code::KeyA), &surface, held_input(KeyAction::Press)).unwrap();
+    barrier
+        .press(
+            keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
+            &surface,
+            held_input(KeyAction::Press),
+        )
+        .unwrap();
     peer.next(KeyAction::Press); // Deliberately withhold its authenticated ACK.
     assert!(barrier.begin_window_exit());
-    assert_eq!(barrier.press(keyboard::key::Physical::Code(keyboard::key::Code::KeyB), &surface, held_input(KeyAction::Press)), Err(TerminalSendError::Closed));
+    assert_eq!(
+        barrier.press(
+            keyboard::key::Physical::Code(keyboard::key::Code::KeyB),
+            &surface,
+            held_input(KeyAction::Press)
+        ),
+        Err(TerminalSendError::Closed)
+    );
     barrier.note_review(surface.terminal_id(), true); // A late native action cannot reopen Review during committed exit.
-    let failures = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
-        barrier.drain_window_exit_for_test(Duration::from_millis(30)));
-    assert!(failures.iter().any(|reason| reason.contains("not confirmed before window exit")));
+    let failures = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(barrier.drain_window_exit_for_test(Duration::from_millis(30)));
+    assert!(
+        failures
+            .iter()
+            .any(|reason| reason.contains("not confirmed before window exit"))
+    );
     assert_eq!(barrier.pending_counts(), (0, 0));
-    assert_eq!(surface.key(held_input(KeyAction::Press)), Err(TerminalSendError::Closed));
-    assert!(peer.keys.try_recv().is_err(), "no guessed late release may follow a failed original admission");
+    assert_eq!(
+        surface.key(held_input(KeyAction::Press)),
+        Err(TerminalSendError::Closed)
+    );
+    assert!(
+        peer.keys.try_recv().is_err(),
+        "no guessed late release may follow a failed original admission"
+    );
 }

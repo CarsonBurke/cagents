@@ -10,7 +10,10 @@
 //! both whichever way they went: ahead of the content when they reach it, and
 //! from within the overlays when those take them first.
 
-use std::{cell::{Cell, RefCell}, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
@@ -24,7 +27,10 @@ use cosmic::{Element, Renderer, Theme};
 /// Cloning shares the record. It is cheap to hand to every widget that reads
 /// it, and costs one copy of a few words per recorded event.
 #[derive(Clone, Default)]
-pub struct InputTrace(Rc<Cell<Sample>>, Rc<RefCell<Option<crate::terminal::ReviewInputBarrier>>>);
+pub struct InputTrace(
+    Rc<Cell<Sample>>,
+    Rc<RefCell<Option<crate::terminal::ReviewInputBarrier>>>,
+);
 
 #[derive(Clone, Copy, Default)]
 struct Sample {
@@ -37,13 +43,15 @@ struct Sample {
 
 impl InputTrace {
     pub(crate) fn bind_terminal_keys(&self, barrier: crate::terminal::ReviewInputBarrier) {
-        *self.1.borrow_mut()=Some(barrier);
+        *self.1.borrow_mut() = Some(barrier);
     }
     /// Records one event the window delivered.
     pub(crate) fn record(&self, event: &Event) {
         // Observe releases during native dispatch, before child widgets. A
         // queued app message may run after a newer press of the same key.
-        if let Event::Keyboard(event)=event && let Some(barrier)=self.1.borrow().as_ref() {
+        if let Event::Keyboard(event) = event
+            && let Some(barrier) = self.1.borrow().as_ref()
+        {
             barrier.observe_key_event(event);
         }
         let mut sample = self.0.get();

@@ -36,19 +36,33 @@ pub struct ClipboardTarget {
 }
 impl ClipboardTarget {
     pub(super) fn capture(surface: &crate::terminal::TerminalSurface) -> Option<Self> {
-        let worker=surface.execution_instance().filter(|worker| !worker.is_nil())?;
-        let proof=surface.host_proof().filter(crate::model::HostSessionProof::is_complete)?;
-        Some(Self {terminal:surface.terminal_id(),worker,proof})
+        let worker = surface
+            .execution_instance()
+            .filter(|worker| !worker.is_nil())?;
+        let proof = surface
+            .host_proof()
+            .filter(crate::model::HostSessionProof::is_complete)?;
+        Some(Self {
+            terminal: surface.terminal_id(),
+            worker,
+            proof,
+        })
     }
     pub(super) fn matches(&self, surface: &crate::terminal::TerminalSurface) -> bool {
-        Self::capture(surface).as_ref()==Some(self)
+        Self::capture(surface).as_ref() == Some(self)
     }
     /// A temporary detach grants nothing, but does not silently replace or
     /// destroy the pending original generation's permission request.
     pub(super) fn stale(&self, surface: &crate::terminal::TerminalSurface) -> bool {
-        surface.terminal_id()!=self.terminal
-            || surface.execution_instance().filter(|worker| !worker.is_nil()).is_some_and(|worker| worker!=self.worker)
-            || surface.host_proof().filter(crate::model::HostSessionProof::is_complete).is_some_and(|proof| proof!=self.proof)
+        surface.terminal_id() != self.terminal
+            || surface
+                .execution_instance()
+                .filter(|worker| !worker.is_nil())
+                .is_some_and(|worker| worker != self.worker)
+            || surface
+                .host_proof()
+                .filter(crate::model::HostSessionProof::is_complete)
+                .is_some_and(|proof| proof != self.proof)
     }
 }
 
@@ -56,19 +70,26 @@ impl ClipboardTarget {
 mod tests {
     use super::*;
     use cosmic::iced::futures::StreamExt;
-    fn clipboard_peer(id:TerminalId,worker:uuid::Uuid) -> crate::terminal::TerminalTestPeer {
-        crate::terminal::TerminalTestPeer::with_generation(id,worker,crate::model::HostSessionProof {
-            host_session_id:crate::model::HostSessionId::new("clipboard-test-session"),
-            boot_id:crate::model::BootId::new("clipboard-test-boot"),
-            host_incarnation:crate::model::HostIncarnation::new("clipboard-test-host"),
-        })
+    fn clipboard_peer(id: TerminalId, worker: uuid::Uuid) -> crate::terminal::TerminalTestPeer {
+        crate::terminal::TerminalTestPeer::with_generation(
+            id,
+            worker,
+            crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("clipboard-test-session"),
+                boot_id: crate::model::BootId::new("clipboard-test-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("clipboard-test-host"),
+            },
+        )
     }
-    fn clipboard_app(program:&str) -> (Cagents,CardId,crate::terminal::TerminalTestPeer) {
-        let (mut app,card,_directory)=super::super::tests::live_agent_app(program);
-        let CardRuntime::Terminal(surface)=app.cards.get(&card).unwrap() else {unreachable!()};
-        let peer=clipboard_peer(surface.terminal_id(),uuid::Uuid::new_v4());
-        app.cards.insert(card,CardRuntime::Terminal(peer.surface()));
-        (app,card,peer)
+    fn clipboard_app(program: &str) -> (Cagents, CardId, crate::terminal::TerminalTestPeer) {
+        let (mut app, card, _directory) = super::super::tests::live_agent_app(program);
+        let CardRuntime::Terminal(surface) = app.cards.get(&card).unwrap() else {
+            unreachable!()
+        };
+        let peer = clipboard_peer(surface.terminal_id(), uuid::Uuid::new_v4());
+        app.cards
+            .insert(card, CardRuntime::Terminal(peer.surface()));
+        (app, card, peer)
     }
     fn confirm_clipboard(app: &Cagents, card: CardId, allow: bool) -> Action {
         let (_, terminal, ..) = app
@@ -80,16 +101,19 @@ mod tests {
 
     #[test]
     fn stale_clipboard_action_cannot_approve_or_discard_a_replacement_request() {
-        let (mut app, card, _peer) =
-            clipboard_app("clipboard-stale-action-fixture");
+        let (mut app, card, _peer) = clipboard_app("clipboard-stale-action-fixture");
         app.settings.terminal_clipboard_write = crate::settings::TerminalClipboardWritePolicy::Ask;
         drop(app.handle_terminal_clipboard_write(card, false, "old".into()));
         let old_action = confirm_clipboard(&app, card, true);
-        let replacement=app.terminal_clipboard.as_ref().unwrap().1.terminal;
-        let replacement_peer=clipboard_peer(replacement,uuid::Uuid::new_v4());
-        app.cards.insert(card,CardRuntime::Terminal(replacement_peer.surface()));
+        let replacement = app.terminal_clipboard.as_ref().unwrap().1.terminal;
+        let replacement_peer = clipboard_peer(replacement, uuid::Uuid::new_v4());
+        app.cards
+            .insert(card, CardRuntime::Terminal(replacement_peer.surface()));
         app.reconcile_terminal_review_owner();
-        assert!(app.terminal_clipboard.is_none(),"a confirmed successor invalidates the old prompt");
+        assert!(
+            app.terminal_clipboard.is_none(),
+            "a confirmed successor invalidates the old prompt"
+        );
         drop(app.handle_terminal_clipboard_write(card, false, "replacement".into()));
         let pending = app.terminal_clipboard.clone();
         assert!(clipboard_actions(app.handle_terminal_find(old_action)).is_empty());
@@ -136,8 +160,7 @@ mod tests {
     #[test]
     fn clipboard_consent_dismissal_restores_terminal_keyboard_focus() {
         for allow in [false, true] {
-            let (mut app, card, _peer) =
-                clipboard_app("clipboard-focus-fixture");
+            let (mut app, card, _peer) = clipboard_app("clipboard-focus-fixture");
             app.context_inspector_open = false;
             app.settings.terminal_clipboard_write =
                 crate::settings::TerminalClipboardWritePolicy::Ask;
@@ -154,8 +177,7 @@ mod tests {
     #[test]
     fn terminal_clipboard_policy_denies_allows_and_prompts_with_terminal_scoped_consent() {
         use crate::settings::TerminalClipboardWritePolicy;
-        let (mut app, card, _peer) =
-            clipboard_app("clipboard-policy-fixture");
+        let (mut app, card, _peer) = clipboard_app("clipboard-policy-fixture");
         app.settings.terminal_clipboard_write = TerminalClipboardWritePolicy::Deny;
         assert!(
             clipboard_actions(app.handle_terminal_clipboard_write(card, false, "denied".into()))
@@ -200,8 +222,7 @@ mod tests {
     #[test]
     fn rejected_terminal_clipboard_consent_never_writes_and_stale_identity_never_inherits_it() {
         use crate::settings::TerminalClipboardWritePolicy;
-        let (mut app, card, _peer) =
-            clipboard_app("clipboard-consent-fixture");
+        let (mut app, card, _peer) = clipboard_app("clipboard-consent-fixture");
         app.settings.terminal_clipboard_write = TerminalClipboardWritePolicy::Ask;
         drop(app.handle_terminal_clipboard_write(card, false, "ask".into()));
         assert!(
@@ -213,9 +234,12 @@ mod tests {
                 .is_empty()
         );
         assert!(app.terminal_clipboard.is_none());
-        let CardRuntime::Terminal(surface)=app.cards.get(&card).unwrap() else {unreachable!()};
-        let replacement_peer=clipboard_peer(surface.terminal_id(),uuid::Uuid::new_v4());
-        app.cards.insert(card,CardRuntime::Terminal(replacement_peer.surface()));
+        let CardRuntime::Terminal(surface) = app.cards.get(&card).unwrap() else {
+            unreachable!()
+        };
+        let replacement_peer = clipboard_peer(surface.terminal_id(), uuid::Uuid::new_v4());
+        app.cards
+            .insert(card, CardRuntime::Terminal(replacement_peer.surface()));
         assert!(
             clipboard_actions(app.handle_terminal_clipboard_write(
                 card,
@@ -234,70 +258,137 @@ mod tests {
 
     #[test]
     fn remembered_allow_does_not_grant_a_same_id_successor_worker_clipboard_access() {
-        let (mut app,card,_peer)=clipboard_app("clipboard-worker-permission");
-        app.settings.terminal_clipboard_write=crate::settings::TerminalClipboardWritePolicy::Ask;
-        drop(app.handle_terminal_clipboard_write(card,false,"first".into()));
-        let original=app.terminal_clipboard.as_ref().unwrap().1.clone();
-        let allow=confirm_clipboard(&app,card,true);
-        assert_eq!(clipboard_actions(app.handle_terminal_find(allow)).len(),1);
-        let replacement=clipboard_peer(original.terminal,uuid::Uuid::new_v4());
-        app.cards.insert(card,CardRuntime::Terminal(replacement.surface()));
-        assert!(clipboard_actions(app.handle_terminal_clipboard_write(card,false,"successor".into())).is_empty());
-        let pending=app.terminal_clipboard.as_ref().expect("a new worker must request its own permission");
-        assert_eq!(pending.1.terminal,original.terminal);
-        assert_ne!(pending.1.worker,original.worker);
-        assert_eq!(pending.1.proof,original.proof,"worker fence is independent of daemon identity");
+        let (mut app, card, _peer) = clipboard_app("clipboard-worker-permission");
+        app.settings.terminal_clipboard_write = crate::settings::TerminalClipboardWritePolicy::Ask;
+        drop(app.handle_terminal_clipboard_write(card, false, "first".into()));
+        let original = app.terminal_clipboard.as_ref().unwrap().1.clone();
+        let allow = confirm_clipboard(&app, card, true);
+        assert_eq!(clipboard_actions(app.handle_terminal_find(allow)).len(), 1);
+        let replacement = clipboard_peer(original.terminal, uuid::Uuid::new_v4());
+        app.cards
+            .insert(card, CardRuntime::Terminal(replacement.surface()));
+        assert!(
+            clipboard_actions(app.handle_terminal_clipboard_write(card, false, "successor".into()))
+                .is_empty()
+        );
+        let pending = app
+            .terminal_clipboard
+            .as_ref()
+            .expect("a new worker must request its own permission");
+        assert_eq!(pending.1.terminal, original.terminal);
+        assert_ne!(pending.1.worker, original.worker);
+        assert_eq!(
+            pending.1.proof, original.proof,
+            "worker fence is independent of daemon identity"
+        );
     }
 
     #[test]
     fn clipboard_permissions_do_not_cross_authenticated_hosts_even_if_a_worker_uuid_is_reused() {
-        let (mut app,card,_peer)=clipboard_app("clipboard-host-scope");
-        app.settings.terminal_clipboard_write=crate::settings::TerminalClipboardWritePolicy::Ask;
-        drop(app.handle_terminal_clipboard_write(card,false,"first".into()));
-        let original=app.terminal_clipboard.as_ref().unwrap().1.clone();
-        let old_action=confirm_clipboard(&app,card,true);
-        assert_eq!(clipboard_actions(app.handle_terminal_find(old_action.clone())).len(),1);
-        let replacement=crate::terminal::TerminalTestPeer::with_generation(original.terminal,original.worker,crate::model::HostSessionProof {
-            host_session_id:crate::model::HostSessionId::new("other-session"),
-            boot_id:crate::model::BootId::new("other-boot"),
-            host_incarnation:crate::model::HostIncarnation::new("other-host"),
-        });
-        app.cards.insert(card,CardRuntime::Terminal(replacement.surface()));
-        assert!(clipboard_actions(app.handle_terminal_clipboard_write(card,false,"other-host".into())).is_empty());
-        let pending=app.terminal_clipboard.clone();
-        assert!(pending.is_some(),"earlier Allow does not grant another host permission");
+        let (mut app, card, _peer) = clipboard_app("clipboard-host-scope");
+        app.settings.terminal_clipboard_write = crate::settings::TerminalClipboardWritePolicy::Ask;
+        drop(app.handle_terminal_clipboard_write(card, false, "first".into()));
+        let original = app.terminal_clipboard.as_ref().unwrap().1.clone();
+        let old_action = confirm_clipboard(&app, card, true);
+        assert_eq!(
+            clipboard_actions(app.handle_terminal_find(old_action.clone())).len(),
+            1
+        );
+        let replacement = crate::terminal::TerminalTestPeer::with_generation(
+            original.terminal,
+            original.worker,
+            crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("other-session"),
+                boot_id: crate::model::BootId::new("other-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("other-host"),
+            },
+        );
+        app.cards
+            .insert(card, CardRuntime::Terminal(replacement.surface()));
+        assert!(
+            clipboard_actions(app.handle_terminal_clipboard_write(
+                card,
+                false,
+                "other-host".into()
+            ))
+            .is_empty()
+        );
+        let pending = app.terminal_clipboard.clone();
+        assert!(
+            pending.is_some(),
+            "earlier Allow does not grant another host permission"
+        );
         assert!(clipboard_actions(app.handle_terminal_find(old_action)).is_empty());
-        assert_eq!(app.terminal_clipboard,pending,"queued old Allow cannot consume another host's prompt");
+        assert_eq!(
+            app.terminal_clipboard, pending,
+            "queued old Allow cannot consume another host's prompt"
+        );
     }
 
     #[test]
     fn temporarily_unknown_attachment_cannot_grant_or_refresh_clipboard_authority() {
-        let (mut app,card,_peer)=clipboard_app("clipboard-detach");
-        app.settings.terminal_clipboard_write=crate::settings::TerminalClipboardWritePolicy::Ask;
-        drop(app.handle_terminal_clipboard_write(card,false,"original".into()));
-        let pending=app.terminal_clipboard.clone();
-        let old_allow=confirm_clipboard(&app,card,true);
-        let terminal=pending.as_ref().unwrap().1.terminal;
-        let directory=tempfile::tempdir().unwrap();
-        app.cards.insert(card,CardRuntime::Terminal(super::super::tests::unconnected_surface(directory.path(),terminal)));
+        let (mut app, card, _peer) = clipboard_app("clipboard-detach");
+        app.settings.terminal_clipboard_write = crate::settings::TerminalClipboardWritePolicy::Ask;
+        drop(app.handle_terminal_clipboard_write(card, false, "original".into()));
+        let pending = app.terminal_clipboard.clone();
+        let old_allow = confirm_clipboard(&app, card, true);
+        let terminal = pending.as_ref().unwrap().1.terminal;
+        let directory = tempfile::tempdir().unwrap();
+        app.cards.insert(
+            card,
+            CardRuntime::Terminal(super::super::tests::unconnected_surface(
+                directory.path(),
+                terminal,
+            )),
+        );
         app.reconcile_terminal_review_owner();
-        assert_eq!(app.terminal_clipboard,pending,"unknown transport retains original pending identity");
+        assert_eq!(
+            app.terminal_clipboard, pending,
+            "unknown transport retains original pending identity"
+        );
         assert!(clipboard_actions(app.handle_terminal_find(old_allow)).is_empty());
-        assert_eq!(app.terminal_clipboard,pending,"unknown transport cannot grant permission");
-        assert!(clipboard_actions(app.handle_terminal_clipboard_write(card,false,"unproved".into())).is_empty());
-        assert_eq!(app.terminal_clipboard,pending,"an unproved event cannot refresh original request");
-        let deny=confirm_clipboard(&app,card,false);
+        assert_eq!(
+            app.terminal_clipboard, pending,
+            "unknown transport cannot grant permission"
+        );
+        assert!(
+            clipboard_actions(app.handle_terminal_clipboard_write(card, false, "unproved".into()))
+                .is_empty()
+        );
+        assert_eq!(
+            app.terminal_clipboard, pending,
+            "an unproved event cannot refresh original request"
+        );
+        let deny = confirm_clipboard(&app, card, false);
         assert!(clipboard_actions(app.handle_terminal_find(deny)).is_empty());
-        assert!(app.terminal_clipboard.is_none(),"the original request may still be dismissed while detached");
-        assert!(app.terminal_find.get(&card).is_none_or(|find| find.clipboard_consent.is_none()));
+        assert!(
+            app.terminal_clipboard.is_none(),
+            "the original request may still be dismissed while detached"
+        );
+        assert!(
+            app.terminal_find
+                .get(&card)
+                .is_none_or(|find| find.clipboard_consent.is_none())
+        );
     }
 
     #[test]
     fn an_unconfirmed_terminal_never_issues_clipboard_authority() {
-        let (mut app,card,_directory)=super::super::tests::live_agent_app("clipboard-no-worker-authority");
-        for policy in [crate::settings::TerminalClipboardWritePolicy::Ask,crate::settings::TerminalClipboardWritePolicy::Allow] {
-            app.settings.terminal_clipboard_write=policy;
-            assert!(clipboard_actions(app.handle_terminal_clipboard_write(card,false,"unproved".into())).is_empty());
+        let (mut app, card, _directory) =
+            super::super::tests::live_agent_app("clipboard-no-worker-authority");
+        for policy in [
+            crate::settings::TerminalClipboardWritePolicy::Ask,
+            crate::settings::TerminalClipboardWritePolicy::Allow,
+        ] {
+            app.settings.terminal_clipboard_write = policy;
+            assert!(
+                clipboard_actions(app.handle_terminal_clipboard_write(
+                    card,
+                    false,
+                    "unproved".into()
+                ))
+                .is_empty()
+            );
             assert!(app.terminal_clipboard.is_none());
         }
     }
@@ -752,18 +843,38 @@ impl Cagents {
         if let Action::ConfirmClipboard(card, requested, allow) = &action {
             // Compare before taking: a queued action for an old worker cannot
             // approve or dismiss a newer request in the same terminal/card.
-            if !self.terminal_clipboard.as_ref().is_some_and(|(target, source, ..)|
-                target==card && source==requested)
-            { return Task::none(); }
-            let current=matches!(self.cards.get(card),Some(CardRuntime::Terminal(handle)) if requested.matches(handle));
-            if *allow && !current { return Task::none(); }
-            let Some((target, source, primary, text))=self.terminal_clipboard.take() else { return Task::none(); };
-            if current { self.terminal_find.entry(target).or_default().clipboard_consent=Some((source,*allow)); }
-            let target=self.nested_modal_focus_target().unwrap_or_else(||
-                self.workspace.focused().map_or_else(||widget::Id::new(TOOLBAR_FOCUS_ID),|focused|self.card_keyboard_focus(focused)));
-            let focus=iced::widget::operation::focus(target).map(cosmic::Action::App);
-            if *allow && self.settings.terminal_clipboard_write!=crate::settings::TerminalClipboardWritePolicy::Deny {
-                return Task::batch([clipboard_write_task(primary,text),focus]);
+            if !self
+                .terminal_clipboard
+                .as_ref()
+                .is_some_and(|(target, source, ..)| target == card && source == requested)
+            {
+                return Task::none();
+            }
+            let current = matches!(self.cards.get(card),Some(CardRuntime::Terminal(handle)) if requested.matches(handle));
+            if *allow && !current {
+                return Task::none();
+            }
+            let Some((target, source, primary, text)) = self.terminal_clipboard.take() else {
+                return Task::none();
+            };
+            if current {
+                self.terminal_find
+                    .entry(target)
+                    .or_default()
+                    .clipboard_consent = Some((source, *allow));
+            }
+            let target = self.nested_modal_focus_target().unwrap_or_else(|| {
+                self.workspace.focused().map_or_else(
+                    || widget::Id::new(TOOLBAR_FOCUS_ID),
+                    |focused| self.card_keyboard_focus(focused),
+                )
+            });
+            let focus = iced::widget::operation::focus(target).map(cosmic::Action::App);
+            if *allow
+                && self.settings.terminal_clipboard_write
+                    != crate::settings::TerminalClipboardWritePolicy::Deny
+            {
+                return Task::batch([clipboard_write_task(primary, text), focus]);
             }
             return focus;
         }
@@ -1191,7 +1302,9 @@ impl Cagents {
         let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
             return Task::none();
         };
-        let Some(terminal) = ClipboardTarget::capture(handle) else { return Task::none(); };
+        let Some(terminal) = ClipboardTarget::capture(handle) else {
+            return Task::none();
+        };
         let consent = self
             .terminal_find
             .get(&card)

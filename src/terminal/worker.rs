@@ -1477,27 +1477,55 @@ impl TerminalHandle {
 
     /// The daemon keeps the exact listed record pending until this result
     /// proves cleanup. Queue refusal and failure leave its holder retryable.
-    pub(crate) fn release_completed_holder_async(&self) -> Result<std::sync::mpsc::Receiver<CompletedRelease>, String> {
+    pub(crate) fn release_completed_holder_async(
+        &self,
+    ) -> Result<std::sync::mpsc::Receiver<CompletedRelease>, String> {
         holder::release::completed(self)
     }
 
-    pub(crate) fn release_completed_holder_until(&self, deadline: std::time::Instant) -> Result<(), String> {
-        if std::time::Instant::now() >= deadline {return Err("Terminal family cleanup deadline expired; its exact owner remains retained".into());}
-        let mut retained = self.inner.published.retained_holder.try_lock()
-            .map_err(|_| "Another close retains this terminal holder; retry after its deadline".to_owned())?;
-        if let Some(holder) = retained.as_mut() {holder.close_until(deadline)?;}
-        else if !self.inner.published.cleanup_published.load(Ordering::Acquire) {
+    pub(crate) fn release_completed_holder_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "Terminal family cleanup deadline expired; its exact owner remains retained".into(),
+            );
+        }
+        let mut retained = self
+            .inner
+            .published
+            .retained_holder
+            .try_lock()
+            .map_err(|_| {
+                "Another close retains this terminal holder; retry after its deadline".to_owned()
+            })?;
+        if let Some(holder) = retained.as_mut() {
+            holder.close_until(deadline)?;
+        } else if !self
+            .inner
+            .published
+            .cleanup_published
+            .load(Ordering::Acquire)
+        {
             return Err("Terminal has no retained cleanup owner or published family proof; preserved ownership cannot be released".into());
         }
-        let mut archive = self.inner.published.archive.try_lock()
-            .map_err(|_| "Terminal cleanup is proved; archive metadata is busy, retry publication".to_owned())?;
+        let mut archive = self.inner.published.archive.try_lock().map_err(|_| {
+            "Terminal cleanup is proved; archive metadata is busy, retry publication".to_owned()
+        })?;
         *archive = ArchivePhase::Released;
         let holder = retained.take();
         drop(archive);
         drop(retained);
         drop(holder);
-        self.inner.published.cleanup_published.store(true, Ordering::Release);
-        self.inner.published.completed.store(true, Ordering::Release);
+        self.inner
+            .published
+            .cleanup_published
+            .store(true, Ordering::Release);
+        self.inner
+            .published
+            .completed
+            .store(true, Ordering::Release);
         self.inner.published.archive_ready.notify_all();
         Ok(())
     }
@@ -1739,19 +1767,16 @@ impl TerminalHandle {
 
 fn should_follow_key_input(input: &KeyInput) -> bool {
     input.scroll_to_bottom_on_input
-            && input.action != KeyAction::Release
-            && !input.key.is_modifier()
-            && !(input.modifiers.shift
-                && !input.modifiers.control
-                && !input.modifiers.alt
-                && !input.modifiers.super_key
-                && matches!(
-                    input.key,
-                    TerminalKey::PageUp
-                        | TerminalKey::PageDown
-                        | TerminalKey::Home
-                        | TerminalKey::End
-                ))
+        && input.action != KeyAction::Release
+        && !input.key.is_modifier()
+        && !(input.modifiers.shift
+            && !input.modifiers.control
+            && !input.modifiers.alt
+            && !input.modifiers.super_key
+            && matches!(
+                input.key,
+                TerminalKey::PageUp | TerminalKey::PageDown | TerminalKey::Home | TerminalKey::End
+            ))
 }
 
 fn is_interrupt_key(key: &KeyInput) -> bool {
@@ -2966,8 +2991,11 @@ impl Worker {
     }
 
     fn follow_admitted_input(&mut self, follow: bool) {
-        if follow && self.terminal.scrollbar()
-            .is_ok_and(|bar| bar.offset.saturating_add(bar.len) < bar.total)
+        if follow
+            && self
+                .terminal
+                .scrollbar()
+                .is_ok_and(|bar| bar.offset.saturating_add(bar.len) < bar.total)
         {
             self.terminal.scroll_viewport(ScrollViewport::Bottom);
             if self.visibility == Visibility::Visible {
@@ -3690,7 +3718,9 @@ impl Worker {
         // Priority Ctrl+C can signal the exact PTY without a user-write call.
         // Preserve the same conservative input fence before either signal or
         // raw/extended encoding admission, including partial/fatal outcomes.
-        if !encoded.is_empty() { self.unacknowledged_input = true; }
+        if !encoded.is_empty() {
+            self.unacknowledged_input = true;
+        }
         self.pending_input.clear();
         self.retained_commands
             .retain(|command| !is_cancelable_input_before(command, boundary));
@@ -7255,17 +7285,61 @@ mod tests {
 
     #[test]
     fn preserved_completed_owner_cannot_be_reported_as_published_cleanup() {
-        let handle=TerminalHandle::spawn(shell_session("exit 0"),TerminalConfig::default(),|_|{}).unwrap();
-        let deadline=Instant::now()+Duration::from_secs(5);
-        while !handle.is_completed() {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
-        assert!(handle.inner.published.retained_holder.lock().unwrap().is_some());
+        let handle =
+            TerminalHandle::spawn(shell_session("exit 0"), TerminalConfig::default(), |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            handle
+                .inner
+                .published
+                .retained_holder
+                .lock()
+                .unwrap()
+                .is_some()
+        );
         handle.preserve_completed_for_restart();
-        assert!(handle.inner.published.retained_holder.lock().unwrap().is_none());
+        assert!(
+            handle
+                .inner
+                .published
+                .retained_holder
+                .lock()
+                .unwrap()
+                .is_none()
+        );
         assert!(handle.inner.published.input_order.lock().unwrap().handoff);
-        assert!(!handle.inner.published.cleanup_published.load(Ordering::Acquire));
-        assert!(handle.release_completed_holder_until(Instant::now()+Duration::from_secs(1)).is_err());
-        assert!(matches!(handle.release_completed_holder_async().unwrap().recv_timeout(Duration::from_secs(5)).unwrap(),CompletedRelease::Retained(_)));
-        assert!(!handle.inner.published.cleanup_published.load(Ordering::Acquire));
+        assert!(
+            !handle
+                .inner
+                .published
+                .cleanup_published
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            handle
+                .release_completed_holder_until(Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(matches!(
+            handle
+                .release_completed_holder_async()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            CompletedRelease::Retained(_)
+        ));
+        assert!(
+            !handle
+                .inner
+                .published
+                .cleanup_published
+                .load(Ordering::Acquire)
+        );
     }
 
     #[test]
@@ -7292,12 +7366,29 @@ mod tests {
         let retained = handle.inner.published.retained_holder.lock().unwrap();
         assert!(retained.is_some());
         let result = handle.release_completed_holder_async().unwrap();
-        assert!(matches!(result.recv_timeout(Duration::from_secs(5)).unwrap(), CompletedRelease::Retained(_)));
-        assert!(retained.is_some(), "contention cannot discard exact cleanup ownership");
+        assert!(matches!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            CompletedRelease::Retained(_)
+        ));
+        assert!(
+            retained.is_some(),
+            "contention cannot discard exact cleanup ownership"
+        );
         drop(retained);
         let result = handle.release_completed_holder_async().unwrap();
-        assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), CompletedRelease::Released);
-        assert!(handle.inner.published.retained_holder.lock().unwrap().is_none());
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            CompletedRelease::Released
+        );
+        assert!(
+            handle
+                .inner
+                .published
+                .retained_holder
+                .lock()
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -9400,7 +9491,10 @@ mod tests {
             Some('x'),
         ));
         assert_eq!(worker.terminal.scrollbar().unwrap().offset, 0);
-        assert!(worker.unacknowledged_input, "failed user writes protect close without falsely following input");
+        assert!(
+            worker.unacknowledged_input,
+            "failed user writes protect close without falsely following input"
+        );
         worker.published.request_shutdown();
         worker.run();
     }
@@ -9409,45 +9503,88 @@ mod tests {
     fn priority_interrupt_follows_only_successful_enabled_input_and_never_recaptures_bottom() {
         let (mut worker, _) = capture_worker_for(shell_session("exec sleep 60").launch);
         worker.terminal.vt_write(&b"row\r\n".repeat(100));
-        let mut attributes: libc::termios = unsafe {std::mem::zeroed()};
-        assert_eq!(unsafe {libc::tcgetattr(worker.writer.as_raw_fd(), &mut attributes)},0);
+        let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(worker.writer.as_raw_fd(), &mut attributes) },
+            0
+        );
         attributes.c_lflag &= !libc::ISIG;
-        assert_eq!(unsafe {libc::tcsetattr(worker.writer.as_raw_fd(),libc::TCSANOW,&attributes)},0);
-        let mut input=key_input(KeyAction::Press,TerminalKey::Character('c'),Some("c"),Some('c'));
-        input.modifiers.control=true;
-        input.scroll_to_bottom_on_input=false;
+        assert_eq!(
+            unsafe { libc::tcsetattr(worker.writer.as_raw_fd(), libc::TCSANOW, &attributes) },
+            0
+        );
+        let mut input = key_input(
+            KeyAction::Press,
+            TerminalKey::Character('c'),
+            Some("c"),
+            Some('c'),
+        );
+        input.modifiers.control = true;
+        input.scroll_to_bottom_on_input = false;
         worker.terminal.scroll_viewport(ScrollViewport::Top);
         assert!(worker.published.request_interrupt(Some(input.clone())));
         worker.interrupt_input();
-        assert_eq!(worker.terminal.scrollbar().unwrap().offset,0,"disabled priority input preserves review position");
-        assert!(worker.unacknowledged_input, "raw priority input protects close independently of follow setting");
-        input.scroll_to_bottom_on_input=true;
+        assert_eq!(
+            worker.terminal.scrollbar().unwrap().offset,
+            0,
+            "disabled priority input preserves review position"
+        );
+        assert!(
+            worker.unacknowledged_input,
+            "raw priority input protects close independently of follow setting"
+        );
+        input.scroll_to_bottom_on_input = true;
         assert!(worker.published.request_interrupt(Some(input.clone())));
         worker.interrupt_input();
-        let bar=worker.terminal.scrollbar().unwrap();
-        assert_eq!(bar.offset+bar.len,bar.total,"admitted raw Ctrl+C follows the prompt");
+        let bar = worker.terminal.scrollbar().unwrap();
+        assert_eq!(
+            bar.offset + bar.len,
+            bar.total,
+            "admitted raw Ctrl+C follows the prompt"
+        );
         present(&worker);
-        let generation=worker.generation;
+        let generation = worker.generation;
         assert!(worker.published.request_interrupt(Some(input.clone())));
         worker.interrupt_input();
-        assert_eq!(worker.generation,generation,"a key at bottom must not publish a redundant capture");
+        assert_eq!(
+            worker.generation, generation,
+            "a key at bottom must not publish a redundant capture"
+        );
         worker.terminal.scroll_viewport(ScrollViewport::Top);
         attributes.c_lflag |= libc::ISIG;
-        worker.unacknowledged_input=false;
-        assert_eq!(unsafe {libc::tcsetattr(worker.writer.as_raw_fd(),libc::TCSANOW,&attributes)},0);
+        worker.unacknowledged_input = false;
+        assert_eq!(
+            unsafe { libc::tcsetattr(worker.writer.as_raw_fd(), libc::TCSANOW, &attributes) },
+            0
+        );
         assert!(worker.published.request_interrupt(Some(input.clone())));
         worker.interrupt_input();
-        let bar=worker.terminal.scrollbar().unwrap();
-        assert_eq!(bar.offset+bar.len,bar.total,"successful out-of-band conventional interrupt follows too");
-        assert!(worker.unacknowledged_input, "TIOCSIG cannot bypass close protection");
+        let bar = worker.terminal.scrollbar().unwrap();
+        assert_eq!(
+            bar.offset + bar.len,
+            bar.total,
+            "successful out-of-band conventional interrupt follows too"
+        );
+        assert!(
+            worker.unacknowledged_input,
+            "TIOCSIG cannot bypass close protection"
+        );
         worker.terminal.scroll_viewport(ScrollViewport::Top);
-        worker.writer=File::open("/dev/null").unwrap();
-        worker.unacknowledged_input=false;
+        worker.writer = File::open("/dev/null").unwrap();
+        worker.unacknowledged_input = false;
         assert!(worker.published.request_interrupt(Some(input)));
         worker.interrupt_input();
-        assert_eq!(worker.terminal.scrollbar().unwrap().offset,0,"failed interrupt must not move review position");
-        assert!(worker.unacknowledged_input, "failed priority admission cannot restore unknown quiet-close authority");
-        worker.published.request_shutdown();worker.run();
+        assert_eq!(
+            worker.terminal.scrollbar().unwrap().offset,
+            0,
+            "failed interrupt must not move review position"
+        );
+        assert!(
+            worker.unacknowledged_input,
+            "failed priority admission cannot restore unknown quiet-close authority"
+        );
+        worker.published.request_shutdown();
+        worker.run();
     }
 
     #[test]

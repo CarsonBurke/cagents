@@ -5053,14 +5053,17 @@ pub struct Cagents {
 
 impl Cagents {
     fn set_terminal_review_owner(&mut self, owner: Option<CardId>) {
-        if self.exit.is_some() && owner.is_some() { return; }
-        let previous=self.terminal_review_identity;
+        if self.exit.is_some() && owner.is_some() {
+            return;
+        }
+        let previous = self.terminal_review_identity;
         self.terminal_review_card = owner;
         self.terminal_review_identity = owner.and_then(|card| match self.cards.get(&card) {
             Some(CardRuntime::Terminal(handle)) => Some(handle.terminal_id()),
             _ => None,
         });
-        self.terminal_review_input.confirm_review(previous,self.terminal_review_identity);
+        self.terminal_review_input
+            .confirm_review(previous, self.terminal_review_identity);
         self.terminal_review_revision = self.terminal_review_revision.wrapping_add(1);
     }
 
@@ -11793,7 +11796,9 @@ impl Cagents {
             cosmic::task::future(async move {
                 Message::TerminalKeysDrained(ownership.drain_window_exit().await)
             })
-        } else { Task::none() };
+        } else {
+            Task::none()
+        };
         // `Drop` writes the final state; this snapshot is queued now because
         // someone who has watched the window close may power off before then.
         self.persist();
@@ -13226,9 +13231,12 @@ impl Application for Cagents {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         self.reconcile_terminal_review_owner();
-        self.terminal_review_input.flush_orphans(self.terminal_review_card.is_some());
+        self.terminal_review_input
+            .flush_orphans(self.terminal_review_card.is_some());
         for reason in self.terminal_review_input.take_failures() {
-            self.notices.record(TransientNotice::warning(format!("Terminal input was refused or could not be confirmed: {reason}")));
+            self.notices.record(TransientNotice::warning(format!(
+                "Terminal input was refused or could not be confirmed: {reason}"
+            )));
         }
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -14713,7 +14721,7 @@ impl Application for Cagents {
                 // successor mounted in the same card while the task was pending.
                 if !matches!(self.cards.get(&card), Some(CardRuntime::Terminal(handle)) if handle.terminal_id() == terminal)
                 {
-                    self.terminal_review_input.note_review(terminal,false);
+                    self.terminal_review_input.note_review(terminal, false);
                     return Task::none();
                 }
                 if active {
@@ -15948,7 +15956,9 @@ impl Application for Cagents {
                     }
                     if let Some((card, terminal, ..)) = &self.terminal_clipboard {
                         return self.handle_terminal_find(terminal_ui::Action::ConfirmClipboard(
-                            *card, terminal.clone(), false,
+                            *card,
+                            terminal.clone(),
+                            false,
                         ));
                     }
                     if let Some((card, _)) = &self.terminal_paste {
@@ -17478,7 +17488,8 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
-        self.input_trace.bind_terminal_keys(self.terminal_review_input.clone());
+        self.input_trace
+            .bind_terminal_keys(self.terminal_review_input.clone());
         let surface = crate::input_trace::observe(surface, &self.input_trace);
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]
@@ -19040,47 +19051,99 @@ mod tests {
     #[test]
     fn window_exit_waits_for_real_key_receipts_after_review_and_both_other_gates() {
         use cosmic::iced::futures::StreamExt;
-        for (review, window_first, accepted) in [(true, true, true), (true, false, true), (false, true, false)] {
+        for (review, window_first, accepted) in [
+            (true, true, true),
+            (true, false, true),
+            (false, true, false),
+        ] {
             let (mut app, card, _directory) = live_agent_app("window-key-exit-fixture");
             let (surface, peer) = crate::terminal::TerminalHeldKeyTestPeer::connect();
-            app.cards.insert(card, CardRuntime::Terminal(surface.clone()));
-            let mut mounted = crate::terminal::hold_key_in_widget(&surface, app.terminal_review_input.clone());
-            peer.next(crate::terminal::KeyAction::Press); peer.ack(true);
-            if review { app.set_terminal_review_owner(Some(card)); mounted.enter_review(); }
+            app.cards
+                .insert(card, CardRuntime::Terminal(surface.clone()));
+            let mut mounted =
+                crate::terminal::hold_key_in_widget(&surface, app.terminal_review_input.clone());
+            peer.next(crate::terminal::KeyAction::Press);
+            peer.ack(true);
+            if review {
+                app.set_terminal_review_owner(Some(card));
+                mounted.enter_review();
+            }
             let window = window::Id::unique();
             app.core.set_main_window_id(Some(window));
             let close = app.update(Message::WindowCloseRequested(window));
             assert!(app.exit.is_some());
             assert!(!app.exit.unwrap().terminal_keys_drained);
-            assert!(app.terminal_review_card.is_none(), "committed close explicitly ends Review");
-            assert_eq!(app.core.main_window_id(), None, "the visible close is not delayed by key receipts");
-            let (first, second) = if window_first { (Message::WindowClosed(window), Message::LanguageServersReaped) }
-                else { (Message::LanguageServersReaped, Message::WindowClosed(window)) };
-            drop(app.update(first)); drop(mounted); drop(app.update(second));
-            assert!(!app.exit.unwrap().is_complete(), "window/LSP cannot retire admitted terminal input");
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            assert!(
+                app.terminal_review_card.is_none(),
+                "committed close explicitly ends Review"
+            );
+            assert_eq!(
+                app.core.main_window_id(),
+                None,
+                "the visible close is not delayed by key receipts"
+            );
+            let (first, second) = if window_first {
+                (
+                    Message::WindowClosed(window),
+                    Message::LanguageServersReaped,
+                )
+            } else {
+                (
+                    Message::LanguageServersReaped,
+                    Message::WindowClosed(window),
+                )
+            };
+            drop(app.update(first));
+            drop(mounted);
+            drop(app.update(second));
+            assert!(
+                !app.exit.unwrap().is_complete(),
+                "window/LSP cannot retire admitted terminal input"
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             runtime.block_on(async {
                 let mut stream = iced::runtime::task::into_stream(close).unwrap();
                 // Poll the actual App close task, including its bounded drain.
                 let early = tokio::time::timeout(Duration::from_millis(40), async {
                     while let Some(action) = stream.next().await {
-                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::TerminalKeysDrained(_))) = action {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::TerminalKeysDrained(_),
+                        )) = action
+                        {
                             return;
                         }
                     }
                     panic!("close task ended before key admission");
-                }).await;
-                assert!(early.is_err(), "withheld ACK must keep final process exit fenced");
+                })
+                .await;
+                assert!(
+                    early.is_err(),
+                    "withheld ACK must keep final process exit fenced"
+                );
                 peer.next(crate::terminal::KeyAction::Release);
                 assert!(!app.exit.unwrap().is_complete());
                 peer.ack(accepted);
                 let failures = tokio::time::timeout(Duration::from_secs(2), async {
                     while let Some(action) = stream.next().await {
-                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::TerminalKeysDrained(failures))) = action { return failures; }
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::TerminalKeysDrained(failures),
+                        )) = action
+                        {
+                            return failures;
+                        }
                     }
                     panic!("missing App key-drain completion");
-                }).await.unwrap();
-                assert_eq!(failures.is_empty(), accepted, "refusal must be an explicit failure, never delivered");
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    failures.is_empty(),
+                    accepted,
+                    "refusal must be an explicit failure, never delivered"
+                );
                 drop(app.update(Message::TerminalKeysDrained(failures)));
                 assert!(app.exit.unwrap().is_complete());
             });
