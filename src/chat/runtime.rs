@@ -21,6 +21,8 @@ use std::{
     time::{Duration, Instant},
 };
 mod execution;
+mod directory;
+pub(crate) use directory::DirectoryProof;
 mod store;
 mod websocket;
 mod remote_actor;
@@ -40,6 +42,11 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
+    CaptureExecutionDirectory {
+        directory: std::path::PathBuf,
+        proof: crossbeam_channel::Sender<Result<DirectoryProof, String>>,
+    },
+    RelocateExecutionDirectory(std::path::PathBuf),
     UpdateSource(
         super::Session,
         Option<crate::model::LaunchRecipe>,
@@ -203,7 +210,7 @@ impl LocalHandle {
         session_id: Option<String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        Self::start_inner(spec, adapter, initial, store, None, session_id, None, notify)
+        Self::start_inner(spec, adapter, initial, store, None, session_id, None, true, notify)
     }
 
     pub(crate) fn start_owned(
@@ -225,6 +232,7 @@ impl LocalHandle {
             previous.map(|handle|handle.0.store.clone()),
             id,
             Some(NativeOwnership::New(source, recovery_environment)),
+            true,
             notify,
         )
     }
@@ -251,6 +259,7 @@ impl LocalHandle {
             previous.map(|handle|handle.0.store.clone()),
             recovery.confirmed_thread,
             Some(NativeOwnership::Adopted(holder, server)),
+            true,
             notify,
         )
     }
@@ -263,6 +272,7 @@ impl LocalHandle {
         retained_store:Option<Arc<Mutex<Store>>>,
         session_id: Option<String>,
         ownership: Option<NativeOwnership>,
+        manage_launch_ownership:bool,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
@@ -635,7 +645,7 @@ impl LocalHandle {
             .map_err(|e| e.to_string())?;
         *inner.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         let handle = Self(inner);
-        if !adopted_native && let Some(context) = &launch_context {
+        if manage_launch_ownership && !adopted_native && let Some(context) = &launch_context {
             context.claim_owner(Arc::new(handle.clone()));
         }
         // No child can exist before its exact actor cleanup capability and
@@ -646,13 +656,13 @@ impl LocalHandle {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 use super::protocol::LaunchCleanup;
-                if handle.cleanup().is_ok() || launch_context.is_some() {
+                if handle.cleanup().is_ok() || (manage_launch_ownership&&launch_context.is_some()) {
                     return Err(error);
                 }
                 // Interactive launches have no execution journal. Preserve
                 // their exact actor for host publication if cleanup is unknown.
             }
-            Err(error) if launch_context.is_some() => {
+            Err(error) if manage_launch_ownership&&launch_context.is_some() => {
                 return Err(format!(
                     "Provider startup did not finish: {error}; its exact cleanup owner is retained"
                 ));
@@ -755,6 +765,10 @@ impl LocalHandle {
             })?
             .map_err(Rejection::Refused)
     }
+    pub(crate) fn relocate_execution_directory(&self, directory: &std::path::Path) -> Result<(), String> {
+        self.ownership_command(ActorCommand::RelocateExecutionDirectory(directory.to_path_buf()))
+    }
+
     fn ownership_command(&self, command: ActorCommand) -> Result<(), String> {
         if self.is_completed()
             || self.0.draining.load(Ordering::Acquire)
@@ -2179,7 +2193,28 @@ impl Actor {
                 continue;
             }
             let (run, command) = match command {
+                ActorCommand::CaptureExecutionDirectory { directory, proof } => {
+                    let result = directory::capture(self, &directory);
+                    let _ = proof.send(result);
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
                 ActorCommand::Provider { run, command } => (run, command),
+                ActorCommand::RelocateExecutionDirectory(directory) => {
+                    let result: Result<(), String> = (|| {
+                        let context = self.launch_context.as_ref().ok_or("The provider has no approved directory identity")?;
+                        if context.directory_identity()?.is_none() { return Err("The provider has no approved directory identity".into()); }
+                        crate::secure_file::reject_symlink_components(&directory).map_err(|error| error.to_string())?;
+                        context.verify_directory(&directory)?;
+                        if self.working_directory == directory { return Ok(()); }
+                        self.adapter.relocate_directory(&directory)?;
+                        self.record_execution_directory(&directory);
+                        self.working_directory = directory;
+                        Ok(())
+                    })();
+                    let _ = reply.send(result);
+                    continue;
+                }
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
                     let result = self
                         .native_holder
@@ -4028,6 +4063,38 @@ mod tests {
     }
 
     #[test]
+    fn same_inode_project_move_updates_actor_paths_without_new_process_authority() {
+        struct PathAware { directory: std::path::PathBuf, calls: Arc<Mutex<Vec<std::path::PathBuf>>> }
+        impl Adapter for PathAware {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
+            fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> { self.directory = directory.into(); Ok(()) }
+            fn command(&mut self, _command: Command) -> Result<Step, String> { self.calls.lock().unwrap().push(self.directory.clone()); Ok(Step::default()) }
+            fn command_for_run(&mut self, _run: crate::model::RunId, command: Command) -> Result<Step, String> { self.command(command) }
+            fn receive(&mut self, _frame: serde_json::Value) -> Result<Step, String> { Ok(Step::default()) }
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let old = fixture.path().join("old"); std::fs::create_dir(&old).unwrap();
+        let original = Arc::new(std::fs::File::open(&old).unwrap());
+        let context = Arc::new(super::super::protocol::ExecutionContext::new(Some(original)));
+        let spec = ProcessSpec { execution: Some(context), messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new() };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut initial = Step { events: vec![Event::Ready(true)], ..Default::default() };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, Box::new(PathAware { directory: old.clone(), calls: calls.clone() }), initial, store, None, |_| {}).unwrap();
+        let moved = fixture.path().join("moved"); std::fs::rename(&old, &moved).unwrap();
+        std::fs::create_dir(&old).unwrap();
+        handle.relocate_execution_directory(&moved).unwrap();
+        handle.command_for_run(crate::model::RunId::new(), Command::Prompt { text: "fixture".into(), attachments: Vec::new(), mode: super::super::PromptMode::Send }).unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![moved.clone()]);
+        assert!(handle.relocate_execution_directory(&old).is_err(), "reused path is another inode, not the approved process directory");
+        std::fs::rename(&moved, fixture.path().join("retained")).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        assert!(handle.command(Command::Prompt { text: "replacement must refuse".into(), attachments: Vec::new(), mode: super::super::PromptMode::Send }).is_err());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        handle.close().unwrap();
+    }
+
+    #[test]
     fn startup_cleanup_joins_the_exact_actor_before_releasing_ownership() {
         use super::super::protocol::{ExecutionContext, LaunchOutcome};
         let directory = tempfile::tempdir().unwrap();
@@ -5047,6 +5114,34 @@ mod tests {
         assert!(state.reasoning.is_none());
     }
 
+    #[test]
+    fn holder_local_actor_context_does_not_keep_its_own_handle_alive() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let context=Arc::new(super::super::protocol::ExecutionContext::capture(directory.path()).unwrap());
+        let spec=ProcessSpec {execution:Some(context.clone()),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start_inner(spec,Box::new(Echo),initial,store,None,None,None,false,|_|{}).unwrap();
+        let alive=handle.resource_lifetime();
+        assert!(alive());drop(handle);
+        assert!(!alive(),"a helper owns the actor directly; its policy context must not form an inner-handle cycle");
+    }
+    #[test]
+    fn a_live_actor_with_an_unpinned_context_can_pin_only_its_actual_cwd() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let old=directory.path().join("old");let moved=directory.path().join("moved");std::fs::create_dir(&old).unwrap();
+        let context=Arc::new(super::super::protocol::ExecutionContext::new(None));
+        let spec=ProcessSpec {execution:Some(context),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:old.clone(),environment:BTreeMap::new()};
+        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start_inner(spec,Box::new(Echo),initial,store,None,None,None,false,|_|{}).unwrap();
+        std::fs::rename(&old,&moved).unwrap();std::fs::create_dir(&old).unwrap();
+        let proof=handle.capture_execution_directory(&moved).unwrap();
+        assert_eq!(proof.identity,crate::agent_execution::DirectoryIdentity::from_metadata(&std::fs::metadata(&moved).unwrap()));
+        handle.relocate_execution_directory(&moved).unwrap();
+        assert_eq!(handle.close_observation().working_directory,moved);
+        assert!(handle.capture_execution_directory(&old).is_err());
+        handle.close().unwrap();
+    }
     #[test]
     fn recovery_preflight_preserves_partial_output_missing_from_provider_history() {
         let recipe = crate::model::LaunchRecipe {
