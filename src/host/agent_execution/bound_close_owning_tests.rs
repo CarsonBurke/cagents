@@ -245,7 +245,9 @@ fn combined_close_retained_lifecycle_real_created_pair_stays_held_until_exact_co
             panic!("test interruption after actual helper/pair source publication");
         });
     }));
-    assert!(interrupted.is_err());
+    let panic=interrupted.expect_err("the exact scheduled publication interruption must run");
+    let message=panic.downcast_ref::<&str>().copied().or_else(||panic.downcast_ref::<String>().map(String::as_str));
+    assert_eq!(message,Some("test interruption after actual helper/pair source publication"));
     let phase=super::super::chat::source_binding::pending_claim_for_test(&host,&binding).expect("real pending pair operation");
     assert!(phase.0.is_some()&&!phase.1);
     let pair=host.lock().unwrap().chats[&id].paired_terminal.as_ref().unwrap().clone();

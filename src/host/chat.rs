@@ -6621,7 +6621,7 @@ pub(in crate::host) fn owning_console_for_test(host: &SharedHost, client: Client
     after_source: impl FnOnce()) -> Result<ServerResponse, ProtocolError> {
     let id=expected.source.id;
     let transition=restart::transition_gate(host,id);
-    let _guard=transition.lock().unwrap();
+    let _guard=transition.lock().unwrap_or_else(|poison|poison.into_inner());
     let (handle,source)={let state=host.lock().unwrap();
         let record=attached(&state,client,id)?;
         (record.handle.clone(),record.session.clone())};
