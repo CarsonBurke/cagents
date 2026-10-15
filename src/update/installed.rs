@@ -129,7 +129,16 @@ pub(super) fn perform(
             .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
     )?;
     validate_before_close(&confirmed, &before_close)?;
-    let windows = guard.prepare_and_close_windows(Duration::from_secs(45))?;
+    let windows =
+        guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+            crate::install_guard::preflight_source_panes(
+                guard,
+                confirmed
+                    .daemon
+                    .as_ref()
+                    .map(|daemon| daemon.capability.proof.clone()),
+            )
+        })?;
     let mut startup_pending = false;
     let result = (|| {
         let current = observe(

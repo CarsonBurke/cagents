@@ -24,6 +24,20 @@ use crate::instance::UiUpdateGuard;
 mod companions;
 pub(crate) use companions::preflight_editor_companions;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceInspectionRequest {
+    pub(crate) protocol: u16,
+    pub(crate) proof: Option<crate::model::HostSessionProof>,
+}
+
+pub(crate) fn preflight_source_panes(
+    guard: &UiUpdateGuard,
+    proof: Option<crate::model::HostSessionProof>,
+) -> io::Result<()> {
+    crate::update::inspect_source_panes(guard, proof).map_err(io::Error::other)
+}
+
 const RESULT_FD_ENV: &str = "CAGENTS_INSTALL_RESULT_FD";
 const OWNER_CLI_ENV: &str = "CAGENTS_INSTALL_OWNER_CLI";
 const DEFERRED_RECEIPT: &[u8] = b"{\"version\":1,\"preserve_previous_ui\":true}\n";
@@ -218,7 +232,9 @@ pub(crate) fn run(
         {
             preflight_editor_companions(None)?;
         }
-        guard.prepare_and_close_windows(Duration::from_secs(45))?
+        guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+            preflight_source_panes(guard, None)
+        })?
     };
     let fd = script.as_raw_fd();
     let mut result = ResultPipe::new()?;

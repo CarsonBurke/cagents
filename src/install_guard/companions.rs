@@ -3,10 +3,27 @@
 use super::*;
 use std::os::unix::ffi::OsStrExt;
 
+struct CompanionIdentity {
+    protocol: u16,
+    instance: String,
+}
+#[cfg(test)]
+impl From<u16> for CompanionIdentity {
+    fn from(protocol: u16) -> Self {
+        Self {
+            protocol,
+            instance: crate::instance::NAME.into(),
+        }
+    }
+}
+
 pub(crate) fn preflight_editor_companions(candidate_protocol: Option<u16>) -> io::Result<()> {
     let runtime = crate::instance::runtime_directory()?;
     preflight_in(Path::new("/proc"), &runtime, candidate_protocol, |cli| {
-        crate::update::companion_protocol(cli).map_err(io::Error::other)
+        Ok(CompanionIdentity {
+            instance: crate::update::companion_namespace(cli).map_err(io::Error::other)?,
+            protocol: crate::update::companion_protocol(cli).map_err(io::Error::other)?,
+        })
     })
 }
 
@@ -14,7 +31,7 @@ fn preflight_in(
     proc_root: &Path,
     runtime: &Path,
     candidate_protocol: Option<u16>,
-    mut protocol: impl FnMut(&Path) -> io::Result<u16>,
+    mut protocol: impl FnMut(&Path) -> io::Result<CompanionIdentity>,
 ) -> io::Result<()> {
     for entry in std::fs::read_dir(proc_root)? {
         let entry = entry?;
@@ -85,29 +102,50 @@ fn preflight_in(
                 "Ceditor process {pid}'s terminal service has no matched CLI/daemon pair to verify its protocol; close or update Ceditor before upgrading"
             )));
         }
-        let Some(expected) = candidate_protocol else {
-            return Err(io::Error::other(format!(
-                "Ceditor process {pid} has a private terminal service. Close it before installing, or use the application's reviewed update to check compatibility"
-            )));
-        };
         let before = std::fs::read_to_string(process.join("stat"))?;
+        let companion_before = std::fs::symlink_metadata(&cli)?;
         let actual = protocol(&cli).map_err(|_| io::Error::other(format!("Cannot verify Ceditor process {pid}'s private service protocol; close or update Ceditor before upgrading")))?;
+        let companion_after = std::fs::symlink_metadata(&cli)?;
         let after = std::fs::read_to_string(process.join("stat"))?;
         if process_start(&before) != process_start(&after)
             || process_start(&before).is_none()
             || std::fs::read_link(process.join("exe"))? != executable
+            || companion_stamp(&companion_before) != companion_stamp(&companion_after)
         {
             return Err(io::Error::other(
                 "Ceditor ownership changed during update preflight; retry without closing the application",
             ));
         }
-        if actual != expected {
+        if actual.instance != crate::instance::NAME {
+            continue;
+        }
+        let Some(expected) = candidate_protocol else {
             return Err(io::Error::other(format!(
-                "Ceditor process {pid}'s private service uses protocol {actual}, but the update requires {expected}. Close or update Ceditor first; application windows and conversations were kept open"
+                "Ceditor process {pid} has a private terminal service. Close it before installing, or use the application's reviewed update to check compatibility"
+            )));
+        };
+        if actual.protocol != expected {
+            return Err(io::Error::other(format!(
+                "Ceditor process {pid}'s private service uses protocol {}, but the update requires {expected}. Close or update Ceditor first; application windows and conversations were kept open",
+                actual.protocol
             )));
         }
     }
     Ok(())
+}
+
+fn companion_stamp(metadata: &std::fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64, u32, u32) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+        metadata.uid(),
+        metadata.mode(),
+    )
 }
 
 fn same_namespace(left: &Path, right: &Path) -> io::Result<bool> {
@@ -159,17 +197,12 @@ mod tests {
         let bin = root.path().join("editor/bin");
         let runtime = root.path().join("runtime");
         editor(&proc_root, &bin, &runtime);
-        let error = preflight_in(&proc_root, &runtime, Some(77), |_| Ok(56)).unwrap_err();
+        let error = preflight_in(&proc_root, &runtime, Some(77), |_| Ok(56.into())).unwrap_err();
         assert!(error.to_string().contains("protocol 56"));
         assert!(error.to_string().contains("kept open"));
         assert!(!error.to_string().contains("must-not-be-printed"));
-        assert!(preflight_in(&proc_root, &runtime, Some(77), |_| Ok(77)).is_ok());
-        assert!(
-            preflight_in(&proc_root, &runtime, None, |_| panic!(
-                "unverified installer must not probe"
-            ))
-            .is_err()
-        );
+        assert!(preflight_in(&proc_root, &runtime, Some(77), |_| Ok(77.into())).is_ok());
+        assert!(preflight_in(&proc_root, &runtime, None, |_| Ok(77.into())).is_err());
         let other_runtime = root.path().join("other-runtime");
         std::fs::create_dir(&other_runtime).unwrap();
         assert!(
@@ -180,10 +213,10 @@ mod tests {
         );
         let alias = root.path().join("runtime-alias");
         symlink(&runtime, &alias).unwrap();
-        assert!(preflight_in(&proc_root, &alias, Some(77), |_| Ok(56)).is_err());
+        assert!(preflight_in(&proc_root, &alias, Some(77), |_| Ok(56.into())).is_err());
         std::fs::remove_file(bin.join(".ceditor-companions")).unwrap();
         assert!(
-            preflight_in(&proc_root, &runtime, Some(77), |_| Ok(56)).is_err(),
+            preflight_in(&proc_root, &runtime, Some(77), |_| Ok(56.into())).is_err(),
             "unmarked older private companions must be checked too"
         );
         std::fs::remove_file(bin.join("cagents")).unwrap();
@@ -217,6 +250,33 @@ mod tests {
     }
 
     #[test]
+    fn another_compiled_instance_sharing_the_xdg_root_cannot_block_this_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let proc_root = root.path().join("proc");
+        let runtime = root.path().join("runtime");
+        editor(&proc_root, &root.path().join("editor/bin"), &runtime);
+        let different = if crate::instance::NAME == "development" {
+            "production"
+        } else {
+            "development"
+        };
+        assert!(
+            preflight_in(&proc_root, &runtime, Some(77), |_| Ok(CompanionIdentity {
+                protocol: 56,
+                instance: different.into()
+            }))
+            .is_ok()
+        );
+        assert!(
+            preflight_in(&proc_root, &runtime, None, |_| Ok(CompanionIdentity {
+                protocol: 56,
+                instance: different.into()
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn changed_process_identity_cannot_authorize_the_editor_companion() {
         let root = tempfile::tempdir().unwrap();
         let proc_root = root.path().join("proc");
@@ -231,7 +291,7 @@ mod tests {
                 .unwrap()
                 .write_all(b"42 (replaced) invalid")
                 .unwrap();
-            Ok(77)
+            Ok(77.into())
         })
         .unwrap_err();
         assert!(error.to_string().contains("ownership changed"));

@@ -577,13 +577,28 @@ pub fn is_upgrade_identity_learning(source: &Session, replacement: &Session) -> 
         || source.launch.recipe != replacement.launch.recipe
         || !source.has_valid_native_continuity()
         || source.owned_codex_listener.is_some() && !source.owns_codex_listener()
-        || !source.proof.as_ref().zip(replacement.proof.as_ref()).is_some_and(|(old, new)| old.boot_id == new.boot_id)
-        || source.terminal.as_ref().is_some_and(|terminal| terminal.continuity.live_proof().as_ref() != source.proof.as_ref())
-        || replacement.terminal.as_ref().is_some_and(|terminal| terminal.continuity.live_proof().as_ref() != replacement.proof.as_ref())
+        || !source
+            .proof
+            .as_ref()
+            .zip(replacement.proof.as_ref())
+            .is_some_and(|(old, new)| old.boot_id == new.boot_id)
+        || source.terminal.as_ref().is_some_and(|terminal| {
+            terminal.continuity.live_proof().as_ref() != source.proof.as_ref()
+        })
+        || replacement.terminal.as_ref().is_some_and(|terminal| {
+            terminal.continuity.live_proof().as_ref() != replacement.proof.as_ref()
+        })
     {
         return false;
     }
-    let Some(identity) = replacement.launch.session_id.as_ref().filter(|id| !id.is_empty() && id.len() <= 1024) else { return false; };
+    let Some(identity) = replacement
+        .launch
+        .session_id
+        .as_ref()
+        .filter(|id| !id.is_empty() && id.len() <= 1024)
+    else {
+        return false;
+    };
     let mut confirmed = source.clone();
     confirmed.launch.session_id = Some(identity.clone());
     is_upgrade_recovery(&confirmed, replacement)

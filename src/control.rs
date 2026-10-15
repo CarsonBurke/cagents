@@ -468,7 +468,7 @@ pub struct ControlClient {
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
-fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
     let bytes = path.as_os_str().as_encoded_bytes();
@@ -579,6 +579,32 @@ impl ControlClient {
 
     pub fn proof(&self) -> &HostSessionProof {
         &self.proof
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn verify_local_owner(&self, socket: &Path) -> io::Result<()> {
+        let pid = crate::daemon::lease_owner(&socket.with_file_name("cagentsd.lock"), &self.proof)
+            .map_err(io::Error::other)?;
+        let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                self.stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut peer as *mut libc::ucred).cast(),
+                &mut length,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if peer.uid != unsafe { libc::geteuid() } || u32::try_from(peer.pid).ok() != Some(pid) {
+            return Err(io::Error::other(
+                "source connection does not belong to its authenticated lease owner",
+            ));
+        }
+        Ok(())
     }
 
     /// Release a native-to-terminal replay receipt after its replacement is durable.

@@ -1004,7 +1004,16 @@ fn perform_update(
             .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
     )?;
     validate_before_close(&confirmed, &before_close)?;
-    let windows = guard.prepare_and_close_windows(Duration::from_secs(45))?;
+    let windows =
+        guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+            crate::install_guard::preflight_source_panes(
+                guard,
+                confirmed
+                    .daemon
+                    .as_ref()
+                    .map(|daemon| daemon.capability.proof.clone()),
+            )
+        })?;
     let install_result = (|| {
         Installation::detect()?;
         let current = observe_impact(
@@ -1074,9 +1083,92 @@ fn validate_before_close(
     Ok(())
 }
 
+/// Invoke only the matched host implementation: SQLite stays out of the CLI
+/// graph, and an older helper must refuse its unknown option before admission.
+pub(crate) fn inspect_source_panes(
+    guard: &crate::instance::UiUpdateGuard,
+    proof: Option<crate::model::HostSessionProof>,
+) -> Result<(), UpdateError> {
+    let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
+    let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
+    let before = fs::symlink_metadata(&helper)?;
+    if !before.is_file() || before.uid() != unsafe { libc::geteuid() } || before.mode() & 0o022 != 0
+    {
+        return Err(invalid(
+            "The matched source inspector is unavailable; source windows remain usable",
+        ));
+    }
+    let request = crate::install_guard::SourceInspectionRequest { protocol, proof };
+    let mut command = Command::new(&helper);
+    crate::install_guard::sanitize_child_environment(&mut command);
+    command.args([
+        "--inspect-upgrade-source",
+        &serde_json::to_string(&request)?,
+    ]);
+    guard.inherit_for_install(&mut command)?;
+    let mut output = bounded_command(
+        &mut command,
+        "source pane inspection (windows remain open)",
+        16 * 1024,
+        Duration::from_secs(35),
+        &CancellationToken::new(),
+    )?;
+    let after = fs::symlink_metadata(helper)?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        return Err(invalid(
+            "The source inspector changed during inspection; source windows remain usable",
+        ));
+    }
+    let result: Result<(), String> = serde_json::from_reader(&mut output)?;
+    result.map_err(invalid)
+}
+
 /// Probe only a fixed, owned companion beside an authenticated editor process.
 /// No daemon startup command or inherited installer authority is passed.
 pub(crate) fn companion_protocol(executable: &Path) -> Result<u16, UpdateError> {
+    let envelope = companion_read(executable, &["--json", "daemon", "protocol-version"], None)?;
+    envelope
+        .get("data")
+        .and_then(|data| data.get("protocol_version"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .filter(|version| *version > 0)
+        .ok_or_else(|| invalid("Ceditor's companion did not report a valid protocol"))
+}
+
+pub(crate) fn companion_namespace(executable: &Path) -> Result<String, UpdateError> {
+    // `daemon status` reports the compiled instance even when stopped. Give it
+    // a fresh nonexistent runtime, so it cannot contact production or start a
+    // service. This also works with older unmarked companion sets.
+    let isolated = std::env::temp_dir().join(format!(
+        "cagents-namespace-inspect-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let envelope = companion_read(executable, &["--json", "daemon", "status"], Some(&isolated))?;
+    match envelope
+        .get("data")
+        .and_then(|data| data.get("instance"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(instance @ ("production" | "development")) => Ok(instance.into()),
+        _ => Err(invalid(
+            "Ceditor's companion has no verifiable application instance",
+        )),
+    }
+}
+
+fn companion_read(
+    executable: &Path,
+    arguments: &[&str],
+    runtime: Option<&Path>,
+) -> Result<serde_json::Value, UpdateError> {
     let before = fs::symlink_metadata(executable)?;
     if !before.is_file() || before.uid() != unsafe { libc::geteuid() } || before.mode() & 0o022 != 0
     {
@@ -1084,7 +1176,10 @@ pub(crate) fn companion_protocol(executable: &Path) -> Result<u16, UpdateError> 
     }
     let mut command = Command::new(executable);
     crate::install_guard::sanitize_child_environment(&mut command);
-    command.args(["--json", "daemon", "protocol-version"]);
+    command.args(arguments);
+    if let Some(runtime) = runtime {
+        command.env("XDG_RUNTIME_DIR", runtime);
+    }
     let mut output = bounded_command(
         &mut command,
         "editor companion protocol check",
@@ -1105,14 +1200,7 @@ pub(crate) fn companion_protocol(executable: &Path) -> Result<u16, UpdateError> 
     {
         return Err(invalid("Ceditor's companion changed during preflight"));
     }
-    let envelope: serde_json::Value = serde_json::from_reader(&mut output)?;
-    envelope
-        .get("data")
-        .and_then(|data| data.get("protocol_version"))
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|version| u16::try_from(version).ok())
-        .filter(|version| *version > 0)
-        .ok_or_else(|| invalid("Ceditor's companion did not report a valid protocol"))
+    Ok(serde_json::from_reader(&mut output)?)
 }
 
 fn observe_impact(
@@ -1780,6 +1868,16 @@ mod tests {
             blockers: vec!["saved pane needs migration".into()],
         });
         assert!(validate_before_close(&blocked, &blocked).is_err());
+    }
+
+    #[test]
+    fn editor_namespace_probe_is_offline_and_does_not_use_the_real_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("cagents");
+        fs::write(&executable, "#!/bin/sh\n[ \"$*\" = '--json daemon status' ] || exit 42\n[ ! -e \"$XDG_RUNTIME_DIR\" ] || exit 43\nprintf '%s\\n' '{\"data\":{\"instance\":\"development\",\"running\":false}}'\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(companion_namespace(&executable).unwrap(), "development");
     }
 
     #[test]

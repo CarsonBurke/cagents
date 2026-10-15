@@ -2314,9 +2314,12 @@ pub(crate) fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, C
             "terminal" => CardKind::Terminal(load_terminal_record(&transaction, card)?),
             "chat" => CardKind::Chat(from_json(
                 "migration chat",
-                content.as_deref().ok_or_else(|| StoreError::corrupt_row(
-                    format!("migration chat card {card}"), "missing session descriptor",
-                ))?,
+                content.as_deref().ok_or_else(|| {
+                    StoreError::corrupt_row(
+                        format!("migration chat card {card}"),
+                        "missing session descriptor",
+                    )
+                })?,
             )?),
             _ => unreachable!("query restricts session kinds"),
         };
@@ -6317,18 +6320,28 @@ mod tests {
             let path = directory.path().join("migration-source.sqlite3");
             let store = StateStore::open(&path, boot("chat-boot")).unwrap();
             let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
-            if chat { workspace.cards[0].kind = CardKind::Chat(source); }
+            if chat {
+                workspace.cards[0].kind = CardKind::Chat(source);
+            }
             let expected = (workspace.cards[0].id, workspace.cards[0].kind.clone());
             let mut lane = SaveLane::default();
             lane.save(&store, &workspace).unwrap();
             drop(store);
             let before = std::fs::read(&path).unwrap();
             assert_eq!(read_open_migration_sessions(&path).unwrap(), vec![expected]);
-            assert_eq!(std::fs::read(&path).unwrap(), before, "inspection cannot migrate or update the database");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "inspection cannot migrate or update the database"
+            );
             let store = StateStore::open(&path, boot("chat-boot")).unwrap();
-            workspace.cards[0].existence = Existence::Closed { tombstone: Tombstone {
-                operation_id: None, closed_at_unix_ms: 1, reason: Some("fixture closed".into()),
-            }};
+            workspace.cards[0].existence = Existence::Closed {
+                tombstone: Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: 1,
+                    reason: Some("fixture closed".into()),
+                },
+            };
             workspace.focused = None;
             lane.save(&store, &workspace).unwrap();
             assert!(read_open_migration_sessions(&path).unwrap().is_empty());

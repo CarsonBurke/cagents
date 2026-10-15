@@ -14,6 +14,15 @@ fn main() -> std::process::ExitCode {
     // SAFETY: first statement of main, before any thread exists. Every
     // terminal and conversation this daemon starts inherits its environment.
     unsafe { cagents::account::detach_inherited_selections() };
+    if let Some(result) = cagents::host::run_upgrade_inspection_helper() {
+        return match result {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("cagents source inspection: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     if let Some(result) = cagents::host::run_automation_helper() {
         return match result {
             Ok(()) => std::process::ExitCode::SUCCESS,

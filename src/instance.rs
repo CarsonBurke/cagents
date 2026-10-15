@@ -912,6 +912,17 @@ impl UiUpdateGuard {
     }
 
     pub fn prepare_and_close_windows(&mut self, timeout: Duration) -> io::Result<Vec<String>> {
+        self.prepare_and_close_windows_with_preflight(timeout, |_| Ok(()))
+    }
+
+    /// Inspect the flushed source panes after every participant prepared and
+    /// before sending even the first irreversible commit. Failure cancels all
+    /// preparations through this guard's ordinary drop path.
+    pub(crate) fn prepare_and_close_windows_with_preflight(
+        &mut self,
+        timeout: Duration,
+        preflight: impl FnOnce(&Self) -> io::Result<()>,
+    ) -> io::Result<Vec<String>> {
         let deadline = std::time::Instant::now() + timeout;
         let slots = running_window_slots(&self.runtime)?;
         for slot in &slots {
@@ -923,6 +934,13 @@ impl UiUpdateGuard {
                 "update-prepare",
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )?;
+        }
+        preflight(self)?;
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Source inspection exceeded the window preparation allowance; source windows remain usable",
+            ));
         }
         for slot in &slots {
             // A lost ACK cannot prove that the UI did not accept an irreversible close.
@@ -2277,6 +2295,59 @@ mod tests {
                 .to_string()
                 .contains("unsaved editor")
         );
+        drop(guard);
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), ["update-prepare", "update-cancel"]);
+        }
+    }
+
+    #[test]
+    fn source_inspection_veto_cancels_all_prepared_windows_before_commit() {
+        let runtime = tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy =
+            owned_lock(&runtime.path().join(APPLICATION_LOCK_FILE), libc::LOCK_SH).unwrap();
+        let mut workers = Vec::new();
+        for slot in [PRIMARY_WINDOW, "window-2"] {
+            let lease =
+                owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap();
+            let listener =
+                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
+                    .unwrap();
+            workers.push(std::thread::spawn(move || {
+                let _lease = lease;
+                let mut actions = Vec::new();
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().unwrap();
+                    actions.push(read_capped_line(&stream).unwrap());
+                    writeln!(&stream, "ok").unwrap();
+                }
+                actions
+            }));
+        }
+        let mut guard = UiUpdateGuard {
+            lock: Some(lock),
+            _legacy_fence: legacy,
+            runtime: runtime.path().into(),
+            prepared: vec![],
+            closed: vec![],
+            fallback_executable: None,
+        };
+        let error = guard
+            .prepare_and_close_windows_with_preflight(Duration::from_secs(5), |guard| {
+                assert_eq!(guard.prepared.len(), 2);
+                assert!(guard.closed.is_empty());
+                Err(io::Error::other("saved native pane has no exact migration"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("saved native pane"));
+        assert!(guard.closed.is_empty());
         drop(guard);
         for worker in workers {
             assert_eq!(worker.join().unwrap(), ["update-prepare", "update-cancel"]);
