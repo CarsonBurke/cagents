@@ -20,6 +20,8 @@ pub struct DocumentEdits {
 pub struct OpenSnapshot {
     pub text: Arc<str>,
     pub version: i32,
+    /// Actual shared-URI version sent by the language-server manager.
+    pub protocol_version: Option<i32>,
     pub writable: bool,
 }
 
@@ -34,6 +36,7 @@ pub struct DocumentPlan {
     pub after: Arc<str>,
     pub before_hash: blake3::Hash,
     pub version: Option<i32>,
+    pub protocol_version: Option<i32>,
     pub open: bool,
     /// Original selected-source spellings, captured by the preparation worker.
     pub open_paths: Vec<PathBuf>,
@@ -89,7 +92,7 @@ pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<Pa
         let Ok(canonical) = std::fs::canonicalize(path) else { continue; };
         aliases.entry(canonical.clone()).or_default().push(path.clone());
         if let Some(previous) = canonical_open.insert(canonical, snapshot) {
-            if previous.text != snapshot.text || previous.version != snapshot.version || previous.writable != snapshot.writable {
+            if previous.text != snapshot.text || previous.version != snapshot.version || previous.protocol_version != snapshot.protocol_version || previous.writable != snapshot.writable {
                 return Err("Two open views of the same file disagree; close the stale view before applying this edit".into());
             }
         }
@@ -107,7 +110,7 @@ pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<Pa
         let snapshot = canonical_open.get(&path).copied();
         if snapshot.is_some_and(|snapshot| !snapshot.writable) { return Err(format!("{} is read-only", path.display())); }
         for version in [document.version, document.observed_version].into_iter().flatten() {
-            if snapshot.is_none_or(|snapshot| snapshot.version != version) { return Err(format!("{} changed after the server prepared its edits", path.display())); }
+            if snapshot.is_none_or(|snapshot| snapshot.protocol_version != Some(version)) { return Err(format!("{} changed after the server prepared its edits", path.display())); }
         }
         let before = if let Some(snapshot) = snapshot { snapshot.text.clone() } else {
             let file = fs_safety::open_beneath(&root, &relative).map_err(|error| error.to_string())?;
@@ -136,7 +139,7 @@ pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<Pa
         if total > 64 * 1024 * 1024 { return Err("This workspace edit exceeds the 64 MiB preview budget".into()); }
         let open_paths = aliases.remove(&path).unwrap_or_default();
         result.push(DocumentPlan { before_hash: blake3::hash(before.as_bytes()), path, relative,
-            before, after: after.into(), version: snapshot.map(|snapshot| snapshot.version), open: snapshot.is_some(), open_paths, edits });
+            before, after: after.into(), version: snapshot.map(|snapshot| snapshot.version), protocol_version: snapshot.and_then(|snapshot| snapshot.protocol_version), open: snapshot.is_some(), open_paths, edits });
     }
     result.sort_by(|left, right| left.relative.cmp(&right.relative));
     Ok(Plan { worktree, documents: result })
@@ -195,7 +198,7 @@ mod tests {
         let result = resolve_targets(directory.path().into(), vec![DocumentEdits { path: "file7.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], paths).unwrap();
         assert_eq!(result.open_paths.len(), 2);
         assert!(result.open_paths.contains(&alias));
-        let open = result.open_paths.iter().map(|path| (path.clone(), OpenSnapshot { text: "old()".into(), version: 1, writable: true })).collect();
+        let open = result.open_paths.iter().map(|path| (path.clone(), OpenSnapshot { text: "old()".into(), version: 1, protocol_version: Some(1), writable: true })).collect();
         let plan = prepare(&result.worktree, result.documents, &open).unwrap();
         assert_eq!(plan.documents[0].open_paths.len(), 2);
     }
@@ -212,22 +215,37 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         for name in ["a.rs", "b.rs", "c.rs"] { std::fs::write(directory.path().join(name), "old()").unwrap(); }
         let path = std::fs::canonicalize(directory.path().join("a.rs")).unwrap();
-        let mut open = HashMap::from([(path, OpenSnapshot { text: "old()".into(), version: 7, writable: true })]);
+        let mut open = HashMap::from([(path, OpenSnapshot { text: "old()".into(), version: 7, protocol_version: Some(7), writable: true })]);
         let documents = || ["a.rs", "b.rs", "c.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: (name == "a.rs").then_some(7), observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "renamed")] }).collect();
         let plan = prepare(directory.path(), documents(), &open).unwrap();
         assert_eq!(plan.documents.len(), 3);
         publish_unopened(&plan).unwrap();
         assert_eq!(std::fs::read_to_string(directory.path().join("a.rs")).unwrap(), "old()");
         assert_eq!(std::fs::read_to_string(directory.path().join("b.rs")).unwrap(), "renamed()");
-        open.values_mut().next().unwrap().version = 8;
+        open.values_mut().next().unwrap().protocol_version = Some(8);
         assert!(prepare(directory.path(), documents(), &open).is_err());
     }
+    #[test]
+    fn manager_protocol_versions_are_distinct_from_local_buffer_revisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("a.rs");
+        std::fs::write(&path, "old()").unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        let mut open = HashMap::from([(path, OpenSnapshot { text: "old()".into(), version: 2, protocol_version: Some(7), writable: true })]);
+        let documents = || vec![DocumentEdits { path: "a.rs".into(), version: Some(7), observed_version: Some(7), coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }];
+        let plan = prepare(directory.path(), documents(), &open).unwrap();
+        assert_eq!(plan.documents[0].version, Some(2), "runtime freeze retains its own revision");
+        assert_eq!(plan.documents[0].protocol_version, Some(7), "protocol checks retain manager URI version");
+        open.values_mut().next().unwrap().protocol_version = Some(8);
+        assert!(prepare(directory.path(), documents(), &open).is_err());
+    }
+
     #[test]
     fn equal_position_insertions_preserve_server_array_order_and_observed_versions() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("a.rs"), "body").unwrap();
         let path = std::fs::canonicalize(directory.path().join("a.rs")).unwrap();
-        let open = HashMap::from([(path, OpenSnapshot { text: "body".into(), version: 7, writable: true })]);
+        let open = HashMap::from([(path, OpenSnapshot { text: "body".into(), version: 7, protocol_version: Some(7), writable: true })]);
         let input = |observed_version| vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 0, "first"), edit(0, 0, "second")] }];
         assert_eq!(&*prepare(directory.path(), input(Some(7)), &open).unwrap().documents[0].after, "firstsecondbody");
         assert!(prepare(directory.path(), input(Some(6)), &open).is_err());

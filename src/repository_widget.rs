@@ -3894,7 +3894,7 @@ impl RepositoryRuntime {
     pub fn workspace_edit_snapshot(&self) -> Option<(PathBuf, crate::editor_workspace_edit::OpenSnapshot)> {
         let DocumentState::Editable(document) = &self.document else { return None; };
         Some((self.descriptor.worktree.join(&document.source), crate::editor_workspace_edit::OpenSnapshot {
-            text: document.content.text().into(), version: document.lsp_version,
+            text: document.content.text().into(), version: document.lsp_version, protocol_version: None,
             writable: !self.is_saving() && !self.is_read_only_source(),
         }))
     }
@@ -16260,7 +16260,7 @@ mod tests {
         let plan = crate::editor_workspace_edit::DocumentPlan {
             path: "/repo/main.rs".into(), relative: "main.rs".into(),
             before: before.clone().into(), after: after.into(),
-            before_hash: blake3::hash(before.as_bytes()), version: Some(1), open: true, open_paths: vec![], edits: vec![],
+            before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: vec![], edits: vec![],
         };
         runtime.begin_workspace_edit(42, &plan).unwrap();
         assert!(runtime.is_saving());

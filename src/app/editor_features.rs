@@ -108,6 +108,25 @@ mod tests {
         assert_eq!(text(&app, b), original);
     }
 
+    #[test]
+    fn changed_protocol_version_refuses_publication_before_buffer_or_disk_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let original = "fn old() {}\n";
+        for name in ["a.rs", "b.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+        let mut app = app();
+        let card = buffer(&mut app, root.path(), "a.rs", original);
+        let mut plan = plan(&app, root.path(), &["a.rs", "b.rs"]);
+        // The preview observed a manager-owned URI version which has since
+        // retired. Its local editor version/text are still unchanged.
+        Arc::make_mut(&mut plan).documents.iter_mut().find(|document| document.open).unwrap().protocol_version = Some(7);
+        let operation = operation(&app, card);
+        drop(app.publish_editor_workspace_edit(19, operation, plan));
+        assert_eq!(text(&app, card), original);
+        assert_eq!(std::fs::read_to_string(root.path().join("b.rs")).unwrap(), original);
+        assert!(!app.editor_features.publishing());
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+    }
+
     #[tokio::test]
     async fn failed_unopened_compare_and_swap_preserves_buffers_and_releases_every_freeze() {
         let root = tempfile::tempdir().unwrap();
@@ -783,14 +802,15 @@ impl Cagents {
     fn capture_workspace_edit_targets(&self, paths: &[PathBuf]) -> Result<HashMap<PathBuf, workspace::OpenSnapshot>, String> {
         let mut open: HashMap<PathBuf, workspace::OpenSnapshot> = HashMap::new();
         let mut captured = 0usize;
-        for runtime in self.cards.values() {
+        for (card, runtime) in &self.cards {
             if let CardRuntime::Repository(runtime) = runtime {
                 if runtime.workspace_edit_candidate_source().is_some_and(|path| paths.contains(&path)) {
                     captured = captured.saturating_add(runtime.workspace_edit_snapshot_size());
                     if captured > 64 * 1024 * 1024 { return Err("The open buffers exceed the 64 MiB preview budget".into()); }
-                    let Some((path, snapshot)) = runtime.workspace_edit_snapshot() else { return Err("Wait for the selected target to finish loading, or close its read-only view, before applying edits".into()); };
+                    let Some((path, mut snapshot)) = runtime.workspace_edit_snapshot() else { return Err("Wait for the selected target to finish loading, or close its read-only view, before applying edits".into()); };
+                    snapshot.protocol_version = self.lsp_document(*card).and_then(|doc| self.lsp.document_version(doc));
                         if let Some(previous) = open.insert(path, snapshot.clone()) {
-                            if previous.text != snapshot.text || previous.version != snapshot.version || previous.writable != snapshot.writable {
+                            if previous.text != snapshot.text || previous.version != snapshot.version || previous.protocol_version != snapshot.protocol_version || previous.writable != snapshot.writable {
                                 return Err("Two open views of the same file disagree".into());
                             }
                         }
@@ -815,6 +835,7 @@ impl Cagents {
             self.feature_failure(operation.card, "The open file tabs changed; prepare the edit again");
             return Task::none();
         }
+        let protocol_versions: HashMap<CardId, Option<i32>> = self.cards.keys().map(|card| (*card, self.lsp_document(*card).and_then(|doc| self.lsp.document_version(doc)))).collect();
         let mut matched_documents = HashSet::new();
         let mut cards = Vec::new();
         let mut failure = None;
@@ -828,6 +849,7 @@ impl Cagents {
                     if let Some((index, document)) = document {
                         matched_documents.insert(index);
                         if !document.open { failure = Some("A target file was opened after this preview was prepared".into()); break; }
+                        if protocol_versions[card] != document.protocol_version { failure = Some("A target language-server version changed after this preview was prepared".into()); break; }
                         match runtime.begin_workspace_edit(ticket, document) { Ok(()) => cards.push(*card), Err(error) => { failure = Some(error); break; } }
                     }
                 }
