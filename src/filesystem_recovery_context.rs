@@ -6,6 +6,19 @@
 use std::{io, sync::Arc};
 use crate::{fs_safety::{RecoveryPlacement, Root}, recovery_authority::{RecoveryContext, RecoverySlot}, worktree_cleanup::Protection};
 
+/// Preeffect factory admission bound to its exact issued context. The private
+/// pair cannot substitute another placement after reserving scarce ownership.
+/// A factory transfers this SAME reservation to the successful producer, or
+/// retains it with the entire typed publication/preparation on failure.
+pub(crate) struct FilesystemRecoveryReservation {
+    context: FilesystemRecoveryContext,
+    slot: RecoverySlot,
+}
+impl FilesystemRecoveryReservation {
+    pub(crate) fn context(&self) -> &FilesystemRecoveryContext { &self.context }
+    pub(crate) fn into_parts(self) -> (FilesystemRecoveryContext, RecoverySlot) { (self.context, self.slot) }
+}
+
 #[derive(Clone)]
 pub struct FilesystemRecoveryContext {
     // Drop our accessor reference before the charged generic guard. Slots
@@ -63,6 +76,12 @@ impl FilesystemRecoveryContext {
     pub fn retained_descriptor_count(&self) -> usize { self.descriptors }
     /// Reserve before producer effects. The unresolved leaf retains the exact
     /// native context through failed retry and actual eventual resolution.
+    /// The candidate parent must ALREADY be issued and protected. This does
+    /// not bootstrap the parent needed to construct this context itself.
+    pub(crate) fn reserve_directory(&self) -> Result<FilesystemRecoveryReservation, String> {
+        let slot = self.reserve()?;
+        Ok(FilesystemRecoveryReservation { context: self.clone(), slot })
+    }
     pub(crate) fn reserve(&self) -> Result<RecoverySlot, String> {
         self.placement.validate().map_err(|error| error.to_string())?;
         self.context.reserve()
