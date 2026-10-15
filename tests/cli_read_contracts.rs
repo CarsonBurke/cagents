@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! CLI-only behavior: reads can refuse startup even when a launchable sibling exists.
 use serde_json::Value;
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::{Command, Output, Stdio}};
@@ -15,7 +16,7 @@ impl Fixture {
         fs::set_permissions(daemon, fs::Permissions::from_mode(0o700)).unwrap();
         Self { root, cli }
     }
-    fn output(&self, args: &[&str], environment_policy: bool) -> Output {
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(&self.cli);
         command.env_clear().env("HOME", self.root.path().join("home"))
             .env("XDG_RUNTIME_DIR", self.root.path().join("run"))
@@ -23,9 +24,14 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("XDG_CACHE_HOME", self.root.path().join("cache"))
             .env("PATH", "/usr/bin:/bin").current_dir(self.root.path()).stdin(Stdio::null());
-        if environment_policy { command.env("CAGENTS_NO_START", "1"); }
-        command.arg("--json").args(args).output().unwrap()
+        command.arg("--json").args(args);command
     }
+    fn output(&self, args: &[&str], environment_policy: bool) -> Output {
+        let mut command=self.command(args);
+        if environment_policy { command.env("CAGENTS_NO_START", "1"); }
+        command.output().unwrap()
+    }
+
 }
 
 #[test]
@@ -55,4 +61,48 @@ fn stopping_an_absent_daemon_twice_succeeds_and_has_a_stable_shape() {
         assert_eq!(value["data"], serde_json::json!({"state":"already_stopped"}));
         assert!(!fixture.root.path().join("spawned").exists());
     }
+}
+
+fn configure_remote_fixture(fixture:&Fixture,failing_ssh:bool) {
+    let config=fixture.root.path().join("config").join(cagents::instance::STORAGE_NAME);
+    fs::create_dir_all(config).unwrap();
+    fs::write(config.join("devices.json"),serde_json::to_vec(&serde_json::json!({"devices":[{"name":"fixture","host":"fixture-host","executable":fixture.cli}]})).unwrap()).unwrap();
+    let ssh=fixture.root.path().join("bin/ssh");
+    fs::write(&ssh,if failing_ssh {"#!/bin/sh\nprintf 'genuine ssh failure\\n' >&2\nexit 255\n"} else {"#!/bin/sh\nset -eu\nlast=''\nfor arg do last=$arg; done\nprintf '%s\\n' \"$last\" >> \"$HOME/../ssh-calls\"\nexec /bin/sh -c \"$last\"\n"}).unwrap();
+    fs::set_permissions(ssh,fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn remote_stop_is_idempotent_and_no_start_reads_report_remote_absence() {
+    let fixture=Fixture::new();configure_remote_fixture(&fixture,false);
+    let path=format!("{}:/usr/bin:/bin",fixture.root.path().join("bin").display());
+    for _ in 0..2 {
+        let output=fixture.command(&["--device","fixture","daemon","stop"]).env("PATH",&path).output().unwrap();
+        assert!(output.status.success(),"{output:?}");
+        let value:Value=serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["data"],serde_json::json!({"state":"already_stopped"}));
+    }
+    for environment in [false,true] {
+        let mut command=fixture.command(&["--device","fixture","agent","list"]);
+        if environment {command.env("CAGENTS_NO_START","1");} else {command.arg("--no-start");}
+        let output=command.env("PATH",&path).output().unwrap();
+        assert_eq!(output.status.code(),Some(1),"{output:?}");
+        let error:Value=serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"],"daemon_not_running");
+    }
+    assert!(!fixture.root.path().join("spawned").exists());
+    let calls=fs::read_to_string(fixture.root.path().join("ssh-calls")).unwrap();
+    assert!(calls.lines().all(|line|line.contains(" --no-start daemon bridge")),"{calls}");
+}
+
+#[test]
+fn a_genuine_ssh_failure_is_not_an_already_stopped_remote_daemon() {
+    let fixture=Fixture::new();configure_remote_fixture(&fixture,true);
+    let path=format!("{}:/usr/bin:/bin",fixture.root.path().join("bin").display());
+    let output=fixture.command(&["--device","fixture","daemon","stop"]).env("PATH",path).output().unwrap();
+    assert_eq!(output.status.code(),Some(1),"{output:?}");
+    assert!(output.stdout.is_empty());
+    let error:Value=serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"],"device");
+    assert!(!fixture.root.path().join("spawned").exists());
 }
