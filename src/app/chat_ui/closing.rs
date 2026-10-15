@@ -20,6 +20,7 @@ pub(in crate::app) struct Confirmation {
     generation: u64,
     source: CloseSource,
     batch: Option<uuid::Uuid>,
+    sidebar_target: Option<Arc<sidebar::ConversationEndTarget>>,
 }
 
 /// The issued descriptor and live logical identity observed at consent time.
@@ -180,7 +181,11 @@ impl Cagents {
             self.status = Some(TransientNotice::warning("The original conversation or its sidebar scope changed. Its current source was kept."));
             return Task::none();
         }
-        self.update_chat_close(Action::End(target.card))
+        let task = self.update_chat_close(Action::End(target.card));
+        if let Some(dialog) = self.chat_ui.close_dialog.as_mut().filter(|dialog| dialog.card == target.card) {
+            dialog.sidebar_target = Some(target);
+        }
+        task
     }
 
     fn chat_close_source(&self, card: CardId) -> Option<CloseSource> {
@@ -197,7 +202,8 @@ impl Cagents {
         })
     }
     fn chat_close_source_matches(&self, dialog: &Confirmation) -> bool {
-        dialog.source.registry == self.workspace_model.identity && self.card_state(dialog.card).is_some_and(|state| {
+        dialog.sidebar_target.as_ref().is_none_or(|target| self.conversation_end_target_current(target))
+            && dialog.source.registry == self.workspace_model.identity && self.card_state(dialog.card).is_some_and(|state| {
             state.existence.is_open()
                 && matches!(&state.kind, CardKind::Chat(current) if current == &dialog.source.descriptor)
         }) && self.chat_return_session(dialog.card).as_ref() == Some(&dialog.source.session)
@@ -323,6 +329,7 @@ impl Cagents {
             generation: self.chat_ui.close_generation,
             source,
             batch,
+            sidebar_target: None,
         });
         self.modal_focus(widget::Id::new("chat-close.cancel"))
     }
@@ -976,6 +983,39 @@ mod tests {
             assert_eq!(app.chat_ui.close_dialog.is_some(), change == 11);
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert!(app.chat_ui.phases.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_sidebar_confirmation_keeps_its_original_filing_until_the_actual_decision() {
+        for move_scope in [false, true] {
+            let (mut app, card, directory) = fixture();
+            write(&mut app, card, "keep original scoped draft", true);
+            retain_in_channel(&mut app, directory.path(), vec![card]);
+            shared_scope(&mut app, card, directory.path());
+            let target = app.capture_conversation_end_target(card).unwrap();
+            drop(app.request_conversation_end(target));
+            drop(app.finish_modal_update(Task::none()));
+            let held = emitted_confirm(&app);
+            if move_scope {
+                app.workspace_model.views[0].scope = crate::workspace_model::views::Scope::Worktree {
+                    repository: directory.path().into(), path: directory.path().join("moved-worktree"),
+                };
+            } else {
+                app.workspace_model.views[0].panes[0].scope = Some(directory.path().join("moved-filing"));
+            }
+            drop(app.update(held));
+            assert!(app.chat_ui.end_requests.is_empty());
+            assert!(app.chat_ui.phases.is_empty());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.recently_closed.is_empty());
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("original runtime retained"); };
+            assert_eq!(runtime.unsent_text(), "keep original scoped draft");
+            drop(app.finish_modal_update(Task::none()));
+            assert!(app.chat_ui.close_dialog.is_none());
+            let current = app.capture_conversation_end_target(card).unwrap();
+            drop(app.request_conversation_end(current));
+            assert!(app.chat_ui.close_dialog.is_some(), "fresh consent may use the new scope");
         }
     }
 
