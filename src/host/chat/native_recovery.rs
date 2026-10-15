@@ -386,6 +386,7 @@ fn restore_authenticated(
     };
     let response = session_snapshot(&record);
     record.handle.commit_native_installation();
+    state.issued_chat_ids.insert(id);
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();

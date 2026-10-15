@@ -769,6 +769,12 @@ fn start_with_execution(
     retained_sources: &[crate::agent_execution::HostedSession],
     execution_directory: Option<&std::path::Path>,
 ) -> Result<ServerResponse, ProtocolError> {
+    if source.is_none() && retained_sources.is_empty() {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.issued_chat_ids.contains(&session.id) && !state.chats.contains_key(&session.id) {
+            return Err(error("This native session ID was retired by this daemon. Open a new pane to start another provider; the old pane cannot identify a replacement actor"));
+        }
+    }
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
     // the account-wide list of conversations.
@@ -1215,6 +1221,7 @@ fn start_with_execution(
             None
         };
         if recovering {
+            state.issued_chat_ids.insert(session.id);
             retired = state.chats.remove(&session.id);
         }
         session.proof = Some(state.proof().clone());
@@ -1460,6 +1467,7 @@ fn start_with_execution(
         };
         let response = session_snapshot(&record);
         record.handle.commit_native_installation();
+        state.issued_chat_ids.insert(id);
         state.chats.insert(id, record);
         if let Some(context) = &execution {
             context.installed();
@@ -2514,6 +2522,7 @@ fn process_inner(
                         "The chat was closed while returning to terminal; the replacement terminal was retired",
                     ));
                 }
+                state.issued_chat_ids.insert(chat_id);
                 let mut record = state.chats.remove(&chat_id);
                 state.chat_handoffs.insert(
                     chat_id,
@@ -2555,13 +2564,15 @@ fn process_inner(
         }
         ClientRequest::ChatClose { chat_id } => {
             let handle = {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.chat_handoffs.contains_key(&chat_id) {
                     return Err(error(
                         "This chat already returned to terminal; complete the retained handoff before closing its card",
                     ));
                 }
-                attached(&state, client, chat_id)?.handle.clone()
+                let handle = attached(&state, client, chat_id)?.handle.clone();
+                state.issued_chat_ids.insert(chat_id);
+                handle
             };
             handle.close_for_resume().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
@@ -3069,6 +3080,7 @@ pub(super) fn close_terminal_actor(
         .get(&terminal_id)
         .is_some_and(|record| record.handle.same_actor(handle))
     {
+        state.issued_chat_ids.insert(terminal_id);
         state.inventory_generation += 1;
         state.chats.remove(&terminal_id)
     } else {
