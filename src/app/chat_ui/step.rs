@@ -569,6 +569,9 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
+        if matches!(item.content,ItemContent::Tool {..}|ItemContent::Command {..}|ItemContent::Changes {..}) {
+            rows.push(raw_original::detail(self,&item.id));
+        }
         // Messages a coordinating step collected read as messages, ahead of
         // the command and output they were printed in.
         if let Some(coordinated) = cached

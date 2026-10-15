@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod presentation;
+pub mod cache;
+#[cfg(feature = "ui")]
+pub(crate) mod source_owners;
 pub mod pricing;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
@@ -22,6 +25,11 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(feature = "host")]
+pub(crate) mod stderr_log;
+#[cfg(any(feature = "ui", feature = "host"))]
+#[path = "chat/protocol/terminal_output.rs"]
+pub(crate) mod terminal_output;
 
 /// Whether answering a request with `action` turns its work down rather than
 /// authorizing it.
@@ -880,6 +888,8 @@ pub struct Snapshot {
     /// work finished. Historical imports without an observed turn have no time.
     #[serde(default)]
     pub finished_at: Option<u64>,
+    #[serde(default)]
+    pub outcome: Option<crate::agent::ActivityOutcome>,
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
     pub items: Vec<std::sync::Arc<Item>>,
@@ -906,6 +916,8 @@ pub struct Snapshot {
     pub native_continuity: NativeContinuity,
     pub title: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub provider_exit: Option<ProviderExitDiagnostic>,
     /// Why this snapshot shows saved history without an executable provider.
     /// Carried over IPC so every client explains the same read-only state.
     #[serde(default)]
@@ -950,6 +962,36 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Original prose mutation boundary, independent of status/presentation updates.
+    #[serde(default)]
+    pub source_revision: u64,
+    /// Exact source cache lifetime, including Reset followed by the same session.
+    #[serde(default)]
+    pub source_incarnation: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub source_parts: Vec<cache::SourcePart>,
+    /// Store-authored original raw call aliases; bodies remain on disk.
+    #[serde(default)]
+    pub raw_source_parts: Vec<cache::raw::RawSourcePart>,
+}
+
+/// Readable provider failure with a separately expandable bounded stderr tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderExitDiagnostic {
+    pub summary: String,
+    /// Last 64 KiB of readable stderr, independent of retained-log availability.
+    pub output: String,
+    #[serde(default)]
+    pub log: Option<ProviderExitLog>,
+}
+
+/// Opaque retained diagnostic identity. Full output is loaded only on demand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderExitLog {
+    pub id: String,
+    pub bytes: u64,
+    /// Raw bytes beyond the per-session disk cap or lost after a write failure.
+    pub omitted: u64,
 }
 
 /// When a provider takes a message it is holding.
@@ -1087,6 +1129,16 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
                 thinking,
                 delta,
             }],
+            Event::InputDelta {
+                id: item_id,
+                offset,
+                delta,
+            } => vec![Event::SubagentInputDelta {
+                id: id.into(),
+                item_id,
+                offset,
+                delta,
+            }],
             Event::OutputDelta {
                 id: item_id,
                 offset,
@@ -1217,6 +1269,9 @@ pub enum Command {
         cursor: Option<FilePatchCursor>,
         revision: u64,
     },
+    /// Read original prose without hydrating or changing the presentation window.
+    LoadSource { query: cache::SourceQuery },
+    LoadRawSource { query: cache::raw::RawSourceQuery },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
@@ -1923,6 +1978,19 @@ pub enum Event {
     Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
     Item(Item),
+    /// Append tool input at its exact byte offset without rewriting prior chunks.
+    ProviderExit(ProviderExitDiagnostic),
+    InputDelta {
+        id: String,
+        offset: usize,
+        delta: String,
+    },
+    SubagentInputDelta {
+        id: String,
+        item_id: String,
+        offset: usize,
+        delta: String,
+    },
     /// An append to a tracked command/tool output, never an authoritative rewrite.
     OutputDelta {
         id: String,
@@ -2058,10 +2126,63 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// A delayed result for an already superseded turn: notifications only.
+    /// It must not settle current activity, requests, tools or completion time.
+    PastTurnFinished {
+        key: Option<String>,
+        outcome: crate::notifications::Kind,
+    },
+    /// Exact original call source, independently of its derived display item.
+    RawToolCapture(cache::raw::RawToolCapture),
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_provider_outcomes_and_diagnostics_round_trip_without_losing_reason() {
+        use crate::agent::ActivityOutcome;
+        for outcome in [
+            ActivityOutcome::Succeeded,
+            ActivityOutcome::Cancelled,
+            ActivityOutcome::Failed {
+                reason: "Provider exited with status 3: authentication failed".into(),
+            },
+            ActivityOutcome::Interrupted {
+                reason: "Provider exited with status 0 before its final result".into(),
+            },
+        ] {
+            let snapshot = super::Snapshot {
+                outcome: Some(outcome),
+                provider_exit: Some(super::ProviderExitDiagnostic {
+                    summary: "Provider exited with status 3. Restart session to continue.".into(),
+                    output: "First diagnostic\nAuthentication failed\n".into(),
+                    log: None,
+                }),
+                ..Default::default()
+            };
+            let binary = postcard::to_stdvec(&snapshot).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<super::Snapshot>(&binary).unwrap(),
+                snapshot
+            );
+            let json = serde_json::to_value(&snapshot).unwrap();
+            assert_eq!(
+                serde_json::from_value::<super::Snapshot>(json).unwrap(),
+                snapshot
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_json_defaults_absent_provider_outcome_and_diagnostic() {
+        let mut legacy = serde_json::to_value(super::Snapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("outcome");
+        legacy.as_object_mut().unwrap().remove("provider_exit");
+        let restored: super::Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(restored.outcome.is_none());
+        assert!(restored.provider_exit.is_none());
+    }
+
     #[test]
     fn request_kind_roundtrips_and_legacy_json_requires_explicit_approval() {
         let legacy = serde_json::json!({"id":"request","title":"Prompt","description":"","fields":[],"actions":[]});

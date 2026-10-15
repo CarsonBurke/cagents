@@ -34,6 +34,9 @@ mod selection;
 mod step;
 mod thumbnails;
 mod tool_text;
+mod raw_original;
+mod disclosure_intent;
+mod clipboard_intent;
 mod turn;
 mod view;
 
@@ -216,6 +219,11 @@ pub enum Action {
     SessionLinkWindowBackend(String, TerminalId, bool),
     SessionLinkToken(String, TerminalId, Option<String>),
     Copy(Target, String, CopyPart),
+    RawOriginalToggle(Target,String,chat::cache::raw::RawSourceField),
+    RawOriginalReload(Target,String,chat::cache::raw::RawSourceField),
+    RawOriginalCopy(Target,String,chat::cache::raw::RawSourceField),
+    RawOriginalReady(Target,chat::cache::SourceKey,chat::cache::raw::RawSourceField,u64,u64,raw_original::Reply),
+    RawOriginalCopied(Target,u64,chat::source_owners::ResidentRaw,raw_original::CopyReply),
     OpenUrl(String),
     OpenDocument(Target, String),
     OpenChangedFile(Target, PathBuf),
@@ -324,6 +332,8 @@ impl Action {
                 | Self::PasteRefused(..)
                 | Self::ImageSaved(..)
                 | Self::ImageLoaded(..)
+                | Self::RawOriginalReady(..)
+                | Self::RawOriginalCopied(..)
                 | Self::ThumbnailLoaded(..)
                 | Self::RetryThumbnails(..)
                 | Self::HandoffFinished(..)
@@ -472,6 +482,7 @@ pub(super) struct State {
     /// refused. Holding the draft here makes the round trip lossless, and the
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
+    copy_intents: clipboard_intent::Intents,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -499,6 +510,7 @@ impl Default for State {
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
             drafts: HashMap::new(),
+            copy_intents: clipboard_intent::Intents::default(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -1489,6 +1501,7 @@ pub(super) struct Runtime {
     composer_actions: bool,
     branch_picker: bool,
     changes: changes::State,
+    raw_original:raw_original::State,
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
@@ -2075,6 +2088,7 @@ impl Runtime {
             composer_actions: false,
             branch_picker: false,
             changes: changes::State::default(),
+            raw_original:raw_original::State::default(),
             fork_requested: false,
             fork_seen: None,
             files: None,
@@ -2139,6 +2153,7 @@ impl Runtime {
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
+        self.raw_original.clear();
         self.cache.clear();
         self.turns.clear();
         self.selected_subagent = None;
@@ -2536,6 +2551,7 @@ impl Runtime {
             self.interrupt_armed = None;
         }
         self.snapshot = snapshot;
+        raw_original::sync(self);
         images::sync(self);
         self.refresh_find();
     }
@@ -2599,6 +2615,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
+        if !visible {self.raw_original.evict();}
         images::sync(self);
         self.present()
     }
@@ -4546,6 +4563,7 @@ impl Cagents {
         for card in self.cards.values() {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
+                subscriptions.extend(raw_original::subscriptions(runtime));
                 if runtime.visible.load(Ordering::Relaxed) {
                     subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
                 }
@@ -6049,6 +6067,7 @@ impl Cagents {
                 return self.update(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::Ready(target, ready) => {
+                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.raw_original.clear();}
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
                 let Some(result) = result else {
                     return Task::none();
@@ -7598,10 +7617,20 @@ impl Cagents {
                             .any(|agent| &agent.id == id)
                     });
                     runtime.deferred_page = None;
+                    raw_original::sync(runtime);
                     images::sync(runtime);
                 }
             }
+            Action::RawOriginalToggle(target,item,field)=>{if let Some(runtime)=self.chat_runtime_mut(target) {raw_original::toggle(runtime,&item,field,false);}}
+            Action::RawOriginalReload(target,item,field)=>{if let Some(runtime)=self.chat_runtime_mut(target) {raw_original::toggle(runtime,&item,field,true);}}
+            Action::RawOriginalCopy(target,item,field)=>{
+                let intent=self.chat_ui.copy_intents.next();
+                if let Some(runtime)=self.chat_runtime_mut(target) {return raw_original::copy(runtime,&item,field,intent);}
+            }
+            Action::RawOriginalReady(target,source,field,context,attempt,reply)=>{if let Some(runtime)=self.chat_runtime_mut(target) {raw_original::complete(runtime,source,field,context,attempt,reply);}}
+            Action::RawOriginalCopied(target,context,proof,reply)=>{if let Some(runtime)=self.chat_runtime_mut(target) {return raw_original::copied(runtime,context,proof,reply);}}
             Action::Copy(target, id, part) => {
+                self.chat_ui.copy_intents.next();
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
@@ -7759,6 +7788,7 @@ impl Cagents {
                 }
             }
             Action::CopyLiteral(text) => {
+                self.chat_ui.copy_intents.next();
                 self.status = Some(TransientNotice::success("Copied code block"));
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }

@@ -165,6 +165,13 @@ impl Preview {
 }
 
 impl ToolText {
+    /// The call reader has already frozen, hashed and admitted this exact
+    /// immutable allocation. The canonical reader integration retains its
+    /// worker-produced ReaderSource rather than cloning or scanning the body.
+    pub(super) fn from_captured(text:Arc<str>,key:u64)->Self {
+        Self {key,language:Language::Plain,text,syntax:std::cell::RefCell::new(None)}
+    }
+
     pub(super) fn update(previous: Option<Self>, text: &str, language: Language) -> Self {
         let language = if text.len() > CachedItem::HIGHLIGHT_LIMIT {
             Language::Plain
