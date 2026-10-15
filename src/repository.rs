@@ -709,19 +709,29 @@ struct ControlMetadata {
 /// malformed or unreadable metadata; a failed prepass must not certify a cache.
 fn read_git_metadata_file(path: &Path, limit: usize) -> io::Result<Option<Vec<u8>>> {
     use std::os::unix::fs::OpenOptionsExt;
-    let file = match fs::OpenOptions::new().read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path) {
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     if !file.metadata()?.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Git metadata is not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Git metadata is not a regular file",
+        ));
     }
     let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1) as u64).read_to_end(&mut bytes)?;
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > limit {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Git metadata exceeds its size limit"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Git metadata exceeds its size limit",
+        ));
     }
     Ok(Some(bytes))
 }
@@ -731,16 +741,24 @@ fn local_git_dir(worktree: &Path) -> io::Result<Option<PathBuf>> {
     let path = worktree.join(".git");
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_dir() => return Ok(Some(path)),
-        Ok(_) => {},
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     }
-    let Some(bytes) = read_git_metadata_file(&path, 4096)? else { return Ok(None); };
-    let value = bytes.strip_prefix(b"gitdir: ")
-        .map(trim_one_line_ending).filter(|path| !path.is_empty())
+    let Some(bytes) = read_git_metadata_file(&path, 4096)? else {
+        return Ok(None);
+    };
+    let value = bytes
+        .strip_prefix(b"gitdir: ")
+        .map(trim_one_line_ending)
+        .filter(|path| !path.is_empty())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid .git locator"))?;
     let directory = bytes_to_path(value);
-    Ok(Some(if directory.is_absolute() { directory } else { worktree.join(directory) }))
+    Ok(Some(if directory.is_absolute() {
+        directory
+    } else {
+        worktree.join(directory)
+    }))
 }
 
 struct SnapshotAdmin {
@@ -805,11 +823,25 @@ fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
 
 /// Filesystem-only metadata observations keep the missed-event fallback
 /// authoritative without extra Git commands on an unchanged snapshot.
-fn snapshot_admin_fingerprint(worktree: &Path, cancellation: &CancellationToken) -> io::Result<SnapshotAdmin> {
-    let cancelled = || io::Error::new(io::ErrorKind::Interrupted, "Git metadata observation cancelled");
-    if cancellation.is_cancelled() { return Err(cancelled()); }
+fn snapshot_admin_fingerprint(
+    worktree: &Path,
+    cancellation: &CancellationToken,
+) -> io::Result<SnapshotAdmin> {
+    let cancelled = || {
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Git metadata observation cancelled",
+        )
+    };
+    if cancellation.is_cancelled() {
+        return Err(cancelled());
+    }
     let Some(git_dir) = local_git_dir(worktree)? else {
-        return Ok(SnapshotAdmin { git_dir: None, common_dir: None, fingerprint: BTreeMap::new() });
+        return Ok(SnapshotAdmin {
+            git_dir: None,
+            common_dir: None,
+            fingerprint: BTreeMap::new(),
+        });
     };
     let git_dir = fs::canonicalize(&git_dir)?;
     let common = match read_git_metadata_file(&git_dir.join("commondir"), 4096)? {
@@ -868,7 +900,9 @@ fn snapshot_admin_fingerprint(worktree: &Path, cancellation: &CancellationToken)
     }
     let mut pending = vec![common.join("refs"), git_dir.join("refs")];
     while let Some(path) = pending.pop() {
-        if cancellation.is_cancelled() { return Err(cancelled()); }
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
         if paths.contains_key(&path) {
             continue;
         }
@@ -881,7 +915,9 @@ fn snapshot_admin_fingerprint(worktree: &Path, cancellation: &CancellationToken)
         paths.insert(path.clone(), identity);
         if let Ok(entries) = fs::read_dir(&path) {
             for entry in entries.flatten() {
-                if cancellation.is_cancelled() { return Err(cancelled()); }
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
                 if entry
                     .path()
                     .extension()
@@ -903,7 +939,11 @@ fn snapshot_admin_fingerprint(worktree: &Path, cancellation: &CancellationToken)
             }
         }
     }
-    Ok(SnapshotAdmin { git_dir: Some(git_dir), common_dir: Some(common), fingerprint: paths })
+    Ok(SnapshotAdmin {
+        git_dir: Some(git_dir),
+        common_dir: Some(common),
+        fingerprint: paths,
+    })
 }
 
 /// Replacement objects can change the bytes behind an unchanged object id.
@@ -4526,10 +4566,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let observation = snapshot_admin_fingerprint(worktree, cancellation).map_err(|error| {
             cache.invalidate(true);
             if cancellation.is_cancelled() {
-                RepositoryError::from(process_failure(&CommandSpec::new(&self.git),
-                    ProcessFailureKind::Cancelled, "Git metadata observation cancelled", false))
+                RepositoryError::from(process_failure(
+                    &CommandSpec::new(&self.git),
+                    ProcessFailureKind::Cancelled,
+                    "Git metadata observation cancelled",
+                    false,
+                ))
             } else {
-                RepositoryError::from(ValidationError::Io(format!("Cannot observe Git metadata for {}: {error}", worktree.display())))
+                RepositoryError::from(ValidationError::Io(format!(
+                    "Cannot observe Git metadata for {}: {error}",
+                    worktree.display()
+                )))
             }
         })?;
         let git_dir = observation.git_dir;
@@ -9028,33 +9075,62 @@ mod tests {
         let gitdir = directory.path().join(".git");
         fs::create_dir_all(gitdir.join("refs/heads/feature")).unwrap();
         fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        let first = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint;
+        let first = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+            .unwrap()
+            .fingerprint;
         fs::write(gitdir.join("index.lock"), "temporary").unwrap();
         fs::remove_file(gitdir.join("index.lock")).unwrap();
-        assert_eq!(first, snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint);
+        assert_eq!(
+            first,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .fingerprint
+        );
         fs::write(gitdir.join("refs/heads/main.lock"), "unpublished").unwrap();
-        assert_eq!(first, snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint);
+        assert_eq!(
+            first,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .fingerprint
+        );
         fs::remove_file(gitdir.join("refs/heads/main.lock")).unwrap();
-        assert_eq!(first, snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint);
+        assert_eq!(
+            first,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .fingerprint
+        );
         fs::write(
             gitdir.join("config"),
             "[remote \"origin\"]\nurl = example\n",
         )
         .unwrap();
-        let configured = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint;
+        let configured =
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .fingerprint;
         assert_ne!(first, configured);
         fs::write(gitdir.join("index"), "new-index").unwrap();
-        let indexed = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint;
+        let indexed = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+            .unwrap()
+            .fingerprint;
         assert_ne!(configured, indexed);
         fs::write(gitdir.join("refs/heads/feature/new"), "oid\n").unwrap();
         fs::File::open(gitdir.join("refs/heads/feature"))
             .unwrap()
             .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
             .unwrap();
-        let created = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint;
+        let created = snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+            .unwrap()
+            .fingerprint;
         assert_ne!(indexed, created);
         fs::write(gitdir.join("refs/heads/feature/new"), "updated-oid\n").unwrap();
-        assert_ne!(created, snapshot_admin_fingerprint(directory.path(), &CancellationToken::default()).unwrap().fingerprint);
+        assert_ne!(
+            created,
+            snapshot_admin_fingerprint(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .fingerprint
+        );
     }
 
     #[test]
@@ -9369,7 +9445,9 @@ mod tests {
             if std::env::var_os(CHILD).is_none() {
                 let evidence = tempfile::tempdir().unwrap();
                 let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-                command.args(["--exact", TEST, "--nocapture"]).env(CHILD, evidence.path());
+                command
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, evidence.path());
                 assert_numstat_child(command, evidence);
                 return;
             }
@@ -9379,7 +9457,12 @@ mod tests {
                 // SAFETY: this is a NUL-terminated owned fixture path.
                 assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
             };
-            for case in ["gitfile-fifo", "commondir-fifo", "gitfile-symlink", "gitfile-oversize"] {
+            for case in [
+                "gitfile-fifo",
+                "commondir-fifo",
+                "gitfile-symlink",
+                "gitfile-oversize",
+            ] {
                 let root = evidence.join(case);
                 fs::create_dir_all(&root).unwrap();
                 let marker = root.join(".git");
@@ -9399,13 +9482,40 @@ mod tests {
                 let executor = Arc::new(FakeExecutor::default());
                 let git = RepositoryService::new("git", executor.clone());
                 let mut cache = SnapshotCache::default();
-                assert!(git.snapshot_cached(&root, SnapshotOptions::default(), &CancellationToken::default(), &mut cache).is_err(), "{case}");
-                assert!(cache.dirty, "failed metadata never certifies an unchanged cache");
-                assert!(executor.commands.lock().unwrap().is_empty(), "invalid prepass must fail before Git: {case}");
+                assert!(
+                    git.snapshot_cached(
+                        &root,
+                        SnapshotOptions::default(),
+                        &CancellationToken::default(),
+                        &mut cache
+                    )
+                    .is_err(),
+                    "{case}"
+                );
+                assert!(
+                    cache.dirty,
+                    "failed metadata never certifies an unchanged cache"
+                );
+                assert!(
+                    executor.commands.lock().unwrap().is_empty(),
+                    "invalid prepass must fail before Git: {case}"
+                );
                 let cancel = CancellationToken::default();
                 cancel.cancel();
-                let failure = git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache).unwrap_err();
-                assert!(matches!(failure, RepositoryError::Process(ProcessFailure { kind: ProcessFailureKind::Cancelled, started: false, .. })), "{case}: {failure:?}");
+                let failure = git
+                    .snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        failure,
+                        RepositoryError::Process(ProcessFailure {
+                            kind: ProcessFailureKind::Cancelled,
+                            started: false,
+                            ..
+                        })
+                    ),
+                    "{case}: {failure:?}"
+                );
                 assert!(executor.commands.lock().unwrap().is_empty());
             }
             let root = evidence.join("recovery");
@@ -9419,16 +9529,31 @@ mod tests {
             let git = RepositoryService::new("git", executor.clone());
             let cancel = CancellationToken::default();
             let mut cache = SnapshotCache::default();
-            assert!(git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
+            assert!(
+                git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_some()
+            );
             let before = executor.commands.lock().unwrap().len();
             let marker = root.join(".git/commondir");
             fifo(&marker);
-            assert!(git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache).is_err());
+            assert!(
+                git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .is_err()
+            );
             assert_eq!(executor.commands.lock().unwrap().len(), before);
             fs::remove_file(marker).unwrap();
-            assert!(git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some(),
-                "restoring identical metadata must publish after a failed prepass");
-            assert!(git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_none());
+            assert!(
+                git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_some(),
+                "restoring identical metadata must publish after a failed prepass"
+            );
+            assert!(
+                git.snapshot_cached(&root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         #[test]

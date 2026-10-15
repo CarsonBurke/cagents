@@ -11143,7 +11143,9 @@ impl Cagents {
         }
         if self.refresh_ui.source_cancel.is_some() {
             self.refresh_ui.source_reload_pending = true;
-            self.refresh_ui.source_invalidated.fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
             return Task::none();
         }
         self.reload_source_control(key)
@@ -28996,32 +28998,64 @@ mod tests {
         let active = CancellationToken::default();
         app.refresh_ui.source_cancel = Some(active.clone());
         for _ in 0..1000 {
-            assert!(cosmic::iced::runtime::task::into_stream(app.reload_source_control_from_event(&key)).is_none());
+            assert!(
+                cosmic::iced::runtime::task::into_stream(
+                    app.reload_source_control_from_event(&key)
+                )
+                .is_none()
+            );
         }
-        assert!(!active.is_cancelled(), "continuous events must let the active reader finish");
+        assert!(
+            !active.is_cancelled(),
+            "continuous events must let the active reader finish"
+        );
         assert_eq!(app.refresh_ui.source_generation, generation);
         assert!(app.refresh_ui.source_reload_pending);
         let snapshot = crate::repository::RepositorySnapshot {
-            operation: None, stashes: Vec::new(), last_fetch_unix_ms: None,
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
             status: crate::repository::StatusSnapshot::default(),
-            files: crate::repository::WorkingFiles::default(), remotes: Vec::new(),
-            local_refs: Vec::new(), remote_refs: Vec::new(), remote_heads: Vec::new(),
+            files: crate::repository::WorkingFiles::default(),
+            remotes: Vec::new(),
+            local_refs: Vec::new(),
+            remote_refs: Vec::new(),
+            remote_heads: Vec::new(),
         };
         let model = SourceControlModel::ready(key.clone(), &snapshot);
         let followup = app.update(Message::SourceControlLoaded {
-            key: key.clone(), request: generation,
+            key: key.clone(),
+            request: generation,
             result: Ok(Some(Box::new((snapshot, model)))),
         });
-        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().data_state, sidebar::SidebarDataState::Ready,
-            "the completed full model is installed before its queued followup");
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .data_state,
+            sidebar::SidebarDataState::Ready,
+            "the completed full model is installed before its queued followup"
+        );
         assert!(cosmic::iced::runtime::task::into_stream(followup).is_some());
-        assert_eq!(app.refresh_ui.source_generation, generation.wrapping_add(1), "one new generation for all 1000 edges");
+        assert_eq!(
+            app.refresh_ui.source_generation,
+            generation.wrapping_add(1),
+            "one new generation for all 1000 edges"
+        );
         assert!(!app.refresh_ui.source_reload_pending);
         assert!(app.refresh_ui.source_cancel.is_some());
         assert!(!active.is_cancelled());
         let next = app.refresh_ui.source_generation;
-        drop(app.update(Message::SourceControlLoaded { key, request: next, result: Ok(None) }));
-        assert_eq!(app.refresh_ui.source_generation, next, "no trailing reload after the pending edge was consumed");
+        drop(app.update(Message::SourceControlLoaded {
+            key,
+            request: next,
+            result: Ok(None),
+        }));
+        assert_eq!(
+            app.refresh_ui.source_generation, next,
+            "no trailing reload after the pending edge was consumed"
+        );
         assert!(app.refresh_ui.source_cancel.is_none());
     }
 
@@ -29036,9 +29070,20 @@ mod tests {
             let generation = app.refresh_ui.source_generation;
             app.refresh_ui.source_cancel = Some(CancellationToken::default());
             drop(app.reload_source_control_from_event(&key));
-            let result = if failed { Err("transient read failure".to_owned()) } else { Ok(None) };
-            let followup = app.update(Message::SourceControlLoaded { key, request: generation, result });
-            assert!(cosmic::iced::runtime::task::into_stream(followup).is_some(), "pending invalidation survives failed={failed}");
+            let result = if failed {
+                Err("transient read failure".to_owned())
+            } else {
+                Ok(None)
+            };
+            let followup = app.update(Message::SourceControlLoaded {
+                key,
+                request: generation,
+                result,
+            });
+            assert!(
+                cosmic::iced::runtime::task::into_stream(followup).is_some(),
+                "pending invalidation survives failed={failed}"
+            );
             assert_eq!(app.refresh_ui.source_generation, generation.wrapping_add(1));
             assert!(!app.refresh_ui.source_reload_pending);
             assert!(app.refresh_ui.source_cancel.is_some());
@@ -29065,8 +29110,15 @@ mod tests {
         assert!(active.is_cancelled());
         assert!(!app.refresh_ui.source_reload_pending);
         assert!(app.refresh_ui.source_cancel.is_none());
-        drop(app.update(Message::SourceControlLoaded { key, request: retired, result: Ok(None) }));
-        assert!(app.refresh_ui.source_cancel.is_none(), "retired callback cannot start a new read");
+        drop(app.update(Message::SourceControlLoaded {
+            key,
+            request: retired,
+            result: Ok(None),
+        }));
+        assert!(
+            app.refresh_ui.source_cancel.is_none(),
+            "retired callback cannot start a new read"
+        );
         assert!(!app.refresh_ui.source_reload_pending);
     }
 

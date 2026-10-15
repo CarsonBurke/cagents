@@ -465,7 +465,10 @@ impl Cagents {
                     self.refresh_ui.git.changed(project, change);
                 }
                 if let Some(key) = reload {
-                    return Task::batch([self.reload_source_control_from_event(&key), self.start_git_reads()]);
+                    return Task::batch([
+                        self.reload_source_control_from_event(&key),
+                        self.start_git_reads(),
+                    ]);
                 }
             }
             Action::Read {
