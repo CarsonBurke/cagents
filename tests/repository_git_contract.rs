@@ -6062,3 +6062,46 @@ fn recovery_refuses_late_writes_during_other_batches_and_destructive_prechecks()
         );
     }
 }
+
+#[test]
+fn undo_discard_refuses_a_same_size_substituted_unpack_file_and_preserves_it() {
+    struct SubstituteUnpacked { root: PathBuf, changed: std::sync::atomic::AtomicBool }
+    impl ProcessExecutor for SubstituteUnpacked {
+        fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancel)?;
+            if command.arguments.iter().any(|argument| argument == "unpack-file") && output.success {
+                use std::os::unix::ffi::OsStrExt;
+                let name = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+                assert!(name.starts_with(b".merge_file_"));
+                let path = self.root.join(OsStr::from_bytes(name));
+                assert_eq!(fs::metadata(&path).unwrap().len(), 4);
+                fs::remove_file(&path).unwrap();
+                fs::write(&path, b"EVIL").unwrap();
+                self.changed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            Ok(output)
+        }
+    }
+    let Some(fixture) = Fixture::new() else { return; };
+    fixture.write("tracked.txt", b"base");
+    fixture.git_in_work(&["add", "."]);
+    fixture.commit("base");
+    fixture.write("tracked.txt", b"work");
+    let cancel = CancellationToken::default();
+    let receipt = fixture.service().discard_recoverable(&DiscardRequest {
+        worktree: fixture.work(), tracked: vec![PathSelection::new(path("tracked.txt"))],
+        untracked: vec![], confirmed: true,
+    }, &cancel).unwrap().recovery;
+    assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"base");
+    let executor = Arc::new(SubstituteUnpacked { root: fixture.work(), changed: std::sync::atomic::AtomicBool::new(false) });
+    let result = RepositoryService::new("git", executor.clone()).undo_discard(&receipt, &cancel).unwrap();
+    assert!(executor.changed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!matches!(result, MutationOutcome::Applied { .. }), "{result:?}");
+    assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"base");
+    assert!(fs::read_dir(fixture.work()).unwrap().filter_map(Result::ok).any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_file()) && fs::read(entry.path()).is_ok_and(|bytes| bytes == b"EVIL")
+    }), "the unexpected generated entry must be retained rather than blindly unlinked");
+    let before = receipt.entries.iter().find(|entry| entry.path == path("tracked.txt")).unwrap();
+    let cagents::repository::SavedEntry::Blob { oid, .. } = &before.before else { panic!("tracked backup required") };
+    assert_eq!(fixture.git_in_work(&["cat-file", "blob", oid.as_str()]), b"work");
+}
