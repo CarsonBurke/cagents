@@ -404,7 +404,7 @@ impl Cagents {
     }
 
     pub(super) fn creation_project_is_current(&self, project: ProjectId, generation: Option<u64>) -> bool {
-        generation.is_none_or(|generation| self.repository_generations.get(&project) == Some(&generation)
+        generation.is_none_or(|generation| self.project_creation_generation(project) == Some(generation)
             && self.sidebar_model.project(project).is_some())
     }
 
@@ -419,7 +419,7 @@ impl Cagents {
             self.status = Some(TransientNotice::warning("The displayed project source changed. Reload the project before creating a worktree."));
             return Task::none();
         }
-        let Some(generation) = self.repository_generations.get(&project_id).copied() else {
+        let Some(generation) = self.project_creation_generation(project_id) else {
             self.status = Some(TransientNotice::warning("The project generation is unavailable. Reload the project before creating a worktree."));
             return Task::none();
         };
@@ -435,7 +435,7 @@ impl Cagents {
         draft: WorktreeDraft,
         replaces: Option<OperationId>,
     ) -> Task<Message> {
-        let Some(generation) = self.repository_generations.get(&project_id).copied().filter(|_| self.sidebar_model.project(project_id).is_some()) else {
+        let Some(generation) = self.project_creation_generation(project_id).filter(|_| self.sidebar_model.project(project_id).is_some()) else {
             self.status = Some(TransientNotice::warning("The original project generation is unavailable. Reload the project before creating a worktree."));
             return Task::none();
         };
@@ -1382,7 +1382,6 @@ mod tests {
         let root = temporary.path().join("displayed");
         super::super::git_binding::tests::init(&root, "original\n");
         let (mut app, key) = super::super::git_binding::tests::app_for(&root);
-        app.repository_generations.insert(key.project_id, 1);
         let identity = crate::repository::CommitIdentity {
             name: "Fixture".into(), email: "fixture@example.invalid".into(),
             timestamp: 0, offset_minutes: 0,
@@ -1424,7 +1423,6 @@ mod tests {
         let oid = crate::repository::Oid::parse_object(isolated_git(&root, &["rev-parse", "HEAD"])).unwrap();
         fixture.app.settings.managed_worktree_directory = ".worktrees".into();
         fixture.app.sidebar_model.projects[0].repository = root.clone();
-        fixture.app.repository_generations.insert(fixture.project, 1);
         let authority = crate::repository::WorktreeAuthority::capture(&root).unwrap();
         drop(fixture.app.open_worktree_dialog_bound(fixture.project, authority,
             WorktreeDraft { branch: "history-topic".into(), base: oid.as_str().into(), destination: String::new() }, None));
