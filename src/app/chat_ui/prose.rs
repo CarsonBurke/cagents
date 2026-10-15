@@ -254,6 +254,7 @@ pub(super) fn view(
         target,
         blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
         revision: cached.revision,
+        flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
         item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
         path: vec![0],
@@ -277,6 +278,7 @@ pub(super) fn content_view(
         target,
         blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
         revision: cached.revision,
+        flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
         item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
         path: vec![1, cached.coordination.as_ref().and_then(|coordinated| coordinated.contents().position(|candidate| std::ptr::eq(candidate, content))).unwrap_or_default() as u32],
@@ -296,6 +298,7 @@ pub(super) fn items_for_test(
         target,
         blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
         revision: cached.revision,
+        flow_cache: cached.flow_cache.clone(),
         reader_memory: cached.reader_memory.clone(), reader_context: cached.reader_context.clone(),
         item: cached.item.as_ref().map_or_else(|| format!("unbound-{}", cached.revision), |item| item.id.clone()).into(),
         path: vec![0],
@@ -310,6 +313,7 @@ pub(super) fn items_for_test(
 
 #[derive(Clone)]
 struct Renderer {
+    flow_cache: flow_layout::Cache,
     reader_memory: scroll::Memory,
     reader_context: Option<String>,
     item: Arc<str>,
@@ -418,9 +422,9 @@ impl Renderer {
         use markdown::Item;
         match item {
             Item::Heading(level, text) => {
-                heading(settings, *level, text, index, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0)))
+                heading(settings, *level, text, index, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0)), Some(&self.flow_cache))
             }
-            Item::Paragraph(text) => paragraph(settings, text, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0))),
+            Item::Paragraph(text) => paragraph(settings, text, self.target, self.find.as_deref(), Some(self.logical(text.plain(), 0)), Some(&self.flow_cache)),
             Item::CodeBlock { language, code, .. } => {
                 self.code_block(settings, language.as_deref(), code)
             }
@@ -632,6 +636,7 @@ fn heading(
     target: Target,
     find: Option<&str>,
     logical: Option<selectable_prose::Logical>,
+    flow_cache: Option<&flow_layout::Cache>,
 ) -> Element<'static, Message> {
     use markdown::HeadingLevel;
     widget::container(paragraph(markdown::Settings {
@@ -643,7 +648,7 @@ fn heading(
             HeadingLevel::H5 => settings.h5_size,
             HeadingLevel::H6 => settings.h6_size,
         }, style: heading_style(settings, level), ..settings
-    }, text, target, find, logical))
+    }, text, target, find, logical, flow_cache))
     .padding(iced::Padding::ZERO.top(if index > 0 {
         settings.text_size.0 / 2.0
     } else {
@@ -807,40 +812,17 @@ fn paragraph(
     target: Target,
     find: Option<&str>,
     logical: Option<selectable_prose::Logical>,
+    flow_cache: Option<&flow_layout::Cache>,
 ) -> Element<'static, Message> {
-    if text.len() <= 2048 || !text.plain().is_ascii() || text.plain().contains('\t') {
-        return leaf_text(text.spans(settings.style), settings.text_size, settings.style.font, target, find, logical);
+    let spans = text.spans(settings.style);
+    if text.len() > 2048
+        && let Some(cache) = flow_cache
+        && let Some(logical) = logical.clone()
+    {
+        let flow = cache.entry(logical.identity, spans.clone());
+        return selectable_prose::flow_text(spans, settings.text_size, settings.style.font, target, find, logical, flow);
     }
-    let plain = text.plain();
-    let text = Arc::new(text.clone());
-    let find: Option<Arc<str>> = find.map(Arc::from);
-    let rows = chunk_ranges(&plain).into_iter().map(|range| {
-        use std::hash::{Hash, Hasher};
-        let mut key = std::hash::DefaultHasher::new();
-        (logical.as_ref().map(|logical| logical.identity), range.start).hash(&mut key);
-        let key = key.finish();
-        let mut revision = std::hash::DefaultHasher::new();
-        (&plain[range.clone()], &find, settings.style.font, settings.text_size.0.to_bits(), cosmic::theme::is_dark()).hash(&mut revision);
-        let revision = revision.finish();
-        let estimate = ((range.len() as f32 * settings.text_size.0 * 0.5 / design::READABLE_MEASURE).ceil().max(1.0)
-            + plain[range.clone()].matches('\n').count() as f32) * settings.text_size.0 * 1.3;
-        let text = text.clone(); let find = find.clone();
-        let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
-            identity: logical.identity, bytes: logical.start + range.start..logical.start + range.end, chunk: true });
-        let logical = logical.clone().map(|mut logical| { logical.start += range.start; logical });
-        let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
-            let text = text.clone(); let find = find.clone();
-            let logical = logical.clone(); let range = range.clone();
-            retained::kept(revision, move || {
-                leaf_text(text.spans_range(settings.style, range.clone()), settings.text_size, settings.style.font,
-                    target, find.as_deref(), logical.clone())
-            })
-        });
-        row.anchor = true;
-        row.logical = descriptor;
-        row
-    }).collect();
-    virtualized::column(rows, Default::default())
+    leaf_text(spans, settings.text_size, settings.style.font, target, find, logical)
 }
 
 /// A table column's alignment as the layout takes it.

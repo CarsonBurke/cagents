@@ -31,6 +31,8 @@ pub(super) struct State {
     /// Selection/find backgrounds are painted from glyph positions and never
     /// change the paragraph's spans or trigger reshaping.
     paragraph: std::cell::OnceCell<ParagraphBuffer>,
+    flow: Option<flow_layout::Handle>,
+    flow_projection: std::cell::RefCell<Option<flow_layout::Projection>>,
     #[cfg(test)]
     paragraph_builds: std::cell::Cell<usize>,
     pub(super) anchor: usize,
@@ -53,6 +55,8 @@ impl Default for State {
             spans: None,
             shape: None,
             paragraph: std::cell::OnceCell::new(),
+            flow: None,
+            flow_projection: std::cell::RefCell::new(None),
             #[cfg(test)]
             paragraph_builds: std::cell::Cell::new(0),
             anchor: 0,
@@ -90,6 +94,7 @@ impl Shape {
 
 impl State {
     fn paragraph(&self) -> &ParagraphBuffer {
+        debug_assert!(self.flow.is_none(), "flow text must never shape synchronously");
         self.paragraph
             .get_or_init(|| match (&self.spans, self.shape) {
                 (Some(spans), Some(shape)) => {
@@ -108,6 +113,9 @@ impl State {
         if logical.identity != identity || byte < logical.start { return None; }
         let byte = byte - logical.start;
         if byte > self.plain.len() { return None; }
+        if let Some(flow) = &self.flow {
+            return flow.borrow().prepared()?.byte_bounds(byte, self.plain.len());
+        }
         let paragraph = self.paragraph();
         let mut prefixes = Vec::with_capacity(paragraph.buffer().lines.len());
         let mut offset = 0;
@@ -127,10 +135,17 @@ impl State {
     }
 
     pub(super) fn hit(&self, position: Point) -> usize {
+        if let Some(flow) = &self.flow {
+            return flow.borrow().prepared().map_or(0, |ready| ready.hit(position, self.plain.len()));
+        }
         hit(self.paragraph(), &self.plain, position)
     }
 
     pub(super) fn link(&self, position: Point) -> Option<String> {
+        if let Some(flow) = &self.flow {
+            let metadata = flow.borrow().prepared()?.link(position)?;
+            return self.spans.as_ref()?.get(metadata)?.link.clone();
+        }
         // Link activation uses the glyph under the pointer, rather than a
         // caret offset: iced's hit_span rejects line.len() even with Before
         // affinity, losing the right half of the last linked glyph.
@@ -164,7 +179,7 @@ pub(super) struct Logical {
 
 pub(super) fn logical_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
     font: iced::Font, target: Target, find: Option<&str>, logical: Logical) -> Element<'static, Message> {
-    build_text(spans, size, font, target, find, Some(logical))
+    build_text(spans, size, font, target, find, Some(logical), None)
 }
 
 pub(super) fn text(
@@ -174,10 +189,15 @@ pub(super) fn text(
     target: Target,
     find: Option<&str>,
 ) -> Element<'static, Message> {
-    build_text(spans, size, font, target, find, None)
+    build_text(spans, size, font, target, find, None, None)
 }
+pub(super) fn flow_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels, font: iced::Font,
+    target: Target, find: Option<&str>, logical: Logical, flow: flow_layout::Handle) -> Element<'static, Message> {
+    build_text(spans, size, font, target, find, Some(logical), Some(flow))
+}
+
 fn build_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
-    font: iced::Font, target: Target, find: Option<&str>, logical: Option<Logical>) -> Element<'static, Message> {
+    font: iced::Font, target: Target, find: Option<&str>, logical: Option<Logical>, flow: Option<flow_layout::Handle>) -> Element<'static, Message> {
     let plain: Arc<str> = spans
         .iter()
         .map(|span| span.text.as_ref())
@@ -192,6 +212,7 @@ fn build_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
         font,
         target,
         logical,
+        flow,
         matches: highlights.ranges,
     });
     if truncated {
@@ -223,6 +244,7 @@ pub(super) fn plain(
 }
 
 struct Selectable {
+    flow: Option<flow_layout::Handle>,
     logical: Option<Logical>,
     matches: Vec<std::ops::Range<usize>>,
     spans: Arc<[Span<'static, String>]>,
@@ -288,7 +310,7 @@ impl Selectable {
     }
 
     fn hit(&self, state: &State, position: Point) -> usize {
-        hit(state.paragraph(), &self.plain, position)
+        state.hit(position)
     }
 }
 
@@ -400,6 +422,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         state.dirty = false;
         state.target = Some(self.target);
         state.logical = self.logical.clone();
+        state.flow = self.flow.clone();
         if state
             .spans
             .as_ref()
@@ -420,6 +443,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             size: self.size,
             font: self.font,
         };
+        if let Some(flow) = &state.flow {
+            state.paragraph.take();
+            state.spans = Some(self.spans.clone());
+            state.shape = Some(shape);
+            let mut flow = flow.borrow_mut();
+            flow.configure(shape.bounds.width, self.size, self.font);
+            return layout::Node::new(limits.resolve(Length::Shrink, Length::Shrink, flow.bounds(self.plain.len())));
+        }
         if state
             .spans
             .as_ref()
@@ -461,6 +492,21 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     ) {
         if layout.bounds().intersection(viewport).is_none() { return; }
         let state = tree.state.downcast_ref::<State>();
+        if let Some(flow) = &state.flow {
+            if let Some(ready) = flow.borrow().prepared() {
+                let top = (viewport.y - layout.bounds().y).max(0.0);
+                if let Some(projection) = ready.projection(top, top + viewport.height + self.size.0 * 1.3) {
+                    flow_layout::paint(renderer, &projection, &self.spans, &self.matches,
+                        state.anchor.min(state.end)..state.anchor.max(state.end), self.size,
+                        layout.position(), theme, defaults, viewport);
+                    *state.flow_projection.borrow_mut() = Some(projection);
+                }
+            } else if let Some(shape) = state.shape {
+                let label = if flow.borrow().failed() { "Text could not be displayed" } else { "Loading…" };
+                renderer.fill_text(shape.text(label.to_owned()), layout.position(), defaults.text_color, *viewport);
+            }
+            return;
+        }
         let paragraph = state.paragraph();
         let translation = layout.position() - Point::ORIGIN;
         // Preserve inline code surfaces, emphasis, links and strike-throughs
@@ -510,6 +556,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         if std::mem::take(&mut state.dirty) {
             shell.invalidate_layout();
         }
+        if matches!(event, Event::Window(iced::window::Event::RedrawRequested(_)))
+            && layout.bounds().intersection(viewport).is_some()
+            && let Some(flow) = &state.flow
+            && let Some(request) = flow.borrow_mut().request()
+        {
+            shell.publish(action(Action::FlowRequest(self.target, request)));
+        }
         if state.managed {
             return;
         }
@@ -550,8 +603,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 }
                 if state.anchor == state.end
                     && let Some(position) = position
-                    && let Some(span) = state.paragraph().hit_span(position)
-                    && let Some(link) = self.spans.get(span).and_then(|span| span.link.clone())
+                    && let Some(link) = state.link(position)
                 {
                     shell.publish(action(Action::OpenDocument(self.target, link)));
                 }
@@ -650,6 +702,7 @@ mod tests {
         let spans: Arc<[Span<'static, String>]> = vec![Span::new("α first\nβ second")].into();
         let selectable = Selectable {
             logical: None,
+            flow: None,
             plain: "α first\nβ second".into(),
             spans: spans.clone(),
             matches: vec![],
@@ -755,6 +808,7 @@ mod tests {
                 generation: 0,
             },
             logical: None,
+            flow: None,
         };
         let mut tree =
             Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
@@ -863,6 +917,7 @@ mod tests {
         .into();
         let selectable = Selectable {
             logical: None,
+            flow: None,
             plain: "before αβ linked".into(),
             spans,
             matches: vec![],
@@ -906,6 +961,7 @@ mod tests {
     fn unicode_find_highlights_original_text_across_syntax_spans() {
         let selectable = Selectable {
             logical: None,
+            flow: None,
             plain: "Straße CAFÉ".into(),
             spans: vec![Span::new("Stra"), Span::new("ße"), Span::new(" CAFÉ")].into(),
             matches: super::super::find::ranges("Straße CAFÉ", "STRASSE"),
@@ -931,6 +987,7 @@ mod tests {
     fn find_marks_only_the_matching_text() {
         let selectable = Selectable {
             logical: None,
+            flow: None,
             plain: "one needle two".into(),
             spans: vec![Span::new("one needle two")].into(),
             matches: vec![4..10],
@@ -950,5 +1007,39 @@ mod tests {
                 .collect::<String>(),
             "needle"
         );
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+    #[test]
+    fn huge_flow_layout_defers_shaping_and_requests_only_when_native_visible() {
+        let renderer = crate::app::tests::headless_renderer();
+        let spans: Arc<[Span<'static, String>]> = vec![Span::new("word ".repeat(210_000))].into();
+        let cache = flow_layout::Cache::default();
+        let flow = cache.entry(99, spans.clone());
+        let target = Target { card: CardId::new(), generation: 0 };
+        let mut element = flow_text(spans, iced::Pixels(16.0), iced::Font::DEFAULT, target, None,
+            Logical { identity: 99, start: 0 }, flow);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY)));
+        assert_eq!(tree.state.downcast_ref::<State>().paragraph_builds.get(), 0);
+        assert!(tree.children.is_empty());
+        let mut messages = Vec::new();
+        let event = Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now()));
+        let hidden = Rectangle::new(Point::new(1000.0, 0.0), Size::new(100.0, 400.0));
+        element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
+            &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &hidden);
+        assert!(messages.is_empty());
+        let visible = Rectangle::with_size(Size::new(720.0, 400.0));
+        for _ in 0..2 {
+            element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
+                &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &visible);
+        }
+        assert_eq!(messages.len(), 1, "one pending request per source/font/width generation");
+        assert!(matches!(messages[0], Message::ChatUi(Action::FlowRequest(found, _)) if found == target));
+        assert_eq!(tree.state.downcast_ref::<State>().paragraph_builds.get(), 0);
     }
 }
