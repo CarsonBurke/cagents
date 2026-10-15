@@ -491,6 +491,7 @@ fn every_diff_basis_reads_the_matching_pair_of_sides() {
                 new,
                 old_label,
                 new_label,
+                ..
             } => (old, new, old_label, new_label),
             other => panic!("expected a comparison, got {other:?}"),
         }
@@ -3102,6 +3103,7 @@ fn a_pull_request_fetch_writes_only_its_private_refs_and_proves_the_head() {
         new,
         old_label,
         new_label,
+        ..
     } = content
     else {
         panic!("expected a comparison");
