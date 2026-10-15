@@ -77,14 +77,19 @@ impl Preview {
             } => (turn::first_line(command), Language::Shell, output.as_str()),
             // The last line of a file that was read, or of a search's
             // matches, says nothing about how the step went.
-            ItemContent::Command { .. } => (turn::step_label(content), Language::Plain, ""),
+            ItemContent::Command { output, status, .. } => (
+                turn::step_label(content),
+                Language::Plain,
+                if *status == ToolStatus::Failed { output.as_str() } else { "" },
+            ),
             // The row already names the tool, so its second line is what
             // the tool was called with. That stays once there is output: a
             // name alone does not tell one call of a tool from the next.
             ItemContent::Tool { name,input, output, .. } => {
                 let (source,language)=builtin.as_ref().map_or((input.as_str(),Language::structured(input)),
                     |(text,language)|(text.as_str(),*language));
-                let output=if turn::builtin_action(name).is_some_and(|action|action!=chat::CommandAction::Run) {""} else {output.as_str()};
+                let output=if content.status() != Some(ToolStatus::Failed)
+                    && turn::builtin_action(name).is_some_and(|action|action!=chat::CommandAction::Run) {""} else {output.as_str()};
                 (source,language,output)
             }
             _ => (turn::step_label(content), Language::Plain, ""),
@@ -804,6 +809,34 @@ mod tests {
         assert_eq!(output_summary("\n\n",true),"");
         let huge=format!("error: old unrelated failure\n{}\nlatest progress", "🦀".repeat(100_000));
         assert_eq!(output_summary(&huge,true),"latest progress");
+    }
+
+    #[test]
+    fn failed_read_and_search_keep_diagnostics_without_previewing_successful_contents() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        for (name, input, action) in [
+            ("Read", r#"{"file_path":"missing.rs"}"#, chat::CommandAction::Read),
+            ("Grep", r#"{"pattern":"needle"}"#, chat::CommandAction::Search),
+            ("Glob", r#"{"pattern":"*.rs"}"#, chat::CommandAction::List),
+        ] {
+            for status in [ToolStatus::Failed, ToolStatus::Succeeded, ToolStatus::Running] {
+                let output = "No such file or directory\nProcess exited with code 1\n";
+                let tool = ItemContent::Tool {
+                    name: name.into(), input: input.into(), output: output.into(), status,
+                };
+                let command = ItemContent::Command {
+                    label: name.into(), command: "missing.rs".into(),
+                    working_directory: String::new(), action, status,
+                    exit_code: None, duration_ms: None, output: output.into(),
+                };
+                for content in [tool, command] {
+                    let preview = Preview::update(None, &content, theme);
+                    assert_eq!(preview.tail,
+                        if status == ToolStatus::Failed { "No such file or directory" } else { "" },
+                        "{name} {status:?}");
+                }
+            }
+        }
     }
 
 }
