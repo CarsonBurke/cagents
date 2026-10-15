@@ -44,6 +44,10 @@ use std::{
 const QUICK_OPEN_ROW_HEIGHT: f32 = 40.0;
 const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 
+fn review_request_interval(focused: bool) -> Duration {
+    Duration::from_secs(if focused { 10 } else { 5 * 60 })
+}
+
 mod checkout;
 mod notification_ui;
 
@@ -3172,6 +3176,8 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::WindowFocused(window, focused) => {
+                    let regained = self.core.main_window_id() == Some(window)
+                        && focused && !self.window_focused;
                     if self.core.main_window_id() == Some(window) {
                         cagents::ui_controls::observe_activity_window_event(&if focused {
                             window::Event::Focused
@@ -3183,7 +3189,14 @@ impl Application for Editor {
                             self.tab_history.finish(self.active);
                         }
                     }
-                    self.notification_focus()
+                    let reviews = if regained {
+                        Task::done(cosmic::Action::App(Message::ReviewRequests(
+                            pull_request_review::request_ui::monitor::Action::FocusGained,
+                        )))
+                    } else {
+                        Task::none()
+                    };
+                    Task::batch([self.notification_focus(), reviews])
                 }
                 Message::RefreshVisible => {
                     // A colour-only theme change reaches the hook but not the
@@ -4544,7 +4557,7 @@ impl Application for Editor {
             .iter()
             .any(|tab| tab.review.review_request_repository().is_some())
         {
-            iced::time::every(Duration::from_secs(10)).map(|_| {
+            iced::time::every(review_request_interval(self.window_focused)).map(|_| {
                 Message::ReviewRequests(pull_request_review::request_ui::monitor::Action::Tick)
             })
         } else {
@@ -5982,6 +5995,38 @@ mod tests {
             app.tab(id).unwrap().runtime.editor_text().is_some(),
             "the buffer for {file} never opened",
         );
+    }
+
+    #[test]
+    fn review_discovery_backs_off_and_refreshes_once_on_main_window_focus() {
+        use cosmic::iced::futures::{FutureExt, StreamExt};
+
+        fn refreshes(task: Task<Message>) -> usize {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return 0;
+            };
+            let mut count = 0;
+            while let Some(Some(action)) = stream.next().now_or_never() {
+                if matches!(action, iced::runtime::Action::Output(cosmic::Action::App(
+                    Message::ReviewRequests(pull_request_review::request_ui::monitor::Action::FocusGained)
+                ))) {
+                    count += 1;
+                }
+            }
+            count
+        }
+
+        assert_eq!(review_request_interval(false), Duration::from_secs(300));
+        assert_eq!(review_request_interval(true), Duration::from_secs(10));
+        let mut app = editor();
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        assert_eq!(refreshes(app.update(Message::WindowFocused(window::Id::unique(), true))), 0);
+        assert!(!app.window_focused);
+        assert_eq!(refreshes(app.update(Message::WindowFocused(main, true))), 1);
+        assert_eq!(refreshes(app.update(Message::WindowFocused(main, true))), 0);
+        assert_eq!(refreshes(app.update(Message::WindowFocused(main, false))), 0);
+        assert_eq!(refreshes(app.update(Message::WindowFocused(main, true))), 1);
     }
 
     #[test]
