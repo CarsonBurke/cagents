@@ -1682,7 +1682,7 @@ fn delayed_diagnostic_reply_preserves_reservation(mode: DelayedDiagnosticReply, 
     let (wake_tx, wake_rx) = std::sync::mpsc::channel();
     let handle = ClientHandle::connect_on(client, super::super::tests::omp_card(None, None), Intent::Start, None, false, None, None, move |wake| { let _ = wake_tx.send(wake); }).unwrap();
     handle.install_snapshot_for_test(Snapshot { error: Some("Original provider crash".into()), ..Default::default() });
-    let log = super::super::super::ProviderExitLog { id: "late-log".into(), bytes: 4, omitted: 0 };
+    let log = super::super::super::ProviderExitLog { id: "late-log".into(), bytes: 256 * 1024, omitted: 0 };
     let weak = Arc::downgrade(&handle.inner);
     let request = handle.diagnostic_request(CardId::new(), 7, 3, &log, false, true, Arc::new(move || weak.upgrade().is_some())).unwrap();
     let reader_handle = handle.clone(); let reader_request = request.clone();
@@ -1834,7 +1834,8 @@ fn retained_cap_invalid_utf8_cleanup_and_copy_report_actual_layout_and_process_r
     lane().peak_capacity.store(0,Ordering::Release);
     let before=rss_kib();let job=request(Duration::from_secs(30),true,true);let worker=worker();
     let suffix=b"\x1b[31mred\x1b[0m\n";let invalid=provider_exit::MAX_OUTPUT_BYTES-suffix.len();
-    let mut input=vec![0xff;invalid];input.extend_from_slice(suffix);
+    let mut input=Vec::with_capacity(provider_exit::MAX_OUTPUT_BYTES);input.resize(invalid,0xff);input.extend_from_slice(suffix);
+    assert_eq!(input.capacity(),provider_exit::MAX_OUTPUT_BYTES,"fixture input has no geometric spare capacity outside the charged lane");
     let text=normalize(raw(&input,&job,&worker),&job,&worker).unwrap();drop(input);
     assert!(text.starts_with('\u{fffd}'));assert!(text.ends_with("red\n"));assert_eq!(text.len(),invalid*3+4);
     let resident=text.capacity();text.installed();let normalized_rss=rss_kib();
