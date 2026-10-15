@@ -64,16 +64,25 @@ impl Dialog {
         self.id
     }
     #[cfg(test)]
-    pub(super) fn fixture_prepared(&mut self, prepared: cagents::pull_request_review::checkout::PreparedCheckout) -> OperationId {
+    pub(super) fn fixture_prepared(
+        &mut self,
+        prepared: cagents::pull_request_review::checkout::PreparedCheckout,
+    ) -> OperationId {
         self.prepared = Some(prepared);
         self.id
     }
     #[cfg(test)]
-    pub(super) fn completed_for_test(&self) -> Option<&Path> { self.completed.as_deref() }
+    pub(super) fn completed_for_test(&self) -> Option<&Path> {
+        self.completed.as_deref()
+    }
     #[cfg(test)]
-    pub(super) fn cancellation_for_test(&self) -> Option<CancellationToken> { self.cancellation.clone() }
+    pub(super) fn cancellation_for_test(&self) -> Option<CancellationToken> {
+        self.cancellation.clone()
+    }
     #[cfg(test)]
-    pub(super) fn retained_receipt_for_test(&self) -> Option<&VerifiedPrCheckout> { self.existing_receipt.as_ref() }
+    pub(super) fn retained_receipt_for_test(&self) -> Option<&VerifiedPrCheckout> {
+        self.existing_receipt.as_ref()
+    }
     #[cfg(test)]
     pub(super) fn error_for_test(&self) -> Option<&str> {
         self.error.as_deref()
@@ -107,15 +116,22 @@ impl Editor {
     }
 
     pub(super) fn begin_review_checkout(&mut self, card: CardId, target: CheckoutTarget) {
-        let Some(tab) = self.tab(card) else { return; };
-        let Some(review) = tab.review.target().cloned() else { return; };
+        let Some(tab) = self.tab(card) else {
+            return;
+        };
+        let Some(review) = tab.review.target().cloned() else {
+            return;
+        };
         let owner = (card, tab.review.selection_generation(), review);
         self.begin_checkout_owned(target, Some(owner));
         self.invalidate_stale_checkout();
     }
 
-    fn begin_checkout_owned(&mut self, target: CheckoutTarget,
-        review_owner: Option<(CardId, u64, pull_request_review::ReviewTarget)>) {
+    fn begin_checkout_owned(
+        &mut self,
+        target: CheckoutTarget,
+        review_owner: Option<(CardId, u64, pull_request_review::ReviewTarget)>,
+    ) {
         if self.modal_open() {
             return;
         }
@@ -136,12 +152,18 @@ impl Editor {
     }
 
     fn checkout_origin_is_current(&self) -> bool {
-        let Some(dialog) = self.checkout_dialog.as_ref() else { return false; };
+        let Some(dialog) = self.checkout_dialog.as_ref() else {
+            return false;
+        };
         let Some((card, generation, original)) = dialog.review_owner.as_ref() else {
             return dialog.target.pull_request.is_none();
         };
-        let Some(tab) = self.tab(*card) else { return false; };
-        let Some(current) = tab.review.target() else { return false; };
+        let Some(tab) = self.tab(*card) else {
+            return false;
+        };
+        let Some(current) = tab.review.target() else {
+            return false;
+        };
         *generation == tab.review.selection_generation()
             && original.repository.same_repository(&current.repository)
             && original.worktree == current.worktree
@@ -153,28 +175,52 @@ impl Editor {
             && current.pull_request.head_ref_name == dialog.target.head_ref_name
             && original.pull_request.head_ref_oid == current.pull_request.head_ref_oid
             && current.pull_request.head_ref_oid == dialog.target.head.as_str()
-            && tab.review.range().is_some_and(|range| range.head == dialog.target.head)
-            && original.pull_request.head_repository_key().zip(current.pull_request.head_repository_key())
+            && tab
+                .review
+                .range()
+                .is_some_and(|range| range.head == dialog.target.head)
+            && original
+                .pull_request
+                .head_repository_key()
+                .zip(current.pull_request.head_repository_key())
                 .is_some_and(|(original, current)| original.same_repository(&current))
-            && dialog.target.pull_request.as_ref().is_some_and(|key|
-                key.repository.same_repository(&current.repository) && key.number == current.pull_request.number)
+            && dialog.target.pull_request.as_ref().is_some_and(|key| {
+                key.repository.same_repository(&current.repository)
+                    && key.number == current.pull_request.number
+            })
     }
 
-    fn checkout_plan_is_current(&self, prepared: &cagents::pull_request_review::checkout::PreparedCheckout) -> bool {
-        if !self.checkout_origin_is_current() { return false; }
+    fn checkout_plan_is_current(
+        &self,
+        prepared: &cagents::pull_request_review::checkout::PreparedCheckout,
+    ) -> bool {
+        if !self.checkout_origin_is_current() {
+            return false;
+        }
         let dialog = self.checkout_dialog.as_ref().unwrap();
-        prepared.repository == dialog.target.repository && prepared.reconciliation.as_ref().is_none_or(|plan| {
-            let request = plan.request();
-            request.expected_head == dialog.target.head && request.repository == dialog.target.repository
-                && request.head_branch.as_str() == dialog.target.head_ref_name
-                && dialog.review_owner.as_ref().is_some_and(|(_, _, original)| original.pull_request.belongs_to_head(&request.head_repository))
-        })
+        prepared.repository == dialog.target.repository
+            && prepared.reconciliation.as_ref().is_none_or(|plan| {
+                let request = plan.request();
+                request.expected_head == dialog.target.head
+                    && request.repository == dialog.target.repository
+                    && request.head_branch.as_str() == dialog.target.head_ref_name
+                    && dialog
+                        .review_owner
+                        .as_ref()
+                        .is_some_and(|(_, _, original)| {
+                            original
+                                .pull_request
+                                .belongs_to_head(&request.head_repository)
+                        })
+            })
     }
 
     pub(super) fn invalidate_stale_checkout(&mut self) {
         if self.checkout_dialog.is_some() && !self.checkout_origin_is_current() {
             let dialog = self.checkout_dialog.as_mut().unwrap();
-            if let Some(token) = &dialog.cancellation { token.cancel(); }
+            if let Some(token) = &dialog.cancellation {
+                token.cancel();
+            }
             dialog.completed = None;
             dialog.error = Some("The owning PR branch, source or head changed. Close this dialog and prepare checkout again.".into());
         }
@@ -182,7 +228,11 @@ impl Editor {
 
     pub(super) fn checkout_action(&mut self, action: Action) -> Task<Message> {
         let origin_current = self.checkout_origin_is_current();
-        if matches!(&action, Action::Resolve | Action::Create | Action::ReconcileExisting | Action::Open(_)) && !origin_current {
+        if matches!(
+            &action,
+            Action::Resolve | Action::Create | Action::ReconcileExisting | Action::Open(_)
+        ) && !origin_current
+        {
             self.invalidate_stale_checkout();
             return Task::none();
         }
@@ -234,14 +284,21 @@ impl Editor {
                 }
             }
             Action::Open(path) => {
-                if self
-                    .checkout_dialog
-                    .as_ref()
-                    .is_some_and(|d| d.completed.as_ref() == Some(&path)
-                        && d.prepared.as_ref().and_then(|plan| plan.reconciliation.as_ref()).is_none_or(|plan|
-                            d.existing_receipt.as_ref().is_some_and(|receipt|
-                                cagents::pull_request_review::checkout::verified_existing_path(&d.target, plan, receipt).as_ref() == Ok(&path))))
-                {
+                if self.checkout_dialog.as_ref().is_some_and(|d| {
+                    d.completed.as_ref() == Some(&path)
+                        && d.prepared
+                            .as_ref()
+                            .and_then(|plan| plan.reconciliation.as_ref())
+                            .is_none_or(|plan| {
+                                d.existing_receipt.as_ref().is_some_and(|receipt| {
+                                    cagents::pull_request_review::checkout::verified_existing_path(
+                                        &d.target, plan, receipt,
+                                    )
+                                    .as_ref()
+                                        == Ok(&path)
+                                })
+                            })
+                }) {
                     self.checkout_dialog = None;
                     self.selection_epoch = self.selection_epoch.wrapping_add(1);
                     return Self::open(path, self.selection_epoch);
@@ -318,7 +375,9 @@ impl Editor {
                 });
             }
             Action::Prepared(id, result) => {
-                let plan_current = result.as_ref().is_ok_and(|plan| self.checkout_plan_is_current(plan));
+                let plan_current = result
+                    .as_ref()
+                    .is_ok_and(|plan| self.checkout_plan_is_current(plan));
                 let Some(dialog) = self
                     .checkout_dialog
                     .as_mut()
@@ -331,7 +390,8 @@ impl Editor {
                     .take()
                     .is_some_and(|token| token.is_cancelled());
                 if cancelled || !origin_current {
-                    dialog.error = Some("Cancelled or owning PR changed before preparing checkout.".into());
+                    dialog.error =
+                        Some("Cancelled or owning PR changed before preparing checkout.".into());
                     return Task::none();
                 }
                 match result {
@@ -361,7 +421,9 @@ impl Editor {
                         .take()
                         .is_some_and(|token| token.is_cancelled());
                     if cancelled || !origin_current {
-                        dialog.error = Some("Cancelled or owning PR changed before creating a worktree.".into());
+                        dialog.error = Some(
+                            "Cancelled or owning PR changed before creating a worktree.".into(),
+                        );
                     } else {
                         match result {
                             Ok(request) => dialog.request = Some(request),
@@ -371,7 +433,12 @@ impl Editor {
                 }
             }
             Action::ReconcileExisting => {
-                if !self.checkout_dialog.as_ref().and_then(|dialog| dialog.prepared.as_ref()).is_some_and(|plan| self.checkout_plan_is_current(plan)) {
+                if !self
+                    .checkout_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.prepared.as_ref())
+                    .is_some_and(|plan| self.checkout_plan_is_current(plan))
+                {
                     return Task::none();
                 }
                 let Some(dialog) = self
@@ -417,7 +484,9 @@ impl Editor {
                     return Task::none();
                 };
                 dialog.cancellation = None;
-                if let Ok(receipt) = &result { dialog.existing_receipt = Some(receipt.clone()); }
+                if let Ok(receipt) = &result {
+                    dialog.existing_receipt = Some(receipt.clone());
+                }
                 if !origin_current {
                     dialog.completed = None;
                     dialog.error = Some("Checkout settled after its owning PR changed. Its result was retained; refresh the review before opening it.".into());
@@ -489,10 +558,18 @@ impl Editor {
                 if let Some(dialog) = self.checkout_dialog.as_mut().filter(|d| d.id == id) {
                     dialog.cancellation = None;
                     match result {
-                        Ok(report) if report.state == WorktreeOperationState::Created && origin_current => {
+                        Ok(report)
+                            if report.state == WorktreeOperationState::Created
+                                && origin_current =>
+                        {
                             dialog.completed = report.request.map(|r| r.destination);
                         }
-                        Ok(report) if !origin_current => dialog.error = Some(format!("Checkout settled after its owning PR changed. {} Reopen the review before opening its result.", report.detail)),
+                        Ok(report) if !origin_current => {
+                            dialog.error = Some(format!(
+                                "Checkout settled after its owning PR changed. {} Reopen the review before opening its result.",
+                                report.detail
+                            ))
+                        }
                         Ok(report) => dialog.error = Some(report.detail),
                         Err(error) => {
                             dialog.error = Some(format!(
