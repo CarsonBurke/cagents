@@ -197,10 +197,40 @@ impl Drop for OwnedSocket {
     }
 }
 
+/// One resident identity sample for close admission. No transcript ownership
+/// or serialization crosses this boundary.
+pub(crate) struct CloseIdentity {
+    pub session_id: Option<String>,
+    pub native_continuity: super::NativeContinuity,
+    pub owns_work: bool,
+    pub completed: bool,
+}
+
 impl LocalHandle {
     #[cfg(test)]
     pub(crate) fn with_presentation_store_locked(&self, action: impl FnOnce()) {
         let _store = self.0.store.lock().unwrap();
+        action();
+    }
+
+    /// Close admission may hold HostState. Snapshot publication owns this same
+    /// state mutex during file/transcript IO, so contention must refuse rather
+    /// than indirectly hold the global host behind presentation work.
+    pub(crate) fn try_close_identity(&self) -> Result<CloseIdentity, String> {
+        let state = self.0.state.try_lock()
+            .map_err(|_| "Provider presentation metadata is busy or unavailable; retry close after it settles".to_owned())?;
+        let completed = self.is_completed();
+        let owns_work = if self.0.history_only { false }
+            else if !completed { true }
+            else { self.0.failure.try_lock()
+                .map_err(|_| "Provider close metadata is busy or unavailable; retry close after it settles".to_owned())?.is_some() };
+        Ok(CloseIdentity {session_id: state.session_id.clone(),
+            native_continuity: state.native_continuity.clone(), owns_work, completed})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_presentation_state_locked(&self, action: impl FnOnce()) {
+        let _state = self.0.state.lock().unwrap();
         action();
     }
 

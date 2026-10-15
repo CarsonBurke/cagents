@@ -623,3 +623,52 @@ fn combined_close_retained_local_owner_refuses_degraded_managed_registry_before_
     assert!(Arc::ptr_eq(&registry(&fixture.host).unwrap(), &store));
     assert_eq!(fixture.rpc_counts(), counts);
 }
+
+
+#[test]
+fn combined_close_local_busy_presentation_identity_refuses_without_blocking_host() {
+    if owning_close_isolated("combined_close_local_busy_presentation_identity_refuses_without_blocking_host").is_some() { return; }
+    let fixture = LocalCodexPresentationFixture::start();
+    let target = fixture.inspect();
+    let store = registry(&fixture.host).unwrap();
+    let before = store.lock().unwrap().model().unwrap();
+    let counts = fixture.rpc_counts();
+    let (held, holding) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let handle = fixture.handle.clone();
+    let owner = std::thread::spawn(move || handle.with_presentation_state_locked(|| {
+        held.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    holding.recv_timeout(Duration::from_secs(1)).unwrap();
+    let host = fixture.host.clone();
+    let (done, completion) = std::sync::mpsc::channel();
+    let closing = std::thread::spawn(move || {
+        done.send(process(&host, Authority::default(), Operation::ConfirmPresentationClose {observed: target})).unwrap();
+    });
+    let outcome = completion.recv_timeout(Duration::from_secs(2));
+    let (sent, census) = std::sync::mpsc::channel();
+    let host = fixture.host.clone();
+    let reader = std::thread::spawn(move || { sent.send(host.lock().unwrap().chats.len()).unwrap(); });
+    let responsive = census.recv_timeout(Duration::from_millis(500));
+    release.send(()).unwrap();
+    owner.join().unwrap();
+    reader.join().unwrap();
+    closing.join().unwrap();
+    let error = outcome.expect("presentation state contention must return instead of waiting under HostState").unwrap_err();
+    assert!(error.contains("metadata is busy or unavailable"), "{error}");
+    assert!(responsive.is_ok());
+    assert!(fixture.owner.root.is_current()); assert!(!fixture.pair.is_completed());
+    assert_eq!(store.lock().unwrap().model().unwrap(), before);
+    assert_eq!(store.lock().unwrap().agent(fixture.agent.id).unwrap(), fixture.agent);
+    assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
+    assert_eq!(fixture.rpc_counts(), counts);
+    // A new explicit inspection after contention has ended still names the
+    // same exact owner; the busy refusal did not mint/consume close authority.
+    let fresh = fixture.inspect();
+    let Reply::Closed(closed) = process(&fixture.host, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: fresh}).unwrap() else {panic!("not closed")};
+    assert!(closed.closed);
+    assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
+    assert_eq!(fixture.rpc_counts(), counts);
+}
