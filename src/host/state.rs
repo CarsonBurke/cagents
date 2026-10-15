@@ -3719,12 +3719,11 @@ fn start_terminal_view_owned(
         initially_visible: options.initially_visible,
         theme: options.theme,
         execution_environment,
-        execution_recipe: execution_recipe.clone(),
         adoption,
         holder_recovery,
         ..TerminalConfig::default()
     };
-    let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
+    let handle = match TerminalHandle::spawn_with_execution(session.clone(), config, execution_recipe.clone(), move |wake| {
         broadcast_redraw(&weak, terminal_id, wake.generation);
     }) {
         Ok(handle) => handle,

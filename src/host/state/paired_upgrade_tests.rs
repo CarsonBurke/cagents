@@ -625,14 +625,24 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
         execution_environment: None,
         execution_recipe: Some(effective.clone()),
     };
-    let mut handle = TerminalHandle::spawn(
+    let refused = TerminalHandle::spawn(
         issued.clone(),
         TerminalConfig {
-            execution_recipe: Some(effective.clone()),
+            holder_recovery: Some(recovery.clone()),
+            ..Default::default()
+        },
+        |_| {},
+    ).unwrap_err();
+    assert!(refused.to_string().contains("retained holder context"),
+        "public configuration cannot supply a separate execution recipe");
+    let mut handle = TerminalHandle::spawn_with_execution(
+        issued.clone(),
+        TerminalConfig {
             holder_recovery: Some(recovery),
             initially_visible: false,
             ..Default::default()
         },
+        Some(effective.clone()),
         |_| {},
     )
     .unwrap();
@@ -689,15 +699,15 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
         let mut changed = recovery.clone();
         changed.execution_recipe = None;
         assert!(
-            TerminalHandle::spawn(
+            TerminalHandle::spawn_with_execution(
                 changed.source.clone(),
                 TerminalConfig {
-                    execution_recipe: Some(effective.clone()),
                     holder_recovery: Some(changed),
                     adoption: Some(socket.clone()),
                     initially_visible: false,
                     ..Default::default()
                 },
+                Some(effective.clone()),
                 |_| {}
             )
             .is_err(),
@@ -706,15 +716,16 @@ fn paired_effective_execution_survives_actual_holder_adoption_without_restarting
         let (retained, _) = crate::terminal::inspect_holder(&socket, &original, &proof).unwrap();
         assert_eq!(retained.execution_recipe.as_ref(), Some(&effective));
         assert!(original.root.is_current());
-        handle = TerminalHandle::spawn(
+        let execution = recovery.execution_recipe.clone();
+        handle = TerminalHandle::spawn_with_execution(
             recovery.source.clone(),
             TerminalConfig {
-                execution_recipe: recovery.execution_recipe.clone(),
                 holder_recovery: Some(recovery),
                 adoption: Some(socket.clone()),
                 initially_visible: false,
                 ..Default::default()
             },
+            execution,
             |_| {},
         )
         .unwrap();

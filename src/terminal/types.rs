@@ -29,10 +29,6 @@ pub struct TerminalConfig {
     /// Exact native execution environment for a host-owned CLI replacement.
     /// Never serialized with the terminal's durable launch recipe.
     pub execution_environment: Option<super::ipc::ChatExecutionEnvironment>,
-    /// Validated upgrade execution, separate from the terminal descriptor
-    /// already issued to its panes. Ordinary spawn requests cannot set this.
-    #[cfg(feature = "host")]
-    pub(crate) execution_recipe: Option<crate::model::LaunchRecipe>,
     /// Daemon-issued identity for child-agent tools, never a durable recipe.
     pub agent_authority: crate::agent_execution::Authority,
     /// Take over the terminal a previous daemon left to its holder, which
@@ -57,8 +53,6 @@ impl Default for TerminalConfig {
             transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
             transcript_max_bytes: DEFAULT_TRANSCRIPT_MAX_BYTES,
             execution_environment: None,
-            #[cfg(feature = "host")]
-            execution_recipe: None,
             agent_authority: Default::default(),
             adoption: None,
             #[cfg(feature = "host")]

@@ -703,6 +703,17 @@ impl TerminalHandle {
         config: TerminalConfig,
         wake: impl Fn(TerminalWake) + Send + Sync + 'static,
     ) -> Result<Self, TerminalStartError> {
+        Self::spawn_with_execution(session, config, None, wake)
+    }
+
+    /// Only validated checkpoint/holder callers can separate the issued
+    /// descriptor from the exact recipe the worker must execute and track.
+    pub(crate) fn spawn_with_execution(
+        session: TerminalSession,
+        config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+    ) -> Result<Self, TerminalStartError> {
         let (command_tx, command_rx) = command_channel(config.command_capacity);
         // Semantic events are lossless and independent from visual wakes. They
         // are low-volume metadata; an unbounded queue avoids either dropping a
@@ -719,7 +730,7 @@ impl TerminalHandle {
             .name(format!("terminal-{:?}", session.id))
             .spawn(move || {
                 let completion = Arc::clone(&worker_published);
-                let result = Worker::start(session, config, command_rx, event_tx, worker_published);
+                let result = Worker::start(session, config, execution_recipe, command_rx, event_tx, worker_published);
                 match result {
                     Ok(worker) => {
                         let _ = startup_tx.send(Ok(()));
@@ -874,6 +885,7 @@ impl TerminalHandle {
             let mut worker = Worker::start(
                 session,
                 TerminalConfig::default(),
+                None,
                 receiver,
                 events,
                 worker_published,
@@ -1511,10 +1523,16 @@ impl Worker {
     fn start(
         session: TerminalSession,
         config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
         commands: Receiver<Command>,
         events: Sender<TerminalEvent>,
         published: Arc<PublishedState>,
     ) -> Result<Self, String> {
+        if config.holder_recovery.as_ref().is_some_and(|recovery| {
+            recovery.execution_recipe.as_ref() != execution_recipe.as_ref()
+        }) {
+            return Err("Terminal execution does not match its retained holder context".into());
+        }
         let current_size = TerminalSize {
             columns: config.columns.max(1),
             rows: config.rows.max(1),
@@ -1569,11 +1587,7 @@ impl Worker {
             })
             .map_err(|error| format!("register working directory effect: {error}"))?;
 
-        let execution = config
-            .execution_recipe
-            .as_ref()
-            .unwrap_or(&session.launch)
-            .clone();
+        let execution = execution_recipe.unwrap_or_else(|| session.launch.clone());
         let mut command = match &config.execution_environment {
             Some(environment) => {
                 let mut command = CommandBuilder::new(&execution.program);
@@ -4655,7 +4669,7 @@ mod tests {
         let (events, receiver) = crossbeam_channel::unbounded();
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
         (
-            Worker::start(session, config, commands, events, published).unwrap(),
+            Worker::start(session, config, None, commands, events, published).unwrap(),
             receiver,
         )
     }
@@ -6474,7 +6488,7 @@ mod tests {
         let (_tx, commands) = command_channel(1);
         let (events, _receiver) = crossbeam_channel::unbounded();
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
-        let failure = Worker::start(session, config, commands, events, published)
+        let failure = Worker::start(session, config, None, commands, events, published)
             .err()
             .expect("removed account blocks PTY creation");
         assert!(failure.contains("removed"), "{failure}");
