@@ -108,6 +108,7 @@ fn chat_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatTerminal { .. }
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
+                | ServerResponse::ChatProviderExitOutput { .. }
         }
     )
 }
@@ -180,6 +181,7 @@ pub(crate) struct DeliveryQueue {
     capacity: usize,
     state: Mutex<QueueState>,
     available: Condvar,
+    async_available: tokio::sync::Notify,
 }
 
 impl DeliveryQueue {
@@ -196,6 +198,7 @@ impl DeliveryQueue {
                 aborted: false,
             }),
             available: Condvar::new(),
+            async_available: tokio::sync::Notify::new(),
         }
     }
 
@@ -302,10 +305,12 @@ impl DeliveryQueue {
             });
             state.close_after_drain = true;
             self.available.notify_all();
+            self.async_available.notify_one();
             return Err(DeliveryError::Full);
         }
         state.enqueue(message);
         self.available.notify_one();
+        self.async_available.notify_one();
         Ok(())
     }
 
@@ -331,6 +336,27 @@ impl DeliveryQueue {
         }
     }
 
+    pub(crate) async fn pop_async(&self) -> Option<Outbound> {
+        loop {
+            let available = self.async_available.notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            {
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if state.aborted {
+                    return None;
+                }
+                if let Some(message) = state.dequeue() {
+                    return Some(message);
+                }
+                if state.close_after_drain {
+                    return None;
+                }
+            }
+            available.await;
+        }
+    }
+
     pub(crate) fn close_after_drain(&self) {
         let mut state = self
             .state
@@ -338,6 +364,7 @@ impl DeliveryQueue {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.close_after_drain = true;
         self.available.notify_all();
+        self.async_available.notify_one();
     }
 
     /// Severs the connection without draining. `reason` is logged, because an
@@ -358,6 +385,7 @@ impl DeliveryQueue {
         state.aborted = true;
         state.discard();
         self.available.notify_all();
+        self.async_available.notify_one();
     }
 }
 

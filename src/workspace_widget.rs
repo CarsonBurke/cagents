@@ -250,6 +250,7 @@ pub enum GlobalShortcut {
     CloseFocusedCard,
     FocusProjectSearch,
     FindInPane,
+    TerminalReview,
     FocusAdjacent(FocusDirection),
     CyclePaneWidth,
     /// Moves between the top-level workspaces: every project's worktrees and
@@ -374,6 +375,7 @@ impl GlobalShortcut {
 
     pub const fn id(self) -> &'static str {
         match self {
+            Self::TerminalReview => "terminal_review",
             Self::ToggleProjects => "toggle_projects",
             Self::RenamePane => "rename_pane",
             Self::NewBrowser => "new_browser",
@@ -616,6 +618,7 @@ pub enum ShortcutScope {
     Repository,
     /// Embedded browser content or its non-text chrome. Address fields remain native text.
     Browser,
+    Terminal,
 }
 
 impl ShortcutScope {
@@ -634,7 +637,8 @@ impl ShortcutScope {
     /// the card, while `focused` has focus.
     pub fn applies_to(self, focused: FocusedPane) -> bool {
         match self {
-            Self::Browser => focused == FocusedPane::Browser,
+            Self::Terminal => focused == FocusedPane::Terminal,
+            Self::Browser => matches!(focused, FocusedPane::Browser | FocusedPane::BrowserChrome),
             Self::Workspace => true,
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::OutsideTextInput => !focused.is_text_editing(),
@@ -679,6 +683,8 @@ pub enum FocusedPane {
     ChatPane,
     /// The native code editor.
     Editor,
+    /// Browser chrome uses browser commands while retaining non-text workspace shortcuts.
+    BrowserChrome,
     /// Browser content can own a DOM field; preserve native editing vocabulary.
     Browser,
     /// A text control outside the focused pane (sidebar, inspector, find bar).
@@ -900,6 +906,7 @@ impl ShortcutDescriptor {
                 | ShortcutScope::Editor
                 | ShortcutScope::EditorHistory
                 | ShortcutScope::Browser
+                | ShortcutScope::Terminal
         ) && !self.scope.applies_to(context.focused)
         {
             return false;
@@ -1007,6 +1014,7 @@ impl ShortcutDescriptor {
 pub const HOVER_ACTIVATION_DWELL: Duration = Duration::from_millis(300);
 
 pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
+
     ShortcutDescriptor {
         action: GlobalShortcut::ChatPermissions,
         label: "Choose chat permission mode",
@@ -2174,6 +2182,13 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::EditorReload, label: "Reload file from disk", repeatable: false, scope: ShortcutScope::Repository },
     ShortcutDescriptor { action: GlobalShortcut::EditorOverwrite, label: "Overwrite conflicting file on disk", repeatable: false, scope: ShortcutScope::Repository },
 
+    ShortcutDescriptor {
+        action: GlobalShortcut::TerminalReview,
+        label: "Toggle terminal text review",
+        repeatable: false,
+        scope: ShortcutScope::Terminal,
+    },
+
 ];
 
 static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
@@ -2387,6 +2402,7 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::CloseFocusedCard => &shortcuts.close_focused_column,
         GlobalShortcut::FocusProjectSearch => &shortcuts.search_projects,
         GlobalShortcut::FindInPane => &shortcuts.find_in_pane,
+        GlobalShortcut::TerminalReview => &shortcuts.terminal_review,
         GlobalShortcut::FocusAdjacent(FocusDirection::Left) => &shortcuts.previous_column,
         GlobalShortcut::FocusAdjacent(FocusDirection::Right) => &shortcuts.next_column,
         GlobalShortcut::CyclePaneWidth => &shortcuts.cycle_pane_width,
@@ -8204,4 +8220,25 @@ mod tests {
         moved.offset = moved_offset;
         assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
     }
+    #[test]
+    fn terminal_review_and_browser_chrome_use_their_actual_keyboard_scopes() {
+        use iced::keyboard::key::Code;
+        let mut shortcuts = KeyboardShortcuts::default();
+        let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
+        let review = key_press("r", Code::KeyR, modifiers, false);
+        assert_eq!(global_shortcut(&review, &shortcuts, FocusedPane::Terminal), Some(GlobalShortcut::TerminalReview));
+        assert_eq!(global_shortcut(&review, &shortcuts, FocusedPane::Other), None);
+        let descriptor = shortcut_descriptor(GlobalShortcut::TerminalReview);
+        assert!(descriptor.available(&CommandContext { focused: FocusedPane::Terminal, pane_index: Some(0), pane_count: 1, ..Default::default() }));
+        assert!(!descriptor.available(&CommandContext { focused: FocusedPane::Other, pane_index: Some(0), pane_count: 1, ..Default::default() }));
+        shortcuts.terminal_passthrough_actions.push(GlobalShortcut::TerminalReview.id().into());
+        assert_eq!(global_shortcut(&review, &shortcuts, FocusedPane::Terminal), None);
+        assert!(!is_global_shortcut_chord(&keyboard::Key::Character("r".into()), keyboard::key::Physical::Code(Code::KeyR), modifiers, &shortcuts, FocusedPane::Terminal));
+        let reopen = key_press("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, false);
+        assert_eq!(global_shortcut(&reopen, &shortcuts, FocusedPane::BrowserChrome), Some(GlobalShortcut::ReopenPane));
+        assert_eq!(global_shortcut(&reopen, &shortcuts, FocusedPane::Browser), None);
+        assert!(ShortcutScope::Browser.applies_to(FocusedPane::BrowserChrome));
+        assert!(!FocusedPane::BrowserChrome.is_text_editing());
+    }
+
 }

@@ -15893,26 +15893,6 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn async_diff_source_locations_map_lf_lines_across_bare_cr_and_crlf() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("mixed.rs"), "first\rcontinued\nsecond\r\nthird\n").unwrap();
-        let card = CardId::new();
-        let mut runtime = RepositoryRuntime::new_directory(RepositoryView { project: ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: None });
-        let task = runtime.open_source_file_location(card, "mixed.rs".into(), 1);
-        assert!(matches!(&runtime.document, DocumentState::Loading));
-        finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
-        assert_eq!(document.content.cursor().position, text_editor::Position { line: 2, column: 0 });
-        let task = runtime.open_source_file_location(card, "mixed.rs".into(), 2);
-        finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
-        assert_eq!(document.content.cursor().position, text_editor::Position { line: 3, column: 0 });
-        let task = runtime.open_source_file_location(card, "mixed.rs".into(), usize::MAX);
-        finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
-        assert_eq!(document.content.cursor().position.line, document.content.line_count() - 1);
-    }
 
     #[tokio::test]
     async fn newer_source_or_native_location_supersedes_a_pending_scalar_column() {

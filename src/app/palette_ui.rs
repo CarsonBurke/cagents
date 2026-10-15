@@ -396,7 +396,7 @@ fn browser_embedded_command_available(
 
 fn palette_command_uses_origin(command: Command, context: &workspace_widget::CommandContext) -> bool {
     if context.sidebar_commands.is_some() && command.sidebar_command_bit().is_some() { return false; }
-    if matches!(workspace_widget::shortcut_descriptor(command).scope, workspace_widget::ShortcutScope::Chat | workspace_widget::ShortcutScope::Review | workspace_widget::ShortcutScope::Editor | workspace_widget::ShortcutScope::EditorHistory | workspace_widget::ShortcutScope::Repository | workspace_widget::ShortcutScope::Browser) { return true; }
+    if matches!(workspace_widget::shortcut_descriptor(command).scope, workspace_widget::ShortcutScope::Chat | workspace_widget::ShortcutScope::Review | workspace_widget::ShortcutScope::Editor | workspace_widget::ShortcutScope::EditorHistory | workspace_widget::ShortcutScope::Repository | workspace_widget::ShortcutScope::Browser | workspace_widget::ShortcutScope::Terminal) { return true; }
     matches!(command, Command::RenamePane | Command::ClonePane | Command::CloseFocusedCard | Command::CloseOtherPanes | Command::ClosePanesToRight | Command::CopyPath | Command::RevealInProjects | Command::SwitchPane | Command::ForkConversation | Command::ReviewConversationChanges | Command::EndConversation | Command::MovePaneToChannel | Command::OpenInExternalEditor | Command::FindInPane | Command::NewThread | Command::NewTerminal | Command::NewBrowser | Command::NewChannel | Command::NewWorktree | Command::SearchInProject | Command::ReopenPane | Command::MovePaneLeft | Command::MovePaneRight | Command::CyclePaneWidth | Command::FocusAdjacent(_) | Command::CycleWorkspace(_))
 }
 
@@ -2666,6 +2666,19 @@ impl Cagents {
             Command::CloseFocusedCard => close_focused_message(&self.workspace)
                 .map_or_else(Task::none, |message| self.update(message)),
             Command::FocusProjectSearch => self.update(Message::FocusProjectSearch),
+            Command::TerminalReview => {
+                let Some(card) = self.workspace.focused() else {
+                    return Task::none();
+                };
+                let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
+                    return Task::none();
+                };
+                self.update(Message::TerminalReviewMode {
+                    card,
+                    terminal: handle.terminal_id(),
+                    active: self.terminal_review_card != Some(card),
+                })
+            }
             Command::FindInPane => {
                 if self.settings_card_focused() {
                     return iced::widget::operation::focus(crate::settings_widgets::search_id())
@@ -2985,6 +2998,7 @@ impl SettingsField {
             Self::ShortcutClonePane => Some(Command::ClonePane),
             Self::ShortcutCloseFocusedColumn => Some(Command::CloseFocusedCard),
             Self::ShortcutSearchProjects => Some(Command::FocusProjectSearch),
+            Self::ShortcutTerminalReview => Some(Command::TerminalReview),
             Self::ShortcutFindInPane => Some(Command::FindInPane),
             Self::ShortcutPreviousColumn => Some(Command::FocusAdjacent(
                 crate::workspace::FocusDirection::Left,
@@ -3355,6 +3369,7 @@ impl ShortcutDraft {
             (Command::GitDiscardAllUntracked, self.git_discard_all_untracked.as_str()),
             (Command::EditorReload, self.editor_reload.as_str()),
             (Command::EditorOverwrite, self.editor_overwrite.as_str()),
+            (Command::TerminalReview, self.terminal_review.as_str()),
         ]
     }
 }

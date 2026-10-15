@@ -22,7 +22,7 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
 
-pub const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+pub const MAX_TERMINAL_SCROLLBACK_MIB: usize = 1024;
 pub const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
 /// The longest terminal font family name, in bytes.
 pub const MAX_TERMINAL_FONT_FAMILY_BYTES: usize = 128;
@@ -451,6 +451,7 @@ pub struct KeyboardShortcuts {
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
+    pub terminal_review: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -496,6 +497,7 @@ impl Default for KeyboardShortcuts {
             focus_pane_9: vec!["Alt+9".to_owned()],
             focus_last_pane: vec!["Alt+0".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
+            terminal_review: vec!["Ctrl+Alt+Shift+R".into()],
             rename_pane: vec!["F2".to_owned()],
             new_browser: Vec::new(),
             open_folder: Vec::new(),
@@ -694,7 +696,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 201] {
+    pub fn actions(&self) -> [&Vec<String>; 202] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -897,12 +899,13 @@ impl KeyboardShortcuts {
             &self.git_discard_all_untracked,
             &self.editor_reload,
             &self.editor_overwrite,
+            &self.terminal_review,
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 201] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 202] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -1105,6 +1108,7 @@ impl KeyboardShortcuts {
             &mut self.git_discard_all_untracked,
             &mut self.editor_reload,
             &mut self.editor_overwrite,
+            &mut self.terminal_review,
         ]
     }
 
@@ -1166,7 +1170,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 201] = [
+const SHORTCUT_ACTIONS: [&str; 202] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1368,6 +1372,7 @@ const SHORTCUT_ACTIONS: [&str; 201] = [
     "git_discard_all_untracked",
     "editor_reload",
     "editor_overwrite",
+    "terminal_review",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1850,8 +1855,19 @@ const fn default_chat_font_size() -> f32 {
     14.0
 }
 
-const fn default_terminal_scrollback_lines() -> usize {
+/// Previous line values are migrated at 1 KiB per requested line, rounded up
+/// to MiB. The old setting reached Ghostty as bytes, so this intentionally
+/// restores useful retention rather than preserving the broken tiny budget.
+const fn legacy_scrollback_mib(lines: usize) -> usize {
+    lines.saturating_add(1023) / 1024
+}
+
+const fn default_legacy_terminal_scrollback_lines() -> usize {
     10_000
+}
+
+const fn default_terminal_scrollback_mib() -> usize {
+    16
 }
 
 const fn default_terminal_scroll_size() -> usize {
@@ -2018,6 +2034,24 @@ impl DefaultPane {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalClipboardWritePolicy {
+    Allow,
+    #[default]
+    Ask,
+    Deny,
+}
+impl TerminalClipboardWritePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 /// Settings are forward compatible, because mixed builds share one file and an
 /// older one must neither refuse to start nor erase what a newer one wrote. A
 /// key this build does not know is ignored, and a value it cannot read - a
@@ -2050,6 +2084,12 @@ pub struct AppSettings {
     pub terminal_line_height: f32,
     #[serde(default = "default_terminal_scroll_speed")]
     pub terminal_scroll_speed: f32,
+    #[serde(default = "crate::terminal::default_scroll_to_bottom_on_input")]
+    pub terminal_scroll_to_bottom_on_input: bool,
+    #[serde(default)]
+    pub terminal_clipboard_write: TerminalClipboardWritePolicy,
+    #[serde(default)]
+    pub always_show_terminal_review_bar: bool,
     #[serde(default = "default_terminal_padding")]
     pub terminal_padding: f32,
     #[serde(default = "default_terminal_scroll_size")]
@@ -2067,8 +2107,8 @@ pub struct AppSettings {
     pub sidebar_width: f32,
     pub inspector_width: f32,
     pub default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
-    pub terminal_scrollback_lines: usize,
+    #[serde(default = "default_terminal_scrollback_mib")]
+    pub terminal_scrollback_mib: usize,
     #[serde(default)]
     pub link_open_destination: LinkOpenDestination,
     #[serde(default)]
@@ -2204,6 +2244,9 @@ impl Default for AppSettings {
             focus_follows_mouse: default_focus_follows_mouse(),
             app_theme: AppTheme::default(),
             terminal_scroll_speed: default_terminal_scroll_speed(),
+            terminal_scroll_to_bottom_on_input: true,
+            terminal_clipboard_write: TerminalClipboardWritePolicy::Ask,
+            always_show_terminal_review_bar: false,
             ui_scale: default_ui_scale(),
             interface_font_family: String::new(),
             interface_font_size: default_interface_font_size(),
@@ -2220,7 +2263,7 @@ impl Default for AppSettings {
             sidebar_width: layout_metrics::NAVIGATION_DEFAULT_WIDTH,
             inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: 0.5,
-            terminal_scrollback_lines: 10_000,
+            terminal_scrollback_mib: default_terminal_scrollback_mib(),
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
             pull_request_open_target: PullRequestOpenTarget::default(),
@@ -2435,7 +2478,7 @@ struct V2TomlSettings {
     terminal_font_family: String,
     sidebar_width: f32,
     default_column_fraction: f32,
-    #[serde(default = "default_terminal_scrollback_lines")]
+    #[serde(default = "default_legacy_terminal_scrollback_lines")]
     terminal_scrollback_lines: usize,
     #[serde(default)]
     link_open_destination: LinkOpenDestination,
@@ -2716,7 +2759,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 196] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 197] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2913,6 +2956,7 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 196] = [
     "git_discard_all_untracked",
     "editor_reload",
     "editor_overwrite",
+    "terminal_review",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -3054,7 +3098,7 @@ impl From<V2TomlSettings> for AppSettings {
             sidebar_width: previous.sidebar_width,
             inspector_width: layout_metrics::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: previous.default_column_fraction,
-            terminal_scrollback_lines: previous.terminal_scrollback_lines,
+            terminal_scrollback_mib: legacy_scrollback_mib(previous.terminal_scrollback_lines),
             link_open_destination: previous.link_open_destination,
             link_open_gesture: previous.link_open_gesture,
             // A version-2 file predates language servers, so it can hold no
@@ -3240,9 +3284,9 @@ impl AppSettings {
                 "default_column_fraction must be between 0.25 and 1.0",
             ));
         }
-        if self.terminal_scrollback_lines > MAX_TERMINAL_SCROLLBACK_LINES {
+        if self.terminal_scrollback_mib > MAX_TERMINAL_SCROLLBACK_MIB {
             return Err(SettingsError::Invalid(
-                "terminal_scrollback_lines must be between 0 and 1000000",
+                "terminal_scrollback_mib must be between 0 and 1024",
             ));
         }
         if self.managed_worktree_directory.trim().is_empty()
@@ -3833,6 +3877,17 @@ fn load_toml(path: &Path) -> Result<Loaded, SettingsError> {
 /// preference. Its value represented lines per wheel notch, so it is the same
 /// setting; the old default of one is promoted to the new default of two.
 fn normalize_current(table: &mut toml::Table) {
+    if !table.contains_key("terminal_scrollback_mib")
+        && let Some(toml::Value::Integer(lines)) = table.get("terminal_scrollback_lines")
+        && let Ok(lines) = usize::try_from(*lines)
+    {
+        table.insert(
+            "terminal_scrollback_mib".into(),
+            toml::Value::Integer(legacy_scrollback_mib(lines) as i64),
+        );
+        table.remove("terminal_scrollback_lines");
+    }
+
     // Decoding moves it too; moving it first lets a setting set aside or
     // kept be found under the name this build writes.
     if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
@@ -4827,6 +4882,21 @@ mod tests {
         assert_eq!(settings.validate().unwrap().git_status_limit, 100_000);
     }
 
+
+    #[test]
+    fn introduced_terminal_review_preserves_existing_custom_binding() {
+        let mut table = toml::Table::new();
+        table.insert(
+            "cycle_pane_width".into(),
+            toml::Value::Array(vec![toml::Value::String("Ctrl+Alt+Shift+R".into())]),
+        );
+        preserve_introduced_shortcuts(&mut table);
+        assert_eq!(
+            table["cycle_pane_width"].as_array().unwrap()[0].as_str(),
+            Some("Ctrl+Alt+Shift+R")
+        );
+        assert!(table["terminal_review"].as_array().unwrap().is_empty());
+    }
     #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
@@ -6196,14 +6266,36 @@ new_thread = "Alt+Shift+G"
     }
 
     #[test]
+    fn legacy_scrollback_lines_migrate_to_explicit_memory_budget() {
+        for (lines, mib) in [(0, 0), (1, 1), (10_000, 10), (1_000_000, 977)] {
+            let mut table = toml::Table::new();
+            table.insert(
+                "terminal_scrollback_lines".into(),
+                toml::Value::Integer(lines),
+            );
+            normalize_current(&mut table);
+            assert_eq!(table["terminal_scrollback_mib"].as_integer(), Some(mib));
+            assert!(!table.contains_key("terminal_scrollback_lines"));
+        }
+        let mut table = toml::Table::new();
+        table.insert(
+            "terminal_scrollback_lines".into(),
+            toml::Value::Integer(10_000),
+        );
+        table.insert("terminal_scrollback_mib".into(), toml::Value::Integer(32));
+        normalize_current(&mut table);
+        assert_eq!(table["terminal_scrollback_mib"].as_integer(), Some(32));
+    }
+
+    #[test]
     fn terminal_scrollback_is_bounded() {
         let at_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB,
             ..AppSettings::default()
         };
         assert!(at_limit.validate().is_ok());
         let above_limit = AppSettings {
-            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES + 1,
+            terminal_scrollback_mib: MAX_TERMINAL_SCROLLBACK_MIB + 1,
             ..AppSettings::default()
         };
         assert!(matches!(
@@ -7286,4 +7378,47 @@ new_thread = "Alt+Shift+G"
         }
     }
 
+
+    #[test]
+    fn terminal_integration_settings_have_safe_backwards_compatible_defaults() {
+        let defaults = AppSettings::default();
+        assert!(!defaults.always_show_terminal_review_bar);
+        assert!(defaults.terminal_scroll_to_bottom_on_input);
+        assert_eq!(
+            defaults.terminal_clipboard_write,
+            TerminalClipboardWritePolicy::Ask
+        );
+        assert_eq!(
+            defaults.keyboard_shortcuts.terminal_review,
+            ["Ctrl+Alt+Shift+R"]
+        );
+        let mut text = toml::to_string(&defaults).unwrap();
+        text = text
+            .lines()
+            .filter(|line| {
+                !line.starts_with("always_show_terminal_review_bar =")
+                    && !line.starts_with("terminal_scroll_to_bottom_on_input =")
+                    && !line.starts_with("terminal_clipboard_write =")
+                    && !line.starts_with("terminal_review =")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let old: AppSettings = toml::from_str(&text).unwrap();
+        assert_eq!(
+            old.always_show_terminal_review_bar,
+            defaults.always_show_terminal_review_bar
+        );
+        assert_eq!(
+            old.terminal_scroll_to_bottom_on_input,
+            defaults.terminal_scroll_to_bottom_on_input
+        );
+        assert_eq!(
+            old.terminal_clipboard_write,
+            defaults.terminal_clipboard_write
+        );
+        assert_eq!(
+            old.keyboard_shortcuts.terminal_review,
+            defaults.keyboard_shortcuts.terminal_review
+        );
+    }
 }

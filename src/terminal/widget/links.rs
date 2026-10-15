@@ -101,10 +101,22 @@ fn boundary(row: &RowSnapshot, column: usize) -> bool {
 }
 
 fn safe_url(text: &str) -> Option<url::Url> {
-    let url = url::Url::parse(text).ok()?;
+    let mut url = url::Url::parse(text).ok()?;
     match url.scheme() {
         "http" | "https" if url.host_str().is_some() => Some(url),
-        "file" if url.to_file_path().is_ok() => Some(url),
+        "file" => {
+            if let Some(host) = url.host_str() {
+                if !host.eq_ignore_ascii_case("localhost")
+                    && !crate::terminal::local_host_name()
+                        .is_some_and(|local| local.eq_ignore_ascii_case(host))
+                {
+                    return None;
+                }
+                url.set_host(None).ok()?;
+            }
+            url.to_file_path().ok()?;
+            Some(url)
+        }
         _ => None,
     }
 }
@@ -366,4 +378,27 @@ pub(super) fn at(snapshot: &RenderSnapshot, row: usize, column: u16, cwd: &Path)
         }
     }
     from_positions(rows, &positions, hovered, cwd, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn file_links_accept_only_the_local_machine() {
+        for uri in ["file:///p", "file://localhost/p"] {
+            assert_eq!(
+                safe_url(uri).unwrap().to_file_path().unwrap(),
+                Path::new("/p")
+            );
+        }
+        let local = crate::terminal::local_host_name().expect("local hostname");
+        assert_eq!(
+            safe_url(&format!("file://{local}/p"))
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            Path::new("/p")
+        );
+        assert!(safe_url("file://foreign-host.invalid/p").is_none());
+    }
 }

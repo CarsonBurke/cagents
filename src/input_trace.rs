@@ -33,6 +33,7 @@ pub struct InputTrace(
     Rc<Cell<Sample>>,
     Rc<Cell<Option<KeyboardRegion>>>,
     Rc<RefCell<Option<cosmic::iced::widget::Id>>>,
+    Rc<RefCell<Option<crate::terminal::ReviewInputBarrier>>>,
 );
 
 #[derive(Clone, Copy, Default)]
@@ -66,8 +67,18 @@ impl InputTrace {
         trace
     }
 
+    pub(crate) fn bind_terminal_keys(&self, barrier: crate::terminal::ReviewInputBarrier) {
+        *self.3.borrow_mut() = Some(barrier);
+    }
     /// Records one event the window delivered.
     pub(crate) fn record(&self, event: &Event) {
+        // Observe releases during native dispatch, before child widgets. A
+        // queued app message may run after a newer press of the same key.
+        if let Event::Keyboard(event) = event
+            && let Some(barrier) = self.3.borrow().as_ref()
+        {
+            barrier.observe_key_event(event);
+        }
         let mut sample = self.0.get();
         match event {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {

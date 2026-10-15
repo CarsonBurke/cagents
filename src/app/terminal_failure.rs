@@ -1125,6 +1125,7 @@ mod ownership_tests {
             host_incarnation: "test-incarnation".into(),
         };
         let descriptor = TerminalDescriptor {
+            execution_instance: uuid::Uuid::nil(),
             screen_lost_after_crash: false,
             session: session.clone(),
             generation: 0,

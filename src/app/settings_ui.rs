@@ -930,6 +930,40 @@ fn settings_category_controls<'a>(
                         invalid,
                         &draft.numeric_display,
                     ),
+                    setting_field(
+                        "Terminal accessibility",
+                        "The review action is always available to assistive technology. Ctrl+Alt+Shift+R toggles text review.",
+                        crate::settings_widgets::toggle(
+                            "Always show terminal review bar",
+                            draft.always_show_terminal_review_bar,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::AlwaysShowTerminalReviewBar,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ),
+                    settings_choice(
+                        "Terminal clipboard writes",
+                        "OSC 52 writes from programs, including remote shells. Ask remembers your decision for each terminal; clipboard reads are disabled.",
+                        SettingsField::TerminalClipboardWrite,
+                        [
+                            ("Allow", "allow", draft.terminal_clipboard_write == "allow"),
+                            ("Ask", "ask", draft.terminal_clipboard_write == "ask"),
+                            ("Deny", "deny", draft.terminal_clipboard_write == "deny"),
+                        ],
+                    ),
+                    setting_field(
+                        "Follow terminal input",
+                        "Return to the live prompt when typing. Scrollback shortcuts keep their position.",
+                        crate::settings_widgets::toggle(
+                            "Scroll to bottom on input",
+                            draft.terminal_scroll_to_bottom_on_input,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::TerminalScrollToBottomOnInput,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ),
                     terminal_theme_choice(&draft.terminal_theme, draft.has_custom_terminal_theme),
                     setting_field(
                         "Multiline paste",
@@ -968,9 +1002,9 @@ fn settings_category_controls<'a>(
                 "History",
                 "Keep enough output to investigate a task without retaining unlimited terminal history.",
                 vec![setting_input(
-                    "0–1,000,000 lines per newly started terminal. Existing history is preserved.",
-                    &draft.terminal_scrollback_lines,
-                    SettingsField::TerminalScrollbackLines,
+                    "0–1,024 MiB per new terminal, allocated as output arrives. Row count depends on width and content.",
+                    &draft.terminal_scrollback_mib,
+                    SettingsField::TerminalScrollbackMib,
                     invalid,
                 )],
             ),

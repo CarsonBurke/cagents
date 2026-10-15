@@ -51,3 +51,19 @@ arrive during review. Check ordinary typing afterward, resize, rapid output with
 a final quiet frame, card migration, and unmount. Stop the owned fixture and its
 private daemon/compositor. If AT-SPI registration or Orca is unavailable, record
 that limitation; do not claim a completed native screen-reader acceptance.
+
+The review action is always in the accessibility tree. Its visible bar reserves
+space only while an assistive technology client is active, while this terminal
+is in review mode, or when **Settings → Terminal → Always show terminal review
+bar** is enabled. With no active client and the setting disabled, the terminal
+uses the full pane height.
+
+**Ctrl+Alt+Shift+R** toggles review for the focused terminal. The chord can be changed
+in Keyboard settings, and **Toggle terminal text review** is available in the
+command palette. Escape also returns from review to input. These keys never
+reach the running terminal program.
+
+Terminal programs can request clipboard writes using OSC 52. **Terminal clipboard
+writes** defaults to **Ask**, remembering consent separately for each terminal
+until it closes; **Allow** and **Deny** apply without a prompt. Each write is
+limited to 1 MiB of decoded data. Clipboard read requests remain disabled.

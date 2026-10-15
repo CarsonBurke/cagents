@@ -1,8 +1,7 @@
 //! Durable proof that an exact terminal root/PTY owner was explicitly released.
 //! Active close first stops its inspected process family; natural completion
-//! requires root exit and PTY drain. Neither case claims ownership of previously
-//! disowned processes outside that terminal family. Native provider holders
-//! independently require ECHILD for their provider/tool descendants.
+//! requires dedicated-subreaper ECHILD after terminating/reaping descendants.
+//! Root exit and PTY drain alone never establish family cleanup.
 //! Recipes remain in holder memory; only authenticated lineage digests persist.
 use super::{Record, Recovery};
 use crate::{
@@ -18,6 +17,8 @@ use std::{
 
 #[derive(Serialize, Deserialize)]
 struct Receipt {
+    #[serde(default)]
+    family_reaped: bool,
     record: Record,
     sources: Vec<[u8; 32]>,
 }
@@ -42,12 +43,40 @@ fn digest(source: &TerminalSession) -> Result<[u8; 32], String> {
     Ok(Sha256::digest(serde_json::to_vec(&source).map_err(|e| e.to_string())?).into())
 }
 
-pub(crate) fn publish(record: &Record, recovery: &Recovery) -> Result<(), String> {
+/// Bounded private lineage captured from an authenticated spawn/adoption.
+/// Keep the digest rather than another copy of the issued recipe/environment.
+pub(crate) struct SourceReceipt {
+    digest: [u8; 32],
+    proof: HostSessionProof,
+}
+
+impl SourceReceipt {
+    pub(crate) fn capture(source: &TerminalSession) -> Result<Self, String> {
+        Ok(Self {
+            digest: digest(source)?,
+            proof: source
+                .continuity
+                .live_proof()
+                .ok_or("Terminal close source has no ownership proof")?,
+        })
+    }
+
+    pub(crate) fn confirmed(&self, expected: &Record) -> Result<bool, String> {
+        confirmed_receipt(expected, &self.proof, Some(self.digest))
+    }
+}
+
+pub(crate) fn publish(
+    record: &Record,
+    recovery: &Recovery,
+    _family: &crate::daemon::owned_children::ReapedFamily,
+) -> Result<(), String> {
     if record.root.is_current() {
         return Err("Terminal root has not been reaped".into());
     }
     recovery.validate(&record.boot, record.terminal)?;
     let receipt = Receipt {
+        family_reaped: true,
         record: record.clone(),
         sources: recovery
             .previous_sources
@@ -141,9 +170,10 @@ fn confirmed_receipt(
         return Err("Terminal close receipt is oversized".into());
     }
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    Ok(receipt.record == *expected
+    Ok(receipt.family_reaped
+        && receipt.record == *expected
         && receipt.record.kind == Kind::Terminal
-        && receipt.record.version == 4
+        && receipt.record.version == 5
         && receipt.record.application == crate::instance::APPLICATION_ID
         && receipt.record.boot == proof.boot_id
         && holder_exited(&receipt.record.holder)?

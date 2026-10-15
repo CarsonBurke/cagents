@@ -5,6 +5,7 @@ use super::*;
 pub(super) struct Viewport {
     pub epoch: u64,
     pub offset: Option<u64>,
+    pub history: crate::terminal::HistoryPosition,
     pub size: Option<crate::terminal::TerminalSize>,
     pub focused: bool,
     pub source_generation: u64,
@@ -81,11 +82,31 @@ impl HostState {
             .or_default();
         let rows = view.size.map_or(snapshot.rows, |size| size.rows);
         let maximum = snapshot.scroll.total.saturating_sub(u64::from(rows));
-        let current = view.offset.unwrap_or(maximum).min(maximum);
+        let current = view
+            .offset
+            .map(|row| {
+                snapshot
+                    .scroll
+                    .history
+                    .rebase_row(row, view.history)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(maximum)
+            .min(maximum);
         view.offset = match scroll {
             crate::terminal::ipc::TerminalScroll::Bottom => None,
             crate::terminal::ipc::TerminalScroll::Top => Some(0),
             crate::terminal::ipc::TerminalScroll::Row(row) => Some(row.min(maximum)),
+            crate::terminal::ipc::TerminalScroll::Match(range) => {
+                let range = range.rebase(snapshot.scroll.history).ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Output moved; search again",
+                        false,
+                    )
+                })?;
+                Some(range.start_row.min(maximum))
+            }
             crate::terminal::ipc::TerminalScroll::Lines(delta) if delta < 0 => {
                 Some(current.saturating_sub(delta.unsigned_abs()))
             }
@@ -93,6 +114,7 @@ impl HostState {
                 Some(current.saturating_add(delta as u64).min(maximum))
             }
         };
+        view.history = snapshot.scroll.history;
         view.epoch = view.epoch.saturating_add(1);
         view.advance(snapshot.generation);
         self.notify_viewport(client, id);
@@ -148,6 +170,7 @@ impl HostState {
             .flat_map(|clients| clients.iter())
             .filter(|(client, visibility)| {
                 **visibility == TerminalVisibility::Visible
+                    && self.subscription_current(**client, id)
                     && self
                         .subscriptions
                         .viewports
@@ -164,18 +187,23 @@ impl HostState {
         let owner = owner
             .or_else(|| {
                 previous.filter(|client| {
-                    self.subscriptions
-                        .by_client
-                        .get(client)
-                        .and_then(|terminals| terminals.get(&id))
-                        == Some(&TerminalVisibility::Visible)
+                    self.subscription_current(*client, id)
+                        && self
+                            .subscriptions
+                            .by_client
+                            .get(client)
+                            .and_then(|terminals| terminals.get(&id))
+                            == Some(&TerminalVisibility::Visible)
                 })
             })
             .or_else(|| {
                 self.subscriptions.by_terminal.get(&id).and_then(|clients| {
                     clients
                         .iter()
-                        .find(|(_, visible)| **visible == TerminalVisibility::Visible)
+                        .find(|(client, visible)| {
+                            **visible == TerminalVisibility::Visible
+                                && self.subscription_current(**client, id)
+                        })
                         .map(|(client, _)| *client)
                 })
             });
@@ -235,7 +263,7 @@ pub(in crate::host) fn snapshot(
     after: u64,
 ) -> Result<Option<TerminalSnapshot>, ProtocolError> {
     for _ in 0..4 {
-        let (handle, offset, rows, epoch) = {
+        let (handle, offset, rows, epoch, history) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let handle = state.history_handle(client, id)?;
             let revision = state.presentation_revision(client, id);
@@ -249,16 +277,20 @@ pub(in crate::host) fn snapshot(
                 view.size
                     .map_or(handle.snapshot().rows.max(1), |size| size.rows),
                 view.epoch,
+                view.history,
             )
         };
-        let capture = handle.viewport_snapshot(offset, rows).map_err(|message| {
-            ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
-        })?;
+        let capture = handle
+            .viewport_snapshot(offset, rows, history)
+            .map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+            })?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !state.subscriptions.attached(client, id) {
+        let current = state.attached_terminal(client, id)?;
+        if !current.handle.same_worker(&handle) {
             return Err(ProtocolError::new(
-                ProtocolErrorCode::PermissionDenied,
-                "client detached during capture",
+                ProtocolErrorCode::ProofMismatch,
+                "The terminal worker changed during capture; rediscover its attachment",
                 false,
             ));
         }

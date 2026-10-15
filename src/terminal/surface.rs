@@ -41,6 +41,10 @@ impl TerminalSurface {
         self.handle.terminal_id()
     }
 
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool {
+        self.handle.same_attachment(&other.handle)
+    }
+
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
         self.handle.snapshot()
     }
@@ -69,6 +73,14 @@ impl TerminalSurface {
 
     pub fn host_proof(&self) -> Option<HostSessionProof> {
         self.handle.proof()
+    }
+
+    pub fn worker_binding(&self) -> Option<super::HostedTerminalBinding> {
+        self.handle.worker_binding()
+    }
+
+    pub fn execution_instance(&self) -> Option<uuid::Uuid> {
+        self.handle.execution_instance()
     }
 
     pub fn acknowledge_redraw(&self, observed_generation: u64) {
@@ -102,8 +114,27 @@ impl TerminalSurface {
         self.handle.paste(text, origin)
     }
 
+    pub fn key_with_receipt(
+        &self,
+        key: KeyInput,
+    ) -> Result<super::hosted::HostedKeyReceipt, TerminalSendError> {
+        self.handle.key_with_receipt(key)
+    }
+
+    pub fn key_after_receipt(
+        &self,
+        key: KeyInput,
+        after: &super::hosted::HostedKeyReceipt,
+    ) -> Result<super::hosted::HostedKeyReceipt, TerminalSendError> {
+        self.handle.key_after_receipt(key, after)
+    }
+
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
         self.handle.key(key)
+    }
+
+    pub(crate) fn abandon_key_delivery(&self, reason: &str) {
+        self.handle.abandon_key_delivery(reason);
     }
 
     pub fn mouse(&self, mouse: MouseInput) -> Result<(), TerminalSendError> {
@@ -135,6 +166,10 @@ impl TerminalSurface {
     pub fn scroll_to_row(&self, row: u64) -> Result<(), TerminalSendError> {
         self.handle.scroll_to_row(row)
     }
+    pub fn scroll_to_match(&self, range: super::SearchMatch) -> Result<(), TerminalSendError> {
+        self.handle.scroll_to_match(range)
+    }
+
     pub fn clear_scrollback(&self) -> Result<(), TerminalSendError> {
         self.handle.clear_scrollback()
     }
