@@ -3851,12 +3851,19 @@ mod tests {
     #[test]
     fn compact_provider_notice_omits_transport_jargon_from_stderr_but_preserves_saved_details() {
         use std::os::unix::process::ExitStatusExt;
-        let stderr="Authentication failed\ntungstenite: connection closed\ninspect the exact thread for raw output\n";
-        let diagnostic=provider_exit_diagnostic(Some(std::process::ExitStatus::from_raw(3<<8)),"socket closed",stderr);
+        let stderr = "Authentication failed\ntungstenite: connection closed\ninspect the exact thread for raw output\n";
+        let diagnostic = provider_exit_diagnostic(
+            Some(std::process::ExitStatus::from_raw(3 << 8)),
+            "socket closed",
+            stderr,
+        );
         assert!(diagnostic.summary.contains("Authentication failed"));
         assert!(!diagnostic.summary.to_lowercase().contains("tungstenite"));
         assert!(!diagnostic.summary.to_lowercase().contains("inspect"));
-        assert_eq!(diagnostic.output,stderr,"saved readable output must remain faithful to provider diagnostics");
+        assert_eq!(
+            diagnostic.output, stderr,
+            "saved readable output must remain faithful to provider diagnostics"
+        );
     }
 
     #[test]
@@ -3873,7 +3880,10 @@ mod tests {
         assert_eq!(diagnostic.output, stderr);
         let without_stderr = provider_exit_diagnostic(None, cause, "");
         assert!(without_stderr.summary.contains(cause));
-        for boilerplate in ["inspect the exact thread before recovery", "inspect exact thread before recovery"] {
+        for boilerplate in [
+            "inspect the exact thread before recovery",
+            "inspect exact thread before recovery",
+        ] {
             let diagnostic = provider_exit_diagnostic(None, boilerplate, boilerplate);
             assert!(!diagnostic.summary.to_lowercase().contains(boilerplate));
             assert_eq!(diagnostic.output, boilerplate);

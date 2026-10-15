@@ -1227,9 +1227,17 @@ impl ClientHandle {
     /// Rebuild from validated borrowed text so spare input capacity is not kept.
     pub(crate) fn diagnostic_proof(&self) -> Option<HostSessionProof> {
         let proof = &self.inner.proof;
-        if !proof.is_complete() || [
-            proof.host_session_id.as_str(), proof.boot_id.as_str(), proof.host_incarnation.as_str(),
-        ].into_iter().any(|field| field.len() > 256) { return None; }
+        if !proof.is_complete()
+            || [
+                proof.host_session_id.as_str(),
+                proof.boot_id.as_str(),
+                proof.host_incarnation.as_str(),
+            ]
+            .into_iter()
+            .any(|field| field.len() > 256)
+        {
+            return None;
+        }
         Some(HostSessionProof {
             host_session_id: crate::model::HostSessionId::new(proof.host_session_id.as_str()),
             boot_id: crate::model::BootId::new(proof.boot_id.as_str()),
@@ -1241,11 +1249,19 @@ impl ClientHandle {
     /// This baseline has no global source-revocation model: exact attachment,
     /// proof, native session, turn and opaque log identity are the real contract.
     pub(crate) fn diagnostic_snapshot_matches(
-        &self, proof: &HostSessionProof, session: Option<&str>,
+        &self,
+        proof: &HostSessionProof,
+        session: Option<&str>,
         matches: impl FnOnce(&Snapshot) -> bool,
     ) -> bool {
-        if &self.inner.proof != proof || !proof.is_complete() { return false; }
-        let snapshot = self.inner.snapshot.lock().unwrap_or_else(|error| error.into_inner());
+        if &self.inner.proof != proof || !proof.is_complete() {
+            return false;
+        }
+        let snapshot = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         snapshot.session_id.as_deref() == session && matches(&snapshot)
     }
 
