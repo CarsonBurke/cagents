@@ -84,11 +84,12 @@ pub fn plan(target: &super::CheckoutTarget, head: &crate::github::checkout::Chec
     let remotes = git.remotes()?;
     let refs = git.local_refs()?;
     let worktrees = git.worktrees()?;
-    let existing_remote = remotes.iter().find(|remote| {
+    let matches_remote = |remote: &RemoteRecord| {
         let matches = |url: &str| crate::github::remote_repository_key(url).is_some_and(|repo| repo.same_repository(&head.repository));
         remote.fetch_url.as_deref().is_some_and(matches)
             && remote.push_url.as_deref().is_none_or(matches)
-    });
+    };
+    let existing_remote = remotes.iter().find(|remote| matches_remote(remote));
     let remote = existing_remote.map(|remote| remote.name.clone()).unwrap_or_else(|| {
         let base = format!("pr-{}", head.repository.owner);
         let mut name = base.clone();
@@ -96,9 +97,9 @@ pub fn plan(target: &super::CheckoutTarget, head: &crate::github::checkout::Chec
         while remotes.iter().any(|remote| remote.name == name) { name = format!("{base}-{suffix}"); suffix += 1; }
         name
     });
-    let upstream = format!("refs/remotes/{remote}/{}", head.branch);
+    let upstreams=remotes.iter().filter(|remote|matches_remote(remote)).map(|remote|format!("refs/remotes/{}/{}",remote.name,head.branch)).collect::<Vec<_>>();
     let existing_worktree = refs.iter().filter(|local| {
-        local.upstream.as_ref().is_some_and(|reference| reference.as_str() == upstream)
+        local.upstream.as_ref().is_some_and(|reference| upstreams.iter().any(|upstream|reference.as_str()==upstream))
             || (local.name.as_str() == format!("refs/heads/{}", head.branch)
                 && local.upstream.is_none() && local.oid.as_str() == head.oid)
     }).find_map(|local| worktrees.iter()
@@ -106,7 +107,7 @@ pub fn plan(target: &super::CheckoutTarget, head: &crate::github::checkout::Chec
         .map(|worktree| worktree.path.clone());
     if let Some(path) = existing_worktree {
         return Ok(PreparedCheckout { repository: target.repository.clone(), branch_input: head.branch.clone(), base: String::new(),
-            existing_worktree: Some(path), notice: format!("Open the existing PR worktree tracking {remote}/{}.{}", head.branch, if head.can_push { "" } else { " You do not have permission to push to the PR head." }) });
+            existing_worktree: Some(path), notice: format!("Open the existing worktree for PR branch {}.{}", head.branch, if head.can_push { "" } else { " You do not have permission to push to the PR head." }) });
     }
     if !head.can_push {
         return Ok(PreparedCheckout { repository: target.repository.clone(), branch_input: format!("pr/{}", target.number), base: target.head.as_str().to_owned(),
@@ -165,6 +166,9 @@ mod tests {
         git.refs.push(LocalRefRecord { name: ValidatedRefName::parse("refs/heads/feature/x").unwrap(), oid: target.head.clone(), upstream: Some(ValidatedRefName::parse("refs/remotes/origin/feature/x").unwrap()), head: false });
         git.worktrees = crate::repository::parse_worktree_list(format!("worktree /existing\0HEAD {}\0branch refs/heads/feature/x\0\0", target.head.as_str()).as_bytes()).unwrap();
         assert_eq!(plan(&target, &head, &git).unwrap().existing_worktree, Some(PathBuf::from("/existing")));
+        git.remotes.push(RemoteRecord{name:"same-repository".into(),fetch_url:Some(head.clone_url.clone()),push_url:None});
+        git.refs[0].upstream=Some(ValidatedRefName::parse("refs/remotes/same-repository/feature/x").unwrap());
+        assert_eq!(plan(&target,&head,&git).unwrap().existing_worktree,Some(PathBuf::from("/existing")),"remote aliases identify the same PR checkout");
         git.worktrees.clear();
         assert_eq!(plan(&target, &head, &git).unwrap().branch_input, "origin/feature/x");
     }
