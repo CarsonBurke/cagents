@@ -25,11 +25,18 @@ impl Registry {
         }
         transaction.commit().map_err(|error| error.to_string())
     }
-    pub(crate) fn retention_pins(&self) -> Result<std::collections::BTreeSet<TerminalId>, String> {
-        let mut statement = self.db.prepare("SELECT terminal FROM terminal_retention_pins")
+    pub(crate) fn retention_pins(&self, candidates: &std::collections::BTreeSet<TerminalId>) -> Result<std::collections::BTreeSet<TerminalId>, String> {
+        // Stale closed-window IDs never make the census scale with history:
+        // only currently hosted candidates perform indexed point lookups.
+        let mut statement = self.db.prepare("SELECT EXISTS(SELECT 1 FROM terminal_retention_pins WHERE terminal=?1)")
             .map_err(|error| error.to_string())?;
-        statement.query_map([], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())?
-            .map(|row| row.map_err(|error| error.to_string())?.parse::<TerminalId>().map_err(|error| error.to_string())).collect()
+        let mut pinned = std::collections::BTreeSet::new();
+        for candidate in candidates {
+            let exists: bool = statement.query_row([candidate.to_string()], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            if exists { pinned.insert(*candidate); }
+        }
+        Ok(pinned)
     }
     pub(crate) fn forget_retention_pin(&mut self, terminal: TerminalId) -> Result<(), String> {
         self.db.execute("DELETE FROM terminal_retention_pins WHERE terminal=?1", [terminal.to_string()])
@@ -49,11 +56,11 @@ mod tests {
         registry.pin_window_terminals(&[terminal]).unwrap();
         // An early empty presence on reconnect cannot erase saved ownership.
         registry.pin_window_terminals(&[]).unwrap();
-        assert!(registry.pinned_terminals().unwrap().contains(&terminal));
+        assert!(registry.pinned_terminals(&std::collections::BTreeSet::from([terminal])).unwrap().contains(&terminal));
         drop(registry);
         let mut reopened = Registry::at(&path).unwrap();
-        assert!(reopened.pinned_terminals().unwrap().contains(&terminal));
+        assert!(reopened.pinned_terminals(&std::collections::BTreeSet::from([terminal])).unwrap().contains(&terminal));
         reopened.forget_retention_pin(terminal).unwrap();
-        assert!(!reopened.pinned_terminals().unwrap().contains(&terminal));
+        assert!(!reopened.pinned_terminals(&std::collections::BTreeSet::from([terminal])).unwrap().contains(&terminal));
     }
 }
