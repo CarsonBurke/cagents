@@ -115,7 +115,7 @@ fn provider_settings_reach_cli_and_automation_processes_and_recorded_recipes() {
     std::fs::write(&wrapper, script).unwrap();
     let configuration = crate::settings::AgentLaunchSettings {
         model: Some("settings-model".into()), effort: Some("low".into()), permission_mode: Some("plan".into()),
-        executable: Some(wrapper.to_string_lossy().into_owned()), arguments: vec!["--fixture-option".into(), "one argument with spaces".into()],
+        executable: Some(wrapper.to_string_lossy().into_owned()), arguments: vec!["--append-system-prompt".into(), "one argument with spaces".into()],
         environment: std::collections::BTreeMap::from([("PROVIDER_FIXTURE_VALUE".into(), "settings environment".into())]),
     };
     let settings = crate::settings::AppSettings { agents: std::collections::BTreeMap::from([("claude".into(), configuration)]), ..Default::default() };
@@ -132,7 +132,7 @@ fn provider_settings_reach_cli_and_automation_processes_and_recorded_recipes() {
         let Some(HostedSession::Chat(session)) = agent.session else { panic!("native launch recipe missing") };
         assert_eq!(session.launch.recipe.program, wrapper.to_string_lossy());
         let arguments = &session.launch.recipe.arguments;
-        assert!(arguments.windows(2).any(|pair| pair == ["--fixture-option", "one argument with spaces"]));
+        assert!(arguments.windows(2).any(|pair| pair == ["--append-system-prompt", "one argument with spaces"]));
         assert!(arguments.windows(2).any(|pair| pair == ["--model", "settings-model"]));
         assert_eq!(session.launch.recipe.environment["PROVIDER_FIXTURE_VALUE"], "settings environment");
     }
