@@ -58,6 +58,8 @@ impl Cagents {
             Some(scope) if state.scopes.len() < 32 || state.scopes.contains(scope) => { state.scopes.insert(scope.clone()); },
             _ => state.unknown_scope = true,
         }
+        let cancel_all = state.unknown_scope;
+        self.cancel_git_for_file_recovery(if cancel_all { None } else { scope.map(PathBuf::as_path) });
     }
     pub(super) fn start_publication_recovery(&mut self, authority: crate::editor::RecoveryAuthority) -> Task<Message> {
         let Some(state) = &mut self.editor_features.recovery else { return Task::none(); };

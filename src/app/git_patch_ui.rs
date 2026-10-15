@@ -459,6 +459,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn returned_git_effect_task_observes_recovery_before_its_first_worker_effect() {
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        let (temporary, mut app, card, key) = fixture();
+        let root = temporary.path();
+        committed_base(root);
+        let prepared = worker_message(app.start_diff_patch(card, git_patch::Kind::Stage, None),
+            |message| matches!(message, Message::DiffPatchPrepared { .. })).await;
+        let ready_effect = app.update(prepared);
+        let original_token = app.source_control_mutations[&key.canonical_path].cancellation.clone();
+        assert!(!original_token.is_cancelled());
+        let _recovery = retain_recovery(&mut app, root);
+        assert!(original_token.is_cancelled(), "the returned task retains the same scoped cancellation owner");
+        let refused = worker_message(ready_effect, |message| matches!(message, Message::SourceControlMutated { .. })).await;
+        assert!(matches!(&refused, Message::SourceControlMutated { report: Some(reason), committed: false, .. }
+            if reason.contains("cancelled before its worker started")));
+        drop(app.update(refused));
+        assert!(app.source_control_mutations.is_empty());
+        assert_eq!(git_text(root, &["show", ":file.txt"]), "original\nkeep\n");
+        assert!(git_text(root, &["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[tokio::test]
     async fn ready_successor_cannot_start_after_recovery_overtakes_an_earlier_actual_turn() {
         if !crate::repository::WorktreeAuthority::supported() { return; }
         let (temporary, mut app, card, key) = fixture();

@@ -15601,6 +15601,17 @@ impl Cagents {
     /// running: two `git add` runs against one index corrupt each other's
     /// `index.lock`, and the panel's own controls stand down while one is in
     /// flight, so this is the guard for a press that raced the frame.
+    /// Accepted file recovery invalidates work already returned as a lazy
+    /// Task too. Each worker holds this SAME cancellation token.
+    pub(super) fn cancel_git_for_file_recovery(&mut self, worktree: Option<&Path>) {
+        for (path, active) in &mut self.source_control_mutations {
+            if worktree.is_none_or(|worktree| worktree == path.as_path()) {
+                active.cancellation.cancel();
+                active.pending.clear();
+            }
+        }
+    }
+
     fn git_effect_block_reason(&self, worktree: &Path) -> Option<&'static str> {
         if self.exit.is_some() {
             Some("The application is closing; the queued Git action was not applied.")
@@ -15837,6 +15848,9 @@ impl Cagents {
                         selection: selection.clone(),
                     };
                     let result = tokio::task::spawn_blocking(move || {
+                        if cancellation.is_cancelled() {
+                            return Err(Some("The original Git action was cancelled before its worker started.".into()));
+                        }
                         let service = match binding.mutation_service() {
                             Ok(service) => service,
                             Err(error) => return Err(Some(error)),
@@ -15886,6 +15900,9 @@ impl Cagents {
                     .unwrap_or_default();
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
+                        if cancellation.is_cancelled() {
+                            return Err("The original Git action was cancelled before its worker started.".into());
+                        }
                         binding
                             .mutation_service()?
                             .discard_recoverable(&request, &cancellation)
@@ -15917,6 +15934,9 @@ impl Cagents {
                 let worktree = key.canonical_path.clone();
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
+                        if cancellation.is_cancelled() {
+                            return Err("The original Git action was cancelled before its worker started.".into());
+                        }
                         binding
                             .mutation_service()?
                             .apply_patch_recoverable(
@@ -16012,9 +16032,14 @@ impl Cagents {
             return Task::none();
         };
         cosmic::task::future(async move {
-            let joined = tokio::task::spawn_blocking(move || match binding.mutation_service() {
-                Ok(service) => run(&service, &cancellation),
-                Err(error) => (Some(error), false),
+            let joined = tokio::task::spawn_blocking(move || {
+                if cancellation.is_cancelled() {
+                    return (Some("The original Git action was cancelled before its worker started.".into()), false);
+                }
+                match binding.mutation_service() {
+                    Ok(service) => run(&service, &cancellation),
+                    Err(error) => (Some(error), false),
+                }
             })
             .await;
             let (report, committed) = match joined {
