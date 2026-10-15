@@ -315,7 +315,7 @@ mod tests {
                 kind: RequestKind::Hover,
                 position: lsp_types::Position::new(0, 0),
                 version: 1,
-                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: HashMap::new(),
+                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: Arc::new(HashMap::new()),
             }),
             SessionCommand::Close {
                 doc: LspDocumentId(1),

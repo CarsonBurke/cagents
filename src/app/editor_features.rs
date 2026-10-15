@@ -67,18 +67,19 @@ mod tests {
     }
 
     fn operation(app: &Cagents, card: CardId) -> Operation {
-        Operation { card, doc: LspDocumentId(44), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: app.editor_open_files() }
+        Operation { card, doc: LspDocumentId(44), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, command_context: None, server_request: None, annotations: Vec::new(), open_files: app.editor_open_files() }
     }
 
     fn plan(app: &Cagents, root: &Path, names: &[&str]) -> Arc<workspace::Plan> {
         let open = app.cards.iter().filter_map(|(card, runtime)| match runtime {
             CardRuntime::Repository(runtime) => runtime.workspace_edit_snapshot().map(|(path, mut snapshot)| {
                 snapshot.protocol_version = app.lsp_document(*card).and_then(|doc| app.lsp.document_version(doc));
+                snapshot.protocol_incarnation = app.lsp_document(*card).and_then(|doc| app.lsp.document_incarnation(doc));
                 (path, snapshot)
             }), _ => None,
         }).collect();
         let documents = names.iter().map(|name| workspace::DocumentEdits {
-            path: (*name).into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar,
+            path: (*name).into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar,
             edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }],
         }).collect();
         Arc::new(workspace::prepare(root, documents, &open).unwrap())
@@ -409,6 +410,175 @@ mod tests {
         assert!(!app.editor_features.publishing());
     }
 
+    async fn code_action_fixture(root: &Path) -> (Cagents, CardId, CardId, LspDocumentId, LspDocumentId) {
+        let original = "fn old() {}\n";
+        for name in ["a.rs", "b.rs", "unopened.rs"] { std::fs::write(root.join(name), original).unwrap(); }
+        let mut app = app(); let a = buffer(&mut app, root, "a.rs", original); let b = buffer(&mut app, root, "b.rs", original);
+        let a_doc = LspDocumentId(44); let b_doc = LspDocumentId(45);
+        app.lsp = LspManager::fixture_ready_code_actions(a_doc, &root.join("a.rs"), root, original).await;
+        app.lsp.fixture_open_format_on_save_document(b_doc, &root.join("b.rs"), root, original).await;
+        for (card, doc) in [(a, a_doc), (b, b_doc)] {
+            app.lsp_documents.insert(doc, card); app.lsp_contexts.entry(card).or_default().document = Some(doc);
+            if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
+                runtime.set_lsp_document(Some(doc));
+                // The fixture has already delivered the initial open through
+                // the real manager; retain only later publication changes.
+                drop(runtime.take_lsp_intents()); drop(runtime.take_lsp_edits());
+            }
+        }
+        (app, a, b, a_doc, b_doc)
+    }
+
+    async fn acknowledge_code_action_command(app: &mut Cagents) {
+        let events = app.lsp.events();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = events.recv().await.expect("framed fixture remains open");
+                let done = matches!(event, LspEvent::CommandExecuted { .. });
+                drop(app.editor_feature_event(&event));
+                if done { break; }
+            }
+        }).await.expect("actual executeCommand response");
+        assert!(app.editor_features.requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_opaque_command_revalidates_actual_peer_context_on_choice() {
+        for change in 0..4 {
+            let root = tempfile::tempdir().unwrap();
+            let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
+            let item = app.lsp.fixture_code_action(a_doc).await;
+            let version = app.lsp.document_version(a_doc).unwrap();
+            app.editor_features.code_actions.insert(a, (version, vec![item]));
+            if change == 1 || change == 2 { app.lsp.close(b_doc); }
+            if change == 2 { app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn outside() {}\n").await; }
+            if change == 3 { app.lsp.fixture_open_format_on_save_document(LspDocumentId(46), &root.path().join("unopened.rs"), root.path(), "fn old() {}\n").await; }
+            drop(app.update_editor_features(Action::ChooseCodeAction(a, 0)));
+            if change == 0 {
+                assert_eq!(app.editor_features.requests.len(), 1);
+                acknowledge_code_action_command(&mut app).await;
+            } else {
+                assert!(app.editor_features.requests.is_empty(), "stale command must not be submitted");
+                assert!(app.lsp_contexts[&a].failure.as_ref().is_some_and(|message| message.contains("command was not run")));
+            }
+            app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn command_preview_checks_unchanged_target_and_reopened_unedited_peer_before_freeze() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
+        let item = app.lsp.fixture_code_action(a_doc).await;
+        let mut operation = app.editor_operation(a, LspEditKind::CodeAction).unwrap();
+        operation.command = item.command.clone(); operation.command_context = Some(item); operation.open_files = app.editor_open_files();
+        let prepared = plan(&app, root.path(), &["a.rs"]);
+        app.lsp.close(b_doc);
+        app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn old() {}\n").await;
+        drop(app.publish_editor_workspace_edit(821, operation, prepared));
+        assert!(!app.editor_features.publishing());
+        assert_eq!(text(&app, a), "fn old() {}\n");
+        assert!(matches!(&app.cards[&a], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+        assert!(app.lsp_contexts[&a].failure.as_ref().is_some_and(|message| message.contains("no longer current")));
+        app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn completed_publication_rechecks_command_before_own_version_changes() {
+        for stale_peer in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
+            let item = app.lsp.fixture_code_action(a_doc).await;
+            let mut operation = app.editor_operation(a, LspEditKind::CodeAction).unwrap();
+            operation.command = item.command.clone(); operation.command_context = Some(item); operation.open_files = app.editor_open_files();
+            let prepared = plan(&app, root.path(), &["a.rs", "unopened.rs"]);
+            let publishing = app.publish_editor_workspace_edit(822, operation, prepared);
+            assert!(app.editor_features.publishing());
+            if stale_peer {
+                app.lsp.close(b_doc);
+                app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn old() {}\n").await;
+            }
+            finish(&mut app, publishing).await;
+            assert_eq!(text(&app, a), "fn renamed() {}\n");
+            assert_eq!(std::fs::read_to_string(root.path().join("unopened.rs")).unwrap(), "fn renamed() {}\n");
+            if stale_peer {
+                assert!(app.editor_features.requests.is_empty());
+                assert!(app.lsp_contexts[&a].failure.as_ref().is_some_and(|message| message.contains("edits were applied, but the code action command was not run")));
+            } else {
+                assert!(app.lsp.document_version(a_doc).unwrap() > 1, "the action's own native edit advanced its URI version");
+                assert_eq!(app.editor_features.requests.len(), 1);
+                acknowledge_code_action_command(&mut app).await;
+            }
+            app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn emitted_peer_edit_rejects_closed_or_reopened_uri_before_preview() {
+        for reopen in [false, true] {
+            let root = tempfile::tempdir().unwrap(); let original = "fn old() {}\n";
+            for name in ["a.rs", "b.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+            let mut app = app(); let a = buffer(&mut app, root.path(), "a.rs", original);
+            let b = buffer(&mut app, root.path(), "b.rs", original);
+            let a_doc = LspDocumentId(44); let b_doc = LspDocumentId(45);
+            app.lsp = LspManager::fixture_ready_format_on_save(a_doc, &root.path().join("a.rs"), root.path(), original).await;
+            app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), original).await;
+            for (card, doc) in [(a, a_doc), (b, b_doc)] { app.lsp_documents.insert(doc, card); app.lsp_contexts.entry(card).or_default().document = Some(doc); }
+            let original_incarnation = app.lsp.document_incarnation(b_doc).unwrap();
+            let edit = LspWorkspaceEdit { documents: vec![LspDocumentEdits {
+                path: root.path().join("b.rs"), version: None, observed_version: app.lsp.document_version(b_doc), observed_incarnation: Some(original_incarnation.clone()), coordinates: LspCoordinates::Scalar,
+                edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }],
+            }], ..Default::default() };
+            app.lsp.close(b_doc); app.lsp_documents.remove(&b_doc); app.lsp_contexts.remove(&b); app.cards.remove(&b);
+            std::fs::write(root.path().join("b.rs"), "fn outside() {}\n").unwrap();
+            if reopen {
+                let b = buffer(&mut app, root.path(), "b.rs", "fn outside() {}\n");
+                app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn outside() {}\n").await;
+                app.lsp_documents.insert(b_doc, b); app.lsp_contexts.entry(b).or_default().document = Some(b_doc);
+                assert_eq!(app.lsp.document_version(b_doc), Some(1));
+                assert_ne!(app.lsp.document_incarnation(b_doc), Some(original_incarnation));
+            }
+            let operation = app.editor_operation(a, LspEditKind::Rename).unwrap();
+            let mut tasks = VecDeque::from([app.prepare_editor_workspace_edit(operation, edit)]);
+            while let Some(task) = tasks.pop_front() {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::EditorFeatures(action))) = action { tasks.push_back(app.update_editor_features(action)); }
+                    }
+                }
+            }
+            assert!(app.editor_features.preview.is_none() && !app.editor_features.publishing());
+            assert!(app.lsp_contexts.get(&a).unwrap().failure.is_some());
+            assert_eq!(text(&app, a), original);
+            assert_eq!(std::fs::read_to_string(root.path().join("b.rs")).unwrap(), "fn outside() {}\n");
+            app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reopened_same_version_peer_refuses_preview_publication_before_freezing() {
+        let root = tempfile::tempdir().unwrap(); let original = "fn old() {}\n";
+        for name in ["a.rs", "b.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+        let mut app = app(); let a = buffer(&mut app, root.path(), "a.rs", original); let b = buffer(&mut app, root.path(), "b.rs", original);
+        let a_doc = LspDocumentId(44); let b_doc = LspDocumentId(45);
+        app.lsp = LspManager::fixture_ready_format_on_save(a_doc, &root.path().join("a.rs"), root.path(), original).await;
+        app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), original).await;
+        for (card, doc) in [(a, a_doc), (b, b_doc)] { app.lsp_documents.insert(doc, card); app.lsp_contexts.entry(card).or_default().document = Some(doc); }
+        let prepared = plan(&app, root.path(), &["a.rs", "b.rs"]); let mut operation = app.editor_operation(a, LspEditKind::Rename).unwrap();
+        operation.open_files = app.editor_open_files();
+        let old_identity = app.lsp.document_incarnation(b_doc).unwrap();
+        app.lsp.close(b_doc);
+        app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), original).await;
+        assert_eq!(app.lsp.document_version(b_doc), Some(1));
+        assert_ne!(app.lsp.document_incarnation(b_doc), Some(old_identity));
+        assert_eq!(app.editor_open_files(), operation.open_files, "card/path equality alone cannot detect the server URI lifetime change");
+        drop(app.publish_editor_workspace_edit(818, operation, prepared));
+        assert!(!app.editor_features.publishing());
+        for card in [a, b] { assert_eq!(text(&app, card), original); assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending())); }
+        for name in ["a.rs", "b.rs"] { assert_eq!(std::fs::read_to_string(root.path().join(name)).unwrap(), original); }
+        app.lsp.shutdown(); app.lsp.wait_for_shutdown().await;
+    }
+
     #[test]
     fn changed_protocol_version_refuses_publication_before_buffer_or_disk_mutation() {
         let root = tempfile::tempdir().unwrap();
@@ -516,7 +686,7 @@ mod tests {
     fn retired_manager_response_cannot_consume_a_new_documents_reused_request_id() {
         let mut app = app();
         let request = LspRequestId(7);
-        let current = Operation { card: CardId::new(), doc: LspDocumentId(2), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
+        let current = Operation { card: CardId::new(), doc: LspDocumentId(2), version: 1, kind: LspEditKind::Rename, save_after: false, command: None, command_context: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
         app.editor_features.requests.insert(request, current);
         drop(app.editor_feature_event(&LspEvent::WorkspaceEdit { request, doc: LspDocumentId(1), kind: LspEditKind::Rename, edit: LspWorkspaceEdit::default() }));
         assert_eq!(app.editor_features.requests.get(&request).unwrap().doc, LspDocumentId(2));
@@ -668,7 +838,7 @@ mod tests {
         app.close_lsp_document(a);
         app.cards.remove(&a);
         let (id, response) = app.lsp.fixture_workspace_edit_preview(LspDocumentId(2), Duration::from_secs(120)).unwrap();
-        let task = app.editor_feature_event(&LspEvent::ApplyWorkspaceEdit { doc: LspDocumentId(2), id, label: Some("Import quick fix".into()), edit: LspWorkspaceEdit { documents: vec![LspDocumentEdits { path: root.path().join("b.rs"), version: Some(1), observed_version: Some(1), coordinates: LspCoordinates::Scalar, edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }] }], ..Default::default() } }).unwrap();
+        let task = app.editor_feature_event(&LspEvent::ApplyWorkspaceEdit { doc: LspDocumentId(2), id, label: Some("Import quick fix".into()), edit: LspWorkspaceEdit { documents: vec![LspDocumentEdits { path: root.path().join("b.rs"), version: Some(1), observed_version: Some(1), observed_incarnation: app.lsp.document_incarnation(LspDocumentId(3)), coordinates: LspCoordinates::Scalar, edits: vec![LspTextEdit { range: LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6)), new_text: "renamed".into() }] }], ..Default::default() } }).unwrap();
         let mut tasks = vec![task];
         while let Some(task) = tasks.pop() {
             if let Some(mut stream) = iced::runtime::task::into_stream(task) {
@@ -752,6 +922,7 @@ struct Operation {
     kind: LspEditKind,
     save_after: bool,
     command: Option<LspCommand>,
+    command_context: Option<LspCodeAction>,
     server_request: Option<LspServerEditId>,
     annotations: Vec<LspChangeAnnotation>,
     open_files: Vec<(CardId, PathBuf)>,
@@ -965,13 +1136,32 @@ impl Cagents {
             if runtime.cursor_position() == Some(at) && runtime.editor_selection_range() == selection)
     }
 
+    fn validate_editor_feature_command(&self, operation: &Operation) -> Result<(), LspError> {
+        if operation.command.is_none() { return Ok(()); }
+        if let Some(context) = &operation.command_context {
+            self.lsp.validate_code_action_context(context)?;
+        }
+        Ok(())
+    }
+
     fn execute_editor_feature_command(&mut self, operation: &Operation, command: LspCommand) {
+        if let Err(error) = self.validate_editor_feature_command(operation) {
+            self.feature_failure(operation.card, format!("Code action command was not run: {error}"));
+            return;
+        }
+        self.send_admitted_editor_feature_command(operation, command);
+    }
+
+    // The caller may validate immediately before applying this action's own
+    // edits. Their LSP version updates must not invalidate that admission.
+    fn send_admitted_editor_feature_command(&mut self, operation: &Operation, command: LspCommand) {
         let request = self.lsp.execute_command(operation.doc, command);
         let mut completion = operation.clone();
         // An executeCommand result has no edit coordinates. Its failure still
         // belongs to this invocation even if workspace/applyEdit advanced the
         // buffer version before the command acknowledged completion.
         completion.command = None;
+        completion.command_context = None;
         completion.server_request = None;
         completion.save_after = false;
         self.editor_features.requests.insert(request, completion);
@@ -1006,6 +1196,7 @@ impl Cagents {
                 let Some(mut operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
                 if !self.editor_operation_current(&operation) { return Some(Task::none()); }
                 if let Some(reason) = &item.disabled { self.feature_failure(operation.card, reason.clone()); return Some(Task::none()); }
+                operation.command_context = Some(item.clone());
                 operation.command = item.command.clone();
                 if let Some(edit) = &item.edit { Some(self.prepare_editor_workspace_edit(operation, edit.clone())) }
                 else {
@@ -1063,13 +1254,13 @@ impl Cagents {
         // can be a read-only std tab; writability is checked independently for
         // every actual target by the workspace planner and publication fence.
         Some(Operation { card, doc, version: self.lsp.document_version(doc)?, kind: LspEditKind::CodeAction,
-            save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
+            save_after: false, command: None, command_context: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
     }
 
     fn editor_operation(&self, card: CardId, kind: LspEditKind) -> Option<Operation> {
         if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source() || !runtime.desired_file_present()) { return None; }
         let doc = self.lsp_document(card)?;
-        Some(Operation { card, doc, version: self.lsp.document_version(doc)?, kind, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
+        Some(Operation { card, doc, version: self.lsp.document_version(doc)?, kind, save_after: false, command: None, command_context: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() })
     }
 
     fn editor_operation_current(&self, operation: &Operation) -> bool {
@@ -1208,6 +1399,7 @@ impl Cagents {
                     self.editor_features.requests.insert(request, operation);
                     return Task::none();
                 }
+                operation.command_context = Some(item.clone());
                 operation.command = item.command;
                 if let Some(edit) = item.edit { self.prepare_editor_workspace_edit(operation, edit) }
                 else if let Some(command) = operation.command.clone() { self.execute_editor_feature_command(&operation, command); Task::none() }
@@ -1216,7 +1408,7 @@ impl Cagents {
             Action::Signature(card, trigger) => {
                 let Some(doc) = self.lsp_document(card) else { return Task::none(); };
                 let Some(version) = self.lsp.document_version(doc) else { return Task::none(); };
-                let operation = Operation { card, doc, version, kind: LspEditKind::CodeAction, save_after: false, command: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
+                let operation = Operation { card, doc, version, kind: LspEditKind::CodeAction, save_after: false, command: None, command_context: None, server_request: None, annotations: Vec::new(), open_files: Vec::new() };
                 let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return Task::none(); };
                 let Some(at) = runtime.cursor_position() else { return Task::none(); };
                 let active = runtime.editor_signature_help().cloned();
@@ -1339,6 +1531,10 @@ impl Cagents {
                 };
                 let has_warnings = !report.durability_warnings.is_empty();
                 if has_warnings { self.feature_failure(publication.operation.card, report.durability_warnings.join("\n")); }
+                // Validate the captured command context before these native
+                // edits advance the same URI versions. This reducer sends the
+                // admitted command without yielding to another user message.
+                let command_admission = self.validate_editor_feature_command(&publication.operation);
                 let mut tasks = Vec::new();
                 let mut failure = None;
                 for card in publication.cards {
@@ -1355,7 +1551,12 @@ impl Cagents {
                     self.feature_failure(publication.operation.card, error);
                 } else {
                     if let Some(lease) = publication.server_lease.take() { lease.respond(true, None); }
-                    if let Some(command) = publication.operation.command.clone() { self.execute_editor_feature_command(&publication.operation, command); }
+                    if let Some(command) = publication.operation.command.clone() {
+                        match command_admission {
+                            Ok(()) => self.send_admitted_editor_feature_command(&publication.operation, command),
+                            Err(error) => self.feature_failure(publication.operation.card, format!("Workspace edits were applied, but the code action command was not run: {error}")),
+                        }
+                    }
                     tasks.push(self.save_after_feature(&publication.operation));
                     if publication.hidden && !has_warnings {
                         self.notices.record(TransientNotice::success("Workspace edit applied"));
@@ -1404,7 +1605,7 @@ impl Cagents {
         let worktree = owner.descriptor.worktree.clone();
         operation.open_files = self.editor_open_files();
         let open_paths = operation.open_files.iter().map(|(_, path)| path.clone()).collect();
-        let documents = edit.documents.into_iter().map(|document| workspace::DocumentEdits { path: document.path, version: document.version, observed_version: document.observed_version, coordinates: document.coordinates, edits: document.edits }).collect();
+        let documents = edit.documents.into_iter().map(|document| workspace::DocumentEdits { path: document.path, version: document.version, observed_version: document.observed_version, observed_incarnation: document.observed_incarnation, coordinates: document.coordinates, edits: document.edits }).collect();
         let ticket = self.editor_features.next();
         self.editor_features.preparing.insert(ticket, operation);
         cosmic::task::future(async move {
@@ -1423,8 +1624,9 @@ impl Cagents {
                     if captured > 64 * 1024 * 1024 { return Err("The open buffers exceed the 64 MiB preview budget".into()); }
                     let Some((path, mut snapshot)) = runtime.workspace_edit_snapshot() else { return Err("Wait for the selected target to finish loading, or close its read-only view, before applying edits".into()); };
                     snapshot.protocol_version = self.lsp_document(*card).and_then(|doc| self.lsp.document_version(doc));
+                    snapshot.protocol_incarnation = self.lsp_document(*card).and_then(|doc| self.lsp.document_incarnation(doc));
                         if let Some(previous) = open.insert(path, snapshot.clone()) {
-                            if previous.text != snapshot.text || previous.version != snapshot.version || previous.protocol_version != snapshot.protocol_version || previous.writable != snapshot.writable {
+                            if previous.text != snapshot.text || previous.version != snapshot.version || previous.protocol_version != snapshot.protocol_version || previous.protocol_incarnation != snapshot.protocol_incarnation || previous.writable != snapshot.writable {
                                 return Err("Two open views of the same file disagree".into());
                             }
                         }
@@ -1444,6 +1646,11 @@ impl Cagents {
 
     fn publish_editor_workspace_edit(&mut self, ticket: u64, operation: Operation, plan: Arc<workspace::Plan>) -> Task<Message> {
         if self.editor_features.publication.is_some() { self.reject_server_edit(&operation, "Another edit is being applied"); return Task::none(); }
+        if let Err(error) = self.validate_editor_feature_command(&operation) {
+            self.reject_server_edit(&operation, &error.to_string());
+            self.feature_failure(operation.card, format!("Code action is no longer current: {error}"));
+            return Task::none();
+        }
         if operation.open_files != self.editor_open_files() {
             self.reject_server_edit(&operation, "The open file tabs changed; prepare the edit again");
             self.feature_failure(operation.card, "The open file tabs changed; prepare the edit again");
@@ -1459,6 +1666,7 @@ impl Cagents {
             None => None,
         };
         let protocol_versions: HashMap<CardId, Option<i32>> = self.cards.keys().map(|card| (*card, self.lsp_document(*card).and_then(|doc| self.lsp.document_version(doc)))).collect();
+        let protocol_incarnations: HashMap<CardId, Option<crate::lsp::LspDocumentIncarnation>> = self.cards.keys().map(|card| (*card, self.lsp_document(*card).and_then(|doc| self.lsp.document_incarnation(doc)))).collect();
         let mut matched_documents = HashSet::new();
         let mut cards = Vec::new();
         let mut failure = None;
@@ -1473,6 +1681,7 @@ impl Cagents {
                         matched_documents.insert(index);
                         if !document.open { failure = Some("A target file was opened after this preview was prepared".into()); break; }
                         if protocol_versions[card] != document.protocol_version { failure = Some("A target language-server version changed after this preview was prepared".into()); break; }
+                        if protocol_incarnations[card] != document.protocol_incarnation { failure = Some("A target language-server document was closed or reopened after this preview was prepared".into()); break; }
                         match runtime.begin_workspace_edit(ticket, document) { Ok(()) => cards.push(*card), Err(error) => { failure = Some(error); break; } }
                     }
                 }

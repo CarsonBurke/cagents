@@ -30338,7 +30338,7 @@ mod tests {
         // consuming the history position. Cancelling it permits the same Back.
         if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&origin) {
             let (path, snapshot) = runtime.workspace_edit_snapshot().unwrap();
-            let plan = crate::editor_workspace_edit::DocumentPlan { path, relative: "origin.rs".into(), before_hash: blake3::hash(snapshot.text.as_bytes()), before: snapshot.text.clone(), after: snapshot.text, version: Some(snapshot.version), protocol_version: None, open: true, open_paths: Vec::new(), edits: Vec::new() };
+            let plan = crate::editor_workspace_edit::DocumentPlan { path, relative: "origin.rs".into(), before_hash: blake3::hash(snapshot.text.as_bytes()), before: snapshot.text.clone(), after: snapshot.text, version: Some(snapshot.version), protocol_version: None, protocol_incarnation: None, open: true, open_paths: Vec::new(), edits: Vec::new() };
             runtime.begin_workspace_edit(313, &plan).unwrap();
             assert!(runtime.is_saving());
         }

@@ -12,6 +12,7 @@ pub struct DocumentEdits {
     pub path: PathBuf,
     pub version: Option<i32>,
     pub observed_version: Option<i32>,
+    pub observed_incarnation: Option<crate::lsp::LspDocumentIncarnation>,
     pub coordinates: LspCoordinates,
     pub edits: Vec<LspTextEdit>,
 }
@@ -22,6 +23,7 @@ pub struct OpenSnapshot {
     pub version: i32,
     /// Actual shared-URI version sent by the language-server manager.
     pub protocol_version: Option<i32>,
+    pub protocol_incarnation: Option<crate::lsp::LspDocumentIncarnation>,
     pub writable: bool,
 }
 
@@ -37,6 +39,7 @@ pub struct DocumentPlan {
     pub before_hash: blake3::Hash,
     pub version: Option<i32>,
     pub protocol_version: Option<i32>,
+    pub protocol_incarnation: Option<crate::lsp::LspDocumentIncarnation>,
     pub open: bool,
     /// Original selected-source spellings, captured by the preparation worker.
     pub open_paths: Vec<PathBuf>,
@@ -117,7 +120,7 @@ fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree
         let Ok(canonical) = std::fs::canonicalize(path) else { continue; };
         aliases.entry(canonical.clone()).or_default().push(path.clone());
         if let Some(previous) = canonical_open.insert(canonical, snapshot) {
-            if previous.text != snapshot.text || previous.version != snapshot.version || previous.protocol_version != snapshot.protocol_version || previous.writable != snapshot.writable {
+            if previous.text != snapshot.text || previous.version != snapshot.version || previous.protocol_version != snapshot.protocol_version || previous.protocol_incarnation != snapshot.protocol_incarnation || previous.writable != snapshot.writable {
                 return Err("Two open views of the same file disagree; close the stale view before applying this edit".into());
             }
         }
@@ -135,6 +138,10 @@ fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree
         if snapshot.is_some_and(|snapshot| !snapshot.writable) { return Err(format!("{} is read-only", path.display())); }
         for version in [document.version, document.observed_version].into_iter().flatten() {
             if snapshot.is_none_or(|snapshot| snapshot.protocol_version != Some(version)) { return Err(format!("{} changed after the server prepared its edits", path.display())); }
+        }
+        if let Some(expected) = &document.observed_incarnation
+            && snapshot.is_none_or(|snapshot| snapshot.protocol_incarnation.as_ref() != Some(expected)) {
+            return Err(format!("{} was closed or reopened after the server prepared its edits", path.display()));
         }
         let before = if let Some(snapshot) = snapshot { snapshot.text.clone() } else {
             let file = fs_safety::open_beneath(&root, &relative).map_err(|error| error.to_string())?;
@@ -163,7 +170,7 @@ fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree
         if total > 64 * 1024 * 1024 { return Err("This workspace edit exceeds the 64 MiB preview budget".into()); }
         let open_paths = aliases.remove(&path).unwrap_or_default();
         result.push(DocumentPlan { before_hash: blake3::hash(before.as_bytes()), path, relative,
-            before, after: after.into(), version: snapshot.map(|snapshot| snapshot.version), protocol_version: snapshot.and_then(|snapshot| snapshot.protocol_version), open: snapshot.is_some(), open_paths, edits });
+            before, after: after.into(), version: snapshot.map(|snapshot| snapshot.version), protocol_version: snapshot.and_then(|snapshot| snapshot.protocol_version), protocol_incarnation: snapshot.and_then(|snapshot| snapshot.protocol_incarnation.clone()), open: snapshot.is_some(), open_paths, edits });
     }
     result.sort_by(|left, right| left.relative.cmp(&right.relative));
     verify_root(&root)?;
@@ -241,7 +248,7 @@ mod tests {
     fn rollback_reports_restored_bytes_with_unconfirmed_parent_sync() {
         let directory = tempfile::tempdir().unwrap();
         for name in ["a.rs", "b.rs"] { std::fs::write(directory.path().join(name), "old").unwrap(); }
-        let documents = ["a.rs", "b.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }).collect();
+        let documents = ["a.rs", "b.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }).collect();
         let plan = prepare(directory.path(), documents, &HashMap::new()).unwrap();
         let error = publish_unopened_with_writer(&plan, |index| {
             if index == 1 { std::fs::write(directory.path().join("b.rs"), "outside writer").unwrap(); }
@@ -270,10 +277,10 @@ mod tests {
         let alias = directory.path().join("alias.rs");
         std::os::unix::fs::symlink(&paths[7], &alias).unwrap();
         paths.push(alias.clone());
-        let result = resolve_targets(directory.path().into(), vec![DocumentEdits { path: "file7.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], paths).unwrap();
+        let result = resolve_targets(directory.path().into(), vec![DocumentEdits { path: "file7.rs".into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], paths).unwrap();
         assert_eq!(result.open_paths.len(), 2);
         assert!(result.open_paths.contains(&alias));
-        let open = result.open_paths.iter().map(|path| (path.clone(), OpenSnapshot { text: "old()".into(), version: 1, protocol_version: Some(1), writable: true })).collect();
+        let open = result.open_paths.iter().map(|path| (path.clone(), OpenSnapshot { text: "old()".into(), version: 1, protocol_version: Some(1), protocol_incarnation: None, writable: true })).collect();
         let plan = prepare(&result.worktree, result.documents, &open).unwrap();
         assert_eq!(plan.documents[0].open_paths.len(), 2);
     }
@@ -290,8 +297,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         for name in ["a.rs", "b.rs", "c.rs"] { std::fs::write(directory.path().join(name), "old()").unwrap(); }
         let path = std::fs::canonicalize(directory.path().join("a.rs")).unwrap();
-        let mut open = HashMap::from([(path, OpenSnapshot { text: "old()".into(), version: 7, protocol_version: Some(7), writable: true })]);
-        let documents = || ["a.rs", "b.rs", "c.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: (name == "a.rs").then_some(7), observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "renamed")] }).collect();
+        let mut open = HashMap::from([(path, OpenSnapshot { text: "old()".into(), version: 7, protocol_version: Some(7), protocol_incarnation: None, writable: true })]);
+        let documents = || ["a.rs", "b.rs", "c.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: (name == "a.rs").then_some(7), observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "renamed")] }).collect();
         let plan = prepare(directory.path(), documents(), &open).unwrap();
         assert_eq!(plan.documents.len(), 3);
         publish_unopened(&plan).unwrap();
@@ -306,8 +313,8 @@ mod tests {
         let path = directory.path().join("a.rs");
         std::fs::write(&path, "old()").unwrap();
         let path = std::fs::canonicalize(path).unwrap();
-        let mut open = HashMap::from([(path, OpenSnapshot { text: "old()".into(), version: 2, protocol_version: Some(7), writable: true })]);
-        let documents = || vec![DocumentEdits { path: "a.rs".into(), version: Some(7), observed_version: Some(7), coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }];
+        let mut open = HashMap::from([(path, OpenSnapshot { text: "old()".into(), version: 2, protocol_version: Some(7), protocol_incarnation: None, writable: true })]);
+        let documents = || vec![DocumentEdits { path: "a.rs".into(), version: Some(7), observed_version: Some(7), observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }];
         let plan = prepare(directory.path(), documents(), &open).unwrap();
         assert_eq!(plan.documents[0].version, Some(2), "runtime freeze retains its own revision");
         assert_eq!(plan.documents[0].protocol_version, Some(7), "protocol checks retain manager URI version");
@@ -320,8 +327,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("a.rs"), "body").unwrap();
         let path = std::fs::canonicalize(directory.path().join("a.rs")).unwrap();
-        let open = HashMap::from([(path, OpenSnapshot { text: "body".into(), version: 7, protocol_version: Some(7), writable: true })]);
-        let input = |observed_version| vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 0, "first"), edit(0, 0, "second")] }];
+        let open = HashMap::from([(path, OpenSnapshot { text: "body".into(), version: 7, protocol_version: Some(7), protocol_incarnation: None, writable: true })]);
+        let input = |observed_version| vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 0, "first"), edit(0, 0, "second")] }];
         assert_eq!(&*prepare(directory.path(), input(Some(7)), &open).unwrap().documents[0].after, "firstsecondbody");
         assert!(prepare(directory.path(), input(Some(6)), &open).is_err());
     }
@@ -330,11 +337,11 @@ mod tests {
     fn overlap_and_external_paths_are_refused_before_writes() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("a.rs"), "abcdef").unwrap();
-        let documents = vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(1, 3, "x"), edit(2, 4, "y")] }];
+        let documents = vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(1, 3, "x"), edit(2, 4, "y")] }];
         assert!(prepare(directory.path(), documents, &HashMap::new()).is_err());
         assert_eq!(std::fs::read_to_string(directory.path().join("a.rs")).unwrap(), "abcdef");
         let outside = tempfile::NamedTempFile::new().unwrap();
-        assert!(prepare(directory.path(), vec![DocumentEdits { path: outside.path().into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![] }], &HashMap::new()).is_err());
+        assert!(prepare(directory.path(), vec![DocumentEdits { path: outside.path().into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![] }], &HashMap::new()).is_err());
     }
     #[test]
     fn replacing_previewed_root_with_identical_files_refuses_every_write() {
@@ -343,7 +350,7 @@ mod tests {
         let moved = parent.path().join("original-worktree");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a.rs"), "old").unwrap();
-        let documents = vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }];
+        let documents = vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }];
         let resolved = resolve_targets(root.clone(), documents, Vec::new()).unwrap();
         let plan = prepare_resolved(resolved, &HashMap::new()).unwrap();
         std::fs::rename(&root, &moved).unwrap();
@@ -366,7 +373,7 @@ mod tests {
         let moved = parent.path().join("original");
         std::fs::create_dir(&root).unwrap();
         for name in ["a.rs", "b.rs"] { std::fs::write(root.join(name), "old").unwrap(); }
-        let documents = ["a.rs", "b.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }).collect();
+        let documents = ["a.rs", "b.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }).collect();
         let plan = prepare(&root, documents, &HashMap::new()).unwrap();
         let result = publish_unopened_with_before_file(&plan, |index| {
             if index == 1 {
@@ -388,7 +395,7 @@ mod tests {
         let root = parent.path().join("worktree");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a.rs"), "old").unwrap();
-        let resolved = resolve_targets(root.clone(), vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], Vec::new()).unwrap();
+        let resolved = resolve_targets(root.clone(), vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], Vec::new()).unwrap();
         std::fs::rename(&root, parent.path().join("original")).unwrap();
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a.rs"), "old").unwrap();
@@ -399,7 +406,7 @@ mod tests {
     fn outside_change_cancels_batch_and_restores_preceding_atomic_writes() {
         let directory = tempfile::tempdir().unwrap();
         for name in ["a.rs", "b.rs"] { std::fs::write(directory.path().join(name), "old").unwrap(); }
-        let documents = ["a.rs", "b.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }).collect();
+        let documents = ["a.rs", "b.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }).collect();
         let plan = prepare(directory.path(), documents, &HashMap::new()).unwrap();
         std::fs::write(directory.path().join("b.rs"), "outside").unwrap();
         assert!(publish_unopened(&plan).is_err());

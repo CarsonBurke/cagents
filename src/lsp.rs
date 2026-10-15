@@ -831,6 +831,25 @@ struct SessionKey {
     root: Arc<Path>,
 }
 
+/// Opaque identity of one continuous open-URI registration lifetime.
+///
+/// Versions can restart when the last tab closes. Retaining this token in a
+/// request or edit prevents a newly opened URI from aliasing that earlier
+/// lifetime, including when its protocol version is again one.
+#[derive(Debug, Clone)]
+pub struct LspDocumentIncarnation(Arc<()>);
+
+impl PartialEq for LspDocumentIncarnation {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for LspDocumentIncarnation {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedDocument {
+    version: i32,
+    incarnation: LspDocumentIncarnation,
+}
+
 /// Per-URI text state shared between the manager and its session tasks.
 ///
 /// Two editor tabs may address the same file. They share one URI on the wire,
@@ -842,6 +861,7 @@ struct SessionKey {
 #[derive(Debug)]
 struct UriState {
     session: SessionKey,
+    incarnation: LspDocumentIncarnation,
     docs: Vec<LspDocumentId>,
     /// Newest last, at most [`MAX_RETAINED_SNAPSHOTS`] entries.
     snapshots: VecDeque<Arc<Snapshot>>,
@@ -933,6 +953,7 @@ impl SnapshotStore {
                     Arc::clone(uri),
                     UriState {
                         session: session.clone(),
+                        incarnation: LspDocumentIncarnation(Arc::new(())),
                         docs: vec![doc],
                         snapshots,
                     },
@@ -970,6 +991,24 @@ impl SnapshotStore {
 
     fn latest(&self, uri: &Url) -> Option<Arc<Snapshot>> {
         Some(self.lock().uris.get(uri)?.latest())
+    }
+
+    fn observation(&self, uri: &Url) -> Option<(Arc<Snapshot>, LspDocumentIncarnation)> {
+        let inner = self.lock();
+        let state = inner.uris.get(uri)?;
+        Some((state.latest(), state.incarnation.clone()))
+    }
+
+    fn observations_for_session(&self, session: &SessionKey) -> Arc<HashMap<Url, ObservedDocument>> {
+        Arc::new(self.lock().uris.iter().filter(|(_, state)| &state.session == session)
+            .map(|(uri, state)| ((**uri).clone(), ObservedDocument {
+                version: state.latest().version, incarnation: state.incarnation.clone(),
+            })).collect())
+    }
+
+    fn document_incarnation(&self, doc: LspDocumentId) -> Option<LspDocumentIncarnation> {
+        let inner = self.lock();
+        Some(inner.uris.get(inner.docs.get(&doc)?)?.incarnation.clone())
     }
 
     fn snapshot_at(&self, uri: &Url, version: i32) -> Option<Arc<Snapshot>> {
@@ -1979,7 +2018,7 @@ struct PendingRequest {
     version: i32,
     args: RequestArgs,
     timeout: Duration,
-    observed_versions: HashMap<Url, i32>,
+    observed_versions: Arc<HashMap<Url, ObservedDocument>>,
 }
 
 enum SessionCommand {
@@ -4478,6 +4517,13 @@ impl LspManager {
         Some(self.snapshots.latest(&reference.uri)?.version)
     }
 
+    /// Registration lifetime of a currently synchronized URI. Pending discovery
+    /// has no incarnation; the same version after close/reopen has a new token.
+    #[must_use]
+    pub fn document_incarnation(&self, doc: LspDocumentId) -> Option<LspDocumentIncarnation> {
+        self.snapshots.document_incarnation(doc)
+    }
+
     /// Converts a protocol UTF-16 position into the editor-native scalar
     /// position, against `doc`'s current snapshot.
     ///
@@ -4659,6 +4705,11 @@ impl LspManager {
             Ok(position) => position,
             Err(error) => return fail(&self.events, error),
         };
+        let observed_versions = match &args {
+            RequestArgs::Resolve { observed, .. } => observed.clone(),
+            _ if matches!(kind,RequestKind::Rename|RequestKind::Formatting|RequestKind::RangeFormatting|RequestKind::CodeActions|RequestKind::ExecuteCommand) => self.snapshots.observations_for_session(&reference.session),
+            _ => Arc::new(HashMap::new()),
+        };
         if let Err(reason) = session
             .commands
             .send(SessionCommand::Request(PendingRequest {
@@ -4669,7 +4720,7 @@ impl LspManager {
                 kind,
                 position,
                 version: snapshot.version,
-                args, timeout, observed_versions: if matches!(kind,RequestKind::Rename|RequestKind::Formatting|RequestKind::RangeFormatting|RequestKind::CodeActions|RequestKind::ResolveCodeAction|RequestKind::ExecuteCommand) {self.snapshots.lock().uris.iter().filter(|(_,state)|state.session==reference.session).map(|(uri,state)| ((**uri).clone(),state.latest().version)).collect()} else {HashMap::new()},
+                args, timeout, observed_versions,
             }))
         {
             return fail(&self.events, LspError::Protocol(reason.to_owned()));
@@ -5032,6 +5083,18 @@ impl LspManager {
     #[cfg(test)]
     pub(crate) async fn fixture_open_format_on_save_document(&mut self, doc: LspDocumentId, path: &Path, worktree: &Path, text: &str) {
         tests::open_ready_format_on_save(self, doc, path, worktree, text).await;
+    }
+
+    /// Real framed test server for controller command-context regressions.
+    /// No provider process or production capability bypass is involved.
+    #[cfg(test)]
+    pub(crate) async fn fixture_ready_code_actions(doc:LspDocumentId,path:&Path,worktree:&Path,text:&str)->Self {
+        tests::ready_code_actions(doc,path,worktree,text).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn fixture_code_action(&mut self,doc:LspDocumentId)->LspCodeAction {
+        tests::request_fixture_code_action(self,doc).await
     }
 
     /// Replaces the process launcher. Tests inject in-process duplex
@@ -5449,6 +5512,28 @@ mod tests {
         assert!(manager.capabilities(doc).ready && manager.capabilities(doc).format_document);
         assert_eq!(manager.formatting_settings(doc).map(|(enabled, _)| enabled), Some(true));
         manager
+    }
+
+    pub(super) async fn ready_code_actions(doc:LspDocumentId,path:&Path,worktree:&Path,text:&str)->LspManager {
+        let mut manager=rust_manager();manager.servers[0].format_on_save=true;
+        let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"documentFormattingProvider":true,"codeActionProvider":true,"executeCommandProvider":{"commands":["fixture.command"]}}),|incoming| {
+            let result=match incoming.method.as_str() {
+                "textDocument/codeAction"=>json!([{"title":"Run fixture command","command":"fixture.command"}]),
+                "workspace/executeCommand"=>Value::Null,
+                "textDocument/formatting"=>json!([]),
+                _=>return vec![],
+            };
+            vec![json!({"jsonrpc":"2.0","id":incoming.id,"result":result})]
+        });
+        let events=manager.events();manager.open_for_test(doc,path,worktree,rust_language(),1,text);
+        let _handle=handle_of(&slot).await;await_ready(&events,doc).await;
+        assert!(manager.capabilities(doc).ready && manager.capabilities(doc).code_actions);
+        manager
+    }
+
+    pub(super) async fn request_fixture_code_action(manager:&mut LspManager,doc:LspDocumentId)->LspCodeAction {
+        let events=manager.events();let request=manager.request_code_actions(doc,LspRange::default(),&[]);
+        next_matching(&events,|event|match event {LspEvent::CodeActions{request:id,items,..} if *id==request=>items.first().cloned(),_=>None}).await
     }
 
     pub(super) async fn open_ready_format_on_save(manager: &mut LspManager, doc: LspDocumentId, path: &Path, worktree: &Path, text: &str) {
@@ -9144,7 +9229,7 @@ mod tests {
             kind: RequestKind::Definition,
             position: lsp_types::Position::new(0, 0),
             version: 1,
-                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: HashMap::new(),
+                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: Arc::new(HashMap::new()),
         }
     }
 
@@ -9312,7 +9397,7 @@ mod tests {
             kind: RequestKind::Completion,
             position: lsp_types::Position::new(0, 3),
             version: 1,
-                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: HashMap::new(),
+                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: Arc::new(HashMap::new()),
         };
         let event = convert_result(
             &store,
@@ -9403,12 +9488,106 @@ mod tests {
     });}
 
     #[test]
+    fn workspace_edit_peer_incarnations_refuse_closed_and_reopened_versions() {
+        let store=SnapshotStore::default();
+        let uri=Arc::new(Url::parse("file:///repo/peer.rs").unwrap());
+        let unopened=Url::parse("file:///repo/unopened.rs").unwrap();
+        let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
+        store.register(LspDocumentId(1),&uri,&key,1,Arc::from("old"));
+        let observed=store.observations_for_session(&key);
+        let old_identity=store.document_incarnation(LspDocumentId(1)).unwrap();
+        let edit=|target:&Url| serde_json::from_value::<lsp_types::WorkspaceEdit>(json!({"changes":{target.as_str():[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"new"}]}})).unwrap();
+        let converted=features::convert_workspace_edit(&store,edit(&uri),Some(&observed)).unwrap();
+        assert_eq!(converted.documents[0].observed_incarnation,Some(old_identity.clone()));
+        store.unregister(LspDocumentId(1));
+        assert!(matches!(features::convert_workspace_edit(&store,edit(&uri),Some(&observed)),Err(LspError::Unsupported(_))));
+        store.register(LspDocumentId(2),&uri,&key,1,Arc::from("changed"));
+        assert_eq!(store.latest(&uri).unwrap().version,1);
+        assert_ne!(old_identity,store.document_incarnation(LspDocumentId(2)).unwrap());
+        assert!(matches!(features::convert_workspace_edit(&store,edit(&uri),Some(&observed)),Err(LspError::Unsupported(_))));
+        let converted=features::convert_workspace_edit(&store,edit(&unopened),Some(&observed)).unwrap();
+        assert_eq!(converted.documents[0].observed_version,None);
+        assert_eq!(converted.documents[0].observed_incarnation,None);
+        assert_eq!(converted.documents[0].coordinates,LspCoordinates::Utf16);
+        store.register(LspDocumentId(4),&Arc::new(unopened.clone()),&key,1,Arc::from("opened later"));
+        assert!(matches!(features::convert_workspace_edit(&store,edit(&unopened),Some(&observed)),Err(LspError::StaleVersion{..})));
+        // An emitted edit owns its token even after conversion. A UI consumer
+        // compares it before publication; the old allocation cannot be reused.
+        assert_ne!(store.document_incarnation(LspDocumentId(2)),Some(old_identity));
+    }
+
+    #[test]
+    fn uri_incarnation_survives_mirrored_tabs_and_changes_but_not_reset() {
+        let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());
+        let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
+        store.register(LspDocumentId(1),&uri,&key,1,Arc::from("one"));
+        let first=store.document_incarnation(LspDocumentId(1)).unwrap();
+        store.register(LspDocumentId(2),&uri,&key,2,Arc::from("two"));
+        assert_eq!(store.document_incarnation(LspDocumentId(2)),Some(first.clone()));
+        store.unregister(LspDocumentId(1));
+        store.record(&uri,3,Arc::from("three"));
+        assert_eq!(store.document_incarnation(LspDocumentId(2)),Some(first.clone()));
+        store.clear();store.register(LspDocumentId(2),&uri,&key,1,Arc::from("one"));
+        assert_ne!(store.document_incarnation(LspDocumentId(2)),Some(first));
+    }
+
+    #[test]
+    fn actual_rename_response_refuses_peer_closed_or_reopened_at_version_one() { block_on(async {
+        for reopen in [false,true] {
+            let (_guard,worktree,file)=workspace();let peer=file.with_file_name("peer.rs");
+            std::fs::write(&peer,"old").unwrap();let peer_uri=Url::from_file_path(&peer).unwrap();
+            let mut manager=rust_manager();let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"renameProvider":true}),|_|vec![]);
+            let events=manager.events();let origin=LspDocumentId(1);let peer_doc=LspDocumentId(2);
+            manager.open_for_test(origin,&file,&worktree,rust_language(),1,"foo");
+            let handle=handle_of(&slot).await;await_ready(&events,origin).await;
+            manager.open_for_test(peer_doc,&peer,&worktree,rust_language(),1,"old");
+            if !manager.status(peer_doc).is_ready(){await_ready(&events,peer_doc).await;}
+            let request=manager.request_rename(origin,LspPosition::default(),"new".into());
+            let pending=handle.wait_for("textDocument/rename").await;
+            manager.close(peer_doc);
+            if reopen {
+                manager.open_for_test(LspDocumentId(3),&peer,&worktree,rust_language(),1,"changed");
+                assert_eq!(manager.document_version(LspDocumentId(3)),Some(1));
+            }
+            handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":pending.id,"result":{"changes":{peer_uri.as_str():[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"new"}]}}}))).unwrap();
+            next_matching(&events,|event|match event {LspEvent::RequestFailed{request:id,error:LspError::Unsupported(_),..}if *id==request=>Some(()),_=>None}).await;
+            assert_eq!(manager.document_version(origin),Some(1));
+            manager.begin_shutdown().await;
+        }
+    }); }
+
+    #[test]
+    fn lazy_code_action_keeps_original_peer_incarnation_through_resolve() { block_on(async {
+        let (_guard,worktree,file)=workspace();let peer=file.with_file_name("peer.rs");std::fs::write(&peer,"old").unwrap();let peer_uri=Url::from_file_path(&peer).unwrap();
+        let mut manager=rust_manager();let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"codeActionProvider":{"resolveProvider":true}}),|_|vec![]);
+        let events=manager.events();let origin=LspDocumentId(1);manager.open_for_test(origin,&file,&worktree,rust_language(),1,"foo");let handle=handle_of(&slot).await;await_ready(&events,origin).await;
+        manager.open_for_test(LspDocumentId(2),&peer,&worktree,rust_language(),1,"old");
+        let request=manager.request_code_actions(origin,LspRange::default(),&[]);let pending=handle.wait_for("textDocument/codeAction").await;
+        handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":pending.id,"result":[{"title":"Fix peer","data":{"opaque":7}}]}))).unwrap();
+        let item=next_matching(&events,|event|match event {LspEvent::CodeActions{request:id,items,..}if *id==request=>items.first().cloned(),_=>None}).await;
+        assert!(manager.validate_code_action_context(&item).is_ok());
+        let added=file.with_file_name("added.rs");std::fs::write(&added,"new peer").unwrap();
+        manager.open_for_test(LspDocumentId(4),&added,&worktree,rust_language(),1,"new peer");
+        assert!(manager.validate_code_action_context(&item).is_err(),"opaque command must not bless a newly opened same-session peer");
+        manager.close(LspDocumentId(4));
+        assert!(manager.validate_code_action_context(&item).is_ok());
+        manager.close(LspDocumentId(2));manager.open_for_test(LspDocumentId(3),&peer,&worktree,rust_language(),1,"changed");
+        assert!(manager.validate_code_action_context(&item).is_err());
+        let request=manager.request_resolve_code_action(origin,item);let pending=handle.wait_for("codeAction/resolve").await;
+        handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":pending.id,"result":{"title":"Fix peer","edit":{"changes":{peer_uri.as_str():[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"new"}]}}}}))).unwrap();
+        next_matching(&events,|event|match event {LspEvent::RequestFailed{request:id,error:LspError::Unsupported(_),..}if *id==request=>Some(()),_=>None}).await;
+        manager.begin_shutdown().await;
+    }); }
+
+    #[test]
     fn workspace_edit_conversion_refuses_stale_targets_and_preserves_document_changes_precedence(){
         let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
         store.register(LspDocumentId(1),&uri,&key,2,Arc::from("a𝄞foo"));
         let edit: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"changes":{"file:///ignored.rs":[]},"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":2},"edits":[{"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}},"newText":"bar"}]}]})).unwrap();
-        let converted=features::convert_workspace_edit(&store,edit.clone(),Some(&HashMap::from([((*uri).clone(),2)]))).unwrap();assert_eq!(converted.documents.len(),1);assert_eq!(converted.documents[0].edits[0].range.start.character,2);
-        assert!(matches!(features::convert_workspace_edit(&store,edit,Some(&HashMap::from([((*uri).clone(),1)]))),Err(LspError::StaleVersion{..})));
+        let observed=store.observations_for_session(&key);
+        let converted=features::convert_workspace_edit(&store,edit.clone(),Some(&observed)).unwrap();assert_eq!(converted.documents.len(),1);assert_eq!(converted.documents[0].edits[0].range.start.character,2);
+        let mut stale=observed;Arc::make_mut(&mut stale).get_mut(&*uri).unwrap().version=1;
+        assert!(matches!(features::convert_workspace_edit(&store,edit,Some(&stale)),Err(LspError::StaleVersion{..})));
         let resource: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"documentChanges":[{"kind":"create","uri":"file:///repo/new.rs"}]})).unwrap();assert!(matches!(features::convert_workspace_edit(&store,resource,None),Err(LspError::Unsupported(_))));
         assert_eq!(features::configuration(&json!({"rust-analyzer":{"check":{"command":"clippy"}}}),Some("rust-analyzer.check.command")),json!("clippy"));
     }
