@@ -1003,7 +1003,7 @@ impl Cagents {
                 worktree_id,
                 command,
             } => {
-                if self.modal_is_open() && !self.project_ui.modal_open() {
+                if self.modal_is_open() {
                     return Task::none();
                 }
                 let Some(target) = self.project_target(project_id, worktree_id) else {
@@ -2402,6 +2402,26 @@ mod tests {
         );
         let _ = app.handle_project_action(Action::Dismiss);
         assert!(!app.project_ui.modal_open());
+    }
+
+    #[test]
+    fn queued_background_project_command_cannot_replace_a_visible_upper_dialog() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project, RepositoryId::new(), "repo".into(), "/repo".into(), Vec::new(), Vec::new(),
+        ));
+        app.project_ui.dialog = Some(Dialog {
+            target: Target { project, worktree: None, repository: "/repo".into(), path: "/repo/linked".into(), label: "linked".into() },
+            blocker: None, failure: None,
+        });
+        drop(app.finish_modal_update(Task::none()));
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        drop(app.handle_project_action(Action::Command { project_id: project, worktree_id: None, command: ProjectCommand::Remove }));
+        assert!(app.project_ui.remove_dialog.is_none());
+        assert!(app.project_ui.dialog.is_some());
+        assert_eq!(app.top_modal(), Some(modal_ui::Modal::SettingsReset));
     }
 
     /// A window with session storage and one project at `repository` whose
