@@ -17,7 +17,7 @@ impl Cagents {
         if let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card)
             && let Some(reason) = pane.review.restart_blocker()
         {
-            return Some(reason);
+            return Some(reason.to_owned());
         }
         self.worktree_operations
             .values()
