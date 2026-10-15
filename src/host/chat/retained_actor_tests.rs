@@ -122,6 +122,17 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     let identity = handle
         .actor_identity()
         .expect("the test opts into a real retained actor");
+    // The annotation store is independent of the execution cursor. A future
+    // format simulates a real, recoverable refusal without deleting data or
+    // changing the actor/account identity. The helper must retain this proof
+    // through daemon loss even after its execution cursor already committed.
+    let scope=handle.launch_account_scope().unwrap().clone();
+    drop(chat::annotations::storage::Store::pending_installation(&scope).unwrap());
+    let annotations=crate::instance::project_dirs().unwrap().data_dir().join("conversation-annotations");
+    let annotation_paths=fs::read_dir(&annotations).unwrap().map(|entry|entry.unwrap().path().join("annotations.sqlite")).filter(|path|path.is_file()).collect::<Vec<_>>();
+    assert_eq!(annotation_paths.len(),1,"fixture has one exact captured physical account");
+    let annotation_fault=rusqlite::Connection::open(&annotation_paths[0]).unwrap();
+    annotation_fault.pragma_update(None,"user_version",3).unwrap();
     let active_proof = Arc::new(std::sync::Mutex::new(first.clone()));
     struct Cleanup {
         owner: crate::daemon::holder_registry::Record,
@@ -320,6 +331,18 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     );
     let retained = retained_actor::retained_runs(&successor);
     let registry = super::super::agent_execution::registry(&successor).unwrap();
+    let mut retained_turn=None;
+    wait_until(|| {
+        let page=handle.uncommitted_outcomes().unwrap();
+        let Some(entry)=page.iter().find(|entry|matches!(&entry.update,Update::TurnOutcome {..})) else {return false;};
+        if registry.lock().unwrap().native_actor_cursor_for_test(identity.instance).unwrap().is_none_or(|cursor|cursor<entry.sequence) {return false;}
+        if let Update::TurnOutcome {update}=&entry.update {retained_turn=Some(update.clone());}
+        true
+    },"the Store refusal must leave the real helper turn proof unacknowledged despite a committed registry cursor");
+    let retained_turn=retained_turn.unwrap();
+    assert!(retained_turn.identity().session_id.len()>0);
+    annotation_fault.pragma_update(None,"user_version",2).unwrap();
+    drop(annotation_fault);
     registry
         .lock()
         .unwrap()
@@ -382,6 +405,9 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
         1,
         "adoption must never resend the accepted prompt"
     );
+    wait_until(||handle.uncommitted_outcomes().unwrap().is_empty(),"all semantic stores must commit before helper ACK");
+    let mut annotation=chat::annotations::storage::Store::installation(&scope,&retained_turn.identity().session_id).unwrap();
+    assert!(!annotation.apply_turn_update(&retained_turn).unwrap().changed,"replay after an already committed registry cursor must still have committed the independent annotation Store before ACK");
     super::super::agent_execution::close(&successor, &Authority::default(), accepted.agent.id)
         .unwrap();
     wait_until(
@@ -416,6 +442,9 @@ for line in sys.stdin:
         send({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':{}}})
     elif frame.get('type')=='user':
         with (root/'prompts').open('a') as log: log.write('prompt\n')
+        received=frame['uuid']
+        send({'type':'user','uuid':received,'session_id':session,'parent_tool_use_id':None,'message':{'id':'native-'+received,'role':'user','content':[{'type':'text','text':'One exact slow turn'}]}})
+        send({'type':'command_lifecycle','command_uuid':received,'state':'started','session_id':session,'uuid':'lifecycle-'+received})
         for index in range(40):
             send({'type':'assistant','uuid':f'frame-{index}','message':{'id':f'frame-{index}','role':'assistant','content':[{'type':'text','text':f'FRAME_{index:03}|'}]}})
             with (root/'produced').open('a') as log: log.write(str(index)+'\n')

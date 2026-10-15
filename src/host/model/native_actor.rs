@@ -43,6 +43,10 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
 }
 
 impl Registry {
+    #[cfg(test)]
+    pub(in crate::host) fn native_actor_cursor_for_test(&self, actor:Uuid)->Result<Option<u64>,String> {
+        self.db.query_row("SELECT sequence FROM native_actor_cursors WHERE actor=?1",[actor.to_string()],|row|row.get::<_,u64>(0)).optional().map_err(|error|error.to_string())
+    }
     /// A typed loss is already durable in the authenticated helper. Commit all
     /// affected runs together before its separate loss ACK permits recovery.
     /// Repeating this transaction cannot replace a committed terminal outcome.
