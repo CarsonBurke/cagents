@@ -46,11 +46,17 @@ pub(in crate::host) fn capture(host: &SharedHost, observation: PresentationClose
     if let Some(handle) = &hosted_handle {
         if receipt.is_none() || owner.holder.is_current() {
             handle.refresh_retained_state()?;
-            let current = handle.provider_process().ok_or("The hosted provider incarnation is unknown; no close consent was issued")?;
-            if backend.as_ref().is_some_and(|captured| captured != &current) {
-                return Err("The retained close owner belongs to a previous backend incarnation; its successor was preserved".into());
+            if let Some(current) = handle.provider_process() {
+                if backend.as_ref().is_some_and(|captured| captured != &current) {
+                    return Err("The retained close owner belongs to a previous backend incarnation; its successor was preserved".into());
+                }
+                backend = Some(current);
+            } else if Handle::is_remote_record(&owner) {
+                return Err("The hosted provider incarnation is unknown; no close consent was issued".into());
             }
-            backend = Some(current);
+            // Local Codex's server belongs to native_holder rather than the
+            // protocol actor's child. Its positive process identity comes
+            // from the authenticated Recovery.server_process below.
         } else if backend.is_none() {
             // This cache belongs to the retained exact handle and its final
             // authenticated publication; never refresh a new handle by ID.
