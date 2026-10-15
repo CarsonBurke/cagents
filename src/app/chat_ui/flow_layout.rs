@@ -21,7 +21,10 @@ pub(super) type Handle = Rc<RefCell<Entry>>;
 
 pub(super) struct Entry {
     id: u64,
-    spans: Arc<[Span<'static, String>]>,
+    source: Source,
+    source_revision: u64,
+    source_len: usize,
+    ready_revision: Option<u64>,
     key: Option<Key>,
     attempt: u64,
     requested: bool,
@@ -42,14 +45,61 @@ struct Key {
     version: graphics_text::Version,
 }
 
+#[derive(Clone)]
+enum Source {
+    Markdown { text: markdown::Text, style: markdown::Style },
+    Styled(Arc<[Span<'static, String>]>),
+}
+impl Source {
+    fn len(&self) -> usize {
+        match self { Self::Markdown { text, .. } => text.len(), Self::Styled(spans) => spans.iter().map(|span| span.text.len()).sum() }
+    }
+    fn extends(&self, previous: &Self) -> bool {
+        match (self, previous) {
+            (Self::Markdown { text, style }, Self::Markdown { text: old, style: old_style }) => style == old_style && text.append_proven(old),
+            (Self::Styled(spans), Self::Styled(previous)) => Arc::ptr_eq(spans, previous),
+            _ => false,
+        }
+    }
+    fn materialize(&self) -> (Arc<[Span<'static, String>]>, Arc<str>) {
+        match self {
+            Self::Markdown { text, style } => (text.spans(*style), text.plain()),
+            Self::Styled(spans) => (spans.clone(), spans.iter().map(|span| span.text.as_ref()).collect::<String>().into()),
+        }
+    }
+}
+
 impl Cache {
+    #[cfg(test)]
     pub(super) fn entry(&self, identity: u64, spans: Arc<[Span<'static, String>]>) -> Handle {
+        self.source_entry(identity, Source::Styled(spans))
+    }
+    pub(super) fn markdown_entry(&self, identity: u64, text: markdown::Text, style: markdown::Style) -> Handle {
+        self.source_entry(identity, Source::Markdown { text, style })
+    }
+    fn source_entry(&self, identity: u64, source: Source) -> Handle {
         let mut entries = self.0.borrow_mut();
-        if let Some(entry) = entries.get(&identity).and_then(std::rc::Weak::upgrade)
-            && Arc::ptr_eq(&entry.borrow().spans, &spans) { return entry; }
+        if let Some(entry) = entries.get(&identity).and_then(std::rc::Weak::upgrade) {
+            let reusable = source.extends(&entry.borrow().source);
+            if reusable {
+                let mut current = entry.borrow_mut();
+                let length = source.len();
+                if length != current.source_len {
+                    current.source_revision = current.source_revision.wrapping_add(1);
+                    current.source_len = length;
+                    current.failed = false;
+                }
+                current.source = source;
+                drop(current);
+                return entry;
+            }
+        }
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let entry = Rc::new(RefCell::new(Entry { id: NEXT.fetch_add(1, Ordering::Relaxed), spans,
-            key: None, attempt: 0, requested: false, deferred: None, failed: false, ready: None, cancelled: Arc::new(AtomicBool::new(false)) }));
+        let source_len = source.len();
+        let entry = Rc::new(RefCell::new(Entry { id: NEXT.fetch_add(1, Ordering::Relaxed), source,
+            source_len, source_revision: 0, ready_revision: None,
+            key: None, attempt: 0, requested: false, deferred: None, failed: false, ready: None,
+            cancelled: Arc::new(AtomicBool::new(false)) }));
         entries.insert(identity, Rc::downgrade(&entry));
         entry
     }
@@ -61,6 +111,7 @@ impl Cache {
             .map(|prepared| prepared.snapshot.retained_bytes()).sum()
     }
 }
+
 impl Entry {
     pub(super) fn configure(&mut self, width: f32, size: iced::Pixels, font: iced::Font) {
         let key = Key { width, size, font, version: graphics_text::font_system().read().expect("font system").version() };
@@ -71,29 +122,30 @@ impl Entry {
             self.deferred = None;
             self.failed = false;
             self.ready = None;
+            self.ready_revision = None;
             self.cancelled.store(true, Ordering::Release);
             self.cancelled = Arc::new(AtomicBool::new(false));
         }
     }
     pub(super) fn failed(&self) -> bool { self.failed }
     pub(super) fn prepared(&self) -> Option<Arc<Prepared>> { self.ready.clone() }
-    pub(super) fn bounds(&self, bytes: usize) -> iced::Size {
+    pub(super) fn bounds(&self, _bytes: usize) -> iced::Size {
         self.ready.as_ref().map_or_else(|| {
             let key = self.key.expect("configured layout");
-            let lines = (bytes as f32 * key.size.0 * 0.5 / key.width.max(1.0)).ceil().max(1.0);
+            let lines = (self.source_len as f32 * key.size.0 * 0.5 / key.width.max(1.0)).ceil().max(1.0);
             iced::Size::new(key.width, lines * key.size.0 * 1.3)
         }, |ready| ready.bounds)
     }
     pub(super) fn request(&mut self) -> Option<Request> {
         let key = self.key?;
-        if self.ready.is_some() || self.requested || self.failed || self.deferred == Some(COMPLETED.load(Ordering::Acquire)) || !key.width.is_finite() || key.width <= 0.0 { return None; }
+        if self.ready_revision == Some(self.source_revision) || self.requested || self.failed || self.deferred == Some(COMPLETED.load(Ordering::Acquire)) || !key.width.is_finite() || key.width <= 0.0 { return None; }
         self.requested = true;
         self.deferred = None;
-        Some(Request { id: self.id, attempt: self.attempt, key, spans: self.spans.clone(), cancelled: self.cancelled.clone() })
+        Some(Request { id: self.id, attempt: self.attempt, key, source: self.source.clone(), source_revision: self.source_revision, cancelled: self.cancelled.clone() })
     }
     pub(super) fn accepts(&self, request: &Request) -> bool {
         self.id == request.id && self.attempt == request.attempt && self.key == Some(request.key)
-            && Arc::ptr_eq(&self.spans, &request.spans) && !request.cancelled.load(Ordering::Acquire)
+            && request.source_revision <= self.source_revision && !request.cancelled.load(Ordering::Acquire)
     }
     pub(super) fn defer(&mut self, request: &Request, epoch: u64) {
         if self.accepts(request) { self.requested = false; self.deferred = Some(epoch); }
@@ -110,10 +162,12 @@ impl Entry {
             self.requested = false;
             self.deferred = None;
             self.ready = None;
+            self.ready_revision = None;
             return true;
         }
         self.requested = false;
         self.failed = ready.is_none();
+        self.ready_revision = ready.as_ref().map(|_| request.source_revision);
         self.ready = ready;
         true
     }
@@ -124,7 +178,8 @@ pub(super) struct Request {
     pub(super) id: u64,
     attempt: u64,
     key: Key,
-    spans: Arc<[Span<'static, String>]>,
+    source: Source,
+    source_revision: u64,
     cancelled: Arc<AtomicBool>,
 }
 impl std::fmt::Debug for Request {
@@ -160,7 +215,8 @@ pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64
             let _permit = permit;
             if work.cancelled.load(Ordering::Acquire) { return None; }
             let mut fonts = cosmic_text::FontSystem::new_with_locale_and_db(locale, db);
-            let prepared = Prepared::with_fonts(&work.spans, work.key.size, work.key.font, work.key.width,
+            let (spans, plain) = work.source.materialize();
+            let prepared = Prepared::with_fonts(spans, plain, work.key.size, work.key.font, work.key.width,
                 iced::widget::text::Wrapping::WordOrGlyph, &mut fonts);
             (!work.cancelled.load(Ordering::Acquire)).then(|| Arc::new(prepared))
         }).await.ok().flatten();
@@ -174,6 +230,8 @@ pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64
 pub(super) struct Prepared {
     pub(super) snapshot: cosmic_text::LayoutSnapshot,
     pub(super) bounds: iced::Size,
+    pub(super) spans: Arc<[Span<'static, String>]>,
+    pub(super) plain: Arc<str>,
 }
 
 impl Prepared {
@@ -186,10 +244,10 @@ impl Prepared {
             (fonts.db().clone(), fonts.raw().locale().to_owned())
         };
         let mut fonts = cosmic_text::FontSystem::new_with_locale_and_db(locale, db);
-        Self::with_fonts(spans, size, font, width, wrapping, &mut fonts)
+        Self::with_fonts(spans.to_vec().into(), spans.iter().map(|span| span.text.as_ref()).collect::<String>().into(), size, font, width, wrapping, &mut fonts)
     }
 
-    fn with_fonts(spans: &[Span<'static, String>], size: iced::Pixels, font: iced::Font, width: f32,
+    fn with_fonts(spans: Arc<[Span<'static, String>]>, plain: Arc<str>, size: iced::Pixels, font: iced::Font, width: f32,
         wrapping: iced::widget::text::Wrapping, fonts: &mut cosmic_text::FontSystem) -> Self {
         let line_height = iced::widget::text::LineHeight::default();
         let mut buffer = cosmic_text::Buffer::new(fonts, cosmic_text::Metrics::new(size.0, line_height.to_absolute(size).0));
@@ -207,7 +265,7 @@ impl Prepared {
         buffer.shape_until_scroll(fonts, false);
         let bounds = graphics_text::align(&mut buffer, fonts, Default::default());
         let snapshot = buffer.into_layout_snapshot().expect("complete paragraph layout");
-        Self { snapshot, bounds }
+        Self { snapshot, bounds, spans, plain }
     }
 }
 
@@ -472,4 +530,71 @@ fn virtual_row_eviction_releases_flow_glyphs_without_hiding_the_chat() {
     element.as_widget_mut().layout(&mut tree, &renderer, &limits);
     assert!(first.iter().all(|owner| owner.upgrade().is_none()), "cached item descriptors must not retain evicted glyph snapshots");
     assert!(cache.retained_bytes() > 0, "the same active chat still owns visible row geometry");
+}
+
+
+#[test]
+fn continuous_append_publishes_versioned_progress_and_eventually_exact_final_geometry() {
+    fn text(content: &markdown::Content) -> markdown::Text {
+        let markdown::Item::Paragraph(text) = &content.items()[0] else { panic!("paragraph fixture") };
+        text.clone()
+    }
+    fn finish(request: &Request) -> Arc<Prepared> {
+        let (spans, plain) = request.source.materialize();
+        let mut result = Prepared::new(&spans, request.key.size, request.key.font,
+            request.key.width, iced::widget::text::Wrapping::WordOrGlyph);
+        result.plain = plain;
+        Arc::new(result)
+    }
+    let cache = Cache::default();
+    let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE).style;
+    let mut content = markdown::Content::parse(&"word ".repeat(600));
+    let mut entry = cache.markdown_entry(7, text(&content), style);
+    entry.borrow_mut().configure(720.0, iced::Pixels(16.0), iced::Font::DEFAULT);
+    let mut pending = entry.borrow_mut().request().unwrap();
+    let mut visible_bytes = 0;
+    let mut published = 0;
+    // Controlled scheduler: one completion per 20 append ticks. A tick models
+    // a 12.5ms source update, not a wall-clock benchmark or a timing assertion.
+    for tick in 1..=240 {
+        content.push_str(" next");
+        let next = cache.markdown_entry(7, text(&content), style);
+        assert!(Rc::ptr_eq(&entry, &next), "proven append keeps in-flight work live");
+        entry = next;
+        assert!(entry.borrow_mut().request().is_none(), "no replacement job queues behind a full paragraph");
+        if tick % 20 == 0 {
+            let ready = finish(&pending);
+            assert!(ready.plain.len() > visible_bytes, "displayed text progresses during uninterrupted input");
+            assert!(text(&content).plain().starts_with(ready.plain.as_ref()));
+            visible_bytes = ready.plain.len();
+            assert!(entry.borrow_mut().complete(&pending, Some(ready)));
+            let shown = entry.borrow().prepared().unwrap();
+            assert_eq!(shown.plain.len(), visible_bytes, "snapshot retains its own source version");
+            assert!(shown.plain.len() < text(&content).len());
+            published += 1;
+            pending = entry.borrow_mut().request().expect("newest source still needs exact layout");
+        }
+    }
+    assert_eq!(published, 12);
+    let final_ready = finish(&pending);
+    assert!(entry.borrow_mut().complete(&pending, Some(final_ready)));
+    assert!(entry.borrow_mut().request().is_none());
+    let ready = entry.borrow().prepared().unwrap();
+    assert_eq!(ready.plain.as_ref(), text(&content).plain().as_ref());
+    let reference = reference(&ready.spans, iced::Pixels(16.0), iced::Font::DEFAULT,
+        720.0, iced::widget::text::Wrapping::WordOrGlyph);
+    assert_eq!(ready.bounds, reference.min_bounds());
+    let all = ready.snapshot.project(0..ready.snapshot.visual_line_count()).unwrap();
+    for (expected, actual) in reference.buffer().layout_runs().zip(all.buffer().layout_runs()) {
+        assert_eq!(expected.glyphs.len(), actual.glyphs.len());
+        assert_eq!(expected.line_w.to_bits(), actual.line_w.to_bits());
+        for (expected, actual) in expected.glyphs.iter().zip(actual.glyphs) {
+            assert_eq!((expected.font_id, expected.glyph_id, expected.x.to_bits(), expected.w.to_bits()),
+                (actual.font_id, actual.glyph_id, actual.x.to_bits(), actual.w.to_bits()));
+        }
+    }
+    let rewrite = markdown::Content::parse("**replacement changes style and content**");
+    let replacement = cache.markdown_entry(7, text(&rewrite), style);
+    assert!(!Rc::ptr_eq(&entry, &replacement));
+    assert!(!replacement.borrow().accepts(&pending), "old rendered source cannot cross a rewrite");
 }

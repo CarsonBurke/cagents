@@ -298,6 +298,11 @@ pub struct Row {
     pub cells: Vec<Vec<Item>>,
 }
 
+#[cfg(test)]
+thread_local! { static MATERIALIZED_BYTES: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn materialized_bytes() -> usize { MATERIALIZED_BYTES.with(Cell::get) }
+
 /// A bunch of parsed Markdown text.
 #[derive(Debug, Clone)]
 pub struct Text {
@@ -377,7 +382,11 @@ impl Text {
     /// Logical text without constructing styled presentation spans. Shared by
     /// the active transcript's selection/find index and bounded visible rows.
     pub fn plain(&self) -> Arc<str> {
-        self.plain.get_or_init(|| self.spans.iter().map(Span::text).collect::<String>().into()).clone()
+        self.plain.get_or_init(|| {
+            #[cfg(test)]
+            MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
+            self.spans.iter().map(Span::text).collect::<String>().into()
+        }).clone()
     }
     pub fn len(&self) -> usize { self.starts.last().copied().unwrap_or_default() }
 
@@ -399,6 +408,8 @@ impl Text {
     /// provided changes.
     pub fn spans(&self, style: Style) -> Arc<[text::Span<'static, Uri>]> {
         if Some(style) != self.last_style.get() {
+            #[cfg(test)]
+            MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
             *self.last_styled_spans.borrow_mut() =
                 self.spans.iter().map(|span| span.view(&style)).collect();
 
