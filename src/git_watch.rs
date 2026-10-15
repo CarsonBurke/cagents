@@ -170,30 +170,27 @@ impl Project {
                 let mut worktree_polling = network_filesystem(&record.path)
                     .map_err(|error| error.to_string())?
                     .then(|| "network or FUSE filesystem may omit native change events".to_owned());
-                let files = match git.watch_files_projection(
-                    &record.path,
-                    inventory_limit,
-                    cancellation,
-                ) {
-                    Ok(files) => {
-                        if files.listing_truncated {
-                            // The independent census below still covers every
-                            // nonignored directory within the watch budget.
-                            // Force-tracked children beyond this prefix need
-                            // the explicit, quiet periodic fallback.
-                            worktree_polling
-                                .get_or_insert_with(|| "directory watch limit reached".into());
+                let files =
+                    match git.watch_files_projection(&record.path, inventory_limit, cancellation) {
+                        Ok(files) => {
+                            if files.listing_truncated {
+                                // The independent census below still covers every
+                                // nonignored directory within the watch budget.
+                                // Force-tracked children beyond this prefix need
+                                // the explicit, quiet periodic fallback.
+                                worktree_polling
+                                    .get_or_insert_with(|| "directory watch limit reached".into());
+                            }
+                            files
                         }
-                        files
-                    }
-                    Err(error) => {
-                        if cancellation.is_cancelled() {
-                            return Err("watch planning cancelled".into());
+                        Err(error) => {
+                            if cancellation.is_cancelled() {
+                                return Err("watch planning cancelled".into());
+                            }
+                            worktree_polling = Some(error.to_string());
+                            crate::repository::WorkingFiles::default()
                         }
-                        worktree_polling = Some(error.to_string());
-                        crate::repository::WorkingFiles::default()
-                    }
-                };
+                    };
                 // ls-files lists files, not empty directories. An agent can
                 // create a folder long before its first file, so discover those
                 // too. Git collapses ignored build trees before the filesystem
@@ -381,16 +378,26 @@ impl Project {
         records: impl IntoIterator<Item = &'a WorktreeRecord>,
         upstreams: &BTreeMap<WorktreeId, String>,
     ) -> Option<Self> {
-        let records = records.into_iter().map(|record| (record.id, record)).collect::<BTreeMap<_, _>>();
+        let records = records
+            .into_iter()
+            .map(|record| (record.id, record))
+            .collect::<BTreeMap<_, _>>();
         let changed = self.worktrees.iter().any(|worktree| {
-            records.get(&worktree.id).is_some_and(|record| record.path == worktree.root
-                && (record.branch != worktree.branch
-                    || worktree.upstream.as_ref() != upstreams.get(&worktree.id)))
+            records.get(&worktree.id).is_some_and(|record| {
+                record.path == worktree.root
+                    && (record.branch != worktree.branch
+                        || worktree.upstream.as_ref() != upstreams.get(&worktree.id))
+            })
         });
-        if !changed { return None; }
+        if !changed {
+            return None;
+        }
         let mut next = self.clone();
         for worktree in &mut next.worktrees {
-            if let Some(record) = records.get(&worktree.id).filter(|record| record.path == worktree.root) {
+            if let Some(record) = records
+                .get(&worktree.id)
+                .filter(|record| record.path == worktree.root)
+            {
                 worktree.branch = record.branch.clone();
                 worktree.upstream = upstreams.get(&worktree.id).cloned();
             }

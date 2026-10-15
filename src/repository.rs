@@ -4103,11 +4103,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         known_files: &[RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<WorkingFiles, RepositoryError> {
-        self.ignored_files_with_limit(worktree,known_files,None,cancellation)
+        self.ignored_files_with_limit(worktree, known_files, None, cancellation)
     }
 
-    pub fn ignored_files_with_limit(&self,worktree:&Path,known_files:&[RepoPath],limit:Option<usize>,cancellation:&CancellationToken)->Result<WorkingFiles,RepositoryError> {
-        let (output,truncated) = self.listing_output(
+    pub fn ignored_files_with_limit(
+        &self,
+        worktree: &Path,
+        known_files: &[RepoPath],
+        limit: Option<usize>,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
+        let (output, truncated) = self.listing_output(
             &self.git_read(
                 worktree,
                 [
@@ -4124,7 +4130,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         let parsed = (|| {
-            let mut files = WorkingFiles {listing_truncated:truncated,..WorkingFiles::default()};
+            let mut files = WorkingFiles {
+                listing_truncated: truncated,
+                ..WorkingFiles::default()
+            };
             for (record, field) in nul_fields(&output.stdout, "git ls-files --ignored")?
                 .into_iter()
                 .enumerate()
@@ -4643,20 +4652,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             };
             cache.fsmonitor_checked = true;
         }
-        let (output,truncated) = self.listing_output(
-            &snapshot_fsmonitor(
-                self.status_command_with_untracked(worktree, options.untracked_changes),
-                cache.fsmonitor.as_deref(),
-            ),
-            options.status_limit,
-            status_limit::Format::Status,
-            cancellation,
-        ).inspect_err(|_| cache.status_attempt_failed = true)?;
+        let (output, truncated) = self
+            .listing_output(
+                &snapshot_fsmonitor(
+                    self.status_command_with_untracked(worktree, options.untracked_changes),
+                    cache.fsmonitor.as_deref(),
+                ),
+                options.status_limit,
+                status_limit::Format::Status,
+                cancellation,
+            )
+            .inspect_err(|_| cache.status_attempt_failed = true)?;
         use sha2::Digest;
-        let mut digest=sha2::Sha256::new();
+        let mut digest = sha2::Sha256::new();
         digest.update(&output.stdout);
         digest.update([u8::from(truncated)]);
-        let digest:[u8;32]=digest.finalize().into();
+        let digest: [u8; 32] = digest.finalize().into();
         let mut observations_fresh = false;
         if !cache.dirty
             && cache.digest == Some(digest)
@@ -4703,7 +4714,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             invalid_output(parse_status_details(&output.stdout, true), output)
                 .inspect_err(|_| cache.status_attempt_failed = true)?;
         status.untracked_omitted = !options.untracked_changes;
-        status.listing_truncated=truncated;
+        status.listing_truncated = truncated;
         let root = fs_safety::Root::open(worktree).ok();
         // Capture identities before the readers. A concurrent write after a
         // diff must remain detectable by the next missed-event reconciliation.
@@ -4801,9 +4812,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if options.untracked_files
             && let Some((files, ..)) = cache.metadata.as_mut()
         {
-            let (output,truncated)=self.listing_output(&self.working_files_command(worktree),options.status_limit,status_limit::Format::Files,cancellation)?;
+            let (output, truncated) = self.listing_output(
+                &self.working_files_command(worktree),
+                options.status_limit,
+                status_limit::Format::Files,
+                cancellation,
+            )?;
             *files = invalid_output(parse_working_files(&output.stdout), output)?;
-            files.listing_truncated=truncated;
+            files.listing_truncated = truncated;
         }
         if cache.metadata.is_none() {
             let files_command = if options.untracked_files {
@@ -4811,9 +4827,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             } else {
                 self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
             };
-            let (output,truncated)=self.listing_output(&files_command,options.status_limit,status_limit::Format::Files,cancellation)?;
+            let (output, truncated) = self.listing_output(
+                &files_command,
+                options.status_limit,
+                status_limit::Format::Files,
+                cancellation,
+            )?;
             let mut files = invalid_output(parse_working_files(&output.stdout), output)?;
-            files.listing_truncated=truncated;
+            files.listing_truncated = truncated;
             let (remotes, publication_config, dependencies) = self
                 .observed_publication_configuration(
                     worktree,
@@ -5121,7 +5142,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             let mut records = Vec::new();
             for command in commands {
-                let (output,_) = self.listing_output(
+                let (output, _) = self.listing_output(
                     &snapshot_fsmonitor(command, cache.fsmonitor.as_deref()),
                     options.status_limit,
                     status_limit::Format::Numstat,

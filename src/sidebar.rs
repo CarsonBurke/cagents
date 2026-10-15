@@ -112,9 +112,10 @@ const PANEL_ROW_HEIGHT: f32 = design::DENSE_ROW_HEIGHT;
 /// filter narrows to them - rather than a silent truncation.
 pub(crate) const MAX_VISIBLE_FILE_ROWS: usize = 400;
 /// Read-only sidebar summaries never authorize complete-set mutations.
-pub(crate) const STATUS_DISPLAY_LIMIT:usize=10_000;
+pub(crate) const STATUS_DISPLAY_LIMIT: usize = 10_000;
 /// Only viewport rows plus overscan are mounted; bulk commands retain the full group.
-const MAX_VISIBLE_CHANGE_ROWS: usize = crate::change_list::VIEW_ROWS + 2 * crate::change_list::OVERSCAN;
+const MAX_VISIBLE_CHANGE_ROWS: usize =
+    crate::change_list::VIEW_ROWS + 2 * crate::change_list::OVERSCAN;
 /// How many open pull requests one listing asks `gh` for.
 ///
 /// Defined here, beside the only surfaces that render a number out of the
@@ -727,7 +728,15 @@ impl SidebarWorktree {
         let untracked_complete = dirty.is_some();
         let label = worktree_display_name(&path, branch.as_deref(), detached);
         let path_label = path.display().to_string();
-        let status = status_summary(detached, locked, dirty.as_ref(), false, false, ahead, behind);
+        let status = status_summary(
+            detached,
+            locked,
+            dirty.as_ref(),
+            false,
+            false,
+            ahead,
+            behind,
+        );
         let accessible_name = format!(
             "Open worktree {label}, {}, {status}",
             branch.as_deref().unwrap_or(&path_label)
@@ -810,7 +819,8 @@ impl SidebarWorktree {
         );
         row.untracked_omitted = status.is_some_and(|status| status.untracked_omitted);
         row.listing_truncated = status.is_some_and(|status| status.listing_truncated);
-        row.untracked_complete = status.is_some_and(|status| !status.untracked_omitted && !status.listing_truncated);
+        row.untracked_complete =
+            status.is_some_and(|status| !status.untracked_omitted && !status.listing_truncated);
         row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
         row
@@ -875,22 +885,30 @@ impl SidebarWorktree {
         // Only a successful complete full read can authorize reuse of its
         // untracked count. A tracked-only cap is independent of that saved
         // completeness; a capped full read or read error invalidates it.
-        let mut dirty=status.dirty.clone();
-        let reuse_untracked=status.untracked_omitted && self.untracked_complete && self.status_error.is_none();
-        let untracked_complete=reuse_untracked || !status.untracked_omitted && !status.listing_truncated;
-        let untracked_omitted=status.untracked_omitted && !reuse_untracked;
-        if reuse_untracked {dirty.untracked=self.dirty.as_ref().map_or(0,|known|known.untracked);}
+        let mut dirty = status.dirty.clone();
+        let reuse_untracked =
+            status.untracked_omitted && self.untracked_complete && self.status_error.is_none();
+        let untracked_complete =
+            reuse_untracked || !status.untracked_omitted && !status.listing_truncated;
+        let untracked_omitted = status.untracked_omitted && !reuse_untracked;
+        if reuse_untracked {
+            dirty.untracked = self.dirty.as_ref().map_or(0, |known| known.untracked);
+        }
         if self.status_error.is_none()
-            && self.untracked_omitted==untracked_omitted
-            && self.untracked_complete==untracked_complete
-            && self.listing_truncated==status.listing_truncated
-            && self.dirty.as_ref()==Some(&dirty)
-            && self.ahead==ahead && self.behind==behind {return;}
-        self.untracked_complete=untracked_complete;
-        self.status_error=None;
-        self.dirty=Some(dirty);
-        self.untracked_omitted=untracked_omitted;
-        self.listing_truncated=status.listing_truncated;
+            && self.untracked_omitted == untracked_omitted
+            && self.untracked_complete == untracked_complete
+            && self.listing_truncated == status.listing_truncated
+            && self.dirty.as_ref() == Some(&dirty)
+            && self.ahead == ahead
+            && self.behind == behind
+        {
+            return;
+        }
+        self.untracked_complete = untracked_complete;
+        self.status_error = None;
+        self.dirty = Some(dirty);
+        self.untracked_omitted = untracked_omitted;
+        self.listing_truncated = status.listing_truncated;
         self.ahead = ahead;
         self.behind = behind;
         self.refresh_status_chrome();
@@ -979,23 +997,23 @@ impl SidebarWorktree {
             self.chrome.delete_name = format!("Delete merged worktree {label}").into_boxed_str();
             self.chrome.label = label.into();
         }
-        self.chrome.dirty_badge =
-            self.dirty
-                .as_ref()
-                .filter(|dirty| dirty.is_dirty() || self.listing_truncated)
-                .map(|dirty| {
-                    format!(
-                        "{}{} {}changes",
-                        dirty_count(dirty),
-                        if self.listing_truncated { "+" } else { "" },
-                        if self.untracked_omitted {
-                            "tracked "
-                        } else {
-                            ""
-                        }
-                    )
-                    .into_boxed_str()
-                });
+        self.chrome.dirty_badge = self
+            .dirty
+            .as_ref()
+            .filter(|dirty| dirty.is_dirty() || self.listing_truncated)
+            .map(|dirty| {
+                format!(
+                    "{}{} {}changes",
+                    dirty_count(dirty),
+                    if self.listing_truncated { "+" } else { "" },
+                    if self.untracked_omitted {
+                        "tracked "
+                    } else {
+                        ""
+                    }
+                )
+                .into_boxed_str()
+            });
         if self.status_error.is_some() {
             self.chrome.dirty_badge = Some(match self.chrome.dirty_badge.take() {
                 Some(badge) => format!("Last known: {badge}").into_boxed_str(),
@@ -2004,20 +2022,24 @@ fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
 }
 
 fn change_file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
-    crate::change_list::compact_tree(build_file_tree(paths)).into_iter().map(|entry| {
-        let kind = if entry.directory { "folder" } else { "file" };
-        FileRow {
-            chrome: FileRowChrome {
-                folded: fold(&entry.path.display()),
-                accessible_name: format!("Open {kind} {}", entry.path.display()).into_boxed_str(),
-                label: entry.label.into_boxed_str(),
-            },
-            path: entry.path,
-            depth: entry.depth,
-            directory: entry.directory,
-            ignored: false,
-        }
-    }).collect()
+    crate::change_list::compact_tree(build_file_tree(paths))
+        .into_iter()
+        .map(|entry| {
+            let kind = if entry.directory { "folder" } else { "file" };
+            FileRow {
+                chrome: FileRowChrome {
+                    folded: fold(&entry.path.display()),
+                    accessible_name: format!("Open {kind} {}", entry.path.display())
+                        .into_boxed_str(),
+                    label: entry.label.into_boxed_str(),
+                },
+                path: entry.path,
+                depth: entry.depth,
+                directory: entry.directory,
+                ignored: false,
+            }
+        })
+        .collect()
 }
 
 fn file_rows_from_listing(files: &[crate::repository_widget::RepositoryFile]) -> Vec<FileRow> {
@@ -3431,8 +3453,14 @@ impl SidebarState {
                     self.commit_draft.amend = *amend;
                 }
             }
-            SidebarAction::ChangeViewport { key, scope, first_row, epoch } => {
-                if self.active_worktree.as_ref() == Some(key) && self.change_scroll_epoch == *epoch {
+            SidebarAction::ChangeViewport {
+                key,
+                scope,
+                first_row,
+                epoch,
+            } => {
+                if self.active_worktree.as_ref() == Some(key) && self.change_scroll_epoch == *epoch
+                {
                     self.change_first_rows.insert(*scope, *first_row);
                 }
             }
@@ -5976,21 +6004,43 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
 /// reserved slot.
 fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
     if worktree.status_error.is_some()
-        || worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0)
-    { Icon::Warning } else { Icon::Changes }
+        || worktree
+            .dirty
+            .as_ref()
+            .is_some_and(|dirty| dirty.conflicted > 0)
+    {
+        Icon::Warning
+    } else {
+        Icon::Changes
+    }
 }
 
 fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
-    if worktree.status_error.is_some() { BadgeTone::Warning }
-    else if worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0) {
+    if worktree.status_error.is_some() {
+        BadgeTone::Warning
+    } else if worktree
+        .dirty
+        .as_ref()
+        .is_some_and(|dirty| dirty.conflicted > 0)
+    {
         BadgeTone::Danger
-    } else { BadgeTone::Warning }
+    } else {
+        BadgeTone::Warning
+    }
 }
 
 fn worktree_change_count(worktree: &SidebarWorktree) -> String {
-    if worktree.status_error.is_some() { return "?".to_owned(); }
+    if worktree.status_error.is_some() {
+        return "?".to_owned();
+    }
     let count = worktree.dirty.as_ref().map_or(0, dirty_count);
-    if count > 999 { "999+".to_owned() } else if worktree.listing_truncated {format!("{count}+")} else { count.to_string() }
+    if count > 999 {
+        "999+".to_owned()
+    } else if worktree.listing_truncated {
+        format!("{count}+")
+    } else {
+        count.to_string()
+    }
 }
 
 fn worktree_indicator(
@@ -6012,9 +6062,13 @@ fn worktree_indicator(
         ));
     }
     if compact && show_changes_icons {
-        return indicators
-            .dirty
-            .map(|label| status_icon(worktree_change_icon(worktree), label.to_owned(), worktree_change_tone(worktree)));
+        return indicators.dirty.map(|label| {
+            status_icon(
+                worktree_change_icon(worktree),
+                label.to_owned(),
+                worktree_change_tone(worktree),
+            )
+        });
     }
     None
 }
@@ -6093,7 +6147,10 @@ fn worktree_view<'a>(
                 widget::row::with_capacity(2)
                     .spacing(2)
                     .align_y(Alignment::Center)
-                    .push(toned_icon(worktree_change_icon(worktree), worktree_change_tone(worktree)))
+                    .push(toned_icon(
+                        worktree_change_icon(worktree),
+                        worktree_change_tone(worktree),
+                    ))
                     .push(design::caption(worktree_change_count(worktree))),
                 label.to_owned(),
             ));
@@ -7775,17 +7832,27 @@ fn change_viewport_rows<'a>(
     let mut count = 0;
     let mut skip_below = None;
     for row in rows {
-        if flat && row.directory { continue; }
+        if flat && row.directory {
+            continue;
+        }
         if let Some(depth) = skip_below {
-            if row.depth > depth { continue; }
+            if row.depth > depth {
+                continue;
+            }
             skip_below = None;
         }
-        if (start..end).contains(&count) { visible.push(row); }
+        if (start..end).contains(&count) {
+            visible.push(row);
+        }
         count += 1;
-        if !flat && row.directory && collapsed.is_some_and(|paths| paths.contains(&row.path)) { skip_below = Some(row.depth); }
+        if !flat && row.directory && collapsed.is_some_and(|paths| paths.contains(&row.path)) {
+            skip_below = Some(row.depth);
+        }
     }
     let clamped = first.min(count.saturating_sub(crate::change_list::VIEW_ROWS));
-    if clamped != first { return change_viewport_rows(rows, collapsed, flat, clamped); }
+    if clamped != first {
+        return change_viewport_rows(rows, collapsed, flat, clamped);
+    }
     (visible, count)
 }
 
@@ -7797,20 +7864,39 @@ fn virtual_changes<'a>(
     total: usize,
     _modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let range = crate::change_list::visible_range(total, state.change_first_rows.get(&scope).copied().unwrap_or(0));
+    let range = crate::change_list::visible_range(
+        total,
+        state.change_first_rows.get(&scope).copied().unwrap_or(0),
+    );
     let content = widget::column::with_children(vec![
-        widget::Space::new().height(range.start as f32 * PANEL_ROW_HEIGHT).into(),
+        widget::Space::new()
+            .height(range.start as f32 * PANEL_ROW_HEIGHT)
+            .into(),
         crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT),
-        widget::Space::new().height(total.saturating_sub(range.end) as f32 * PANEL_ROW_HEIGHT).into(),
+        widget::Space::new()
+            .height(total.saturating_sub(range.end) as f32 * PANEL_ROW_HEIGHT)
+            .into(),
     ]);
     let key = key.clone();
     let epoch = state.change_scroll_epoch;
-    let scroll:Element<'a,SidebarAction> = widget::scrollable(content)
-        .id(stable_id(format!("changes.scroll.{}.{scope:?}.{}", key.worktree_id, state.change_scroll_epoch)))
-        .on_scroll(move |viewport| SidebarAction::ChangeViewport { key: key.clone(), scope, epoch,
-            first_row: (viewport.absolute_offset().y / PANEL_ROW_HEIGHT).max(0.0) as usize })
-        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()))
-        .height(Length::Fixed((total.min(crate::change_list::VIEW_ROWS) as f32 * PANEL_ROW_HEIGHT).max(PANEL_ROW_HEIGHT)))
+    let scroll: Element<'a, SidebarAction> = widget::scrollable(content)
+        .id(stable_id(format!(
+            "changes.scroll.{}.{scope:?}.{}",
+            key.worktree_id, state.change_scroll_epoch
+        )))
+        .on_scroll(move |viewport| SidebarAction::ChangeViewport {
+            key: key.clone(),
+            scope,
+            epoch,
+            first_row: (viewport.absolute_offset().y / PANEL_ROW_HEIGHT).max(0.0) as usize,
+        })
+        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+            crate::design::scrollbar(),
+        ))
+        .height(Length::Fixed(
+            (total.min(crate::change_list::VIEW_ROWS) as f32 * PANEL_ROW_HEIGHT)
+                .max(PANEL_ROW_HEIGHT),
+        ))
         .width(Length::Fill)
         .into();
     // A scrollable ID only identifies operations; it does not reset State.
@@ -7999,9 +8085,13 @@ fn branch_changes_section<'a>(
                     file.depth,
                     widget::row::with_children(vec![
                         crate::file_icon::folder(!folded).into(),
-                        design::body(&*file.chrome.label).width(Length::Fill)
+                        design::body(&*file.chrome.label)
+                            .width(Length::Fill)
                             .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(EllipsizeHeightLimit::Lines(1))).into(),
+                            .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(
+                                EllipsizeHeightLimit::Lines(1),
+                            ))
+                            .into(),
                     ])
                     .spacing(space::XS)
                     .align_y(Alignment::Center),
@@ -8053,7 +8143,16 @@ fn branch_changes_section<'a>(
             modal_open,
         ) });
     }
-    column.push(virtual_changes(state, &source.key, scope, rows, total, modal_open)).into()
+    column
+        .push(virtual_changes(
+            state,
+            &source.key,
+            scope,
+            rows,
+            total,
+            modal_open,
+        ))
+        .into()
 }
 
 fn change_group_view<'a>(
@@ -8089,9 +8188,13 @@ fn change_group_view<'a>(
                     file.depth,
                     widget::row::with_children(vec![
                         crate::file_icon::folder(!folded).into(),
-                        design::body(&*file.chrome.label).width(Length::Fill)
+                        design::body(&*file.chrome.label)
+                            .width(Length::Fill)
                             .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(EllipsizeHeightLimit::Lines(1))).into(),
+                            .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(
+                                EllipsizeHeightLimit::Lines(1),
+                            ))
+                            .into(),
                     ])
                     .spacing(space::XS)
                     .align_y(Alignment::Center),
@@ -8199,7 +8302,9 @@ fn change_row_view<'a>(
                 Cow::Borrowed(&*chrome.label)
             })
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)))
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::Middle(
+                EllipsizeHeightLimit::Lines(1),
+            ))
             .width(Length::Fill)
             .into(),
             widget::container(status)
@@ -9416,7 +9521,7 @@ fn status_summary(
     locked: bool,
     dirty: Option<&DirtyState>,
     untracked_omitted: bool,
-    listing_truncated:bool,
+    listing_truncated: bool,
     ahead: Option<u64>,
     behind: Option<u64>,
 ) -> String {
@@ -9432,7 +9537,9 @@ fn status_summary(
         Some(_) => parts.push("No changes".to_owned()),
         None => parts.push("status unavailable".to_owned()),
     }
-    if listing_truncated {parts.push("listing limited".to_owned());}
+    if listing_truncated {
+        parts.push("listing limited".to_owned());
+    }
     if detached {
         parts.push("detached".to_owned());
     }
@@ -15857,56 +15964,69 @@ pub(crate) mod tests {
 
     #[test]
     fn capped_tracked_reads_keep_independent_complete_untracked_authority() {
-        let mut row=worktree(11,"feature/cap",false);
-        let mut full=StatusSnapshot::default();
-        full.dirty.untracked=12;
-        full.dirty.unstaged=2;
+        let mut row = worktree(11, "feature/cap", false);
+        let mut full = StatusSnapshot::default();
+        full.dirty.untracked = 12;
+        full.dirty.unstaged = 2;
         row.apply_status(&full);
-        let mut tracked=StatusSnapshot {untracked_omitted:true,listing_truncated:true,..Default::default()};
-        tracked.dirty.unstaged=3;
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            listing_truncated: true,
+            ..Default::default()
+        };
+        tracked.dirty.unstaged = 3;
         row.apply_status(&tracked);
-        assert_eq!(row.dirty.as_ref().unwrap().untracked,12);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
         assert!(row.untracked_complete);
-        assert_eq!(row.chrome.dirty_badge.as_deref(),Some("15+ changes"));
-        assert_eq!(worktree_change_count(&row),"15+");
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("15+ changes"));
+        assert_eq!(worktree_change_count(&row), "15+");
         assert!(row.status_description().contains("listing limited"));
-        tracked.listing_truncated=false;
+        tracked.listing_truncated = false;
         row.apply_status(&tracked);
-        assert_eq!(row.chrome.dirty_badge.as_deref(),Some("15 changes"));
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("15 changes"));
         assert!(row.untracked_complete);
-        let mut partial_full=StatusSnapshot {listing_truncated:true,..Default::default()};
-        partial_full.dirty.untracked=1;
+        let mut partial_full = StatusSnapshot {
+            listing_truncated: true,
+            ..Default::default()
+        };
+        partial_full.dirty.untracked = 1;
         row.apply_status(&partial_full);
         assert!(!row.untracked_complete);
         row.apply_status(&tracked);
-        assert_eq!(row.dirty.as_ref().unwrap().untracked,0);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
         assert!(row.untracked_omitted);
         assert!(!row.untracked_complete);
-        assert_eq!(row.chrome.dirty_badge.as_deref(),Some("3 tracked changes"));
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("3 tracked changes"));
         row.apply_status(&full);
         assert!(row.untracked_complete);
         assert!(!row.untracked_omitted);
         assert!(!row.listing_truncated);
-        assert_eq!(row.dirty.as_ref().unwrap().untracked,12);
+        assert_eq!(row.dirty.as_ref().unwrap().untracked, 12);
     }
 
     #[test]
     fn capped_zero_and_failed_reads_never_publish_a_complete_clean_claim() {
-        let mut row=worktree(11,"feature/large-record",false);
-        row.apply_status(&StatusSnapshot {listing_truncated:true,..Default::default()});
-        assert_eq!(row.chrome.dirty_badge.as_deref(),Some("0+ changes"));
-        assert_eq!(worktree_change_count(&row),"0+");
+        let mut row = worktree(11, "feature/large-record", false);
+        row.apply_status(&StatusSnapshot {
+            listing_truncated: true,
+            ..Default::default()
+        });
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("0+ changes"));
+        assert_eq!(worktree_change_count(&row), "0+");
         assert!(!row.status_description().contains("No changes"));
         row.apply_status_error(Some("status unavailable"));
-        assert_eq!(worktree_change_count(&row),"?");
+        assert_eq!(worktree_change_count(&row), "?");
         assert!(row.status_description().contains("Last known: 0+ changes"));
-        let mut tracked=StatusSnapshot {untracked_omitted:true,..Default::default()};
-        tracked.dirty.unstaged=1;
+        let mut tracked = StatusSnapshot {
+            untracked_omitted: true,
+            ..Default::default()
+        };
+        tracked.dirty.unstaged = 1;
         row.apply_status(&tracked);
         assert!(row.status_error.is_none());
         assert!(!row.untracked_complete);
         assert!(row.untracked_omitted);
-        assert_eq!(row.chrome.dirty_badge.as_deref(),Some("1 tracked changes"));
+        assert_eq!(row.chrome.dirty_badge.as_deref(), Some("1 tracked changes"));
         row.apply_status(&StatusSnapshot::default());
         assert!(row.untracked_complete);
         assert!(row.chrome.dirty_badge.is_none());
@@ -16015,10 +16135,19 @@ pub(crate) mod tests {
         source.groups = vec![ChangeGroup::new(
             source.key.worktree_id,
             ChangeArea::Unstaged,
-            (0..40_000).map(|index| ChangeRow::new(
-                source.key.worktree_id,
-                &changed(repo_path(&format!("file-{index:05}.rs")), ChangeArea::Unstaged, ChangeKind::Modified, None),
-            )).collect(),
+            (0..40_000)
+                .map(|index| {
+                    ChangeRow::new(
+                        source.key.worktree_id,
+                        &changed(
+                            repo_path(&format!("file-{index:05}.rs")),
+                            ChangeArea::Unstaged,
+                            ChangeKind::Modified,
+                            None,
+                        ),
+                    )
+                })
+                .collect(),
         )];
         let group = &source.groups[0];
         let first = group.rows.first().unwrap().chrome.stage_id.to_string();
@@ -16028,61 +16157,150 @@ pub(crate) mod tests {
         let ids = control_ids(&change_group_view(&state, &source, group, false));
         assert!(ids.contains(&first));
         assert!(!ids.contains(&last));
-        assert!(ids.len() <= MAX_VISIBLE_CHANGE_ROWS * 8 + 8, "mounted {} controls", ids.len());
+        assert!(
+            ids.len() <= MAX_VISIBLE_CHANGE_ROWS * 8 + 8,
+            "mounted {} controls",
+            ids.len()
+        );
         state.apply(&SidebarAction::ChangeViewport {
-            key:source.key.clone(), scope:ChangeTreeScope::Area(group.area), first_row:39_984, epoch:state.change_scroll_epoch,
+            key: source.key.clone(),
+            scope: ChangeTreeScope::Area(group.area),
+            first_row: 39_984,
+            epoch: state.change_scroll_epoch,
         });
         let ids = control_ids(&change_group_view(&state, &source, group, false));
         assert!(!ids.contains(&first));
         assert!(ids.contains(&last));
-        assert!(ids.len() <= MAX_VISIBLE_CHANGE_ROWS * 8 + 8, "mounted {} controls", ids.len());
-        assert_eq!(group.rows.len(), 40_000, "virtualization retains the complete command model");
-        let old_epoch=state.change_scroll_epoch;
-        state.apply(&SidebarAction::SetChangeListMode { key:source.key.clone(), mode:FileListMode::Flat });
-        state.apply(&SidebarAction::ChangeViewport { key:source.key.clone(), scope:ChangeTreeScope::Area(group.area), first_row:39_984, epoch:old_epoch });
-        assert!(state.change_first_rows.is_empty(), "old layout callbacks cannot undo a list-mode scroll reset");
+        assert!(
+            ids.len() <= MAX_VISIBLE_CHANGE_ROWS * 8 + 8,
+            "mounted {} controls",
+            ids.len()
+        );
+        assert_eq!(
+            group.rows.len(),
+            40_000,
+            "virtualization retains the complete command model"
+        );
+        let old_epoch = state.change_scroll_epoch;
+        state.apply(&SidebarAction::SetChangeListMode {
+            key: source.key.clone(),
+            mode: FileListMode::Flat,
+        });
+        state.apply(&SidebarAction::ChangeViewport {
+            key: source.key.clone(),
+            scope: ChangeTreeScope::Area(group.area),
+            first_row: 39_984,
+            epoch: old_epoch,
+        });
+        assert!(
+            state.change_first_rows.is_empty(),
+            "old layout callbacks cannot undo a list-mode scroll reset"
+        );
         assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
         state.apply(&SidebarAction::ChangeViewport {
-            key:source.key.clone(), scope:ChangeTreeScope::Area(group.area), first_row:39_984, epoch:state.change_scroll_epoch,
+            key: source.key.clone(),
+            scope: ChangeTreeScope::Area(group.area),
+            first_row: 39_984,
+            epoch: state.change_scroll_epoch,
         });
-        assert!(state.change_first_rows.is_empty(), "old worktree scroll callbacks cannot move the newly bound pane");
+        assert!(
+            state.change_first_rows.is_empty(),
+            "old worktree scroll callbacks cannot move the newly bound pane"
+        );
     }
 
     #[test]
     fn changing_change_layout_resets_the_native_scroll_state_with_its_coordinates() {
-        use cosmic::iced::{Rectangle,Vector,advanced::widget::{Operation,operation}};
+        use cosmic::iced::{
+            Rectangle, Vector,
+            advanced::widget::{Operation, operation},
+        };
         #[derive(Default)]
         struct Offset(Option<f32>);
         impl Operation for Offset {
-            fn traverse(&mut self, operate:&mut dyn FnMut(&mut dyn Operation)) {operate(self);}
-            fn scrollable(&mut self,_id:Option<&Id>,_bounds:Rectangle,_content:Rectangle,translation:Vector,_state:&mut dyn operation::Scrollable) {self.0=Some(translation.y);}
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                _id: Option<&Id>,
+                _bounds: Rectangle,
+                _content: Rectangle,
+                translation: Vector,
+                _state: &mut dyn operation::Scrollable,
+            ) {
+                self.0 = Some(translation.y);
+            }
         }
-        let mut source=source_control();
-        source.groups=vec![ChangeGroup::new(source.key.worktree_id,ChangeArea::Unstaged,
-            (0..200).map(|index|ChangeRow::new(source.key.worktree_id,&changed(repo_path(&format!("file-{index:04}.rs")),ChangeArea::Unstaged,ChangeKind::Modified,None))).collect())];
-        let model=panel_model();
-        let mut state=panel_state(&model);
-        let group=&source.groups[0];
-        let scope=ChangeTreeScope::Area(group.area);
-        let renderer=headless_renderer();
-        let mut element=change_group_view(&state,&source,group,false);
-        let mut tree=Tree::new(&element);
-        let limits=layout::Limits::new(Size::ZERO,Size::new(380.0,500.0));
-        let mut node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
-        let id=stable_id(format!("changes.scroll.{}.{scope:?}.{}",source.key.worktree_id,state.change_scroll_epoch));
-        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,
-            &mut operation::scrollable::scroll_to::<()>(id,operation::scrollable::AbsoluteOffset {x:None,y:Some(640.0)}));
-        let mut before=Offset::default();
-        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut before);
-        assert_eq!(before.0,Some(640.0));
+        let mut source = source_control();
+        source.groups = vec![ChangeGroup::new(
+            source.key.worktree_id,
+            ChangeArea::Unstaged,
+            (0..200)
+                .map(|index| {
+                    ChangeRow::new(
+                        source.key.worktree_id,
+                        &changed(
+                            repo_path(&format!("file-{index:04}.rs")),
+                            ChangeArea::Unstaged,
+                            ChangeKind::Modified,
+                            None,
+                        ),
+                    )
+                })
+                .collect(),
+        )];
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let group = &source.groups[0];
+        let scope = ChangeTreeScope::Area(group.area);
+        let renderer = headless_renderer();
+        let mut element = change_group_view(&state, &source, group, false);
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(380.0, 500.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let id = stable_id(format!(
+            "changes.scroll.{}.{scope:?}.{}",
+            source.key.worktree_id, state.change_scroll_epoch
+        ));
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                id,
+                operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(640.0),
+                },
+            ),
+        );
+        let mut before = Offset::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+        assert_eq!(before.0, Some(640.0));
         drop(element);
-        state.apply(&SidebarAction::SetChangeListMode {key:source.key.clone(),mode:FileListMode::Flat});
-        element=change_group_view(&state,&source,group,false);
+        state.apply(&SidebarAction::SetChangeListMode {
+            key: source.key.clone(),
+            mode: FileListMode::Flat,
+        });
+        element = change_group_view(&state, &source, group, false);
         tree.diff(&mut element);
-        node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
-        let mut after=Offset::default();
-        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut after);
-        assert_eq!(after.0,Some(0.0),"native offset and mounted row coordinates must reset together");
+        node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut after = Offset::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut after);
+        assert_eq!(
+            after.0,
+            Some(0.0),
+            "native offset and mounted row coordinates must reset together"
+        );
     }
 
     #[test]

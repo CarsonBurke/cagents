@@ -17784,7 +17784,12 @@ fn load_repository(
             let status = (!worktree.bare)
                 .then(|| {
                     service
-                        .status_projection(&worktree.path, true, sidebar::STATUS_DISPLAY_LIMIT, &cancellation)
+                        .status_projection(
+                            &worktree.path,
+                            true,
+                            sidebar::STATUS_DISPLAY_LIMIT,
+                            &cancellation,
+                        )
                         .ok()
                         .map(|status| status.display_summary())
                 })

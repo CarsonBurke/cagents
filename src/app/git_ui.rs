@@ -1081,8 +1081,14 @@ fn read_local_with_plan(
             )
         })
         .transpose()?
-        .or_else(|| previous_plan.and_then(|plan| plan.refresh_routing(
-            snapshot.worktrees.iter().map(|(record, _)| record), &upstreams)));
+        .or_else(|| {
+            previous_plan.and_then(|plan| {
+                plan.refresh_routing(
+                    snapshot.worktrees.iter().map(|(record, _)| record),
+                    &upstreams,
+                )
+            })
+        });
     Ok((snapshot, plan))
 }
 
@@ -2053,37 +2059,83 @@ mod tests {
     #[test]
     fn partial_watcher_recovery_repairs_missed_branch_routing_without_a_census() {
         const TEST: &str = "app::git_ui::tests::partial_watcher_recovery_repairs_missed_branch_routing_without_a_census";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::git_watch::tests::fixture_isolated(TEST) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repo");
         let project = ProjectId::new();
         let cancel = CancellationToken::default();
-        let (snapshot, plan) = read_local(project, fixture(&root), git_watch::Change {
-            topology: true, ..Default::default()
-        }, cancel.clone()).unwrap();
+        let (snapshot, plan) = read_local(
+            project,
+            fixture(&root),
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+            cancel.clone(),
+        )
+        .unwrap();
         let old_plan = plan.unwrap();
         let id = snapshot.worktrees[0].0.id;
         let index = fs::read(root.join(".git/index")).unwrap();
         fs::write(root.join(".git/index"), "corrupt index").unwrap();
-        let partial = git_watch::Change { worktrees: [id].into(), untracked: true, ..Default::default() };
-        let (failed, plan) = read_local_with_plan(project, snapshot, partial.clone(), cancel.clone(), Some(&old_plan)).unwrap();
+        let partial = git_watch::Change {
+            worktrees: [id].into(),
+            untracked: true,
+            ..Default::default()
+        };
+        let (failed, plan) = read_local_with_plan(
+            project,
+            snapshot,
+            partial.clone(),
+            cancel.clone(),
+            Some(&old_plan),
+        )
+        .unwrap();
         assert!(failed.status_errors.contains_key(&id));
         assert!(plan.is_none(), "failed row retains prior watch plan");
         fs::write(root.join(".git/index"), index).unwrap();
         git(&root, &["switch", "-c", "learned"]);
-        let (recovered, plan) = read_local_with_plan(project, failed, partial.clone(), cancel.clone(), Some(&old_plan)).unwrap();
+        let (recovered, plan) = read_local_with_plan(
+            project,
+            failed,
+            partial.clone(),
+            cancel.clone(),
+            Some(&old_plan),
+        )
+        .unwrap();
         assert!(!recovered.status_errors.contains_key(&id));
-        assert_eq!(recovered.worktrees[0].0.branch.as_deref(), Some("refs/heads/learned"));
+        assert_eq!(
+            recovered.worktrees[0].0.branch.as_deref(),
+            Some("refs/heads/learned")
+        );
         let plan = plan.expect("a new branch needs a pure routing refresh");
-        assert!(plan.matches(&recovered.repository.common_dir, &[recovered.worktrees[0].0.clone()]));
-        let (_, unchanged) = read_local_with_plan(project, recovered, partial, cancel, Some(&plan)).unwrap();
-        assert!(unchanged.is_none(), "unchanged partial success reuses existing coverage");
+        assert!(plan.matches(
+            &recovered.repository.common_dir,
+            &[recovered.worktrees[0].0.clone()]
+        ));
+        let (_, unchanged) =
+            read_local_with_plan(project, recovered, partial, cancel, Some(&plan)).unwrap();
+        assert!(
+            unchanged.is_none(),
+            "unchanged partial success reuses existing coverage"
+        );
         let monitor = git_watch::Monitor::start().unwrap();
         monitor.configure(vec![Arc::new(plan)]);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if monitor.drain().get(&project).is_some_and(|change| change.coverage == Some(true)) { break; }
-            assert!(Instant::now() < deadline, "routing configuration was not acknowledged");
+            if monitor
+                .drain()
+                .get(&project)
+                .is_some_and(|change| change.coverage == Some(true))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "routing configuration was not acknowledged"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         monitor.drain();
@@ -2092,8 +2144,17 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if monitor.drain().get(&project).is_some_and(|change| change.worktrees.contains(&id)) { break; }
-            assert!(Instant::now() < deadline, "new-branch event omitted the recovered worktree");
+            if monitor
+                .drain()
+                .get(&project)
+                .is_some_and(|change| change.worktrees.contains(&id))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "new-branch event omitted the recovered worktree"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
