@@ -2614,7 +2614,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
-        if !visible {self.raw_original.clear();}
+        if !visible {self.raw_original.evict();}
         images::sync(self);
         self.present()
     }

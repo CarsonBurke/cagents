@@ -77,6 +77,19 @@ impl State {
         let entries=std::mem::take(&mut self.entries);for (_,entry) in entries {retire_entry(entry);}self.aliases.clear();self.actor=None;self.session=None;self.incarnation=None;self.selected=None;self.restore_error=None;self.notice_revision=0;
         self.context=self.context.wrapping_add(1);self.revision=self.revision.wrapping_add(1);
     }
+    /// Hidden views retain only exact-source disclosure intent. A live reveal
+    /// re-reads the same complete call instead of retaining its body or relying
+    /// on the EOF sidecar. Identity changes still use clear().
+    pub(super) fn evict(&mut self) {
+        let mut changed=false;
+        for entry in self.entries.values_mut() {
+            changed |=entry.attempt.take().is_some();
+            if let Some(loaded)=entry.loaded.take() {retire_loaded(loaded);changed=true;}
+            if let Some(text)=entry.restored.take() {retire(text);changed=true;}
+            if changed {entry.revision=next_revision();}
+        }
+        if changed {self.context=self.context.wrapping_add(1);self.revision=self.revision.wrapping_add(1);}
+    }
     fn sync(&mut self,snapshot:&Snapshot,selected:Option<&str>,actor:Option<&Arc<ClientHandle>>) {
         let same_actor=match (&self.actor,actor) {(None,None)=>true,(Some(old),Some(new))=>old.as_ptr()==Arc::as_ptr(new),_=>false};
         if !same_actor || self.session!=snapshot.session_id || self.incarnation!=snapshot.source_incarnation || self.selected.as_deref()!=selected {self.clear();}
@@ -101,6 +114,15 @@ impl State {
         let removed:Vec<_>=self.entries.keys().filter(|key|!present.contains(*key)).cloned().collect();
         for key in removed {if let Some(entry)=self.entries.remove(&key) {retire_entry(entry);self.revision=self.revision.wrapping_add(1);}}
         self.aliases=aliases;
+        for entry in self.entries.values_mut() {
+            if entry.opened && entry.loaded.is_none() && entry.restored.is_none() && entry.attempt.is_none() && entry.error.is_none() {
+                match eligible(&entry.part) {
+                    Ok(())=>{self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);entry.revision=next_revision();},
+                    Err(error)=>entry.error=Some(error),
+                }
+                self.revision=self.revision.wrapping_add(1);
+            }
+        }
     }
     fn key(&self,item:&str,field:RawSourceField)->Option<Key> {
         let mut keys=self.aliases.get(item)?.iter().filter(|key|key.field==field);
@@ -125,6 +147,14 @@ impl State {
             if !entry.opened {return None;}
             let loaded=entry.loaded.as_ref()?;
             (loaded.record==record(&entry.part)).then(||Leaf {record:loaded.record.clone(),text:loaded.view.text.clone(),prefixes:loaded.prefixes.clone()})
+        }).collect()
+    }
+    /// Placeholder identities carry no text, only current-source suspended
+    /// selection intent while an already-open disclosure rehydrates.
+    pub(super) fn pending_paths(&self,item:&str)->Vec<[u32;2]> {
+        [RawSourceField::ToolInput,RawSourceField::CommandCall].into_iter().filter_map(|field| {
+            let key=self.key(item,field)?;let entry=self.entries.get(&key)?;
+            (entry.opened && entry.loaded.is_none() && entry.attempt.is_some()).then_some([10,field_index(field)])
         }).collect()
     }
     pub(super) fn complete_for_find(&self,item:&str)->bool {
@@ -213,7 +243,7 @@ fn stream(request:&Request)->Pin<Box<dyn iced::futures::Stream<Item=Message>+Sen
     }))
 }
 pub(super) fn sync(runtime:&mut Runtime) {
-    if !runtime.visible.load(Ordering::Relaxed) {runtime.raw_original.clear();return;}
+    if !runtime.visible.load(Ordering::Relaxed) {runtime.raw_original.evict();return;}
     let handle=runtime.handle().cloned();runtime.raw_original.sync(&runtime.snapshot,runtime.selected_subagent.as_deref(),handle.as_ref());
 }
 pub(super) fn subscriptions(runtime:&Runtime)->Vec<Subscription<Message>> {
@@ -559,6 +589,27 @@ mod tests {
     fn raw_prefix_checkpoints_follow_exact_display_bytes_including_utf8_and_newlines() {
         let text="λ\r\n".repeat(3000);let values=prefixes(&text);
         for (index,value) in values.iter().enumerate() {assert_eq!(*value,*blake3::hash(&text.as_bytes()[..index*4096]).as_bytes());}
+    }
+    #[tokio::test]
+    async fn same_actor_live_hide_releases_call_and_rehydrates_only_current_disclosure_intent() {
+        let text="{ \"original\": \"live hidden input\" }";let(mut runtime,part)=runtime_fixture(text);
+        toggle(&mut runtime,&part.item_id,part.field,false);let context=runtime.raw_original.context;
+        let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
+        let weak=Arc::downgrade(&runtime.raw_original.loaded_leaves(&part.item_id)[0].text);
+        let _=runtime.set_visible(false);flush();assert!(weak.upgrade().is_none());
+        assert!(runtime.raw_original.entries[&Key::of(&part)].opened);
+        assert_eq!(runtime.raw_original.retained_bytes(),0);
+        let _=runtime.set_visible(true);sync(&mut runtime);
+        assert_eq!(runtime.raw_original.pending_paths(&part.item_id),vec![[10,0]]);
+        let context=runtime.raw_original.context;let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
+        assert_eq!(runtime.raw_original.loaded_leaves(&part.item_id)[0].text.as_ref(),text);
+        let _=runtime.set_visible(false);
+        Arc::make_mut(&mut runtime.snapshot).raw_source_parts[0].epoch.revision+=1;
+        let _=runtime.set_visible(true);sync(&mut runtime);
+        assert!(!runtime.raw_original.entries[&Key::of(&part)].opened,"new source cannot inherit old disclosure intent");
+        runtime.raw_original.clear();assert!(runtime.raw_original.entries.is_empty(),"reset/revoke fully forget intent");
     }
     #[test]
     fn source_reader_and_retirement_payloads_require_safe_send() {
