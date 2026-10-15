@@ -4638,7 +4638,8 @@ impl Cagents {
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
         self.notices.resolve(&format!("chat-resume:{card}"));
-        self.notices.resolve_target("daemon-interrupted-turns", card);
+        self.notices
+            .resolve_target("daemon-interrupted-turns", card);
         self.chat_ui.default_chats.remove(&card);
         // A start still in flight is not dropped with the card: whatever it
         // leaves in the daemon is given up when it answers, as for a close.
@@ -6265,7 +6266,8 @@ impl Cagents {
                                 self.retire_switched_terminal(terminal, &session);
                             }
                         }
-                        self.notices.resolve(&format!("chat-resume:{}", target.card));
+                        self.notices
+                            .resolve(&format!("chat-resume:{}", target.card));
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
                         }
@@ -6384,7 +6386,11 @@ impl Cagents {
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.error = Some("Couldn’t reopen this conversation. Open application notices for details.".into());
-                            self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
+                            self.status = Some(
+                                TransientNotice::error("Couldn’t reopen this conversation")
+                                    .key(format!("chat-resume:{}", target.card))
+                                    .details(failure.message),
+                            );
                             runtime.disconnected = true;
                             self.observe_agent_activity_for_card(target.card, None);
                         } else if matches!(
@@ -6392,12 +6398,20 @@ impl Cagents {
                             Some(CardKind::Chat(_))
                         ) {
                             self.fail_runtime(target.card, "Couldn’t reopen this conversation. Open application notices for details.".into());
-                            self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
+                            self.status = Some(
+                                TransientNotice::error("Couldn’t reopen this conversation")
+                                    .key(format!("chat-resume:{}", target.card))
+                                    .details(failure.message),
+                            );
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
                             self.chat_ui.fresh_offers.remove(&target.card);
-                            self.status = Some(TransientNotice::error("Couldn’t reopen this conversation").key(format!("chat-resume:{}", target.card)).details(failure.message));
+                            self.status = Some(
+                                TransientNotice::error("Couldn’t reopen this conversation")
+                                    .key(format!("chat-resume:{}", target.card))
+                                    .details(failure.message),
+                            );
                         }
                         let cleanup = if account_source.is_some() {
                             self.retire_chat(target.card, None, Some(attempt.session))
@@ -7323,7 +7337,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7418,7 +7433,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -7461,7 +7477,8 @@ impl Cagents {
                 let pending = runtime.pending.take().unwrap();
                 let provider = runtime.session.launch.provider;
                 if result.is_ok() && pending.sent.is_some() {
-                    self.notices.resolve_target("daemon-interrupted-turns", target.card);
+                    self.notices
+                        .resolve_target("daemon-interrupted-turns", target.card);
                 }
                 if result.is_ok()
                     && let Some((model, reasoning)) = pending.model.clone()
@@ -11154,14 +11171,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11180,7 +11202,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
@@ -12728,16 +12753,28 @@ mod tests {
         app.chat_runtime_mut(target).unwrap().disconnected = true;
         drop(app.update(Message::ChatUi(Action::Reconnect(target))));
         let attempt = chat_runtime_attempt(&app, card);
-        answer_start(&mut app, attempt, Err(chat::StartFailure::retry("Exact native chat not found")));
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure::retry("Exact native chat not found")),
+        );
         let key = format!("chat-resume:{card}");
-        assert!(app.notices.recent().any(|entry| entry.notice.key.as_deref() == Some(key.as_str())));
+        assert!(
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.key.as_deref() == Some(key.as_str()))
+        );
         let retry = chat_runtime(&app, card).target;
         drop(app.update(Message::ChatUi(Action::Reconnect(retry))));
         let attempt = chat_runtime_attempt(&app, card);
         let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
         answer_start(&mut app, attempt, Ok(handle));
         assert!(chat_runtime(&app, card).connected());
-        assert!(!app.notices.recent().any(|entry| entry.notice.key.as_deref() == Some(key.as_str())));
+        assert!(
+            !app.notices
+                .recent()
+                .any(|entry| entry.notice.key.as_deref() == Some(key.as_str()))
+        );
     }
 
     #[test]
@@ -15762,7 +15799,11 @@ mod tests {
             "a failed attachment can be retried"
         );
         assert_eq!(errors(&app), ["Couldn’t reopen this conversation"]);
-        let notice = app.notices.recent().find(|entry| entry.notice.key.as_deref() == Some(format!("chat-resume:{id}").as_str())).unwrap();
+        let notice = app
+            .notices
+            .recent()
+            .find(|entry| entry.notice.key.as_deref() == Some(format!("chat-resume:{id}").as_str()))
+            .unwrap();
         assert_eq!(notice.notice.details.as_deref(), Some(reason));
         assert!(
             matches!(
