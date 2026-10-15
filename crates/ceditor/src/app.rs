@@ -678,6 +678,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectoryListed { .. }
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::ConfiguredFileLoaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
@@ -1441,6 +1442,7 @@ impl Editor {
         };
         runtime.set_standalone(true);
         runtime.set_auto_save(self.settings.editor_auto_save);
+        runtime.set_editor_tab_width(self.settings.editor_tab_width);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_line_height(self.settings.terminal_line_height);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
@@ -3503,7 +3505,7 @@ impl Application for Editor {
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
-                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. })
+                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. } | RepositoryAction::ConfiguredFileLoaded { .. })
                         && self.active == Some(id)
                         && !self.modal_open();
                     let saved = matches!(action, RepositoryAction::SaveFinished { .. });
@@ -4053,6 +4055,7 @@ impl Application for Editor {
                     self.shortcut_draft = self.shortcuts.clone();
                     for tab in &mut self.tabs {
                         tab.runtime.set_auto_save(self.settings.editor_auto_save);
+                        tab.runtime.set_editor_tab_width(self.settings.editor_tab_width);
                         tab.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                         tab.runtime
                             .set_line_height(self.settings.terminal_line_height);
@@ -7415,6 +7418,25 @@ mod tests {
                 ),
             })),
         );
+    }
+
+    #[test]
+    fn configured_file_completion_survives_modal_and_uses_saved_tab_width() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("empty.rs"), "").unwrap();
+        let mut app = configured(&directory);
+        app.settings.editor_auto_save = false;
+        app.settings.editor_tab_width = 8;
+        let task = app.add(Opened { root: directory.path().into(), file: Some("empty.rs".into()), snapshot: None }, true);
+        let card = app.active.unwrap();
+        app.settings_open = true;
+        run_tasks(&mut app, task);
+        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some(""));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (8, true));
+        app.settings_open = false;
+        drop(app.update(Message::ResetSettings));
+        drop(app.update(Message::ResetSettings));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (4, true));
     }
 
     #[test]
