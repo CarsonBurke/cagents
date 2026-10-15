@@ -92,7 +92,9 @@ impl Store {
             })
             .collect();
         let changed = self.source_revision != state.source_revision
-            || cached.values().any(|part| part.epoch.incarnation != self.source_incarnation);
+            || cached
+                .values()
+                .any(|part| part.epoch.incarnation != self.source_incarnation);
         let wanted: Vec<_> = visible
             .iter()
             .filter(|(key, _)| changed || !cached.contains_key(key))
@@ -157,7 +159,10 @@ impl Store {
                 end: if replacement { 0 } else { source_len },
                 source_len,
                 replacement,
-                epoch: SourceEpoch { incarnation: self.source_incarnation, revision: epoch },
+                epoch: SourceEpoch {
+                    incarnation: self.source_incarnation,
+                    revision: epoch,
+                },
                 metadata,
             });
         }
@@ -206,7 +211,10 @@ impl Store {
             (epoch, length, SourceMetadata::from_item(&item))
         };
         let metadata = metadata.ok_or(SourceError::Unsupported)?;
-        let epoch = SourceEpoch { incarnation: self.source_incarnation, revision: epoch };
+        let epoch = SourceEpoch {
+            incarnation: self.source_incarnation,
+            revision: epoch,
+        };
         if query
             .expected_epoch
             .is_some_and(|expected| expected != epoch)
@@ -663,50 +671,96 @@ mod tests {
 
     #[test]
     fn replaced_store_cannot_reuse_child_aliases_from_an_older_publication() {
-        let mut old=Store::new().unwrap();
-        let mut replacement=Store::new().unwrap();
-        let original=item("root","full original");
-        for store in [&mut old,&mut replacement] {
-            store.apply(Event::SubagentItem{id:"child".into(),item:original.clone()}).unwrap();
+        let mut old = Store::new().unwrap();
+        let mut replacement = Store::new().unwrap();
+        let original = item("root", "full original");
+        for store in [&mut old, &mut replacement] {
+            store
+                .apply(Event::SubagentItem {
+                    id: "child".into(),
+                    item: original.clone(),
+                })
+                .unwrap();
         }
-        let mut state=crate::chat::Snapshot::default();
-        state.subagents.push(crate::chat::Subagent{id:"child".into(),items:vec![std::sync::Arc::new(original)],kind:String::new(),description:String::new(),status:crate::chat::ToolStatus::Running,background:false,model:None,waiting:false,detail:String::new()});
+        let mut state = crate::chat::Snapshot::default();
+        state.subagents.push(crate::chat::Subagent {
+            id: "child".into(),
+            items: vec![std::sync::Arc::new(original)],
+            kind: String::new(),
+            description: String::new(),
+            status: crate::chat::ToolStatus::Running,
+            background: false,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+        });
         old.publish_source_parts(&mut state).unwrap();
-        let prior=state.source_parts[0].epoch;
+        let prior = state.source_parts[0].epoch;
         // A replacement can retain the same client Snapshot and restart its
         // local publication counter. It must still refresh cached aliases.
-        replacement.source_revision=state.source_revision;
+        replacement.source_revision = state.source_revision;
         replacement.publish_source_parts(&mut state).unwrap();
-        assert_eq!(state.source_parts[0].epoch.incarnation,replacement.source_incarnation);
-        assert_ne!(state.source_parts[0].epoch.incarnation,prior.incarnation);
-        assert_eq!(replacement.source_page(query(Some("child"),"root")).unwrap().epoch,state.source_parts[0].epoch);
+        assert_eq!(
+            state.source_parts[0].epoch.incarnation,
+            replacement.source_incarnation
+        );
+        assert_ne!(state.source_parts[0].epoch.incarnation, prior.incarnation);
+        assert_eq!(
+            replacement
+                .source_page(query(Some("child"), "root"))
+                .unwrap()
+                .epoch,
+            state.source_parts[0].epoch
+        );
     }
 
     #[test]
     fn replaced_store_rejects_same_revision_and_identical_source_prefix() {
-        for agent in [None,Some("child")] {
-            let mut old=Store::new().unwrap();
-            let mut replacement=Store::new().unwrap();
-            let text="same original bytes".repeat(PAGE_BYTES/4);
-            for store in [&mut old,&mut replacement] {
-                let event=if let Some(agent)=agent {Event::SubagentItem{id:agent.into(),item:item("root",&text)}} else {Event::Item(item("root",&text))};
+        for agent in [None, Some("child")] {
+            let mut old = Store::new().unwrap();
+            let mut replacement = Store::new().unwrap();
+            let text = "same original bytes".repeat(PAGE_BYTES / 4);
+            for store in [&mut old, &mut replacement] {
+                let event = if let Some(agent) = agent {
+                    Event::SubagentItem {
+                        id: agent.into(),
+                        item: item("root", &text),
+                    }
+                } else {
+                    Event::Item(item("root", &text))
+                };
                 store.apply(event).unwrap();
             }
-            let first=old.source_page(query(agent,"root")).unwrap();
+            let first = old.source_page(query(agent, "root")).unwrap();
             // An execed replacement can restart its process-local revision
             // counter. Simulate that exact collision without relying on globals.
-            if let Some(agent)=agent {
-                replacement.db.execute("UPDATE child_sources SET epoch=?1 WHERE agent=?2 AND id='root'",params![first.epoch.revision,agent]).unwrap();
+            if let Some(agent) = agent {
+                replacement
+                    .db
+                    .execute(
+                        "UPDATE child_sources SET epoch=?1 WHERE agent=?2 AND id='root'",
+                        params![first.epoch.revision, agent],
+                    )
+                    .unwrap();
             } else {
-                replacement.db.execute("UPDATE source_epochs SET epoch=?1 WHERE id='root'",[first.epoch.revision]).unwrap();
+                replacement
+                    .db
+                    .execute(
+                        "UPDATE source_epochs SET epoch=?1 WHERE id='root'",
+                        [first.epoch.revision],
+                    )
+                    .unwrap();
             }
-            let current=replacement.source_page(query(agent,"root")).unwrap();
-            assert_eq!(current.epoch.revision,first.epoch.revision);
-            assert_ne!(current.epoch.incarnation,first.epoch.incarnation);
-            assert_eq!(current.source_len,first.source_len);
-            assert_eq!(current.text,first.text);
-            assert_eq!(replacement.source_page(next(&first)),Err(SourceError::Changed));
-            assert_eq!(old.source_page(next(&first)).unwrap().epoch,first.epoch);
+            let current = replacement.source_page(query(agent, "root")).unwrap();
+            assert_eq!(current.epoch.revision, first.epoch.revision);
+            assert_ne!(current.epoch.incarnation, first.epoch.incarnation);
+            assert_eq!(current.source_len, first.source_len);
+            assert_eq!(current.text, first.text);
+            assert_eq!(
+                replacement.source_page(next(&first)),
+                Err(SourceError::Changed)
+            );
+            assert_eq!(old.source_page(next(&first)).unwrap().epoch, first.epoch);
         }
     }
 

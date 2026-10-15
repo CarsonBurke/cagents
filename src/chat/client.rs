@@ -3273,7 +3273,10 @@ mod tests {
                         chat_id,
                         result: Ok(SourcePage {
                             source: query.source,
-                            epoch: super::super::cache::SourceEpoch { incarnation: uuid::Uuid::new_v4(), revision: 1 },
+                            epoch: super::super::cache::SourceEpoch {
+                                incarnation: uuid::Uuid::new_v4(),
+                                revision: 1,
+                            },
                             source_len: text.len(),
                             offset: 0,
                             next_offset: text.len(),

@@ -122,7 +122,10 @@ mod tests {
             source: source.clone(),
             offset: 4,
             limit: PAGE_BYTES,
-            expected_epoch: Some(SourceEpoch { incarnation: uuid::Uuid::nil(), revision: 17 }),
+            expected_epoch: Some(SourceEpoch {
+                incarnation: uuid::Uuid::nil(),
+                revision: 17,
+            }),
             until: Some(8),
         };
         let chat_id = TerminalId::new();
@@ -136,7 +139,10 @@ mod tests {
         );
         let page = SourcePage {
             source,
-            epoch: SourceEpoch { incarnation: uuid::Uuid::nil(), revision: 17 },
+            epoch: SourceEpoch {
+                incarnation: uuid::Uuid::nil(),
+                revision: 17,
+            },
             source_len: 8,
             offset: 4,
             next_offset: 8,

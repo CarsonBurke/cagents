@@ -1200,7 +1200,10 @@ impl Store {
                         end: end0,
                         source_len: len0,
                         replacement: false,
-                        epoch: crate::chat::cache::SourceEpoch { incarnation: self.source_incarnation, revision: source_epoch },
+                        epoch: crate::chat::cache::SourceEpoch {
+                            incarnation: self.source_incarnation,
+                            revision: source_epoch,
+                        },
                         metadata: crate::chat::cache::SourceMetadata::from_item(&base).unwrap(),
                     });
                 }
