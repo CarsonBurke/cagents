@@ -867,15 +867,15 @@ fn parse_with<'a>(
                 code_block = false;
 
 
-                let source:Arc<str>=Arc::from(mem::take(&mut code));
+                let display:Arc<str>=Arc::from(mem::take(&mut code));
                 produce(
                     state.borrow_mut(),
                     &mut stack,
                     Item::CodeBlock {
                         language: code_language.take(),
-                        source: source.clone(),
-                        reader_source: super::reader_source::Source::new(&source),
-                        code: source,
+                        source: display.clone(),
+                        reader_source: super::reader_source::Source::new(&display),
+                        code: display,
                         lines: code_lines.drain(..).collect(),
                     },
                     source,
