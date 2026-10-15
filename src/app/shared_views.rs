@@ -1083,7 +1083,10 @@ impl Cagents {
             }
         }
         if active {
-            tasks.push(self.project_shared_strip(&view.panes, &visible));
+            let public_panes = view.panes.iter()
+                .filter(|pane| !self.configured_chat_is_local(pane.id))
+                .collect::<Vec<_>>();
+            tasks.push(self.project_shared_strip(&public_panes, &visible));
         }
         if !self.shared_views.applying {
             self.persist();
@@ -1164,7 +1167,7 @@ impl Cagents {
         self.sidebar_state.clear_agent_activity(id);
     }
 
-    fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
+    fn project_shared_strip(&mut self, panes: &[&Pane], visible: &[CardId]) -> Task<Message> {
         let camera = self.workspace.camera().offset();
         let focus = self.workspace.focused();
         let mut updates = Vec::new();
@@ -2186,6 +2189,8 @@ mod tests {
         // A backup shares the original card ID, but a peer's descriptor must
         // not replace this window's still-unstarted private choices.
         let before = app.card_state(card).unwrap().kind.clone();
+        let strip_before = app.workspace.card(card).unwrap().clone();
+        let order_before = app.workspace.order().collect::<Vec<_>>();
         let mut peer_issued = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
         let CardKind::Chat(session) = &mut peer_issued.kind else { panic!("draft") };
         session.proof = Some(crate::model::HostSessionProof {
@@ -2193,9 +2198,14 @@ mod tests {
             boot_id: "peer-boot".into(),
             host_incarnation: "peer-incarnation".into(),
         });
-        public.panes.push(peer_issued);
+        peer_issued.title = "different peer title".into();
+        peer_issued.user_title = Some("peer-only custom title".into());
+        peer_issued.width_fraction = 0.9;
+        public.panes.insert(0, peer_issued);
         drop(app.project_shared_view(&public, &HashSet::from([incoming.id, card])));
         assert_eq!(app.card_state(card).unwrap().kind, before);
+        assert_eq!(app.workspace.card(card), Some(&strip_before));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), order_before);
         let channel = app.durable.channels.iter().find(|item| item.id == channel).unwrap();
         assert_eq!(channel.cards.iter().filter(|id| **id == card).count(), 1);
         assert!(app.configured_chat_is_local(card));
