@@ -17,6 +17,7 @@ use crate::agent::Provider;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LaunchAccountScope {
     pub provider: Provider,
+    #[serde(with="crate::selected_file_path::required")]
     pub canonical_home: PathBuf,
     pub device: u64,
     pub inode: u64,
@@ -130,6 +131,16 @@ impl LaunchAccountScope {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn captured_scope_preserves_raw_home_bytes_in_private_census_and_actor_handoff() {
+        use std::os::unix::ffi::OsStringExt;
+        let scope=LaunchAccountScope {provider:Provider::Claude,canonical_home:PathBuf::from(OsString::from_vec(b"/fixture/profile-\xff".to_vec())),device:1,inode:2,registered_id:None};
+        let json=serde_json::to_vec(&scope).unwrap();
+        assert_eq!(serde_json::from_slice::<LaunchAccountScope>(&json).unwrap(),scope);
+        let binary=postcard::to_allocvec(&scope).unwrap();
+        assert_eq!(postcard::from_bytes::<LaunchAccountScope>(&binary).unwrap(),scope);
+    }
 
     #[test]
     fn account_scope_uses_actual_home_aliases_and_refuses_missing_selected_home() {
