@@ -4082,6 +4082,7 @@ pub enum Message {
     CyclePaneWidth,
     CloseCard(CardId),
     CloseCardUnasked(CardId),
+    CloseQueuedCard(terminal_close::QueuedCardClose),
     WindowCloseRequested(window::Id),
     CancelTransientWorkClose,
     ReturnToDeviceBeforeClose,
@@ -13169,6 +13170,10 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let message=match message {
+            Message::CloseQueuedCard(queued)=>match self.resolve_queued_card_close(queued) {Some(message)=>message,None=>return Task::none()},
+            message=>message,
+        };
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -15061,6 +15066,7 @@ impl Application for Cagents {
             }
             Message::CloseCard(id) => self.begin_card_close(id),
             Message::CloseCardUnasked(id) => self.close_card_unasked(id),
+            Message::CloseQueuedCard(_)=>unreachable!("queued close normalized before dispatch"),
             Message::ConfirmTerminalClose => self.confirm_terminal_close(),
             Message::CancelTerminalClose => self.cancel_terminal_close(),
             Message::TerminalCloseDontAskChanged(value) => {

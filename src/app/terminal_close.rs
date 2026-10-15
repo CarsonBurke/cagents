@@ -13,7 +13,8 @@ pub(super) struct CapturedTerminal {
 #[derive(Default)]
 pub(super) struct Bindings {
     bound: HashMap<CardId, CapturedTerminal>,
-    adoptions: HashMap<CardId, (uuid::Uuid, uuid::Uuid)>,
+    adoptions: HashMap<CardId, (uuid::Uuid, HostSessionProof, uuid::Uuid, HostSessionProof)>,
+    removals: HashMap<CardId, CapturedTerminal>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,17 +45,27 @@ pub enum CloseOutcome {
 #[derive(Debug, Clone)]
 pub enum CompletedCloseOutcome {
     Closed,
-    ClosedWorker(uuid::Uuid),
+    ClosedWorker { execution_instance: uuid::Uuid, proof: HostSessionProof },
     /// Presentation dismissal only; no execution/retirement RPC was issued.
-    Dismissed { expected_worker: Option<uuid::Uuid> },
+    Dismissed { expected_worker: Option<(uuid::Uuid, HostSessionProof)> },
     Active(HostSessionProof),
     ActiveWorker { source: TerminalSession, execution_instance: uuid::Uuid, proof: HostSessionProof },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(super) struct QueuedCardClose {
     card: CardId,
     unasked: bool,
+    kind: Option<CardKind>,
+    captured: Option<CapturedTerminal>,
+}
+
+fn same_captured(expected:Option<&CapturedTerminal>,current:Option<&CapturedTerminal>)->bool {
+    match (expected,current) {
+        (None,None)=>true,
+        (Some(expected),Some(current))=>expected.execution_instance==current.execution_instance && expected.proof==current.proof && expected.source.id==current.source.id && expected.source.launch==current.source.launch,
+        _=>false,
+    }
 }
 
 fn target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
@@ -78,15 +89,19 @@ impl Cagents {
         let Some(CardRuntime::Terminal(surface)) = self.cards.get(&card) else { return };
         let Some(binding) = surface.worker_binding() else { return };
         let Some(proof) = surface.host_proof().filter(HostSessionProof::is_complete) else { return };
-        if binding.execution_instance.is_nil() { return; }
+        self.record_terminal_close_binding(card,binding,proof,spawned);
+    }
+
+    fn record_terminal_close_binding(&mut self, card:CardId, binding:crate::terminal::HostedTerminalBinding, proof:HostSessionProof, spawned:bool) {
+        if binding.execution_instance.is_nil() || !proof.is_complete() { return; }
         let Some(CardKind::Terminal(saved)) = self.card_state(card).map(|state| &state.kind) else { return };
         if saved.id != binding.source.id || saved.launch != binding.source.launch { return; }
         if saved.continuity.live_proof().is_some_and(|saved| saved != proof) || binding.source.continuity.live_proof().is_some_and(|issued| issued != proof) { return; }
         let known = self.terminal_close_bindings.bound.get(&card);
         if !spawned && known.is_none() && ended_terminal(self.card_state(card)).is_some() { return; }
         if let Some(previous) = known {
-            if previous.execution_instance == binding.execution_instance { return; }
-            let adopted = self.terminal_close_bindings.adoptions.get(&card) == Some(&(previous.execution_instance,binding.execution_instance));
+            if previous.execution_instance == binding.execution_instance && previous.proof == proof { return; }
+            let adopted = self.terminal_close_bindings.adoptions.get(&card).is_some_and(|(before,before_proof,after,after_proof)| *before==previous.execution_instance && *before_proof==previous.proof && *after==binding.execution_instance && *after_proof==proof);
             if !spawned && previous.source.id == binding.source.id && !adopted { return; }
         }
         self.terminal_close_bindings.bound.insert(card,CapturedTerminal { source:binding.source,execution_instance:binding.execution_instance,proof });
@@ -97,10 +112,9 @@ impl Cagents {
         if descriptor.execution_instance.is_nil() { return; }
         for (card,previous) in &self.terminal_close_bindings.bound {
             if previous.source.id == descriptor.session.id
-                && previous.execution_instance != descriptor.execution_instance
                 && descriptor.session.continuity.live_proof().is_some_and(|proof| proof != previous.proof)
-                && descriptor.upgrade_sources.iter().any(|source| crate::agent_execution::HostedSession::Terminal(source.clone()).same_process(&crate::agent_execution::HostedSession::Terminal(previous.source.clone()))) {
-                self.terminal_close_bindings.adoptions.insert(*card,(previous.execution_instance,descriptor.execution_instance));
+                && descriptor.upgrade_sources.iter().any(|source| *source==previous.source || crate::agent_execution::HostedSession::Terminal(source.clone()).same_process(&crate::agent_execution::HostedSession::Terminal(previous.source.clone()))) {
+                self.terminal_close_bindings.adoptions.insert(*card,(previous.execution_instance,previous.proof.clone(),descriptor.execution_instance,descriptor.session.continuity.live_proof().expect("complete adoption proof checked")));
             }
         }
     }
@@ -108,37 +122,58 @@ impl Cagents {
     pub(super) fn forget_terminal_close_binding(&mut self, card: CardId) {
         self.terminal_close_bindings.bound.remove(&card);
         self.terminal_close_bindings.adoptions.remove(&card);
+        self.terminal_close_bindings.removals.remove(&card);
     }
 
     fn terminal_close_binding_current(&self, intent: &CloseIntent) -> bool {
-        intent.captured.as_ref().is_none_or(|captured| self.terminal_close_bindings.bound.get(&intent.card).is_some_and(|current| current.execution_instance == captured.execution_instance && current.source.id == captured.source.id && current.source.launch == captured.source.launch))
+        intent.captured.as_ref().is_none_or(|captured| self.terminal_close_bindings.bound.get(&intent.card).is_some_and(|current| current.execution_instance == captured.execution_instance && current.proof == captured.proof && current.source.id == captured.source.id && current.source.launch == captured.source.launch))
+    }
+
+    fn queued_card_close(&mut self, card: CardId, unasked: bool) -> QueuedCardClose {
+        self.capture_terminal_close_binding(card, false);
+        QueuedCardClose {
+            card, unasked,
+            kind: self.card_state(card).map(|state| state.kind.clone()),
+            captured: self.terminal_close_bindings.bound.get(&card).cloned(),
+        }
     }
 
     pub(super) fn close_cards_in_order(&mut self, cards: Vec<CardId>) -> Task<Message> {
         self.project_recovery_ui.closing_panes = true;
-        self.queued_card_closes
-            .extend(cards.into_iter().map(|card| QueuedCardClose {
-                card,
-                unasked: false,
-            }));
+        let selected = cards.into_iter().map(|card| self.queued_card_close(card, false)).collect::<Vec<_>>();
+        self.queued_card_closes.extend(selected);
         self.next_queued_card_close()
     }
 
     pub(super) fn next_queued_card_close(&mut self) -> Task<Message> {
-        while let Some(QueuedCardClose { card, unasked }) = self.queued_card_closes.pop_front() {
-            if self
-                .card_state(card)
-                .is_some_and(|state| state.existence.is_open())
-            {
-                return cosmic::task::message(if unasked {
-                    Message::CloseCardUnasked(card)
-                } else {
-                    Message::CloseCard(card)
-                });
+        while let Some(queued) = self.queued_card_closes.pop_front() {
+            if self.card_state(queued.card).is_some_and(|state| state.existence.is_open()) {
+                return cosmic::task::message(Message::CloseQueuedCard(queued));
             }
         }
         self.project_recovery_ui.closing_panes = false;
         Task::none()
+    }
+
+    pub(super) fn resolve_queued_card_close(&mut self, queued: QueuedCardClose) -> Option<Message> {
+        self.capture_terminal_close_binding(queued.card, false);
+        let current = self.card_state(queued.card).filter(|state| state.existence.is_open());
+        let kind_matches = match (queued.kind.as_ref(), current.map(|state| &state.kind)) {
+            (Some(CardKind::Terminal(expected)), Some(CardKind::Terminal(current))) => {
+                expected.id == current.id && expected.launch == current.launch
+                    && current.continuity.live_proof().is_none_or(|proof| Some(proof) == queued.captured.as_ref().map(|binding| binding.proof.clone()).or_else(|| expected.continuity.live_proof()))
+            },
+            (Some(expected), Some(current)) => expected == current,
+            _ => false,
+        };
+        let binding_matches = same_captured(queued.captured.as_ref(), self.terminal_close_bindings.bound.get(&queued.card));
+        if !kind_matches || !binding_matches || self.terminal_start_in_flight(queued.card) || self.chat_start_pending(queued.card) {
+            self.queued_card_closes.clear();
+            self.project_recovery_ui.closing_panes = false;
+            self.status = Some(TransientNotice::warning("A selected pane changed while Close panes was waiting. Its new session was preserved; select Close again."));
+            return None;
+        }
+        Some(if queued.unasked { Message::CloseCardUnasked(queued.card) } else { Message::CloseCard(queued.card) })
     }
 
     pub(super) fn terminal_close_dialog_visible(&self) -> bool {
@@ -263,8 +298,8 @@ impl Cagents {
                 {
                     queued.unasked |= unasked;
                 } else {
-                    self.queued_card_closes
-                        .push_back(QueuedCardClose { card, unasked });
+                    let queued = self.queued_card_close(card, unasked);
+                    self.queued_card_closes.push_back(queued);
                 }
             }
             return Task::none();
@@ -325,12 +360,12 @@ impl Cagents {
         }
         let mut captured = self.terminal_close_bindings.bound.get(&card).cloned();
         let result=match result {
-            Ok(CompletedCloseOutcome::ClosedWorker(worker)) => {
-                if captured.as_ref().is_none_or(|current|current.execution_instance!=worker) { return Task::none(); }
+            Ok(CompletedCloseOutcome::ClosedWorker {execution_instance,proof}) => {
+                if captured.as_ref().is_none_or(|current|current.execution_instance!=execution_instance || current.proof!=proof) { return Task::none(); }
                 Ok(CompletedCloseOutcome::Closed)
             },
             Ok(CompletedCloseOutcome::ActiveWorker { source,execution_instance,proof }) => {
-                if captured.as_ref().is_none_or(|current|current.execution_instance!=execution_instance) { return Task::none(); }
+                if captured.as_ref().is_none_or(|current|current.execution_instance!=execution_instance || current.proof!=proof) { return Task::none(); }
                 captured=Some(CapturedTerminal { source,execution_instance,proof:proof.clone() });
                 Ok(CompletedCloseOutcome::Active(proof))
             },
@@ -338,19 +373,21 @@ impl Cagents {
         };
         match result {
             Ok(CompletedCloseOutcome::Dismissed { expected_worker }) => {
-                if captured.as_ref().map(|current|current.execution_instance)!=expected_worker { return Task::none(); }
-                self.request_card_removal(card)
+                if captured.as_ref().map(|current|(current.execution_instance,current.proof.clone()))!=expected_worker { return Task::none(); }
+                // A List absence is not an atomic execution or shared-pane generation fence.
+                // Keep its shared membership and history rather than hiding a successor.
+                self.status=Some(TransientNotice::warning("No resident terminal was found. Its saved pane was kept because absence cannot authorize shared session removal. Refresh its connection, or use guarded project removal after inspecting remaining sessions."));
+                Task::none()
             },
             Ok(CompletedCloseOutcome::Closed) => {
+                if let Some(captured)=captured {self.terminal_close_bindings.removals.insert(card,captured);}
                 self.closed_terminal_cards.insert(card);
                 self.request_card_removal(card)
             }
             Ok(CompletedCloseOutcome::Active(proof)) => {
                 if self.terminal_close.is_some() {
-                    self.queued_card_closes.push_back(QueuedCardClose {
-                        card,
-                        unasked: false,
-                    });
+                    let queued=self.queued_card_close(card,false);
+                    self.queued_card_closes.push_back(queued);
                     return Task::none();
                 }
                 self.terminal_close = Some(CloseIntent {
@@ -377,7 +414,7 @@ impl Cagents {
                 )));
                 Task::none()
             }
-            Ok(CompletedCloseOutcome::ClosedWorker(_) | CompletedCloseOutcome::ActiveWorker { .. }) => unreachable!("bound outcomes normalized above"),
+            Ok(CompletedCloseOutcome::ClosedWorker { .. } | CompletedCloseOutcome::ActiveWorker { .. }) => unreachable!("bound outcomes normalized above"),
         }
     }
 
@@ -425,6 +462,18 @@ impl Cagents {
             Option<(TerminalId, TerminalId)>,
         )>,
     ) -> Option<Task<Message>> {
+        if let Some(expected)=self.terminal_close_bindings.removals.get(&id) {
+            let matches=same_captured(Some(expected),self.terminal_close_bindings.bound.get(&id))
+                && self.card_state(id).is_some_and(|state| matches!(&state.kind,CardKind::Terminal(source) if source.id==expected.source.id && source.launch==expected.source.launch))
+                && !self.terminal_start_in_flight(id) && !self.chat_start_pending(id);
+            if !matches {
+                let _=self.workspace.cancel_close(id);
+                self.closed_terminal_cards.remove(&id);
+                self.terminal_close_bindings.removals.remove(&id);
+                self.status=Some(TransientNotice::warning("The pane changed before its close was committed. Its new session was preserved."));
+                return None;
+            }
+        }
         let handoff = self.workspace.pending_close();
         let replacing = replacement.is_some();
         let closed_descriptor = (!replacing).then(|| self.card_state(id).cloned()).flatten();
@@ -595,6 +644,7 @@ impl Cagents {
         // Do not persist a stale target's dialog either.
         let save = if (target_matches(intent, self.card_state(intent.card))
             || exited_target_matches(intent, self.card_state(intent.card)))
+            && self.terminal_close_binding_current(intent)
             && intent.dont_ask_again
         {
             self.apply_setting_input(SettingsField::ConfirmTerminalClose, "false".into())
@@ -684,6 +734,7 @@ impl Cagents {
                 if intent.active || intent.detail.is_some() {
                     self.core.set_keyboard_nav(intent.restore_keyboard_nav);
                 }
+                if let Some(captured)=intent.captured.clone() {self.terminal_close_bindings.removals.insert(card,captured);}
                 self.terminal_close = None;
                 self.closed_terminal_cards.insert(card);
                 self.request_card_removal(card)
@@ -875,7 +926,7 @@ mod tests {
             });
             let mut client=ControlClient::from_stream(reader).unwrap();
             let outcome=close_completed_with_client(&mut client,&captured.source,known.then_some(&captured),true);
-            if resident && !successor && known {assert!(matches!(outcome,Ok(CompletedCloseOutcome::ClosedWorker(worker)) if worker==captured.execution_instance));}
+            if resident && !successor && known {assert!(matches!(outcome,Ok(CompletedCloseOutcome::ClosedWorker {execution_instance,..}) if execution_instance==captured.execution_instance));}
             else if !resident {assert!(matches!(outcome,Ok(CompletedCloseOutcome::Dismissed {..})));}
             else {assert!(outcome.is_err());}
             drop(client);
@@ -913,12 +964,12 @@ mod tests {
 
     #[test]
     fn completed_worker_receipt_or_absence_dismissal_cannot_remove_a_new_bound_pane() {
-        for outcome in [CompletedCloseOutcome::ClosedWorker(uuid::Uuid::nil()),CompletedCloseOutcome::Dismissed { expected_worker:None }] {
+        for outcome in [CompletedCloseOutcome::ClosedWorker {execution_instance:uuid::Uuid::nil(),proof:bound_fixture().2.proof},CompletedCloseOutcome::Dismissed { expected_worker:None }] {
             let (mut app,card,captured)=bound_fixture();
             let CardKind::Terminal(source)=&mut app.card_state_mut(card).unwrap().kind else { panic!() };
             source.continuity=TerminalContinuity::Exited { last_exit:crate::model::TerminalExit { code:Some(0),signal:None,occurred_at_unix_ms:1 } };
             let ended=source.clone();
-            let outcome=match outcome { CompletedCloseOutcome::ClosedWorker(_)=>CompletedCloseOutcome::ClosedWorker(captured.execution_instance), outcome=>outcome };
+            let outcome=match outcome { CompletedCloseOutcome::ClosedWorker {..}=>CompletedCloseOutcome::ClosedWorker {execution_instance:captured.execution_instance,proof:captured.proof.clone()}, outcome=>outcome };
             let mut replacement=captured;
             replacement.execution_instance=uuid::Uuid::new_v4();
             app.terminal_close_bindings.bound.insert(card,replacement);
@@ -926,6 +977,85 @@ mod tests {
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert!(!app.closed_terminal_cards.contains(&card));
         }
+    }
+
+    #[test]
+    fn queued_close_keeps_initial_worker_and_rejects_replacement_before_dispatch() {
+        for dequeue_first in [false,true] {
+            let (mut app,card,captured)=bound_fixture();
+            let mut queued=app.queued_card_close(card,true);
+            if dequeue_first {
+                app.queued_card_closes.push_back(queued);
+                let Message::CloseQueuedCard(target)=super::super::tests::task_app_message(app.next_queued_card_close()) else {panic!()};
+                queued=target;
+            }
+            let mut replacement=captured.clone();
+            replacement.execution_instance=uuid::Uuid::new_v4();
+            app.terminal_close_bindings.bound.insert(card,replacement);
+            assert!(app.resolve_queued_card_close(queued).is_none());
+            assert!(app.terminal_close.is_none());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+        }
+    }
+
+    #[test]
+    fn queued_close_allows_same_worker_natural_completion_but_not_new_legacy_binding() {
+        let (mut app,card,captured)=bound_fixture();
+        let queued=app.queued_card_close(card,true);
+        let CardKind::Terminal(source)=&mut app.card_state_mut(card).unwrap().kind else {panic!()};
+        source.continuity=TerminalContinuity::Exited {last_exit:crate::model::TerminalExit {code:Some(0),signal:None,occurred_at_unix_ms:1}};
+        assert!(matches!(app.resolve_queued_card_close(queued),Some(Message::CloseCardUnasked(candidate)) if candidate==card));
+        app.forget_terminal_close_binding(card);
+        let legacy=app.queued_card_close(card,true);
+        app.terminal_close_bindings.bound.insert(card,captured);
+        assert!(app.resolve_queued_card_close(legacy).is_none());
+    }
+
+    #[test]
+    fn stale_worker_confirmation_does_not_persist_opt_out() {
+        let (mut app,card,captured)=bound_fixture();
+        app.settings.confirm_terminal_close=true;
+        let _=app.begin_card_close(card);
+        let intent=app.terminal_close.clone().unwrap();
+        let _=app.terminal_close_finished(card,intent.terminal,intent.proof.clone(),intent.generation,CloseOutcome::Active);
+        app.terminal_close.as_mut().unwrap().dont_ask_again=true;
+        let mut replacement=captured;
+        replacement.execution_instance=uuid::Uuid::new_v4();
+        app.terminal_close_bindings.bound.insert(card,replacement);
+        let _=app.confirm_terminal_close();
+        assert!(app.settings.confirm_terminal_close);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.terminal_close.as_ref().unwrap().pending);
+    }
+
+    #[test]
+    fn acknowledged_old_worker_cannot_commit_after_pane_adoption() {
+        let (mut app,card,captured)=bound_fixture();
+        app.terminal_close_bindings.removals.insert(card,captured.clone());
+        app.closed_terminal_cards.insert(card);
+        let _=app.request_card_removal(card);
+        let mut replacement=captured;
+        replacement.proof.host_incarnation=HostIncarnation::new("new-daemon");
+        app.terminal_close_bindings.bound.insert(card,replacement);
+        assert!(app.commit_card_removal(card,None).is_none());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.card(card).is_some());
+        assert!(!app.closed_terminal_cards.contains(&card));
+        assert!(app.workspace.pending_close().is_none());
+    }
+
+    #[test]
+    fn absent_completed_worker_does_not_remove_shared_pane_or_history() {
+        let (mut app,card,captured)=bound_fixture();
+        let CardKind::Terminal(source)=&mut app.card_state_mut(card).unwrap().kind else {panic!()};
+        source.continuity=TerminalContinuity::Exited {last_exit:crate::model::TerminalExit {code:Some(0),signal:None,occurred_at_unix_ms:1}};
+        let ended=source.clone();
+        let _=app.completed_terminal_closed(card,ended,Ok(CompletedCloseOutcome::Dismissed {expected_worker:Some((captured.execution_instance,captured.proof))}));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.card(card).is_some());
+        assert!(!app.closed_terminal_cards.contains(&card));
+        assert!(app.workspace.pending_close().is_none());
+        assert!(app.recently_closed.is_empty());
     }
 
     #[test]
@@ -938,10 +1068,28 @@ mod tests {
         adopted.upgrade_sources=vec![captured.source.clone()];
         app.corroborate_terminal_close_adoption(&adopted);
         assert_eq!(app.terminal_close_bindings.bound[&card].execution_instance,captured.execution_instance);
-        assert_eq!(app.terminal_close_bindings.adoptions[&card],(captured.execution_instance,adopted.execution_instance));
+        assert_eq!(app.terminal_close_bindings.adoptions[&card].0,captured.execution_instance);
+        assert_eq!(app.terminal_close_bindings.adoptions[&card].2,adopted.execution_instance);
         app.forget_terminal_close_binding(card);
         assert!(app.terminal_close_bindings.bound.is_empty());
         assert!(app.terminal_close_bindings.adoptions.is_empty());
+    }
+
+    #[test]
+    fn same_worker_new_proof_adoption_advances_new_consent_but_preserves_pending_intent() {
+        let (mut app,card,captured)=bound_fixture();
+        let _=app.begin_card_close(card);
+        let intent=app.terminal_close.as_ref().unwrap().clone();
+        let mut adopted=descriptor_for(&captured);
+        let proof=HostSessionProof {host_incarnation:HostIncarnation::new("adopted"),..captured.proof.clone()};
+        adopted.session.continuity=TerminalContinuity::Live {host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone()};
+        adopted.upgrade_sources=vec![captured.source.clone()];
+        app.corroborate_terminal_close_adoption(&adopted);
+        app.card_state_mut(card).unwrap().kind=CardKind::Terminal(adopted.session.clone());
+        app.record_terminal_close_binding(card,crate::terminal::HostedTerminalBinding {source:adopted.session,execution_instance:adopted.execution_instance},proof.clone(),false);
+        assert_eq!(app.terminal_close_bindings.bound[&card].proof,proof);
+        assert_eq!(app.terminal_close.as_ref().unwrap().captured.as_ref().unwrap().proof,captured.proof);
+        assert!(!app.terminal_close_binding_current(&intent),"old consent must not follow a new daemon proof");
     }
 
     #[test]
@@ -1192,18 +1340,15 @@ mod tests {
         let _ = app.begin_card_close(login);
         let _ = app.close_card_unasked(login);
 
-        assert_eq!(
-            app.queued_card_closes.front().copied(),
-            Some(QueuedCardClose {
-                card: login,
-                unasked: true,
-            }),
+        assert!(matches!(
+            app.queued_card_closes.front(),
+            Some(QueuedCardClose {card,unasked:true,..}) if *card == login),
             "a later explicit cancellation upgrades a queued ordinary close"
         );
         app.terminal_close = None;
         assert!(matches!(
             super::super::tests::task_app_message(app.next_queued_card_close()),
-            Message::CloseCardUnasked(card) if card == login
+            Message::CloseQueuedCard(queued) if queued.card == login && queued.unasked
         ));
     }
 }
@@ -1212,12 +1357,12 @@ fn close_completed_with_client(client:&mut ControlClient,source:&TerminalSession
     let Some(descriptor)=client.list().map_err(|error|error.to_string())?.into_iter().find(|descriptor|descriptor.session.id==source.id) else {
         // Presentation only. A successor may appear after List, so do not
         // issue the legacy source-only release or any other teardown RPC.
-        return Ok(CompletedCloseOutcome::Dismissed { expected_worker:captured.map(|captured|captured.execution_instance) });
+        return Ok(CompletedCloseOutcome::Dismissed { expected_worker:captured.map(|captured|(captured.execution_instance,captured.proof.clone())) });
     };
     let captured=captured.ok_or("This saved pane has no verified worker identity. Close the original session from a current attached pane or the CLI, then retry. Its current resident was preserved.")?;
     if client.proof()!=&captured.proof || !captured_matches_descriptor(captured,&descriptor) { return Err("The terminal worker changed; its successor was preserved".into()); }
     Ok(match client.close_terminal_source_checked(descriptor.session,captured.execution_instance,allow_active).map_err(|error|error.to_string())? {
-        TerminalCloseResult::Closed=>CompletedCloseOutcome::ClosedWorker(captured.execution_instance),
+        TerminalCloseResult::Closed=>CompletedCloseOutcome::ClosedWorker {execution_instance:captured.execution_instance,proof:captured.proof.clone()},
         TerminalCloseResult::Active=>CompletedCloseOutcome::ActiveWorker { source:captured.source.clone(),execution_instance:captured.execution_instance,proof:captured.proof.clone() },
         TerminalCloseResult::Unknown(reason)=>return Err(reason),
     })
