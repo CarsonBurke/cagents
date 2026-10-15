@@ -259,10 +259,14 @@ impl Claude {
             self.originals.revision = self.originals.revision.wrapping_add(1);
             return;
         }
-        // The enclosing receive path already validated this actual provider
-        // identity against the connection. Launch --session-id is not evidence.
-        if let Some(session) = frame["session_id"].as_str() {
-            self.originals.confirmed_session = Some(session.to_owned());
+        // Optional predictions and child frames cannot establish or alter
+        // foreground input authority. Only the main decoder's verified native
+        // identity is eligible; a raw frame session is not sufficient.
+        if frame["type"] == "prompt_suggestion" || !frame["parent_tool_use_id"].is_null() {
+            return;
+        }
+        if let Some(session) = &self.session_id {
+            self.originals.confirmed_session = Some(session.clone());
         }
         if frame["type"] == "system" && frame["subtype"] == "init" {
             let mut init = serde_json::Map::new();
@@ -457,6 +461,21 @@ mod tests {
     fn started(command: &str) -> Value {
         json!({"type":"command_lifecycle","command_uuid":command,"state":"started"})
     }
+    #[test]
+    fn optional_suggestion_cannot_seed_original_acceptance_session() {
+        let mut adapter = adapter();
+        adapter.receive(json!({"type":"prompt_suggestion","session_id":"wrong-prediction-session","suggestion":"optional"})).unwrap();
+        assert!(adapter.session_id.is_none());
+        assert!(adapter.originals.confirmed_session.is_none());
+        adapter.original_command(Some("exact-command".into()));
+        let read=adapter.command(prompt("original",PromptMode::Send)).unwrap();
+        adapter.receive(settings_reply(&read.writes[0])).unwrap();
+        adapter.receive(init()).unwrap();
+        adapter.receive(user("exact-command")).unwrap();
+        adapter.receive(started("exact-command")).unwrap();
+        assert!(adapter.take_original_updates().iter().any(|update|matches!(update,OriginalUpdate::Accepted{command_id,session_id,..} if command_id=="exact-command"&&session_id=="00000000-0000-4000-8000-000000000001")));
+    }
+
     #[test]
     fn actual_decoder_first_prompt_joins_dispatch_settings_native_session_user_and_lifecycle() {
         for echo_first in [false, true] {
