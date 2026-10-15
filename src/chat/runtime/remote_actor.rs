@@ -524,7 +524,8 @@ impl Server {
         }
     }
     fn revision(&self)->u64 {self.changed.load(Ordering::Acquire).wrapping_add(self.actor.close_observation().close_revision)}
-    fn resident(&self)->Result<Resident,String> {
+    fn resident(&self)->Result<Resident,String> {self.resident_after_copy(||{})}
+    fn resident_after_copy(&self,after_copy:impl FnOnce())->Result<Resident,String> {
         // Sample before copying any metadata. A concurrent actor publication
         // may make this conservative token old, which forces the next poll;
         // stamping the newest token after copying could hide Ready forever.
@@ -534,6 +535,7 @@ impl Server {
         let state=self.actor.0.state.lock().unwrap_or_else(|p|p.into_inner());
         let generation=state.generation;let session_id=state.session_id.clone();let title=state.title.clone();let ready=state.ready;let busy=state.busy;let waiting=state.waiting;let outcome=state.outcome.clone();let usage=state.usage.clone();let requests=state.requests.clone();
         drop(state);
+        after_copy();
         let close=self.actor.close_observation();
         let activity=close.activity;let working=activity==crate::agent::ActivityState::Working;
         let busy=busy||working;let ready=ready&&close.ready;
@@ -776,6 +778,39 @@ fn terminal_endpoint_error(error:&str,holder_current:bool)->bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Fixture {server:Server,_root:tempfile::TempDir}
+    impl Drop for Fixture {fn drop(&mut self) {let _=self.server.actor.close();}}
+    fn resident_fixture()->Fixture {
+        use crate::chat::protocol::{Adapter,Step};
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step {events:vec![chat::Event::Ready(true)],..Default::default()})}
+            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step::default())}
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let remote=RemoteActor::fixture();let mut identity=remote.identity();let proof=remote.0.proof.clone();
+        let recipe=crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:Vec::new(),working_directory:root.path().into(),environment:BTreeMap::new(),unset_environment:Default::default()};
+        let source=chat::Session {id:identity.record.terminal,launch:chat::Launch {provider:crate::agent::Provider::Claude,recipe:recipe.clone(),session_id:None},proof:Some(proof.clone()),terminal:None,owned_codex_listener:None,native_continuity:chat::NativeContinuity::ReconnectOnly};
+        let spec=ProcessSpec::from(&recipe);let mut adapter:Box<dyn Adapter>=Box::new(Idle);let mut initial=adapter.initialize().unwrap();let store=super::super::preflight(&spec,&mut initial).unwrap();
+        let actor=LocalHandle::start(spec,adapter,initial,store,None,|_|{}).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(2);while !actor.0.state.lock().unwrap().ready {assert!(Instant::now()<deadline);thread::yield_now();}
+        identity.instance=actor.close_observation().actor_id;
+        let journal_directory=root.path().join("journal");std::fs::create_dir(&journal_directory).unwrap();
+        let socket=root.path().join("fixture.sock");let listener=UnixListener::bind(&socket).unwrap();let metadata=std::fs::symlink_metadata(&socket).unwrap();
+        Fixture {server:Server {actor,identity,source,lineage:Vec::new(),execution_console:None,paired_holder:None,proof,epoch:uuid::Uuid::new_v4(),installed:true,journal:Arc::new(Mutex::new(Journal::open(&journal_directory).unwrap())),changed:Arc::new(std::sync::atomic::AtomicU64::new(1)),pending:Vec::new(),account_reports:Arc::new(Mutex::new(Vec::new())),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:BTreeMap::new(),listener,socket,socket_identity:(metadata.dev(),metadata.ino()),_directory:None,mailbox_seal:None},_root:root}
+    }
+    #[test]
+    fn concurrent_ready_publication_cannot_be_hidden_by_a_new_revision_on_old_metadata() {
+        let mut fixture=resident_fixture();fixture.server.actor.0.state.lock().unwrap().ready=false;
+        let first=fixture.server.resident_after_copy(|| {
+            let mut state=fixture.server.actor.0.state.lock().unwrap();state.ready=true;state.generation+=1;drop(state);
+            fixture.server.changed.fetch_add(1,Ordering::Release);
+        }).unwrap();
+        assert!(!first.ready);assert_ne!(first.changed,fixture.server.revision());
+        let response=fixture.server.invoke(Invocation {proof:fixture.server.proof.clone(),epoch:Some(fixture.server.epoch),method:"state".into(),args:json!([first.changed])}).unwrap();
+        let next:Option<Resident>=serde_json::from_value(response).unwrap();assert!(next.unwrap().ready,"the next real state RPC must fetch the raced Ready transition");
+    }
     #[test]
     fn proved_close_keeps_exact_final_publication_without_a_live_socket() {
         let actor=RemoteActor::fixture();
