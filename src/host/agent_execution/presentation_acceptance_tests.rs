@@ -93,7 +93,7 @@ impl Drop for OwningCloseChild {
     }
 }
 
-fn owning_close_isolated(name: &str) -> Option<tempfile::TempDir> {
+fn owning_close_isolated(name: &str) -> Option<std::path::PathBuf> {
     use std::{
         os::{
             fd::FromRawFd,
@@ -236,7 +236,8 @@ fn owning_close_isolated(name: &str) -> Option<tempfile::TempDir> {
         && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;");
     let result = serde_json::json!({"schema":"owning-close-test-result-v1", "test":exact,
         "exit_code":status.code(), "exact_named_one_passed":one, "original_child_reaped":true,
-        "native_or_full_cohort_retirement_claimed":false});
+        "native_or_full_cohort_retirement_claimed":false,
+        "namespace_retained_pending_strict_family_settlement":true});
     std::fs::write(
         root.join("child-result.json"),
         serde_json::to_vec_pretty(&result).unwrap(),
@@ -246,7 +247,13 @@ fn owning_close_isolated(name: &str) -> Option<tempfile::TempDir> {
         status.success() && one,
         "owning test did not execute exactly one passing named contract: {exact}; inspect private retained child.stdout.log/child.stderr.log"
     );
-    Some(directory.0.take().unwrap())
+    // The original Child's successful exit proves neither native cleanup nor
+    // whole-family retirement. Keep its exact namespace even on success until
+    // the external owner establishes strict settlement; callers use only the
+    // parent/child discriminator and must not receive a deleting TempDir.
+    let retained = directory.0.take().unwrap().keep();
+    eprintln!("owning close fixture namespace retained pending strict family settlement at {}", retained.display());
+    Some(retained)
 }
 
 struct LocalCodexPresentationFixture {
