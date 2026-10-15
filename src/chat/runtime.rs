@@ -1051,13 +1051,10 @@ impl LocalHandle {
         }
         // A deadline-bearing owner command must not hydrate Snapshot or wait
         // behind publication/diagnostic metadata. Contention preserves ownership.
-        let (observed_id, unobserved) =
+        let observed_id =
             match self.0.close_state.try_lock() {
-                Ok(close) => (close.actor_id, close.unobserved_native),
-                Err(std::sync::TryLockError::Poisoned(p)) => {
-                    let close = p.into_inner();
-                    (close.actor_id, close.unobserved_native)
-                }
+                Ok(close) => close.actor_id,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().actor_id,
                 Err(std::sync::TryLockError::WouldBlock) => return Err(
                     "Provider identity is being updated; retain its owner and retry session stop"
                         .into(),
@@ -1082,9 +1079,18 @@ impl LocalHandle {
                     );
                 }
             };
+            // Teardown can publish retained ownership after our initial identity
+            // read. Completion/stop alone cannot authorize that unknown owner.
+            let close = match self.0.close_state.try_lock() {
+                Ok(close) => close,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Err(
+                    "Provider ownership is being updated; retain its owner and retry session stop".into(),
+                ),
+            };
             return if self.0.preserve_native.load(Ordering::Acquire) {
                 Err("Provider ownership is being preserved for a successor; its owner was preserved".into())
-            } else if unobserved {
+            } else if close.unobserved_native {
                 Err("Retained provider ownership must be reattached before session stop".into())
             } else {
                 self.0.release_native.store(true, Ordering::Release);
@@ -6085,6 +6091,9 @@ mod tests {
                 .unwrap_err()
                 .contains("reattach")
         );
+        assert!(handle.fence_session_stop_until(
+            observation.actor_id, Instant::now() + Duration::from_millis(40),
+        ).unwrap_err().contains("reattached"));
         handle.0.close_state.lock().unwrap().unobserved_native = false;
     }
 
