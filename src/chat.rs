@@ -10,6 +10,7 @@ pub mod presentation;
 pub mod pricing;
 mod restart;
 pub use restart::RestartReceipt;
+pub mod annotations;
 pub mod turn_outcomes;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.

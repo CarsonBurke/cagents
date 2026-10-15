@@ -23,6 +23,10 @@ pub(crate) struct LaunchAccountScope {
     pub inode: u64,
     /// Optional registry metadata for purge, never the annotation authority.
     pub registered_id: Option<AccountId>,
+    /// All registry aliases validated against this physical tuple at capture.
+    /// Used only to remember deletion associations, never for read/write access.
+    #[serde(default)]
+    pub purge_ids: Vec<AccountId>,
 }
 
 impl LaunchAccountScope {
@@ -86,9 +90,11 @@ impl LaunchAccountScope {
             device: metadata.dev(),
             inode: metadata.ino(),
             registered_id: None,
+            purge_ids: Vec::new(),
         };
         if let Some(registry) = registry.filter(|registry| !registry.is_newer()) {
-            let mut matching = registry
+            // Registry input is bounded by its validated 256 KiB document.
+            let mut matching: Vec<_> = registry
                 .registered()
                 .iter()
                 .filter(|entry| entry.provider == provider)
@@ -103,13 +109,16 @@ impl LaunchAccountScope {
                         && metadata.dev() == scope.device
                         && metadata.ino() == scope.inode)
                         .then(|| super::Account::linked(provider, entry.key, path).id())
-                });
-            let first = matching.next();
+                })
+                .collect();
+            matching.sort();
+            matching.dedup();
             // Aliases share physical authority. Never arbitrarily name one as
             // the sole registered owner when several IDs resolve to this home.
-            if matching.next().is_none() {
-                scope.registered_id = first;
+            if matching.len() == 1 {
+                scope.registered_id = matching.first().cloned();
             }
+            scope.purge_ids = matching;
         }
         scope.revalidate()?;
         Ok(scope)
@@ -135,12 +144,13 @@ mod tests {
     #[test]
     fn captured_scope_preserves_raw_home_bytes_in_private_census_and_actor_handoff() {
         use std::os::unix::ffi::OsStringExt;
-        let scope=LaunchAccountScope {provider:Provider::Claude,canonical_home:PathBuf::from(OsString::from_vec(b"/fixture/profile-\xff".to_vec())),device:1,inode:2,registered_id:None};
+        let scope=LaunchAccountScope {provider:Provider::Claude,canonical_home:PathBuf::from(OsString::from_vec(b"/fixture/profile-\xff".to_vec())),device:1,inode:2,registered_id:None,purge_ids:Vec::new()};
         let json=serde_json::to_vec(&scope).unwrap();
         assert_eq!(serde_json::from_slice::<LaunchAccountScope>(&json).unwrap(),scope);
         let binary=postcard::to_allocvec(&scope).unwrap();
         assert_eq!(postcard::from_bytes::<LaunchAccountScope>(&binary).unwrap(),scope);
     }
+
 
     #[test]
     fn account_scope_uses_actual_home_aliases_and_refuses_missing_selected_home() {
@@ -236,11 +246,25 @@ mod tests {
             scope.registered_id,
             Some(super::super::Account::linked(Provider::Codex, first, home.clone()).id())
         );
-        registry
-            .register(register(uuid::Uuid::new_v4()), &[])
-            .unwrap();
+        let second = uuid::Uuid::new_v4();
+        registry.register(register(second), &[]).unwrap();
         let alias_scope = resolve(&registry);
         assert!(alias_scope.registered_id.is_none());
+        let mut expected = [first, second]
+            .into_iter()
+            .map(|key| super::super::Account::linked(Provider::Codex, key, home.clone()).id())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(alias_scope.purge_ids, expected);
+        assert_eq!(scope.purge_ids, [scope.registered_id.clone().unwrap()]);
+        let mut legacy = serde_json::to_value(&alias_scope).unwrap();
+        legacy.as_object_mut().unwrap().remove("purge_ids");
+        assert!(
+            serde_json::from_value::<LaunchAccountScope>(legacy)
+                .unwrap()
+                .purge_ids
+                .is_empty()
+        );
         assert_eq!(
             (alias_scope.device, alias_scope.inode),
             (scope.device, scope.inode)

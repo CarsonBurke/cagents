@@ -198,7 +198,7 @@ mod tests {
         let source=chat::Session { id,launch:chat::Launch {provider:crate::agent::Provider::Claude,session_id:None,recipe:crate::model::LaunchRecipe {program:"claude".into(),arguments:vec![],working_directory:root.into(),environment:Default::default(),unset_environment:Default::default()}},proof:Some(proof.clone()),terminal:None,owned_codex_listener:None,native_continuity:chat::NativeContinuity::RetainedClaudeActor {protocol:1}};
         let owner=Record {version:4,build:None,kind:crate::daemon::holder_registry::Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:proof.boot_id,terminal:id,holder:crate::daemon::holder_registry::Process {pid:42,start:1},root:crate::daemon::holder_registry::Process {pid:43,start:2}};
         let metadata=std::fs::metadata(root).unwrap();
-        let scope=LaunchAccountScope { provider:crate::agent::Provider::Claude,canonical_home:root.canonicalize().unwrap(),device:metadata.dev(),inode:metadata.ino(),registered_id:None };
+        let scope=LaunchAccountScope { provider:crate::agent::Provider::Claude,canonical_home:root.canonicalize().unwrap(),device:metadata.dev(),inode:metadata.ino(),registered_id:None,purge_ids:Vec::new() };
         (actor,owner,source,scope)
     }
 
