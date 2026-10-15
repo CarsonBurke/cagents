@@ -1804,6 +1804,7 @@ impl Actor {
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
         let mut garbage_lines = 0usize;
+        let mut garbage_total=0u64;
         loop {
             let housekeeping = self.adapter.tick();
             self.step(housekeeping)?;
@@ -1861,8 +1862,11 @@ impl Actor {
                     }
                     Err(error) => {
                         garbage_lines += 1;
+                        garbage_total=garbage_total.saturating_add(1);
                         let preview = super::protocol::preview(&self.output[..newline], 200);
-                        tracing::warn!(%preview, %error, consecutive = garbage_lines, "Skipping non-JSON provider stdout line");
+                        if garbage_total<=3 || garbage_total.is_power_of_two() {
+                            tracing::warn!(%preview, %error, consecutive = garbage_lines, ignored_total=garbage_total, "Skipping non-JSON provider stdout line");
+                        }
                         if garbage_lines >= 8 {
                             return Err(format!(
                                 "Provider printed 8 consecutive invalid protocol lines. Last output: {preview}"
