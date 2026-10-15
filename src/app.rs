@@ -19291,8 +19291,16 @@ impl Application for Cagents {
                             sidebar::HistoryCommand::CopySha => iced::clipboard::write(oid.as_str().to_owned()).map(cosmic::Action::App),
                             sidebar::HistoryCommand::CopyMessage => iced::clipboard::write(message.to_string()).map(cosmic::Action::App),
                             sidebar::HistoryCommand::NewWorktree => {
-                                let Some(project) = self.sidebar_model.project(key.project_id) else { return Task::none(); };
-                                self.open_worktree_dialog(key.project_id, project.repository.clone(), WorktreeDraft { base: oid.as_str().to_owned(), ..WorktreeDraft::default() }, None)
+                                let Some(authority) = self.refresh_ui.source_binding.as_ref()
+                                    .filter(|binding| binding.key == key
+                                        && self.sidebar_model.source_control.as_ref().is_some_and(|source|
+                                            source.matches_command_binding(binding.id)))
+                                    .and_then(|binding| binding.authority.clone()) else {
+                                    self.status = Some(TransientNotice::warning("The original Git worktree authority is unavailable"));
+                                    return Task::none();
+                                };
+                                self.open_worktree_dialog_bound(key.project_id, authority,
+                                    WorktreeDraft { base: oid.as_str().to_owned(), ..WorktreeDraft::default() }, None)
                             }
                             sidebar::HistoryCommand::CreateBranch => Task::none(),
                             sidebar::HistoryCommand::Revert => self.enqueue_git_mutation(key, QueuedGitMutation::Operation(crate::repository::GitOperation::RevertCommit { oid, mainline })),

@@ -1225,6 +1225,39 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn actual_history_menu_uses_displayed_linked_source_and_retains_its_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("displayed");
+        super::super::git_binding::tests::init(&root, "original\n");
+        let (mut app, key) = super::super::git_binding::tests::app_for(&root);
+        let identity = crate::repository::CommitIdentity {
+            name: "Fixture".into(), email: "fixture@example.invalid".into(),
+            timestamp: 0, offset_minutes: 0,
+        };
+        let oid = crate::repository::Oid::parse("1234567890123456789012345678901234567890").unwrap();
+        let source = app.sidebar_model.source_control.as_mut().unwrap();
+        source.append_history(&[crate::repository::CommitSummary {
+            oid: oid.clone(), parents: vec![], author: identity.clone(), committer: identity,
+            subject: "Shown commit".into(), body: "".into(),
+        }]);
+        let row = source.history.last().unwrap();
+        let action = sidebar::commands::registered(sidebar::commands::bound(source.command_binding_id(),
+            SidebarAction::HistoryCommand { key: key.clone(), oid, mainline: row.mainline,
+                message: row.message.clone(), command: sidebar::HistoryCommand::NewWorktree }));
+        app.sidebar_state.changes_tab = sidebar::ChangesTab::History;
+        app.sidebar_model.projects.iter_mut().find(|project| project.id == key.project_id).unwrap()
+            .repository = temporary.path().join("different-primary");
+        drop(app.update(Message::Sidebar(action)));
+        let dialog = app.worktree_dialog.as_ref().expect("registered History menu opens bound dialog");
+        assert_eq!(dialog.repository, root);
+        let retained = dialog.source.clone().expect("displayed authority remains attached");
+        std::fs::rename(&root, temporary.path().join("original")).unwrap();
+        super::super::git_binding::tests::init(&root, "replacement\n");
+        assert!(retained.service().is_err(), "dialog cannot resolve or create from replacement root");
+    }
+
+    #[cfg(target_os = "linux")]
     fn real_history_source() -> (Fixture, tempfile::TempDir, PathBuf, crate::repository::Oid) {
         let mut fixture = fixture();
         let files = tempfile::tempdir().unwrap();
