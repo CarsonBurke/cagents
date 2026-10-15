@@ -440,6 +440,7 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                self.join_workspace_model(model.identity);
                 self.workspace_model = model;
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
@@ -564,6 +565,7 @@ impl Cagents {
     }
 
     pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
+        let relocated = self.recover_shared_project_relocations();
         let closed = self
             .workspace_model
             .closed_projects
@@ -574,11 +576,9 @@ impl Cagents {
             })
             .cloned()
             .collect::<Vec<_>>();
-        Task::batch(
-            closed
-                .into_iter()
-                .map(|repository| self.close_shared_project(&repository)),
-        )
+        Task::batch(std::iter::once(relocated).chain(
+            closed.into_iter().map(|repository| self.close_shared_project(&repository)),
+        ))
     }
 
     /// Settles what this window has shared with the registry it just reached.
@@ -597,6 +597,7 @@ impl Cagents {
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
+        durable.shared_project_ordinals.clear();
         for channel in durable.channels.iter_mut() {
             channel.shared = false;
         }
@@ -929,6 +930,10 @@ impl Cagents {
             return Adoption::Retained;
         }
         if let Some(project_id) = self.project_for_repository(&shared.repository) {
+            if shared.ordinal != PENDING_ORDINAL && self.durable.shared_project_ordinals.get(&project_id) != Some(&shared.ordinal) {
+                Arc::make_mut(&mut self.durable).shared_project_ordinals.insert(project_id, shared.ordinal);
+                self.persist();
+            }
             if crate::device::is_remote()
                 && !self.workspace_model_opens.contains(&shared.repository)
             {
@@ -985,6 +990,7 @@ impl Cagents {
         self.sidebar_model
             .apply_project_order(&self.durable.project_order);
         self.sidebar_model.data_state = SidebarDataState::Ready;
+        if shared.ordinal != PENDING_ORDINAL { Arc::make_mut(&mut self.durable).shared_project_ordinals.insert(project.id, shared.ordinal); self.persist(); }
         Adoption::Opening(self.project_load_task(
             shared.repository.clone(),
             Some(project.id),

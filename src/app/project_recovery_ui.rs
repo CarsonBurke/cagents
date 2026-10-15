@@ -221,6 +221,37 @@ impl Cagents {
         if let Some(project) = self.sidebar_model.projects.iter_mut().find(|project| project.id == id) { project.reloading = false; }
     }
 
+    /// A reconnect can miss Locate's watch edge. Recover logical ownership
+    /// from the non-reused registry project rank or exact channel/agent IDs before
+    /// honoring the old project's tombstone. Paths alone prove no association.
+    pub(super) fn recover_shared_project_relocations(&mut self) -> Task<Message> {
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY || self.durable.workspace_model_identity != Some(self.workspace_model.identity) { return Task::none(); }
+        let mut relocations = Vec::new();
+        for project in &self.sidebar_model.projects {
+            let mut repositories = HashSet::new();
+            if let Some(ordinal) = self.durable.shared_project_ordinals.get(&project.id) {
+                repositories.extend(self.workspace_model.projects.iter().filter(|shared| shared.ordinal == *ordinal).map(|shared| shared.repository.clone()));
+            } else {
+                // Channels cannot change project association except in an
+                // explicit project relocation. A pane ID alone is insufficient:
+                // panes can legitimately be transferred between projects.
+                repositories.extend(self.durable.channels.iter().filter(|channel| channel.project_id == project.id && channel.shared).filter_map(|channel| self.workspace_model.channel(channel.id)).map(|channel| channel.repository.clone()));
+                let owned = self.project_cards(project.id);
+                for location in &self.workspace_model.agent_locations {
+                    if owned.contains(&CardId::from_uuid(location.agent.as_uuid())) { repositories.insert(location.repository.clone()); }
+                }
+            }
+            if repositories.len() != 1 { continue; }
+            let destination = repositories.into_iter().next().unwrap();
+            if destination == project.repository { continue; }
+            let Some(located) = self.workspace_model.project(&destination) else { continue; };
+            let new_root = if located.kind == ProjectKind::Git && destination.file_name().is_some_and(|name| name == ".git") { destination.parent().unwrap_or(&destination).to_path_buf() } else { destination.clone() };
+            let relocation = Relocation { repository: project.repository.clone(), destination, old_root: root(project), new_root };
+            if relocation.validate().is_ok() { relocations.push(relocation); }
+        }
+        Task::batch(relocations.into_iter().map(|relocation| self.apply_project_relocation(&relocation)))
+    }
+
     pub(super) fn apply_project_relocation(&mut self, relocation: &Relocation) -> Task<Message> {
         let Some(id) = self.sidebar_model.projects.iter().find(|project| project.repository == relocation.repository).map(|project| project.id) else { return Task::none(); };
         let owned = self.project_cards(id);
@@ -271,6 +302,41 @@ mod tests {
         app.sidebar_model.projects.push(SidebarProject::new(id, RepositoryId::new(), "Fixture".into(), root.to_path_buf(), Vec::new(), Vec::new()).with_kind(ProjectKind::Folder));
         (app,id)
     }
+    #[test]
+    fn reconnect_follows_non_reused_project_identity_even_when_old_path_is_reopened() {
+        let old = Path::new("/old/project");
+        let (mut app,id) = app(old);
+        let identity = uuid::Uuid::new_v4();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.workspace_model_identity = Some(identity);
+        durable.shared_project_ordinals.insert(id, 7);
+        app.workspace_model = crate::workspace_model::WorkspaceModel { identity, projects: vec![
+            crate::workspace_model::ModelProject { repository: "/moved/project".into(), name: "Original".into(), kind: ProjectKind::Folder, ordinal: 7 },
+            crate::workspace_model::ModelProject { repository: old.into(), name: "Replacement".into(), kind: ProjectKind::Folder, ordinal: 8 },
+        ], ..Default::default() };
+        drop(app.recover_shared_project_relocations());
+        assert_eq!(app.sidebar_model.project(id).unwrap().repository, Path::new("/moved/project"));
+        assert_eq!(app.durable.shared_project_ordinals[&id], 7);
+        // A fresh project at the reused path is not associated with rank7.
+        let fresh = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(fresh, RepositoryId::new(), "Replacement".into(), old.into(), Vec::new(), Vec::new()).with_kind(ProjectKind::Folder));
+        Arc::make_mut(&mut app.durable).shared_project_ordinals.insert(fresh, 8);
+        drop(app.recover_shared_project_relocations());
+        assert_eq!(app.sidebar_model.project(fresh).unwrap().repository, old);
+    }
+
+    #[test]
+    fn reconnect_does_not_interpret_a_replacement_registry_rank_as_the_old_project() {
+        let old = Path::new("/old/project");
+        let (mut app,id) = app(old);
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.workspace_model_identity = Some(uuid::Uuid::new_v4());
+        durable.shared_project_ordinals.insert(id, 7);
+        app.workspace_model = crate::workspace_model::WorkspaceModel { identity: uuid::Uuid::new_v4(), projects: vec![crate::workspace_model::ModelProject { repository: "/unrelated/project".into(), name: "Other".into(), kind: ProjectKind::Folder, ordinal: 7 }], ..Default::default() };
+        drop(app.recover_shared_project_relocations());
+        assert_eq!(app.sidebar_model.project(id).unwrap().repository, old);
+    }
+
     #[test]
     fn locating_moved_checkout_repairs_linked_worktree_paths() {
         let parent = tempfile::tempdir().unwrap();

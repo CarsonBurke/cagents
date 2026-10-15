@@ -195,6 +195,7 @@ fn scope_descriptor(
         // A projection carries no channels, so it has nothing to say about what
         // was shared with which registry.
         workspace_model_identity: None,
+        shared_project_ordinals: Default::default(),
         local_only_cards: HashSet::new(),
         pending_terminal_creations: HashSet::new(),
     }

@@ -1230,6 +1230,11 @@ pub struct WorkspaceState {
     /// cleared then, because nothing local has been shared with *that* registry.
     #[serde(default)]
     pub workspace_model_identity: Option<uuid::Uuid>,
+    /// Non-reused project creation ranks, meaningful only within the registry
+    /// identity above. Lets a window follow explicit Locate across reconnects
+    /// without interpreting a reused old path as the original project.
+    #[serde(default)]
+    pub shared_project_ordinals: HashMap<ProjectId, u32>,
     #[serde(default)]
     pub local_only_cards: HashSet<CardId>,
     /// Explicit terminal creations awaiting the daemon's accepted view. Their
@@ -1257,6 +1262,7 @@ impl Default for WorkspaceState {
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
+            shared_project_ordinals: HashMap::new(),
             local_only_cards: HashSet::new(),
             pending_terminal_creations: HashSet::new(),
         }
