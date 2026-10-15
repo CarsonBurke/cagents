@@ -3049,6 +3049,24 @@ fn checked_busy_worktree_agents(reply: crate::worktree_control::Reply) -> Result
     Ok(AgentCensus { agents, census })
 }
 
+// Policy controls must stay usable even when deletion safety cannot inventory a
+// protected directory. A save reply reports the policy readback, not a later census.
+fn read_cleanup_policy(repository: &Path) -> Result<Vec<String>, String> {
+    let reply = crate::device_service::request(crate::device_service::Operation::Worktree {
+        operation: crate::worktree_control::Operation::GetDisposableIgnoredDirectories {
+            repository: repository.to_owned(), path: repository.to_owned(),
+        },
+    })?;
+    disposable_ignored_directories(reply)
+}
+
+fn disposable_ignored_directories(reply: crate::device_service::Reply) -> Result<Vec<String>, String> {
+    match reply {
+        crate::device_service::Reply::Worktree(crate::worktree_control::Reply::DisposableIgnoredDirectories { directories }) => Ok(directories),
+        _ => Err("The selected device returned an unexpected project cleanup policy reply.".into()),
+    }
+}
+
 fn safety_read_task(target: Target, request: u64, confirming: bool) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
