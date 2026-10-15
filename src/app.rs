@@ -12656,11 +12656,13 @@ impl Cagents {
         // `begin_shutdown` spawns the reap on the runtime the sessions run on,
         // so it survives if no new document is opened. New launches wait
         // for the same reap instead of overlapping a second admission cap.
-        let predecessor=self.lsp.begin_shutdown();
-        self.lsp = LspManager::new(self.settings.language_servers.clone()).with_lifecycle(
-            self.settings.lsp_idle_timeout_seconds,
-            self.settings.lsp_max_sessions,
-        ).after_shutdown(predecessor);
+        let predecessor = self.lsp.begin_shutdown();
+        self.lsp = LspManager::new(self.settings.language_servers.clone())
+            .with_lifecycle(
+                self.settings.lsp_idle_timeout_seconds,
+                self.settings.lsp_max_sessions,
+            )
+            .after_shutdown(predecessor);
         self.lsp_contexts.clear();
         self.lsp_documents.clear();
         self.lsp_pending_jumps.clear();

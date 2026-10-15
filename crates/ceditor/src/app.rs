@@ -2088,11 +2088,13 @@ impl Editor {
             }
             // Re-enabling assistance waits for these outgoing processes before
             // launching replacements under a new admission cap.
-            let predecessor=self.lsp.begin_shutdown();
-            self.lsp = LspManager::new(self.settings.language_servers.clone()).with_lifecycle(
-                self.settings.lsp_idle_timeout_seconds,
-                self.settings.lsp_max_sessions,
-            ).after_shutdown(predecessor);
+            let predecessor = self.lsp.begin_shutdown();
+            self.lsp = LspManager::new(self.settings.language_servers.clone())
+                .with_lifecycle(
+                    self.settings.lsp_idle_timeout_seconds,
+                    self.settings.lsp_max_sessions,
+                )
+                .after_shutdown(predecessor);
             tasks.push(self.lsp_next());
         }
         if self.settings_writable {
