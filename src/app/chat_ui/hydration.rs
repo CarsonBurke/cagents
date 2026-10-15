@@ -209,8 +209,8 @@ impl Drop for ReaderCapacity {
     fn drop(&mut self) { self.set(0); }
 }
 pub(super) fn reader_source_capacity()->usize { READER_CAPACITY.load(Ordering::Relaxed) }
-fn admit(item:&Arc<chat::Item>,_bytes:usize,replaced:Option<&Arc<chat::Item>>)->Admission {
-    chat::source_owners::admit(item,replaced)
+fn admit(item:&Arc<chat::Item>,key:&Key,epoch:u64,replaced:Option<&Arc<chat::Item>>)->Admission {
+    chat::source_owners::admit(item,key,epoch,replaced)
 }
 
 #[derive(Clone)]
@@ -248,13 +248,12 @@ async fn load(source:&Source)->Result<Loaded,String> {
     }, &reader_capacity).await?;
     if source.known.as_ref().is_some_and(|known|Arc::ptr_eq(&known.item,&loaded.item)) {return Ok(loaded);}
     let item=&loaded.item;
-    let bytes=match &item.content {ItemContent::Text {text,..}=>text.len(),_=>return Err("The source is not prose.".into())};
     // A previous load may have published its replacement while the UI still
     // owns its old item for one frame. Wait for that single global turnover;
     // never ask the reader to close a chat merely to replace its own source.
     let deadline=Instant::now()+Duration::from_secs(5);
     loop {
-        match admit(item,bytes,source.known.as_ref().map(|known|&known.item)) {
+        match admit(item,&source.key,loaded.epoch,source.known.as_ref().map(|known|&known.item)) {
             Admission::Ready=>break,
             Admission::Turnover if Instant::now()<deadline=>tokio::time::sleep(Duration::from_millis(16)).await,
             Admission::Turnover=>return Err("Message loading is busy. Try again.".into()),

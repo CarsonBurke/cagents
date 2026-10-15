@@ -1,7 +1,7 @@
 //! Shared admission for complete logical message bodies reconstructed by the UI.
 //! Disk restores reserve before decoding and transfer that charge to actual
 //! immutable Item owners. This is payload accounting, not allocator/RSS usage.
-use super::{Item, ItemContent, Snapshot, cache::SourceKey};
+use super::{Item, ItemContent, Snapshot, cache::{SourceKey,SourceMetadata}};
 use std::collections::{HashMap,HashSet};
 use std::sync::{Arc,Mutex};
 
@@ -14,6 +14,7 @@ pub(crate) const RESIDENT_BYTES:usize=72*1024*1024;
 #[derive(Default)]
 struct Owners {
     entries:Vec<(std::sync::Weak<Item>,usize)>,
+    provenance:HashMap<usize,ResidentSource>,
     /// Private offline readers reserve before allocating decoded source bodies.
     reserved:usize,
     /// One global replacement can temporarily overlap the old Item owners.
@@ -26,6 +27,8 @@ fn owners()->&'static Arc<Mutex<Owners>> {
 impl Owners {
     fn prune(&mut self) {
         self.entries.retain(|(owner,_)|owner.strong_count()>0);
+        let live:HashSet<_>=self.entries.iter().map(|(owner,_)|owner.as_ptr() as usize).collect();
+        self.provenance.retain(|pointer,_|live.contains(pointer));
         if self.turnover.as_ref().is_some_and(|(old,new)|old.strong_count()==0 || new.strong_count()==0) {self.turnover=None;}
     }
     fn bytes(&self)->usize {self.entries.iter().map(|(_,bytes)|*bytes).sum()}
@@ -62,9 +65,16 @@ pub(crate) fn usage()->Usage {
 fn text_bytes(item:&Item)->Option<usize> {
     match &item.content {ItemContent::Text {text,..}=>Some(text.len()),_=>None}
 }
-pub(crate) fn admit(item:&Arc<Item>,replaced:Option<&Arc<Item>>)->Admission {
+pub(crate) fn admit(item:&Arc<Item>,source:&SourceKey,epoch:u64,replaced:Option<&Arc<Item>>)->Admission {
+    let Some(metadata)=SourceMetadata::from_item(item) else {return Admission::Capacity;};
     let Some(bytes)=text_bytes(item) else {return Admission::Capacity;};
-    owners().lock().unwrap_or_else(|error|error.into_inner()).admit(item,bytes,replaced)
+    if item.id!=source.source_id {return Admission::Capacity;}
+    let mut owners=owners().lock().unwrap_or_else(|error|error.into_inner());
+    let result=owners.admit(item,bytes,replaced);
+    if result==Admission::Ready {
+        owners.provenance.insert(Arc::as_ptr(item) as usize,ResidentSource {source:source.clone(),bytes,epoch,metadata});
+    }
+    result
 }
 
 /// Exact provenance recorded when a projected view is written to private cache.
@@ -73,15 +83,19 @@ pub(crate) fn admit(item:&Arc<Item>,replaced:Option<&Arc<Item>>)->Admission {
 pub(crate) struct ResidentSource {
     pub source:SourceKey,
     pub bytes:usize,
+    pub epoch:u64,
+    pub metadata:SourceMetadata,
 }
 pub(crate) fn resident_sources(snapshot:&Snapshot)->Vec<ResidentSource> {
     let mut owners=owners().lock().unwrap_or_else(|error|error.into_inner());owners.prune();
-    let charged:HashSet<_>=owners.entries.iter().map(|(owner,_)|owner.as_ptr()).collect();
+    resident_sources_in(&owners,snapshot)
+}
+fn resident_sources_in(owners:&Owners,snapshot:&Snapshot)->Vec<ResidentSource> {
     std::iter::once((None,&snapshot.items))
         .chain(snapshot.subagents.iter().map(|agent|(Some(agent.id.clone()),&agent.items)))
         .flat_map(|(agent_id,items)|items.iter().filter_map(|item| {
-            if !charged.contains(&Arc::as_ptr(item)) {return None;}
-            Some(ResidentSource {source:SourceKey {agent_id:agent_id.clone(),source_id:item.id.clone()},bytes:text_bytes(item)?})
+            let record=owners.provenance.get(&(Arc::as_ptr(item) as usize))?;
+            (record.source.agent_id==agent_id && record.source.source_id==item.id).then(||record.clone())
         }).collect::<Vec<_>>()).collect()
 }
 
@@ -110,25 +124,30 @@ impl Reservation {
     /// Call off the event thread after validating cache provenance and selecting
     /// precisely the recorded full-source Items, excluding bounded raw fragments.
     /// The caller keeps the decoded snapshot private until this succeeds.
-    pub(crate) fn adopt(mut self,items:&[Arc<Item>])->Result<(),ReserveError> {
+    pub(crate) fn adopt(mut self,items:&[(Arc<Item>,ResidentSource)])->Result<(),ReserveError> {
         let mut unique=HashMap::new();
         let mut total=0usize;
-        for item in items {
-            if unique.contains_key(&Arc::as_ptr(item)) {continue;}
+        for (item,record) in items {
             let bytes=text_bytes(item).ok_or(ReserveError::InvalidPayload)?;
-            if bytes>SOURCE_BYTES {return Err(ReserveError::InvalidPayload);}
+            if bytes>SOURCE_BYTES || record.bytes!=bytes || record.source.source_id!=item.id
+                || SourceMetadata::from_item(item).as_ref()!=Some(&record.metadata) {return Err(ReserveError::InvalidPayload);}
+            if let Some((_,previous))=unique.get(&Arc::as_ptr(item)) {
+                if *previous!=record {return Err(ReserveError::InvalidPayload);}
+                continue;
+            }
             total=total.checked_add(bytes).ok_or(ReserveError::InvalidPayload)?;
-            unique.insert(Arc::as_ptr(item),(item,bytes));
+            unique.insert(Arc::as_ptr(item),(item,record));
         }
         if total!=self.bytes {return Err(ReserveError::InvalidPayload);}
         let mut owners=self.pool.lock().unwrap_or_else(|error|error.into_inner());owners.prune();
         // Transfer under one lock: neither a successful handoff nor an error
         // can create an uncharged interval or double-release the reservation.
         owners.reserved-=self.bytes;self.bytes=0;
-        for (pointer,(item,bytes)) in unique {
+        for (pointer,(item,record)) in unique {
             if !owners.entries.iter().any(|(owner,_)|owner.as_ptr()==pointer) {
-                owners.entries.push((Arc::downgrade(item),bytes));
+                owners.entries.push((Arc::downgrade(item),record.bytes));
             }
+            owners.provenance.insert(pointer as usize,record.clone());
         }
         Ok(())
     }
@@ -178,7 +197,18 @@ mod tests {
         let bytes=text_bytes(&first).unwrap()+text_bytes(&second).unwrap();
         let reservation=reserve_in(pool.clone(),bytes,32).unwrap();
         assert_eq!(pool.lock().unwrap().reserved,bytes);
-        reservation.adopt(&[first.clone(),second.clone()]).unwrap();
+        let record=|item:&Arc<Item>,epoch|ResidentSource {source:SourceKey {agent_id:None,source_id:item.id.clone()},
+            bytes:text_bytes(item).unwrap(),epoch,metadata:SourceMetadata::from_item(item).unwrap()};
+        let first_record=record(&first,7);
+        reservation.adopt(&[(first.clone(),first_record.clone()),(second.clone(),record(&second,8))]).unwrap();
+        assert_eq!(pool.lock().unwrap().provenance[&(Arc::as_ptr(&first) as usize)],first_record);
+        let mut replacement_metadata=first_record.metadata.clone();replacement_metadata.at=Some(999);
+        let snapshot=Snapshot {items:vec![first.clone()],source_parts:vec![super::super::cache::SourcePart {
+            item_id:first.id.clone(),source:first_record.source.clone(),start:0,end:first_record.bytes,source_len:first_record.bytes,
+            replacement:false,epoch:99,metadata:replacement_metadata}],..Snapshot::default()};
+        assert_eq!(resident_sources_in(&pool.lock().unwrap(),&snapshot),vec![first_record],
+            "an old displayed prefix keeps its admitted epoch/metadata while raw source parts move to a replacement");
+        drop(snapshot);
         assert_eq!(pool.lock().unwrap().reserved,0);
         assert_eq!(pool.lock().unwrap().bytes(),bytes);
         let queued=first.clone();drop(first);drop(second);
@@ -188,7 +218,8 @@ mod tests {
         let failed=reserve_in(pool.clone(),100,100).unwrap();drop(failed);
         assert_eq!(pool.lock().unwrap().reserved,0);
         let mismatch=reserve_in(pool.clone(),100,100).unwrap();
-        assert_eq!(mismatch.adopt(&[text("wrong","short")]),Err(ReserveError::InvalidPayload));
+        let wrong=text("wrong","short");
+        assert_eq!(mismatch.adopt(&[(wrong.clone(),record(&wrong,9))]),Err(ReserveError::InvalidPayload));
         assert_eq!(pool.lock().unwrap().reserved,0);
     }
     #[test]
