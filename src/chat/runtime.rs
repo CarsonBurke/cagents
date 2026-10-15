@@ -8479,6 +8479,7 @@ mod tests {
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
                 | Update::Attention(_)
+                | Update::AttentionContext { .. }
                 | Update::PastAttention(_)
                 | Update::RetainedOutcomes
                 | Update::Ready
