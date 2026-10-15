@@ -315,10 +315,10 @@ impl Cagents {
         }
     }
 
-    pub(super) fn confirm_setup_review(&mut self, skip: bool) -> Task<Message> {
+    pub(super) fn confirm_setup_review(&mut self, request: OperationId, skip: bool) -> Task<Message> {
         if !self.setup_review_on_top() { return Task::none(); }
         let Some(review) = self.project_ui.setup_review.as_mut() else { return Task::none(); };
-        if review.loading || review.active || (!skip && (review.error.is_some() || (!review.trusted && !review.approved))) { return Task::none(); }
+        if review.request != request || review.loading || review.active || (!skip && (review.error.is_some() || (!review.trusted && !review.approved))) { return Task::none(); }
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         if review.remote.is_none() && store.is_none() { review.error = Some("The setup journal is unavailable".into()); return Task::none(); }
         review.loading = true;
@@ -586,6 +586,7 @@ impl Cagents {
 }
 
 pub(super) fn review_view(review: &Review) -> Element<'_, Message> {
+    let request = review.request;
     let mut rows: Vec<Element<'_, Message>> = vec![
         design::title("Review interrupted worktree setup").into(),
         super::notice_detail(review.path.display().to_string()),
@@ -597,18 +598,18 @@ pub(super) fn review_view(review: &Review) -> Element<'_, Message> {
         if !plan.copy.is_empty() { rows.push(super::notice_detail(format!("Copy: {}", plan.copy.join(", ")))); }
         if !review.trusted && !review.loading {
             rows.push(widget::checkbox("Trust these exact project commands", review.approved)
-                .on_toggle(|value| Message::ProjectUi(project_ui::Action::SetupReviewTrust(value))).into());
+                .on_toggle(move |value| Message::ProjectUi(project_ui::Action::SetupReviewTrust { request, approved: value })).into());
         }
     } else if !review.loading { rows.push(super::notice_detail("This project has no setup configuration.")); }
     if let Some(error) = &review.error { rows.push(super::notice_detail(error.clone())); }
     rows.push(crate::ui_controls::button::secondary("Skip setup")
-        .on_press_maybe((!review.loading && !review.active).then_some(Message::ProjectUi(project_ui::Action::ConfirmSetupReview { skip: true }))).into());
+        .on_press_maybe((!review.loading && !review.active).then_some(Message::ProjectUi(project_ui::Action::ConfirmSetupReview { request: review.request, skip: true }))).into());
     let footer = super::dialog_ui::confirmation_actions(
         crate::ui_controls::button::secondary("Cancel").id(widget::Id::new("dialog.setup.cancel"))
             .on_press(Message::ProjectUi(project_ui::Action::Dismiss)),
         crate::ui_controls::button::primary("Resume setup")
             .on_press_maybe((!review.loading && !review.active && review.error.is_none() && (review.trusted || review.approved))
-                .then_some(Message::ProjectUi(project_ui::Action::ConfirmSetupReview { skip: false }))),
+                .then_some(Message::ProjectUi(project_ui::Action::ConfirmSetupReview { request: review.request, skip: false }))),
     );
     super::dialog_ui::surface(widget::column::with_children(vec![
         widget::container(widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(iced::Length::Shrink)).max_height(420.0).into(), footer,
@@ -702,17 +703,23 @@ mod tests {
             expected: SetupIntent::default(), current: SetupIntent::default(), remote: None, active: false, loading: false,
             trusted: true, approved: false, error: None, token: CancellationToken::new() });
         assert!(app.setup_review_on_top());
+        let stale = OperationId::new();
+        drop(app.handle_project_action(project_ui::Action::SetupReviewTrust { request: stale, approved: true }));
+        assert!(!app.project_ui.setup_review.as_ref().unwrap().approved);
+        let task = app.confirm_setup_review(stale, true);
+        assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+        assert!(!app.project_ui.setup_review.as_ref().unwrap().loading);
         for frozen in [false, true] {
             app.update_prepared = frozen; app.settings_reset_confirm = !frozen;
             assert!(!app.setup_review_on_top());
-            drop(app.handle_project_action(project_ui::Action::SetupReviewTrust(true)));
+            drop(app.handle_project_action(project_ui::Action::SetupReviewTrust { request: id, approved: true }));
             assert!(!app.project_ui.setup_review.as_ref().unwrap().approved);
-            let task = app.confirm_setup_review(true);
+            let task = app.confirm_setup_review(id, true);
             assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
             assert!(!app.project_ui.setup_review.as_ref().unwrap().loading);
         }
-        assert!(user_message_blocked_during_update(&Message::ProjectUi(project_ui::Action::SetupReviewTrust(true))));
-        assert!(user_message_blocked_during_update(&Message::ProjectUi(project_ui::Action::ConfirmSetupReview { skip: false })));
+        assert!(user_message_blocked_during_update(&Message::ProjectUi(project_ui::Action::SetupReviewTrust { request: id, approved: true })));
+        assert!(user_message_blocked_during_update(&Message::ProjectUi(project_ui::Action::ConfirmSetupReview { request: id, skip: false })));
         assert!(!user_message_blocked_during_update(&Message::ProjectUi(project_ui::Action::SetupReviewLoaded { request: id, result: Err("fixture".into()) })));
     }
 

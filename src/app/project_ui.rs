@@ -192,8 +192,8 @@ pub enum Action {
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
     SetupReviewLoaded { request: crate::model::OperationId, result: Result<super::worktree_setup_ui::ReviewSnapshot, String> },
-    SetupReviewTrust(bool),
-    ConfirmSetupReview { skip: bool },
+    SetupReviewTrust { request: crate::model::OperationId, approved: bool },
+    ConfirmSetupReview { request: crate::model::OperationId, skip: bool },
     SetupReviewReady { request: crate::model::OperationId, result: Result<super::worktree_setup_ui::ReviewCompletion, String> },
     ConfirmDelete,
     ConfirmRemove,
@@ -1185,8 +1185,8 @@ impl Cagents {
                 }
             }
             Action::SetupReviewLoaded { request, result } => self.setup_review_loaded(request, result),
-            Action::SetupReviewTrust(value) => { if self.setup_review_on_top() && let Some(review) = &mut self.project_ui.setup_review { review.approved = value; } },
-            Action::ConfirmSetupReview { skip } => return self.confirm_setup_review(skip),
+            Action::SetupReviewTrust { request, approved } => { if self.setup_review_on_top() && let Some(review) = &mut self.project_ui.setup_review && review.request == request { review.approved = approved; } },
+            Action::ConfirmSetupReview { request, skip } => return self.confirm_setup_review(request, skip),
             Action::SetupReviewReady { request, result } => return self.setup_review_ready(request, result),
             Action::Dismiss => {
                 self.dismiss_worktree_setup_review();

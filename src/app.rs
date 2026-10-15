@@ -2586,7 +2586,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::ProjectUi(
                     project_ui::Action::Command { .. }
                         | project_ui::Action::ConfirmDelete
-                        | project_ui::Action::SetupReviewTrust(_)
+                        | project_ui::Action::SetupReviewTrust { .. }
                         | project_ui::Action::ConfirmSetupReview { .. }
                         | project_ui::Action::Dismiss
                 )
