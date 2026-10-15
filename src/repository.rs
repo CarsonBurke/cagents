@@ -12168,6 +12168,17 @@ mod worktree_journal_tests {
         let reused_admin = fixture.service.git_dir(&fixture.request.destination, &token).unwrap();
         assert_eq!(identity.admin_dir.as_ref(), Some(&reused_admin), "Git reuses the original administrative pathname");
         assert!(!identity.matches_checkout(&identity.common_dir, &reused_admin).unwrap(), "direct same-path replacement must not inherit setup authority");
+        #[cfg(any(feature = "host", feature = "ui"))]
+        {
+            let config = fixture.request.repository.join(".cagents"); fs::create_dir(&config).unwrap();
+            fs::write(config.join("worktree.toml"), "copy = [\".env\"]\n").unwrap();
+            fs::write(fixture.request.repository.join(".env"), "fixture-only-secret").unwrap();
+            let plan = crate::worktree_setup::load(&fixture.request.repository).unwrap().unwrap();
+            assert!(crate::worktree_setup::prepare_for_creation(&fixture.request.repository, &fixture.request.destination, &plan, false, fixture.request.operation_id, &token).is_err(), "a delayed original setup must not copy into the replacement");
+            assert!(!fixture.request.destination.join(".env").exists());
+            assert!(crate::worktree_setup::prepare_for_creation(&fixture.request.repository, &fixture.request.destination, &plan, true, fixture.request.operation_id, &token).unwrap().skipped);
+            assert!(!fixture.request.destination.join(".env").exists());
+        }
         assert_eq!(fixture.service.worktree_setup_creation_identity(&fixture.store, fixture.request.operation_id).unwrap(), Some(identity), "a read must retain the original receipt rather than reconcile it to the replacement");
     }
 

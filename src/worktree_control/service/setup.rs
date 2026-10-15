@@ -136,7 +136,7 @@ pub(super) fn prepare(service:&Service,store:&crate::persistence::StateStore,req
         let error=format!("Setup was retained without execution because its creation identity could not be verified: {error}");
         warnings.push(error.clone());return Some(Setup {command:String::new(),run_id,terminal:None,error:Some(error)});
     }
-    match crate::worktree_setup::prepare(primary,destination,plan,false,cancel) {
+    match crate::worktree_setup::prepare_for_creation(primary,destination,plan,false,request.operation_id,cancel) {
         Ok(prepared)=> {
             for missing in prepared.missing_patterns {warnings.push(format!("No setup source matched {missing}"));}
             for skipped in prepared.skipped_paths {warnings.push(format!("Skipped copying {}: {}",skipped.path.display(),skipped.reason));}
