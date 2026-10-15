@@ -36,6 +36,10 @@ pub(crate) fn remove_actor_final_snapshot(
 mod handle;
 pub(crate) use handle::{BackendIdentity, BackendSourceClaim};
 pub use handle::Handle;
+#[cfg(test)]
+pub(crate) fn isolated_backend_contract(exact: &str) -> bool {
+    remote_actor::isolated_backend_contract(exact)
+}
 pub(crate) use remote_actor::RestartState as RetainedRestartState;
 pub(crate) use remote_actor::{
     ActorIdentity, ActorInspection, InputIdentity, InputReceipt, InputState, OutboxEntry,
@@ -102,6 +106,9 @@ enum ActorCommand {
     },
 }
 type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String>>);
+#[cfg(test)]
+type ClaimWaitBarrier = Arc<Mutex<Option<(crossbeam_channel::Sender<()>, crossbeam_channel::Receiver<()>)>>>;
+
 
 /// Why a provider command may not have taken effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,6 +333,8 @@ struct Inner {
     confirmed_session: Arc<Mutex<Option<String>>>,
     backend_conversation: Arc<Mutex<BackendConversation>>,
     source_claimed: Arc<AtomicBool>,
+    #[cfg(test)]
+    claim_wait_barrier: ClaimWaitBarrier,
     #[cfg(test)]
     lose_next_source_release_reply: AtomicBool,
     visible: Arc<AtomicBool>,
@@ -662,6 +671,8 @@ impl LocalHandle {
         let confirmed_session = Arc::new(Mutex::new(None));
         let backend_conversation = Arc::new(Mutex::new(BackendConversation::default()));
         let source_claimed = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let claim_wait_barrier: ClaimWaitBarrier = Default::default();
         let ownership_admission = Arc::new(Mutex::new(()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
@@ -690,6 +701,8 @@ impl LocalHandle {
             confirmed_session: confirmed_session.clone(),
             backend_conversation: backend_conversation.clone(),
             source_claimed: source_claimed.clone(),
+            #[cfg(test)]
+            claim_wait_barrier: claim_wait_barrier.clone(),
             #[cfg(test)]
             lose_next_source_release_reply: AtomicBool::new(false),
             visible: visible.clone(),
@@ -752,6 +765,8 @@ impl LocalHandle {
                     confirmed_session,
                     backend_conversation,
                     source_claimed,
+                    #[cfg(test)]
+                    claim_wait_barrier,
                     store,
                     visible,
                     observe_next,
@@ -2538,6 +2553,8 @@ struct Actor {
     confirmed_session: Arc<Mutex<Option<String>>>,
     backend_conversation: Arc<Mutex<BackendConversation>>,
     source_claimed: Arc<AtomicBool>,
+    #[cfg(test)]
+    claim_wait_barrier: ClaimWaitBarrier,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -3060,6 +3077,14 @@ impl Actor {
         while self.source_claim.is_some() && !self.stop.load(Ordering::Acquire) {
             self.drain_commands(false)?;
             if self.source_claim.is_none() || self.stop.load(Ordering::Acquire) { break; }
+            #[cfg(test)]
+            {
+                let barrier = self.claim_wait_barrier.lock().unwrap().take();
+                if let Some((entered, resume)) = barrier {
+                    let _ = entered.send(());
+                    resume.recv_timeout(Duration::from_secs(5)).map_err(|_| "Claim wait fixture did not release its actual actor".to_string())?;
+                }
+            }
             // Wake bytes coalesce and the bounded turn above may consume an
             // urgent command in addition to the normal queue's capacity. Never
             // sleep while an already-admitted disposition/control remains.
@@ -8607,6 +8632,61 @@ mod tests {
         );
         handle.close().unwrap();
     }
+    #[test]
+    fn claimed_actor_dispatches_64_normal_plus_urgent_without_an_extra_wake() {
+        let exact = thread::current().name().expect("named contract").to_owned();
+        if isolated_backend_contract(&exact) { return; }
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
+            fn command(&mut self, _: Command) -> Result<Step, String> { Ok(Step::default()) }
+            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+        }
+        struct Close(Handle);
+        impl Drop for Close { fn drop(&mut self) { let _ = self.0.close(); } }
+        struct Resume(crossbeam_channel::Sender<()>);
+        impl Drop for Resume { fn drop(&mut self) { let _ = self.0.try_send(()); } }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec { execution: None, messages: None, unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(),
+            working_directory: directory.path().into(), environment: BTreeMap::new() };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let owner = Close(Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap());
+        let local = owner.0.local_actor().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while local.provider_process().is_none() { assert!(Instant::now() < deadline); thread::yield_now(); }
+        let proof = crate::model::HostSessionProof { host_session_id: "claim-inbox".into(),
+            boot_id: crate::daemon::read_boot_id().unwrap(), host_incarnation: "claim-inbox".into() };
+        let witness = owner.0.backend_identity(&proof).unwrap();
+        let (entered, waiting) = crossbeam_channel::bounded(1);
+        let (resume, resumed) = crossbeam_channel::bounded(1);
+        *local.0.claim_wait_barrier.lock().unwrap() = Some((entered, resumed));
+        let resume = Resume(resume);
+        let token = owner.0.claim_backend_source(&witness).unwrap().into_result().unwrap();
+        waiting.recv_timeout(Duration::from_secs(2)).expect("actual claimed actor never reached the pre-poll cut");
+        let mut replies = Vec::new();
+        for _ in 0..63 {
+            let (send, recv) = crossbeam_channel::bounded(1);
+            local.0.commands.try_send((ActorCommand::Provider { run: None, command: Command::Refresh }, send)).unwrap();
+            replies.push(recv);
+        }
+        let (send, urgent) = crossbeam_channel::bounded(1);
+        local.0.urgent_commands.try_send((ActorCommand::Interrupt { run: None, including_subagents: true }, send)).unwrap();
+        let (send, released) = crossbeam_channel::bounded(1);
+        local.0.commands.try_send((ActorCommand::ReleaseBackendSource { expected: witness, claim: token }, send)).unwrap();
+        // Exactly one coalesced notification for ALL65 requests. The old wait
+        // loop drained it, took urgent+63normal, then slept over queued release.
+        local.wake();
+        resume.0.send(()).unwrap();
+        assert_eq!(released.recv_timeout(Duration::from_secs(2)).expect("admitted release needed an unrelated wake"), Ok(()));
+        assert!(urgent.recv_timeout(Duration::from_secs(2)).unwrap().unwrap_err().contains("pending terminal handoff"));
+        for reply in replies { assert!(reply.recv_timeout(Duration::from_secs(2)).unwrap().unwrap_err().contains("pending terminal handoff")); }
+        assert!(!local.has_backend_source_claim());
+        owner.0.close().unwrap();
+        assert!(owner.0.is_completed());
+    }
+
     #[test]
     fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {
         let spec = ProcessSpec {

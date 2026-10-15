@@ -2664,6 +2664,10 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
 
 #[cfg(test)]
 mod backend_binding_test;
+#[cfg(test)]
+pub(super) fn isolated_backend_contract(exact: &str) -> bool {
+    backend_binding_test::isolated(exact)
+}
 
 #[cfg(test)]
 mod tests {

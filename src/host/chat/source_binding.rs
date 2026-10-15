@@ -1029,6 +1029,10 @@ mod tests {
         assert!(!owner.0.is_completed());
         owner.0.close().unwrap();
         assert!(owner.0.is_completed());
+        // Ordinary positive cleanup correctly restores observed completion.
+        // Independently exercise the completed retained/unknown marker gate;
+        // this is a negative predicate fixture, not Native cleanup evidence.
+        owner.0.withdraw_backend_observation_for_test();
         assert!(owner.0.backend_identity(proof).is_err());
         assert!(!owner.0.backend_identity_is_current(&witness));
         assert!(matches!(owner.0.claim_backend_source(&witness).unwrap(), chat::runtime::BackendSourceClaim::Refused(_)));
