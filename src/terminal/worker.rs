@@ -90,7 +90,10 @@ const BELL_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Debug)]
 enum Command {
     Interrupt(Option<KeyInput>),
-    OrderedInput { generation: u64, input: Box<Command> },
+    OrderedInput {
+        generation: u64,
+        input: Box<Command>,
+    },
     Input(Vec<u8>),
     Paste(String, PasteOrigin),
     Key(KeyInput),
@@ -444,7 +447,10 @@ impl PublishedState {
 
     fn request_interrupt(&self, key: Option<KeyInput>) {
         let mut order = self.input_order.lock().unwrap_or_else(|p| p.into_inner());
-        order.generation = order.generation.checked_add(1).expect("terminal input generation exhausted");
+        order.generation = order
+            .generation
+            .checked_add(1)
+            .expect("terminal input generation exhausted");
         order.interrupt_key = key;
         self.interrupt_requested.store(true, Ordering::Release);
         let _ = self.capture_tx.try_send(());
@@ -703,10 +709,20 @@ impl Drop for HandleInner {
 /// A stalled worker cannot indefinitely hold daemon shutdown or a last-handle
 /// drop. Escalation uses the original root pidfd; detaching never claims exit.
 fn join_worker_bounded(worker: JoinHandle<()>, published: &PublishedState) -> bool {
-    join_worker_until(worker, published, std::time::Instant::now() + WORKER_JOIN_TIMEOUT, true)
+    join_worker_until(
+        worker,
+        published,
+        std::time::Instant::now() + WORKER_JOIN_TIMEOUT,
+        true,
+    )
 }
 
-fn join_worker_until(worker: JoinHandle<()>, published: &PublishedState, deadline: std::time::Instant, escalate: bool) -> bool {
+fn join_worker_until(
+    worker: JoinHandle<()>,
+    published: &PublishedState,
+    deadline: std::time::Instant,
+    escalate: bool,
+) -> bool {
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
@@ -1021,8 +1037,7 @@ impl TerminalHandle {
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
-        if key.action != KeyAction::Release && is_interrupt_key(&key)
-        {
+        if key.action != KeyAction::Release && is_interrupt_key(&key) {
             return self.try_command(Command::Interrupt(Some(key)));
         }
         self.try_command(Command::Key(key))
@@ -1176,7 +1191,10 @@ impl TerminalHandle {
             .recv_timeout(WORKER_JOIN_TIMEOUT * 2)
             .map_err(|_| "terminal carry outcome is unknown after its deadline".to_owned())??;
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
-        if let Some(worker) = self.take_worker_until(deadline).map_err(|error| error.to_string())? {
+        if let Some(worker) = self
+            .take_worker_until(deadline)
+            .map_err(|error| error.to_string())?
+        {
             if !join_worker_until(worker, &self.inner.published, deadline, false) {
                 return Err("terminal carry cleanup exceeded its deadline".into());
             }
@@ -1243,11 +1261,17 @@ impl TerminalHandle {
             match self.take_worker_until(deadline) {
                 Ok(Some(worker)) => {
                     if !join_worker_until(worker, &self.inner.published, deadline, true) {
-                        return TerminalCloseResult::Unknown("Terminal worker did not finish close within its deadline".into());
+                        return TerminalCloseResult::Unknown(
+                            "Terminal worker did not finish close within its deadline".into(),
+                        );
                     }
                 }
-                Ok(None) if self.is_completed() => {},
-                Ok(None) => return TerminalCloseResult::Unknown("Terminal worker is already closing".into()),
+                Ok(None) if self.is_completed() => {}
+                Ok(None) => {
+                    return TerminalCloseResult::Unknown(
+                        "Terminal worker is already closing".into(),
+                    );
+                }
                 Err(error) => return TerminalCloseResult::Unknown(error.to_string()),
             }
         }
@@ -1349,7 +1373,10 @@ impl TerminalHandle {
             result?;
         }
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
-        if let Some(worker) = self.take_worker_until(deadline).map_err(|error| error.to_string())? {
+        if let Some(worker) = self
+            .take_worker_until(deadline)
+            .map_err(|error| error.to_string())?
+        {
             if !join_worker_until(worker, &self.inner.published, deadline, false) {
                 return Err("terminal worker exceeded its preserve deadline".into());
             }
@@ -1360,14 +1387,21 @@ impl TerminalHandle {
         Ok(())
     }
 
-    fn take_worker_until(&self, deadline: std::time::Instant) -> Result<Option<JoinHandle<()>>, TerminalSendError> {
+    fn take_worker_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<Option<JoinHandle<()>>, TerminalSendError> {
         loop {
             match self.inner.worker.try_lock() {
                 Ok(mut worker) => return Ok(worker.take()),
-                Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner().take()),
-                Err(std::sync::TryLockError::WouldBlock) => {},
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    return Ok(error.into_inner().take());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
             }
-            if std::time::Instant::now() >= deadline { return Err(TerminalSendError::Closed); }
+            if std::time::Instant::now() >= deadline {
+                return Err(TerminalSendError::Closed);
+            }
             thread::sleep(Duration::from_millis(1));
         }
     }
@@ -1407,27 +1441,55 @@ impl TerminalHandle {
         if matches!(*phase, ArchivePhase::Released) {
             return Err(TerminalSendError::Closed);
         }
-        if matches!(command, Command::Interrupt(_) | Command::CloseChecked { .. }) {
-            let finished = self.inner.worker.try_lock().ok().is_some_and(|worker| worker.as_ref().is_some_and(JoinHandle::is_finished));
-            if finished || published.completed.load(Ordering::Acquire) { return Err(TerminalSendError::Closed); }
+        if matches!(
+            command,
+            Command::Interrupt(_) | Command::CloseChecked { .. }
+        ) {
+            let finished = self
+                .inner
+                .worker
+                .try_lock()
+                .ok()
+                .is_some_and(|worker| worker.as_ref().is_some_and(JoinHandle::is_finished));
+            if finished || published.completed.load(Ordering::Acquire) {
+                return Err(TerminalSendError::Closed);
+            }
         }
         if let Command::Interrupt(key) = command {
             published.request_interrupt(key);
             return Ok(());
         }
         if matches!(command, Command::CloseChecked { .. }) {
-            let mut priority = published.priority_close.lock().unwrap_or_else(|p| p.into_inner());
-            if priority.is_some() { return Err(TerminalSendError::Full); }
+            let mut priority = published
+                .priority_close
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if priority.is_some() {
+                return Err(TerminalSendError::Full);
+            }
             *priority = Some(command);
             let _ = published.capture_tx.try_send(());
             return Ok(());
         }
         // Serialize input admission with the priority cancellation boundary.
         // Commands submitted after Ctrl+C must survive its queue drain.
-        let order = self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
-        let command = if matches!(command, Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_)) {
-            Command::OrderedInput { generation: order.generation, input: Box::new(command) }
-        } else { command };
+        let order = self
+            .inner
+            .published
+            .input_order
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let command = if matches!(
+            command,
+            Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_)
+        ) {
+            Command::OrderedInput {
+                generation: order.generation,
+                input: Box::new(command),
+            }
+        } else {
+            command
+        };
         self.inner
             .commands
             .try_send(command)
@@ -1449,13 +1511,17 @@ impl TerminalHandle {
 }
 
 fn is_interrupt_key(key: &KeyInput) -> bool {
-    key.modifiers.control && !key.modifiers.alt && !key.modifiers.super_key
+    key.modifiers.control
+        && !key.modifiers.alt
+        && !key.modifiers.super_key
         && matches!(key.key, TerminalKey::Character('c' | 'C'))
 }
 
 fn is_cancelable_input_before(command: &Command, boundary: u64) -> bool {
     match command {
-        Command::OrderedInput { generation, input } => *generation < boundary && is_cancelable_input_before(input, boundary),
+        Command::OrderedInput { generation, input } => {
+            *generation < boundary && is_cancelable_input_before(input, boundary)
+        }
         // A press may already be consumed. Preserve key and button releases
         // while canceling bulk input, so raw/extended apps never keep a key or
         // button pressed merely because Ctrl+C overtook its queued release.
@@ -1796,10 +1862,14 @@ impl Worker {
         // Duplicates share the master file description. Reader and detached
         // holder paths also tolerate WouldBlock after readiness races.
         let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0 || unsafe {
-            libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
-        } < 0 {
-            return Err(format!("make PTY nonblocking: {}", std::io::Error::last_os_error()));
+        if flags < 0
+            || unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(format!(
+                "make PTY nonblocking: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         let _ = published.shutdown_pidfd.set(held.child.shutdown_pidfd()?);
         // Output an adopted terminal produced between daemons comes first, as
@@ -1938,10 +2008,22 @@ impl Worker {
             }
             if self.published.interrupt_requested.load(Ordering::Acquire) {
                 let boundary = self.interrupt_input();
-                if carried_command.as_ref().is_some_and(|command| is_cancelable_input_before(command, boundary)) { carried_command = None; }
+                if carried_command
+                    .as_ref()
+                    .is_some_and(|command| is_cancelable_input_before(command, boundary))
+                {
+                    carried_command = None;
+                }
             }
-            let close = self.published.priority_close.lock().unwrap_or_else(|p| p.into_inner()).take();
-            if let Some(close) = close && self.handle_command(close) {
+            let close = self
+                .published
+                .priority_close
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(close) = close
+                && self.handle_command(close)
+            {
                 shutting_down = true;
                 break;
             }
@@ -1952,7 +2034,10 @@ impl Worker {
             if self.last_foreground_observation.elapsed() >= self.foreground_poll {
                 self.observe_foreground();
             }
-            let event = self.retained_commands.pop_front().or_else(|| carried_command.take())
+            let event = self
+                .retained_commands
+                .pop_front()
+                .or_else(|| carried_command.take())
                 .map(|command| WorkerEvent::Command(Some(command)))
                 .unwrap_or_else(|| {
                     wait_for_worker_event(
@@ -1975,7 +2060,9 @@ impl Worker {
                 WorkerEvent::Command(Some(command)) => {
                     // A command selected together with the priority wake must
                     // cross the cancellation boundary before it can write.
-                    let Some(command) = self.command_before_interrupt(command) else { continue; };
+                    let Some(command) = self.command_before_interrupt(command) else {
+                        continue;
+                    };
                     // Wheel bursts otherwise queue one repaint per event. Fold
                     // adjacent viewport deltas before publishing a snapshot.
                     let command =
@@ -2252,14 +2339,18 @@ impl Worker {
             // selected command to the inbox without replacing that control.
             self.retained_commands.push_front(command);
             None
-        } else { Some(command) }
+        } else {
+            Some(command)
+        }
     }
 
     /// Returns true when shutdown was requested.
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
             Command::OrderedInput { input, .. } => return self.handle_command(*input),
-            Command::Interrupt(key) => { self.published.request_interrupt(key); },
+            Command::Interrupt(key) => {
+                self.published.request_interrupt(key);
+            }
             Command::ReadViewport {
                 offset,
                 rows,
@@ -2411,7 +2502,9 @@ impl Worker {
                 let process = self.observe_agent_process().cloned();
                 let _ = sender.send(process);
             }
-            Command::Input(bytes) => { self.write_pty(&bytes, "write terminal input"); },
+            Command::Input(bytes) => {
+                self.write_pty(&bytes, "write terminal input");
+            }
             Command::Paste(text, origin) => self.paste(&text, origin),
             Command::Key(input) => self.encode_key(input),
             Command::Mouse(input) => self.encode_mouse(input),
@@ -2434,7 +2527,9 @@ impl Worker {
                     focus::Event::Lost
                 };
                 match event.encode(&mut buffer) {
-                    Ok(written) => { self.write_pty(&buffer[..written], "write focus report"); },
+                    Ok(written) => {
+                        self.write_pty(&buffer[..written], "write focus report");
+                    }
                     Err(error) => self.error("encode focus report", error.to_string()),
                 }
             }
@@ -2518,7 +2613,9 @@ impl Worker {
 
     fn encode_key(&mut self, input: KeyInput) {
         match encode_key_input(&self.terminal, &mut self.key_encoder, input) {
-            Ok(encoded) => { self.write_pty(&encoded, "write encoded key"); },
+            Ok(encoded) => {
+                self.write_pty(&encoded, "write encoded key");
+            }
             Err(error) => self.error("encode key", error.to_string()),
         }
     }
@@ -2573,7 +2670,9 @@ impl Worker {
             });
         let mut encoded = Vec::with_capacity(32);
         match self.mouse_encoder.encode_to_vec(&event, &mut encoded) {
-            Ok(()) => { self.write_pty(&encoded, "write encoded mouse event"); },
+            Ok(()) => {
+                self.write_pty(&encoded, "write encoded mouse event");
+            }
             Err(error) => self.error("encode mouse event", error.to_string()),
         }
     }
@@ -2828,7 +2927,9 @@ impl Worker {
         let effects = std::mem::take(&mut *self.effects.borrow_mut());
         for effect in effects.ordered {
             match effect {
-                Effect::PtyWrite(bytes) => { self.write_pty(&bytes, "write terminal response"); },
+                Effect::PtyWrite(bytes) => {
+                    self.write_pty(&bytes, "write terminal response");
+                }
                 Effect::Bell => {
                     self.bell.pending = true;
                     self.publish_bell();
@@ -3111,7 +3212,9 @@ impl Worker {
 
     /// True means the entire input was admitted, not necessarily consumed.
     fn write_pty(&mut self, bytes: &[u8], operation: &'static str) -> bool {
-        if !self.flush_pty_input() { return false; }
+        if !self.flush_pty_input() {
+            return false;
+        }
         if bytes.len() > PTY_WRITE_CAPACITY.saturating_sub(self.pending_input.len()) {
             self.error(operation, format!(
                 "Terminal isn't reading input; {} KiB pending. Press Ctrl+C to cancel pending input.",
@@ -3129,20 +3232,29 @@ impl Worker {
         let mut budget = PTY_BATCH_LIMIT;
         while !self.pending_input.is_empty() && budget > 0 {
             let mut ready = libc::pollfd {
-                fd: self.writer.as_raw_fd(), events: libc::POLLOUT, revents: 0,
+                fd: self.writer.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
             };
             if unsafe { libc::poll(&mut ready, 1, 0) } <= 0
-                || ready.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) == 0 {
+                || ready.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) == 0
+            {
                 break;
             }
             let (front, _) = self.pending_input.as_slices();
             match self.writer.write(&front[..front.len().min(budget)]) {
                 Ok(0) => {
                     self.pending_input.clear();
-                    self.error("write terminal input", "PTY write returned zero bytes".into());
+                    self.error(
+                        "write terminal input",
+                        "PTY write returned zero bytes".into(),
+                    );
                     return false;
-                },
-                Ok(written) => { self.pending_input.drain(..written); budget -= written; }
+                }
+                Ok(written) => {
+                    self.pending_input.drain(..written);
+                    budget -= written;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => {
@@ -3157,40 +3269,61 @@ impl Worker {
 
     fn interrupt_input(&mut self) -> u64 {
         let (boundary, key) = {
-            let mut order = self.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
-            self.published.interrupt_requested.store(false, Ordering::Release);
+            let mut order = self
+                .published
+                .input_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            self.published
+                .interrupt_requested
+                .store(false, Ordering::Release);
             (order.generation, order.interrupt_key.take())
         };
         let encoded = match key {
             Some(key) => match encode_key_input(&self.terminal, &mut self.key_encoder, key) {
                 Ok(encoded) => encoded,
-                Err(error) => { self.error("encode interrupt", error.to_string()); return boundary; }
+                Err(error) => {
+                    self.error("encode interrupt", error.to_string());
+                    return boundary;
+                }
             },
             None => vec![3],
         };
         self.pending_input.clear();
-        self.retained_commands.retain(|command| !is_cancelable_input_before(command, boundary));
+        self.retained_commands
+            .retain(|command| !is_cancelable_input_before(command, boundary));
         // A producer may keep filling the bounded inbox. Drain only the
         // commands present at this boundary so cancellation itself is bounded.
         for _ in 0..self.commands.len() {
-            let Ok(command) = self.commands.try_recv() else { break; };
-            if !is_cancelable_input_before(&command, boundary) { self.retained_commands.push_back(command); }
+            let Ok(command) = self.commands.try_recv() else {
+                break;
+            };
+            if !is_cancelable_input_before(&command, boundary) {
+                self.retained_commands.push_back(command);
+            }
         }
         let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
         // The master exposes its exact slave's line discipline. POLLOUT only
         // describes the flip queue: even a writable master can have a full
         // slave input buffer that strands a conventional interrupt byte.
-        let conventional_interrupt = unsafe { libc::tcgetattr(self.writer.as_raw_fd(), &mut attributes) } == 0
-            && attributes.c_lflag & libc::ISIG != 0
-            && encoded.len() == 1
-            && encoded[0] != 0
-            && encoded[0] == attributes.c_cc[libc::VINTR];
+        let conventional_interrupt =
+            unsafe { libc::tcgetattr(self.writer.as_raw_fd(), &mut attributes) } == 0
+                && attributes.c_lflag & libc::ISIG != 0
+                && encoded.len() == 1
+                && encoded[0] != 0
+                && encoded[0] == attributes.c_cc[libc::VINTR];
         self.cancel_kernel_input();
         if conventional_interrupt {
             // TIOCSIG targets the foreground group bound to this exact PTY.
             // Raw applications and extended key encodings retain their bytes.
-            let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSIG, libc::SIGINT) };
-            if result < 0 { self.error("interrupt terminal", std::io::Error::last_os_error().to_string()); }
+            let result =
+                unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSIG, libc::SIGINT) };
+            if result < 0 {
+                self.error(
+                    "interrupt terminal",
+                    std::io::Error::last_os_error().to_string(),
+                );
+            }
         } else {
             self.write_pty(&encoded, "interrupt terminal");
         }
@@ -3201,16 +3334,27 @@ impl Worker {
         // The peer ioctl opens this exact slave without a reusable path or a
         // controlling-terminal change. Flushing TCIFLUSH on the master would
         // discard child output; flushing the peer discards canceled input.
-        let peer = unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCGPTPEER,
-            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        let peer = unsafe {
+            libc::ioctl(
+                self.writer.as_raw_fd(),
+                libc::TIOCGPTPEER,
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
         if peer < 0 {
-            self.error("cancel terminal input", std::io::Error::last_os_error().to_string());
+            self.error(
+                "cancel terminal input",
+                std::io::Error::last_os_error().to_string(),
+            );
             return;
         }
         // SAFETY: the successful ioctl returned a fresh owned descriptor.
         let peer = unsafe { OwnedFd::from_raw_fd(peer) };
         if unsafe { libc::tcflush(peer.as_raw_fd(), libc::TCIFLUSH) } < 0 {
-            self.error("cancel terminal input", std::io::Error::last_os_error().to_string());
+            self.error(
+                "cancel terminal input",
+                std::io::Error::last_os_error().to_string(),
+            );
         }
     }
 
@@ -3701,7 +3845,11 @@ fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>, readiness: Owned
                     return;
                 }
             }
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
             Err(error) => {
                 let _ = sender.send(PtyMessage::Error(error.to_string()));
                 return;
@@ -5745,20 +5893,32 @@ mod tests {
         wait_for_text(&handle, "ready");
         let before = handle.snapshot().generation;
         for _ in 0..3 {
-            handle.paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard).unwrap();
+            handle
+                .paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard)
+                .unwrap();
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut backpressure = false;
         while std::time::Instant::now() < deadline {
             let snapshot = handle.snapshot();
             handle.acknowledge_redraw(snapshot.generation);
-            backpressure |= handle.events().try_iter().any(|event| matches!(event,
-                TerminalEvent::Error { message, .. } if message.contains("isn't reading input")));
-            if backpressure && snapshot.generation > before { break; }
+            backpressure |= handle.events().try_iter().any(|event| {
+                matches!(event,
+                TerminalEvent::Error { message, .. } if message.contains("isn't reading input"))
+            });
+            if backpressure && snapshot.generation > before {
+                break;
+            }
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(backpressure, "pending byte bound must report backpressure to client");
-        assert!(handle.snapshot().generation > before, "output stalled behind PTY write");
+        assert!(
+            backpressure,
+            "pending byte bound must report backpressure to client"
+        );
+        assert!(
+            handle.snapshot().generation > before,
+            "output stalled behind PTY write"
+        );
         handle.input(vec![3]).unwrap();
         wait_for_text(&handle, "interrupted");
         let started = std::time::Instant::now();
@@ -5770,10 +5930,14 @@ mod tests {
     fn nonreading_child_shutdown_is_bounded_with_a_full_pending_paste() {
         let handle = TerminalHandle::spawn(
             shell_session("stty -echo -icanon; echo ready; exec sleep 600"),
-            TerminalConfig::default(), |_| {},
-        ).unwrap();
+            TerminalConfig::default(),
+            |_| {},
+        )
+        .unwrap();
         wait_for_text(&handle, "ready");
-        handle.paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard).unwrap();
+        handle
+            .paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard)
+            .unwrap();
         thread::sleep(Duration::from_millis(50));
         let started = std::time::Instant::now();
         handle.shutdown().unwrap();
@@ -5788,8 +5952,13 @@ mod tests {
             ).launch);
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             loop {
-                let message = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
-                if let PtyMessage::Bytes(bytes) = &message && bytes.windows(5).any(|word| word == b"ready") {
+                let message = worker
+                    .pty_rx
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap();
+                if let PtyMessage::Bytes(bytes) = &message
+                    && bytes.windows(5).any(|word| word == b"ready")
+                {
                     worker.handle_pty_message(Some(message));
                     break;
                 }
@@ -5801,19 +5970,25 @@ mod tests {
                     Ok(0) => break,
                     Ok(count) => accepted += count,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) => panic!("fill PTY: {error}"),
                 }
             }
             assert!(accepted > 0);
-            assert!(worker.pending_input.is_empty(), "all accepted bytes are already inside the kernel");
+            assert!(
+                worker.pending_input.is_empty(),
+                "all accepted bytes are already inside the kernel"
+            );
             if requested == 4096 {
                 assert_eq!(accepted, requested);
             } else {
                 assert!(accepted < requested);
             }
             worker.interrupt_input();
-            assert!(worker.child.exited_within(Duration::from_secs(3)).unwrap(), "Ctrl+C was trapped behind {accepted} kernel bytes");
+            assert!(
+                worker.child.exited_within(Duration::from_secs(3)).unwrap(),
+                "Ctrl+C was trapped behind {accepted} kernel bytes"
+            );
             worker.run();
         }
     }
@@ -5821,40 +5996,79 @@ mod tests {
     #[test]
     fn raw_interrupt_flushes_canceled_paste_and_preserves_its_control_byte() {
         for extended in [false, true] {
-            let mut key = key_input(KeyAction::Press, TerminalKey::Character('c'), Some("c"), Some('c'));
+            let mut key = key_input(
+                KeyAction::Press,
+                TerminalKey::Character('c'),
+                Some("c"),
+                Some('c'),
+            );
             key.modifiers.control = true;
             let mut release = key.clone();
             release.action = KeyAction::Release;
-            let mut terminal = Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 0 }).unwrap();
-            if extended { terminal.vt_write(b"\x1b[>3u"); }
+            let mut terminal = Terminal::new(TerminalOptions {
+                cols: 80,
+                rows: 24,
+                max_scrollback: 0,
+            })
+            .unwrap();
+            if extended {
+                terminal.vt_write(b"\x1b[>3u");
+            }
             let mut encoder = KeyEncoder::new().unwrap();
             let mut expected = encode_key_input(&terminal, &mut encoder, key.clone()).unwrap();
             expected.extend(encode_key_input(&terminal, &mut encoder, release.clone()).unwrap());
             let announce = if extended { "\\033[>3u" } else { "" };
-            let script = format!("stty raw -echo; printf '{announce}ready\\r\\n'; kill -STOP $$; od -An -tu1 -N{}", expected.len());
+            let script = format!(
+                "stty raw -echo; printf '{announce}ready\\r\\n'; kill -STOP $$; od -An -tu1 -N{}",
+                expected.len()
+            );
             let (mut worker, _) = capture_worker_for(shell_session(&script).launch);
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             loop {
-                let message = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+                let message = worker
+                    .pty_rx
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap();
                 let ready = matches!(&message, PtyMessage::Bytes(bytes) if bytes.windows(5).any(|word| word == b"ready"));
                 worker.handle_pty_message(Some(message));
-                if ready { break; }
+                if ready {
+                    break;
+                }
             }
             worker.writer.write_all(&[b'x'; 4096]).unwrap();
             let (commands, receiver) = command_channel(4);
             worker.commands = receiver;
             commands.send(Command::Key(release)).unwrap();
-            commands.send(Command::Mouse(MouseInput {
-                action: MouseAction::Release, button: Some(MouseButton::Left), modifiers: KeyModifiers::default(),
-                x: 0.0, y: 0.0, screen_width: 80, screen_height: 24, cell_width: 1, cell_height: 1, any_button_pressed: false,
-            })).unwrap();
-            commands.send(Command::Paste("canceled".into(), PasteOrigin::Clipboard)).unwrap();
+            commands
+                .send(Command::Mouse(MouseInput {
+                    action: MouseAction::Release,
+                    button: Some(MouseButton::Left),
+                    modifiers: KeyModifiers::default(),
+                    x: 0.0,
+                    y: 0.0,
+                    screen_width: 80,
+                    screen_height: 24,
+                    cell_width: 1,
+                    cell_height: 1,
+                    any_button_pressed: false,
+                }))
+                .unwrap();
+            commands
+                .send(Command::Paste("canceled".into(), PasteOrigin::Clipboard))
+                .unwrap();
             worker.published.request_interrupt(Some(key));
             worker.interrupt_input();
-            assert_eq!(worker.retained_commands.len(), 2, "key/button releases survive canceled paste");
+            assert_eq!(
+                worker.retained_commands.len(),
+                2,
+                "key/button releases survive canceled paste"
+            );
             assert!(worker.retained_commands.iter().any(|command| matches!(command, Command::Mouse(mouse) if mouse.action == MouseAction::Release)));
-            while let Some(command) = worker.retained_commands.pop_front() { worker.handle_command(command); }
-            close_processes::signal(&worker.child.shutdown_pidfd().unwrap(), libc::SIGCONT).unwrap();
+            while let Some(command) = worker.retained_commands.pop_front() {
+                worker.handle_command(command);
+            }
+            close_processes::signal(&worker.child.shutdown_pidfd().unwrap(), libc::SIGCONT)
+                .unwrap();
             let mut output = String::new();
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             while std::time::Instant::now() < deadline {
@@ -5864,15 +6078,24 @@ mod tests {
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     Err(_) => break,
                 };
-                if let PtyMessage::Bytes(bytes) = message { output.push_str(&String::from_utf8_lossy(&bytes)); }
-                else { break; }
-                let observed: Vec<u8> = output.split_whitespace().filter_map(|word| word.parse().ok()).collect();
+                if let PtyMessage::Bytes(bytes) = message {
+                    output.push_str(&String::from_utf8_lossy(&bytes));
+                } else {
+                    break;
+                }
+                let observed: Vec<u8> = output
+                    .split_whitespace()
+                    .filter_map(|word| word.parse().ok())
+                    .collect();
                 if observed.len() >= expected.len() {
                     assert_eq!(observed, expected, "extended={extended}: {output}");
                     break;
                 }
             }
-            let observed: Vec<u8> = output.split_whitespace().filter_map(|word| word.parse().ok()).collect();
+            let observed: Vec<u8> = output
+                .split_whitespace()
+                .filter_map(|word| word.parse().ok())
+                .collect();
             assert_eq!(observed, expected, "extended={extended}: {output}");
             drop(commands);
             worker.run();
@@ -5885,43 +6108,81 @@ mod tests {
         let (commands, receiver) = command_channel(4);
         worker.commands = receiver;
         let (reply, _) = crossbeam_channel::bounded(1);
-        commands.send(Command::CloseChecked { allow_active: false, deadline: std::time::Instant::now() + Duration::from_secs(3), reply }).unwrap();
+        commands
+            .send(Command::CloseChecked {
+                allow_active: false,
+                deadline: std::time::Instant::now() + Duration::from_secs(3),
+                reply,
+            })
+            .unwrap();
         let mut carried = None;
-        let _ = coalesce_scroll_command(Command::Scroll(ScrollCommand::Delta(1)), &worker.commands, &mut carried);
+        let _ = coalesce_scroll_command(
+            Command::Scroll(ScrollCommand::Delta(1)),
+            &worker.commands,
+            &mut carried,
+        );
         assert!(matches!(carried, Some(Command::CloseChecked { .. })));
-        worker.retained_commands.push_back(Command::Resize(TerminalSize { columns: 81, rows: 24, cell_width_px: 1, cell_height_px: 1 }));
+        worker
+            .retained_commands
+            .push_back(Command::Resize(TerminalSize {
+                columns: 81,
+                rows: 24,
+                cell_width_px: 1,
+                cell_height_px: 1,
+            }));
         let selected = worker.retained_commands.pop_front().unwrap();
         worker.published.request_interrupt(None);
         assert!(worker.command_before_interrupt(selected).is_none());
         worker.interrupt_input();
-        assert!(matches!(carried, Some(Command::CloseChecked { .. })), "pending scroll control must retain ownership");
-        assert!(matches!(worker.retained_commands.pop_front(), Some(Command::Resize(_))));
+        assert!(
+            matches!(carried, Some(Command::CloseChecked { .. })),
+            "pending scroll control must retain ownership"
+        );
+        assert!(matches!(
+            worker.retained_commands.pop_front(),
+            Some(Command::Resize(_))
+        ));
         drop(commands);
         worker.run();
     }
 
     #[test]
     fn priority_interrupt_preserves_input_submitted_after_its_boundary() {
-        let (mut worker, _) = capture_worker_for(shell_session("stty raw -echo; printf 'ready\\r\\n'; kill -STOP $$; od -An -tu1 -N7").launch);
+        let (mut worker, _) = capture_worker_for(
+            shell_session("stty raw -echo; printf 'ready\\r\\n'; kill -STOP $$; od -An -tu1 -N7")
+                .launch,
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
-            let message = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            let message = worker
+                .pty_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
             let ready = matches!(&message, PtyMessage::Bytes(bytes) if bytes.windows(5).any(|word| word == b"ready"));
             worker.handle_pty_message(Some(message));
-            if ready { break; }
+            if ready {
+                break;
+            }
         }
         let (commands, receiver) = command_channel(4);
         worker.commands = receiver;
         let published = Arc::clone(&worker.published);
-        let handle = TerminalHandle { inner: Arc::new(HandleInner {
-            commands, events: crossbeam_channel::unbounded().1, published, worker: Mutex::new(None),
-        }) };
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: crossbeam_channel::unbounded().1,
+                published,
+                worker: Mutex::new(None),
+            }),
+        };
         handle.paste("canceled", PasteOrigin::Clipboard).unwrap();
         handle.input(vec![3]).unwrap();
         handle.input(b"after\n".to_vec()).unwrap();
         worker.interrupt_input();
         assert_eq!(worker.retained_commands.len(), 1);
-        while let Some(command) = worker.retained_commands.pop_front() { worker.handle_command(command); }
+        while let Some(command) = worker.retained_commands.pop_front() {
+            worker.handle_command(command);
+        }
         close_processes::signal(&worker.child.shutdown_pidfd().unwrap(), libc::SIGCONT).unwrap();
         let mut output = String::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -5932,10 +6193,18 @@ mod tests {
                 Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             }
-            let observed: Vec<u8> = output.split_whitespace().filter_map(|word| word.parse().ok()).collect();
-            if observed.len() >= 7 { break; }
+            let observed: Vec<u8> = output
+                .split_whitespace()
+                .filter_map(|word| word.parse().ok())
+                .collect();
+            if observed.len() >= 7 {
+                break;
+            }
         }
-        let observed: Vec<u8> = output.split_whitespace().filter_map(|word| word.parse().ok()).collect();
+        let observed: Vec<u8> = output
+            .split_whitespace()
+            .filter_map(|word| word.parse().ok())
+            .collect();
         assert_eq!(observed, b"\x03after\n", "{output}");
         drop(handle);
         worker.run();
@@ -5947,14 +6216,20 @@ mod tests {
         worker.writer = File::open("/dev/null").unwrap();
         assert!(!worker.write_pty(b"x", "fixture input"));
         assert!(worker.pending_input.is_empty());
-        assert!(events.try_iter().any(|event| matches!(event, TerminalEvent::Error { .. })));
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, TerminalEvent::Error { .. }))
+        );
         worker.run();
     }
 
     #[test]
     fn checked_close_bypasses_a_saturated_input_inbox() {
         let (commands, receiver) = command_channel(1);
-        commands.send(Command::Input(vec![b'x'; 1024 * 1024])).unwrap();
+        commands
+            .send(Command::Input(vec![b'x'; 1024 * 1024]))
+            .unwrap();
         let (ready, initialized) = crossbeam_channel::bounded(1);
         let (run, start) = crossbeam_channel::bounded::<()>(1);
         let thread = thread::spawn(move || {
@@ -5965,35 +6240,78 @@ mod tests {
             worker.run();
         });
         let published = initialized.recv_timeout(Duration::from_secs(3)).unwrap();
-        let handle = TerminalHandle { inner: Arc::new(HandleInner {
-            commands, events: crossbeam_channel::unbounded().1, published, worker: Mutex::new(Some(thread)),
-        }) };
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: crossbeam_channel::unbounded().1,
+                published,
+                worker: Mutex::new(Some(thread)),
+            }),
+        };
         let closing = handle.clone();
         let closer = thread::spawn(move || closing.close_checked(true));
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while handle.inner.published.priority_close.lock().unwrap().is_none() {
-            assert!(std::time::Instant::now() < deadline, "close inspection was rejected by ordinary inbox");
+        while handle
+            .inner
+            .published
+            .priority_close
+            .lock()
+            .unwrap()
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "close inspection was rejected by ordinary inbox"
+            );
             thread::yield_now();
         }
-        assert_eq!(handle.inner.commands.len(), 1, "priority close cannot consume queued paste before inspection");
+        assert_eq!(
+            handle.inner.commands.len(),
+            1,
+            "priority close cannot consume queued paste before inspection"
+        );
         run.send(()).unwrap();
-        assert_eq!(closer.join().unwrap(), super::super::ipc::TerminalCloseResult::Closed);
+        assert_eq!(
+            closer.join().unwrap(),
+            super::super::ipc::TerminalCloseResult::Closed
+        );
         assert!(handle.is_completed());
     }
 
     #[test]
     fn priority_interrupt_obeys_completed_and_released_admission() {
-        let handle = TerminalHandle::spawn(shell_session("exit 0"), TerminalConfig::default(), |_| {}).unwrap();
+        let handle =
+            TerminalHandle::spawn(shell_session("exit 0"), TerminalConfig::default(), |_| {})
+                .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while !handle.is_completed() { assert!(std::time::Instant::now() < deadline); thread::sleep(Duration::from_millis(5)); }
+        while !handle.is_completed() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
         for released in [false, true] {
-            if released { handle.release_completed_holder(); }
-            assert_eq!(handle.input(b"ordinary".to_vec()), Err(TerminalSendError::Closed));
+            if released {
+                handle.release_completed_holder();
+            }
+            assert_eq!(
+                handle.input(b"ordinary".to_vec()),
+                Err(TerminalSendError::Closed)
+            );
             assert_eq!(handle.input(vec![3]), Err(TerminalSendError::Closed));
-            let mut key = key_input(KeyAction::Press, TerminalKey::Character('c'), Some("c"), Some('c'));
+            let mut key = key_input(
+                KeyAction::Press,
+                TerminalKey::Character('c'),
+                Some("c"),
+                Some('c'),
+            );
             key.modifiers.control = true;
             assert_eq!(handle.key(key), Err(TerminalSendError::Closed));
-            assert!(!handle.inner.published.interrupt_requested.load(Ordering::Acquire));
+            assert!(
+                !handle
+                    .inner
+                    .published
+                    .interrupt_requested
+                    .load(Ordering::Acquire)
+            );
         }
         handle.shutdown().unwrap();
     }
@@ -6007,16 +6325,30 @@ mod tests {
         let (release, blocked) = crossbeam_channel::bounded::<()>(1);
         let (ready, observed) = crossbeam_channel::bounded(1);
         let worker = thread::spawn(move || {
-            completion.capture_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            let Some(Command::CloseChecked { reply, .. }) = completion.priority_close.lock().unwrap().take() else { panic!("expected priority close"); };
-            reply.send(super::super::ipc::TerminalCloseResult::Closed).unwrap();
+            completion
+                .capture_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            let Some(Command::CloseChecked { reply, .. }) =
+                completion.priority_close.lock().unwrap().take()
+            else {
+                panic!("expected priority close");
+            };
+            reply
+                .send(super::super::ipc::TerminalCloseResult::Closed)
+                .unwrap();
             ready.send(()).unwrap();
             let _ = blocked.recv();
             completion.completed.store(true, Ordering::Release);
         });
-        let handle = TerminalHandle { inner: Arc::new(HandleInner {
-            commands, events: event_receiver, published, worker: Mutex::new(Some(worker)),
-        }) };
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: event_receiver,
+                published,
+                worker: Mutex::new(Some(worker)),
+            }),
+        };
         let closing = handle.clone();
         let closer = thread::spawn(move || closing.close_checked(true));
         observed.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -6027,9 +6359,15 @@ mod tests {
         }
         let started = std::time::Instant::now();
         assert_eq!(handle.shutdown(), Err(TerminalSendError::Closed));
-        assert!(started.elapsed() < Duration::from_millis(500), "shutdown waited on a lock held by join");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "shutdown waited on a lock held by join"
+        );
         release.send(()).unwrap();
-        assert_eq!(closer.join().unwrap(), super::super::ipc::TerminalCloseResult::Closed);
+        assert_eq!(
+            closer.join().unwrap(),
+            super::super::ipc::TerminalCloseResult::Closed
+        );
     }
 
     #[test]
@@ -6039,7 +6377,9 @@ mod tests {
             TerminalConfig::default(), |_| {},
         ).unwrap();
         wait_for_text(&handle, "ready");
-        handle.paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard).unwrap();
+        handle
+            .paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard)
+            .unwrap();
         thread::sleep(Duration::from_millis(100));
         handle.input(vec![3]).unwrap();
         wait_for_text(&handle, "prompt");
@@ -6054,10 +6394,17 @@ mod tests {
         let (commands, _receiver) = command_channel(1);
         let (_events, event_receiver) = crossbeam_channel::unbounded();
         let (release, blocked) = crossbeam_channel::bounded::<()>(1);
-        let worker = thread::spawn(move || { let _ = blocked.recv(); });
-        let handle = TerminalHandle { inner: Arc::new(HandleInner {
-            commands, events: event_receiver, published, worker: Mutex::new(Some(worker)),
-        }) };
+        let worker = thread::spawn(move || {
+            let _ = blocked.recv();
+        });
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: event_receiver,
+                published,
+                worker: Mutex::new(Some(worker)),
+            }),
+        };
         let started = std::time::Instant::now();
         assert_eq!(handle.shutdown(), Err(TerminalSendError::Closed));
         assert!(started.elapsed() < WORKER_JOIN_TIMEOUT + Duration::from_secs(1));
@@ -6071,7 +6418,8 @@ mod tests {
             cols: config.columns,
             rows: config.rows,
             max_scrollback: config.max_scrollback_bytes,
-        }).unwrap();
+        })
+        .unwrap();
         terminal.vt_write(&b"output\r\n".repeat(20_000));
         assert!(terminal.scrollbar().unwrap().total > 10_000);
     }
@@ -6080,8 +6428,11 @@ mod tests {
     fn scrollback_byte_budget_changes_retained_history() {
         let retained = |budget| {
             let mut terminal = Terminal::new(TerminalOptions {
-                cols: 80, rows: 24, max_scrollback: budget,
-            }).unwrap();
+                cols: 80,
+                rows: 24,
+                max_scrollback: budget,
+            })
+            .unwrap();
             terminal.vt_write(&b"output\r\n".repeat(20_000));
             terminal.scrollbar().unwrap().total
         };

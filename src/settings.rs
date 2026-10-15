@@ -4096,13 +4096,19 @@ new_thread = "Alt+Shift+G"
     fn legacy_scrollback_lines_migrate_to_explicit_memory_budget() {
         for (lines, mib) in [(0, 0), (1, 1), (10_000, 10), (1_000_000, 977)] {
             let mut table = toml::Table::new();
-            table.insert("terminal_scrollback_lines".into(), toml::Value::Integer(lines));
+            table.insert(
+                "terminal_scrollback_lines".into(),
+                toml::Value::Integer(lines),
+            );
             normalize_current(&mut table);
             assert_eq!(table["terminal_scrollback_mib"].as_integer(), Some(mib));
             assert!(!table.contains_key("terminal_scrollback_lines"));
         }
         let mut table = toml::Table::new();
-        table.insert("terminal_scrollback_lines".into(), toml::Value::Integer(10_000));
+        table.insert(
+            "terminal_scrollback_lines".into(),
+            toml::Value::Integer(10_000),
+        );
         table.insert("terminal_scrollback_mib".into(), toml::Value::Integer(32));
         normalize_current(&mut table);
         assert_eq!(table["terminal_scrollback_mib"].as_integer(), Some(32));
