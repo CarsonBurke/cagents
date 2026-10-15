@@ -485,3 +485,86 @@ fn keyring_lookup_service_failure_preserves_guidance_without_exposing_diagnostic
     assert_eq!(error["kind"], "linear_auth_required");
     assert_eq!(f.calls(), 0);
 }
+
+#[test]
+fn keyring_stderr_writer_cannot_extend_the_original_helper_deadline() {
+    use std::{process::Child, time::{Duration, Instant}};
+
+    // The fixture owns this original holder throughout. Transfer just stderr's
+    // write descriptor rather than launching an unowned background descendant.
+    struct Holder(Child);
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let f = Fixture::new();
+    let script = r#"import array, os, pathlib, select, socket, sys
+root = pathlib.Path(sys.argv[1])
+with socket.socket(socket.AF_UNIX) as server:
+    server.bind(str(root / 'stderr-socket'))
+    server.listen(1)
+    server.settimeout(5)
+    (root / 'stderr-ready').write_text('ready')
+    connection, _ = server.accept()
+    with connection:
+        connection.settimeout(5)
+        _, ancillary, _, _ = connection.recvmsg(1, socket.CMSG_SPACE(4))
+    assert len(ancillary) == 1
+    level, kind, payload = ancillary[0]
+    assert level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS
+    descriptors = array.array('i')
+    descriptors.frombytes(payload)
+    assert len(descriptors) == 1
+    try:
+        (root / 'stderr-held').write_text('held')
+        select.select([sys.stdin], [], [], 25)
+    finally:
+        os.close(descriptors[0])
+"#;
+    let mut holder = Holder(
+        Command::new("/usr/bin/python3")
+            .args(["-c", script])
+            .arg(f.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let ready_by = Instant::now() + Duration::from_secs(5);
+    while !f.path().join("stderr-ready").exists() {
+        assert!(Instant::now() < ready_by, "private stderr holder did not start");
+        assert!(holder.0.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(
+        f.path().join("bin/secret-tool"),
+        r#"#!/usr/bin/python3
+import array, os, socket
+with socket.socket(socket.AF_UNIX) as client:
+    client.connect(os.path.join(os.environ['LINEAR_FIXTURE'], 'stderr-socket'))
+    client.sendmsg([b'x'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [2]))])
+raise SystemExit(1)
+"#,
+    )
+    .unwrap();
+    let started = Instant::now();
+    let output = f
+        .command(&["linear", "issue", "ENG-12"])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(f.path().join("stderr-held").exists(), "actual stderr descriptor was not held");
+    assert!(holder.0.try_wait().unwrap().is_none(), "holder must still own the open writer");
+    assert!(elapsed < Duration::from_secs(20), "stderr outlived helper deadline: {elapsed:?}");
+    assert!(!output.status.success());
+    let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
+    assert_eq!(error["kind"], "linear_keyring_unavailable");
+    assert!(output.stdout.is_empty());
+    assert_eq!(f.calls(), 0);
+    drop(holder.0.stdin.take());
+    assert!(holder.0.wait().unwrap().success());
+}

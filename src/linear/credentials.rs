@@ -3,6 +3,7 @@
 //! contain them. Keep the CLI lane independent of the desktop dependency graph.
 use std::{
     io::{self, Read, Write},
+    os::fd::AsRawFd,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -54,63 +55,89 @@ fn helper(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| keyring_error())?;
-    let stdout = child.stdout.take().expect("piped output");
+    let mut stdout = child.stdout.take().expect("piped output");
     let mut stderr = child.stderr.take().expect("piped errors");
-    // libsecret reports both a missing entry and service errors with exit 1.
-    // Only errors emit stderr. Drain it without retaining or logging content:
-    // helper diagnostics are not trusted to keep credential values private.
-    let errors = thread::spawn(move || io::copy(&mut stderr, &mut io::sink()));
-    let reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout
-            .take((MAX_KEY_BYTES + 2) as u64)
-            .read_to_end(&mut output)
-            .map(|_| output)
-    });
     let mut input = child.stdin.take().expect("piped input");
-    let written = match secret {
-        Some(secret) => input.write_all(secret.as_bytes()),
-        None => Ok(()),
-    };
-    drop(input);
     let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if written.is_ok() && started.elapsed() < Duration::from_secs(15) => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
+    let result = (|| -> Result<Option<String>, Error> {
+        for descriptor in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+            // SAFETY: both descriptors stay owned and open for this operation.
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+            if flags < 0
+                || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(keyring_error());
             }
         }
-    };
-    let output = reader
-        .join()
-        .map_err(|_| keyring_error())?
-        .map_err(|_| keyring_error())?;
-    let error_bytes = errors
-        .join()
-        .map_err(|_| keyring_error())?
-        .map_err(|_| keyring_error())?;
-    let status = status.ok_or_else(keyring_error)?;
-    // A missing entry exits 1 with neither a value nor error diagnostics.
-    if operation == ["lookup"] && status.code() == Some(1) && output.is_empty() && error_bytes == 0 {
-        return Ok(None);
+        if let Some(secret) = secret {
+            input.write_all(secret.as_bytes()).map_err(|_| keyring_error())?;
+        }
+        drop(input);
+        let mut output = Vec::new();
+        let mut error_bytes = 0u64;
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+        let mut status = None;
+        let mut buffer = [0; 4096];
+        let status = loop {
+            if started.elapsed() >= Duration::from_secs(15) {
+                return Err(keyring_error());
+            }
+            // Read at most one buffer from each pipe per turn. A noisy helper
+            // cannot postpone the original deadline by keeping a pipe ready.
+            if !stdout_done {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => stdout_done = true,
+                    Ok(count) if output.len() + count <= MAX_KEY_BYTES => {
+                        output.extend_from_slice(&buffer[..count]);
+                    }
+                    Ok(_) => return Err(keyring_error()),
+                    Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                    Err(_) => return Err(keyring_error()),
+                }
+            }
+            if !stderr_done {
+                // libsecret uses exit 1 for both missing entries and errors.
+                // Count diagnostics, retaining and logging none of their bytes.
+                match stderr.read(&mut buffer) {
+                    Ok(0) => stderr_done = true,
+                    Ok(count) => error_bytes = error_bytes.saturating_add(count as u64),
+                    Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                    Err(_) => return Err(keyring_error()),
+                }
+            }
+            if status.is_none() {
+                status = child.try_wait().map_err(|_| keyring_error())?;
+            }
+            if stdout_done && stderr_done {
+                if let Some(status) = status {
+                    break status;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        // A missing entry exits 1 with neither a value nor error diagnostics.
+        if operation == ["lookup"] && status.code() == Some(1) && output.is_empty() && error_bytes == 0 {
+            return Ok(None);
+        }
+        if !status.success() {
+            return Err(keyring_error());
+        }
+        if operation == ["lookup"] {
+            // Piped store/lookup preserve exact bytes through EOF.
+            return String::from_utf8(output).map(Some).map_err(|_| keyring_error());
+        }
+        Ok(None)
+    })();
+    // No pipe reader escapes this function, including error paths. Always
+    // consume this original child's status; never signal a numeric descendant.
+    if result.is_err() {
+        let _ = child.kill();
     }
-    if !status.success() || written.is_err() || output.len() > MAX_KEY_BYTES {
+    if child.wait().is_err() {
         return Err(keyring_error());
     }
-    if operation == ["lookup"] {
-        // Piped secret-tool store/lookup use exact bytes through EOF and do
-        // not add a newline. Never alter the credential during a round trip.
-        return String::from_utf8(output)
-            .map(Some)
-            .map_err(|_| keyring_error());
-    }
-    Ok(None)
+    result
 }
 
 pub fn get(workspace: Option<&str>) -> Result<Option<String>, Error> {
