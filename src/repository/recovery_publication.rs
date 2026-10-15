@@ -24,8 +24,21 @@ impl Holding {
         let slot = RecoverySlot::reserve()?;
         let held_parent = parent.try_clone().map_err(|error| error.to_string())?;
         let name = PathBuf::from(format!(".cagents-undo-{}", Uuid::new_v4()));
-        let mut publication = match fs_safety::create_directory_beneath(parent, &name, 0o700)
-            .map_err(|error| error.to_string())? {
+        let creation = match fs_safety::create_directory_beneath(parent, &name, 0o700) {
+            Ok(creation) => creation,
+            Err(mut error) => {
+                let message = error.to_string();
+                if let Some(mut preparation) = error.take_recovery() {
+                    let description = format!("Private Undo preparation originally named {}", preparation.diagnostic_path().display());
+                    recovery.live_recovery.retain(slot.retain(description, move || {
+                        preparation.retry_cleanup().map_err(|error|error.to_string())?;
+                        fs_safety::sync_directory(&held_parent).map_err(|error|error.to_string())
+                    }));
+                }
+                return Err(message);
+            }
+        };
+        let mut publication = match creation {
             fs_safety::DirectoryCreation::Published(publication) => publication,
             fs_safety::DirectoryCreation::Existing(_) => return Err("The private Undo holding name already exists; it was preserved".into()),
             fs_safety::DirectoryCreation::Unverified { directory, reason } => {

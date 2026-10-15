@@ -588,7 +588,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         for entry in entries {
             if recovery.live_recovery.is_completed(&entry.path) { continue; }
             created_directories.flush_before(Some(&entry.path), &mut failures);
-            let result = if recovery.live_recovery.is_pending() {
+            let result = if recovery.live_recovery.needs_resolution() {
                 Err("An earlier recovery entry is unresolved; this path was not changed".into())
             } else if cancellation.is_cancelled() {
                 Err("Undo cancelled".into())
@@ -823,9 +823,19 @@ fn recovery_parent(
         // their archived mode is restored by the component-ordered frontier.
         let temporary_mode = 0o700 | (mode & 0o2000);
         let slot = crate::recovery_authority::RecoverySlot::reserve()?;
-        let result = fs_safety::create_directory_beneath(
+        let result = match fs_safety::create_directory_beneath(
             &parent, Path::new(component.as_os_str()), temporary_mode,
-        ).map_err(|error| error.to_string())?;
+        ) {
+            Ok(result) => result,
+            Err(mut error) => {
+                let message = error.to_string();
+                if let Some(mut preparation) = error.take_recovery() {
+                    let description = format!("Recovery parent preparation originally named {}", preparation.diagnostic_path().display());
+                    created.live.retain(slot.retain(description, move || preparation.retry_cleanup().map_err(|error|error.to_string())));
+                }
+                return Err(message);
+            }
+        };
         parent = match result {
             fs_safety::DirectoryCreation::Existing(directory) => directory,
             fs_safety::DirectoryCreation::Unverified { directory, reason } => {
