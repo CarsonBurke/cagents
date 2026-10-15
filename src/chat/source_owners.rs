@@ -1,7 +1,7 @@
 //! Shared admission for complete logical message bodies reconstructed by the UI.
 //! Disk restores reserve before decoding and transfer that charge to actual
 //! immutable Item owners. This is payload accounting, not allocator/RSS usage.
-use super::{Item, ItemContent, Snapshot, cache::{SourceKey,SourceMetadata}};
+use super::{Item, ItemContent, Snapshot, cache::{SourceKey,SourceMetadata,SourceEpoch}};
 use std::collections::{HashMap,HashSet};
 use std::sync::{Arc,Mutex};
 
@@ -21,6 +21,7 @@ static READER_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 #[derive(Default)]
 pub(crate) struct ReaderCapacity(std::sync::atomic::AtomicUsize);
 impl ReaderCapacity {
+    pub(crate) fn bytes(&self)->usize {self.0.load(std::sync::atomic::Ordering::Relaxed)}
     pub(crate) fn set(&self, bytes: usize) {
         let old = self.0.swap(bytes, std::sync::atomic::Ordering::Relaxed);
         if bytes >= old { READER_CAPACITY.fetch_add(bytes-old, std::sync::atomic::Ordering::Relaxed); }
@@ -100,7 +101,7 @@ pub(crate) fn usage()->Usage {
 fn text_bytes(item:&Item)->Option<usize> {
     match &item.content {ItemContent::Text {text,..}=>Some(text.len()),_=>None}
 }
-pub(crate) fn admit(item:&Arc<Item>,source:&SourceKey,epoch:u64,replaced:Option<&Arc<Item>>)->Admission {
+pub(crate) fn admit(item:&Arc<Item>,source:&SourceKey,epoch:SourceEpoch,replaced:Option<&Arc<Item>>)->Admission {
     let Some(metadata)=SourceMetadata::from_item(item) else {return Admission::Capacity;};
     let Some(bytes)=text_bytes(item) else {return Admission::Capacity;};
     if item.id!=source.source_id {return Admission::Capacity;}
@@ -118,7 +119,7 @@ pub(crate) fn admit(item:&Arc<Item>,source:&SourceKey,epoch:u64,replaced:Option<
 pub(crate) struct ResidentSource {
     pub source:SourceKey,
     pub bytes:usize,
-    pub epoch:u64,
+    pub epoch:SourceEpoch,
     pub metadata:SourceMetadata,
 }
 pub(crate) fn resident_sources(snapshot:&Snapshot)->Vec<ResidentSource> {
@@ -199,6 +200,7 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn source_epoch(revision:u64)->SourceEpoch {SourceEpoch {incarnation:uuid::Uuid::from_u128(1),revision}}
     fn text(id:&str,body:&str)->Arc<Item> {
         Arc::new(Item {id:id.into(),role:super::super::Role::Assistant,started_at:None,at:None,
             content:ItemContent::Text {text:body.into(),thinking:false,phase:super::super::Phase::Final}})
@@ -234,13 +236,13 @@ mod tests {
         assert_eq!(pool.lock().unwrap().reserved,bytes);
         let record=|item:&Arc<Item>,epoch|ResidentSource {source:SourceKey {agent_id:None,source_id:item.id.clone()},
             bytes:text_bytes(item).unwrap(),epoch,metadata:SourceMetadata::from_item(item).unwrap()};
-        let first_record=record(&first,7);
-        reservation.adopt(&[(first.clone(),first_record.clone()),(second.clone(),record(&second,8))]).unwrap();
+        let first_record=record(&first,source_epoch(7));
+        reservation.adopt(&[(first.clone(),first_record.clone()),(second.clone(),record(&second,source_epoch(8)))]).unwrap();
         assert_eq!(pool.lock().unwrap().provenance[&(Arc::as_ptr(&first) as usize)],first_record);
         let mut replacement_metadata=first_record.metadata.clone();replacement_metadata.at=Some(999);
         let snapshot=Snapshot {items:vec![first.clone()],source_parts:vec![super::super::cache::SourcePart {
             item_id:first.id.clone(),source:first_record.source.clone(),start:0,end:first_record.bytes,source_len:first_record.bytes,
-            replacement:false,epoch:99,metadata:replacement_metadata}],..Snapshot::default()};
+            replacement:false,epoch:source_epoch(99),metadata:replacement_metadata}],..Snapshot::default()};
         assert_eq!(resident_sources_in(&pool.lock().unwrap(),&snapshot),vec![first_record],
             "an old displayed prefix keeps its admitted epoch/metadata while raw source parts move to a replacement");
         drop(snapshot);
@@ -254,7 +256,7 @@ mod tests {
         assert_eq!(pool.lock().unwrap().reserved,0);
         let mismatch=reserve_in(pool.clone(),100,100).unwrap();
         let wrong=text("wrong","short");
-        assert_eq!(mismatch.adopt(&[(wrong.clone(),record(&wrong,9))]),Err(ReserveError::InvalidPayload));
+        assert_eq!(mismatch.adopt(&[(wrong.clone(),record(&wrong,source_epoch(9)))]),Err(ReserveError::InvalidPayload));
         assert_eq!(pool.lock().unwrap().reserved,0);
     }
     #[test]
