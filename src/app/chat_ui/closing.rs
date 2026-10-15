@@ -2,11 +2,11 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::app) enum Action {
+pub enum Action {
     End(CardId), Cancel(DialogTarget), Confirm(DialogTarget), Hide(DialogTarget), CommitHide(CardId),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::app) struct DialogTarget {
+pub struct DialogTarget {
     card: CardId,
     generation: u64,
 }

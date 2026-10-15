@@ -2549,9 +2549,9 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::ReturnToAutomationBeforeClose
                 | Message::DiscardAutomationAndClose(_)
                 | Message::CommitClose(_)
-                | Message::ConfirmTerminalClose
-                | Message::CancelTerminalClose
-                | Message::TerminalCloseDontAskChanged(_)
+                | Message::ConfirmTerminalClose(_)
+                | Message::CancelTerminalClose(_)
+                | Message::TerminalCloseDontAskChanged(..)
                 | Message::SaveAndCloseRepository(_)
                 | Message::OverwriteAndCloseRepository(_)
                 | Message::DiscardAndCloseRepository(_)
@@ -4104,9 +4104,9 @@ pub enum Message {
         result: Result<(), String>,
     },
     CommitClose(CardId),
-    ConfirmTerminalClose,
-    CancelTerminalClose,
-    TerminalCloseDontAskChanged(bool),
+    ConfirmTerminalClose(terminal_close::DialogTarget),
+    CancelTerminalClose(terminal_close::DialogTarget),
+    TerminalCloseDontAskChanged(terminal_close::DialogTarget, bool),
     TerminalCloseFinished {
         card: CardId,
         terminal: TerminalId,
@@ -14917,9 +14917,15 @@ impl Application for Cagents {
             Message::CloseCard(id) if self.chat_has_parked_runtime(id) => self.begin_chat_close(id),
             Message::CloseCard(id) => self.begin_card_close(id),
             Message::CloseCardUnasked(id) => self.close_card_unasked(id),
-            Message::ConfirmTerminalClose => self.confirm_terminal_close(),
-            Message::CancelTerminalClose => self.cancel_terminal_close(),
-            Message::TerminalCloseDontAskChanged(value) => self.set_terminal_close_dont_ask(value),
+            Message::ConfirmTerminalClose(target) => {
+                if self.terminal_close_decision_current(&target) { self.confirm_terminal_close() } else { Task::none() }
+            }
+            Message::CancelTerminalClose(target) => {
+                if self.terminal_close_decision_current(&target) { self.cancel_terminal_close() } else { Task::none() }
+            }
+            Message::TerminalCloseDontAskChanged(target, value) => {
+                if self.terminal_close_decision_current(&target) { self.set_terminal_close_dont_ask(value) } else { Task::none() }
+            }
             Message::TerminalCloseFinished {
                 card,
                 terminal,
@@ -16516,7 +16522,7 @@ impl Application for Cagents {
             return self.terminal_close_dialog().map(|surface| {
                 dialog_ui::overlay(
                     surface,
-                    (!intent.pending).then_some(Message::CancelTerminalClose),
+                    (!intent.pending).then_some(Message::CancelTerminalClose(intent.target())),
                     1.0,
                 )
             });

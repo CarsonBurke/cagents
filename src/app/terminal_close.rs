@@ -17,6 +17,19 @@ pub(super) struct CloseIntent {
     restore_keyboard_nav: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogTarget {
+    card: CardId,
+    terminal: TerminalId,
+    proof: HostSessionProof,
+    generation: u64,
+}
+impl CloseIntent {
+    pub(super) fn target(&self) -> DialogTarget {
+        DialogTarget { card: self.card, terminal: self.terminal, proof: self.proof.clone(), generation: self.generation }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CloseOutcome {
     Closed,
@@ -209,12 +222,14 @@ impl Cagents {
                 .live_proof()
                 .or_else(|| self.uncertain_terminal_proofs.get(&card).cloned())
         {
+            let terminal = session.id;
+            self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
             self.terminal_close = Some(CloseIntent {
                 card,
-                terminal: session.id,
+                terminal,
                 proof,
                 completed_source: None,
-                generation: 0,
+                generation: self.terminal_close_generation,
                 restore_card: self.workspace.focused(),
                 pending: false,
                 active: false,
@@ -260,12 +275,13 @@ impl Cagents {
                     });
                     return Task::none();
                 }
+                self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
                 self.terminal_close = Some(CloseIntent {
                     card,
                     terminal: session.id,
                     proof,
                     completed_source: Some(session),
-                    generation: 0,
+                    generation: self.terminal_close_generation,
                     restore_card: self.workspace.focused(),
                     restore_keyboard_nav: self.core.keyboard_nav(),
                     pending: false,
@@ -625,6 +641,15 @@ impl Cagents {
         }
     }
 
+    pub(super) fn terminal_close_target(&self) -> Option<DialogTarget> {
+        self.terminal_close.as_ref().map(CloseIntent::target)
+    }
+    pub(super) fn terminal_close_decision_current(&self, target: &DialogTarget) -> bool {
+        self.top_modal() == Some(modal_ui::Modal::TerminalClose)
+            && self.terminal_close.as_ref().is_some_and(|intent| intent.card == target.card
+                && intent.terminal == target.terminal && intent.proof == target.proof && intent.generation == target.generation)
+    }
+
     pub(super) fn set_terminal_close_dont_ask(&mut self, value: bool) -> Task<Message> {
         let Some(intent) = self.terminal_close.as_mut()
             .filter(|intent| !intent.pending && intent.active && intent.detail.is_none())
@@ -661,6 +686,8 @@ impl Cagents {
         if !self.terminal_close_dialog_visible() {
             return None;
         }
+        let target = self.terminal_close_target()?;
+        let checkbox_target = target.clone();
         let mut rows: Vec<Element<'_, Message>> = vec![
             crate::design::title(if intent.detail.is_some() {
                 "Terminal kept open"
@@ -681,14 +708,14 @@ impl Cagents {
                     crate::ui_controls::field::checkbox(intent.dont_ask_again)
                         .label("Don't ask me again")
                         .on_toggle_maybe(
-                            (!intent.pending).then_some(Message::TerminalCloseDontAskChanged),
+                            (!intent.pending).then_some(move |value| Message::TerminalCloseDontAskChanged(checkbox_target.clone(), value)),
                         ),
                 )
                 .class(cosmic::theme::Button::Text)
                 .id(widget::Id::new("dialog.terminal-close.dont-ask"))
                 .on_press_maybe(
                     (!intent.pending)
-                        .then_some(Message::TerminalCloseDontAskChanged(!intent.dont_ask_again)),
+                        .then_some(Message::TerminalCloseDontAskChanged(target.clone(), !intent.dont_ask_again)),
                 )
                 .into(),
             );
@@ -701,19 +728,19 @@ impl Cagents {
             vec![
                 crate::ui_controls::button::primary("Dismiss")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
-                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
+                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose(target.clone())))
                     .into(),
             ]
         } else {
             vec![
                 crate::ui_controls::button::secondary("Cancel")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
-                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
+                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose(target.clone())))
                     .into(),
                 crate::ui_controls::button::destructive("Close")
                     .id(widget::Id::new("dialog.terminal-close.confirm"))
                     .on_press_maybe(
-                        (!intent.pending && intent.active).then_some(Message::ConfirmTerminalClose),
+                        (!intent.pending && intent.active).then_some(Message::ConfirmTerminalClose(target.clone())),
                     )
                     .into(),
             ]
@@ -755,6 +782,7 @@ mod tests {
                     pending: false, active: true, dont_ask_again: false, detail: None,
                     focus: 0, restore_keyboard_nav: true,
                 });
+                app.terminal_close_generation = 1;
                 drop(app.finish_modal_update(Task::none()));
                 if clicked {
                     let messages = {
@@ -783,9 +811,9 @@ mod tests {
                         }
                         messages
                     };
-                    assert!(messages.iter().any(|message| matches!(message, Message::TerminalCloseDontAskChanged(true))));
+                    assert!(messages.iter().any(|message| matches!(message, Message::TerminalCloseDontAskChanged(_, true))));
                     for message in messages {
-                        let toggled = matches!(message, Message::TerminalCloseDontAskChanged(_));
+                        let toggled = matches!(message, Message::TerminalCloseDontAskChanged(..));
                         let task = app.update(message);
                         if toggled {
                             assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), task), Some(close_focus_id(2)));
@@ -881,7 +909,7 @@ mod tests {
         });
         assert!(app.terminal_close_dialog().is_some());
         assert!(app.card_state(card).unwrap().existence.is_open());
-        let _ = app.update(Message::ConfirmTerminalClose);
+        let _ = app.update(Message::ConfirmTerminalClose(app.terminal_close_target().unwrap()));
         let intent = app.terminal_close.as_ref().unwrap().clone();
         assert!(intent.pending);
         assert_eq!(intent.completed_source, Some(source));
@@ -937,7 +965,7 @@ mod tests {
             "the dialog owns Tab while it is open"
         );
 
-        let _ = app.update(Message::CancelTerminalClose);
+        let _ = app.update(Message::CancelTerminalClose(app.terminal_close_target().unwrap()));
         assert!(app.terminal_close.is_none());
         assert!(!app.chrome_ui.is_open());
         assert!(
@@ -974,7 +1002,7 @@ mod tests {
             session: source,
             result: Ok(CompletedCloseOutcome::Active(proof)),
         });
-        let _ = app.update(Message::ConfirmTerminalClose);
+        let _ = app.update(Message::ConfirmTerminalClose(app.terminal_close_target().unwrap()));
         let intent = app.terminal_close.as_ref().unwrap().clone();
         assert!(intent.pending);
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {

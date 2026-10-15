@@ -332,10 +332,12 @@ impl Cagents {
         let fallback = self.modal_restore_fallback();
         let project_ui = &self.project_ui;
         let chat_close = self.chat_ui.close_dialog.as_ref();
+        let terminal_close = self.terminal_close.as_ref();
         let changed = self.modal_stack.reconcile_instances(&active, fallback.clone(), |kind| {
             match kind {
                 Modal::Project(role) => project_ui.modal_target(role).map(|target| target.request),
                 Modal::ChatClose => chat_close.map(|dialog| Instance::Counter(dialog.generation())),
+                Modal::TerminalClose => terminal_close.map(|intent| Instance::Counter(intent.generation)),
                 _ => None,
             }
         });
