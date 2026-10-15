@@ -899,6 +899,15 @@ mod tests {
     }
     #[test]
     fn explicit_restart_reuses_the_store_and_never_repeats_a_deduplicated_launch() {
+        const CHILD:&str="CAGENTS_RETAINED_RESTART_SUBREAPER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let test=thread::current().name().expect("test harness name").to_owned();
+            let status=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",&test,"--nocapture"]).env(CHILD,"1").status().unwrap();
+            assert!(status.success());return;
+        }
+        // Orphan reaping is process-wide. Only this isolated test process may
+        // become a subreaper; never reap children belonging to parallel tests.
+        assert_eq!(unsafe {libc::prctl(libc::PR_SET_CHILD_SUBREAPER,1,0,0,0)},0);
         let mut fixture=resident_fixture();let server=&mut fixture.server;
         let old_process=server.actor.provider_process().unwrap();let old_close=server.actor.close_observation();
         let store=server.actor.0.store.clone();
