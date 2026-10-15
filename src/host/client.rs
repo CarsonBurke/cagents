@@ -1427,6 +1427,8 @@ pub(super) fn process_admitted(
                 ));
             }
             if let Some((paired, _)) = paired {
+                #[cfg(test)]
+                terminal_pair_close_cut(session.id);
                 super::chat::close_terminal_actor_under_transition(host, session.id, &paired, None)?;
             }
             if let Some(handle) = &handle {
@@ -1468,6 +1470,8 @@ pub(super) fn process_admitted(
                     .unwrap_or_else(|p| p.into_inner())
                     .close_terminal_attention(terminal_id, Some(&handle));
                 if let Some(paired) = paired {
+                    #[cfg(test)]
+                    terminal_pair_close_cut(terminal_id);
                     super::chat::close_terminal_actor_under_transition(host, terminal_id, &paired, None)?;
                 }
             }
@@ -1530,6 +1534,25 @@ pub(super) fn process_admitted(
             ))
         }
     }
+}
+
+// Test scheduling at the old worker-close -> native-close race boundary.
+// The hook never supplies ownership, a cleanup receipt or a successor.
+#[cfg(test)]
+static TERMINAL_PAIR_CLOSE_CUT: std::sync::Mutex<Option<(crate::model::TerminalId, Box<dyn FnOnce() + Send>)>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(super) fn before_terminal_pair_cleanup(id: crate::model::TerminalId, hook: impl FnOnce() + Send + 'static) {
+    *TERMINAL_PAIR_CLOSE_CUT.lock().unwrap() = Some((id, Box::new(hook)));
+}
+#[cfg(test)]
+fn terminal_pair_close_cut(id: crate::model::TerminalId) {
+    let hook = {
+        let mut slot = TERMINAL_PAIR_CLOSE_CUT.lock().unwrap();
+        if slot.as_ref().is_some_and(|(expected, _)| *expected == id) {
+            slot.take().map(|(_, hook)| hook)
+        } else { None }
+    };
+    if let Some(hook) = hook { hook(); }
 }
 
 fn claim_terminal_transition(transition: &std::sync::Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, ProtocolError> {
@@ -1616,6 +1639,8 @@ fn close_terminal_source_checked(
     };
     if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
         if let Some((paired, _)) = paired {
+            #[cfg(test)]
+            terminal_pair_close_cut(source.id);
             super::chat::close_terminal_actor_under_transition(host, source.id, &paired, Some(deadline))?;
         }
         let retired = {
