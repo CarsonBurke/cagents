@@ -161,8 +161,13 @@ impl Journal {
     pub fn append(&mut self, update: &Update) -> Result<(), String> {
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
-        if !matches!(update, Update::Execution { .. } | Update::Attention(_) | Update::AttentionContext {..}) {
+        if !matches!(update,Update::Execution {..}|Update::Attention(_)|Update::AttentionContext {..}|Update::TurnOutcome {..}) {
             return Ok(());
+        }
+        if let Update::TurnOutcome {update}=update {
+            // Native turn/input identities retain their exact source proof.
+            // They never settle or remove a managed current RunId by inference.
+            update.validate()?;
         }
         // Keep bounded supplied context byte-for-byte. Never consult a later
         // snapshot or modify evidence to repair malformed optional display data.
@@ -636,6 +641,41 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn historical_turn(id:&str)->crate::chat::turn_outcomes::TurnIdentity {
+        crate::chat::turn_outcomes::TurnIdentity {session_id:"confirmed-session".into(),kind:crate::chat::turn_outcomes::TurnIdentityKind::NativeTurn,id:id.into()}
+    }
+    #[test]
+    fn exact_historical_turn_proof_repeats_until_ack_without_settling_current_run() {
+        use crate::chat::turn_outcomes::TurnUpdate;
+        let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),16*1024).unwrap();
+        let current=crate::model::RunId::new();let input=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:[5;32]};
+        journal.admit_with_run(&input,Some(current)).unwrap();
+        let identity=historical_turn("earlier-turn");
+        let updates=[Update::TurnOutcome {update:TurnUpdate::Bind {identity:identity.clone(),item_ids:vec!["actual-provider-item-A".into()]}},
+            Update::TurnOutcome {update:TurnUpdate::Finish {identity:identity.clone(),outcome:crate::agent::ActivityOutcome::Cancelled,finished_at:1234}}];
+        for update in &updates {journal.append(update).unwrap();}
+        let first=journal.page(0).unwrap();let repeated=journal.page(0).unwrap();
+        assert_eq!(serde_json::to_value(&first).unwrap(),serde_json::to_value(repeated).unwrap());
+        for (entry,expected) in first.iter().zip(&updates) {assert_eq!(serde_json::to_value(&entry.update).unwrap(),serde_json::to_value(expected).unwrap());}
+        assert!(matches!(&first[1].update,Update::TurnOutcome {update:TurnUpdate::Finish {identity:at,finished_at:1234,..}} if at==&identity));
+        journal.ack(2).unwrap();assert!(journal.page(2).unwrap().is_empty());
+        assert_eq!(journal.retained_runs().unwrap(),vec![current],"past proof ACK never commits the current managed run");
+        assert_eq!(journal.input(&input).unwrap().unwrap().state,InputState::Accepted);
+    }
+    #[test]
+    fn malformed_turn_proof_is_refused_and_encoded_payload_budget_remains_enforced() {
+        use crate::chat::turn_outcomes::{TurnUpdate,MAX_TURN_ID_BYTES,MAX_TURN_ITEM_IDS};
+        let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),DEFAULT_BUDGET).unwrap();
+        let invalid=Update::TurnOutcome {update:TurnUpdate::Bind {identity:historical_turn("old"),item_ids:vec!["duplicate".into(),"duplicate".into()]}};
+        assert!(journal.append(&invalid).is_err());assert_eq!(journal.latest().unwrap(),0);
+        // Valid individual raw IDs can expand under JSON escaping. The shared
+        // 1MiB semantic entry cap still refuses them with an honest typed loss.
+        let ids=(0..MAX_TURN_ITEM_IDS).map(|index|format!("{index}{}","\0".repeat(MAX_TURN_ID_BYTES-4))).collect();
+        let large=Update::TurnOutcome {update:TurnUpdate::Bind {identity:historical_turn("old"),item_ids:ids}};
+        assert!(journal.append(&large).unwrap_err().contains("overflowed"));
+        assert_eq!(journal.latest().unwrap(),0);assert!(journal.continuity_loss().unwrap().is_some());
+    }
+
     #[test]
     fn immutable_attention_context_repeats_verbatim_until_full_ack() {
         let dir=tempfile::tempdir_in("/var/tmp").unwrap();
