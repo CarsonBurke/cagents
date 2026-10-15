@@ -999,6 +999,7 @@ struct WidgetState {
     /// Only presses actually admitted to this terminal own a PTY release.
     input_keys: Vec<(keyboard::key::Physical, KeyInput)>,
     released_on_blur: Vec<keyboard::key::Physical>,
+    released_during_review: Vec<(keyboard::key::Physical, KeyModifiers)>,
     select_all_request: u64,
     selection_reset: u64,
     pty_size: PtySize,
@@ -1812,18 +1813,22 @@ impl<Message> TerminalWidget<Message> {
         self.model_focused && state.input_focused && !state.window_unfocused
     }
 
-    fn release_blurred_keys(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
-        if self.keyboard_focused(state) || self.read_only || self.suppress_focus_reports || state.a11y.borrow().review {
+    fn flush_key_releases(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
+        if self.read_only || self.suppress_focus_reports || state.a11y.borrow().review {
             return;
         }
         let mut index = 0;
         while index < state.input_keys.len() {
             let (physical, mut input) = state.input_keys[index].clone();
+            let pending = state.released_during_review.iter().position(|(key, _)| key == &physical);
+            if self.keyboard_focused(state) && pending.is_none() { index += 1; continue; }
+            if let Some(pending) = pending { input.modifiers = state.released_during_review[pending].1; }
             input.action = KeyAction::Release;
             input.text = None;
             match self.handle.key(input) {
                 Ok(()) => {
                     state.input_keys.swap_remove(index);
+                    if let Some(pending) = pending { state.released_during_review.swap_remove(pending); }
                     if !state.released_on_blur.contains(&physical) { state.released_on_blur.push(physical); }
                 }
                 Err(error) => { self.publish_error(error, shell); index += 1; shell.request_redraw(); }
@@ -1840,7 +1845,7 @@ impl<Message> TerminalWidget<Message> {
             return;
         }
         let focused = self.keyboard_focused(state);
-        self.release_blurred_keys(state, shell);
+        self.flush_key_releases(state, shell);
         if accessibility::focus_report(
             state.focused,
             focused,
@@ -2467,6 +2472,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         let was_review = state.a11y.borrow().review;
         let consumed_review_input = review_target && state.a11y.borrow_mut().review_input(event);
         if consumed_review_input {
+            if let Event::Keyboard(keyboard::Event::KeyReleased { physical_key, modifiers, .. }) = event
+                && state.input_keys.iter().any(|(key, _)| key == physical_key)
+                && !state.released_during_review.iter().any(|(key, _)| key == physical_key)
+            {
+                // Review emits no PTY commands. Remember releases belonging to
+                // previously admitted presses and pair them after mode exit.
+                state.released_during_review.push((*physical_key, map_iced_modifiers(*modifiers)));
+            }
             self.review_active = state.a11y.borrow().review;
             if was_review && !state.a11y.borrow().review {
                 self.publish_review(false, shell);
