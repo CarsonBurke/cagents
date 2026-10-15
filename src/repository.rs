@@ -674,7 +674,7 @@ pub struct SnapshotCache {
     )>,
     publication_config: BTreeMap<String, String>,
     publication_dependencies: Option<PublicationDependencies>,
-    publication_system_root: Option<Option<PathBuf>>,
+    publication_system_root: Option<PublicationSystemRoot>,
     control_metadata: Option<ControlMetadata>,
     lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
     observed: BTreeMap<RepoPath, Option<FileIdentity>>,
@@ -683,8 +683,15 @@ pub struct SnapshotCache {
 }
 
 #[derive(Debug)]
+struct PublicationSystemRoot {
+    path: Option<PathBuf>,
+    known: bool,
+}
+
+#[derive(Debug)]
 struct PublicationDependencies {
     files: BTreeMap<PathBuf, Option<FileIdentity>>,
+    origins_present: bool,
     opaque: bool,
     checked: Instant,
 }
@@ -2950,6 +2957,7 @@ fn parse_observed_publication_config(
     worktree: &Path,
     output: &[u8],
     system_root: Option<&Path>,
+    system_known: bool,
 ) -> Result<
     (
         Vec<RemoteRecord>,
@@ -2960,17 +2968,12 @@ fn parse_observed_publication_config(
 > {
     let mut files = BTreeMap::new();
     let mut observe = |path: PathBuf| {
-        if !path.as_os_str().is_empty() {
-            let path = if path.is_absolute() {
-                path
-            } else {
-                worktree.join(path)
-            };
-            let identity = fs::metadata(&path)
-                .ok()
-                .map(|metadata| file_identity(&metadata));
-            files.insert(path, identity);
-        }
+        if path.as_os_str().is_empty() { return false; }
+        let path = if path.is_absolute() { path } else { worktree.join(path) };
+        let identity = fs::metadata(&path).ok().map(|metadata| file_identity(&metadata));
+        let present = identity.is_some();
+        files.insert(path, identity);
+        present
     };
     // A previously absent root config has no --show-origin record. Observe
     // those defaults too, so adding the first relevant setting invalidates.
@@ -2998,7 +3001,8 @@ fn parse_observed_publication_config(
         ));
     }
     let mut plain = Vec::new();
-    let mut opaque = system_root.is_none();
+    let mut opaque = !system_known;
+    let mut origins_present = true;
     for pair in fields.chunks_exact(2) {
         let origin = pair[0];
         let record = pair[1];
@@ -3011,7 +3015,10 @@ fn parse_observed_publication_config(
             }
         });
         if let Some(path) = &origin_file {
-            observe(path.clone());
+            // Unlike an absent include candidate, a consumed origin must have
+            // a real version. None before and after cannot certify bytes Git
+            // read from a transient file created only during its query.
+            origins_present &= observe(path.clone());
         }
         let split = record.iter().position(|byte| *byte == b'\n');
         let (key, value) = split
@@ -3053,6 +3060,7 @@ fn parse_observed_publication_config(
         values,
         PublicationDependencies {
             files,
+            origins_present,
             opaque,
             checked: Instant::now(),
         },
@@ -6486,7 +6494,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
         admin: &BTreeMap<PathBuf, Option<FileIdentity>>,
-        system_root: &mut Option<Option<PathBuf>>,
+        system_root: &mut Option<PublicationSystemRoot>,
     ) -> Result<
         (
             Vec<RemoteRecord>,
@@ -6498,15 +6506,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if system_root.is_none() {
             let command = self.git_read(worktree, ["var", "GIT_CONFIG_SYSTEM"]);
             let output = self.run(&command, cancellation)?;
-            *system_root = Some(if output.success {
+            let disabled = std::env::var_os("GIT_CONFIG_SYSTEM").is_some_and(|value| value.is_empty())
+                || std::env::var("GIT_CONFIG_NOSYSTEM").ok().is_some_and(|value| {
+                    let value = value.trim().to_ascii_lowercase();
+                    matches!(value.as_str(), "true" | "yes" | "on")
+                        || value.parse::<i64>().is_ok_and(|value| value != 0)
+                });
+            let path = if output.success {
                 let path = trim_one_line_ending(&output.stdout);
                 (!path.is_empty()).then(|| bytes_to_path(path))
-            } else {
-                None
-            });
+            } else { None };
+            *system_root = Some(PublicationSystemRoot { path, known: output.success || disabled });
         }
-        let system = system_root.as_ref().and_then(|root| root.as_deref());
-        let (_, _, mut seed) = parse_observed_publication_config(worktree, b"", system)?;
+        let root = system_root.as_ref().unwrap();
+        let system = root.path.as_deref();
+        let system_known = root.known;
+        let (_, _, mut seed) = parse_observed_publication_config(worktree, b"", system, system_known)?;
         for path in admin.keys().filter(|path| {
             matches!(
                 path.file_name().and_then(OsStr::to_str),
@@ -6558,7 +6573,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return Err(git_failure(&command, output).into());
             }
             let (remotes, selection, mut after) = invalid_output(
-                parse_observed_publication_config(worktree, &output.stdout, system),
+                parse_observed_publication_config(worktree, &output.stdout, system, system_known),
                 output,
             )?;
             for path in &base {
@@ -6568,7 +6583,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         .map(|metadata| file_identity(&metadata))
                 });
             }
-            if before == after.files {
+            if before == after.files && after.origins_present {
                 return Ok((remotes, selection, after));
             }
             // New origins need discovery followed by a fenced read. A post-read
@@ -8344,13 +8359,18 @@ mod tests {
             let status = b"# branch.oid (initial)\0# branch.head main\0";
             let mut outputs = (0..8).map(|_| success(b"")).collect::<Vec<_>>();
             outputs[1] = success(status);
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            fs::create_dir(root.join(".git")).unwrap();
+            let config_path = root.join(".git/config");
+            fs::write(&config_path, "").unwrap();
             let mut observed = Vec::new();
             for record in config
                 .as_bytes()
                 .split(|byte| *byte == 0)
                 .filter(|record| !record.is_empty())
             {
-                observed.extend_from_slice(b"file:/etc/gitconfig\0");
+                observed.extend_from_slice(format!("file:{}\0", config_path.display()).as_bytes());
                 observed.extend_from_slice(record);
                 observed.push(0);
             }
@@ -8360,7 +8380,6 @@ mod tests {
             let service = RepositoryService::new("git", executor.clone());
             let mut cache = SnapshotCache::default();
             let cancel = CancellationToken::new();
-            let root = Path::new("/snapshot-publication-test");
             assert!(
                 service
                     .snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
@@ -8415,6 +8434,7 @@ mod tests {
             root,
             observed.as_bytes(),
             Some(Path::new("/etc/gitconfig")),
+            true,
         )
         .unwrap();
         let included = root.join(".git/publication.inc");
@@ -8430,6 +8450,7 @@ mod tests {
             root,
             observed.as_bytes(),
             Some(Path::new("/etc/gitconfig")),
+            true,
         )
         .unwrap();
         assert!(!empty.files_changed());
@@ -8446,6 +8467,7 @@ mod tests {
             root,
             opaque.as_bytes(),
             Some(Path::new("/etc/gitconfig")),
+            true,
         )
         .unwrap();
         assert!(dependencies.opaque);
@@ -8455,6 +8477,18 @@ mod tests {
             dependencies.reconciliation_due(),
             "opaque targets receive bounded reconciliation"
         );
+    }
+
+    #[test]
+    fn disabled_system_config_is_known_absence_without_periodic_queries() {
+        let root = Path::new("/publication-known-absence");
+        let (_, _, mut disabled) = parse_observed_publication_config(root, b"", None, true).unwrap();
+        disabled.checked = Instant::now() - Duration::from_secs(61);
+        assert!(!disabled.opaque);
+        assert!(!disabled.reconciliation_due(), "explicitly disabled system config is not an unknown installation");
+        let (_, _, mut unknown) = parse_observed_publication_config(root, b"", None, false).unwrap();
+        unknown.checked = Instant::now() - Duration::from_secs(61);
+        assert!(unknown.reconciliation_due(), "unsupported path discovery must retain bounded reconciliation");
     }
 
     #[test]

@@ -1867,6 +1867,49 @@ mod tests {
     }
 
     #[test]
+    fn consumed_transient_include_cannot_be_certified_as_an_absent_candidate() {
+        use crate::process::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput, SystemProcessExecutor};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct TransientInclude { path: PathBuf, reads: AtomicUsize }
+        impl ProcessExecutor for TransientInclude {
+            fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+                let config = command.arguments.iter().any(|arg| arg == std::ffi::OsStr::new("--show-origin"));
+                let read = if config { self.reads.fetch_add(1, Ordering::Relaxed) + 1 } else { 0 };
+                if read == 2 {
+                    fs::write(&self.path, "[branch \"main\"]\n pushRemote = fork\n").unwrap();
+                }
+                let output = SystemProcessExecutor.execute(command, cancel)?;
+                if read == 2 { fs::remove_file(&self.path).unwrap(); }
+                Ok(output)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        fixture(&root);
+        git(&root, &["remote", "add", "origin", "https://github.com/current/repo.git"]);
+        git(&root, &["remote", "add", "fork", "https://github.com/transient/repo.git"]);
+        git(&root, &["config", "branch.main.pushremote", "origin"]);
+        git(&root, &["config", "include.path", "transient.inc"]);
+        let included = root.join(".git/transient.inc");
+        assert!(!included.exists());
+        let executor = Arc::new(TransientInclude { path: included.clone(), reads: AtomicUsize::new(0) });
+        let service = RepositoryService::new("git", executor.clone());
+        let mut cache = crate::repository::SnapshotCache::default();
+        let cancel = CancellationToken::default();
+        let options = crate::repository::SnapshotOptions::default();
+        assert!(service.snapshot_cached(&root, options, &cancel, &mut cache).unwrap().is_some());
+        assert!(!included.exists());
+        assert!(executor.reads.load(Ordering::Relaxed) >= 3,
+            "consumed origin None→None must fail the second fence and reconcile the actual absent state");
+        assert_eq!(cache.publication_remote().unwrap().name, "origin",
+            "a transient fork must not become permanent authority while its config is absent");
+        let reads = executor.reads.load(Ordering::Relaxed);
+        assert!(service.snapshot_cached(&root, options, &cancel, &mut cache).unwrap().is_none());
+        assert_eq!(cache.publication_remote().unwrap().name, "origin");
+        assert_eq!(executor.reads.load(Ordering::Relaxed), reads);
+    }
+
+    #[test]
     fn failed_worktree_status_is_last_known_and_sibling_reads_cannot_replay_it_after_recovery() {
         let directory = tempfile::tempdir().unwrap();
         let primary = directory.path().join("primary");
