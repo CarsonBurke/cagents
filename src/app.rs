@@ -17089,7 +17089,7 @@ impl Application for Cagents {
                              terminal font and theme, editor syntax theme, interface scale, \
                              pane widths, and the configured language servers.",
                         ),
-                        notice_detail("This cannot be undone."),
+                        notice_detail("A backup is saved before resetting. Use Undo reset in Settings to restore it."),
                         widget::row::with_children(vec![
                             iced::widget::Space::new().width(Length::Fill).into(),
                             crate::ui_controls::button::secondary("Cancel")
