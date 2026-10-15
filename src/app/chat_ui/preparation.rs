@@ -208,6 +208,7 @@ impl Prepared {
         cached.token = ChangeToken::of(&self.request.item.content);
         cached.item = Some(self.request.item);
         cached.preparing = self.request.growing || managed;
+        cached.placeholder = false;
         cached.highlight(theme);
         if !cached.preparing { cached.settle_blocks(); }
         cached.revision = CachedItem::next_revision();
@@ -378,11 +379,12 @@ mod tests {
     #[test]
     fn cold_result_reaches_the_mounted_transcript_without_a_new_snapshot() {
         use iced::advanced::{Layout,layout,widget::{Operation,Tree}};
-        struct Plain(Vec<String>);
+        struct Plain { selectable: Vec<String>, captions: Vec<String> }
         impl Operation for Plain {
             fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation)){visit(self);}
+            fn text(&mut self,_:Option<&iced::advanced::widget::Id>,_:iced::Rectangle,text:&str) {self.captions.push(text.into());}
             fn custom(&mut self,_:Option<&iced::advanced::widget::Id>,_:iced::Rectangle,state:&mut dyn std::any::Any) {
-                if let Some(state)=state.downcast_ref::<selectable_prose::State>() {self.0.push(state.plain.to_string());}
+                if let Some(state)=state.downcast_ref::<selectable_prose::State>() {self.selectable.push(state.plain.to_string());}
             }
         }
         let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
@@ -396,18 +398,89 @@ mod tests {
             let mut element=runtime.find_turn_view_for_test();tree.diff(element.as_widget_mut());
             let node=element.as_widget_mut().layout(&mut tree,&renderer,
                 &layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0)));
-            let mut plain=Plain(Vec::new());element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut plain);plain.0
+            let mut plain=Plain {selectable:vec![],captions:vec![]};element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut plain);plain
         };
-        assert!(rendered(&runtime).iter().any(|text|text.contains("Loading message")));
+        assert!(rendered(&runtime).captions.iter().any(|text|text.contains("Loading message")));
+        assert!(rendered(&runtime).selectable.is_empty());
+        assert!(runtime.selection_document().0.is_empty());
         let generation=runtime.snapshot.generation;drain_fixture(&mut runtime);
         assert_eq!(runtime.snapshot.generation,generation);
-        assert!(rendered(&runtime).iter().any(|text|text=="Worker result reaches the mounted transcript."));
+        assert!(rendered(&runtime).selectable.iter().any(|text|text=="Worker result reaches the mounted transcript."));
         assert!(!runtime.cache["message"].preparing);
         handle.replace_snapshot_for_test(Snapshot {generation:8,ready:true,
             items:vec![item("A replacement has different Markdown context.")],..Snapshot::default()});
         runtime.refresh();
-        assert!(rendered(&runtime).iter().any(|text|text.contains("Loading message")),"unproven replacement must not display old context");
+        assert!(rendered(&runtime).captions.iter().any(|text|text.contains("Loading message")),"unproven replacement must not display old context");
         drain_fixture(&mut runtime);
-        assert!(rendered(&runtime).iter().any(|text|text=="A replacement has different Markdown context."));
+        assert!(rendered(&runtime).selectable.iter().any(|text|text=="A replacement has different Markdown context."));
     }
+    #[test]
+    fn pending_status_is_not_copied_and_unrelated_selection_survives_ready() {
+        use iced::advanced::{Layout,layout,widget::{Operation,Tree}};
+        #[derive(Default)]
+        struct Clipboard(String);
+        impl iced::advanced::Clipboard for Clipboard {
+            fn read(&self,_:iced::advanced::clipboard::Kind)->Option<String> {Some(self.0.clone())}
+            fn write(&mut self,_:iced::advanced::clipboard::Kind,text:String) {self.0=text;}
+        }
+        #[derive(Default)]
+        struct Bounds(Vec<(String,iced::Rectangle)>);
+        impl Operation for Bounds {
+            fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation)) {visit(self);}
+            fn custom(&mut self,_:Option<&iced::advanced::widget::Id>,bounds:iced::Rectangle,state:&mut dyn std::any::Any) {
+                if let Some(state)=state.downcast_ref::<selectable_prose::State>() {self.0.push((state.plain.to_string(),bounds));}
+            }
+        }
+        fn interact(runtime:&Runtime,tree:&mut Tree,clipboard:&mut Clipboard,select:bool,keys:&[&str]) {
+            let (catalog,bookmark)=runtime.selection_document();
+            let mut element=selection::transcript_virtualized(runtime.find_turn_view_for_test(),runtime.target,None,catalog,bookmark);
+            tree.diff(element.as_widget_mut());
+            let renderer=crate::ui_controls::accessibility_probe::headless_renderer();
+            let limits=layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0));
+            let mut node=element.as_widget_mut().layout(tree,&renderer,&limits);
+            let mut bounds=Bounds::default();
+            element.as_widget_mut().operate(tree,Layout::new(&node),&renderer,&mut bounds);
+            let first=bounds.0.first().expect("existing ready prose").1;
+            let start=iced::Point::new(first.x,first.y+3.0);
+            let end=iced::Point::new(first.x+first.width+5.0,first.y+first.height-1.0);
+            let mut events=vec![];
+            if select {events.extend([
+                (iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),start),
+                (iced::Event::Mouse(iced::mouse::Event::CursorMoved {position:end}),end),
+                (iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)),end),
+            ]);}
+            events.extend(keys.iter().map(|key|(iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key:keyboard::Key::Character((*key).into()),modified_key:keyboard::Key::Character((*key).into()),
+                physical_key:keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+                location:keyboard::Location::Standard,modifiers:keyboard::Modifiers::CTRL,text:None,repeat:false,
+            }),end)));
+            for (event,pointer) in events {
+                let mut messages=vec![];let mut shell=iced::advanced::Shell::new(&mut messages);
+                element.as_widget_mut().update(tree,&event,Layout::new(&node),iced::mouse::Cursor::Available(pointer),
+                    &renderer,clipboard,&mut shell,&iced::Rectangle::with_size(iced::Size::new(640.0,1000.0)));
+                if shell.is_layout_invalid() {node=element.as_widget_mut().layout(tree,&renderer,&limits);}
+            }
+        }
+        let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
+        let handle=Arc::new(ClientHandle::fixture(session.clone(),Snapshot {ready:true,..Snapshot::default()}));
+        let mut runtime=Runtime::new(target(),session,Connection::Live(handle.clone()),true,crate::settings::EditorSyntaxTheme::default());
+        let stable=item("Stable selected text.");
+        handle.replace_snapshot_for_test(Snapshot {generation:1,ready:true,items:vec![stable.clone()],..Snapshot::default()});
+        runtime.refresh();drain_fixture(&mut runtime);
+        let mut pending=(*item("Newly prepared answer.")).clone();pending.id="pending".into();
+        handle.replace_snapshot_for_test(Snapshot {generation:2,ready:true,items:vec![stable,Arc::new(pending)],..Snapshot::default()});
+        runtime.refresh();assert!(runtime.cache["pending"].placeholder);
+        let mut tree=Tree::empty();let mut clipboard=Clipboard::default();
+        interact(&runtime,&mut tree,&mut clipboard,true,&["a","c"]);
+        assert_eq!(clipboard.0,"Stable selected text.");
+        interact(&runtime,&mut tree,&mut clipboard,true,&["c"]);
+        assert_eq!(clipboard.0,"Stable selected text.");
+        drain_fixture(&mut runtime);
+        interact(&runtime,&mut tree,&mut clipboard,false,&["c"]);
+        assert_eq!(clipboard.0,"Stable selected text.","ready must preserve an unrelated pointer selection");
+        interact(&runtime,&mut tree,&mut clipboard,false,&["a","c"]);
+        assert_eq!(clipboard.0,"Stable selected text.\n\nNewly prepared answer.");
+        assert!(!clipboard.0.contains("Loading message"));
+    }
+
 }

@@ -965,6 +965,8 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
 /// hints; exact content comparisons authorize parser and presentation reuse.
 struct CachedItem {
     preparing: bool,
+    /// A nonselectable loading caption, never conversation content.
+    placeholder: bool,
     stamp: Option<(u64, String, String)>,
     preview: tool_text::Preview,
     tool_input: Option<tool_text::ToolText>,
@@ -1003,11 +1005,13 @@ struct CachedItem {
     coordination: Option<Box<coordination::Coordinated>>,
 }
 impl CachedItem {
-    fn preparing(content: &ItemContent, theme: crate::settings::EditorSyntaxTheme) -> Self {
-        let placeholder = ItemContent::Text { text: "Loading message…".into(), thinking: false, phase: chat::Phase::Final };
-        let mut cached = Self::updated(&placeholder, theme, None, false, false, None);
+    fn preparing(item: &Arc<chat::Item>, theme: crate::settings::EditorSyntaxTheme) -> Self {
+        let empty = ItemContent::Text { text: String::new(), thinking: false, phase: chat::Phase::Final };
+        let mut cached = Self::updated(&empty, theme, None, false, false, None);
         cached.preparing = true;
-        cached.token = ChangeToken::of(content);
+        cached.placeholder = true;
+        cached.token = ChangeToken::of(&item.content);
+        cached.item = Some(item.clone());
         cached
     }
     /// Approximate exposed presentation storage. Opaque Markdown/parser
@@ -1122,6 +1126,7 @@ impl CachedItem {
         };
         let mut cached = Self {
             preparing: false,
+            placeholder: false,
             preview: tool_text::Preview::update(preview, content, theme),
             tool_input,
             tool_output,
@@ -2385,12 +2390,12 @@ impl Runtime {
                 if pending || (!exact && !small_append) {
                     let replaced=self.preparation.stage(item,growing,|old,new|handle.as_ref().is_some_and(|handle|handle.known_append(old,new)));
                     if replaced && !proven_from_cache {
-                        self.cache.insert(item.id.clone(),CachedItem::preparing(&item.content,self.syntax_theme));
+                        self.cache.insert(item.id.clone(),CachedItem::preparing(item,self.syntax_theme));
                         presentation_changed=true;
                     }
                     if !self.cache.contains_key(&item.id) { presentation_changed=true; }
                     let theme=self.syntax_theme;
-                    let cached=self.cache.entry(item.id.clone()).or_insert_with(||CachedItem::preparing(&item.content,theme));
+                    let cached=self.cache.entry(item.id.clone()).or_insert_with(||CachedItem::preparing(item,theme));
                     cached.preparing=true;
                     cached.reader_memory=self.scroll_memory.clone();cached.reader_context.clone_from(&self.selected_subagent);
                     continue;

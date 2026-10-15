@@ -250,6 +250,9 @@ pub(super) fn view(
     target: Target,
     find: Option<&str>,
 ) -> Element<'static, Message> {
+    if cached.placeholder {
+        return widget::text::caption("Loading message…").into();
+    }
     Renderer {
         target,
         blocks: cached.blocks.iter().map(|(key, block)| (*key, block.spans(cosmic::theme::is_dark()).clone())).collect::<HashMap<_, _>>().into(),
