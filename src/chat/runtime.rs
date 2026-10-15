@@ -236,6 +236,10 @@ impl LocalHandle {
     }
 
     pub(crate) fn backend_instance(&self) -> uuid::Uuid { self.0.backend_instance }
+    pub(crate) fn backend_confirmation(&self) -> (Option<String>, u64) {
+        let confirmed = self.0.backend_conversation.lock().unwrap_or_else(|p| p.into_inner());
+        (confirmed.thread.clone(), confirmed.revision)
+    }
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
         self.0.native_holder_record.as_ref()
     }
@@ -244,6 +248,28 @@ impl LocalHandle {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
+/// Counts every provider-confirmed identity transition, including two identity
+/// events in one frame. Host polling/coalescing never resets this history.
+#[derive(Default)]
+struct BackendConversation {
+    thread: Option<String>,
+    revision: u64,
+}
+impl BackendConversation {
+    fn observe(&mut self, event: &Event) {
+        let next = match event {
+            Event::Session { id, .. } => Some(Some(id.clone())),
+            Event::Reset { .. } => Some(None),
+            _ => None,
+        };
+        if let Some(next) = next
+            && (next != self.thread || matches!(event, Event::Reset { .. })) {
+            self.revision = self.revision.saturating_add(1);
+            self.thread = next;
+        }
+    }
+}
+
 struct Inner {
     // Concrete Local incarnation; retained restart may preserve close.actor_id
     // and Store identity, but it must never overwrite this backend nonce.
@@ -258,6 +284,7 @@ struct Inner {
     state: Arc<Mutex<Snapshot>>,
     close_state: Arc<Mutex<CloseState>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    backend_conversation: Arc<Mutex<BackendConversation>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -587,6 +614,7 @@ impl LocalHandle {
         let store = retained_store.unwrap_or_else(|| Arc::new(Mutex::new(store)));
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let backend_conversation = Arc::new(Mutex::new(BackendConversation::default()));
         let ownership_admission = Arc::new(Mutex::new(()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
@@ -612,6 +640,7 @@ impl LocalHandle {
             state: state.clone(),
             close_state: close_state.clone(),
             confirmed_session: confirmed_session.clone(),
+            backend_conversation: backend_conversation.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -666,6 +695,7 @@ impl LocalHandle {
                     close_input_fd:None,
                     close_input_drained:true,
                     confirmed_session,
+                    backend_conversation,
                     store,
                     visible,
                     observe_next,
@@ -2387,6 +2417,7 @@ struct Actor {
     close_input_fd: Option<std::os::fd::RawFd>,
     close_input_drained: bool,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    backend_conversation: Arc<Mutex<BackendConversation>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -3350,6 +3381,13 @@ impl Actor {
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
     fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
+        // Invalidate historical unknown-thread consent BEFORE any frame work
+        // which can publish or fail. Capture all identities, not only the last
+        // Session observed by a callback/UI snapshot.
+        {
+            let mut history = self.backend_conversation.lock().unwrap_or_else(|p| p.into_inner());
+            for event in &step.events { history.observe(event); }
+        }
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.

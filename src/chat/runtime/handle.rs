@@ -14,13 +14,18 @@ pub(crate) struct BackendIdentity {
     actor: uuid::Uuid,
     process: crate::daemon::holder_registry::Process,
     conversation: Option<String>,
+    conversation_revision: u64,
 }
 impl BackendIdentity {
     pub(crate) fn conversation(&self) -> Option<String> { self.conversation.clone() }
     pub(crate) fn same_backend(&self, other: &Self) -> bool {
         self.helper == other.helper && self.actor == other.actor && self.process == other.process
     }
-    pub(crate) fn valid(&self) -> bool { !self.actor.is_nil() && self.process.pid > 0 && self.process.start > 0 }
+    pub(crate) fn first_confirmation(&self, other: &Self) -> bool {
+        self.same_backend(other) && self.conversation.is_none() && other.conversation.is_some()
+            && self.conversation_revision.checked_add(1) == Some(other.conversation_revision)
+    }
+    pub(crate) fn valid(&self) -> bool { !self.actor.is_nil() && self.process.pid > 0 && self.process.start > 0 && self.conversation_revision != u64::MAX }
 }
 
 #[derive(Clone)]
@@ -263,6 +268,7 @@ impl Handle {
                     helper: Some(remote.identity().instance),
                     actor: state.backend_instance.ok_or("Retained helper has no concrete backend incarnation evidence")?,
                     conversation: state.confirmed_session,
+                    conversation_revision: state.backend_conversation_revision.ok_or("Retained helper lacks exact conversation transition history")?,
                     process: state.provider_process.ok_or(
                         "Retained actor has no authenticated concrete backend identity")?,
                 })
@@ -277,9 +283,10 @@ impl Handle {
                     recovery.server_process.ok_or(
                         "Native holder has no authenticated concrete server identity")?
                 };
+                let (conversation, conversation_revision) = local.backend_confirmation();
+                if conversation != local.confirmed_session_id() { return Err("Provider identity publication is still transitioning".into()); }
                 Ok(BackendIdentity { helper: None,
-                    actor: local.backend_instance(), process,
-                    conversation: local.confirmed_session_id() })
+                    actor: local.backend_instance(), process, conversation, conversation_revision })
             }
         }
     }

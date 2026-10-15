@@ -1834,7 +1834,7 @@ mod tests {
     fn typed_handoff_ack_transmits_the_complete_operation_and_preserves_refusals() {
         let terminal = handoff_terminal();
         let source = Session { id: TerminalId::new(), proof: Some(handoff_proof()),
-            launch: super::Launch { provider: crate::agent::Provider::Omp, recipe: terminal.launch.clone(), session_id: Some("original".into()) },
+            launch: crate::chat::Launch { provider: crate::agent::Provider::Omp, recipe: terminal.launch.clone(), session_id: Some("original".into()) },
             terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
         let binding = crate::terminal_ipc::ChatSourceBinding { source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4() };
         let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(terminal.id, terminal.launch, None);

@@ -71,6 +71,9 @@ pub(crate) struct Resident {
     /// still render but must not authorize a destructive handoff.
     #[serde(default)]
     pub backend_instance: Option<uuid::Uuid>,
+    /// Missing on legacy helpers: no unknown-thread promotion authority.
+    #[serde(default)]
+    pub backend_conversation_revision: Option<u64>,
     pub provider_process: Option<Process>,
     pub generation: u64,
     pub session_id: Option<String>,
@@ -256,6 +259,7 @@ impl RemoteActor {
         let boot = BootId::new("fixture-boot");
         let resident = Resident {
             backend_instance: Some(uuid::Uuid::new_v4()),
+            backend_conversation_revision: Some(0),
             provider_process: Some(process.clone()),
             generation: 1,
             session_id: None,
@@ -1728,6 +1732,7 @@ impl Server {
         let provider_process = self.actor.provider_process();
         let actor_failure = self.actor.failure();
         let confirmed_session = self.actor.confirmed_session_id();
+        let (backend_thread, backend_revision) = self.actor.backend_confirmation();
         let background_subagents = self.actor.background_subagents();
         let interrupt_subagents = self.actor.interrupt_subagents();
         let account_reports = self
@@ -1749,6 +1754,7 @@ impl Server {
             .or(outcome);
         Ok(Resident {
             backend_instance: Some(self.actor.backend_instance()),
+            backend_conversation_revision: (backend_thread == confirmed_session).then_some(backend_revision),
             provider_process,
             generation,
             session_id,

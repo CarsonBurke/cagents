@@ -72,7 +72,7 @@ impl History {
             }
         }
         entry.learned_from = entry.known.as_ref().and_then(|(previous, binding, previous_pair)| {
-            (previous.same_backend(&witness) && *previous_pair == paired
+            (previous.first_confirmation(&witness) && *previous_pair == paired
                 && first_thread_learning(&binding.source, &source)).then(|| binding.clone())
         });
         // Even a failed restart resolved back to A mints fresh authority. An
@@ -205,8 +205,9 @@ pub(super) fn require(host: &SharedHost, client: ClientId, expected: &ChatSource
     let current = refresh(host, expected.source.id, false)?;
     if current == *expected { return Ok(current); }
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let learned = state.native_sources.entries.get(&expected.source.id).and_then(|entry| entry.known.as_ref())
-        .is_some_and(|(witness, _, pair)| previous.0.same_backend(witness) && previous.2 == *pair);
+    let learned = state.native_sources.entries.get(&expected.source.id).is_some_and(|entry|
+        entry.learned_from.as_ref() == Some(expected)
+            || entry.known.as_ref().is_some_and(|(witness, _, pair)| previous.0.first_confirmation(witness) && previous.2 == *pair));
     let mut promoted = expected.source.clone();
     promoted.launch.session_id = current.source.launch.session_id.clone();
     promoted.native_continuity = current.source.native_continuity.clone();
@@ -414,19 +415,22 @@ mod tests {
         assert!(!state.native_sources.authorizes_intent(&before));
     }
 
+    struct Learns;
+    impl Adapter for Learns {
+        fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
+        fn receive(&mut self, value: serde_json::Value) -> Result<Step, String> {
+            let threads: Vec<&str> = if value["thread"] == "batch" { vec!["first", "second"] }
+                else { vec![value["thread"].as_str().unwrap()] };
+            Ok(Step { events: threads.into_iter().map(|id| chat::Event::Session { id: id.into(), title: None }).collect(), ..Step::default() })
+        }
+        fn command(&mut self, command: chat::Command) -> Result<Step, String> {
+            let chat::Command::SetModel { model, .. } = command else { return Ok(Step::default()); };
+            Ok(Step { writes: vec![serde_json::json!({"thread": model})], ..Step::default() })
+        }
+    }
+
     #[test]
     fn first_confirmed_thread_learning_keeps_only_the_original_unknown_intent() {
-        struct Learns;
-        impl Adapter for Learns {
-            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
-            fn receive(&mut self, value: serde_json::Value) -> Result<Step, String> {
-                Ok(Step { events: vec![chat::Event::Session { id: value["thread"].as_str().unwrap().into(), title: None }], ..Step::default() })
-            }
-            fn command(&mut self, command: chat::Command) -> Result<Step, String> {
-                let chat::Command::SetModel { model, .. } = command else { return Ok(Step::default()); };
-                Ok(Step { writes: vec![serde_json::json!({"thread": model})], ..Step::default() })
-            }
-        }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let source = source(directory.path());
         let owner = actor_with(&source, Box::new(Learns));
@@ -486,6 +490,32 @@ mod tests {
             assert!(!fixture.host.lock().unwrap().chat_handoffs.contains_key(&source.id));
         }
         assert!(!owner.0.is_completed(), "metadata ACK never stops any provider or terminal");
+    }
+
+    #[test]
+    fn unobserved_conversation_transitions_never_promote_old_unknown_return_consent() {
+        for one_frame in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let source = source(directory.path());
+            let owner = actor_with(&source, Box::new(Learns));
+            let fixture = BackendFixture::new(source, owner.0.clone(), uuid::Uuid::new_v4());
+            let unknown = fixture.capture().unwrap();
+            let send = |value: &str, confirmed: &str| {
+                owner.0.command(chat::Command::SetModel { model: value.into(), reasoning: None }).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while owner.0.confirmed_session_id().as_deref() != Some(confirmed) {
+                    assert!(Instant::now() < deadline, "actual provider frame did not confirm {confirmed}");
+                    thread::sleep(Duration::from_millis(2));
+                }
+            };
+            if one_frame { send("batch", "second"); }
+            else { send("first", "first"); send("second", "second"); }
+            // No capture, ChatRead or host observation happened between first
+            // and second. The actual producer history must still fence Return.
+            assert!(require(&fixture.host, 1, &unknown).is_err());
+            assert!(fixture.return_refuses(unknown).contains("captured native backend changed"));
+            assert!(!owner.0.is_completed());
+        }
     }
 
 }
