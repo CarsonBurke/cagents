@@ -1154,6 +1154,7 @@ mod tests {
 
     #[test]
     fn branch_row_base_keeps_exact_local_identity_even_when_its_name_looks_qualified() {
+        use crate::model::WorktreeId;
         for name in ["refs/heads/topic", "origin/main"] {
             let Fixture {mut app, project, _state} = fixture();
             app.worktree_dialog = None;
