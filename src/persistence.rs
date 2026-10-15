@@ -1977,11 +1977,18 @@ impl StateStore {
     }
 
     /// Read one creation without loading every retained journal into memory.
-    pub fn journaled_worktree_operation(&self, id: OperationId) -> Result<Option<PendingOperation>> {
+    pub fn journaled_worktree_operation(
+        &self,
+        id: OperationId,
+    ) -> Result<Option<PendingOperation>> {
         Ok(self.operation_rows(false, Some(id))?.into_iter().next())
     }
 
-    fn operation_rows(&self, unresolved_only: bool, id: Option<OperationId>) -> Result<Vec<PendingOperation>> {
+    fn operation_rows(
+        &self,
+        unresolved_only: bool,
+        id: Option<OperationId>,
+    ) -> Result<Vec<PendingOperation>> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
         let mut statement = inner.connection.prepare(
@@ -1993,19 +2000,22 @@ impl StateStore {
                 AND (?2 IS NULL OR operation_id = ?2)
              ORDER BY created_at_unix_ms, operation_id",
         )?;
-        let rows = statement.query_map(params![unresolved_only, id.map(|id| id.to_string())], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, i64>(8)?,
-            ))
-        })?;
+        let rows = statement.query_map(
+            params![unresolved_only, id.map(|id| id.to_string())],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )?;
         let mut operations = Vec::new();
         for row in rows {
             let (id, entity_kind, entity_id, action, generation, payload, status, created, updated) =

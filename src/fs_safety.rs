@@ -768,10 +768,15 @@ pub fn copy_group(source: &File, destination: &File) -> io::Result<()> {
     // its current owner and the group comes from the retained source descriptor.
     if unsafe { libc::fchown(destination.as_raw_fd(), libc::uid_t::MAX, group) } < 0 {
         let error = io::Error::last_os_error();
-        return Err(io::Error::new(error.kind(), format!("cannot preserve source file group: {error}")));
+        return Err(io::Error::new(
+            error.kind(),
+            format!("cannot preserve source file group: {error}"),
+        ));
     }
     if destination.metadata()?.gid() != group {
-        return Err(io::Error::other("the filesystem did not preserve the source file group"));
+        return Err(io::Error::other(
+            "the filesystem did not preserve the source file group",
+        ));
     }
     Ok(())
 }

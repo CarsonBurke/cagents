@@ -674,8 +674,18 @@ mod tests {
         use std::os::fd::AsRawFd;
         fn write_acl(file: &fs::File, name: &std::ffi::CStr, value: &[u8]) -> bool {
             // SAFETY: file and both borrowed buffers outlive this call.
-            let result = unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
-            if result == 0 { return true; }
+            let result = unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            if result == 0 {
+                return true;
+            }
             let error = std::io::Error::last_os_error();
             if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) {
                 eprintln!("SETUP_ACL_FIXTURE_UNSUPPORTED: {error}");
@@ -686,7 +696,9 @@ mod tests {
         fn read_acl(file: &fs::File) -> Option<Vec<u8>> {
             let name = c"system.posix_acl_access";
             // SAFETY: file/name remain live; null with zero size queries length.
-            let size = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+            let size = unsafe {
+                libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0)
+            };
             if size < 0 {
                 let error = std::io::Error::last_os_error();
                 assert_eq!(error.raw_os_error(), Some(libc::ENODATA), "{error}");
@@ -694,7 +706,14 @@ mod tests {
             }
             let mut value = vec![0u8; size as usize];
             // SAFETY: value is writable for its entire passed length.
-            let read = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+            let read = unsafe {
+                libc::fgetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            };
             assert_eq!(read, size);
             Some(value)
         }
@@ -706,27 +725,48 @@ mod tests {
         // group itself has no access. A mode-only copy would broaden access.
         let mut acl = 2_u32.to_le_bytes().to_vec();
         for (tag, permissions, id) in [
-            (0x01_u16, 6_u16, u32::MAX), (0x02, 4, 12_345),
-            (0x04, 0, u32::MAX), (0x10, 4, u32::MAX), (0x20, 0, u32::MAX),
+            (0x01_u16, 6_u16, u32::MAX),
+            (0x02, 4, 12_345),
+            (0x04, 0, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
         ] {
             acl.extend_from_slice(&tag.to_le_bytes());
             acl.extend_from_slice(&permissions.to_le_bytes());
             acl.extend_from_slice(&id.to_le_bytes());
         }
-        if !write_acl(&source, c"system.posix_acl_access", &acl) { return; }
-        assert_eq!(source.metadata().unwrap().permissions().mode() & 0o777, 0o640);
+        if !write_acl(&source, c"system.posix_acl_access", &acl) {
+            return;
+        }
+        assert_eq!(
+            source.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
         let parent = fs::File::open(&fixture.destination).unwrap();
         assert!(write_acl(&parent, c"system.posix_acl_default", &acl));
-        fs::set_permissions(fixture.primary.join(".env.plain"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(
+            fixture.primary.join(".env.plain"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
         let plan = fixture.config("copy = ['.env*']");
         assert_eq!(fixture.prepare(&plan).unwrap().copied.len(), 2);
         let restricted = fs::File::open(fixture.destination.join(".env.restricted")).unwrap();
         let plain = fs::File::open(fixture.destination.join(".env.plain")).unwrap();
         assert_eq!(read_acl(&restricted), Some(acl));
         assert_eq!(read_acl(&plain), None);
-        assert_eq!(plain.metadata().unwrap().permissions().mode() & 0o777, 0o640);
-        assert_eq!(fs::read(fixture.destination.join(".env.restricted")).unwrap(), b"restricted");
-        assert_eq!(fs::read(fixture.destination.join(".env.plain")).unwrap(), b"plain");
+        assert_eq!(
+            plain.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join(".env.restricted")).unwrap(),
+            b"restricted"
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join(".env.plain")).unwrap(),
+            b"plain"
+        );
         println!("SETUP_ACL_COPY_VERIFIED");
     }
 
@@ -735,7 +775,11 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "private source group").unwrap();
-        fs::set_permissions(fixture.primary.join(".env"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(
+            fixture.primary.join(".env"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
         let source_group = fs::metadata(fixture.primary.join(".env")).unwrap().gid();
         // SAFETY: null/zero queries the supplementary group count.
         let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
@@ -743,7 +787,8 @@ mod tests {
         let mut groups = vec![0 as libc::gid_t; count as usize];
         // SAFETY: groups is writable for count gid_t values.
         assert!(unsafe { libc::getgroups(count, groups.as_mut_ptr()) } >= 0);
-        let Some(destination_group) = groups.into_iter().find(|group| *group != source_group) else {
+        let Some(destination_group) = groups.into_iter().find(|group| *group != source_group)
+        else {
             eprintln!("SETUP_GROUP_FIXTURE_NO_ALTERNATE_GROUP");
             return;
         };
@@ -754,8 +799,14 @@ mod tests {
         let copied = fs::metadata(fixture.destination.join(".env")).unwrap();
         assert_eq!(copied.gid(), source_group);
         assert_eq!(copied.permissions().mode() & 0o777, 0o640);
-        assert_eq!(fs::metadata(&fixture.destination).unwrap().gid(), destination_group);
-        assert_eq!(fs::read(fixture.destination.join(".env")).unwrap(), b"private source group");
+        assert_eq!(
+            fs::metadata(&fixture.destination).unwrap().gid(),
+            destination_group
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join(".env")).unwrap(),
+            b"private source group"
+        );
         println!("SETUP_GROUP_COPY_VERIFIED");
     }
 
@@ -789,7 +840,13 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join(".env"), "deep secret").unwrap();
         let plan = fixture.config("copy = ['**/.env']");
-        assert!(fixture.prepare(&plan).unwrap_err().to_string().contains("64 directory levels"));
+        assert!(
+            fixture
+                .prepare(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("64 directory levels")
+        );
         assert_eq!(fs::read(directory.join(".env")).unwrap(), b"deep secret");
         assert!(fixture.destination.join("tracked").exists());
         assert!(!fixture.destination.join("nested").exists());

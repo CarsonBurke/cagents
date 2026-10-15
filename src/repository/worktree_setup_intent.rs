@@ -31,25 +31,48 @@ pub struct WorktreeSetupIntent {
 
 fn settled_setup_journal(operation: &PendingOperation) -> Result<WorktreeJournal, StoreError> {
     let creation_id = operation.id;
-    let invalid = || StoreError::InvalidState(format!(
-        "worktree creation {creation_id} is not a valid settled creation"
-    ));
+    let invalid = || {
+        StoreError::InvalidState(format!(
+            "worktree creation {creation_id} is not a valid settled creation"
+        ))
+    };
     let journal: WorktreeJournal = serde_json::from_value(operation.payload.clone())?;
-    let paths = [&journal.common_dir, &journal.request.managed_root, &journal.request.destination];
+    let paths = [
+        &journal.common_dir,
+        &journal.request.managed_root,
+        &journal.request.destination,
+    ];
     if operation.status != PendingOperationStatus::Applied
         || operation.entity_kind != "worktree_creation"
         || operation.action != "create"
         || journal.version != 1
         || journal.state != WorktreeOperationState::Created
-        || !matches!(&journal.outcome, Some(WorktreeCreationOutcome::Created { .. }))
+        || !matches!(
+            &journal.outcome,
+            Some(WorktreeCreationOutcome::Created { .. })
+        )
         || journal.request.operation_id != creation_id
         || journal.generation != operation.base_generation
         || operation.entity_id != journal_identity(&journal.common_dir, &journal.request)
-        || journal.lease_path != journal.common_dir.join(format!("cagents-operation-{creation_id}.lease"))
-        || !destination_within_managed_root(&journal.request.destination, &journal.request.managed_root)
-        || paths.iter().any(|path| !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)))
+        || journal.lease_path
+            != journal
+                .common_dir
+                .join(format!("cagents-operation-{creation_id}.lease"))
+        || !destination_within_managed_root(
+            &journal.request.destination,
+            &journal.request.managed_root,
+        )
+        || paths.iter().any(|path| {
+            !path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+        })
         || journal.base_oid.as_ref().is_none_or(|oid| !is_hex_oid(oid))
-        || journal.existing_branch_oid.as_ref().is_some_and(|oid| !is_hex_oid(oid))
+        || journal
+            .existing_branch_oid
+            .as_ref()
+            .is_some_and(|oid| !is_hex_oid(oid))
         || !journal.effects_started
         || ValidatedBranchName::parse(journal.request.branch.as_str()).is_err()
         || journal.request.base.validate().is_err()
@@ -85,9 +108,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         expected: Option<&WorktreeSetupIntent>,
         updated: WorktreeSetupIntent,
     ) -> Result<WorktreeOperationReport, StoreError> {
-        let operation = store.journaled_worktree_operation(creation_id)?.ok_or_else(|| {
-            StoreError::InvalidState(format!("worktree creation {creation_id} is missing"))
-        })?;
+        let operation = store
+            .journaled_worktree_operation(creation_id)?
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!("worktree creation {creation_id} is missing"))
+            })?;
         let mut journal = settled_setup_journal(&operation)?;
         if journal.request.setup_intent.as_ref() != expected {
             return Err(StoreError::InvalidState(format!(
@@ -123,7 +148,8 @@ mod tests {
             version: 1,
             generation: 7,
             state: WorktreeOperationState::Created,
-            lease_path: common_dir.join(format!("cagents-operation-{}.lease", request.operation_id)),
+            lease_path: common_dir
+                .join(format!("cagents-operation-{}.lease", request.operation_id)),
             lease_identity: None,
             effects_started: true,
             checkout_completed: true,
@@ -132,39 +158,56 @@ mod tests {
             admin_dir: Some(common_dir.join("worktrees/topic")),
             outcome: Some(WorktreeCreationOutcome::Created {
                 worktree: WorktreeRecord {
-                    id: WorktreeId::new(), path: request.destination.clone(),
-                    created_at_unix_ms: None, head_oid: Some("a".repeat(40)),
-                    branch: Some(request.branch.full_ref()), detached: false,
-                    bare: false, lock: WorktreeLock::default(), prunable_reason: None,
+                    id: WorktreeId::new(),
+                    path: request.destination.clone(),
+                    created_at_unix_ms: None,
+                    head_oid: Some("a".repeat(40)),
+                    branch: Some(request.branch.full_ref()),
+                    detached: false,
+                    bare: false,
+                    lock: WorktreeLock::default(),
+                    prunable_reason: None,
                 },
                 warnings: Vec::new(),
             }),
             warnings: Vec::new(),
             detail: "Created".into(),
-            request, common_dir,
+            request,
+            common_dir,
         }
     }
 
     fn seed(store: &StateStore, journal: &WorktreeJournal, status: PendingOperationStatus) {
-        store.begin_operation(&PendingOperation {
-            id: journal.request.operation_id,
-            entity_kind: "worktree_creation".into(),
-            entity_id: journal_identity(&journal.common_dir, &journal.request),
-            action: "create".into(), base_generation: journal.generation,
-            payload: serde_json::to_value(journal).unwrap(),
-            status: PendingOperationStatus::Pending,
-            created_at_unix_ms: 42, updated_at_unix_ms: 42,
-        }).unwrap();
+        store
+            .begin_operation(&PendingOperation {
+                id: journal.request.operation_id,
+                entity_kind: "worktree_creation".into(),
+                entity_id: journal_identity(&journal.common_dir, &journal.request),
+                action: "create".into(),
+                base_generation: journal.generation,
+                payload: serde_json::to_value(journal).unwrap(),
+                status: PendingOperationStatus::Pending,
+                created_at_unix_ms: 42,
+                updated_at_unix_ms: 42,
+            })
+            .unwrap();
         if status != PendingOperationStatus::Pending {
-            store.resolve_operation(journal.request.operation_id, status).unwrap();
+            store
+                .resolve_operation(journal.request.operation_id, status)
+                .unwrap();
         }
     }
 
     fn intent(request: &CreateWorktreeRequest) -> WorktreeSetupIntent {
         WorktreeSetupIntent {
             primary: Some(request.repository.clone()),
-            plan: Some(WorktreeSetupPlan {copy: vec![".env".into()], commands: vec!["printf setup".into()], fingerprint: "b".repeat(64)}),
-            run_id: Some(OperationId::new()), ..Default::default()
+            plan: Some(WorktreeSetupPlan {
+                copy: vec![".env".into()],
+                commands: vec!["printf setup".into()],
+                fingerprint: "b".repeat(64),
+            }),
+            run_id: Some(OperationId::new()),
+            ..Default::default()
         }
     }
 
@@ -172,8 +215,16 @@ mod tests {
     fn old_requests_and_intents_deserialize_without_setup_fields() {
         let mut value = serde_json::to_value(request(Path::new("/fixture"))).unwrap();
         value.as_object_mut().unwrap().remove("setup_intent");
-        assert!(serde_json::from_value::<CreateWorktreeRequest>(value).unwrap().setup_intent.is_none());
-        assert_eq!(serde_json::from_str::<WorktreeSetupIntent>("{}").unwrap(), WorktreeSetupIntent::default());
+        assert!(
+            serde_json::from_value::<CreateWorktreeRequest>(value)
+                .unwrap()
+                .setup_intent
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::from_str::<WorktreeSetupIntent>("{}").unwrap(),
+            WorktreeSetupIntent::default()
+        );
     }
 
     #[test]
@@ -189,72 +240,169 @@ mod tests {
         journal.request.setup_intent = Some(first.clone());
         let store = StateStore::open(&path, crate::model::BootId::new("setup-intent")).unwrap();
         seed(&store, &journal, PendingOperationStatus::Applied);
-        let mut copied = first.clone(); copied.copy_done = true;
+        let mut copied = first.clone();
+        copied.copy_done = true;
         let report = RepositoryService::system("must-not-execute-git")
-            .update_worktree_setup_intent(&store, request.operation_id, Some(&first), copied.clone()).unwrap();
+            .update_worktree_setup_intent(
+                &store,
+                request.operation_id,
+                Some(&first),
+                copied.clone(),
+            )
+            .unwrap();
         assert_eq!(report.request.unwrap().setup_intent, Some(copied.clone()));
         assert_eq!(report.state, WorktreeOperationState::Created);
         assert_eq!(report.created_at_unix_ms, 42);
         assert_eq!(report.detail, "Created");
         drop(store);
-        let reopened = StateStore::open(path, crate::model::BootId::new("setup-intent-restart")).unwrap();
-        let row = reopened.journaled_worktree_operation(request.operation_id).unwrap().unwrap();
+        let reopened =
+            StateStore::open(path, crate::model::BootId::new("setup-intent-restart")).unwrap();
+        let row = reopened
+            .journaled_worktree_operation(request.operation_id)
+            .unwrap()
+            .unwrap();
         let saved: WorktreeJournal = serde_json::from_value(row.payload).unwrap();
         assert_eq!(saved.request.setup_intent, Some(copied.clone()));
         assert_eq!(row.status, PendingOperationStatus::Applied);
         let service = RepositoryService::system("must-not-execute-git");
-        let before = reopened.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload;
-        let read = service.worktree_setup_creation(&reopened, request.operation_id).unwrap().unwrap();
+        let before = reopened
+            .journaled_worktree_operation(request.operation_id)
+            .unwrap()
+            .unwrap()
+            .payload;
+        let read = service
+            .worktree_setup_creation(&reopened, request.operation_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(read.request.unwrap().setup_intent, Some(copied));
         assert_eq!(read.state, WorktreeOperationState::Created);
         assert_eq!(read.created_at_unix_ms, 42);
-        assert_eq!(reopened.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload, before);
+        assert_eq!(
+            reopened
+                .journaled_worktree_operation(request.operation_id)
+                .unwrap()
+                .unwrap()
+                .payload,
+            before
+        );
         assert!(!request.destination.exists());
     }
 
     #[test]
     fn stale_callbacks_cannot_overwrite_resumed_run_or_add_intent_to_unsettled_rows() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
-        let store = StateStore::open(root.path().join("state.sqlite"), crate::model::BootId::new("setup-intent")).unwrap();
+        let store = StateStore::open(
+            root.path().join("state.sqlite"),
+            crate::model::BootId::new("setup-intent"),
+        )
+        .unwrap();
         let service = RepositoryService::system("must-not-execute-git");
         let request = request(root.path());
         let original = intent(&request);
         let journal = journal(request.clone());
         seed(&store, &journal, PendingOperationStatus::Applied);
-        service.update_worktree_setup_intent(&store, request.operation_id, None, original.clone()).unwrap();
-        let mut resumed = original.clone(); resumed.run_id = Some(OperationId::new());
-        service.update_worktree_setup_intent(&store, request.operation_id, Some(&original), resumed.clone()).unwrap();
-        let mut stale = original.clone(); stale.copy_done = true;
-        assert!(service.update_worktree_setup_intent(&store, request.operation_id, Some(&original), stale).unwrap_err().to_string().contains("stale setup intent"));
-        let row = store.journaled_worktree_operation(request.operation_id).unwrap().unwrap();
-        assert_eq!(serde_json::from_value::<WorktreeJournal>(row.payload).unwrap().request.setup_intent, Some(resumed));
+        service
+            .update_worktree_setup_intent(&store, request.operation_id, None, original.clone())
+            .unwrap();
+        let mut resumed = original.clone();
+        resumed.run_id = Some(OperationId::new());
+        service
+            .update_worktree_setup_intent(
+                &store,
+                request.operation_id,
+                Some(&original),
+                resumed.clone(),
+            )
+            .unwrap();
+        let mut stale = original.clone();
+        stale.copy_done = true;
+        assert!(
+            service
+                .update_worktree_setup_intent(&store, request.operation_id, Some(&original), stale)
+                .unwrap_err()
+                .to_string()
+                .contains("stale setup intent")
+        );
+        let row = store
+            .journaled_worktree_operation(request.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_value::<WorktreeJournal>(row.payload)
+                .unwrap()
+                .request
+                .setup_intent,
+            Some(resumed)
+        );
         let mut pending = journal.clone();
         pending.request.operation_id = OperationId::new();
-        pending.lease_path = pending.common_dir.join(format!("cagents-operation-{}.lease", pending.request.operation_id));
+        pending.lease_path = pending.common_dir.join(format!(
+            "cagents-operation-{}.lease",
+            pending.request.operation_id
+        ));
         pending.request.destination = pending.request.managed_root.join("other");
         pending.state = WorktreeOperationState::OutcomeUnknown;
         pending.outcome = None;
         seed(&store, &pending, PendingOperationStatus::Pending);
-        assert!(service.update_worktree_setup_intent(&store, pending.request.operation_id, None, original).is_err());
+        assert!(
+            service
+                .update_worktree_setup_intent(&store, pending.request.operation_id, None, original)
+                .is_err()
+        );
     }
 
     #[test]
     fn malformed_settled_journals_are_not_rewritten() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
-        let store = StateStore::open(root.path().join("state.sqlite"), crate::model::BootId::new("setup-intent")).unwrap();
+        let store = StateStore::open(
+            root.path().join("state.sqlite"),
+            crate::model::BootId::new("setup-intent"),
+        )
+        .unwrap();
         let request = request(root.path());
         let journal = journal(request.clone());
         seed(&store, &journal, PendingOperationStatus::Applied);
         let prior = serde_json::to_value(&journal).unwrap();
         let mut malformed = prior.clone();
         malformed["lease_path"] = serde_json::json!("/unrelated/lease");
-        store.update_operation(request.operation_id, &prior, &malformed, PendingOperationStatus::Applied).unwrap();
-        assert!(RepositoryService::system("must-not-execute-git")
-            .update_worktree_setup_intent(&store, request.operation_id, None, intent(&request)).is_err());
-        assert_eq!(store.journaled_worktree_operation(request.operation_id).unwrap().unwrap().payload, malformed);
-        assert!(store.journaled_worktree_operation(OperationId::new()).unwrap().is_none());
+        store
+            .update_operation(
+                request.operation_id,
+                &prior,
+                &malformed,
+                PendingOperationStatus::Applied,
+            )
+            .unwrap();
+        assert!(
+            RepositoryService::system("must-not-execute-git")
+                .update_worktree_setup_intent(&store, request.operation_id, None, intent(&request))
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .journaled_worktree_operation(request.operation_id)
+                .unwrap()
+                .unwrap()
+                .payload,
+            malformed
+        );
+        assert!(
+            store
+                .journaled_worktree_operation(OperationId::new())
+                .unwrap()
+                .is_none()
+        );
         let service = RepositoryService::system("must-not-execute-git");
-        assert!(service.worktree_setup_creation(&store, request.operation_id).is_err());
-        assert!(service.worktree_setup_creation(&store, OperationId::new()).unwrap().is_none());
+        assert!(
+            service
+                .worktree_setup_creation(&store, request.operation_id)
+                .is_err()
+        );
+        assert!(
+            service
+                .worktree_setup_creation(&store, OperationId::new())
+                .unwrap()
+                .is_none()
+        );
     }
 }
