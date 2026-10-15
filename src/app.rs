@@ -14780,7 +14780,8 @@ impl Cagents {
             return None;
         }
         let binding = self.refresh_ui.source_binding.as_ref()
-            .filter(|binding| binding.key == *key && binding.authority.is_some())?.clone();
+            .filter(|binding| binding.key == *key && binding.authority.is_some()
+                && self.sidebar_model.source_control.as_ref().is_some_and(|source| source.command_binding_id() == binding.id))?.clone();
         let source = self.sidebar_model.source_control.as_mut()?;
         if source.busy() {
             return None;
@@ -14819,7 +14820,8 @@ impl Cagents {
         }
         let kind = request.kind();
         if let Some(active) = self.source_control_mutations.get_mut(&key.canonical_path) {
-            if self.refresh_ui.source_binding.as_ref().is_none_or(|binding| binding.id != active.binding.id) { return Task::none(); }
+            if self.refresh_ui.source_binding.as_ref().is_none_or(|binding| binding.id != active.binding.id)
+                || self.sidebar_model.source_control.as_ref().is_none_or(|source| source.command_binding_id() != active.binding.id) { return Task::none(); }
             QueuedGitMutation::append(&mut active.pending, request.clone());
             if let Some(source) = self.sidebar_model.source_control.as_mut() {
                 if let Some(selection) = request.optimistic_selection() {
@@ -21725,7 +21727,8 @@ impl Application for Cagents {
                     mutation.pending.clear();
                     self.git_mutation_unavailable(&key);
                 }
-                if current_binding && committed && let Some(revision) = mutation.commit_revision {
+                if committed && (current_binding || self.sidebar_model.source_control.as_ref().is_none_or(|source| source.key != key))
+                    && let Some(revision) = mutation.commit_revision {
                     self.sidebar_state.clear_submitted_commit(&key, revision);
                 }
                 if let Some(next) = mutation.pending.pop_front() {
