@@ -20,8 +20,8 @@ use std::{
 
 mod authority;
 pub(crate) mod read_source;
-pub use read_source::{GitReadReceipt, GitReadSource};
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
+pub use read_source::{GitReadReceipt, GitReadSource};
 mod browse_reveal;
 mod creation_authority;
 mod ignore_path;

@@ -1463,8 +1463,17 @@ pub fn load_repository_diff_with_options_and_font(
     font: cosmic::iced::Font,
     cancellation: &CancellationToken,
 ) -> RenderedDiff {
-    load_repository_diff_with_read_source(worktree, relative_path, basis, previous_path, theme,
-        ignore_whitespace, font, cancellation, None)
+    load_repository_diff_with_read_source(
+        worktree,
+        relative_path,
+        basis,
+        previous_path,
+        theme,
+        ignore_whitespace,
+        font,
+        cancellation,
+        None,
+    )
 }
 
 /// The optional source is fixed by the original runtime owner before this worker starts.
@@ -1497,13 +1506,23 @@ pub fn load_repository_diff_with_read_source(
         old_path,
     };
     let read = match source {
-        Some(source) => source.diff(&request, cancellation).map(|(content, receipt)| (content, Some(receipt))),
-        None => RepositoryService::system("git").diff(&request, cancellation).map(|content| (content, None)),
+        Some(source) => source
+            .diff(&request, cancellation)
+            .map(|(content, receipt)| (content, Some(receipt))),
+        None => RepositoryService::system("git")
+            .diff(&request, cancellation)
+            .map(|content| (content, None)),
     };
     match read {
         Ok((content, receipt)) => {
             let mut rendered = RenderedDiff::from_content_with_options_and_font(
-                content, relative_path, theme, ignore_whitespace, font, cancellation);
+                content,
+                relative_path,
+                theme,
+                ignore_whitespace,
+                font,
+                cancellation,
+            );
             if let RenderedDiff::Text { model, .. } = &mut rendered {
                 Arc::make_mut(model).git_read_receipt = receipt;
             }
