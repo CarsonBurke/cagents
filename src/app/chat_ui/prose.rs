@@ -1112,12 +1112,7 @@ fn code_line(
     // Preserve physical-line Bidi, joining, clusters and tab origin rather
     // than independently shaping a complex run at artificial boundaries.
     // These lines remain an explicit performance qualification requirement.
-    if !text[range.clone()].is_ascii() || text[range.clone()].contains('\t') {
-        let styled = if spans.is_empty() { vec![Span::new(text[range.clone()].to_owned())].into() }
-            else { sliced_spans(&spans, &starts, range) };
-        return leaf_text(styled, size, font, target, find.as_deref(), logical);
-    }
-    let pieces = if range.len() <= 2048 {
+    let pieces = if range.len() <= 2048 || !text[range.clone()].is_ascii() || text[range.clone()].contains('\t') {
         vec![0..range.len()]
     } else {
         chunk_ranges(&text[range.clone()])
@@ -1184,6 +1179,7 @@ fn code_line(
             row
         })
         .collect();
+
 
     virtualized::row(chunks, size.0 * 1.3, Default::default())
 }
