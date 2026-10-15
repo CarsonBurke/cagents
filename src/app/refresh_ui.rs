@@ -24,6 +24,7 @@ pub(super) struct State {
     pub(super) focused: bool,
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,
+    pub(super) source_reload_pending: bool,
     pub(super) source_cache: Option<(
         PathBuf,
         Arc<std::sync::Mutex<crate::repository::SnapshotCache>>,
@@ -45,6 +46,7 @@ impl Default for State {
             focused: false,
             source_generation: 0,
             source_cancel: None,
+            source_reload_pending: false,
             source_cache: None,
             source_invalidated: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             source_last_refresh: Instant::now(),
@@ -320,6 +322,7 @@ impl Cagents {
     }
 
     pub(super) fn cancel_source_read(&mut self) {
+        self.refresh_ui.source_reload_pending = false;
         if let Some(cancel) = self.refresh_ui.source_cancel.take() {
             cancel.cancel();
         }

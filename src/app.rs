@@ -11132,6 +11132,31 @@ impl Cagents {
         self.source_control_snapshot_task(key.clone())
     }
 
+    /// Watcher edges share an in-flight read instead of repeatedly cancelling
+    /// it. One follow-up consumes all invalidations that arrive while it runs.
+    fn reload_source_control_from_event(&mut self, key: &ActiveWorktreeKey) -> Task<Message> {
+        if !self.source_control_is_bound(key) {
+            return Task::none();
+        }
+        if self.folder_scope(key) {
+            return self.reload_source_control(key);
+        }
+        if self.refresh_ui.source_cancel.is_some() {
+            self.refresh_ui.source_reload_pending = true;
+            self.refresh_ui.source_invalidated.fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+            return Task::none();
+        }
+        self.reload_source_control(key)
+    }
+
+    fn reload_pending_source_control(&mut self, key: &ActiveWorktreeKey) -> Task<Message> {
+        if std::mem::take(&mut self.refresh_ui.source_reload_pending) {
+            self.reload_source_control(key)
+        } else {
+            Task::none()
+        }
+    }
+
     fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
         if crate::device::is_remote() {
             return Task::none();
@@ -17293,7 +17318,7 @@ impl Application for Cagents {
                     if let Some(source) = self.sidebar_model.source_control.as_mut() {
                         source.set_reloading(false);
                     }
-                    return Task::none();
+                    return self.reload_pending_source_control(&key);
                 }
                 if let Ok(Some(prepared)) = &result
                     && let Some(worktree) = self
@@ -17346,13 +17371,14 @@ impl Application for Cagents {
                     .get(&next.key.canonical_path)
                     .map(|recovery| recovery.expires_unix_ms);
                 self.sidebar_model.source_control = Some(next);
-                match snapshot {
+                let accepted = match snapshot {
                     Some(snapshot) => Task::batch([self.refresh_branch_changes(&snapshot), reveal]),
                     None => {
                         self.cancel_branch_changes();
                         Task::none()
                     }
-                }
+                };
+                Task::batch([accepted, self.reload_pending_source_control(&key)])
             }
             Message::SourceControlHistory {
                 generation,
@@ -28959,6 +28985,91 @@ mod tests {
         );
         let _ = project;
     }
+    #[test]
+    fn watcher_refresh_bursts_keep_the_active_read_and_drain_one_followup() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let generation = app.refresh_ui.source_generation;
+        let active = CancellationToken::default();
+        app.refresh_ui.source_cancel = Some(active.clone());
+        for _ in 0..1000 {
+            assert!(cosmic::iced::runtime::task::into_stream(app.reload_source_control_from_event(&key)).is_none());
+        }
+        assert!(!active.is_cancelled(), "continuous events must let the active reader finish");
+        assert_eq!(app.refresh_ui.source_generation, generation);
+        assert!(app.refresh_ui.source_reload_pending);
+        let snapshot = crate::repository::RepositorySnapshot {
+            operation: None, stashes: Vec::new(), last_fetch_unix_ms: None,
+            status: crate::repository::StatusSnapshot::default(),
+            files: crate::repository::WorkingFiles::default(), remotes: Vec::new(),
+            local_refs: Vec::new(), remote_refs: Vec::new(), remote_heads: Vec::new(),
+        };
+        let model = SourceControlModel::ready(key.clone(), &snapshot);
+        let followup = app.update(Message::SourceControlLoaded {
+            key: key.clone(), request: generation,
+            result: Ok(Some(Box::new((snapshot, model)))),
+        });
+        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().data_state, sidebar::SidebarDataState::Ready,
+            "the completed full model is installed before its queued followup");
+        assert!(cosmic::iced::runtime::task::into_stream(followup).is_some());
+        assert_eq!(app.refresh_ui.source_generation, generation.wrapping_add(1), "one new generation for all 1000 edges");
+        assert!(!app.refresh_ui.source_reload_pending);
+        assert!(app.refresh_ui.source_cancel.is_some());
+        assert!(!active.is_cancelled());
+        let next = app.refresh_ui.source_generation;
+        drop(app.update(Message::SourceControlLoaded { key, request: next, result: Ok(None) }));
+        assert_eq!(app.refresh_ui.source_generation, next, "no trailing reload after the pending edge was consumed");
+        assert!(app.refresh_ui.source_cancel.is_none());
+    }
+
+    #[test]
+    fn watcher_refresh_pending_edges_drain_after_unchanged_and_failed_reads() {
+        for failed in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            app.active_workspace = Some(key.canonical_path.clone());
+            let generation = app.refresh_ui.source_generation;
+            app.refresh_ui.source_cancel = Some(CancellationToken::default());
+            drop(app.reload_source_control_from_event(&key));
+            let result = if failed { Err("transient read failure".to_owned()) } else { Ok(None) };
+            let followup = app.update(Message::SourceControlLoaded { key, request: generation, result });
+            assert!(cosmic::iced::runtime::task::into_stream(followup).is_some(), "pending invalidation survives failed={failed}");
+            assert_eq!(app.refresh_ui.source_generation, generation.wrapping_add(1));
+            assert!(!app.refresh_ui.source_reload_pending);
+            assert!(app.refresh_ui.source_cancel.is_some());
+        }
+    }
+
+    #[test]
+    fn watcher_refresh_pending_is_binding_scoped_and_explicit_cancellation_retires_it() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let active = CancellationToken::default();
+        app.refresh_ui.source_cancel = Some(active.clone());
+        let mut unrelated = key.clone();
+        unrelated.canonical_path = key.canonical_path.join("unrelated");
+        drop(app.reload_source_control_from_event(&unrelated));
+        assert!(!app.refresh_ui.source_reload_pending);
+        drop(app.reload_source_control_from_event(&key));
+        assert!(app.refresh_ui.source_reload_pending);
+        let retired = app.refresh_ui.source_generation;
+        app.cancel_source_read();
+        assert!(active.is_cancelled());
+        assert!(!app.refresh_ui.source_reload_pending);
+        assert!(app.refresh_ui.source_cancel.is_none());
+        drop(app.update(Message::SourceControlLoaded { key, request: retired, result: Ok(None) }));
+        assert!(app.refresh_ui.source_cancel.is_none(), "retired callback cannot start a new read");
+        assert!(!app.refresh_ui.source_reload_pending);
+    }
+
     #[test]
     fn git_mutation_queue_keeps_ten_clicks_and_refreshes_once_at_drain() {
         let mut app = context_inspector_test_app(false);
