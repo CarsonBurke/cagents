@@ -1820,6 +1820,10 @@ impl Editor {
     }
 
     fn remove_tab(&mut self, id: CardId) {
+        if self.tab(id).is_some_and(|tab| tab.runtime.has_editor_recovery()) {
+            self.notice = Some("The editor was retained until its file recovery finishes.".into());
+            return;
+        }
         self.lsp_navigation.remove_tab(id);
         let scratch = (!self.exiting)
             .then(|| self.untitled_scratch_path(id))

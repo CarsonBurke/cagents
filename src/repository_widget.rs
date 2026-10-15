@@ -2557,6 +2557,7 @@ pub struct RepositoryRuntime {
     pending_source_location: Option<(PathBuf, usize)>,
     pending_editor_focus: Option<AsyncIdentity>,
     recovery: Option<editor_recovery::State>,
+    recovery_capture_ticket: Option<u64>,
     next_save_ticket: u64,
     next_diff_request: u64,
     /// Identity the application gave the open buffer at the LSP boundary, or
@@ -2771,6 +2772,7 @@ impl RepositoryRuntime {
             pending_source_location: None,
             pending_editor_focus: None,
             recovery: None,
+            recovery_capture_ticket: None,
             next_save_ticket: 0,
             lsp_document: None,
             language: EditorLanguageState::default(),
@@ -6724,6 +6726,7 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 document.external_check_pending = true;
+                if capture { self.recovery_capture_ticket = Some(ticket); }
                 let baseline = document.disk_hash; let before = document.saved_text.clone();
                 let worktree = identity.worktree.clone(); let path = identity.path.clone(); let tone = self.document_tone;
                 cosmic::task::future(async move {

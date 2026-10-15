@@ -129,6 +129,10 @@ impl Cagents {
     /// card ran must already have ended or been closed through the daemon,
     /// as a worktree's deletion retires the cards it held.
     pub(super) fn retire_offstrip_card(&mut self, card: CardId) -> Task<Message> {
+        if self.card_has_editor_recovery(card) {
+            self.status = Some(TransientNotice::warning("The editor was retained until its file recovery finishes."));
+            return Task::none();
+        }
         if self.workspace.order().any(|id| id == card)
             || self
                 .card_state(card)
@@ -163,6 +167,10 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        if self.card_has_editor_recovery(card) {
+            self.status = Some(TransientNotice::warning("Resolve file recovery before closing this editor."));
+            return Task::none();
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
@@ -357,6 +365,10 @@ impl Cagents {
             Option<(TerminalId, TerminalId)>,
         )>,
     ) -> Option<Task<Message>> {
+        if self.card_has_editor_recovery(id) {
+            self.status = Some(TransientNotice::warning("The editor was kept because file recovery is pending."));
+            return None;
+        }
         let handoff = self.workspace.pending_close();
         let replacing = replacement.is_some();
         let closed_descriptor = (!replacing).then(|| self.card_state(id).cloned()).flatten();

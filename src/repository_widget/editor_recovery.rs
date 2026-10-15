@@ -8,7 +8,7 @@ pub(super) struct State {
     pub(super) pending: Option<crate::editor::RecoveryAuthority>,
 }
 impl RepositoryRuntime {
-    pub fn has_editor_recovery(&self) -> bool { self.recovery.is_some() }
+    pub fn has_editor_recovery(&self) -> bool { self.recovery.is_some() || self.recovery_capture_ticket.is_some() }
 
     /// A publisher can hand an unopened-file recovery to its owning runtime.
     /// The authority itself retains the exact source descriptors and paths.
@@ -24,6 +24,10 @@ impl RepositoryRuntime {
         }
     }
     pub(super) fn retain_action_recovery(&mut self, action: &RepositoryAction) {
+        if let RepositoryAction::DiskLoaded { ticket, .. } = action
+            && self.recovery_capture_ticket == Some(*ticket) {
+            self.recovery_capture_ticket = None;
+        }
         let authority = match action {
             RepositoryAction::SaveFinished { result, .. } => match result {
                 Ok(SaveOutcome::Saved { durability, .. } | SaveOutcome::Absent { durability, .. }) => durability.recovery_authority(),
@@ -99,6 +103,31 @@ mod tests {
         run_recovery(&mut runtime, card, authority.clone()).await;
         assert!(!runtime.has_editor_recovery()); assert!(authority.is_resolved());
         assert_eq!(attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn cross_presence_capture_owns_retirement_gate_until_real_worker_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "outside").unwrap();
+        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "");
+        runtime.descriptor.worktree = directory.path().to_path_buf();
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        document.present = false; document.saved_present = false;
+        let identity = runtime.current_identity(card, "notes.txt".into());
+        let stamp = crate::editor_reload::stamp(directory.path(), Path::new("notes.txt"), Path::new("notes.txt")).unwrap().unwrap();
+        runtime.disk_poll = Some((7, Instant::now()));
+        let task = runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 7, result: Ok(Some(stamp)) });
+        assert!(runtime.has_editor_recovery()); assert!(runtime.blocks_navigation());
+        assert!(runtime.recovery.is_none(), "this is an admitted worker, not an invented error");
+        let mut stream = iced::runtime::task::into_stream(task).expect("real capture worker");
+        let mut received = false;
+        while let Some(iced::runtime::Action::Output(action)) = stream.next().await {
+            if matches!(action, RepositoryAction::DiskLoaded { .. }) { received = true; }
+            drop(runtime.update(action));
+        }
+        assert!(received); assert!(!runtime.has_editor_recovery());
+        let DocumentState::Editable(document) = &runtime.document else { unreachable!() };
+        assert!(document.external_version.as_ref().unwrap().restoration.is_some());
     }
 
     #[test]

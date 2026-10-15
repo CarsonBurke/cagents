@@ -10907,6 +10907,10 @@ impl Cagents {
         }
     }
     fn fail_runtime(&mut self, card: CardId, message: String) {
+        if self.card_has_editor_recovery(card) {
+            self.status = Some(TransientNotice::error(format!("{message} The editor was kept because file recovery is pending.")));
+            return;
+        }
         let mut failure = self.terminal_failure_payload(card, message.clone());
         self.sidebar_state.clear_agent_activity(card);
         self.retire_lsp_card(card);
@@ -15624,6 +15628,14 @@ impl Cagents {
         }
     }
 
+    fn card_has_editor_recovery(&self, card: CardId) -> bool {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.has_editor_recovery(),
+            Some(CardRuntime::PullRequests(pane)) => pane.runtime.has_editor_recovery(),
+            _ => false,
+        }
+    }
+
     fn focused_repository_is_saving(&self) -> bool {
         focused_save_in_flight(
             self.workspace.focused(),
@@ -15669,6 +15681,14 @@ impl Cagents {
     }
 
     fn exit_after_language_servers(&mut self) -> Task<Message> {
+        if self.cards.values().any(|runtime| match runtime {
+            CardRuntime::Repository(runtime) => runtime.has_editor_recovery(),
+            CardRuntime::PullRequests(pane) => pane.runtime.has_editor_recovery(),
+            _ => false,
+        }) {
+            self.status = Some(TransientNotice::warning("File recovery must finish before closing this window. Retained editors were kept."));
+            return Task::none();
+        }
         if self.exit.is_some() {
             return Task::none();
         }
@@ -24521,6 +24541,23 @@ mod tests {
                 assert!(app.exit.unwrap().is_complete());
             });
         }
+    }
+
+    #[test]
+    fn live_editor_recovery_rejects_final_exit_and_card_failure_replacement() {
+        let mut app = context_inspector_test_app(true); let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique(); app.core.set_main_window_id(Some(window));
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "clean");
+        assert!(!runtime.is_dirty()); assert!(!runtime.is_saving());
+        let authority = crate::editor::RecoverySlot::reserve().unwrap().retain("original held files".into(), || Ok(()));
+        runtime.retain_editor_recovery(authority.clone(), "needs actual recovery".into());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        drop(app.exit_after_language_servers());
+        assert!(app.exit.is_none()); assert_eq!(app.core.main_window_id(), Some(window));
+        app.fail_runtime(card, "unrelated runtime failure".into());
+        assert!(app.card_has_editor_recovery(card)); assert!(!authority.is_resolved());
+        assert!(app.commit_card_removal(card, None).is_none());
+        assert!(app.cards.contains_key(&card));
     }
 
     /// Only the window the exit closed can finish it.
