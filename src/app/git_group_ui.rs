@@ -156,8 +156,11 @@ impl Cagents {
         {
             return Task::none();
         }
-        let binding = self.source_control_mutations[&key.canonical_path].binding.clone();
+        let active = &self.source_control_mutations[&key.canonical_path];
+        let binding = active.binding.clone();
+        let cancelled = active.cancellation.is_cancelled();
         let (selection, report) = match result {
+            _ if cancelled => (None, Some("The Git action was cancelled before confirmation.".into())),
             Ok(selection) => (Some(selection), None),
             Err(error) => (None, Some(error)),
         };

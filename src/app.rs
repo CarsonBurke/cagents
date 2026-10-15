@@ -21539,6 +21539,10 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
+                if self.source_control_mutations[&key.canonical_path].cancellation.is_cancelled() {
+                    return self.update(Message::SourceControlMutated { key, operation,
+                        report: Some("The Git action was cancelled before marker confirmation.".into()), committed: false });
+                }
                 let binding = self.source_control_mutations[&key.canonical_path].binding.id;
                 let task = self.update(Message::SourceControlMutated {
                     key: key.clone(),
