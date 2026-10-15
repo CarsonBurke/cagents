@@ -1923,6 +1923,7 @@ pub struct SourceControlModel {
     /// The most recent mutation failure, retained until the next attempt.
     pub error: Option<String>,
     pub output_expanded: bool,
+    pub undo_discard_until_unix_ms: Option<u64>,
     pub operation: Option<crate::repository::GitOperationState>,
     pub stashes: Vec<crate::repository::StashEntry>,
     pub last_fetch_unix_ms: Option<u64>,
@@ -2098,6 +2099,7 @@ impl SourceControlModel {
             mutation: None,
             error: None,
             output_expanded: false,
+            undo_discard_until_unix_ms: None,
             operation: None,
             stashes: Vec::new(),
             last_fetch_unix_ms: None,
@@ -2244,6 +2246,7 @@ impl SourceControlModel {
             mutation: None,
             error: None,
             output_expanded: false,
+            undo_discard_until_unix_ms: None,
             operation: snapshot.operation.clone(),
             stashes: snapshot.stashes.clone(),
             last_fetch_unix_ms: snapshot.last_fetch_unix_ms,
@@ -2471,6 +2474,7 @@ impl SourceControlModel {
         }
         next.error = self.error.clone();
         next.output_expanded = self.output_expanded;
+        next.undo_discard_until_unix_ms = self.undo_discard_until_unix_ms;
         next.stashes_expanded = self.stashes_expanded;
         next.pending_stash_drop = self.pending_stash_drop.clone();
         next.pending_marker_stage = self.pending_marker_stage.clone();
@@ -3730,6 +3734,7 @@ impl SidebarState {
             | SidebarAction::ToggleStashes { .. }
             | SidebarAction::RequestStashDrop { .. }
             | SidebarAction::ConfirmStageMarkers { .. }
+            | SidebarAction::UndoDiscard { .. }
             | SidebarAction::CancelGitMutation { .. }
             | SidebarAction::ToggleGitOutput { .. }
             | SidebarAction::Stage { .. }
@@ -4012,6 +4017,7 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         confirmed: bool,
     },
+    UndoDiscard { key: ActiveWorktreeKey },
     CancelGitMutation {
         key: ActiveWorktreeKey,
     },
@@ -7369,6 +7375,12 @@ fn source_control_notices<'a>(
             }
         }
     }
+    if source.undo_discard_until_unix_ms.is_some_and(|until| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() <= u128::from(until)) {
+        notices = notices.push(widget::row::with_children(vec![
+            design::caption("Changes discarded. Backups kept.").into(),
+            widget::button::text("Undo discard").on_press(SidebarAction::UndoDiscard { key: source.key.clone() }).into(),
+        ]).spacing(space::XS));
+    }
     if let Some(operation) = &source.operation {
         notices = notices.push(design::caption(format!(
             "{} in progress{}",
@@ -9824,7 +9836,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             design::body(detail.join(". "))
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
-            design::caption("Discarded work is not recoverable from Git.").into(),
+            design::caption("Tracked contents are backed up in Git; new files move to the system Trash. Undo is available for one minute.").into(),
             widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("Cancel")
                     .id(discard_cancel_id())
