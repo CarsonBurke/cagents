@@ -817,7 +817,9 @@ impl HeldChild {
     }
 
     pub(super) fn shutdown_pidfd(&self) -> Result<File, String> {
-        self.pidfd.try_clone().map_err(|error| format!("retain child shutdown pidfd: {error}"))
+        self.pidfd
+            .try_clone()
+            .map_err(|error| format!("retain child shutdown pidfd: {error}"))
     }
 
     /// Hangs the root up, as closing its terminal would. A root that already
