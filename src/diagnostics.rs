@@ -643,13 +643,19 @@ fn observe_holders() -> (bool, Vec<HolderReport>) {
     let mut holders = Vec::new();
     for kind in [Kind::Terminal, Kind::Native] {
         match registry::observed(kind) {
-            Ok(records) => holders.extend(records.into_iter().map(|record| HolderReport {
-                terminal: record.terminal,
-                pid: record.holder.pid,
-                kind: match kind { Kind::Terminal => "terminal", Kind::Native => "native" }.into(),
-                version: record.build.as_ref().map(|build| build.version.clone()),
-                outdated: record.is_outdated(),
-                zombie_children: record.zombie_children().ok(),
+            Ok(records) => holders.extend(records.into_iter().map(|record| {
+                HolderReport {
+                    terminal: record.terminal,
+                    pid: record.holder.pid,
+                    kind: match kind {
+                        Kind::Terminal => "terminal",
+                        Kind::Native => "native",
+                    }
+                    .into(),
+                    version: record.build.as_ref().map(|build| build.version.clone()),
+                    outdated: record.is_outdated(),
+                    zombie_children: record.zombie_children().ok(),
+                }
             })),
             Err(_) => readable = false,
         }
@@ -702,12 +708,21 @@ impl Report {
         }
         lines.push(if self.holders_readable {
             format!("Live holder observations: {}", self.holders.len())
-        } else { "Live holder observations: partially unavailable".into() });
+        } else {
+            "Live holder observations: partially unavailable".into()
+        });
         for holder in &self.holders {
-            lines.push(format!("{} holder {}: terminal={}, version={}, outdated={}, zombie_children={}",
-                holder.kind, holder.pid, holder.terminal,
-                holder.version.as_deref().unwrap_or("unknown"), holder.outdated,
-                holder.zombie_children.map_or_else(|| "unknown".into(), |count| count.to_string())));
+            lines.push(format!(
+                "{} holder {}: terminal={}, version={}, outdated={}, zombie_children={}",
+                holder.kind,
+                holder.pid,
+                holder.terminal,
+                holder.version.as_deref().unwrap_or("unknown"),
+                holder.outdated,
+                holder
+                    .zombie_children
+                    .map_or_else(|| "unknown".into(), |count| count.to_string())
+            ));
         }
         lines.join("\n")
     }
