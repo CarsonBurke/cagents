@@ -775,7 +775,15 @@ fn global_shortcut_event_descriptor(
     // before considering the symbol produced by Shift (for example 1 versus !).
     global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts, focused).or_else(|| {
         (modified_key != key)
-            .then(|| global_shortcut_descriptor(modified_key, *physical_key, *modifiers, shortcuts, focused))
+            .then(|| {
+                global_shortcut_descriptor(
+                    modified_key,
+                    *physical_key,
+                    *modifiers,
+                    shortcuts,
+                    focused,
+                )
+            })
             .flatten()
     })
 }
