@@ -21,6 +21,7 @@ pub(super) struct Bindings {
     batch:Option<uuid::Uuid>,
     selected:HashMap<CardId,uuid::Uuid>,
     completed_attempts:HashMap<TerminalId,CompletedAttempt>,
+    removal_origins:HashMap<CardId,Option<uuid::Uuid>>,
 }
 
 struct CompletedAttempt { nonce:uuid::Uuid,card:CardId,batch:Option<uuid::Uuid> }
@@ -235,6 +236,7 @@ impl Cagents {
         self.terminal_close_bindings.bound.remove(&card);
         self.terminal_close_bindings.adoptions.remove(&card);
         self.terminal_close_bindings.removals.remove(&card);
+        self.terminal_close_bindings.removal_origins.remove(&card);
         self.terminal_close_bindings.local.forget(card);
     }
 
@@ -580,7 +582,7 @@ impl Cagents {
             self.status=Some(TransientNotice::warning("This terminal has no confirmed worker identity yet. Its shared pane and history were kept; reconnect or finish its startup before trying Close again."));
             return Task::none();
         }
-        self.request_card_removal(card)
+        self.request_card_removal_for(card,batch)
     }
 
     pub(super) fn completed_terminal_closed(
@@ -669,7 +671,7 @@ impl Cagents {
                     self.terminal_close_bindings.removals.insert(card, captured);
                 }
                 self.closed_terminal_cards.insert(card);
-                self.request_card_removal(card)
+                self.request_card_removal_for(card,batch)
             }
             Ok(CompletedCloseOutcome::Active(proof)) => {
                 if self.terminal_close.is_some() {
@@ -717,16 +719,38 @@ impl Cagents {
                 .is_some_and(|continuity| continuity.live_proof().is_none())
     }
 
+    /// Direct callers have no batch authority. Async lifecycle consumers must
+    /// pass their original token to request_card_removal_for instead.
     pub(super) fn request_card_removal(&mut self, card: CardId) -> Task<Message> {
+        self.request_card_removal_for(card,None)
+    }
+
+    pub(super) fn request_card_removal_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Task<Message> {
+        self.reserve_card_removal_for(card,batch).map(|handoff|self.card_removal(handoff)).unwrap_or_else(Task::none)
+    }
+
+    /// Reserve a synchronous lifecycle commit without relabeling a pending
+    /// handoff from another origin. Chat End uses this after source validation.
+    pub(super) fn reserve_card_removal_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Option<crate::workspace::FocusHandoff> {
+        if !self.pane_close_decision_current(card,batch) {return None;}
+        if self.terminal_close_bindings.removal_origins.get(&card).is_some_and(|origin|*origin!=batch) {
+            self.stop_pane_close_batch(batch);
+            self.status=Some(TransientNotice::warning("An earlier Close request still owns this pane's pending removal. This selection was kept; retry after the earlier request finishes."));
+            return None;
+        }
         let reservation = match self.workspace.pending_close() {
             Some(handoff) if handoff.unmounting == card => Ok(handoff),
             _ => self.workspace.request_close(card),
         };
         match reservation {
-            Ok(handoff) => self.card_removal(handoff),
+            Ok(handoff) => {
+                self.terminal_close_bindings.removal_origins.insert(card,batch);
+                Some(handoff)
+            }
             Err(error) => {
+                self.stop_pane_close_batch(batch);
                 self.status = Some(TransientNotice::error(error.to_string()));
-                Task::none()
+                None
             }
         }
     }
@@ -754,10 +778,17 @@ impl Cagents {
             Option<(TerminalId, TerminalId)>,
         )>,
     ) -> Option<Task<Message>> {
+        let origin=self.terminal_close_bindings.removal_origins.get(&id).copied().flatten();
+        if !self.pane_close_decision_current(id,origin) {
+            if self.workspace.pending_close().is_some_and(|pending|pending.unmounting==id){let _=self.workspace.cancel_close(id);}
+            self.terminal_close_bindings.removal_origins.remove(&id);
+            return None;
+        }
         if self.card_state(id).is_some_and(|state|matches!(&state.kind,CardKind::Terminal(_))) && !self.terminal_close_bindings.removals.contains_key(&id) {
             if self.workspace.pending_close().is_some_and(|pending|pending.unmounting==id){let _=self.workspace.cancel_close(id);}
             self.closed_terminal_cards.remove(&id);
-            let batch=self.pane_close_batch_for(id);self.stop_pane_close_batch(batch);
+            self.terminal_close_bindings.removal_origins.remove(&id);
+            self.stop_pane_close_batch(origin);
             self.status=Some(TransientNotice::warning("No verified terminal cleanup receipt is available. Its shared pane and history were kept; reconnect and choose Close again."));
             return None;
         }
@@ -770,6 +801,8 @@ impl Cagents {
                 let _ = self.workspace.cancel_close(id);
                 self.closed_terminal_cards.remove(&id);
                 self.terminal_close_bindings.removals.remove(&id);
+                self.terminal_close_bindings.removal_origins.remove(&id);
+                self.stop_pane_close_batch(origin);
                 self.status = Some(TransientNotice::warning(
                     "The pane changed before its close was committed. Its new session was preserved.",
                 ));
@@ -782,6 +815,8 @@ impl Cagents {
         let update = match self.workspace.commit_close(id) {
             Ok(update) => update,
             Err(error) => {
+                self.terminal_close_bindings.removal_origins.remove(&id);
+                self.stop_pane_close_batch(origin);
                 self.status = Some(TransientNotice::error(error.to_string()));
                 return None;
             }
@@ -882,6 +917,11 @@ impl Cagents {
         } else {
             Task::none()
         };
+        let advance = if origin.is_some() {
+            self.finish_selected_pane_close(id,origin)
+        } else if self.terminal_close_bindings.batch.is_none() {
+            self.next_queued_card_close()
+        } else {Task::none()};
         Some(
             Task::batch([
                 closed,
@@ -891,7 +931,7 @@ impl Cagents {
                 reopen,
                 focus,
             ])
-            .chain(self.next_queued_card_close()),
+            .chain(advance),
         )
     }
 
@@ -924,12 +964,13 @@ impl Cagents {
         if let Some(card) = card {
             let _ = self.workspace.focus(card);
         }
+        let advance=if self.terminal_close_bindings.batch.is_none(){self.next_queued_card_close()}else{Task::none()};
         iced::widget::operation::focus(
             card.map(|card| self.card_keyboard_focus(card))
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
         )
         .map(cosmic::Action::App)
-        .chain(self.next_queued_card_close())
+        .chain(advance)
     }
 
     pub(super) fn confirm_terminal_close(&mut self) -> Task<Message> {
@@ -1036,9 +1077,10 @@ impl Cagents {
                 if let Some(captured) = intent.captured.clone() {
                     self.terminal_close_bindings.removals.insert(card, captured);
                 }
+                let origin=intent.batch;
                 self.terminal_close = None;
                 self.closed_terminal_cards.insert(card);
-                self.request_card_removal(card)
+                self.request_card_removal_for(card,origin)
             }
             CloseOutcome::Active if identity_matches => {
                 // The owner positively declined to close: a later explicit Close
@@ -1955,6 +1997,76 @@ mod tests {
             !app.core.keyboard_nav(),
             "dismissal keeps the reader's newer choice"
         );
+    }
+
+    #[test]
+    fn independent_completion_or_cancel_cannot_dequeue_a_waiting_batch_step() {
+        for completed in [false,true] {
+            let (mut app,independent,_)=bound_fixture();
+            let _=app.open_utility_card(CardKind::Accounts);
+            let first=app.utility_card(&CardKind::Accounts).unwrap();
+            let _=app.open_utility_card(CardKind::Automations);
+            let second=app.utility_card(&CardKind::Automations).unwrap();
+            if completed {
+                app.card_state_mut(independent).unwrap().kind=CardKind::Settings;
+                app.cards.insert(independent,CardRuntime::Settings);
+                let _=app.request_card_removal(independent);
+            }else {
+                let _=app.begin_card_close(independent);
+                let intent=app.terminal_close.as_ref().unwrap().clone();
+                let _=app.terminal_close_finished(independent,intent.terminal,intent.proof,intent.generation,CloseOutcome::Active);
+                assert!(app.terminal_close_dialog_visible());
+            }
+            let Message::CloseQueuedCard(held)=super::super::tests::task_app_message(app.close_cards_in_order(vec![first,second])) else {panic!()};
+            let batch=held.batch;
+            assert_eq!(app.queued_card_closes.iter().map(|queued|queued.card).collect::<Vec<_>>(),vec![second]);
+            if completed {let _=app.update(Message::CommitClose(independent));}
+            else {let _=app.update(Message::CancelTerminalClose);}
+            assert_eq!(app.card_state(independent).unwrap().existence.is_open(),!completed);
+            assert_eq!(app.queued_card_closes.iter().map(|queued|queued.card).collect::<Vec<_>>(),vec![second],"independent outcome cannot pop a second batch step while its first delivery is held");
+            assert!(app.pane_close_decision_current(first,batch));
+            let _=app.update(Message::CloseQueuedCard(held));
+            assert_eq!(app.workspace.pending_close().unwrap().unmounting,first);
+            assert_eq!(app.terminal_close_bindings.removal_origins.get(&first),Some(&batch));
+            assert_eq!(app.queued_card_closes.len(),1);
+            let _=app.update(Message::CommitClose(first));
+            assert!(!app.card_state(first).unwrap().existence.is_open());
+            assert!(app.card_state(second).unwrap().existence.is_open());
+            assert!(app.pane_close_decision_current(second,batch));
+            assert!(app.queued_card_closes.is_empty(),"only the acknowledged batch step advances");
+        }
+    }
+
+    #[test]
+    fn pending_card_removal_keeps_its_origin_and_revoked_commit_cannot_close() {
+        let mut app=super::super::tests::context_inspector_test_app(true);
+        let card=app.workspace.focused().unwrap();
+        app.card_state_mut(card).unwrap().kind=CardKind::Settings;
+        app.cards.insert(card,CardRuntime::Settings);
+        let _=app.request_card_removal(card);
+        let _=app.close_cards_in_order(vec![card]);
+        let batch=app.pane_close_batch_for(card);
+        assert!(batch.is_some());
+        assert!(app.reserve_card_removal_for(card,batch).is_none());
+        assert!(!app.project_recovery_ui.closing_panes);
+        assert_eq!(app.terminal_close_bindings.removal_origins.get(&card),Some(&None));
+        assert_eq!(app.workspace.pending_close().unwrap().unmounting,card);
+        let _=app.update(Message::CommitClose(card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+
+        let _=app.open_utility_card(CardKind::Accounts);
+        let old=app.utility_card(&CardKind::Accounts).unwrap();
+        let _=app.close_cards_in_order(vec![old]);
+        let origin=app.pane_close_batch_for(old);
+        assert!(app.reserve_card_removal_for(old,origin).is_some());
+        let _=app.open_utility_card(CardKind::Automations);
+        let new=app.utility_card(&CardKind::Automations).unwrap();
+        let _=app.close_cards_in_order(vec![new]);
+        let current=app.pane_close_batch_for(new);
+        let _=app.update(Message::CommitClose(old));
+        assert!(app.card_state(old).unwrap().existence.is_open(),"a revoked origin cannot commit a held focus handoff");
+        assert!(app.workspace.pending_close().is_none());
+        assert_eq!(app.pane_close_batch_for(new),current);
     }
 
     #[test]
