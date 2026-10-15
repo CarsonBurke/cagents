@@ -244,13 +244,11 @@ fn setup_lease_identity(file: &File) -> Result<(u64, u64), String> {
 }
 
 pub(super) fn spawn_recoverable_with_authority(
-    command: CommandBuilder,
-    size: PtySize,
-    exits: Sender<ChildExit>,
-    recovery: Option<Recovery>,
-    directory: Option<std::sync::Arc<File>>,
-    setup_lease: Option<std::sync::Arc<File>>,
-) -> Result<Held, String> {
+    command: CommandBuilder, size: PtySize, exits: Sender<ChildExit>, recovery: Option<Recovery>,
+    directory: Option<std::sync::Arc<File>>, setup_lease: Option<std::sync::Arc<File>>,
+) -> Result<Held,String> {
+    let cleanup_source = recovery.as_ref().map(|recovery|
+        registry::cleanup::SourceReceipt::capture(&recovery.source)).transpose()?;
     if let Some(directory) = &directory {
         validate_execution_directory(directory)?;
     }
@@ -325,6 +323,7 @@ pub(super) fn spawn_recoverable_with_authority(
     );
     let registered_id = recovery.as_ref().map(|recovery| recovery.source.id);
     holder.registered = recovery.is_some();
+    holder.cleanup_source = cleanup_source;
     holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
     let owner = registry::Process::read(holder.process.as_ref().unwrap().child.id() as i32)
         .map_err(|error| error.to_string())?;
@@ -419,6 +418,8 @@ pub(super) fn adopt_recoverable(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Adopted, String> {
+    let cleanup_source = recovery.as_ref().map(|recovery|
+        registry::cleanup::SourceReceipt::capture(&recovery.source)).transpose()?;
     let evidence = registry::evidence(socket)?;
     let failed =
         |error: io::Error| format!("adopt terminal holder at {}: {error}", socket.display());
@@ -498,6 +499,7 @@ pub(super) fn adopt_recoverable(
     holder.adoption_pending = evidence.is_some();
     holder.registered = evidence.is_some();
     holder.record = evidence;
+    holder.cleanup_source = cleanup_source;
     holder.screen_lost = screen_lost;
     Ok(Adopted {
         held: watched(holder, pid, descriptors, exited, exits)?,
@@ -719,6 +721,7 @@ pub(super) struct Holder {
     release_requested: bool,
     cleanup_acknowledged: bool,
     record: Option<Record>,
+    cleanup_source: Option<registry::cleanup::SourceReceipt>,
 }
 
 impl Holder {
@@ -750,6 +753,7 @@ impl Holder {
         if self.protocol < 5 {
             return Err("This terminal holder predates verified descendant cleanup; retain it for upgrade recovery".into());
         }
+        let attempt = (|| -> Result<(),String> {
         if !self.release_requested {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
@@ -783,6 +787,24 @@ impl Holder {
             .is_some_and(|fd| exits_within(fd, remaining).unwrap_or(false))
         {
             return Err("Terminal cleanup receipt is pending; its exact holder is retained".into());
+        }
+            Ok(())
+        })();
+        if let Err(error) = attempt {
+            // A registered holder may durably publish its exact family proof
+            // and retire discovery before the control acknowledgement is lost.
+            // Exit alone and anonymous holders never authorize reconciliation.
+            let reconciled = if self.registered {
+                match self.record.as_ref().zip(self.cleanup_source.as_ref()) {
+                    Some((record,source)) if self.pidfd.as_ref()
+                        .is_some_and(|fd|exits_within(fd,Duration::ZERO).unwrap_or(false)) =>
+                        source.confirmed(record).map_err(|reason|format!("{error}; durable cleanup receipt could not be verified: {reason}"))?,
+                    _ => false,
+                }
+            } else {false};
+            if !reconciled {return Err(error);}
+            self.cleanup_acknowledged = true;
+            self.release_requested = true;
         }
         if let Some(process) = self.process.as_mut() {
             process
@@ -900,6 +922,7 @@ impl Holder {
             release_requested: false,
             cleanup_acknowledged: false,
             record: None,
+            cleanup_source: None,
         }
     }
 
@@ -966,22 +989,11 @@ impl Drop for Holder {
                 Ok(control) => {
                     self.detached = true;
                     let task = Holder {
-                        control,
-                        process: self.process.take(),
-                        pidfd: self.pidfd.take(),
-                        protocol: self.protocol,
-                        watch: self.watch.take(),
-                        release: self.release.take(),
-                        acknowledged: self.acknowledged.take(),
-                        cleanup: self.cleanup.take(),
-                        detached: false,
-                        adoption_pending: false,
-                        registered: self.registered,
-                        screen_lost: self.screen_lost,
-                        cleanup_proved: self.cleanup_proved,
-                        release_requested: self.release_requested,
-                        cleanup_acknowledged: self.cleanup_acknowledged,
-                        record: self.record.take(),
+                        control, process:self.process.take(), pidfd:self.pidfd.take(), protocol:self.protocol,
+                        watch:self.watch.take(), release:self.release.take(), acknowledged:self.acknowledged.take(), cleanup:self.cleanup.take(),
+                        detached:false, adoption_pending:false, registered:self.registered, screen_lost:self.screen_lost,
+                        cleanup_proved:self.cleanup_proved, release_requested:self.release_requested,
+                        cleanup_acknowledged:self.cleanup_acknowledged, record:self.record.take(), cleanup_source:self.cleanup_source.take(),
                     };
                     release::request(task);
                 }
@@ -2537,6 +2549,56 @@ mod tests {
         let status = process.child.wait().unwrap();
         assert_eq!(status.code(), Some(0));
         wait_gone(root);
+    }
+
+    #[test]
+    fn registered_lost_cleanup_ack_reconciles_only_exact_durable_family_receipt() {
+        const FIXTURE:&str="CAGENTS_TERMINAL_LOST_CLEANUP_ACK";
+        if std::env::var_os(FIXTURE).is_none() {
+            let directory=tempfile::tempdir().unwrap();
+            let result=Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","terminal::worker::holder::tests::registered_lost_cleanup_ack_reconciles_only_exact_durable_family_receipt","--nocapture","--test-threads=1"])
+                .env_clear().env("PATH","/usr/bin:/bin").env("XDG_RUNTIME_DIR",directory.path()).env(FIXTURE,"1").output().unwrap();
+            assert!(result.status.success(),"{}\n{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        let paths=crate::daemon::RuntimePaths::discover().unwrap();
+        let proof=crate::model::HostSessionProof {
+            host_session_id:crate::model::HostSessionId::new("lost-ack-fixture"),
+            boot_id:crate::daemon::read_boot_id().unwrap(),
+            host_incarnation:crate::model::HostIncarnation::new("lost-ack-fixture"),
+        };
+        let _lease=crate::daemon::HostLease::acquire(&paths,&proof).unwrap();
+        let recipe=crate::model::LaunchRecipe {program:"/bin/sh".into(),arguments:vec!["-c".into(),"echo ready; exec sleep 600".into()],working_directory:"/".into(),environment:Default::default(),unset_environment:Default::default()};
+        let source=crate::model::TerminalSession {
+            id:crate::model::TerminalId::new(),launch:recipe,transcript_path:None,resume_hint:None,
+            continuity:crate::model::TerminalContinuity::DetachedSameBoot {
+                host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone(),
+            },owned_codex_listener:None,recovery_origin:None,predecessor:None,
+        };
+        let recovery=Recovery {source:source.clone(),previous_sources:Vec::new(),relaunches:Vec::new(),options:Default::default(),execution_environment:None};
+        let (exits,_exited)=crossbeam_channel::bounded(1);
+        let mut held=spawn_recoverable(command("echo ready; exec sleep 600"),size(),exits,Some(recovery)).unwrap();
+        read_until(&held.master,"ready");
+        // Lose only the genuine operation-specific reply. The real helper
+        // must still stop its family, publish, retire discovery, and exit.
+        drop(held.holder.cleanup.take());
+        struct Resume(File);
+        impl Drop for Resume {fn drop(&mut self){let _=signal(&self.0,libc::SIGCONT);}}
+        let resume=Resume(held.holder.pidfd.as_ref().unwrap().try_clone().unwrap());
+        signal(&resume.0,libc::SIGSTOP).unwrap();
+        assert!(held.holder.close_until(Instant::now()+Duration::from_secs(2)).is_err());
+        drop(resume);
+        assert!(exits_within(held.holder.pidfd.as_ref().unwrap(),Duration::from_secs(5)).unwrap());
+        let record=held.holder.record.as_ref().unwrap().clone();
+        assert!(registry::cleanup::confirmed(&source,&record,&proof).unwrap());
+        let mut wrong=source.clone();wrong.launch.arguments.push("wrong-issued-source".into());
+        held.holder.cleanup_source=Some(registry::cleanup::SourceReceipt::capture(&wrong).unwrap());
+        assert!(held.holder.close_until(Instant::now()+Duration::from_secs(1)).is_err(),"root/holder exit plus another issued digest cannot confirm cleanup");
+        held.holder.cleanup_source=Some(registry::cleanup::SourceReceipt::capture(&source).unwrap());
+        held.holder.close_until(Instant::now()+Duration::from_secs(1)).unwrap();
+        assert!(held.holder.detached);
+        assert!(held.holder.cleanup_acknowledged);
     }
 
     #[test]
