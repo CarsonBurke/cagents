@@ -295,10 +295,10 @@ pub(super) fn spawn_recoverable_with_authority(
     let pidfd = open_pidfd(process.id() as libc::pid_t);
     let mut holder = Holder::new(control, Some(OwnedChild { child: process, reservation: child_reaping }));
     let registered_id = recovery.as_ref().map(|recovery| recovery.source.id);
-    let owner = registry::Process::read(holder.process.as_ref().unwrap().child.id() as i32)
-        .map_err(|error| error.to_string())?;
     holder.registered = recovery.is_some();
     holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
+    let owner = registry::Process::read(holder.process.as_ref().unwrap().child.id() as i32)
+        .map_err(|error| error.to_string())?;
 
     let command = postcard::to_stdvec(&command)
         .map(|command| STANDARD.encode(command))
@@ -691,6 +691,12 @@ impl Holder {
     }
     pub(super) fn close_until(&mut self, deadline: Instant) -> Result<(),String> {
         if self.detached || self.adoption_pending {
+            if !self.adoption_pending && self.release_requested && self.cleanup_acknowledged
+                && self.pidfd.as_ref().is_some_and(|fd| exits_within(fd, Duration::ZERO).unwrap_or(false)) {
+                // A previous call may have completed cleanup before its caller
+                // could publish metadata. Its exact positive receipt is stable.
+                return Ok(());
+            }
             return Err("Terminal holder is retained for authenticated adoption".into());
         }
         if self.protocol < 5 {
@@ -2954,6 +2960,7 @@ while not (root/'exit-root').exists(): time.sleep(.005)
         assert_eq!(unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},-1,"the actual holder retains setup authority until explicit cleanup");
         assert_eq!(io::Error::last_os_error().kind(),io::ErrorKind::WouldBlock);
         held.holder.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        held.holder.close_until(Instant::now()+Duration::from_millis(50)).unwrap();
         assert_eq!(unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
     }
 
