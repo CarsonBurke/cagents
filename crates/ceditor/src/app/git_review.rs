@@ -348,8 +348,9 @@ impl Editor {
                 };
                 for tab in &mut self.tabs { if tab.runtime.descriptor.worktree == origin.key.canonical_path { if let Some(source) = tab.sidebar.source_control.as_mut() { source.set_error(notice.clone()); } } }
                 let prior = self.notice.clone();
+                let foreground_owns_root = self.current().is_some_and(|tab| tab.runtime.descriptor.worktree == origin.key.canonical_path);
                 let task = self.finish_mutation(origin.card, notice);
-                if self.active != Some(origin.card) { self.notice = prior; }
+                if !foreground_owns_root { self.notice = prior; }
                 task
             }
         }
@@ -729,6 +730,9 @@ mod tests {
             git(root, &["add", "tracked.txt"]);
             let original_head = git(root, &["rev-parse", "HEAD"]);
             let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+            let sibling = open_real_git(&mut app, root, Some("tracked.txt"));
+            assert_ne!(sibling, card);
+            let select = app.update(Message::Select(card)); run_tasks(&mut app, select);
             let message = "Commit with cancellation";
             sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: origin.key.clone(), message: message.into() });
             let task = app.update(Message::Sidebar(SidebarAction::Commit { key: origin.key.clone(), message: message.into(), amend: false }));
@@ -746,7 +750,9 @@ mod tests {
                 assert!(messages.iter().any(|message| matches!(message, Message::GitReview(Action::Committed { result: Ok(CommitOutcome::Created { .. }), .. }))));
                 Task::none()
             } else { task };
-            sidebar_action(&mut app, SidebarAction::CancelGitMutation { key: origin.key });
+            let select = app.update(Message::Select(sibling)); run_tasks(&mut app, select);
+            let sibling_key = app.tab(sibling).unwrap().navigation.active_worktree().unwrap().clone();
+            sidebar_action(&mut app, SidebarAction::CancelGitMutation { key: sibling_key });
             assert!(cancellation.is_cancelled());
             assert_eq!(app.tab(card).unwrap().mutation, Some(MutationKind::Commit), "Cancel waits for the owned result");
             if after_worker {
@@ -763,6 +769,9 @@ mod tests {
             assert!(app.tab(card).unwrap().mutation.is_none());
             assert!(app.tab(card).unwrap().git_review.submitted_revision.is_none());
             assert!(app.mutation_cancellation(card).is_none());
+            assert!(app.tab(sibling).unwrap().mutation.is_none());
+            assert_eq!(app.active, Some(sibling));
+            assert!(!app.notice.as_deref().is_some_and(|notice| notice.contains("waiting for the operation")), "same-worktree completion must replace the cancelling notice: {:?}", app.notice);
         }
     }
 
