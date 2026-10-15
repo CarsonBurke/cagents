@@ -1073,7 +1073,7 @@ impl Registry {
                 || saved.owned_codex_listener != receipt.source().owned_codex_listener
             { return Err("The accepted conversation identity changed before restart was saved".into()); }
         }
-        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
+        require_agent_placement(&tx, &agent)?;
         if agent.console.is_some() {
             agent.console = receipt.replacement().terminal.clone();
         }
