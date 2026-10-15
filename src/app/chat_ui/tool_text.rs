@@ -307,12 +307,13 @@ impl ToolText {
             .as_ref()
             .map(|(_, block)| block.spans(cosmic::theme::is_dark()).clone())
             .unwrap_or_else(|| Arc::from([]));
-        let matching = logical.as_ref().is_some_and(|logical| {
-            logical
-                .paint
-                .as_ref()
-                .is_some_and(|paint| paint.blocks.contains_key(&logical.identity))
-        });
+        let matching = match logical.as_ref() {
+            // Indexed surfaces use only their accepted source-bound ranges.
+            Some(logical) => logical.paint.as_ref()
+                .is_some_and(|paint| paint.blocks.contains_key(&logical.identity)),
+            // Legacy non-logical readers still accept their explicit query.
+            None => find.is_some_and(|query| find::contains(&self.text, query)),
+        };
         let logical_id = logical.as_ref().map(|logical| logical.identity);
         let previous_width = reader.as_ref().map_or(0.0, |(memory, context, identity)| {
             memory.reader_width_for(
