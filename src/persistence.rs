@@ -4692,7 +4692,7 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace conversation channels", &value))
         .transpose()?
         .unwrap_or_default(),
-        terminal_handoff_receipts: metadata(
+        terminal_handoff_receipts: bounded_terminal_handoff_metadata(
             connection,
             &format!("workspace:{id}:navigation:terminal_handoff_receipts"),
         )?
@@ -5117,6 +5117,19 @@ fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
         .prepare_cached("SELECT value FROM metadata WHERE key = ?1")?
         .query_row([key], |row| row.get(0))
         .optional()?)
+}
+
+/// A single read distinguishes a legacy missing key from a present oversized
+/// value without allocating the latter into a Rust String first.
+fn bounded_terminal_handoff_metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
+    let value: Option<Option<String>> = connection.prepare_cached(
+        "SELECT CASE WHEN length(CAST(value AS BLOB)) <= ?2 THEN value ELSE NULL END FROM metadata WHERE key = ?1"
+    )?.query_row(params![key, crate::model::MAX_TERMINAL_HANDOFF_BYTES as i64], |row| row.get(0)).optional()?;
+    match value {
+        None => Ok(None),
+        Some(Some(value)) => Ok(Some(value)),
+        Some(None) => Err(StoreError::corrupt_row("workspace terminal handoff receipts", "saved receipt metadata exceeds its byte budget")),
+    }
 }
 
 fn set_metadata(transaction: &Transaction<'_>, key: &str, value: &str) -> Result<()> {
@@ -6263,6 +6276,31 @@ mod tests {
                 .workspace_history
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn oversized_saved_handoff_metadata_refuses_reload_without_rewriting_its_bytes() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("oversized-handoff.sqlite3");
+        let workspace = workspace_with_terminal(&boot("receipt-size"));
+        let store = StateStore::open(&database, boot("receipt-size")).unwrap();
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let key = format!("workspace:{}:navigation:terminal_handoff_receipts", workspace.id);
+        let oversized = crate::model::MAX_TERMINAL_HANDOFF_BYTES as i64 + 1;
+        let db = Connection::open(&database).unwrap();
+        // SQLite generates the corrupt payload; no equally large Rust String
+        // is constructed just to test the bounded production projection.
+        db.execute("UPDATE metadata SET value = CAST(zeroblob(?1) AS TEXT) WHERE key = ?2", params![oversized, key]).unwrap();
+        let store = StateStore::open(&database, boot("receipt-reload")).unwrap();
+        assert!(matches!(store.load_workspace(workspace.id, None), Err(StoreError::CorruptRow {field, ..}) if field == "workspace terminal handoff receipts"));
+        let retained: i64 = db.query_row("SELECT length(CAST(value AS BLOB)) FROM metadata WHERE key = ?1", [&key], |row| row.get(0)).unwrap();
+        assert_eq!(retained, oversized);
+        let prefix: String = db.query_row("SELECT hex(substr(CAST(value AS BLOB), 1, 4)) FROM metadata WHERE key = ?1", [&key], |row| row.get(0)).unwrap();
+        assert_eq!(prefix, "00000000");
+        // Missing legacy metadata remains distinct from oversized corruption.
+        db.execute("DELETE FROM metadata WHERE key = ?1", [&key]).unwrap();
+        assert!(store.load_workspace(workspace.id, None).unwrap().unwrap().terminal_handoff_receipts.is_empty());
     }
 
     #[test]
