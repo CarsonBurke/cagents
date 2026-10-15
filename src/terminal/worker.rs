@@ -1331,10 +1331,13 @@ impl TerminalHandle {
             .map_err(|_| "Another close retains this terminal holder; retry after its deadline".to_owned())?;
         if let Some(holder) = retained.as_mut() {holder.close_until(deadline)?;}
         else if !self.is_completed() {return Err("Terminal worker has not retained a cleanup owner".into());}
+        let mut archive = self.inner.published.archive.try_lock()
+            .map_err(|_| "Terminal cleanup is proved; archive metadata is busy, retry publication".to_owned())?;
+        *archive = ArchivePhase::Released;
         let holder = retained.take();
+        drop(archive);
         drop(retained);
         drop(holder);
-        *self.inner.published.archive.lock().unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Released;
         self.inner.published.completed.store(true, Ordering::Release);
         self.inner.published.archive_ready.notify_all();
         Ok(())
