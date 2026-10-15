@@ -4421,15 +4421,45 @@ done"#;
             inner.proof = server.proof.clone();
             inner.epoch = server.epoch;
         }
-        let client = thread::spawn(move || proxy.capture_continuation_options(Instant::now() + Duration::from_secs(2)));
-        let (control, _) = server.listener.accept().unwrap();
+        server.listener.set_nonblocking(true).unwrap();
+        let (completed, result) = crossbeam_channel::bounded(1);
+        let client = thread::spawn(move || {
+            let captured = proxy.capture_continuation_options(Instant::now() + Duration::from_secs(2));
+            completed.send(captured).unwrap();
+        });
+        let accept_deadline = Instant::now() + Duration::from_secs(3);
+        let accepted = loop {
+            match server.listener.accept() {
+                Ok((control, _)) => break Ok(control),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Ok(early) = result.try_recv() {
+                        break Err(format!("Capture returned before connecting: {early:?}"));
+                    }
+                    if Instant::now() >= accept_deadline {
+                        break Err("Capture did not connect within its original budget".into());
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => break Err(error.to_string()),
+            }
+        };
+        let control = match accepted {
+            Ok(control) => control,
+            Err(error) => {
+                client.join().unwrap();
+                panic!("{error}"); // Fixture drop closes and joins the provider.
+            }
+        };
         let request: Invocation = receive(&control, TIMEOUT).unwrap();
         assert_eq!(request.method, "capture_continuation_options");
         // This private same-process peer tests actual method dispatch + exact
         // attachment proof. Production serve additionally checks daemon lease.
-        let result = server.invoke(request);
-        send(&control, &result, TIMEOUT).unwrap();
-        let options = client.join().unwrap().unwrap().unwrap();
+        let response = server.invoke(request);
+        let sent = send(&control, &response, TIMEOUT);
+        let captured = result.recv_timeout(Duration::from_secs(3));
+        client.join().unwrap();
+        sent.unwrap();
+        let options = captured.unwrap().unwrap().unwrap();
         assert_eq!(options.controls().model.as_deref(), Some("actual-current"));
         assert_eq!(options.controls().reasoning.as_deref(), Some("high"));
         assert_eq!(options.controls().permission_mode.as_deref(), Some("plan"));
