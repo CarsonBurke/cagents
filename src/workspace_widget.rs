@@ -1,4 +1,4 @@
-use std::{cell::Cell, collections::HashMap, mem, rc::Rc, sync::Arc, time::Duration};
+use std::{cell::Cell, collections::HashMap, mem, rc::Rc, sync::{Arc, LazyLock}, time::Duration};
 
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::{
@@ -383,7 +383,7 @@ impl ShortcutDescriptor {
     }
 
     pub fn default_chords(self) -> Vec<String> {
-        shortcut_keys(self.action, &KeyboardShortcuts::default()).to_vec()
+        default_shortcut_keys(self.action).to_vec()
     }
 
     pub fn available(self, context: &CommandContext) -> bool {
@@ -961,6 +961,12 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     },
 
 ];
+
+static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> = LazyLock::new(KeyboardShortcuts::default);
+
+pub fn default_shortcut_keys(action: GlobalShortcut) -> &'static [String] {
+    shortcut_keys(action, &DEFAULT_KEYBOARD_SHORTCUTS)
+}
 
 pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescriptor {
     GLOBAL_SHORTCUT_DESCRIPTORS
