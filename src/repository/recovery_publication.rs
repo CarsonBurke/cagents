@@ -716,17 +716,28 @@ mod tests {
         let private = holding.root().path().to_owned();
         fs_safety::set_directory_permissions(holding.root(), 0o711).unwrap();
         assert!(holding.create_private_blob().is_err());
-        assert_eq!(holding.root().read_dir().unwrap().count(), 0, "no payload is created under a changed boundary");
+        assert_eq!(
+            holding.root().read_dir().unwrap().count(),
+            0,
+            "no payload is created under a changed boundary"
+        );
         assert_eq!(holding.root().metadata().unwrap().mode() & 0o7777, 0o711);
         holding.retain(&recovery);
         let authority = recovery.live_recovery.authority().unwrap();
         assert!(authority.retry().is_err());
-        assert_eq!(fs::metadata(&private).unwrap().mode() & 0o7777, 0o711, "retry never repairs newer permissions implicitly");
+        assert_eq!(
+            fs::metadata(&private).unwrap().mode() & 0o7777,
+            0o711,
+            "retry never repairs newer permissions implicitly"
+        );
         fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
         authority.retry().unwrap();
         assert!(authority.is_resolved());
         assert!(!private.exists());
-        assert_eq!(fs::read(directory.path().join("original")).unwrap(), b"preserved");
+        assert_eq!(
+            fs::read(directory.path().join("original")).unwrap(),
+            b"preserved"
+        );
     }
 
     #[test]
