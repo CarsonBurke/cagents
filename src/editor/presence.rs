@@ -316,7 +316,7 @@ fn replace_or_remove_document_file(
         let cleanup = match fs_safety::unlink_within(&holding, acquired_name) {
             Err(error) => Err(format!("The previous file remains at {}: {error}", holding.path().join(acquired_name).display())),
             Ok(()) => fs_safety::remove_directory_within(parent, &holding_name)
-                .map_err(|error| format!("The previous file was removed; the empty holding directory remains at {}: {error}", holding.path().display())),
+                .map_err(|error| format!("The previous file was removed; the holding directory remains at {}: {error}", holding.path().display())),
         };
         return match (outcome, cleanup) {
             (SaveOutcome::Saved { content_hash, durability }, Ok(())) => Ok(SaveOutcome::Saved {
@@ -491,6 +491,37 @@ mod tests {
             expected_mode: Some(0o100755),
             restoration: None,
         }
+    }
+
+    #[test]
+    fn editor_file_presence_reports_a_committed_replacement_when_holding_cleanup_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("new.txt"), "synthetic alpha").unwrap();
+        fs::set_permissions(root.join("new.txt"), Permissions::from_mode(0o600)).unwrap();
+        let SaveOutcome::Absent { restoration, .. } = save_document_file(root, Path::new("new.txt"), "", blake3::hash(b"synthetic alpha"), false,
+            PresenceSave { expected_mode: Some(0o100644), ..removal() }).unwrap() else { panic!("removed"); };
+        fs::write(root.join("new.txt"), "synthetic beta").unwrap();
+        fs::set_permissions(root.join("new.txt"), Permissions::from_mode(0o644)).unwrap();
+        let held_root = Root::open(root).unwrap();
+        let outcome = replace_or_remove_document_file(&held_root, std::ffi::OsStr::new("new.txt"),
+            blake3::hash(b"synthetic beta"), None, || {
+                let holding = fs::read_dir(root)?.find_map(|entry| {
+                    let entry = entry.ok()?;
+                    entry.file_name().to_string_lossy().starts_with(".cagents-editor-").then_some(entry.path())
+                }).expect("private acquisition directory");
+                fs::write(holding.join("cleanup-probe"), b"retain directory")
+            }, Some((&restoration, "synthetic alpha"))).unwrap();
+        let SaveOutcome::Saved { durability: SaveDurability::Unconfirmed { error }, .. } = outcome
+            else { panic!("publication remains a committed save despite cleanup failure"); };
+        assert!(error.contains("previous file was removed"));
+        assert!(error.contains("holding directory remains"));
+        assert_eq!(fs::read_to_string(root.join("new.txt")).unwrap(), "synthetic alpha");
+        assert_eq!(fs::metadata(root.join("new.txt")).unwrap().mode() & 0o777, 0o600);
+        let holding = fs::read_dir(root).unwrap().filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(".cagents-editor-")).unwrap().path();
+        assert!(!holding.join("file").exists(), "the warning must not claim this file remains");
+        assert!(holding.join("cleanup-probe").exists());
     }
 
     #[test]
