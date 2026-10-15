@@ -415,7 +415,12 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
-    if served == layout.version_root && !daemon_protocol_mismatch() {
+    // Discovery is upgrade-specific and bounded across the entire handshake.
+    // Do not run the ordinary per-read version probe before this adapter.
+    let (source_protocol, source_proof) = source::inspect_identity(None)?;
+    if served == layout.version_root
+        && source_protocol == crate::terminal_ipc::PROTOCOL_VERSION
+    {
         return Err(invalid("the installed application is already running"));
     }
     if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
@@ -424,8 +429,7 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
         ));
     }
     // A newly opened UI may already be current while an older daemon still
-    // owns the sessions. Its own CLI must perform the preview and checkpoint.
-    let (source_protocol, source_proof) = source::inspect_identity(None)?;
+    // owns the sessions. Route the authenticated source to its qualified coordinator.
     let daemon_owner = installed_daemon_owner(&layout)?;
     let new_coordinator_for_legacy_source = source_proof.is_some()
         && source_protocol == 77
