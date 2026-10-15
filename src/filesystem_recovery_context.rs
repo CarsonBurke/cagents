@@ -91,6 +91,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 #[path = "filesystem_recovery_context/fixtures.rs"]
 pub(crate) mod fixtures;
