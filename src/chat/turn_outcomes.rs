@@ -152,7 +152,8 @@ impl TurnOutcomeProjection {
 
 /// Bounded parent history-source proof. This carries no turn outcome,
 /// original-command eligibility, live-session authority or child attribution.
-pub fn validate_history_origins(session:&str,item_ids:&[String]) -> Result<(),String> {
+pub fn validate_history_origins(account:&HistoryAccountOrigin,session:&str,item_ids:&[String]) -> Result<(),String> {
+    account.validate()?;
     if !valid_id(session) || item_ids.is_empty() || item_ids.len()>MAX_TURN_ITEM_IDS {
         return Err("Invalid history origin window".into());
     }
@@ -160,7 +161,7 @@ pub fn validate_history_origins(session:&str,item_ids:&[String]) -> Result<(),St
     if item_ids.iter().any(|id|!valid_id(id)||!seen.insert(id.as_str())) {
         return Err("Invalid or duplicate history source alias".into());
     }
-    if 64+session.len()+item_ids.iter().map(|id|id.len()+8).sum::<usize>()>MAX_TURN_UPDATE_BYTES {
+    if 96+account.canonical_home.as_os_str().len()+session.len()+item_ids.iter().map(|id|id.len()+8).sum::<usize>()>MAX_TURN_UPDATE_BYTES {
         return Err("History origin proof exceeds its byte budget".into());
     }
     Ok(())
