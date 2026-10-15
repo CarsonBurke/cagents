@@ -1881,6 +1881,7 @@ impl<Message> TerminalWidget<Message> {
                 Err(error) => { self.publish_error(error, shell); index += 1; shell.request_redraw(); }
             }
         }
+        if state.input_keys.is_empty() { state.key_owner=None; }
     }
 
     fn synchronize_focus(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
@@ -2334,7 +2335,11 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             if let Some((barrier,surface))=state.key_owner.take() { barrier.unmounted(&surface); }
             state.input_keys.clear(); state.released_during_review.clear(); state.released_on_blur.clear();
         }
-        self.review_input_barrier.flush_orphans(self.suppress_focus_reports || self.review_active);
+        if self.read_only && !state.input_keys.is_empty() {
+            if let Some((barrier,surface))=state.key_owner.take() { barrier.unmounted(&surface); }
+            state.input_keys.clear(); state.released_during_review.clear();
+        }
+        self.review_input_barrier.flush_orphans(self.suppress_focus_reports || self.review_active || state.a11y.borrow().review);
         if !self.model_focused { state.input_focused = false; state.preedit = None; }
         match event {
             Event::Window(window::Event::Unfocused) => { state.window_unfocused = true; state.preedit = None; }
@@ -2803,6 +2808,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     Ok(()) => {
                         state.input_keys.swap_remove(index);
                         self.review_input_barrier.paired(*physical_key,&self.handle);
+                        if state.input_keys.is_empty() { state.key_owner=None; }
                         shell.capture_event();
                     },
                     Err(error) => self.publish_error(error, shell),
