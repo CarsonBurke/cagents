@@ -3,7 +3,8 @@ use super::*;
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_BODY)
+        .font(design::chat_font())
+        .size(design::chat_size())
         .width(Length::Fill)
         .into()
 }
@@ -11,8 +12,8 @@ pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Messag
 fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, Message> {
     widget::container(selectable_prose::plain(
         text,
-        design::TEXT_BODY,
-        iced::Font::default(),
+        design::chat_size(),
+        design::chat_font(),
         target,
     ))
     .width(Length::Fill)
@@ -377,8 +378,8 @@ fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
                         .color(design::warning_color(&cosmic::theme::active())),
                 ]
                 .into(),
-                design::TEXT_CAPTION.into(),
-                iced::Font::default(),
+                (design::interface_size() * design::TEXT_CAPTION / design::TEXT_BODY).into(),
+                design::interface_font(),
                 target,
                 None,
             ))
@@ -1841,7 +1842,7 @@ impl Runtime {
         // which counting newlines could not see. The ceiling keeps a very
         // long paste from squeezing the transcript out, past which the editor
         // scrolls as before.
-        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING;
+        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT * design::chat_size() / design::TEXT_PROSE + 2.0 * COMPOSER_PADDING;
         let suggestion = if available && !transitioning {
             self.prompt_suggestion()
         } else {
@@ -3577,8 +3578,8 @@ impl Runtime {
                 widget::icon(Icon::Attachment.handle()).size(12).into(),
                 selectable_prose::plain(
                     text,
-                    design::TEXT_CAPTION,
-                    iced::Font::default(),
+                    design::interface_size() * design::TEXT_CAPTION / design::TEXT_BODY,
+                    design::interface_font(),
                     self.target,
                 ),
             ])
