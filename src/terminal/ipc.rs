@@ -143,7 +143,8 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 78;
+/// Version 79 appends an explicit unconfirmed original-child shutdown refusal.
+pub const PROTOCOL_VERSION: u16 = 79;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -847,6 +848,9 @@ pub enum ShutdownOutcome {
     ConfirmationRequired {
         current_count: u64,
     },
+    /// An original helper is still owned outside the resident inventory.
+    /// Confirmation cannot turn uncertain teardown into an empty daemon.
+    OwnershipUncertain,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
