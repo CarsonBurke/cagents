@@ -4342,7 +4342,15 @@ impl Application for Editor {
                             | LspEvent::Status { doc, .. }
                             | LspEvent::Progress { doc, .. }
                             | LspEvent::RequestFailed { doc, .. }
-                            | LspEvent::DocumentDesynced { doc, .. } => *doc,
+                                        | LspEvent::PrepareRename { doc, .. }
+            | LspEvent::WorkspaceEdit { doc, .. }
+            | LspEvent::CodeActions { doc, .. }
+            | LspEvent::CodeActionResolved { doc, .. }
+            | LspEvent::SignatureHelp { doc, .. }
+            | LspEvent::ServerMessage { doc, .. }
+            | LspEvent::CommandExecuted { doc, .. }
+            | LspEvent::ApplyWorkspaceEdit { doc, .. }
+            | LspEvent::DocumentDesynced { doc, .. } => *doc,
                         };
                         if let Some(tab) = self
                             .tabs

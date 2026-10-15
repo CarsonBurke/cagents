@@ -2857,6 +2857,25 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn language_server_editor_options_round_trip_and_validate() {
+        let mut settings=AppSettings::default();
+        settings.language_servers[0].format_on_save=true;
+        settings.language_servers[0].formatting_timeout_ms=750;
+        settings.language_servers[0].initialization_options=Some(serde_json::json!({"check":{"command":"clippy"}}));
+        settings.language_servers[0].configuration=serde_json::json!({"rust-analyzer":{"check":{"command":"clippy"}}});
+        let text=toml::to_string(&settings).unwrap();
+        let decoded:AppSettings=toml::from_str(&text).unwrap();
+        assert_eq!(decoded.language_servers,settings.language_servers);
+        assert!(decoded.validate().is_ok());
+        for timeout in [0,49,10001,u64::MAX] {
+            let mut settings=AppSettings::default();settings.language_servers[0].formatting_timeout_ms=timeout;
+            assert!(settings.validate().is_err());
+        }
+        let mut settings=AppSettings::default();settings.language_servers[0].initialization_options=Some(serde_json::json!({"large":"x".repeat(1024*1024)}));
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
     fn lsp_lifecycle_settings_reject_unbounded_or_zero_values() {
         for cap in [0, 65, usize::MAX] {
             let settings = AppSettings {

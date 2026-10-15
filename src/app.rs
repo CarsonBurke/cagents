@@ -10457,6 +10457,14 @@ impl Cagents {
             | LspEvent::Status { doc, .. }
             | LspEvent::Progress { doc, .. }
             | LspEvent::RequestFailed { doc, .. }
+                        | LspEvent::PrepareRename { doc, .. }
+            | LspEvent::WorkspaceEdit { doc, .. }
+            | LspEvent::CodeActions { doc, .. }
+            | LspEvent::CodeActionResolved { doc, .. }
+            | LspEvent::SignatureHelp { doc, .. }
+            | LspEvent::ServerMessage { doc, .. }
+            | LspEvent::CommandExecuted { doc, .. }
+            | LspEvent::ApplyWorkspaceEdit { doc, .. }
             | LspEvent::DocumentDesynced { doc, .. } => *doc,
         };
         // An event for a document that has since been closed has no surface to
@@ -10471,6 +10479,14 @@ impl Cagents {
         match event {
             LspEvent::RootDiscovered { .. } => unreachable!("handled above"),
             LspEvent::Resources { .. } => {}
+            LspEvent::PrepareRename {..} |
+            LspEvent::WorkspaceEdit {..} |
+            LspEvent::CodeActions {..} |
+            LspEvent::CodeActionResolved {..} |
+            LspEvent::SignatureHelp {..} |
+            LspEvent::ServerMessage {..} |
+            LspEvent::CommandExecuted {..} |
+            LspEvent::ApplyWorkspaceEdit {..} => {},
             LspEvent::Diagnostics { version, items, .. } => {
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.set_editor_diagnostics(
