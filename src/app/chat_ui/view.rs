@@ -715,6 +715,9 @@ impl Scroll {
     pub(super) fn content(self) -> f32 {
         self.content
     }
+    pub(super) fn from_top(self) -> f32 { self.from_top }
+    pub(super) fn window_height(self) -> f32 { self.window }
+
 
     pub(super) fn page_height(self) -> f32 {
         (self.window * 0.9).max(1.0)
@@ -1605,6 +1608,7 @@ impl Runtime {
                     }))
                     .collect(),
                 self.observed_scroll.clone(),
+                self.scroll_memory.clone(),
             ),
             target,
             self.selected_subagent.as_deref(),
