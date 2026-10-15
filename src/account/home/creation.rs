@@ -155,6 +155,8 @@ mod tests {
         fs::set_permissions(root.path(),fs::Permissions::from_mode(0o700)).unwrap();
         let key = Uuid::new_v4();
         let created = create(root.path(),Provider::Claude,key).unwrap();
+        assert!(fs::read_dir(created.home()).unwrap().next().is_none());
+        assert!(create(root.path(),Provider::Claude,key).is_err(),"even an empty existing home is never adopted");
         fs::write(created.home().join("existing"), "keep").unwrap();
         assert!(create(root.path(),Provider::Claude,key).is_err());
         assert_eq!(fs::read_to_string(created.home().join("existing")).unwrap(), "keep");
