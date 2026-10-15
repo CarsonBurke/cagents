@@ -1651,6 +1651,45 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn captured_project_branch_keeps_its_full_local_ref_when_short_name_looks_qualified() {
+        const TEST: &str = "app::worktree_dialog::tests::captured_project_branch_keeps_its_full_local_ref_when_short_name_looks_qualified";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let (mut fixture, _files, root, first) = real_history_source();
+        drop(fixture.app.update(Message::CancelDialog));
+        isolated_git(&root, &["branch", "topic", first.as_str()]);
+        isolated_git(&root, &["tag", "refs/heads/topic", first.as_str()]);
+        std::fs::write(root.join("tracked"), b"selected local branch\n").unwrap();
+        isolated_git(&root, &["add", "tracked"]);
+        isolated_git(&root, &["commit", "-m", "Selected branch"]);
+        let selected = isolated_git(&root, &["rev-parse", "HEAD"]);
+        assert_ne!(selected, first.as_str());
+        isolated_git(&root, &["checkout", "-b", "refs/heads/topic"]);
+        let original = fixture.app.project_creation_source(fixture.project).unwrap();
+        publish_real_project(&mut fixture.app, fixture.project, &root, 2, Some(original.clone()));
+        let row = fixture.app.sidebar_model.project(fixture.project).unwrap().worktrees.iter()
+            .find(|row| row.path == root).unwrap();
+        assert_eq!(row.branch.as_deref(), Some("refs/heads/topic"), "the sidebar stores a SHORT local branch name");
+        let target = sidebar::commands::ProjectCreationTarget::capture(&fixture.app.sidebar_model,
+            fixture.project, Some(row.id), true).unwrap();
+        assert_eq!(target.command(), crate::workspace_widget::GlobalShortcut::NewWorktreeFromBranch);
+        drop(fixture.app.update(Message::Sidebar(SidebarAction::CreateProjectWorktree(target))));
+        assert_eq!(dialog(&fixture.app).draft.base, "refs/heads/refs/heads/topic");
+        assert_eq!(dialog(&fixture.app).source.as_ref().unwrap().id(), original.id());
+        drop(fixture.app.update(Message::WorktreeBranchChanged("from-selected-branch".into())));
+        let (project, operation, request) = resolve_history_input(fixture.app.submit_worktree_dialog()).await;
+        assert_eq!(request.base.revision_argument(), "refs/heads/refs/heads/topic");
+        let destination = request.destination.clone();
+        let creation = fixture.app.finish_worktree_input(project, operation, Ok(request));
+        let (report, _final_publication) = creation_final_message(&mut fixture.app, creation).await;
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(isolated_git(&destination, &["rev-parse", "HEAD"]), selected);
+        assert_eq!(std::fs::read(destination.join("tracked")).unwrap(), b"selected local branch\n");
+        assert_eq!(isolated_git(&root, &["rev-parse", "refs/heads/topic"]), first.as_str());
+        assert_eq!(isolated_git(&root, &["rev-parse", "refs/tags/refs/heads/topic"]), first.as_str());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn generic_creation_admission_survives_unchanged_refresh_and_publishes_exact_receipt() {
         const TEST: &str = "app::worktree_dialog::tests::generic_creation_admission_survives_unchanged_refresh_and_publishes_exact_receipt";
         if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
