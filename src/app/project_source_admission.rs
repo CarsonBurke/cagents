@@ -10,6 +10,14 @@ use crate::repository::WorktreeAuthority;
 pub struct PreparedProjectRepository {
     pub(super) loaded: LoadedRepository,
     pub(super) prepared_creation: Option<PreparedProjectCreation>,
+    // Already registered refresh only; fresh intake has no admitted identity
+    // until phase two. The App stores it with the matching source generation.
+    pub(super) editor_root: Option<crate::editor::FileRootIdentity>,
+}
+#[derive(Debug, Clone)]
+pub(super) struct RegisteredProjectSource {
+    pub(super) source: worktree_dialog::WorktreeCreationSource,
+    pub(super) editor_root: crate::editor::FileRootIdentity,
 }
 #[derive(Debug, Clone)]
 pub(super) struct PreparedProjectCreation { authority: WorktreeAuthority, admission: PreparedRoot }
@@ -34,7 +42,7 @@ impl PreparedProjectCreation {
     /// logical project/read generation and window admission, then call this.
     /// Final ingress must repeat those checks plus ticket.phase()==Active.
     pub(super) fn enroll(self, cancellation: &CancellationToken, deadline: Instant)
-        -> Result<worktree_dialog::WorktreeCreationSource, ProjectPreparationFailure> {
+        -> Result<RegisteredProjectSource, ProjectPreparationFailure> {
         let ticket = self.admission.ticket().clone();
         let work = self.admission.begin_enrollment().map_err(|error|
             ProjectPreparationFailure::with_ticket(ticket.clone(), error))?;
@@ -42,12 +50,14 @@ impl PreparedProjectCreation {
             ProjectPreparationFailure::with_ticket(ticket.clone(), error))?;
         let checked = (|| -> Result<_, String> {
             let (root, _) = self.authority.recovery_roots().map_err(|error| error.to_string())?;
-            admitted.validate_for_root(&root, deadline).map_err(|error| error.to_string())?;
+            let editor_root = crate::editor::FileRootIdentity::admitted(root, admitted.clone(), deadline)
+                .map_err(|error| error.to_string())?;
             if cancellation.is_cancelled() || ticket.phase() != AdmissionPhase::Active {
                 return Err("The original project closed during source enrollment; its custody is retained.".into());
             }
-            worktree_dialog::WorktreeCreationSource::new_registered(self.authority, admitted)
-                .map_err(|error| error.to_string())
+            let source = worktree_dialog::WorktreeCreationSource::new_registered(self.authority, admitted)
+                .map_err(|error| error.to_string())?;
+            Ok(RegisteredProjectSource { source, editor_root })
         })();
         checked.map_err(|error| ProjectPreparationFailure::with_ticket(ticket, error))
     }
@@ -67,13 +77,14 @@ pub(super) fn prepare_project_repository(
         if let Some(source) = retained.filter(|_| kind != Some(ProjectKind::Folder)) {
             let admission = source.edited_root_admission().map_err(|error| error.to_string())?;
             let (root, _) = source.recovery_roots().map_err(|error| error.to_string())?;
-            admission.validate_for_root(&root, deadline).map_err(|error| error.to_string())?;
+            let editor_root = crate::editor::FileRootIdentity::admitted(root, admission.clone(), deadline)
+                .map_err(|error| error.to_string())?;
             if admission.ticket().phase() != AdmissionPhase::Active { return Err("The original source is retiring; no replacement was captured.".into()); }
             // No new lease/context on an ordinary refresh. Preserve actor ID,
             // whole admitted pair and original service/physical authority.
             work.finish_read_only();
             let loaded = load_project_with_source(path, Some(project_id), cancellation, kind, Some(source))?;
-            return Ok(PreparedProjectRepository { loaded, prepared_creation: None });
+            return Ok(PreparedProjectRepository { loaded, prepared_creation: None, editor_root: Some(editor_root) });
         }
         let directory = path.canonicalize().map_err(|error| format!("Could not resolve project {}: {error}", path.display()))?;
         let folder = match kind {
@@ -84,14 +95,14 @@ pub(super) fn prepare_project_repository(
         if folder {
             let loaded = load_project_with_source(&directory, Some(project_id), cancellation, Some(ProjectKind::Folder), None)?;
             work.finish_read_only();
-            return Ok(PreparedProjectRepository { loaded, prepared_creation: None });
+            return Ok(PreparedProjectRepository { loaded, prepared_creation: None, editor_root: None });
         }
         let service = RepositoryService::system("git");
         let candidate = service.discover(&directory, &cancellation).map_err(|error| error.to_string())?;
         if candidate.is_bare || !WorktreeAuthority::supported() {
             let loaded = read_loaded_repository(&service, candidate, None, Some(project_id), &cancellation)?;
             work.finish_read_only();
-            return Ok(PreparedProjectRepository { loaded, prepared_creation: None });
+            return Ok(PreparedProjectRepository { loaded, prepared_creation: None, editor_root: None });
         }
         let root = candidate.worktree_root.as_ref().ok_or("Selected repository has no worktree to retain.")?;
         let authority = WorktreeAuthority::capture(root).map_err(|error| error.to_string())?;
@@ -104,7 +115,7 @@ pub(super) fn prepare_project_repository(
         if repository.common_dir != candidate.common_dir { return Err("Repository identity changed during scoped discovery; no new source was published.".into()); }
         let loaded = read_loaded_repository(&scoped, repository, None, Some(project_id), &cancellation)?;
         authority.validate().map_err(|error| error.to_string())?;
-        Ok(PreparedProjectRepository { loaded, prepared_creation: Some(PreparedProjectCreation { authority, admission: prepared }) })
+        Ok(PreparedProjectRepository { loaded, prepared_creation: Some(PreparedProjectCreation { authority, admission: prepared }), editor_root: None })
     })();
     result.map_err(|error| ProjectPreparationFailure::with_ticket(ticket, error))
 }
@@ -130,6 +141,7 @@ mod tests {
         assert_eq!(prepared.loaded.project.repository, folder.path().canonicalize().unwrap());
         assert!(prepared.loaded.creation_source.is_none());
         assert!(prepared.prepared_creation.is_none());
+        assert!(prepared.editor_root.is_none());
         assert_eq!(ticket.phase(), AdmissionPhase::Settled);
         assert!(admissions.is_settled());
     }
@@ -179,8 +191,11 @@ mod tests {
         assert!(peer.events().is_empty(), "Connect/Catalog and metadata do not register the Root");
         // This invokes only the phase-two worker helper. Actual App generation,
         // stale-result and window ingress handlers remain separate requirements.
-        let source = prepared.prepared_creation.take().unwrap().enroll(
+        let registered = prepared.prepared_creation.take().unwrap().enroll(
             &CancellationToken::new(), Instant::now() + Duration::from_secs(3)).unwrap();
+        let source = registered.source;
+        let editor_root = registered.editor_root;
+        assert_eq!(editor_root.retained_admission().unwrap().ticket().id(), ticket.id());
         let actor = source.id();
         let admission = source.edited_root_admission().unwrap();
         assert_eq!(admission.ticket().id(), ticket.id());
@@ -192,6 +207,7 @@ mod tests {
             admissions.reserve().unwrap().begin_preparation().unwrap(),
             Instant::now() + Duration::from_secs(3)).unwrap();
         assert!(refreshed.prepared_creation.is_none());
+        assert_eq!(refreshed.editor_root.as_ref().unwrap().retained_admission().unwrap().ticket().id(), ticket.id());
         assert_eq!(refreshed.loaded.creation_source.as_ref().unwrap().id(), actor);
         ticket.request_retirement();
         assert!(admissions.next_retirement().unwrap().is_none());
@@ -199,6 +215,8 @@ mod tests {
         drop(admission);
         drop(source);
         drop(prepared);
+        assert!(admissions.next_retirement().unwrap().is_none(), "worker-prepared editor identity retains the SAME pair");
+        drop(editor_root);
         admissions.next_retirement().unwrap().unwrap().run(Instant::now() + Duration::from_secs(3)).unwrap();
         assert!(admissions.is_settled());
         let events = peer.finish();
