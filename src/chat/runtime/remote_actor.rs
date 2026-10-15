@@ -112,9 +112,11 @@ struct Remote {
     stop:AtomicBool,
     installed:AtomicBool,
     preserved:AtomicBool,
+    close_job:Mutex<Option<Arc<CloseJob>>>,
     worker:Mutex<Option<thread::JoinHandle<()>>>,
     startup:Mutex<Option<UnixStream>>,
 }
+struct CloseJob {result:Mutex<Option<Result<(),String>>>,done:std::sync::Condvar}
 struct StartupOwner {
     control:Mutex<Option<UnixStream>>,
     cancelled:AtomicBool,
@@ -151,7 +153,7 @@ impl RemoteActor {
         let process=Process::read(std::process::id() as i32).unwrap();
         let boot=BootId::new("fixture-boot");
         let resident=Resident {provider_process:Some(process.clone()),generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,installed:true,close:super::CloseObservation {actor_id:uuid::Uuid::new_v4(),close_revision:0,turn_generation:0,activity:crate::agent::ActivityState::Idle,ready:true,exited:false,completed:false,closing:false,owns_work:true,working_directory:PathBuf::from("/var/tmp"),directory_identity:None},idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,continuity_loss:None,retained_runs:Vec::new(),outbox_ack:0,outbox_latest:0,changed:1};
-        Self(Arc::new(Remote {identity:ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(registry::BuildIdentity::current(Kind::Native)),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:boot.clone(),terminal:TerminalId::new(),holder:process.clone(),root:process}},epoch:uuid::Uuid::new_v4(),proof:HostSessionProof {boot_id:boot,host_session_id:HostSessionId::new("fixture"),host_incarnation:HostIncarnation::new("fixture")},socket:PathBuf::from("/nonexistent/cagents-actor-fixture"),state:Mutex::new(Arc::new(resident)),final_snapshot:Mutex::new(None),environment:Mutex::new(crate::terminal_ipc::ChatExecutionEnvironment(Default::default())),launch_account_scope:Err("fixture has no account scope".into()),recovery_environment:Default::default(),desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(1),uncertain_input:Mutex::new(None),pending:Mutex::new(Vec::new()),notify:Arc::new(|_|{}),stop:AtomicBool::new(false),installed:AtomicBool::new(true),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(None)}))
+        Self(Arc::new(Remote {identity:ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(registry::BuildIdentity::current(Kind::Native)),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:boot.clone(),terminal:TerminalId::new(),holder:process.clone(),root:process}},epoch:uuid::Uuid::new_v4(),proof:HostSessionProof {boot_id:boot,host_session_id:HostSessionId::new("fixture"),host_incarnation:HostIncarnation::new("fixture")},socket:PathBuf::from("/nonexistent/cagents-actor-fixture"),state:Mutex::new(Arc::new(resident)),final_snapshot:Mutex::new(None),environment:Mutex::new(crate::terminal_ipc::ChatExecutionEnvironment(Default::default())),launch_account_scope:Err("fixture has no account scope".into()),recovery_environment:Default::default(),desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(1),uncertain_input:Mutex::new(None),pending:Mutex::new(Vec::new()),notify:Arc::new(|_|{}),stop:AtomicBool::new(false),installed:AtomicBool::new(true),preserved:AtomicBool::new(false),close_job:Mutex::new(None),worker:Mutex::new(None),startup:Mutex::new(None)}))
     }
     #[cfg(test)]
     pub(super) fn completed_failure_fixture()->Self {
@@ -263,7 +265,7 @@ impl RemoteActor {
         if attached.protocol!=PROTOCOL {return Err("Retained Claude actor protocol is incompatible; no prompt was replayed".into());}
         validate_record(&attached.identity.record)?;
         let socket=registry::socket(&registry::directory(Kind::Native)?,attached.identity.record.terminal);
-        let remote=Self(Arc::new(Remote {identity:attached.identity,epoch:attached.epoch,proof,socket,desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(attached.resident.next_input),uncertain_input:Mutex::new(None),state:Mutex::new(Arc::new(attached.resident)),final_snapshot:Mutex::new(None),environment:Mutex::new(attached.execution_environment),launch_account_scope:attached.launch_account_scope,recovery_environment:attached.recovery_environment,pending:Mutex::new(Vec::new()),notify:Arc::new(notify),stop:AtomicBool::new(false),installed:AtomicBool::new(false),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(startup)}));
+        let remote=Self(Arc::new(Remote {identity:attached.identity,epoch:attached.epoch,proof,socket,desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(attached.resident.next_input),uncertain_input:Mutex::new(None),state:Mutex::new(Arc::new(attached.resident)),final_snapshot:Mutex::new(None),environment:Mutex::new(attached.execution_environment),launch_account_scope:attached.launch_account_scope,recovery_environment:attached.recovery_environment,pending:Mutex::new(Vec::new()),notify:Arc::new(notify),stop:AtomicBool::new(false),installed:AtomicBool::new(false),preserved:AtomicBool::new(false),close_job:Mutex::new(None),worker:Mutex::new(None),startup:Mutex::new(startup)}));
         let weak=Arc::downgrade(&remote.0);
         let worker=thread::Builder::new().name("cagents-actor-proxy".into()).spawn(move||{
             loop {
@@ -429,6 +431,28 @@ impl RemoteActor {
         Ok(())
     }
     pub fn preserve(&self)->Result<(),String> {self.call::<()>("preserve",Value::Null)?;self.0.preserved.store(true,Ordering::Release);self.0.stop.store(true,Ordering::Release);Ok(())}
+    pub fn close_until(&self,deadline:Instant)->Result<(),String> {
+        let remaining=deadline.checked_duration_since(Instant::now()).ok_or("Retained actor close budget expired; its exact owner is retained")?;
+        let job={
+            let mut pending=match self.0.close_job.try_lock() {
+                Ok(pending)=>pending,Err(std::sync::TryLockError::Poisoned(error))=>error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock)=>return Err("Another retained close is being admitted; its exact owner remains retained".into()),
+            };
+            let existing=pending.as_ref().filter(|job|job.result.lock().unwrap_or_else(|p|p.into_inner()).as_ref().is_none_or(Result::is_ok)).cloned();
+            if let Some(job)=existing {job}else {
+                let job=Arc::new(CloseJob {result:Mutex::new(None),done:std::sync::Condvar::new()});let completion=job.clone();let actor=self.clone();
+                let millis=u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX).min(32_000);
+                thread::Builder::new().name("cagents-actor-close".into()).spawn(move|| {let result=actor.close_method("close_until",json!([millis]));*completion.result.lock().unwrap_or_else(|p|p.into_inner())=Some(result);completion.done.notify_all();}).map_err(|error|error.to_string())?;
+                *pending=Some(job.clone());job
+            }
+        };
+        let mut result=job.result.lock().unwrap_or_else(|p|p.into_inner());
+        loop {
+            if let Some(result)=result.as_ref() {return result.clone();}
+            let remaining=deadline.checked_duration_since(Instant::now()).ok_or("Retained actor close is still pending; its exact helper and request owner remain retained")?;
+            result=job.done.wait_timeout(result,remaining).unwrap_or_else(|p|p.into_inner()).0;
+        }
+    }
     pub fn close_method(&self,method:&str,args:Value)->Result<(),String> {
         let snapshot=match self.call::<ClosePublication>(method,args) {
             Ok(publication)=>{
@@ -466,7 +490,7 @@ impl chat::protocol::LaunchCleanup for RemoteActor {
 impl Drop for Remote {
     fn drop(&mut self) {
         self.stop.store(true,Ordering::Release);
-        if let Some(worker)=self.worker.get_mut().unwrap_or_else(|p|p.into_inner()).take() && worker.thread().id()!=thread::current().id() {let _=worker.join();}
+        if let Some(worker)=self.worker.get_mut().unwrap_or_else(|p|p.into_inner()).take() && worker.is_finished() {let _=worker.join();}
         // A committed proxy disappearing is a detach, including daemon death.
         // Startup EOF, held until commit, owns uninstalled launch rollback.
     }
@@ -701,6 +725,7 @@ impl Server {
                 self.lineage=lineage;self.source=source;self.execution_console=console;self.paired_holder=pair;
                 Ok(Value::Null)
             },
+            "close_until"=>{let (millis,)=decode!((u64,));if self.closed_snapshot.is_none() {self.actor.close_until(Instant::now()+Duration::from_millis(millis.min(32_000)))?;reap_orphans()?;self.finish_inputs();}value!(self.publish_close()?)},
             "close_if_revision"=>{let (revision,)=decode!((u64,));if self.closed_snapshot.is_none() {self.actor.close_if_revision(revision)?;reap_orphans()?;self.finish_inputs();}value!(self.publish_close()?)},
             "close_if_idle"=>{let (generation,)=decode!((u64,));if self.closed_snapshot.is_none() {self.actor.close_if_idle(generation)?;reap_orphans()?;self.finish_inputs();}value!(self.publish_close()?)},
             "close"=>{if self.closed_snapshot.is_none() {self.actor.close()?;reap_orphans()?;self.finish_inputs();}value!(self.publish_close()?)},
@@ -940,6 +965,19 @@ done"#;
         assert!(!first.ready);assert_ne!(first.changed,fixture.server.revision());
         let response=fixture.server.invoke(Invocation {proof:fixture.server.proof.clone(),epoch:Some(fixture.server.epoch),method:"state".into(),args:json!([first.changed])}).unwrap();
         let next:Option<Resident>=serde_json::from_value(response).unwrap();assert!(next.unwrap().ready,"the next real state RPC must fetch the raced Ready transition");
+    }
+    #[test]
+    fn bounded_remote_close_keeps_one_pending_rpc_and_its_exact_owner() {
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();let socket=root.path().join("bounded.sock");let listener=UnixListener::bind(&socket).unwrap();
+        let mut actor=RemoteActor::fixture();Arc::get_mut(&mut actor.0).unwrap().socket=socket;
+        let resident=actor.state().as_ref().clone();let (entered,started)=crossbeam_channel::bounded(1);let (release,wait)=crossbeam_channel::bounded(1);
+        let peer=thread::spawn(move|| {let (control,_)=listener.accept().unwrap();let request:Invocation=receive(&control,TIMEOUT).unwrap();assert_eq!(request.method,"close_until");entered.send(()).unwrap();wait.recv_timeout(Duration::from_secs(2)).unwrap();send(&control,&Ok::<_,String>(ClosePublication {snapshot:Snapshot {generation:42,exited:true,..Default::default()},resident}),TIMEOUT).unwrap();});
+        assert!(actor.close_until(Instant::now()+Duration::from_millis(20)).is_err());started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let first=actor.0.close_job.lock().unwrap().as_ref().unwrap().clone();
+        assert!(actor.close_until(Instant::now()+Duration::from_millis(10)).is_err());assert!(Arc::ptr_eq(&first,actor.0.close_job.lock().unwrap().as_ref().unwrap()));
+        assert!(!actor.state().completed,"a caller deadline never proves provider teardown");
+        release.send(()).unwrap();assert!(actor.close_until(Instant::now()+Duration::from_secs(1)).is_ok());peer.join().unwrap();
+        assert!(actor.state().completed);assert!(!actor.owns_work());assert_eq!(actor.snapshot(None).unwrap().generation,42);
     }
     #[test]
     fn live_helper_retirement_refusal_is_not_a_successful_cleanup() {

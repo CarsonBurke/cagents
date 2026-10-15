@@ -100,6 +100,7 @@ impl Handle {
     pub(crate) fn native_continuity(&self)->chat::NativeContinuity {match &self.0 {Owner::Local(local)=>local.native_continuity(),Owner::Remote(remote)=>remote.state().native_continuity.clone()}}
     pub(crate) fn preserve_for_restart(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.preserve_for_restart(),Owner::Remote(remote)=>remote.preserve()}}
     pub(crate) fn close_for_resume(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.close_for_resume(),Owner::Remote(remote)=>remote.close()}}
+    pub(crate) fn close_until(&self,deadline:std::time::Instant)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.close_until(deadline),Owner::Remote(remote)=>remote.close_until(deadline)}}
     pub fn close(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.close(),Owner::Remote(remote)=>remote.close()}}
 }
 
