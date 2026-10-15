@@ -82,13 +82,24 @@ pub fn load(worktree: &Path, path: &Path, before: &str, tone: PdfTone) -> Result
 }
 
 pub fn load_with_restoration(worktree: &Path, path: &Path, before: &str, tone: PdfTone, capture: bool) -> Result<Version, crate::editor::FileIoError> {
-    let protection = std::sync::Arc::new(crate::worktree_cleanup::protect(worktree).map_err(|error| crate::editor::FileIoError::Io(error.to_string()))?);
     let root = crate::editor::worktree_root(worktree)?;
-    let context = capture.then(|| crate::editor::recovery_context_at(&root, protection)).transpose()?;
+    if capture {
+        return Err(crate::editor::FileIoError::Io("Reloading across file presence requires the original registered recovery context. Your buffer has been kept.".into()));
+    }
+    load_at_in_context(&root, path, before, tone, None)
+}
+
+/// The operation intake supplies the original source Root and issued context;
+/// an ordinary read may omit it, but metadata capture cannot invent one.
+pub fn load_with_restoration_in_context(root: &fs_safety::Root, path: &Path, before: &str, tone: PdfTone, context: &crate::filesystem_recovery_context::FilesystemRecoveryContext) -> Result<Version, crate::editor::FileIoError> {
+    context.validate_for_source(root).map_err(|error| crate::editor::FileIoError::Io(error.to_string()))?;
+    load_at_in_context(root, path, before, tone, Some(context))
+}
+fn load_at_in_context(root: &fs_safety::Root, path: &Path, before: &str, tone: PdfTone, context: Option<&crate::filesystem_recovery_context::FilesystemRecoveryContext>) -> Result<Version, crate::editor::FileIoError> {
     match crate::editor::load_file_at(&root, path, tone) {
         Ok(LoadedFile { source, content: FileContent::Editable { text, content_hash, markdown } }) => {
             let mapping = LineMap::between(before, &text);
-            let restoration = context.as_ref().map(|context| crate::editor::capture_restoration_at_in_context(&root, &source, content_hash, context)).transpose()?;
+            let restoration = context.map(|context| crate::editor::capture_restoration_at_in_context(root, &source, content_hash, context)).transpose()?;
             Ok(Version { text, content_hash, source, markdown, mapping, restoration })
         }
         Ok(_) => Err(crate::editor::FileIoError::Io("The file on disk is no longer editable text. Your buffer has been kept.".into())),
@@ -106,7 +117,11 @@ mod tests {
         std::fs::write(actual.join("file.rs"), "updated\n").unwrap();
         assert!(stamp(&alias, Path::new("file.rs"), Path::new("file.rs")).unwrap().is_some());
         for capture in [false, true] {
-            let version = load_with_restoration(&alias, Path::new("file.rs"), "old\n", PdfTone::Original, capture).unwrap();
+            let version = if capture {
+                let root = crate::editor::worktree_root(&alias).unwrap();
+                let context = crate::filesystem_recovery_context::fixture_context(&root).unwrap();
+                load_with_restoration_in_context(&root, Path::new("file.rs"), "old\n", PdfTone::Original, &context)
+            } else { load_with_restoration(&alias, Path::new("file.rs"), "old\n", PdfTone::Original, false) }.unwrap();
             assert_eq!(version.text, "updated\n"); assert_eq!(version.restoration.is_some(), capture);
         }
     }

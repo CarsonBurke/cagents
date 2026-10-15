@@ -45,7 +45,7 @@ pub struct DocumentPlan {
 }
 
 #[derive(Debug, Clone)]
-pub struct Plan { pub worktree: PathBuf, pub root: Arc<fs_safety::Root>, pub documents: Vec<DocumentPlan>, recovery_context: editor::RecoveryContext }
+pub struct Plan { pub worktree: PathBuf, pub root: Arc<fs_safety::Root>, pub documents: Vec<DocumentPlan>, recovery_context: Option<crate::filesystem_recovery_context::FilesystemRecoveryContext>, _preview_context: Option<editor::RecoveryContext> }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedTargets {
@@ -101,16 +101,26 @@ pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<Pa
     let worktree = std::fs::canonicalize(worktree).map_err(|error| error.to_string())?;
     let root = Arc::new(fs_safety::Root::open(&worktree).map_err(|error| error.to_string())?);
     let protection = Arc::new(crate::worktree_cleanup::protect(&worktree).map_err(|error| error.to_string())?);
-    prepare_at(root, protection, documents, open)
+    prepare_at(root, protection, documents, open, None)
 }
 
 pub fn prepare_resolved(resolved: ResolvedTargets, open: &HashMap<PathBuf, OpenSnapshot>) -> Result<Plan, String> {
-    prepare_at(resolved.root, resolved.protection, resolved.documents, open)
+    prepare_at(resolved.root, resolved.protection, resolved.documents, open, None)
 }
 
-fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree_cleanup::Protection>>, documents: Vec<DocumentEdits>, open: &HashMap<PathBuf, OpenSnapshot>) -> Result<Plan, String> {
+/// Current domain issuance uses the SAME original Root/physical lease from
+/// ResolvedTargets. A plain preview may be prepared without a placement, but
+/// cannot publish any unopened file until a real issued context is supplied.
+pub fn prepare_resolved_in_context(resolved: ResolvedTargets, open: &HashMap<PathBuf, OpenSnapshot>, context: crate::filesystem_recovery_context::FilesystemRecoveryContext) -> Result<Plan, String> {
+    context.validate_for_source(&resolved.root).map_err(|error| error.to_string())?;
+    prepare_at(resolved.root, resolved.protection, resolved.documents, open, Some(context))
+}
+impl ResolvedTargets {
+    pub fn original_protection(&self) -> Arc<Option<crate::worktree_cleanup::Protection>> { self.protection.clone() }
+}
+fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree_cleanup::Protection>>, documents: Vec<DocumentEdits>, open: &HashMap<PathBuf, OpenSnapshot>, recovery_context: Option<crate::filesystem_recovery_context::FilesystemRecoveryContext>) -> Result<Plan, String> {
     verify_root(&root)?;
-    let recovery_context = editor::recovery_context_at(&root, protection).map_err(|error| error.to_string())?;
+    let preview_context = if recovery_context.is_none() { Some(editor::recovery_context_at(&root, protection).map_err(|error| error.to_string())?) } else { None };
     let worktree = root.path().to_path_buf();
     let mut canonical_open = HashMap::new();
     let mut aliases: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -168,7 +178,7 @@ fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree
     }
     result.sort_by(|left, right| left.relative.cmp(&right.relative));
     verify_root(&root)?;
-    Ok(Plan { worktree, root, documents: result, recovery_context })
+    Ok(Plan { worktree, root, documents: result, recovery_context, _preview_context: preview_context })
 }
 
 /// Atomically publishes each unopened file. A later refusal rolls back earlier
@@ -226,9 +236,10 @@ fn publish_unopened_with_hooks(plan: &Plan, mut before_file: impl FnMut(usize), 
     let mut report = PublicationReport { worktree: Some(plan.worktree.clone()), ..Default::default() };
     let mut published: Vec<&DocumentPlan> = Vec::new();
     for (index, document) in plan.documents.iter().filter(|document| !document.open && document.before != document.after).enumerate() {
+        let context = plan.recovery_context.as_ref().ok_or_else(|| PublicationFailure::from("Applying unopened-file edits requires the original registered recovery context. No file was changed.".to_owned()))?;
         before_file(index);
         let saved = verify_root(&plan.root).map_err(editor::FileIoError::Io)
-            .and_then(|()| editor::save_file_at_with_hooks_in_context(&plan.root, &document.relative, &document.after, document.before_hash, false, || before_publish(document), fs_safety::sync_directory, &plan.recovery_context));
+            .and_then(|()| editor::save_file_at_with_hooks_in_context(&plan.root, &document.relative, &document.after, document.before_hash, false, || before_publish(document), fs_safety::sync_directory, context));
         let failure = match saved {
             Ok(SaveOutcome::Saved { durability, .. }) => {
                 report.durability(&document.relative, durability, false);
@@ -246,7 +257,7 @@ fn publish_unopened_with_hooks(plan: &Plan, mut before_file: impl FnMut(usize), 
         };
         let mut unrestored = Vec::new();
         for previous in published.into_iter().rev() {
-            let restored = editor::save_file_at_in_context(&plan.root, &previous.relative, &previous.before, blake3::hash(previous.after.as_bytes()), false, &plan.recovery_context);
+            let restored = editor::save_file_at_in_context(&plan.root, &previous.relative, &previous.before, blake3::hash(previous.after.as_bytes()), false, context);
             match restored {
                 Ok(SaveOutcome::Saved { durability, .. }) => report.durability(&previous.relative, durability, true),
                 Err(error) => {
@@ -270,6 +281,14 @@ fn publish_unopened_with_hooks(plan: &Plan, mut before_file: impl FnMut(usize), 
 
 #[cfg(test)]
 mod tests {
+    // Pure primitive fixtures issue an actual isolated registration/cleanup
+    // context. Production prepare() never invents this domain authority.
+    fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<PathBuf, OpenSnapshot>) -> Result<Plan, String> {
+        let root = Arc::new(editor::worktree_root(worktree).map_err(|error| error.to_string())?);
+        let context = crate::filesystem_recovery_context::fixture_context(&root).map_err(|error| error.to_string())?;
+        prepare_at(root, Arc::new(None), documents, open, Some(context))
+    }
+
     use super::*;
     use crate::lsp::LspRange;
     fn edit(start: u32, end: u32, new_text: &str) -> LspTextEdit {
@@ -308,11 +327,15 @@ mod tests {
         let named = directory.path().join("worktree"); let moved = directory.path().join("original");
         std::fs::create_dir(&named).unwrap(); std::fs::write(named.join("a.rs"), "old").unwrap();
         let root = Arc::new(fs_safety::Root::open(&named).unwrap());
-        let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), &named, false).unwrap();
-        let plan = prepare_at(root, Arc::new(Some(protection)), vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], &HashMap::new()).unwrap();
+        let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), &named, false).unwrap()));
+        let fixture = crate::filesystem_recovery_context::fixture_context(&root).unwrap();
+        let context = crate::filesystem_recovery_context::FilesystemRecoveryContext::new(&root, protection.clone(), fixture.placement().clone()).unwrap();
+        drop(fixture);
+        let outside = context.placement().directory().try_clone().unwrap();
+        let plan = prepare_at(root, protection, vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], &HashMap::new(), Some(context)).unwrap();
         let mut private = None;
         let report = publish_unopened_with_hooks(&plan, |_| {}, |_| {
-            let path = std::fs::read_dir(&named)?.map(|entry| entry.map(|entry| entry.path())).collect::<std::io::Result<Vec<_>>>()?.into_iter().find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(".cagents-save-"))).expect("actual publisher holding");
+            let path = std::fs::read_dir(outside.path())?.map(|entry| entry.map(|entry| entry.path())).collect::<std::io::Result<Vec<_>>>()?.into_iter().find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(".cagents-save-"))).expect("actual publisher holding");
             let held = fs_safety::Root::open(&path)?;
             std::fs::write(path.join("unresolved"), "preserve")?;
             private = Some(held); Ok(())

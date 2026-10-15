@@ -53,6 +53,7 @@ struct OwnedTemporary { file: File, name: OsString }
 
 pub(super) struct PresenceHolding {
     publication: fs_safety::DirectoryPublication,
+    context: FilesystemRecoveryContext,
     // None means consumer-private setup has not completed. The producer's
     // immutable initial access witness then remains the only permitted base.
     private_access: Option<(u32, u32, u32)>,
@@ -65,23 +66,23 @@ pub(super) struct PresenceHolding {
     slot: Option<RecoverySlot>,
 }
 impl PresenceHolding {
+    #[cfg(test)]
     pub(super) fn create(parent: &Root, name: &std::ffi::OsStr) -> Result<Self, FileIoError> {
-        let protection = Arc::new(crate::worktree_cleanup::protect(parent.path()).map_err(io_error)?);
-        let context = recovery_context_at(parent, protection)?;
+        let context = crate::filesystem_recovery_context::fixture_context(parent).map_err(io_error)?;
         Self::create_in_context(parent, name, &context)
     }
-    pub(super) fn create_in_context(parent: &Root, name: &std::ffi::OsStr, context: &RecoveryContext) -> Result<Self, FileIoError> {
+    pub(super) fn create_in_context(parent: &Root, name: &std::ffi::OsStr, context: &FilesystemRecoveryContext) -> Result<Self, FileIoError> {
         Self::create_in_context_with(parent, name, context, |namespace, parent, leaf| fs_safety::create_directory_in_namespace(namespace, parent, leaf, 0o700))
     }
-    fn create_in_context_with(parent: &Root, name: &std::ffi::OsStr, context: &RecoveryContext, create: impl FnOnce(&fs_safety::DirectoryNamespace, &Root, &Path) -> Result<fs_safety::DirectoryCreation, fs_safety::DirectoryCreateError>) -> Result<Self, FileIoError> {
+    fn create_in_context_with(parent: &Root, name: &std::ffi::OsStr, context: &FilesystemRecoveryContext, create: impl FnOnce(&fs_safety::DirectoryNamespace, &Root, &Path) -> Result<fs_safety::DirectoryCreation, fs_safety::DirectoryCreateError>) -> Result<Self, FileIoError> {
         let slot = context.reserve().map_err(FileIoError::Io)?;
         let parent = parent.try_clone().map_err(io_error)?;
-        // Published only covers this exact protected parent. Shared or unknown
-        // parents can return an unverified mkdir receipt; retain it without
-        // chmod or guessed cleanup rather than claiming no artifact exists.
-        let namespace = fs_safety::DirectoryNamespace::acquire(&parent).map_err(io_error)?;
+        // The public source parent is distinct from the already-issued outside
+        // placement. Never create a payload directory beside a source file.
+        let namespace = context.placement().namespace();
+        let outside = context.placement().directory();
         let leaf = OsString::from(format!(".cagents-editor-{}", uuid::Uuid::new_v4()));
-        let creation = match create(&namespace, &parent, Path::new(&leaf)) {
+        let creation = match create(namespace, outside, Path::new(&leaf)) {
             Ok(creation) => creation,
             Err(mut error) => {
                 let message = error.to_string();
@@ -89,8 +90,11 @@ impl PresenceHolding {
                     // Preparation owns at most3 roots, plus this exact parent.
                     // Capture the whole typed object before converting cause
                     // text; a failed private bootstrap is still an owner.
+                    let context = context.clone();
                     let authority = slot.retain(message.clone(), move || {
+                        context.placement().validate().map_err(|error| error.to_string())?;
                         preparation.retry_cleanup().map_err(|error| error.to_string())?;
+                        fs_safety::sync_directory(context.placement().directory()).map_err(|error| error.to_string())?;
                         fs_safety::sync_directory(&parent).map_err(|error| error.to_string())
                     });
                     return Err(FileIoError::Recovery { message, authority });
@@ -103,25 +107,38 @@ impl PresenceHolding {
             fs_safety::DirectoryCreation::Existing(_) => return Err(FileIoError::Io("The editor staging name already exists and was preserved.".into())),
             fs_safety::DirectoryCreation::Unverified { directory, reason } => {
                 let message = format!("Editor staging ownership could not be verified; the entry was preserved: {reason}. Diagnostic original spelling (not verified location): {}", directory.path().display());
+                let context = context.clone();
                 let authority = slot.retain(message.clone(), move || {
+                    context.placement().validate().map_err(|error| error.to_string())?;
                     // Ownership was never established. Never chmod/delete or
                     // adopt a replacement from a diagnostic public spelling.
                     if directory.metadata().map_err(|error| error.to_string())?.nlink() != 0 {
                         return Err("Creation ownership remains unverified. Inspect and remove the retained entry manually before retrying; no entry was changed.".into());
                     }
+                    fs_safety::sync_directory(context.placement().directory()).map_err(|error| error.to_string())?;
                     fs_safety::sync_directory(&parent).map_err(|error| error.to_string())
                 });
                 return Err(FileIoError::Recovery { message, authority });
             },
         };
-        let mut holding = Self { publication, private_access: None, parent, name: name.to_os_string(), original: None, pre_acquire_source: None, temporary: None, restore_original: false, slot: Some(slot) };
+        let mut holding = Self { publication, context: context.clone(), private_access: None, parent, name: name.to_os_string(), original: None, pre_acquire_source: None, temporary: None, restore_original: false, slot: Some(slot) };
         let prepared = (|| {
+            holding.context.register_payload_root(holding.directory()).map_err(io_error)?;
             if let Some(error) = holding.publication.publication_error() { return Err(FileIoError::Io(error.into())); }
             holding.establish_private_access().map_err(FileIoError::Io)
         })();
         match prepared { Ok(()) => Ok(holding), Err(error) => Err(holding.finish_error(error)) }
     }
     pub(super) fn directory(&self) -> &Root { self.publication.directory() }
+    pub(super) fn validate_live(&self) -> Result<(), FileIoError> {
+        self.context.validate_payload_root(self.directory()).map_err(io_error)?;
+        if let Some(expected) = self.private_access {
+            if Self::access(&self.directory().metadata().map_err(io_error)?) != expected {
+                return Err(FileIoError::Io("The retained editor staging access metadata changed; its files and newer permissions were preserved.".into()));
+            }
+        }
+        Ok(())
+    }
     fn access(metadata: &fs::Metadata) -> (u32, u32, u32) { (metadata.uid(), metadata.gid(), metadata.mode()) }
     fn establish_private_access(&mut self) -> Result<(), String> {
         let current = self.directory().metadata().map_err(|error| error.to_string())?;
@@ -147,15 +164,17 @@ impl PresenceHolding {
         Ok(())
     }
     pub(super) fn create_temporary(&mut self) -> Result<(), FileIoError> {
+        self.validate_live()?;
         if self.temporary.is_some() { return Err(FileIoError::Io("An editor temporary file is already retained.".into())); }
         let (file, name) = fs_safety::create_temporary_in(self.directory(), 0o600).map_err(resolve_error)?;
         self.temporary = Some(OwnedTemporary { file, name });
         Ok(())
     }
-    pub(super) fn temporary(&self) -> &File { &self.temporary.as_ref().expect("temporary created").file }
-    pub(super) fn temporary_mut(&mut self) -> &mut File { &mut self.temporary.as_mut().expect("temporary created").file }
+    pub(super) fn temporary(&self) -> Result<&File, FileIoError> { self.validate_live()?; Ok(&self.temporary.as_ref().expect("temporary created").file) }
+    pub(super) fn temporary_mut(&mut self) -> Result<&mut File, FileIoError> { self.validate_live()?; Ok(&mut self.temporary.as_mut().expect("temporary created").file) }
     pub(super) fn temporary_name(&self) -> &std::ffi::OsStr { &self.temporary.as_ref().expect("temporary created").name }
     fn verify_temporary(&self) -> Result<(), FileIoError> {
+        self.validate_live()?;
         let Some(temporary) = &self.temporary else { return Ok(()); };
         let actual = fs_safety::metadata_beneath(self.directory(), Path::new(&temporary.name)).map_err(resolve_error)?;
         if !same_inode(&temporary.file.metadata().map_err(io_error)?, &actual) {
@@ -181,6 +200,7 @@ impl PresenceHolding {
         self.capture_original_with_hooks(|root| fs_safety::open_beneath(root, Path::new("file")).map_err(resolve_error), |_| Ok(()))
     }
     fn capture_original_with_hooks(&mut self, open: impl FnOnce(&Root) -> Result<File, FileIoError>, after_pin: impl FnOnce(&File) -> Result<(), FileIoError>) -> Result<(), FileIoError> {
+        self.validate_live()?;
         let file = open(self.directory())?;
         // Pin first: metadata/read/coherence failure must never drop the
         // acquired descriptor or retry by adopting a newly opened witness.
@@ -189,6 +209,7 @@ impl PresenceHolding {
         self.original.as_mut().unwrap().capture(self.publication.directory(), std::ffi::OsStr::new("file"))
     }
     pub(super) fn remove_original(&mut self) -> Result<(), FileIoError> {
+        self.validate_live()?;
         if let Some(original) = &self.original {
             original.verify(self.directory(), std::ffi::OsStr::new("file"))?;
             fs_safety::unlink_within(self.directory(), std::ffi::OsStr::new("file")).map_err(resolve_error)?;
@@ -197,6 +218,14 @@ impl PresenceHolding {
         Ok(())
     }
     fn retry_cleanup(&mut self) -> Result<(), String> {
+        self.context.placement().validate().map_err(|error| error.to_string())?;
+        if self.publication.is_removed() {
+            // A prior successful cleanup can be followed by fsync failure.
+            // Never walk the ancestry of an authenticated unlinked holding.
+            fs_safety::sync_directory(self.context.placement().directory()).map_err(|error| error.to_string())?;
+            return fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string());
+        }
+        self.context.validate_payload_root(self.directory()).map_err(|error| error.to_string())?;
         // Restore the producer's exact pending mode witness before applying
         // this consumer's explicit private0700 policy to its original inode.
         // This step never acquires/removes a public recovery entry.
@@ -215,6 +244,7 @@ impl PresenceHolding {
         fs_safety::sync_directory(self.directory()).map_err(|error| error.to_string())?;
         self.publication.resolve_recovery().map_err(|error| error.to_string())?;
         self.publication.cleanup_empty().map_err(|error| error.to_string())?;
+        fs_safety::sync_directory(self.context.placement().directory()).map_err(|error| error.to_string())?;
         // Explicit retries bypass the caller's original sync_durability path.
         // A sync failure keeps this same authority unresolved for another try.
         fs_safety::sync_directory(&self.parent).map_err(|error| error.to_string())
@@ -244,6 +274,33 @@ mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
     #[test]
+    fn registered_presence_payload_stays_outside_actual_git_discovery_and_refuses_public_move() {
+        let tree = tempfile::tempdir().unwrap(); let source = tree.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let git = |args: &[&str]| {
+            let mut command = std::process::Command::new("git"); command.current_dir(&source);
+            for (key, _) in std::env::vars_os().filter(|(key, _)| key.as_encoded_bytes().starts_with(b"GIT_")) { command.env_remove(key); }
+            command.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_GLOBAL", "/dev/null");
+            let output = command.args(args).output().unwrap(); assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr)); output.stdout
+        };
+        git(&["init", "-b", "main"]);
+        let root = Root::open(&source).unwrap(); let context = crate::filesystem_recovery_context::fixture_context(&root).unwrap();
+        let mut holding = PresenceHolding::create_in_context(&root, std::ffi::OsStr::new("file"), &context).unwrap();
+        holding.create_temporary().unwrap(); holding.temporary_mut().unwrap().write_all(b"private recovery payload").unwrap();
+        git(&["add", "--all"]); assert!(git(&["ls-files", "--stage"]).is_empty(), "same-user Git must not discover the retained payload");
+        let outside = holding.directory().path().to_owned(); let moved = source.join("moved-holding");
+        fs::rename(&outside, &moved).unwrap();
+        assert!(context.placement().validate().is_ok(), "the original outside parent alone is insufficient");
+        assert!(holding.create_temporary().is_err()); assert!(holding.publish_temporary().is_err());
+        let error = holding.finish().unwrap_err(); let authority = error.recovery_authority().unwrap();
+        assert!(authority.retry().is_err()); assert!(!source.join("file").exists());
+        fs::create_dir(&outside).unwrap(); fs::write(outside.join("foreign"), b"preserve").unwrap();
+        assert!(authority.retry().is_err()); assert_eq!(fs::read(outside.join("foreign")).unwrap(), b"preserve");
+        fs::remove_file(outside.join("foreign")).unwrap(); fs::remove_dir(&outside).unwrap(); fs::rename(&moved, &outside).unwrap();
+        authority.retry().unwrap(); assert!(authority.is_resolved()); assert!(!outside.exists());
+    }
+
+    #[test]
     fn recovery_does_not_overwrite_newer_original_holding_permissions() {
         let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
         let holding = PresenceHolding::create(&root, std::ffi::OsStr::new("file")).unwrap();
@@ -261,23 +318,24 @@ mod tests {
         let directory = tempfile::tempdir().unwrap(); let other = tempfile::tempdir().unwrap();
         let root = Root::open(directory.path()).unwrap(); let other = Root::open(other.path()).unwrap();
         let namespace = fs_safety::DirectoryNamespace::acquire(&other).unwrap();
-        let context = RecoveryContext::with_guard((), 0).unwrap(); let mut created = None;
+        let context = crate::filesystem_recovery_context::fixture_context(&root).unwrap(); let mut created = None;
         let result = PresenceHolding::create_in_context_with(&root, std::ffi::OsStr::new("file"), &context, |_, parent, leaf| {
             created = Some(leaf.to_path_buf());
             fs_safety::create_directory_in_namespace(&namespace, parent, leaf, 0o700)
         });
         let error = match result { Err(error) => error, Ok(_) => panic!("different namespace cannot prove creation") };
         let authority = error.recovery_authority().expect("unverified native mkdir keeps a live carrier");
-        let leaf = created.unwrap(); let metadata = fs_safety::metadata_beneath(&root, &leaf).unwrap();
+        let outside = context.placement().directory();
+        let leaf = created.unwrap(); let metadata = fs_safety::metadata_beneath(outside, &leaf).unwrap();
         assert!(authority.retry().is_err());
-        let after = fs_safety::metadata_beneath(&root, &leaf).unwrap();
+        let after = fs_safety::metadata_beneath(outside, &leaf).unwrap();
         assert_eq!((metadata.dev(), metadata.ino(), metadata.mode()), (after.dev(), after.ino(), after.mode()));
-        fs_safety::remove_directory_within(&root, leaf.as_os_str()).unwrap();
+        fs_safety::remove_directory_within(outside, leaf.as_os_str()).unwrap();
         // A replacement at the same spelling must remain untouched. Only the
         // retained original's unlink state permits authority resolution.
-        fs::create_dir(directory.path().join(&leaf)).unwrap(); fs::write(directory.path().join(&leaf).join("foreign"), "keep").unwrap();
+        fs::create_dir(outside.path().join(&leaf)).unwrap(); fs::write(outside.path().join(&leaf).join("foreign"), "keep").unwrap();
         authority.retry().unwrap(); assert!(authority.is_resolved());
-        assert_eq!(fs::read(directory.path().join(leaf).join("foreign")).unwrap(), b"keep");
+        assert_eq!(fs::read(outside.path().join(leaf).join("foreign")).unwrap(), b"keep");
     }
 
     #[test]
@@ -286,7 +344,9 @@ mod tests {
         let named = directory.path().join("root"); let moved = directory.path().join("original");
         fs::create_dir(&named).unwrap(); let root = Root::open(&named).unwrap();
         let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), &named, false).unwrap();
-        let context = recovery_context_at(&root, Arc::new(Some(protection))).unwrap();
+        let fixture = crate::filesystem_recovery_context::fixture_context(&root).unwrap();
+        let context = FilesystemRecoveryContext::new(&root, Arc::new(Some(protection)), fixture.placement().clone()).unwrap();
+        drop(fixture);
         let mut private = None;
         let result = PresenceHolding::create_in_context_with(&root, std::ffi::OsStr::new("file"), &context, |_, parent, _| {
             let error = fs_safety::fixture_directory_preparation_failure(parent);
@@ -310,8 +370,8 @@ mod tests {
     fn private_writer_temporary_descriptor_survives_foreign_cleanup_and_failed_retry() {
         let directory = tempfile::tempdir().unwrap(); let parent = Root::open(directory.path()).unwrap();
         let mut holding = PresenceHolding::create(&parent, std::ffi::OsStr::new("file")).unwrap();
-        holding.create_temporary().unwrap(); holding.temporary_mut().write_all(b"ours").unwrap();
-        let descriptor = holding.temporary().as_raw_fd();
+        holding.create_temporary().unwrap(); holding.temporary_mut().unwrap().write_all(b"ours").unwrap();
+        let descriptor = holding.temporary().unwrap().as_raw_fd();
         let original = holding.directory().path().join(holding.temporary_name()); let saved = original.with_file_name("saved-writer");
         fs::rename(&original, &saved).unwrap(); fs::write(&original, b"foreign").unwrap();
         let error = holding.finish().unwrap_err(); let authority = error.recovery_authority().unwrap();

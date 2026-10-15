@@ -19,6 +19,12 @@ pub use presence::FileRestoration;
 pub(crate) use presence::{PresenceSave, save_document_file, save_document_file_at, save_document_file_at_in_context, capture_restoration_at, capture_restoration_at_in_context};
 use save_publication::{SaveBaseline, publish_replacement};
 
+/// Legacy path-only compatibility cannot invent current domain enrollment.
+/// Actual workers must receive an issued FilesystemRecoveryContext.
+fn missing_filesystem_context(_root: &Root) -> Result<FilesystemRecoveryContext, FileIoError> {
+    Err(FileIoError::Io("This operation requires the original registered outside-checkout recovery context; no file was changed.".into()))
+}
+
 /// Builds a worker-side recovery context from the EXACT pre-acquired physical
 /// cleanup lease. No named-path reacquisition occurs after a failure.
 pub(crate) fn recovery_context_at(root: &Root, protection: std::sync::Arc<Option<crate::worktree_cleanup::Protection>>) -> Result<RecoveryContext, FileIoError> {
@@ -1191,15 +1197,13 @@ pub(crate) fn save_file_at_with_hooks_in_context(
 /// Publication refuses any replacement that appeared meanwhile.
 pub fn save_missing_file(worktree: &Path, path: &Path, text: &str) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(path)?;
-    let protection = std::sync::Arc::new(crate::worktree_cleanup::protect(worktree).map_err(io_error)?);
     let root = worktree_root(worktree)?;
-    let context = recovery_context_at(&root, protection)?;
+    let context = missing_filesystem_context(&root)?;
     presence::save_missing_file_at_in_context(&root, path, text, &context)
 }
 
 pub(crate) fn save_missing_file_at(root: &Root, path: &Path, text: &str) -> Result<SaveOutcome, FileIoError> {
-    let protection = std::sync::Arc::new(crate::worktree_cleanup::protect(root.path()).map_err(io_error)?);
-    let context = recovery_context_at(root, protection)?;
+    let context = missing_filesystem_context(root)?;
     presence::save_missing_file_at_in_context(root, path, text, &context)
 }
 
