@@ -12,6 +12,10 @@ const MAX_CHALLENGE_BYTES:usize=4096;
 /// exact host challenge. It serializes private bytes and rights on ONE stream.
 pub(crate) fn send_response(stream:&UnixStream,response:UiJournalResponse,
     files:&[BorrowedFd<'_>;6],deadline:Instant)->io::Result<()> {
+    send_response_cancellable(stream,response,files,deadline,&crate::process::CancellationToken::new())
+}
+pub(crate) fn send_response_cancellable(stream:&UnixStream,response:UiJournalResponse,
+    files:&[BorrowedFd<'_>;6],deadline:Instant,cancellation:&crate::process::CancellationToken)->io::Result<()> {
     let result=(|| {
         let (challenge,row)=response.into_wire();
         challenge.validate_shape()?;
@@ -21,8 +25,8 @@ pub(crate) fn send_response(stream:&UnixStream,response:UiJournalResponse,
         let mut header=[0u8;12];header[..4].copy_from_slice(&MAGIC);
         header[4..8].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
         header[8..12].copy_from_slice(&(row.len() as u32).to_be_bytes());
-        write_all(stream,&header,deadline)?;write_all(stream,&metadata,deadline)?;write_all(stream,&row,deadline)?;
-        created_root_rights::send(stream,files,deadline)
+        write_all(stream,&header,deadline,cancellation)?;write_all(stream,&metadata,deadline,cancellation)?;write_all(stream,&row,deadline,cancellation)?;
+        created_root_rights::send_cancellable(stream,files,deadline,cancellation)
     })();
     fail_closed(stream,result)
 }
@@ -31,21 +35,25 @@ pub(crate) fn send_response(stream:&UnixStream,response:UiJournalResponse,
 /// rights phase. No FrameCodec read can cross into the ancillary byte.
 pub(crate) fn receive_response(stream:&UnixStream,deadline:Instant)
     ->io::Result<(UiJournalResponse,created_root_rights::Roots)> {
+    receive_response_cancellable(stream,deadline,&crate::process::CancellationToken::new())
+}
+pub(crate) fn receive_response_cancellable(stream:&UnixStream,deadline:Instant,
+    cancellation:&crate::process::CancellationToken)->io::Result<(UiJournalResponse,created_root_rights::Roots)> {
     let result=(|| {
-        let mut header=[0u8;12];read_exact(stream,&mut header,deadline)?;
+        let mut header=[0u8;12];read_exact(stream,&mut header,deadline,cancellation)?;
         let metadata_len=u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
         let row_len=u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
         // Check BOTH lengths before allocating either buffer.
         if header[..4]!=MAGIC || metadata_len==0 || metadata_len>MAX_CHALLENGE_BYTES
             || row_len==0 || row_len>MAX_CREATION_ROW_BYTES {return Err(invalid("Invalid private creation response header"));}
-        let mut metadata=vec![0;metadata_len];read_exact(stream,&mut metadata,deadline)?;
+        let mut metadata=vec![0;metadata_len];read_exact(stream,&mut metadata,deadline,cancellation)?;
         let (challenge,unused): (UiJournalChallenge, &[u8]) = postcard::take_from_bytes(&metadata)
             .map_err(|e|invalid(&e.to_string()))?;
         if !unused.is_empty() {return Err(invalid("Trailing private creation challenge metadata"));}
         challenge.validate_shape()?;
-        let mut row=vec![0;row_len];read_exact(stream,&mut row,deadline)?;
+        let mut row=vec![0;row_len];read_exact(stream,&mut row,deadline,cancellation)?;
         let response=UiJournalResponse::from_wire(challenge,row)?;
-        let roots=created_root_rights::receive(stream,deadline)?;
+        let roots=created_root_rights::receive_cancellable(stream,deadline,cancellation)?;
         Ok((response,roots))
     })();
     fail_closed(stream,result)
@@ -56,37 +64,40 @@ fn fail_closed<T>(stream:&UnixStream,result:io::Result<T>)->io::Result<T> {
     // the caller must drop original +writer clones to release queued rights.
     result
 }
-fn write_all(stream:&UnixStream,mut bytes:&[u8],deadline:Instant)->io::Result<()> {
+fn write_all(stream:&UnixStream,mut bytes:&[u8],deadline:Instant,cancellation:&crate::process::CancellationToken)->io::Result<()> {
     while !bytes.is_empty() {
-        check(deadline)?;
+        check(deadline,cancellation)?;
         let sent=unsafe{libc::send(stream.as_raw_fd(),bytes.as_ptr().cast(),bytes.len(),libc::MSG_DONTWAIT|libc::MSG_NOSIGNAL)};
         if sent>0 {bytes=&bytes[sent as usize..];continue;}
         if sent==0 {return Err(io::ErrorKind::WriteZero.into());}
         let error=io::Error::last_os_error();match error.kind(){
-            io::ErrorKind::Interrupted=>{},io::ErrorKind::WouldBlock=>wait(stream,libc::POLLOUT,deadline)?,_=>return Err(error)}
+            io::ErrorKind::Interrupted=>{},io::ErrorKind::WouldBlock=>wait(stream,libc::POLLOUT,deadline,cancellation)?,_=>return Err(error)}
     }Ok(())
 }
-fn read_exact(stream:&UnixStream,mut bytes:&mut[u8],deadline:Instant)->io::Result<()> {
+fn read_exact(stream:&UnixStream,mut bytes:&mut[u8],deadline:Instant,cancellation:&crate::process::CancellationToken)->io::Result<()> {
     while !bytes.is_empty() {
-        check(deadline)?;
+        check(deadline,cancellation)?;
         let read=unsafe{libc::recv(stream.as_raw_fd(),bytes.as_mut_ptr().cast(),bytes.len(),libc::MSG_DONTWAIT)};
         if read>0 {bytes=&mut bytes[read as usize..];continue;}
         if read==0 {return Err(io::ErrorKind::UnexpectedEof.into());}
         let error=io::Error::last_os_error();match error.kind(){
-            io::ErrorKind::Interrupted=>{},io::ErrorKind::WouldBlock=>wait(stream,libc::POLLIN,deadline)?,_=>return Err(error)}
+            io::ErrorKind::Interrupted=>{},io::ErrorKind::WouldBlock=>wait(stream,libc::POLLIN,deadline,cancellation)?,_=>return Err(error)}
     }Ok(())
 }
-fn wait(stream:&UnixStream,events:libc::c_short,deadline:Instant)->io::Result<()> {
-    loop {let remaining=deadline.checked_duration_since(Instant::now()).filter(|time|!time.is_zero())
+fn wait(stream:&UnixStream,events:libc::c_short,deadline:Instant,cancellation:&crate::process::CancellationToken)->io::Result<()> {
+    loop {check(deadline,cancellation)?;let remaining=deadline.checked_duration_since(Instant::now()).filter(|time|!time.is_zero())
         .ok_or_else(||io::Error::from(io::ErrorKind::TimedOut))?;
-        let millis=remaining.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+        let millis=remaining.as_millis().saturating_add(1).min(50) as i32;
         let mut fd=libc::pollfd{fd:stream.as_raw_fd(),events,revents:0};
         let result=unsafe{libc::poll(&mut fd,1,millis)};
         if result>0 {return Ok(());}if result==0 {continue;}
         let error=io::Error::last_os_error();if error.kind()!=io::ErrorKind::Interrupted {return Err(error);}
     }
 }
-fn check(deadline:Instant)->io::Result<()> {if Instant::now()>=deadline {Err(io::ErrorKind::TimedOut.into())}else{Ok(())}}
+fn check(deadline:Instant,cancellation:&crate::process::CancellationToken)->io::Result<()> {
+    if cancellation.is_cancelled() {return Err(io::ErrorKind::Interrupted.into());}
+    if Instant::now()>=deadline {Err(io::ErrorKind::TimedOut.into())}else{Ok(())}
+}
 fn invalid(message:&str)->io::Error {io::Error::new(io::ErrorKind::InvalidData,message)}
 
 #[cfg(test)]
@@ -156,6 +167,41 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         assert_eq!(a.read(&mut [0u8; 1]).unwrap(), 0);
+    }
+    #[test]
+    fn cancellation_interrupts_partial_header_and_pending_rights_with_one_budget() {
+        let metadata = postcard::to_stdvec(&challenge()).unwrap();
+        let mut through_row = Vec::new();
+        through_row.extend_from_slice(&MAGIC);
+        through_row.extend_from_slice(&(metadata.len() as u32).to_be_bytes());
+        through_row.extend_from_slice(&1u32.to_be_bytes());
+        through_row.extend_from_slice(&metadata);
+        through_row.push(1);
+        for prefix in [b"CJR".as_slice(), through_row.as_slice()] {
+            let (mut sender, receiver) = UnixStream::pair().unwrap();
+            sender.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+            sender.write_all(prefix).unwrap();
+            let cancellation = crate::process::CancellationToken::new();
+            let before = Instant::now();
+            std::thread::scope(|scope| {
+                let (done, result) = std::sync::mpsc::sync_channel(1);
+                let token = &cancellation;
+                let worker = scope.spawn(move || {
+                    let error = receive_response_cancellable(&receiver,
+                        before + Duration::from_secs(2), token).err().unwrap();
+                    let _ = done.send(error.kind());
+                });
+                std::thread::sleep(Duration::from_millis(20));
+                cancellation.cancel();
+                let observed = result.recv_timeout(Duration::from_millis(500));
+                // Even a failed assertion must close the peer and settle the
+                // bounded original worker, rather than leave a blocked reader.
+                let _ = sender.shutdown(std::net::Shutdown::Both);
+                worker.join().unwrap();
+                assert_eq!(observed.unwrap(), io::ErrorKind::Interrupted);
+            });
+            assert!(before.elapsed() < Duration::from_secs(1));
+        }
     }
     #[test]
     fn incomplete_private_frame_uses_one_deadline_and_invalidates_stream() {

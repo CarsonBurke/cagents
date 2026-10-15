@@ -20,8 +20,9 @@ const PHASE: u8 = 0xc1;
 pub(crate) struct ReceivedRoots<const N: usize>(pub(crate) [File; N]);
 pub(crate) type Roots = ReceivedRoots<ROOT_COUNT>;
 
-fn wait(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> io::Result<()> {
+fn wait(stream: &UnixStream, events: libc::c_short, deadline: Instant, cancellation: Option<&crate::process::CancellationToken>) -> io::Result<()> {
     loop {
+        check_active(deadline, cancellation)?;
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|time| !time.is_zero())
@@ -29,7 +30,7 @@ fn wait(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> io::Re
         let millis = remaining
             .as_millis()
             .saturating_add(1)
-            .min(i32::MAX as u128) as i32;
+            .min(if cancellation.is_some() { 50 } else { i32::MAX as u128 }) as i32;
         let mut poll = libc::pollfd {
             fd: stream.as_raw_fd(),
             events,
@@ -57,13 +58,20 @@ pub(crate) fn send(
     files: &[BorrowedFd<'_>; ROOT_COUNT],
     deadline: Instant,
 ) -> io::Result<()> {
-    send_exact(stream, files, PHASE, deadline)
+    send_exact(stream, files, PHASE, deadline, None)
+}
+pub(crate) fn send_cancellable(
+    stream: &UnixStream, files: &[BorrowedFd<'_>; ROOT_COUNT], deadline: Instant,
+    cancellation: &crate::process::CancellationToken,
+) -> io::Result<()> {
+    send_exact(stream, files, PHASE, deadline, Some(cancellation))
 }
 fn send_exact<const N: usize>(
     stream: &UnixStream,
     files: &[BorrowedFd<'_>; N],
     phase: u8,
     deadline: Instant,
+    cancellation: Option<&crate::process::CancellationToken>,
 ) -> io::Result<()> {
     let mut byte = phase;
     let mut iov = libc::iovec {
@@ -97,9 +105,7 @@ fn send_exact<const N: usize>(
         }
     }
     loop {
-        if Instant::now() >= deadline {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
+        check_active(deadline, cancellation)?;
         let result = unsafe {
             libc::sendmsg(
                 stream.as_raw_fd(),
@@ -108,7 +114,7 @@ fn send_exact<const N: usize>(
             )
         };
         if result == 1 {
-            return Ok(());
+            return check_active(deadline, cancellation);
         }
         if result >= 0 {
             return Err(io::Error::new(
@@ -119,7 +125,7 @@ fn send_exact<const N: usize>(
         let error = io::Error::last_os_error();
         match error.kind() {
             io::ErrorKind::Interrupted => continue,
-            io::ErrorKind::WouldBlock => wait(stream, libc::POLLOUT, deadline)?,
+            io::ErrorKind::WouldBlock => wait(stream, libc::POLLOUT, deadline, cancellation)?,
             _ => return Err(error),
         }
     }
@@ -129,13 +135,16 @@ fn send_exact<const N: usize>(
 /// request header and user audience. The six owned FDs still grant no source
 /// identity: typed grant admission validates their original scope separately.
 pub(crate) fn receive(stream: &UnixStream, deadline: Instant) -> io::Result<Roots> {
-    receive_exact(stream, PHASE, deadline)
+    receive_exact(stream, PHASE, deadline, None)
 }
-fn receive_exact<const N: usize>(stream: &UnixStream, phase: u8, deadline: Instant) -> io::Result<ReceivedRoots<N>> {
+pub(crate) fn receive_cancellable(stream: &UnixStream, deadline: Instant,
+    cancellation: &crate::process::CancellationToken) -> io::Result<Roots> {
+    receive_exact(stream, PHASE, deadline, Some(cancellation))
+}
+fn receive_exact<const N: usize>(stream: &UnixStream, phase: u8, deadline: Instant,
+    cancellation: Option<&crate::process::CancellationToken>) -> io::Result<ReceivedRoots<N>> {
     loop {
-        if Instant::now() >= deadline {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
+        check_active(deadline, cancellation)?;
         let mut byte = 0u8;
         let mut iov = libc::iovec {
             iov_base: (&mut byte as *mut u8).cast(),
@@ -159,7 +168,7 @@ fn receive_exact<const N: usize>(stream: &UnixStream, phase: u8, deadline: Insta
             match error.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => {
-                    wait(stream, libc::POLLIN, deadline)?;
+                    wait(stream, libc::POLLIN, deadline, cancellation)?;
                     continue;
                 }
                 _ => return Err(error),
@@ -216,8 +225,18 @@ fn receive_exact<const N: usize>(stream: &UnixStream, phase: u8, deadline: Insta
         let files: [File; N] = files
             .try_into()
             .map_err(|_| io::Error::other("creation rights count changed"))?;
+        // All delivered rights are owned before cancellation can reject them.
+        check_active(deadline, cancellation)?;
         return Ok(ReceivedRoots(files));
     }
+}
+
+fn check_active(deadline: Instant, cancellation: Option<&crate::process::CancellationToken>) -> io::Result<()> {
+    if cancellation.is_some_and(|token| token.is_cancelled()) {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    if Instant::now() >= deadline { return Err(io::ErrorKind::TimedOut.into()); }
+    Ok(())
 }
 
 /// Negative recovery uses DISTINCT operation tags and exact role counts.
@@ -227,23 +246,23 @@ pub(crate) mod negative {
     use super::*;
     // Reservation: original source + original holding parent.
     pub(crate) fn send_reservation(stream: &UnixStream, files: &[BorrowedFd<'_>; 2], deadline: Instant) -> io::Result<()> {
-        send_exact(stream, files, 0xc2, deadline)
+        send_exact(stream, files, 0xc2, deadline, None)
     }
     pub(crate) fn receive_reservation(stream: &UnixStream, deadline: Instant) -> io::Result<ReceivedRoots<2>> {
-        receive_exact(stream, 0xc2, deadline)
+        receive_exact(stream, 0xc2, deadline, None)
     }
     // Later actual H publication, distinct from an edited/adopted root.
     pub(crate) fn send_published_payload(stream: &UnixStream, file: BorrowedFd<'_>, deadline: Instant) -> io::Result<()> {
-        send_exact(stream, &[file], 0xc3, deadline)
+        send_exact(stream, &[file], 0xc3, deadline, None)
     }
     pub(crate) fn receive_published_payload(stream: &UnixStream, deadline: Instant) -> io::Result<ReceivedRoots<1>> {
-        receive_exact(stream, 0xc3, deadline)
+        receive_exact(stream, 0xc3, deadline, None)
     }
     pub(crate) fn send_edited_root(stream: &UnixStream, file: BorrowedFd<'_>, deadline: Instant) -> io::Result<()> {
-        send_exact(stream, &[file], 0xc4, deadline)
+        send_exact(stream, &[file], 0xc4, deadline, None)
     }
     pub(crate) fn receive_edited_root(stream: &UnixStream, deadline: Instant) -> io::Result<ReceivedRoots<1>> {
-        receive_exact(stream, 0xc4, deadline)
+        receive_exact(stream, 0xc4, deadline, None)
     }
 }
 
