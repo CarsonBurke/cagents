@@ -170,7 +170,7 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
         // newly authorize closing an actor admitted in another physical scope.
         if !terminal_scope(&directory, identity, path)? { continue; }
         let (revision, busy) = handle.close_observation()?;
-        let token = BusyAgent { session: session.id, instance, close_revision: Some(revision), turn_generation: None };
+        let token = BusyAgent { session: session.id, instance, close_revision: Some(revision), turn_generation: None, session_instance: instance };
         actors.insert(session.id, Actor { token, busy, terminal: Some(Terminal { instance, session, handle, revision }), native: None, starting: false });
     }
     for NativeCandidate { execution_instance, session, handle, pair_valid, paired_live, paired_directory } in candidates.natives {
@@ -196,10 +196,14 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
         let hash = digest.finalize();
         let mut instance = uuid::Uuid::from_bytes(hash[..16].try_into().expect("SHA-256 prefix"));
         let actor = actors.entry(session.id).or_insert_with(|| Actor {
-            token: BusyAgent { session: session.id, instance, close_revision: None, turn_generation: None },
+            token: BusyAgent { session: session.id, instance, close_revision: None, turn_generation: None, session_instance: instance },
             busy: false, terminal: None, native: None, starting: false,
         });
+        let mut session_instance = instance;
         if let Some(terminal) = &actor.terminal {
+            let mut lifetime = Sha256::new();
+            lifetime.update(instance.as_bytes()); lifetime.update(terminal.instance.as_bytes());
+            session_instance = uuid::Uuid::from_bytes(lifetime.finalize()[..16].try_into().expect("SHA-256 prefix"));
             // The console is one logical actor, but replacing it or admitting
             // input must invalidate the native actor's composite consent too.
             let mut digest = Sha256::new();
@@ -207,14 +211,14 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
             let hash = digest.finalize();
             instance = uuid::Uuid::from_bytes(hash[..16].try_into().expect("SHA-256 prefix"));
         }
-        actor.token = BusyAgent { session: session.id, instance, close_revision: Some(observation.close_revision), turn_generation: Some(observation.turn_generation) };
+        actor.token = BusyAgent { session: session.id, instance, close_revision: Some(observation.close_revision), turn_generation: Some(observation.turn_generation), session_instance };
         actor.busy |= observation.owns_work && (!observation.ready || matches!(observation.activity, ActivityState::Working | ActivityState::Waiting | ActivityState::Unknown));
         actor.native = Some(Native { execution_instance, session, handle, observation });
     }
     for (id, instance, directory) in candidates.starting {
         if !inside(&directory, path)? { continue; }
         let actor = actors.entry(id).or_insert_with(|| Actor {
-            token: BusyAgent { session: id, instance, close_revision: None, turn_generation: None },
+            token: BusyAgent { session: id, instance, close_revision: None, turn_generation: None, session_instance: instance },
             busy: true, terminal: None, native: None, starting: true,
         });
         actor.starting = true;
@@ -299,7 +303,7 @@ pub(super) fn close(host: &SharedHost, repository: &Path, path: &Path, agents: &
 mod tests {
     use super::*;
     fn token(session: TerminalId) -> BusyAgent {
-        BusyAgent { session, instance: uuid::Uuid::new_v4(), close_revision: Some(3), turn_generation: Some(2) }
+        BusyAgent { session, instance: uuid::Uuid::new_v4(), close_revision: Some(3), turn_generation: Some(2), session_instance: uuid::Uuid::new_v4() }
     }
     fn host() -> SharedHost {
         std::sync::Arc::new(super::super::state::HostLock::new(super::super::state::HostState::new(crate::model::HostSessionProof {
