@@ -389,7 +389,7 @@ struct CancellationState {
 /// Bounded signals coalesce repeated notifications and never block cancellation.
 #[derive(Debug)]
 enum CancellationNotifier {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "ui"))]
     Process(mpsc::Sender<WaitEvent>),
     Signal(mpsc::SyncSender<()>),
     Descriptor(Arc<OwnedFd>),
@@ -398,7 +398,7 @@ enum CancellationNotifier {
 impl CancellationNotifier {
     fn notify(&self) {
         match self {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "ui"))]
             Self::Process(sender) => {
                 let _ = sender.send(WaitEvent::Cancelled);
             }
@@ -450,7 +450,7 @@ impl CancellationToken {
 
     /// Registers a waker for the duration of one blocking wait. The returned
     /// guard deregisters it, so a long-lived token does not accumulate senders.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "ui"))]
     pub(crate) fn register(&self, waker: mpsc::Sender<WaitEvent>) -> CancellationWaker<'_> {
         self.register_notifier(CancellationNotifier::Process(waker))
     }
