@@ -240,7 +240,7 @@ impl Cagents {
     }
     pub(super) fn recover_worktree_setup(&mut self, creation: OperationId, path: PathBuf, intent: SetupIntent) {
         let status = if intent.skip { WorktreeSetupStatus::Skipped }
-        else if intent.copy_done { WorktreeSetupStatus::Succeeded }
+        else if intent.copy_done && intent.plan.as_ref().is_none_or(|plan| plan.commands.is_empty()) { WorktreeSetupStatus::Succeeded }
         else { WorktreeSetupStatus::Interrupted("Creation finished before setup completion was confirmed. Review files and terminal output before resuming.".into()) };
         if let Some(run) = intent.run_id { self.setup_ui.expected_runs.insert(path.clone(), run); }
         self.setup_ui.recovered.insert(path.clone(), (creation, intent));
@@ -553,6 +553,9 @@ mod tests {
         assert!(app.setup_ui.authorized_runs.lock().unwrap().is_empty());
         assert!(!app.setup_ui.active());
         let mut copied = intent.clone(); copied.copy_done = true;
+        app.recover_worktree_setup(creation, path.clone(), copied.clone());
+        assert!(matches!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Interrupted(_)), "copies do not prove command completion");
+        copied.plan.as_mut().unwrap().commands.clear();
         app.recover_worktree_setup(creation, path.clone(), copied);
         assert_eq!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Succeeded);
         let mut skipped = intent; skipped.skip = true;
