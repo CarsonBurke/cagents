@@ -56,12 +56,18 @@ fn prepare_target(
     let lexical = std::iter::once((path.clone(),path.clone()))
         .chain(roots.iter().map(|(path,_,_)| (path.clone(),path.clone()))).collect::<Vec<_>>();
     watch.register(&lexical);
-    let resolve = |canonicalize: &mut dyn FnMut(&Path)->std::io::Result<PathBuf>| {
-        let canonical = match &cached {Some(value)=>value.clone(),None=>canonicalize(&path)?};
+    let resolve = |canonicalize: &mut dyn FnMut(&Path)->std::io::Result<PathBuf>, use_cached: bool| {
+        let canonical = match cached.as_ref().filter(|_|use_cached) {Some(value)=>value.clone(),None=>canonicalize(&path)?};
+        let mut observed = HashMap::from([(path.clone(),canonical.clone())]);
         let mut resolved = vec![(path.clone(),canonical.clone())];
         let mut selected = (canonical.clone(),0usize,false);
         for (lexical,cached,visible) in &roots {
-            let physical = cached.clone().unwrap_or_else(|| canonicalize(lexical).unwrap_or_else(|_|lexical.clone()));
+            let physical = observed.get(lexical).cloned().unwrap_or_else(|| {
+                let value = cached.as_ref().filter(|_|use_cached).cloned()
+                    .unwrap_or_else(|| canonicalize(lexical).unwrap_or_else(|_|lexical.clone()));
+                observed.insert(lexical.clone(),value.clone());
+                value
+            });
             let depth = physical.components().count();
             if canonical.starts_with(&physical) && (depth,*visible) > (selected.1,selected.2) {
                 selected = (lexical.clone(),depth,*visible);
@@ -75,13 +81,15 @@ fn prepare_target(
         }
         Ok::<_,std::io::Error>((selected.0,physical,resolved))
     };
-    let first = resolve(&mut canonicalize).map_err(|e|e.to_string())?;
+    let first = resolve(&mut canonicalize,true).map_err(|e|e.to_string())?;
     watch.register(&first.2);
-    // A target may have changed before physical ancestors were watched.
-    let validated = resolve(&mut canonicalize).map_err(|e|e.to_string())?;
+    // Cached ownership chooses a candidate; it cannot authorize a new lease.
+    // Real reads fence the first-watch race and retargets whose notify callback
+    // has not run yet. This work runs only for navigation, on the blocking pool.
+    let validated = resolve(&mut canonicalize,false).map_err(|e|e.to_string())?;
     watch.register(&validated.2);
     let guard = protect(&validated.1).map_err(|e|e.to_string())?;
-    let final_paths = resolve(&mut canonicalize).map_err(|e|e.to_string())?;
+    let final_paths = resolve(&mut canonicalize,false).map_err(|e|e.to_string())?;
     if final_paths != validated { return Err("worktree alias changed while acquiring its protection; select it again".into()); }
     Ok((validated.0,validated.2,guard))
 }
@@ -359,13 +367,41 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_cached_roots_require_no_canonicalization_during_preparation() {
+    fn cached_candidates_are_physically_revalidated_at_selection_authorization() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().to_owned();
         let monitor = owner_watch::Monitor::default();
+        let mut reads = Vec::new();
         let (selected,_,_) = prepare_target(path.clone(),vec![(path.clone(),Some(path.clone()),true)],Some(path.clone()),&monitor,
-            |_|panic!("unchanged root was canonicalized again"), |_|Ok(None)).unwrap();
+            |path| { reads.push(path.to_owned()); path.canonicalize() }, |_|Ok(None)).unwrap();
         assert_eq!(selected,path);
+        // The cached candidate requires no read, then each authorization pass
+        // reads a shared requested/root path only once.
+        assert_eq!(reads,vec![path.clone(),path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_alias_retarget_during_protection_rejects_and_releases_the_obsolete_guard() {
+        let runtime = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::os::unix::fs::symlink(&first,&alias).unwrap();
+        let monitor = owner_watch::Monitor::default();
+        let roots = [&first,&second].into_iter().map(|root|(root.clone(),Some(root.clone()),true)).collect();
+        let result = prepare_target(alias.clone(),roots,Some(first.clone()),&monitor,|path|path.canonicalize(),|physical| {
+            let guard = crate::worktree_cleanup::fixture_protection(runtime.path(),physical,false)?;
+            std::fs::remove_file(&alias)?;
+            std::os::unix::fs::symlink(&second,&alias)?;
+            Ok(Some(guard))
+        });
+        assert!(matches!(result,Err(error) if error.contains("alias changed")));
+        crate::worktree_cleanup::fixture_protection(runtime.path(),&first,true).unwrap();
+        crate::worktree_cleanup::fixture_protection(runtime.path(),&second,true).unwrap();
     }
 
     #[test]
