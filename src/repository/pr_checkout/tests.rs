@@ -2398,14 +2398,16 @@ fn new_pr_creation_refuses_remote_advance_before_any_worktree_effect() {
             Some(WorktreeCreationOutcome::NotCreated { .. })
         ));
         assert!(!request.managed_root.exists());
-        assert_eq!(
-            run_git(
-                &fixture.root,
-                &["show-ref", "--verify", "--quiet", "refs/heads/reviewed"]
-            )
-            .status
-            .code(),
-            Some(1)
+        assert!(
+            fixture
+                .service
+                .resolve_optional_revision(
+                    &fixture.root,
+                    "refs/heads/reviewed",
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .is_none()
         );
         assert_eq!(
             git_text(&fixture.root, &["rev-parse", "HEAD"]),
@@ -2926,14 +2928,16 @@ fn new_pr_creation_refuses_redirected_or_broad_push_policy() {
         );
         assert!(!request.managed_root.exists());
         assert_eq!(git_text(&fixture.root, &["config", key]), value);
-        assert_eq!(
-            run_git(
-                &fixture.root,
-                &["show-ref", "--verify", "--quiet", "refs/heads/reviewed"]
-            )
-            .status
-            .code(),
-            Some(1)
+        assert!(
+            fixture
+                .service
+                .resolve_optional_revision(
+                    &fixture.root,
+                    "refs/heads/reviewed",
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .is_none()
         );
     }
     for phase in ["fetch", "unlock"] {
