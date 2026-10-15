@@ -8422,11 +8422,11 @@ mod tests {
         let receipts = crate::chat::runtime::notification_frames_for_test(
             Box::new(Claude { busy: true, ready: true, ..Default::default() }),
             vec![
-                json!({"type":"user","uuid":"notification-topic-user","session_id":"notification-topic-session",
+                json!({"type":"user","uuid":"notification-topic-user","session_id":"44444444-4444-4444-8444-444444444444",
                     "message":{"role":"user","content":[{"type":"text","text":"Repair `config_file.rs`"}]}}),
-                json!({"type":"assistant","uuid":"notification-topic-answer","session_id":"notification-topic-session",
+                json!({"type":"assistant","uuid":"notification-topic-answer","session_id":"44444444-4444-4444-8444-444444444444",
                     "message":{"role":"assistant","content":[{"type":"text","text":"The configuration is ready to review."}]}}),
-                json!({"type":"result","uuid":"notification-topic-result","session_id":"notification-topic-session","is_error":false}),
+                json!({"type":"result","uuid":"notification-topic-result","session_id":"44444444-4444-4444-8444-444444444444","is_error":false}),
             ], false,
         );
         let (evidence, content) = receipts.last().expect("real actor publishes completion");
