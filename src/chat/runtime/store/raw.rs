@@ -529,3 +529,28 @@ mod ordinary_prose_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod cache_fence_tests {
+    use super::*;
+    use serde_json::json;
+    fn call(input:&str)->serde_json::Value{json!({"type":"assistant","uuid":format!("carrier-{input}"),"message":{"id":format!("message-{input}"),"content":[{"type":"tool_use","id":"same","name":"Opaque","input":{"actual":input}}]}})}
+    fn commit(store:&std::sync::Arc<std::sync::Mutex<Store>>,adapter:&mut dyn crate::chat::protocol::Adapter,step:crate::chat::protocol::Step){for event in step.events{store.lock().unwrap().apply(event).unwrap();}adapter.committed();}
+    #[test]
+    fn a_resident_optional_tool_copy_cannot_bypass_canonical_privacy_revocation(){
+        let store=std::sync::Arc::new(std::sync::Mutex::new(Store::new().unwrap()));let mut adapter=crate::chat::protocol::claude::fixture_adapter();adapter.bind_item_reader(super::super::adapter_item_reader(&store));let step=adapter.receive(call("first")).unwrap();commit(&store,adapter.as_mut(),step);
+        // Keep the small copy resident on purpose; the authoritative removal
+        // arrives through Store, independently of adapter cache housekeeping.
+        store.lock().unwrap().apply(Event::ItemsRemoved{ids:vec!["same".into()]}).unwrap();
+        let result=adapter.receive(json!({"type":"user","uuid":"late","message":{"content":[{"type":"tool_result","tool_use_id":"same","content":"done"}]}})).unwrap();assert!(result.events.iter().any(|event|matches!(event,Event::Error{fatal:false,..})));assert!(!result.events.iter().any(|event|matches!(event,Event::Item(_))));
+        let replay=adapter.receive(call("replayed")).unwrap();commit(&store,adapter.as_mut(),replay);assert!(!store.lock().unwrap().exists("same").unwrap());assert!(store.lock().unwrap().raw_original(&key("","same")).is_err());
+    }
+    #[test]
+    fn changed_full_call_identity_is_fenced_before_it_can_replace_canonical_history(){
+        let store=std::sync::Arc::new(std::sync::Mutex::new(Store::new().unwrap()));let mut adapter=crate::chat::protocol::claude::fixture_adapter();adapter.bind_item_reader(super::super::adapter_item_reader(&store));let step=adapter.receive(call("first")).unwrap();commit(&store,adapter.as_mut(),step);
+        let metadata:Vec<u8>=store.lock().unwrap().db.query_row("SELECT metadata FROM items WHERE id='same'",[],|r|r.get(0)).unwrap();
+        let reused=adapter.receive(call("different")).unwrap();commit(&store,adapter.as_mut(),reused);assert_eq!(store.lock().unwrap().db.query_row("SELECT metadata FROM items WHERE id='same'",[],|r|r.get::<_,Vec<u8>>(0)).unwrap(),metadata);
+        let result=adapter.receive(json!({"type":"user","uuid":"ambiguous-result","message":{"content":[{"type":"tool_result","tool_use_id":"same","content":"done"}]}})).unwrap();assert!(!result.events.iter().any(|event|matches!(event,Event::Item(_))));assert!(result.events.iter().any(|event|matches!(event,Event::Error{fatal:false,..})));
+        assert!(store.lock().unwrap().window().unwrap().raw_source_parts.is_empty(),"ambiguous original must not be advertised");
+    }
+}
