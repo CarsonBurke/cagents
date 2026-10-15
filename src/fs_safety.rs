@@ -431,6 +431,11 @@ pub(crate) use directory_creation::fixture_directory_preparation_failure;
 mod recovery_placement;
 pub use recovery_placement::{RecoveryDirectoryStamp, RecoveryPlacement, RecoveryRegistrationLease, RecoveryRegistryCheck, recovery_directory_stamp};
 
+#[path = "fs_safety/recovery_cache.rs"]
+mod recovery_cache;
+pub use recovery_cache::RecoveryParentCandidates;
+pub(crate) use recovery_cache::{RecoveryDirectory, RecoveryDirectoryError, prepare_recovery_directory};
+
 /// Changes a held directory's permissions. An O_PATH fd cannot be passed to
 /// fchmod; Linux's descriptor link pins the same inode without re-resolving
 /// its mutable worktree name.
