@@ -397,7 +397,7 @@ pub(super) fn configuration(configuration:&serde_json::Value,section:Option<&str
 impl RequestArgs {
     pub(super) fn queued_bytes(&self)->usize {match self{
         Self::None=>0,Self::Rename(s)=>s.len(),Self::Formatting(_)|Self::RangeFormatting{..}=>std::mem::size_of::<Self>(),
-        Self::CodeActions{diagnostics,..}=>diagnostics.iter().map(|d|d.message.len()+d.source.as_ref().map_or(0,String::len)+128).sum(),
+        Self::CodeActions{diagnostics,..}=>serde_json::to_vec(diagnostics).map_or(MAX_CONTENT_LENGTH,|bytes|bytes.len()),
         Self::Resolve(item)=>serde_json::to_vec(item).map_or(MAX_CONTENT_LENGTH,|b|b.len()),
         Self::Execute(c)=>c.command.len()+c.arguments.iter().map(|a|serde_json::to_vec(a).map_or(MAX_CONTENT_LENGTH,|b|b.len())).sum::<usize>(),
         Self::Signature(s)=>s.as_ref().map_or(0,String::len),
@@ -425,6 +425,13 @@ impl LspCodeAction {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn code_action_queue_accounts_for_opaque_diagnostic_metadata() {
+        let diagnostic=lsp_types::Diagnostic {message:"short".into(),data:Some(json!({"opaque":"x".repeat(1024*1024)})),..Default::default()};
+        let args=RequestArgs::CodeActions {range:Default::default(),diagnostics:vec![diagnostic]};
+        assert!(args.queued_bytes()>=1024*1024,"opaque diagnostic data is retained by each queued request");
+    }
 
     #[test]
     fn command_acknowledgement_survives_its_own_workspace_edit(){
