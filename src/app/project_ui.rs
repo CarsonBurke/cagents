@@ -2350,6 +2350,7 @@ mod tests {
 
     #[test]
     fn worktree_context_new_thread_uses_the_linked_worktree_directory() {
+        for registered in [false, true] {
         let repository = tempfile::tempdir().unwrap();
         let linked_directory = tempfile::tempdir().unwrap();
         let primary = SidebarWorktree::from_durable(
@@ -2363,11 +2364,18 @@ mod tests {
             Some("feature/login".into()),
         );
         let (mut app, _state, project) = deletable_app(repository.path(), &linked, &primary);
-        drop(app.handle_project_action(Action::Command {
-            project_id: project,
-            worktree_id: Some(linked.id),
-            command: ProjectCommand::NewChannel,
-        }));
+        if registered {
+            let row = sidebar::SelectionRow::Worktree(project, linked.id);
+            let region = crate::input_trace::KeyboardRegion::from(crate::workspace_widget::FocusedPane::SidebarRows);
+            let _event = app.input_trace.scoped_keyboard_focus(region, Some(sidebar::selection_row_focus_id(row)));
+            drop(app.run_workspace_command(crate::workspace_widget::GlobalShortcut::NewThread, keyboard::Modifiers::empty()));
+        } else {
+            drop(app.handle_project_action(Action::Command {
+                project_id: project,
+                worktree_id: Some(linked.id),
+                command: ProjectCommand::NewChannel,
+            }));
+        }
         assert_eq!(
             app.active_workspace.as_deref(),
             Some(linked_directory.path())
@@ -2378,6 +2386,7 @@ mod tests {
         );
         assert!(app.durable.cards.iter().any(|card| matches!(&card.kind,
             CardKind::Chat(session) if session.launch.recipe.working_directory == linked_directory.path())));
+        }
     }
 
     #[test]
