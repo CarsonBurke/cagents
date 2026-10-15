@@ -91,7 +91,11 @@ fn creates_lists_and_removes_in_configured_location_and_retains_branch_by_defaul
     assert!(entry.get("ahead").is_some());assert!(entry.get("behind").is_some());
     fixture.cli(&["worktree","remove","feat-one"]);assert!(!path.exists());
     fixture.git(&fixture.root.path().join("project"),&["show-ref","--verify","refs/heads/feat-one"]);
-    let second=fixture.create("feat-two");fixture.cli(&["worktree","remove",second.to_str().unwrap(),"--delete-branch"]);
+    // Removal retires the exact creation receipt, so the retained branch can
+    // be checked out again through the same journaled service.
+    let recreated=fixture.create("feat-one");assert_eq!(recreated,path);
+    fixture.cli(&["worktree","remove","feat-one"]);
+    let second=fixture.create("feat-two");fixture.cli(&["worktree","remove","managed/feat-two","--delete-branch"]);
     assert!(!second.exists());
     assert!(!fixture.git(&fixture.root.path().join("project"),&["branch","--list","feat-two"]).contains("feat-two"));
 }

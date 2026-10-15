@@ -63,7 +63,10 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
     let (operation,spawn)=match command {
         WorktreeCommand::Create {branch,base,linear,no_setup,spawn_agent,prompt,model,reasoning_effort,..}=>(Operation::Create {repository:repository.clone(),branch,base,linear,no_setup},spawn_agent.map(|provider|(provider,prompt,model,reasoning_effort))),
         WorktreeCommand::List {..}=>(Operation::List {repository:repository.clone()},None),
-        WorktreeCommand::Remove {target,force,delete_branch,..}=>(Operation::Remove {repository:repository.clone(),target,force,delete_branch,expected_fingerprint:None},None),
+        WorktreeCommand::Remove {target,force,delete_branch,..}=> {
+            let target=if !crate::device::is_remote() {std::fs::canonicalize(&target).ok().map(|path|path.to_string_lossy().into_owned()).unwrap_or(target)} else {target};
+            (Operation::Remove {repository:repository.clone(),target,force,delete_branch,expected_fingerprint:None},None)
+        },
     };
     let response=client.device_operation(crate::device_service::Operation::Worktree {operation}).map_err(protocol_error)?;
     let crate::device_service::Reply::Worktree(reply)=response else {return Err(AppError::new("protocol","Unexpected worktree response"));};

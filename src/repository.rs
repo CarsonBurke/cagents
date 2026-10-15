@@ -11642,8 +11642,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         &self,
         store: &StateStore,
     ) -> Result<Vec<WorktreeOperationReport>, StoreError> {
+        self.rehydrate_worktree_operation_rows(store, store.journaled_worktree_operations()?)
+    }
+
+    /// The daemon reconciles only unresolved journal rows before a control
+    /// operation; listing many completed creations must stay inexpensive.
+    pub fn rehydrate_pending_worktree_operations(
+        &self,
+        store: &StateStore,
+    ) -> Result<Vec<WorktreeOperationReport>, StoreError> {
+        let pending = store.operations_requiring_reconciliation()?.into_iter()
+            .filter(|operation|operation.entity_kind == "worktree_creation").collect();
+        self.rehydrate_worktree_operation_rows(store,pending)
+    }
+
+    fn rehydrate_worktree_operation_rows(
+        &self,
+        store:&StateStore,
+        operations:Vec<PendingOperation>,
+    )->Result<Vec<WorktreeOperationReport>,StoreError> {
         let mut reports = Vec::new();
-        for operation in store.journaled_worktree_operations()? {
+        for operation in operations {
             let parsed = serde_json::from_value::<WorktreeJournal>(operation.payload.clone());
             let mut journal = match parsed {
                 Ok(journal)
