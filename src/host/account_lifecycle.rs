@@ -11,7 +11,7 @@ use crate::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::{fd::{AsRawFd, FromRawFd}, unix::fs::{MetadataExt, OpenOptionsExt}},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -34,6 +34,7 @@ pub(super) struct Home {
     canonical: PathBuf,
     pin: Option<Arc<File>>,
     identity: Option<(u64, u64)>,
+    ancestors: BTreeSet<(u64, u64)>,
 }
 
 fn refusal(message: impl Into<String>) -> ProtocolError {
@@ -57,11 +58,13 @@ impl Home {
         };
         let identity = pin.as_ref().map(|pin| pin.metadata()).transpose().map_err(|e| e.to_string())?
             .map(|metadata| (metadata.dev(), metadata.ino()));
+        let ancestors = physical_ancestors(&canonical, pin.as_deref())?;
         let home = Self {
             path,
             canonical,
             pin,
             identity,
+            ancestors,
         };
         home.verify()?;
         Ok(home)
@@ -82,10 +85,21 @@ impl Home {
         }
     }
 
+    fn refresh_ancestors(&mut self) -> Result<(), String> {
+        if let Some(pin) = &self.pin {
+            // Once cleanup unlinks this exact root, it has no current
+            // descendants; retain the original lexical guard until Drop.
+            if pin.metadata().map_err(|error| error.to_string())?.nlink() == 0 { return Ok(()); }
+            self.ancestors.extend(physical_ancestors(&self.canonical, Some(pin.as_ref()))?);
+        }
+        Ok(())
+    }
+
     fn overlaps(&self, other: &Self) -> bool {
         self.canonical.starts_with(&other.canonical)
             || other.canonical.starts_with(&self.canonical)
-            || self.identity.zip(other.identity).is_some_and(|(left,right)| left==right)
+            || self.identity.is_some_and(|identity| other.ancestors.contains(&identity))
+            || other.identity.is_some_and(|identity| self.ancestors.contains(&identity))
     }
 
     fn scope(&self, provider: crate::agent::Provider) -> Option<crate::account::scope::LaunchAccountScope> {
@@ -93,6 +107,38 @@ impl Home {
             provider, canonical_home: self.canonical.clone(), device, inode,
             registered_id: None, purge_ids: Vec::new() })
     }
+}
+
+/// Walk the actual directory parent chain through descriptors. Lexical
+/// aliases can change when a reserved home/provider parent is renamed.
+fn physical_ancestors(path: &Path, pin: Option<&File>) -> Result<BTreeSet<(u64, u64)>, String> {
+    let mut cursor = if let Some(pin) = pin {
+        pin.try_clone().map_err(|error| error.to_string())?
+    } else {
+        let mut existing = path;
+        loop {
+            match std::fs::OpenOptions::new().read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(existing) {
+                Ok(file) => break file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    existing = existing.parent().ok_or("Account scope has no existing directory ancestor")?;
+                }
+                Err(error) => return Err(format!("Cannot capture account scope ancestry: {error}")),
+            }
+        }
+    };
+    let mut identities = BTreeSet::new();
+    for _ in 0..256 {
+        let metadata = cursor.metadata().map_err(|error| error.to_string())?;
+        let identity = (metadata.dev(), metadata.ino());
+        if !identities.insert(identity) { return Ok(identities); }
+        // SAFETY: the parent component is fixed and the owned descriptor
+        // outlives openat; the returned descriptor is newly owned.
+        let parent = unsafe { libc::openat(cursor.as_raw_fd(), c"..".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if parent < 0 { return Err(format!("Cannot capture account scope parent: {}", std::io::Error::last_os_error())); }
+        cursor = unsafe { File::from_raw_fd(parent) };
+    }
+    Err("Account scope ancestry exceeds the directory bound".into())
 }
 
 /// Resolve aliases even for a not-yet-created descendant without interpreting
@@ -154,6 +200,22 @@ impl Drop for Reservation {
     }
 }
 impl Reservation {
+    /// Called under the same short writer as the current park transaction.
+    /// Reserving a private capability's inode grants no deletion authority;
+    /// it prevents a new linked/startup descendant during outside-lock cleanup.
+    pub(super) fn reserve_parked_cleanup(&self, parked: &crate::account::home::ParkedRemoval) -> Result<(), String> {
+        let home = Home::capture(parked.current_path().map_err(|error| error.to_string())?)?;
+        if home.identity != Some(parked.identity().map_err(|error| error.to_string())?) {
+            return Err("The parked cleanup directory changed; its files were retained".into());
+        }
+        let mut entries = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = entries.get_mut(&self.token).ok_or("The cleanup reservation was released; parked files were retained")?;
+        if entry.homes.iter().any(|existing| existing.identity == home.identity) { return Ok(()); }
+        if entry.homes.len() >= 64 { return Err("The cleanup reservation exceeds its physical scope bound".into()); }
+        entry.homes.push(home);
+        Ok(())
+    }
+
     pub(super) fn install(host: &SharedHost, accounts: &[Account]) -> Result<Self, ProtocolError> {
         let map = host
             .lock()
@@ -195,16 +257,21 @@ impl Reservation {
             .map(|scope| crate::chat::annotations::storage::account_key(&scope))
             .collect::<BTreeSet<_>>();
         let token = uuid::Uuid::new_v4();
+        let (previous_tokens, mut previous_homes) = {
+            let entries = map.lock().unwrap_or_else(|p| p.into_inner());
+            (entries.keys().copied().collect::<BTreeSet<_>>(), entries.values().flat_map(|entry| entry.homes.iter().cloned()).collect::<Vec<_>>())
+        };
+        for home in &mut previous_homes { home.refresh_ancestors().map_err(refusal)?; }
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
+        if previous_tokens != entries.keys().copied().collect::<BTreeSet<_>>() {
+            return Err(refusal("Account operations changed during reservation; retry"));
+        }
         if entries.len() >= 64 {
             return Err(refusal(
                 "Too many account operations are already pending; wait and retry",
             ));
         }
-        if entries
-            .values()
-            .flat_map(|entry| entry.homes.iter())
-            .any(|other| homes.iter().any(|home| home.overlaps(other)))
+        if previous_homes.iter().any(|other| homes.iter().any(|home| home.overlaps(other)))
         {
             return Err(refusal(
                 "An operation is already changing this account home. Wait for it to finish, then retry.",
@@ -262,7 +329,7 @@ pub(super) fn ensure_paths(
         .unwrap_or_else(|p| p.into_inner())
         .account_lifecycle
         .clone();
-    let reserved: Vec<_> = map
+    let mut reserved: Vec<_> = map
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .values()
@@ -272,6 +339,7 @@ pub(super) fn ensure_paths(
     if reserved.is_empty() {
         return Ok(());
     }
+    for home in &mut reserved { home.refresh_ancestors().map_err(refusal)?; }
     for path in paths {
         let home = Home::capture(path).map_err(refusal)?;
         if reserved.iter().any(|other| home.overlaps(other)) {

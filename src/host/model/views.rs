@@ -323,13 +323,19 @@ impl Registry {
     /// agents, automation history or retired pane indexes. The account caller
     /// walks until None under its mutation reservation and time budget.
     pub(in crate::host) fn account_view_page(&self, after: Option<&str>) -> Result<Option<(String, Vec<crate::workspace_model::views::Pane>)>, String> {
-        let row: Option<(String, Option<String>)> = self.db.query_row(
-            "SELECT scope, CASE WHEN length(CAST(panes AS BLOB)) <= 16777216 THEN panes ELSE NULL END FROM shared_views WHERE scope > ?1 ORDER BY scope LIMIT 1",
-            [after.unwrap_or("")], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional().map_err(|e| e.to_string())?;
+        let select = "SELECT CASE WHEN length(CAST(scope AS BLOB)) <= 65536 THEN scope ELSE NULL END, CASE WHEN length(CAST(panes AS BLOB)) <= 16777216 THEN panes ELSE NULL END FROM shared_views";
+        let decode = |row: &rusqlite::Row<'_>| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?));
+        // Empty/invalid keys are evidence too. Only later pages use the exact
+        // lower bound; an empty string must never stand in for first-page None.
+        let row = match after {
+            Some(after) => self.db.query_row(&format!("{select} WHERE scope > ?1 ORDER BY scope LIMIT 1"), [after], decode),
+            None => self.db.query_row(&format!("{select} ORDER BY scope LIMIT 1"), [], decode),
+        }.optional().map_err(|e| e.to_string())?;
         row.map(|(scope, panes)| {
+            let scope = scope.ok_or("Shared account pane scope exceeds its census byte bound")?;
+            parse_scope(&scope).map_err(|_| "Shared account pane scope is malformed")?;
             let panes = panes.ok_or("Shared account pane metadata exceeds its census byte bound")?;
-            let panes = serde_json::from_str(&panes).map_err(|e| format!("Cannot decode account pane ownership: {e}"))?;
+            let panes = serde_json::from_str(&panes).map_err(|_| "Cannot decode account pane ownership metadata")?;
             Ok((scope, panes))
         }).transpose()
     }
@@ -405,6 +411,25 @@ mod tests {
         }
         (registry, dir, a, b)
     }
+    #[test]
+    fn account_census_refuses_empty_and_oversized_scope_evidence_without_rewriting_it() {
+        let (registry, _directory, channel, _) = setup();
+        let panes = serde_json::to_string(&vec![pane()]).unwrap();
+        registry.db.execute("INSERT INTO shared_view_scopes(scope,channel) VALUES ('',?1)", [channel.to_string()]).unwrap();
+        registry.db.execute("INSERT INTO shared_views(scope,revision,panes,retired) VALUES ('',0,?1,'[]')", [&panes]).unwrap();
+        assert!(registry.account_view_page(None).unwrap_err().contains("scope is malformed"));
+        let retained: String = registry.db.query_row("SELECT panes FROM shared_views WHERE scope=''", [], |row| row.get(0)).unwrap();
+        assert_eq!(retained, panes);
+        registry.db.execute("DELETE FROM shared_views WHERE scope=''", []).unwrap();
+        registry.db.execute("DELETE FROM shared_view_scopes WHERE scope=''", []).unwrap();
+        let oversized = "x".repeat(65537);
+        registry.db.execute("INSERT INTO shared_view_scopes(scope,channel) VALUES (?1,?2)", params![oversized,channel.to_string()]).unwrap();
+        registry.db.execute("INSERT INTO shared_views(scope,revision,panes,retired) VALUES (?1,0,?2,'[]')", params![oversized,panes]).unwrap();
+        assert!(registry.account_view_page(None).unwrap_err().contains("scope exceeds"));
+        let size: usize = registry.db.query_row("SELECT length(scope) FROM shared_views WHERE scope=?1", [&oversized], |row| row.get(0)).unwrap();
+        assert_eq!(size, 65537);
+    }
+
     fn pane() -> Pane {
         Pane {
             id: CardId::new(),

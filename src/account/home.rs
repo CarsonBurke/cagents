@@ -95,7 +95,9 @@ pub struct Homes {
 /// Both descriptors survive pathname replacement and are held until cleanup.
 #[derive(Debug)]
 pub(crate) struct ParkedRemoval {
+    #[cfg(feature = "host")]
     provider: Provider,
+    #[cfg(feature = "host")]
     key: Uuid,
     parent: fs::File,
     directory: fs::File,
@@ -103,11 +105,15 @@ pub(crate) struct ParkedRemoval {
 }
 
 impl ParkedRemoval {
+    #[cfg(feature = "host")]
     pub(crate) fn account(&self) -> (Provider, Uuid) { (self.provider, self.key) }
-    #[cfg(test)]
-    pub(crate) fn path_for_test(&self) -> PathBuf {
-        fs::read_link(descriptor_path(&self.directory)).unwrap()
+    #[cfg(any(feature = "host", test))]
+    pub(crate) fn current_path(&self) -> io::Result<PathBuf> {
+        fs::read_link(descriptor_path(&self.directory))
     }
+    #[cfg(test)]
+    pub(crate) fn path_for_test(&self) -> PathBuf { self.current_path().unwrap() }
+    #[cfg(feature = "host")]
     pub(crate) fn identity(&self) -> io::Result<(u64, u64)> {
         let metadata = self.directory.metadata()?;
         Ok((metadata.dev(), metadata.ino()))
@@ -153,6 +159,32 @@ fn unlink_entry(parent: &fs::File, name: &std::ffi::OsStr, flags: libc::c_int) -
     Ok(())
 }
 
+fn open_child_without_mounts(parent: &fs::File, name: &std::ffi::OsStr) -> io::Result<fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+        #[repr(C)]
+        struct OpenHow { flags: u64, mode: u64, resolve: u64 }
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| io::Error::other("Account entry contains a zero byte"))?;
+        // linux/openat2.h: NO_XDEV rejects all mount transitions, including
+        // bind mounts on the same device; the inode/device check alone cannot.
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+            mode: 0, resolve: 0x01 | 0x02 | 0x04 | 0x08,
+        };
+        // SAFETY: the owned directory, CString and exact open_how layout
+        // outlive the syscall; a successful result is one newly owned FD.
+        let raw = unsafe { libc::syscall(libc::SYS_openat2, parent.as_raw_fd(), name.as_ptr(), &how, std::mem::size_of::<OpenHow>()) };
+        if raw < 0 { return Err(io::Error::last_os_error()); }
+        Ok(unsafe { fs::File::from_raw_fd(raw as libc::c_int) })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (parent, name);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "This platform has no scoped account cleanup backend"))
+    }
+}
+
 fn remove_contents(directory: &fs::File, depth: usize, remaining: &mut usize) -> io::Result<()> {
     if depth > 256 { return Err(io::Error::other("Account tree exceeds the cleanup depth bound")); }
     let anchored = descriptor_path(directory);
@@ -165,7 +197,7 @@ fn remove_contents(directory: &fs::File, depth: usize, remaining: &mut usize) ->
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.is_dir() {
             // Never follow a substituted link or cross a mounted filesystem.
-            let child = open_directory(&path)?;
+            let child = open_child_without_mounts(directory, &entry.file_name())?;
             require_same_directory(&child, &path)?;
             if child.metadata()?.dev() != device {
                 return Err(io::Error::other("Account cleanup refuses a mounted filesystem"));
@@ -278,6 +310,13 @@ impl Homes {
     /// Rename under the lifecycle/registry locks; delete the parked tree only
     /// after releasing them, since provider caches can be large.
     pub(crate) fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<ParkedRemoval>> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (provider, key);
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Scoped account-tree deletion needs this platform's descriptor cleanup backend; files were retained"));
+        }
+        #[cfg(target_os = "linux")]
+        {
         let path = self.path(provider, key);
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -301,7 +340,12 @@ impl Homes {
         }
         require_same_directory(&directory, &descriptor_path(&parent).join(&name))?;
         parent.sync_all()?;
-        Ok(Some(ParkedRemoval { provider, key, parent, directory, name }))
+        Ok(Some(ParkedRemoval {
+            #[cfg(feature = "host")] provider,
+            #[cfg(feature = "host")] key,
+            parent, directory, name,
+        }))
+        }
     }
 
     /// Legacy parked names have no retained operation/census authority.
@@ -694,6 +738,63 @@ mod tests {
             libc::geteuid()
         });
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly invoked private user/mount namespace"]
+    fn scoped_cleanup_refuses_a_same_filesystem_bind_mount() {
+        const CHILD: &str = "CAGENTS_PRIVATE_ACCOUNT_MOUNT_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new("unshare")
+                .args(["--user", "--map-root-user", "--mount", "--fork"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "account::home::tests::scoped_cleanup_refuses_a_same_filesystem_bind_mount", "--ignored", "--nocapture"])
+                .env(CHILD,"1").status().unwrap();
+            assert!(status.success(),"private mount namespace unavailable or fixture failed; no production mount was requested");
+            return;
+        }
+        // No mount operation occurs outside the explicit private child.
+        assert_eq!(unsafe { libc::mount(std::ptr::null(),c"/".as_ptr(),std::ptr::null(),libc::MS_REC | libc::MS_PRIVATE,std::ptr::null()) },0);
+        let temporary=tempfile::tempdir().unwrap();
+        let homes=Homes::at(temporary.path().join("accounts"));
+        let (key,path)=homes.create(Provider::Claude,None).unwrap();
+        let external=temporary.path().join("external");fs::create_dir(&external).unwrap();
+        fs::write(external.join("keep"),b"outside selected tree").unwrap();
+        let target=path.join("mounted");fs::create_dir(&target).unwrap();
+        let source=std::ffi::CString::new(external.as_os_str().as_bytes()).unwrap();
+        let target_c=std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mount(source.as_ptr(),target_c.as_ptr(),std::ptr::null(),libc::MS_BIND,std::ptr::null()) },0);
+        struct Mount(PathBuf);
+        impl Drop for Mount { fn drop(&mut self) {
+            let target=std::ffi::CString::new(self.0.as_os_str().as_bytes()).unwrap();
+            unsafe { libc::umount2(target.as_ptr(),libc::MNT_DETACH); }
+        } }
+        let mut mounted=Mount(target);
+        let receipt=homes.park(Provider::Claude,key).unwrap().unwrap();
+        mounted.0=receipt.path_for_test().join("mounted");
+        assert_eq!(fs::metadata(&external).unwrap().dev(),fs::metadata(&mounted.0).unwrap().dev(),"same-device case");
+        let error=receipt.finish().unwrap_err();
+        assert_eq!(error.raw_os_error(),Some(libc::EXDEV));
+        assert_eq!(fs::read(external.join("keep")).unwrap(),b"outside selected tree");
+        drop(mounted);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_cleanup_directory_opens_require_kernel_no_mount_crossing() {
+        let root = open_directory(Path::new("/")).unwrap();
+        let error = open_child_without_mounts(&root, std::ffi::OsStr::new("proc")).unwrap_err();
+        assert!(matches!(error.raw_os_error(), Some(libc::EXDEV | libc::ENOSYS | libc::EINVAL)), "kernel must refuse mount traversal or an unsupported mechanism: {error}");
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("child")).unwrap();
+        let directory = open_directory(temporary.path()).unwrap();
+        let child = open_child_without_mounts(&directory, std::ffi::OsStr::new("child"));
+        match child {
+            Ok(child) => assert_eq!(child.metadata().unwrap().ino(),fs::metadata(temporary.path().join("child")).unwrap().ino()),
+            Err(error) => assert!(matches!(error.raw_os_error(),Some(libc::ENOSYS | libc::EINVAL))),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn scoped_cleanup_deletes_only_its_captured_tree_and_preserves_replacements() {
         let temporary = tempfile::tempdir().unwrap();

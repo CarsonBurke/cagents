@@ -704,7 +704,7 @@ pub(super) fn process_request(
             }, |account| {
                 ensure_control_open(host).map_err(|error| error.message)?;
                 reservation.deletion_permit(host, account)
-            })
+            }, |parked| reservation.reserve_parked_cleanup(parked))
             .map(crate::device_service::Reply::AccountLifecycle)
             .map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)

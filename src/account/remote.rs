@@ -218,6 +218,7 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
             gate: None,
             verify: &|| Ok(()),
             deletion: None,
+            parked: None,
             #[cfg(test)] isolated_delete: false,
         },
     )
@@ -232,6 +233,7 @@ pub(crate) fn execute_reserved<'a>(
     gate: std::sync::Arc<std::sync::RwLock<()>>,
     verify: impl Fn() -> Result<(), String>,
     deletion: impl Fn(&super::Account) -> Result<crate::host::DeletionPermit<'a>, String>,
+    parked: impl Fn(&super::home::ParkedRemoval) -> Result<(), String>,
 ) -> Result<serde_json::Value, String> {
     execute_with_commits(
         operation,
@@ -239,6 +241,7 @@ pub(crate) fn execute_reserved<'a>(
             gate: Some(gate),
             verify: &verify,
             deletion: Some(&deletion),
+            parked: Some(&parked),
             #[cfg(test)] isolated_delete: false,
         },
     )
@@ -249,10 +252,28 @@ struct Commits<'callbacks, 'reservation> {
     gate: Option<std::sync::Arc<std::sync::RwLock<()>>>,
     verify: &'callbacks dyn Fn() -> Result<(), String>,
     deletion: Option<&'callbacks dyn Fn(&super::Account) -> Result<crate::host::DeletionPermit<'reservation>, String>>,
+    parked: Option<&'callbacks dyn Fn(&super::home::ParkedRemoval) -> Result<(), String>>,
     #[cfg(test)] isolated_delete: bool,
 }
 #[cfg(feature = "host")]
 impl Commits<'_, '_> {
+    fn park(&self, store: &super::registry::Store, homes: &super::home::Homes,
+        provider: Provider, key: uuid::Uuid, registered: bool,
+    ) -> Result<(super::registry::Registry, Option<String>, Option<super::home::ParkedRemoval>), String> {
+        self.apply(|| {
+            let result = store.park_home_checked(homes,provider,key,registered,||Ok(()))?;
+            if let Some(parked) = &result.2 {
+                match self.parked {
+                    Some(reserve) => reserve(parked).map_err(std::io::Error::other)?,
+                    None => {
+                        #[cfg(not(test))]
+                        return Err(std::io::Error::other("Scoped cleanup has no retained admission reservation; parked files were retained"));
+                    }
+                }
+            }
+            Ok(result)
+        })
+    }
     fn apply<T>(&self, change: impl FnOnce() -> std::io::Result<T>) -> Result<T, String> {
         let _writer = self
             .gate
@@ -311,8 +332,7 @@ fn execute_with_commits(
                 Err(error) => {
                     // A launch recipe failure must not strand an unused home
                     // and pending registry entry before the terminal opens.
-                    if let Ok((_, _, Some(parked))) = commits
-                        .apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(()))) {
+                    if let Ok((_, _, Some(parked))) = commits.park(&store,&homes,provider,key,false) {
                         let _ = parked.finish();
                     }
                     return Err(error);
@@ -394,8 +414,7 @@ fn execute_with_commits(
                 return Err("The provider needs this account to sign in again".into());
             }
             if !probe::confirms_login(identity.as_ref(), snapshot.status) {
-                let (registry, _, parked) = commits
-                    .apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(())))?;
+                let (registry, _, parked) = commits.park(&store,&homes,provider,key,false)?;
                 if let Some(parked) = parked { parked.finish().map_err(|error| error.to_string())?; }
                 return serde_json::to_value(Settled::Abandoned(Some(registry)))
                     .map_err(|error| error.to_string());
@@ -435,9 +454,7 @@ fn execute_with_commits(
                 Err(existing) => {
                     (commits.verify)()?;
                     runtime.block_on(probe::logout_locked(account))?;
-                    let (registry, _, parked) = commits.apply(|| {
-                        store.park_home_checked(&homes, provider, key, false, || Ok(()))
-                    })?;
+                    let (registry, _, parked) = commits.park(&store,&homes,provider,key,false)?;
                     if let Some(parked) = parked { parked.finish().map_err(|error| error.to_string())?; }
                     Settled::Duplicate {
                         existing,
@@ -460,8 +477,7 @@ fn execute_with_commits(
             let lock_cache =
                 super::cache::Cache::installation().ok_or("Account storage cannot be locked")?;
             let _probe_locks = probe::lock_accounts(&lock_cache, &[&account])?;
-            let (registry, _, parked) = commits
-                .apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(())))?;
+            let (registry, _, parked) = commits.park(&store,&homes,provider,key,false)?;
             if let Some(parked) = parked { parked.finish().map_err(|error| error.to_string())?; }
             serde_json::to_value(Settled::Abandoned(Some(registry)))
                 .map_err(|error| error.to_string())
@@ -517,6 +533,7 @@ fn remove_account(
             gate: None,
             verify: &|| Ok(()),
             deletion: None,
+            parked: None,
             isolated_delete: true,
         },
     )
@@ -620,8 +637,7 @@ fn remove_account_with_commits(
             // effect. Explicit deletion still works without an installed CLI.
             let logout_error = logout(account.clone()).err();
             if let Some(permit) = &deletion_permit { permit.verify()?; }
-            let (registry, error, parked) = commits
-                .apply(|| store.park_home_checked(homes, account.provider, key, true, || Ok(())))?;
+            let (registry, error, parked) = commits.park(store,homes,account.provider,key,true)?;
             let cleanup_error = parked.and_then(|parked| {
                 match &deletion_permit {
                     Some(permit) => permit.finish_parked(parked).err(),

@@ -5468,6 +5468,18 @@ fn abandon_home(
     provider: Provider,
     key: uuid::Uuid,
 ) -> Result<Option<Registry>, String> {
+    #[cfg(not(test))]
+    {
+        let _ = (store, homes);
+        // Even a fallback UI has no authority to delete provider files. The
+        // host must qualify and retain the exact current pending-home lease.
+        match remote_lifecycle(account::remote::Operation::Abandon { provider, key })? {
+            Settled::Abandoned(registry) => Ok(registry),
+            _ => Err("The device did not abandon this exact pending sign-in".into()),
+        }
+    }
+    #[cfg(test)]
+    {
     if let (Some(store), Some(homes)) = (store, homes) {
         let (registry, error) = store
             .remove_home(homes, provider, key, false)
@@ -5483,6 +5495,7 @@ fn abandon_home(
             .map_err(|error| error.to_string())?;
     }
     abandon(store, key)
+    }
 }
 
 fn abandon(store: Option<&Store>, key: uuid::Uuid) -> Result<Option<Registry>, String> {

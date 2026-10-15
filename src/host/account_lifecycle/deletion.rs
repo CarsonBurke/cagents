@@ -853,14 +853,47 @@ mod tests {
         }
         let (b_key,b_path)=homes.create(Provider::Codex,None).unwrap();
         std::fs::write(b_path.join("delete"),b"selected B").unwrap();
+        std::fs::create_dir(b_path.join("child-home")).unwrap();
         store.update(|registry|registry.register(Registered {key:b_key,provider:Provider::Codex,linked_home:None,label:None,email:None,organization:None,added_at:0},&[]).unwrap()).unwrap();
         let b=Account::managed(Provider::Codex,b_key,b_path.clone());
         let b_reservation=Reservation::install(&host,&[b.clone()]).unwrap();
         let b_permit=b_reservation.deletion_permit(&host,&b).unwrap();
         let (_,warning,b_parked)=store.park_home_checked(&homes,Provider::Codex,b_key,true,||Ok(())).unwrap();
         assert!(warning.is_none());
-        b_permit.finish_parked(b_parked.unwrap()).unwrap();
+        let b_parked=b_parked.unwrap();
+        let parked_b=b_parked.path_for_test();
+        let child=parked_b.join("child-home");
+        let assert_blocked = |child: &Path| {
+            assert!(super::super::ensure_paths(&host,[child.to_owned()]).is_err());
+            let account=Account::linked(Provider::Claude,uuid::Uuid::new_v4(),child.to_owned());
+            assert!(Reservation::install(&host,&[account]).is_err(),"nested physical aliases must conflict with the retained root");
+            assert!(super::super::ensure_launch(&host,&root,&[("CLAUDE_CONFIG_DIR".into(),child.display().to_string())].into(),&Default::default(),false).is_err(),"startup must refuse before provider construction");
+            let request=crate::terminal_ipc::ClientRequest::DeviceOperation {operation:crate::device_service::Operation::AccountLifecycle {operation:crate::account::remote::Operation::Link {provider:Provider::Claude,key:uuid::Uuid::new_v4(),path:child.display().to_string()}}};
+            assert!(crate::host::client::process_request(&host,0,request).is_err(),"public Link must not enroll a descendant during deletion");
+            super::super::ensure_paths(&host,[parked_a.clone()]).unwrap();
+        };
+        assert_blocked(&child);
+        // A lexical parked prefix alone also fails after its provider parent
+        // moves. Current physical ancestry still contains the reserved inode.
+        let original_parent=parked_b.parent().unwrap();
+        let moved_parent=root.join("moved-provider-parent");
+        std::fs::rename(original_parent,&moved_parent).unwrap();
+        let moved_child=moved_parent.join(parked_b.file_name().unwrap()).join("child-home");
+        assert_blocked(&moved_child);
+        b_permit.finish_parked(b_parked).unwrap();
         homes.finish_removals();store.load_and_sweep(&homes).unwrap();
+        drop(b_permit);drop(b_reservation);
+        // A fresh sign-in operation initially has no selected physical home.
+        // Its current parked receipt is enrolled before releasing admission.
+        let create_reservation=Reservation::install(&host,&[]).unwrap();
+        let (fresh_key,fresh)=homes.create(Provider::Claude,None).unwrap();
+        std::fs::create_dir(fresh.join("child-home")).unwrap();
+        let fresh=homes.park(Provider::Claude,fresh_key).unwrap().unwrap();
+        create_reservation.reserve_parked_cleanup(&fresh).unwrap();
+        let child=fresh.path_for_test().join("child-home");
+        assert!(super::super::ensure_paths(&host,[child]).is_err());
+        super::super::ensure_paths(&host,[parked_a.clone()]).unwrap();
+        fresh.finish().unwrap();drop(create_reservation);
         assert!(!b_path.exists());
         assert_eq!(std::fs::read(parked_a.join("keep")).unwrap(),b"live parked A");
         assert!(!live.is_completed(),"unrelated parked A actor remains alive");

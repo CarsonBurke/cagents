@@ -937,6 +937,7 @@ impl Store {
     /// deletion cannot make an unregistered home launchable again. Only this
     /// operation's exact parked receipt may delete its tree; a failed cleanup
     /// retains files for explicit recovery. Linked aliases protect their home.
+    #[cfg(test)]
     pub fn remove_home(
         &self,
         homes: &Homes,
@@ -950,6 +951,7 @@ impl Store {
     /// Prepare deletion while both the spawn lifecycle lock and the latest
     /// registry lock are held. A refusal leaves registration and files intact.
     /// The callback is skipped if another registered alias retains this home.
+    #[cfg(test)]
     pub(crate) fn remove_home_checked(
         &self,
         homes: &Homes,
