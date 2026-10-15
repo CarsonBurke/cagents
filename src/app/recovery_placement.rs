@@ -165,6 +165,27 @@ mod tests {
     }
 
     #[test]
+    fn holding_metadata_candidates_cannot_be_borrowed_from_an_unrelated_project() {
+        let files = tempfile::tempdir().unwrap();
+        let root = |name: &str| {
+            let path = files.path().join(name); std::fs::create_dir(&path).unwrap();
+            Arc::new(Root::open(&path).unwrap())
+        };
+        let a = root("source-a"); let b = root("source-b"); let foreign = root("source-c");
+        let ma = root("metadata-a"); let mb = root("metadata-b");
+        let identity = |root: &Root| { let m = root.metadata().unwrap(); (m.dev(), m.ino()) };
+        let census = ResolvedWindowRoots { registry: uuid::Uuid::new_v4(), required_projects: Vec::new(),
+            edited_and_project_roots: vec![a.clone(), b.clone()],
+            common_directory_candidates: vec![(identity(&a), ma.clone()), (identity(&b), mb.clone())],
+        };
+        let candidates = census.holding_candidates(&a).unwrap();
+        assert_eq!(candidates.len(), 1); assert!(Arc::ptr_eq(&candidates[0], &ma));
+        let candidates = census.holding_candidates(&b).unwrap();
+        assert_eq!(candidates.len(), 1); assert!(Arc::ptr_eq(&candidates[0], &mb));
+        assert!(census.holding_candidates(&foreign).unwrap().is_empty());
+    }
+
+    #[test]
     fn cancelled_census_does_not_resolve_any_project_or_open_a_replacement() {
         let token = CancellationToken::new(); token.cancel();
         let input = WindowRecoveryRoots { registry: uuid::Uuid::new_v4(), required_projects: Vec::new(), projects: Vec::new(), edited: Vec::new() };
