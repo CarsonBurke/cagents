@@ -1601,19 +1601,34 @@ mod tests {
         let card = app.workspace.focused().unwrap();
         let runtime = RepositoryRuntime::pending_working_diff_fixture(card);
         app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
-        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
         let task = app.install_workspace_scope(WorkspaceState::default(), "/other".into(), None);
         let due = tokio::time::timeout(Duration::from_secs(2), async move {
-            let Some(mut stream) = iced::runtime::task::into_stream(task) else { return None; };
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return None;
+            };
             while let Some(action) = stream.next().await {
-                if let iced::runtime::Action::Output(cosmic::Action::App(
-                    Message::Repository(action @ RepositoryAction::WorkingDiffDue { card: target, .. })
-                )) = action && target == card { return Some(action); }
+                if let iced::runtime::Action::Output(cosmic::Action::App(Message::Repository(
+                    action @ RepositoryAction::WorkingDiffDue { card: target, .. },
+                ))) = action
+                    && target == card
+                {
+                    return Some(action);
+                }
             }
             None
-        }).await.expect("the hidden diff debounce must remain bounded");
-        assert!(due.is_some(), "workspace handoff must drive the debounce it recorded before hiding the previous pane");
-        assert!(app.lsp_documents.is_empty(), "visibility work must not open an editor LSP document");
+        })
+        .await
+        .expect("the hidden diff debounce must remain bounded");
+        assert!(
+            due.is_some(),
+            "workspace handoff must drive the debounce it recorded before hiding the previous pane"
+        );
+        assert!(
+            app.lsp_documents.is_empty(),
+            "visibility work must not open an editor LSP document"
+        );
     }
 
     #[test]
