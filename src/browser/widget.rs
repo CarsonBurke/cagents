@@ -686,15 +686,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 modifiers,
                 ..
             }) => {
-                if let Some(index) = state
-                    .shortcut_keys
-                    .iter()
-                    .position(|key| key == physical_key)
-                {
-                    state.shortcut_keys.swap_remove(index);
-                    shell.capture_event();
-                    return;
-                }
+                let shortcut = state.shortcut_keys.iter().position(|key| key == physical_key);
+                if let Some(index) = shortcut { state.shortcut_keys.swap_remove(index); }
                 let release = iced_key(
                     ButtonState::Released,
                     key,
@@ -706,6 +699,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 );
                 match self.handle.mailbox.release_key(*physical_key, release) {
                     Ok(true) => {}
+                    Ok(false) if shortcut.is_some() => {}
                     Ok(false) => return,
                     Err(error) => self.publish_error(error, shell),
                 }
@@ -1446,4 +1440,37 @@ mod tests {
         assert!(native.placement.source_x + native.placement.source_width <= native.buffer.width);
         assert!(native.placement.source_y + native.placement.source_height <= native.buffer.height);
     }
+    #[test]
+    fn admitted_raw_repeat_owns_release_even_after_the_initial_browser_shortcut() {
+        use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use keyboard::key::Code;
+        for raw_repeat in [false, true] {
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let handle = BrowserHandle::fixture();
+            let content = Id::unique();
+            let browser = BrowserWidget::<()>::new(&handle).id(content.clone()).model_focused(true)
+                .on_shortcut(|event| crate::app::browser_shortcut(crate::model::CardId::new(), &event).map(|_| ()));
+            let mut ui = UserInterface::build(browser.into(), Size::new(400.0, 240.0), Cache::new(), &mut renderer);
+            ui.operate(&renderer, &mut focusable::focus::<()>(content));
+            let mut events = vec![press("r", Code::KeyR, keyboard::Modifiers::CTRL), Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()))];
+            if raw_repeat {
+                let mut repeat = press("r", Code::KeyR, keyboard::Modifiers::empty());
+                if let Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. }) = &mut repeat { *repeat = true; }
+                events.push(repeat);
+            }
+            events.push(Event::Keyboard(keyboard::Event::KeyReleased {
+                key: keyboard::Key::Character("r".into()), modified_key: keyboard::Key::Character("r".into()),
+                physical_key: keyboard::key::Physical::Code(Code::KeyR), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(),
+            }));
+            let mut messages = Vec::new();
+            let _ = ui.update(&events, mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
+            assert_eq!(messages.len(), 1, "the actual browser reload callback owns only the initial CtrlR");
+            let input = queued_input(&handle);
+            if raw_repeat {
+                assert!(matches!(input.as_slice(), [BrowserInput::Key { state: ButtonState::Pressed, code: down, .. }, BrowserInput::Key { state: ButtonState::Released, code: up, .. }] if down == "KeyR" && up == "KeyR"), "{input:?}");
+            } else { assert!(input.is_empty(), "a shortcut-only down cannot generate a raw up: {input:?}"); }
+        }
+    }
+
 }
