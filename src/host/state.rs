@@ -1,4 +1,5 @@
 mod presentation;
+mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -2715,6 +2716,7 @@ fn restore_upgrade_from(
     let mut adopted = Vec::new();
     let mut unattached = Vec::new();
     let mut reattached = Vec::new();
+    let mut interrupted_setups = false;
     let restored = (|| {
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
@@ -2742,6 +2744,9 @@ fn restore_upgrade_from(
                 !checkpoint.preserve_carried,
             ) {
                 adopted.push(terminal.source.id);
+            } else if crate::upgrade::is_worktree_setup_recipe(&terminal.source.launch) {
+                interrupted_setups = true;
+                setup_restore::retain_pane(host, &terminal.source, &terminal.source.launch);
             } else if checkpoint.preserve_carried {
                 return Err(format!(
                     "Terminal {} could not be authenticated for continued ownership; no recipe restart was authorized. Its checkpoint was retained for explicit recovery",
@@ -2794,6 +2799,11 @@ fn restore_upgrade_from(
         for terminal in &checkpoint.terminals {
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
+            }
+            if crate::upgrade::is_worktree_setup_recipe(&terminal.source.launch) {
+                interrupted_setups = true;
+                setup_restore::retain_pane(host, &terminal.source, &terminal.recipe);
+                continue;
             }
             // An unattached conversation's paired view would reconnect to its
             // retained server as a new, unowned client. Keep it as evidence.
@@ -2876,7 +2886,13 @@ fn restore_upgrade_from(
             store.path.display()
         ));
     }
-    store.remove()?;
+    if interrupted_setups {
+        let evidence = store.archive_interrupted_setup()?;
+        tracing::warn!(evidence = %evidence.display(),
+            "Interrupted worktree setup requires explicit review; its checkpoint was preserved and other sessions were restored");
+    } else {
+        store.remove()?;
+    }
     publish();
     if !unattached.is_empty() {
         tracing::warn!(
@@ -3105,6 +3121,11 @@ fn adopt_carried_terminal(
     }
     if !allow_restart {
         tracing::warn!(terminal = %id, %error, "confirmed continuation requires its original holder; recipe restart is refused");
+        return false;
+    }
+    if crate::upgrade::is_worktree_setup_recipe(&terminal.source.launch) {
+        tracing::warn!(terminal = %id, %error,
+            "worktree setup lost its authenticated holder; its command was not replayed");
         return false;
     }
     let recipe = match crate::upgrade::checkpoint_recipe(&terminal.source, &terminal.relaunches) {
