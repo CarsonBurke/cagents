@@ -412,3 +412,38 @@ fn daemon_setup_review_selects_current_generation_with_a_stale_history_snapshot(
     assert!(!warnings.is_empty(),"the stale old receipt remains diagnostic evidence");
     assert!(client.list().unwrap().is_empty(),"skip must not start a terminal");
 }
+
+#[test]
+fn superseded_pending_setup_cannot_start_after_an_explicit_skip() {
+    use cagents::{device_service,model::{CardId,CardKind,LaunchRecipe,TerminalContinuity,TerminalId,TerminalSession},repository::WorktreeSetupIntent,worktree_control::{Operation,Reply},workspace_model::{ModelEdit,views::{Pane,Scope}}};
+    let fixture=Fixture::new();let project=fixture.root.path().join("project");let path=fixture.create("stale-pending");
+    fs::create_dir(project.join(".cagents")).unwrap();
+    fs::write(project.join(".cagents/worktree.toml"),"setup = \"printf stale > unauthorized-setup\"\n").unwrap();
+    let plan=cagents::worktree_setup::load(&project).unwrap().unwrap();
+    cagents::worktree_setup::trust(&project,&plan,&cagents::repository::CancellationToken::new()).unwrap();
+    let mut intent:WorktreeSetupIntent=serde_json::from_value(fixture.setup_intent(&path)).unwrap();
+    intent.skip=false;intent.copy_done=true;intent.plan=Some(plan);
+    let run=intent.run_id.unwrap();
+    let journal=fixture.root.path().join("data").join(cagents::instance::STORAGE_NAME).join("worktree-operations.sqlite3");
+    let connection=rusqlite::Connection::open(&journal).unwrap();
+    assert_eq!(connection.execute("UPDATE pending_operations SET payload_json=json_set(payload_json,'$.request.setup_intent',json(?1)) WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?2",rusqlite::params![serde_json::to_string(&intent).unwrap(),path.to_str().unwrap()]).unwrap(),1);
+    drop(connection);
+    let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client=cagents::control::ControlClient::connect(&socket).unwrap();let repository=project.join(".git");
+    let device_service::Reply::Worktree(Reply::SetupIntent {creation_id,..})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntent {repository:repository.clone(),path:path.clone()}}).unwrap() else {panic!("wrong setup metadata")};
+    let recipe=LaunchRecipe {program:"/bin/sh".into(),arguments:vec!["-c".into(),"printf stale > unauthorized-setup".into()],working_directory:path.clone(),environment:std::collections::BTreeMap::from([("CAGENTS_WORKTREE_SETUP".into(),"1".into()),("CAGENTS_WORKTREE_SETUP_ID".into(),run.to_string()),("CAGENTS_WORKTREE_SETUP_CREATION_ID".into(),creation_id.to_string())]),unset_environment:Default::default()};
+    let session=TerminalSession {id:TerminalId::new(),launch:recipe.clone(),transcript_path:None,resume_hint:None,owned_codex_listener:None,recovery_origin:None,predecessor:None,continuity:TerminalContinuity::RelaunchAvailable {recipe,last_exit:None}};
+    let pane=CardId::new();
+    client.edit_workspace_model(ModelEdit::SeedView {scope:Scope::Worktree {repository:repository.clone(),path:path.clone()},panes:vec![Pane {id:pane,title:"Worktree setup".into(),user_title:None,pending_terminal_start:true,width_fraction:1.0,kind:CardKind::Terminal(session.clone()),scope:Some(path.clone())}],closed:vec![]}).unwrap();
+    // A copied receipt in another known window store is ambiguous authority.
+    let duplicate=fixture.root.path().join("data").join(cagents::instance::STORAGE_NAME).join("sessions.sqlite3");
+    assert!(!duplicate.exists());
+    let connection=rusqlite::Connection::open(&journal).unwrap();
+    connection.execute("VACUUM INTO ?1",[duplicate.to_str().unwrap()]).unwrap();drop(connection);
+    assert!(client.start_worktree_setup(pane,session.id,run,Default::default()).is_err(),"copied creation journals must not arbitrarily choose one owner");
+    assert!(!path.join("unauthorized-setup").exists());fs::remove_file(duplicate).unwrap();
+    let device_service::Reply::Worktree(Reply::SetupPrepared {run_id,..})=client.device_operation(device_service::Operation::Worktree {operation:Operation::ResumeSetup {repository,path:path.clone(),expected_run_id:Some(run),expected_plan_fingerprint:None,trust:false,skip:true}}).unwrap() else {panic!("wrong skip result")};
+    assert_ne!(run_id,run);
+    assert!(client.start_worktree_setup(pane,session.id,run,Default::default()).is_err(),"old pending pane must not execute after a newer reviewed skip");
+    assert!(!path.join("unauthorized-setup").exists());assert!(client.list().unwrap().is_empty());
+}

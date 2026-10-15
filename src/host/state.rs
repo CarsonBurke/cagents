@@ -3429,6 +3429,46 @@ pub(super) fn verify_worktree_setup_generation(recipe:&crate::model::LaunchRecip
     Ok(())
 }
 
+/// Hold the creator's SQLite writer reservation through actual child startup.
+/// Every metadata CAS uses that same SQLite writer, so a superseding resume or
+/// skip cannot authorize an older pending pane after this check.
+fn worktree_setup_run_guard(recipe:&crate::model::LaunchRecipe)->Result<crate::persistence::WorktreeOperationGuard,ProtocolError> {
+    let invalid=|detail:String|ProtocolError::new(ProtocolErrorCode::InvalidRequest,detail,false);
+    let creation=recipe.environment.get("CAGENTS_WORKTREE_SETUP_CREATION_ID").ok_or_else(||invalid("Setup has no creation identity".into()))?.parse::<crate::model::OperationId>().map_err(|error|invalid(error.to_string()))?;
+    let run=recipe.environment.get("CAGENTS_WORKTREE_SETUP_ID").ok_or_else(||invalid("Setup has no run identity".into()))?.parse::<crate::model::OperationId>().map_err(|error|invalid(error.to_string()))?;
+    let mut paths=crate::instance::window_database_paths().map_err(|error|invalid(error.to_string()))?;
+    let directories=crate::instance::project_dirs().ok_or_else(||invalid("Data directory is unavailable".into()))?;
+    paths.push(directories.data_dir().join("worktree-operations.sqlite3"));
+    paths.sort();paths.dedup();
+    let mut owners=Vec::new();
+    for path in paths {
+        if !path.try_exists().map_err(|error|invalid(error.to_string()))? {continue;}
+        if crate::persistence::read_worktree_operation_at(&path,creation).map_err(|error|invalid(error.to_string()))?.is_some() {owners.push(path);}
+    }
+    if owners.len()!=1 {return Err(invalid("No unique current setup creation journal is available; review this worktree again".into()));}
+    let service=crate::repository::RepositoryService::system("git");
+    let cancel=crate::repository::CancellationToken::new();
+    let common=service.common_dir(&recipe.working_directory,&cancel).map_err(|error|invalid(error.to_string()))?;
+    let admin=service.git_dir(&recipe.working_directory,&cancel).map_err(|error|invalid(error.to_string()))?;
+    let records=service.list_worktrees(&recipe.working_directory,&cancel).map_err(|error|invalid(error.to_string()))?;
+    let guard=crate::persistence::lock_worktree_operation_at(&owners[0],creation).map_err(|error|invalid(error.to_string()))?;
+    let report=service.worktree_setup_creation_from_row(&guard.operation).map_err(|error|invalid(error.to_string()))?;
+    let request=report.request.as_ref().ok_or_else(||invalid("Setup creation has no request".into()))?;
+    let intent=request.setup_intent.as_ref().ok_or_else(||invalid("Setup creation has no retained intent".into()))?;
+    if intent.run_id!=Some(run)||intent.skip||!intent.copy_done||!intent.plan.as_ref().is_some_and(|plan|plan.requires_trust())||request.destination!=recipe.working_directory {
+        return Err(invalid("This setup run was superseded, skipped or is not prepared; review its current intent before starting".into()));
+    }
+    let saved_common=serde_json::from_value::<std::path::PathBuf>(guard.operation.payload["common_dir"].clone()).map_err(|error|invalid(error.to_string()))?;
+    let saved_admin=serde_json::from_value::<std::path::PathBuf>(guard.operation.payload["admin_dir"].clone()).map_err(|error|invalid(error.to_string()))?;
+    if common!=saved_common||admin!=saved_admin||!records.iter().any(|record|record.path==request.destination&&record.branch.as_deref()==Some(request.branch.full_ref().as_str())) {
+        return Err(invalid("The setup creation no longer owns this checkout registration".into()));
+    }
+    if !crate::repository::worktree_setup_marker_matches(&admin,creation).map_err(|error|invalid(error.to_string()))? {
+        return Err(invalid("The checkout generation changed before setup execution".into()));
+    }
+    Ok(guard)
+}
+
 /// Starts a terminal's worker, spawning its process or, given `adoption`,
 /// adopting the one a predecessor daemon's holder waits with there.
 fn start_terminal_view_owned(
@@ -3590,12 +3630,15 @@ fn start_terminal_view_owned(
     } else {
         Default::default()
     };
-    if adoption.is_none()&&crate::upgrade::is_worktree_setup_recipe(&session.launch) {
-        if let Err(error)=verify_worktree_setup_generation(&session.launch) {
+    let setup_run_guard=if adoption.is_none()&&crate::upgrade::is_worktree_setup_recipe(&session.launch) {
+        match worktree_setup_run_guard(&session.launch) {
+            Ok(guard)=>Some(guard),
+            Err(error)=> {
             shared.lock().unwrap_or_else(|poison|poison.into_inner()).cancel_spawn(terminal_id);
             return Err(error);
+            }
         }
-    }
+    } else {None};
     let weak = Arc::downgrade(shared);
     let config = TerminalConfig {
         agent_authority,
@@ -3616,6 +3659,7 @@ fn start_terminal_view_owned(
     }) {
         Ok(handle) => handle,
         Err(error) => {
+            drop(setup_run_guard);
             shared
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3627,6 +3671,7 @@ fn start_terminal_view_owned(
             ));
         }
     };
+    drop(setup_run_guard);
     let output_host = Arc::downgrade(shared);
     handle
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
@@ -4175,15 +4220,8 @@ mod tests {
         assert!(spawn_terminal(&host,1,session.clone(),options.clone()).is_err());
         assert!(spawn_reviewed_worktree_setup(&host,1,pane.id,session.id,crate::model::OperationId::new(),options.clone()).is_err());
         assert!(!directory.path().join("setup-count").exists());
-        spawn_reviewed_worktree_setup(&host,1,pane.id,session.id,run_id,options.clone()).unwrap();
-        spawn_reviewed_worktree_setup(&host,1,pane.id,session.id,run_id,options.clone()).unwrap();
-        let deadline=Instant::now()+Duration::from_secs(5);
-        loop {
-            let complete=host.lock().unwrap().terminals.get(&session.id).is_some_and(|record|record.handle.is_completed());
-            if complete {break;}
-            assert!(Instant::now()<deadline,"setup fixture did not exit");thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(fs::read_to_string(directory.path().join("setup-count")).unwrap(),"once");
+        assert!(spawn_reviewed_worktree_setup(&host,1,pane.id,session.id,run_id,options.clone()).is_err(),"a manually retained marker and pane cannot replace the current authorizing journal");
+        assert!(!directory.path().join("setup-count").exists());
         // Reopen the saved pre-launch pane after a simulated daemon loss.
         // Its marker and pending bit are evidence, not replay permission.
         let restored=make_host("restored.sqlite3");
@@ -4191,7 +4229,7 @@ mod tests {
         assert!(spawn_terminal(&restored,1,session.clone(),options.clone()).is_err());
         fs::remove_file(repository.join(".git/cagents-setup-creation")).unwrap();
         assert!(spawn_reviewed_worktree_setup(&restored,1,pane.id,session.id,run_id,options).is_err(),"even explicit stale callbacks must refuse missing generation evidence");
-        assert_eq!(fs::read_to_string(directory.path().join("setup-count")).unwrap(),"once");
+        assert!(!directory.path().join("setup-count").exists());
     }
 
     #[test]
