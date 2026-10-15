@@ -55,6 +55,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "editor_widget/snapshot.rs"]
+mod snapshot;
+pub use snapshot::TextSnapshot;
+
+#[cfg(test)]
+thread_local! { static TEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+pub(crate) fn take_text_call_count() -> usize {
+    TEXT_CALLS.with(|count| count.replace(0))
+}
+
 /// A diagnostic mapped once to the renderer's byte-addressed line positions.
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
@@ -83,6 +95,59 @@ impl SearchSnapshot {
             query,
             cancelled,
         )
+    }
+
+    pub(crate) fn find_matches_with(
+        &self,
+        query: &str,
+        options: crate::editor_search::FindOptions,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<Vec<(Position, Position)>>, String> {
+        crate::editor_search::find_in_lines(
+            self.lines.iter().map(|range| &self.text[range.clone()]),
+            query,
+            options,
+            cancelled,
+        )
+    }
+
+    pub(crate) fn replace_matches_with(
+        &self,
+        matches: &[(Position, Position)],
+        query: &str,
+        replacement: &str,
+        options: crate::editor_search::FindOptions,
+        preserve: bool,
+    ) -> Result<String, String> {
+        let replacement =
+            crate::editor_search::Replacement::new(query, replacement, options, preserve)?;
+        let mut result = String::with_capacity(self.text.len());
+        let mut copied = 0;
+        for &(start, end) in matches {
+            if start.line != end.line {
+                return Err("A search match crosses a line boundary.".into());
+            }
+            let line = self
+                .lines
+                .get(start.line)
+                .ok_or("The selected match is outside the document.")?;
+            let text = &self.text[line.clone()];
+            let inserted = replacement.expand(text, start.column, end.column)?;
+            let start = line.start + start.column;
+            let end = line.start + end.column;
+            if end < start || start < copied {
+                return Err("Search matches overlap.".into());
+            }
+            result.push_str(
+                self.text
+                    .get(copied..start)
+                    .ok_or("Invalid search position.")?,
+            );
+            result.push_str(&inserted);
+            copied = end;
+        }
+        result.push_str(self.text.get(copied..).ok_or("Invalid search position.")?);
+        Ok(result)
     }
 
     /// Build a replacement in source order: each match and source byte is
@@ -114,7 +179,7 @@ impl SearchSnapshot {
     }
 }
 
-fn find_in_lines<T: AsRef<str>>(
+pub(crate) fn find_in_lines<T: AsRef<str>>(
     lines: impl Iterator<Item = T>,
     query: &str,
     cancelled: impl Fn() -> bool,
@@ -907,6 +972,8 @@ where
     R: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
 {
     editor: R::Editor,
+    snapshot: TextSnapshot,
+    snapshot_edit_depth: usize,
     layout: Option<EditorLayout>,
     reset_highlighter: bool,
     pending_scroll: Option<ScrollPosition>,
@@ -1000,8 +1067,19 @@ where
         // Renew that marker at the start after the append-only load, without
         // changing text, so the first viewport highlights from line zero.
         mark_changed_from(&mut editor, Position { line: 0, column: 0 });
+        let count = editor.line_count();
+        let snapshot = TextSnapshot::from_lines((0..count).map(|index| {
+            let ending = editor.line(index).expect("native line exists").ending;
+            (
+                editor.buffer().lines[index].text(),
+                ending,
+                terminator(ending, index + 1 == count),
+            )
+        }));
         Self(RefCell::new(Internal {
             editor,
+            snapshot,
+            snapshot_edit_depth: 0,
             layout: None,
             reset_highlighter: true,
             pending_scroll: None,
@@ -1015,7 +1093,23 @@ where
     }
 
     /// Performs an [`Action`] on the [`Content`].
-    pub fn perform(&mut self, mut action: Action) {
+    pub fn perform(&mut self, action: Action) {
+        let editing = matches!(action, Action::Edit(_));
+        let window = (editing && self.0.borrow().snapshot_edit_depth == 0)
+            .then(|| self.snapshot_edit_window());
+        if editing {
+            self.0.get_mut().snapshot_edit_depth += 1;
+        }
+        self.perform_native(action);
+        if editing {
+            self.0.get_mut().snapshot_edit_depth -= 1;
+        }
+        if let Some(window) = window {
+            self.refresh_snapshot(window);
+        }
+    }
+
+    fn perform_native(&mut self, mut action: Action) {
         match &action {
             Action::Edit(Edit::Paste(text)) if self.try_splice(text, None) => return,
             Action::Edit(Edit::Delete | Edit::Backspace)
@@ -1048,6 +1142,48 @@ where
         }
 
         internal.editor.perform(action);
+    }
+
+    fn snapshot_edit_window(&self) -> (usize, usize, usize) {
+        let cursor = self.cursor();
+        let anchor = cursor.selection.unwrap_or(cursor.position);
+        let count = self.line_count();
+        (
+            cursor.position.line.min(anchor.line).saturating_sub(1),
+            (cursor.position.line.max(anchor.line) + 1).min(count.saturating_sub(1)),
+            count,
+        )
+    }
+
+    fn refresh_snapshot(&mut self, (first, last, before_count): (usize, usize, usize)) {
+        let internal = self.0.get_mut();
+        if internal.snapshot_edit_depth != 0 {
+            return;
+        }
+        let after_count = internal.editor.line_count();
+        let after_last = (last + after_count)
+            .saturating_sub(before_count)
+            .max(first)
+            .min(after_count.saturating_sub(1));
+        let editor = &internal.editor;
+        internal.snapshot.replace_lines(
+            first,
+            last + 1,
+            (first..=after_last).map(|index| {
+                let ending = editor.line(index).expect("native line exists").ending;
+                (
+                    editor.buffer().lines[index].text(),
+                    ending,
+                    terminator(ending, index + 1 == after_count),
+                )
+            }),
+        );
+    }
+
+    /// Clone an immutable, Send snapshot in constant time. Its complete text
+    /// is materialized once on whichever worker actually needs it.
+    pub fn text_snapshot(&self) -> TextSnapshot {
+        self.0.borrow().snapshot.clone()
     }
 
     /// Native multiline insertion and removal shift row vectors repeatedly.
@@ -1264,6 +1400,18 @@ where
         find_in_lines(lines.map(|line| line.text), query, || false).unwrap_or_default()
     }
 
+    pub fn find_matches_with(
+        &self,
+        query: &str,
+        options: crate::editor_search::FindOptions,
+    ) -> Result<Vec<(Position, Position)>, String> {
+        let internal = self.0.borrow();
+        let lines =
+            (0..internal.editor.line_count()).filter_map(|index| internal.editor.line(index));
+        crate::editor_search::find_in_lines(lines.map(|line| line.text), query, options, || false)
+            .map(Option::unwrap_or_default)
+    }
+
     pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
         let internal = self.0.borrow();
         let count = internal.editor.line_count();
@@ -1287,16 +1435,7 @@ where
     /// This is a length, not a fingerprint: equal lengths do not imply equal
     /// text, so it can only rule a change *in*, never out.
     pub fn text_len(&self) -> usize {
-        let internal = self.0.borrow();
-        let count = internal.editor.line_count();
-        let mut length = 0;
-        for index in 0..count {
-            let Some(line) = internal.editor.line(index) else {
-                break;
-            };
-            length += line.text.len() + terminator(line.ending, index + 1 == count).len();
-        }
-        length
+        self.0.borrow().snapshot.len()
     }
 
     /// Returns an iterator of the text of the lines in the [`Content`].
@@ -1309,6 +1448,8 @@ where
 
     /// Returns the text of the [`Content`].
     pub fn text(&self) -> String {
+        #[cfg(test)]
+        TEXT_CALLS.with(|count| count.set(count.get() + 1));
         let internal = self.0.borrow();
         let count = internal.editor.line_count();
         let mut contents = String::new();
@@ -1380,6 +1521,16 @@ where
             change,
             before: selection,
         })
+    }
+
+    /// Exact selected span, including native word/line selections.
+    pub(crate) fn selected_cursor(&self) -> Cursor {
+        let cursor = self.cursor();
+        let anchor = cursor.selection.unwrap_or(cursor.position);
+        let first = cursor.position.line.min(anchor.line).saturating_sub(1);
+        let last =
+            (cursor.position.line.max(anchor.line) + 1).min(self.line_count().saturating_sub(1));
+        self.selected_span(&self.excerpt(first, last), cursor)
     }
 
     /// The caret with the exact span it has selected.
@@ -1568,7 +1719,9 @@ where
                 self.perform(Action::Edit(Edit::Paste(Arc::new(replacement.to_owned()))));
                 return;
             }
+            let window = self.snapshot_edit_window();
             if self.try_splice(replacement, Some(breaks)) {
+                self.refresh_snapshot(window);
                 return;
             }
             let mut previous = 0;
@@ -4917,17 +5070,27 @@ mod tests {
                 if let Some(edit) = content.perform_edit(edit) {
                     history.record(edit.change, kind, edit.before, content.cursor(), now);
                 }
+                assert_eq!(
+                    content.text_snapshot().text().as_ref(),
+                    content.text(),
+                    "snapshot round {round} step {step}"
+                );
+                assert_eq!(content.text_len(), content.text().len());
             }
             let last = content.text();
             let last_lines = native_lines(&content);
-            while history.undo(&mut content) == Replay::Applied {}
+            while history.undo(&mut content) == Replay::Applied {
+                assert_eq!(content.text_snapshot().text().as_ref(), content.text());
+            }
             assert_eq!(content.text(), original, "round {round}");
             assert_eq!(
                 native_lines(&content),
                 original_lines,
                 "native undo, round {round}"
             );
-            while history.redo(&mut content) == Replay::Applied {}
+            while history.redo(&mut content) == Replay::Applied {
+                assert_eq!(content.text_snapshot().text().as_ref(), content.text());
+            }
             assert_eq!(content.text(), last, "round {round}");
             assert_eq!(
                 native_lines(&content),

@@ -4246,9 +4246,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn diff_hunk_aliases_use_review_scope_and_leave_other_panes_untouched() {
+        use keyboard::key::{Code, Named};
+        let shortcuts = KeyboardShortcuts::default();
+        let events = [
+            (key_press("j",Code::KeyJ,keyboard::Modifiers::ALT,false),GlobalShortcut::ReviewNextChange),
+            (key_press("k",Code::KeyK,keyboard::Modifiers::ALT,false),GlobalShortcut::ReviewPreviousChange),
+            (named_key_press(Named::F7,Code::F7,keyboard::Modifiers::empty(),false),GlobalShortcut::ReviewNextChange),
+            (named_key_press(Named::F7,Code::F7,keyboard::Modifiers::SHIFT,false),GlobalShortcut::ReviewPreviousChange),
+        ];
+        for (event,expected) in events {
+            assert_eq!(global_shortcut(&event,&shortcuts,FocusedPane::Review),Some(expected));
+            for focused in [FocusedPane::Terminal,FocusedPane::Chat,FocusedPane::Other] {
+                assert_eq!(global_shortcut(&event,&shortcuts,focused),None);
+            }
+        }
+    }
+
     /// The review chords are arrow chords a terminal program may well use,
     /// so they are withheld from a card's process only while a pull request
-    /// pane, which is the only thing that acts on them, has focus.
+    /// or repository diff pane has focus.
     #[test]
     fn review_chords_are_reserved_only_while_a_review_pane_has_focus() {
         use keyboard::key::{Code, Physical};

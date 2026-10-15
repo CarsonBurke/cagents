@@ -297,8 +297,8 @@ impl Default for KeyboardShortcuts {
             review_next_file: vec!["Alt+Down".to_owned()],
             review_previous_file: vec!["Alt+Up".to_owned()],
             review_next_unviewed: vec!["Alt+Shift+Down".to_owned()],
-            review_next_change: vec!["Alt+J".to_owned()],
-            review_previous_change: vec!["Alt+K".to_owned()],
+            review_next_change: vec!["Alt+J".to_owned(), "F7".to_owned()],
+            review_previous_change: vec!["Alt+K".to_owned(), "Shift+F7".to_owned()],
             command_palette: vec!["Ctrl+Shift+P".to_owned()],
             new_native_thread: vec!["Ctrl+T".to_owned(), "Ctrl+Shift+N".to_owned()],
             chat_permissions: vec!["Ctrl+Shift+O".to_owned()],
@@ -854,6 +854,8 @@ pub struct AppSettings {
     #[serde(default = "default_diff_hide_unchanged")]
     pub diff_hide_unchanged: bool,
     #[serde(default)]
+    pub diff_ignore_whitespace: bool,
+    #[serde(default)]
     pub editor_syntax_theme: EditorSyntaxTheme,
     #[serde(default = "default_confirm_terminal_close")]
     pub confirm_terminal_close: bool,
@@ -904,6 +906,8 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    #[serde(default)]
+    pub editor_replace_preserve_case: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -915,6 +919,8 @@ pub struct AppSettings {
     /// header would read as a key inside that table.
     #[serde(default = "default_language_servers")]
     pub language_servers: Vec<LanguageServerSettings>,
+    #[serde(default)]
+    pub editor_find_options: EditorFindOptions,
     #[serde(default, deserialize_with = "deserialize_keyboard_shortcuts")]
     pub keyboard_shortcuts: KeyboardShortcuts,
     #[serde(default)]
@@ -959,6 +965,7 @@ impl Default for AppSettings {
             browser_search_url: default_browser_search_url(),
             editor_wrap_lines: false,
             diff_hide_unchanged: default_diff_hide_unchanged(),
+            diff_ignore_whitespace: false,
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
             chat_enter_sends: default_chat_enter_sends(),
@@ -971,10 +978,21 @@ impl Default for AppSettings {
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
+            editor_find_options: EditorFindOptions::default(),
+            editor_replace_preserve_case: false,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+/// Persisted matching preferences shared by editor find surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorFindOptions {
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub whole_word: bool,
 }
 
 /// One language a server handles, and the file extensions that select it.
@@ -1133,7 +1151,7 @@ struct V2TomlSettings {
 /// `shortcut_defaults_revision`; one without it predates the first change of
 /// defaults and is at revision 1. Loading a file at an older revision moves
 /// every action still bound to that revision's default onto this build's.
-pub const SHORTCUT_DEFAULTS_REVISION: u32 = 5;
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 7;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
@@ -1157,6 +1175,7 @@ struct RetiredShortcutDefault {
 /// Revision 3 adds the conventional new-tab chord to native threads.
 /// Revision 4 restores `Ctrl+W` to close a pane and `Alt+R` to cycle its width.
 /// Revision 5 separates project search from find in the focused pane.
+/// Revision 7 adds F7 aliases to hunk navigation without replacing custom chords.
 const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
@@ -1212,6 +1231,16 @@ const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
         action: "search_projects",
         retired_in: 5,
         chords: &["Ctrl+F"],
+    },
+    RetiredShortcutDefault {
+        action: "review_next_change",
+        retired_in: 7,
+        chords: &["Alt+J"],
+    },
+    RetiredShortcutDefault {
+        action: "review_previous_change",
+        retired_in: 7,
+        chords: &["Alt+K"],
     },
 ];
 
@@ -2808,6 +2837,25 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn editor_find_options_round_trip_with_disabled_language_servers() {
+        let settings = AppSettings {
+            language_servers: Vec::new(),
+            editor_find_options: EditorFindOptions {
+                case_sensitive: true,
+                regex: true,
+                whole_word: true,
+            },
+            editor_replace_preserve_case: true,
+            ..AppSettings::default()
+        };
+        let serialized = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&serialized).unwrap();
+        assert!(restored.language_servers.is_empty());
+        assert_eq!(restored.editor_find_options, settings.editor_find_options);
+        assert!(restored.editor_replace_preserve_case);
+    }
+
+    #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
         previous_schema
@@ -4024,8 +4072,40 @@ new_thread = "Alt+Shift+G"
         shortcuts.insert("new_terminal".into(), vec!["Alt+J"].into());
         shortcuts.insert("search_projects".into(), vec!["Alt+Shift+Down"].into());
         let migrated: AppSettings = value.try_into().unwrap();
-        assert!(migrated.keyboard_shortcuts.review_next_change.is_empty());
+        assert_eq!(migrated.keyboard_shortcuts.review_next_change, ["F7"]);
         assert!(migrated.keyboard_shortcuts.review_next_unviewed.is_empty());
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_previous_change,
+            ["Alt+K", "Shift+F7"]
+        );
+        migrated.validate().unwrap();
+    }
+
+    #[test]
+    fn diff_hunk_alias_migration_preserves_custom_bindings_and_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let migrate = |settings: &AppSettings| {
+            fs::write(&path, toml::to_string(settings).unwrap()).unwrap();
+            load(&path).unwrap()
+        };
+        let mut previous = AppSettings::default();
+        previous.shortcut_defaults_revision = 6;
+        previous.keyboard_shortcuts.review_next_change = vec!["Alt+J".into()];
+        previous.keyboard_shortcuts.review_previous_change = vec!["Alt+K".into()];
+        let migrated = migrate(&previous);
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_next_change,
+            ["Alt+J", "F7"]
+        );
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_previous_change,
+            ["Alt+K", "Shift+F7"]
+        );
+        previous.keyboard_shortcuts.review_next_change = vec!["Alt+L".into()];
+        previous.keyboard_shortcuts.new_terminal = vec!["Shift+F7".into()];
+        let migrated = migrate(&previous);
+        assert_eq!(migrated.keyboard_shortcuts.review_next_change, ["Alt+L"]);
         assert_eq!(
             migrated.keyboard_shortcuts.review_previous_change,
             ["Alt+K"]

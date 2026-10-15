@@ -34,6 +34,10 @@ pub mod device;
 pub mod device_service;
 pub mod diagnostics;
 #[cfg(feature = "ui")]
+pub mod diff_interaction;
+#[cfg(feature = "ui")]
+pub mod diff_patch;
+#[cfg(feature = "ui")]
 pub mod diff_view;
 #[cfg(feature = "ui")]
 pub mod git_patch;
@@ -45,6 +49,8 @@ pub mod document_render;
 pub mod editor;
 #[cfg(feature = "ui")]
 pub(crate) mod editor_history;
+#[cfg(feature = "ui")]
+pub mod editor_search;
 #[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]

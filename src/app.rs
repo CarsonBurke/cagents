@@ -2377,6 +2377,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::WorkingDiffDue { .. }
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::FindLoaded { .. }
+            | RepositoryAction::DiffFindLoaded { .. }
+            | RepositoryAction::EndDiffSelection { .. }
             | RepositoryAction::AutoSaveDue { .. }
             // Refusing these strands the card's file list and markdown preview
             // behind their own debounce until the next self-heal.
@@ -2635,6 +2637,8 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::ToggleContextInspector
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
+            | Message::Repository(RepositoryAction::OpenWorkingFileLocation { .. })
+            | Message::Repository(RepositoryAction::DiffCommand { command:crate::diff_interaction::Command::OpenInEditor { .. },.. })
             | Message::Sidebar(
                 SidebarAction::OpenRepositoryPicker
                     | SidebarAction::OpenRepository { .. }
@@ -6115,8 +6119,13 @@ impl Cagents {
             self.settings.editor_font_size(),
         );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_find_preferences(
+            self.settings.editor_find_options,
+            self.settings.editor_replace_preserve_case,
+        );
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
+        runtime.set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
         PullRequestPane {
             repository: view.repository.clone(),
             review: pull_request_review::State::new(
@@ -6451,7 +6460,13 @@ impl Cagents {
             self.worktree_owners.insert(card_id, scope);
         }
         self.register_channel_card(card_id);
-        let pane = self.pull_request_pane(&view);
+        let mut pane = self.pull_request_pane(&view);
+        pane.runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card_id).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         self.cards
             .insert(card_id, CardRuntime::PullRequests(Box::new(pane)));
         let index = self.workspace.cards().len();
@@ -6839,12 +6854,23 @@ impl Cagents {
             self.settings.editor_font_size(),
         );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_find_preferences(
+            self.settings.editor_find_options,
+            self.settings.editor_replace_preserve_case,
+        );
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
+        runtime.set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
         if let Some(navigation) = self.durable.repository_navigation.get(&card) {
             runtime.restore_navigation(navigation);
         }
+        runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         let load = repository_task(runtime.initial_load(card));
         self.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -6865,7 +6891,13 @@ impl Cagents {
             );
             return Task::none();
         }
-        let pane = self.pull_request_pane(&view);
+        let mut pane = self.pull_request_pane(&view);
+        pane.runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         self.cards
             .insert(card, CardRuntime::PullRequests(Box::new(pane)));
         self.open_pending_pull_request(card)
@@ -8185,6 +8217,18 @@ impl Cagents {
                 Some(CardRuntime::Chat(runtime)) => {
                     let _ = runtime
                         .set_visible(transition.to == VisibilityClass::Visible && surfaces_visible);
+                }
+                Some(CardRuntime::Repository(runtime)) => {
+                    tasks.push(repository_task(runtime.refresh_diff_visibility(
+                        transition.id,
+                        transition.to == VisibilityClass::Visible && surfaces_visible,
+                    )))
+                }
+                Some(CardRuntime::PullRequests(pane)) => {
+                    tasks.push(repository_task(pane.runtime.refresh_diff_visibility(
+                        transition.id,
+                        transition.to == VisibilityClass::Visible && surfaces_visible,
+                    )))
                 }
                 #[cfg(feature = "integrated-browser")]
                 Some(CardRuntime::Browser(browser)) => {
@@ -10352,8 +10396,13 @@ impl Cagents {
     /// `Open` that is never drained leaves a document the server has not been
     /// told about while the application shows results for it.
     fn drain_lsp_intents(&mut self, card: CardId) -> Task<Message> {
+        let visible = self.workspace_surfaces_visible()
+            && self.durable.cards.iter().any(|state| {
+                state.id == card && state.existence.is_open() && state.exposure == Exposure::Visible
+            });
         let (intents, edits, auto_save) = match self.cards.get_mut(&card) {
             Some(CardRuntime::Repository(runtime)) => {
+                runtime.set_diff_surface_visible(visible);
                 let intents = runtime.take_lsp_intents();
                 // Strictly after `take_lsp_intents`, which is what materialises
                 // the `Change` these edits describe.
@@ -11455,7 +11504,8 @@ impl Cagents {
         })
     }
 
-    fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
+    fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) -> Task<Message> {
+        let mut tasks = Vec::new();
         let visible_cards = self
             .durable
             .cards
@@ -11474,6 +11524,18 @@ impl Cagents {
                 }
                 .map_err(|error| error.to_string()),
                 CardRuntime::Chat(runtime) => runtime.set_visible(visible),
+                CardRuntime::Repository(runtime) => {
+                    tasks.push(repository_task(
+                        runtime.refresh_diff_visibility(*id, visible),
+                    ));
+                    Ok(())
+                }
+                CardRuntime::PullRequests(pane) => {
+                    tasks.push(repository_task(
+                        pane.runtime.refresh_diff_visibility(*id, visible),
+                    ));
+                    Ok(())
+                }
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
                     .handle
@@ -11482,8 +11544,6 @@ impl Cagents {
                 CardRuntime::Loading
                 | CardRuntime::Failed(_)
                 | CardRuntime::Completed
-                | CardRuntime::Repository(_)
-                | CardRuntime::PullRequests(_)
                 | CardRuntime::Settings
                 | CardRuntime::Accounts
                 | CardRuntime::Automations => Ok(()),
@@ -11497,19 +11557,20 @@ impl Cagents {
                 "could not update workspace visibility: {error}"
             )));
         }
+        Task::batch(tasks)
     }
 
-    /// The focused card when it is a repository card showing an editable
-    /// buffer, which is the only context in which the search chord means
-    /// "find in this file" rather than "find a project".
+    /// The focused source pane that can search its own text: either an
+    /// editable buffer or a read-only worktree/PR comparison.
     fn focused_editable_repository_card(&self) -> Option<CardId> {
         let card = self.workspace.focused()?;
         match self.cards.get(&card) {
             Some(CardRuntime::Repository(runtime))
-                if runtime.editor_focus_target(card).is_some() =>
+                if runtime.editor_focus_target(card).is_some() || runtime.shows_diff() =>
             {
                 Some(card)
             }
+            Some(CardRuntime::PullRequests(pane)) if pane.runtime.shows_diff() => Some(card),
             _ => None,
         }
     }
@@ -11520,6 +11581,7 @@ impl Cagents {
         let card = self.workspace.focused()?;
         match self.cards.get(&card) {
             Some(CardRuntime::Repository(runtime)) if runtime.find_is_open() => Some(card),
+            Some(CardRuntime::PullRequests(pane)) if pane.runtime.find_is_open() => Some(card),
             _ => None,
         }
     }
@@ -11751,11 +11813,12 @@ impl Cagents {
         let was_overlay = self.context_inspector_overlay_active;
         let is_overlay = self.context_inspector_is_overlay();
         self.context_inspector_overlay_active = is_overlay;
-        if was_overlay != is_overlay {
-            let visible = self.workspace_surfaces_visible();
-            self.set_workspace_surfaces_visible(visible);
-        }
-        match context_overlay_change(was_overlay, is_overlay) {
+        let visibility = if was_overlay != is_overlay {
+            self.set_workspace_surfaces_visible(self.workspace_surfaces_visible())
+        } else {
+            Task::none()
+        };
+        let focus = match context_overlay_change(was_overlay, is_overlay) {
             ContextOverlayChange::Entered => self.enter_context_overlay(),
             ContextOverlayChange::Exited
                 if !self.context_inspector_open || self.workspace.focused().is_none() =>
@@ -11774,7 +11837,8 @@ impl Cagents {
                 Task::none()
             }
             ContextOverlayChange::Unchanged => Task::none(),
-        }
+        };
+        Task::batch([visibility, focus])
     }
 
     fn set_context_inspector_open(&mut self, open: bool) -> Task<Message> {
@@ -12886,10 +12950,30 @@ impl Cagents {
         {
             let font = crate::terminal::monospace_font(self.settings.editor_font_family());
             let size = self.settings.editor_font_size();
+            for (&card, runtime) in self.cards.iter_mut() {
+                let runtime = match runtime {
+                    CardRuntime::Repository(runtime) => runtime,
+                    CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                    _ => continue,
+                };
+                runtime.set_editor_font(font, size);
+                tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
+                tasks.push(repository_task(runtime.restore_font_viewport()));
+            }
+        }
+        if previous.editor_find_options != self.settings.editor_find_options
+            || previous.editor_replace_preserve_case != self.settings.editor_replace_preserve_case
+        {
             for runtime in self.cards.values_mut() {
                 match runtime {
-                    CardRuntime::Repository(runtime) => runtime.set_editor_font(font, size),
-                    CardRuntime::PullRequests(pane) => pane.runtime.set_editor_font(font, size),
+                    CardRuntime::Repository(runtime) => runtime.set_find_preferences(
+                        self.settings.editor_find_options,
+                        self.settings.editor_replace_preserve_case,
+                    ),
+                    CardRuntime::PullRequests(pane) => pane.runtime.set_find_preferences(
+                        self.settings.editor_find_options,
+                        self.settings.editor_replace_preserve_case,
+                    ),
                     _ => {}
                 }
             }
@@ -14211,6 +14295,60 @@ impl Application for Cagents {
             Message::Repository(RepositoryAction::Language { card, action }) => {
                 self.update_editor_lsp(card, action)
             }
+            Message::Repository(RepositoryAction::OpenWorkingFileLocation { identity, line }) => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let (descriptor, review) = match self.cards.get(&identity.card) {
+                    Some(CardRuntime::Repository(runtime)) => {
+                        (runtime.diff_working_file_target(&identity), false)
+                    }
+                    Some(CardRuntime::PullRequests(pane)) => {
+                        (pane.runtime.diff_working_file_target(&identity), true)
+                    }
+                    _ => return Task::none(),
+                };
+                let Some(descriptor) = descriptor else {
+                    return Task::none();
+                };
+                let mut tasks = Vec::new();
+                let destination = if review {
+                    let existing = self.repository_card_for(&descriptor.worktree).filter(|card| matches!(self.cards.get(card),Some(CardRuntime::Repository(runtime)) if !(runtime.is_dirty() || runtime.is_saving()) || runtime.selected_path() == Some(identity.path.as_path())));
+                    match existing {
+                        Some(card) => card,
+                        None => {
+                            tasks.push(self.add_repository_card(
+                                descriptor.project,
+                                descriptor.repository,
+                                descriptor.worktree,
+                            ));
+                            let Some(card) = self.workspace.focused() else {
+                                return Task::batch(tasks);
+                            };
+                            card
+                        }
+                    }
+                } else {
+                    identity.card
+                };
+                // PR snapshots stay read-only in their review card. The working
+                // file opens in a repository card with normal save/LSP/close
+                // ownership, and its native coordinates are clamped on load.
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&destination) {
+                    tasks.push(repository_task(runtime.open_file_location(
+                        destination,
+                        identity.path,
+                        line,
+                        0,
+                        0,
+                    )));
+                }
+                if let Ok(update) = self.workspace.focus(destination) {
+                    tasks.push(self.apply_viewport(update, true, false));
+                }
+                tasks.push(self.drain_lsp_intents(destination));
+                Task::batch(tasks)
+            }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let path = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => {
@@ -14222,9 +14360,35 @@ impl Application for Cagents {
                 };
                 path.map_or_else(Task::none, |path| self.open_file_in_editor(path, editor_id))
             }
+
             Message::Repository(RepositoryAction::ApplyDiffSelection { card, kind }) => self.start_diff_patch(card, kind, None),
             Message::Repository(RepositoryAction::ApplyDiffHunk { card, kind, request }) => self.start_diff_patch(card, kind, Some(request)),
             Message::DiffPatchPrepared { key, identity, buffer_revision, result } => self.finish_diff_patch(key, identity, buffer_revision, result),
+
+            Message::Repository(RepositoryAction::RevertFile { card }) => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+                    return Task::none();
+                };
+                let Some(source) = self
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
+                    .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
+                else {
+                    return Task::none();
+                };
+                let Some(request) = runtime.selected_discard_request() else {
+                    return Task::none();
+                };
+                self.update(Message::Sidebar(SidebarAction::RequestDiscard {
+                    key: source.key.clone(),
+                    request,
+                }))
+            }
+
             Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
                 if self.modal_is_open() {
                     return Task::none();
@@ -14267,6 +14431,31 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::Review { card, action }) => {
                 self.handle_pull_request_review(card, action)
+            }
+            Message::Repository(RepositoryAction::ToggleDiffWhitespace { card: origin }) => {
+                self.settings.diff_ignore_whitespace = !self.settings.diff_ignore_whitespace;
+                let enabled = self.settings.diff_ignore_whitespace;
+                let visible = self
+                    .durable
+                    .cards
+                    .iter()
+                    .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
+                    .map(|card| card.id)
+                    .collect::<HashSet<_>>();
+                let mut tasks = Vec::new();
+                for (&card, runtime) in self.cards.iter_mut() {
+                    let runtime = match runtime {
+                        CardRuntime::Repository(runtime) => runtime,
+                        CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                        _ => continue,
+                    };
+                    runtime.set_diff_ignore_whitespace(enabled);
+                    if card == origin || visible.contains(&card) {
+                        tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
+                    }
+                }
+                tasks.push(self.save_settings_task(false));
+                Task::batch(tasks)
             }
             Message::Repository(RepositoryAction::ZoomFont { card, delta }) => {
                 self.update(Message::ZoomFont {
@@ -14320,6 +14509,11 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
+                let find_preferences_changed = matches!(
+                    &action,
+                    RepositoryAction::FindOptionsChanged { .. }
+                        | RepositoryAction::PreserveCaseChanged { .. }
+                );
                 let completion_character = match &action {
                     RepositoryAction::EditorAction {
                         action:
@@ -14368,6 +14562,31 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                if find_preferences_changed {
+                    let preferences = match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => Some(runtime.find_preferences()),
+                        Some(CardRuntime::PullRequests(pane)) => {
+                            Some(pane.runtime.find_preferences())
+                        }
+                        _ => None,
+                    };
+                    if let Some((options, preserve)) = preferences {
+                        self.settings.editor_find_options = options;
+                        self.settings.editor_replace_preserve_case = preserve;
+                        for runtime in self.cards.values_mut() {
+                            match runtime {
+                                CardRuntime::Repository(runtime) => {
+                                    runtime.set_find_preferences(options, preserve)
+                                }
+                                CardRuntime::PullRequests(pane) => {
+                                    pane.runtime.set_find_preferences(options, preserve)
+                                }
+                                _ => {}
+                            }
+                        }
+                        tasks.push(self.save_settings_task(false));
+                    }
+                }
                 tasks.push(self.restore_repository_editor_focus());
                 if let Some(character) = completion_character
                     && let Some(doc) = self.lsp_document(card)
@@ -16235,6 +16454,69 @@ impl Application for Cagents {
                             .map(cosmic::Action::App);
                     }
                 }
+                if !captured
+                    && !self.workspace_inputs_blocked()
+                    && let Some(card) = self.workspace.focused()
+                    && let Some(runtime) = match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => Some(runtime),
+                        Some(CardRuntime::PullRequests(pane)) => Some(&pane.runtime),
+                        _ => None,
+                    }
+                    && runtime.shows_diff()
+                    && !runtime.find_input_is_focused()
+                    && let keyboard::Event::KeyPressed { key, modifiers, .. } = &event
+                {
+                    use repository_widget::ClipboardOp;
+                    let action = match key {
+                        keyboard::Key::Character(character)
+                            if modifiers.command()
+                                && !modifiers.alt()
+                                && character.eq_ignore_ascii_case("c") =>
+                        {
+                            Some(RepositoryAction::Clipboard {
+                                card,
+                                op: ClipboardOp::Copy,
+                            })
+                        }
+                        keyboard::Key::Character(character)
+                            if modifiers.command()
+                                && !modifiers.alt()
+                                && character.eq_ignore_ascii_case("a") =>
+                        {
+                            Some(RepositoryAction::Clipboard {
+                                card,
+                                op: ClipboardOp::SelectAll,
+                            })
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowUp)
+                            if !modifiers.command() && !modifiers.alt() =>
+                        {
+                            Some(RepositoryAction::MoveDiffSelection {
+                                card,
+                                delta: -1,
+                                extend: modifiers.shift(),
+                            })
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+                            if !modifiers.command() && !modifiers.alt() =>
+                        {
+                            Some(RepositoryAction::MoveDiffSelection {
+                                card,
+                                delta: 1,
+                                extend: modifiers.shift(),
+                            })
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Escape)
+                            if !runtime.find_is_open() && runtime.has_diff_selection() =>
+                        {
+                            Some(RepositoryAction::ClearDiffSelection { card })
+                        }
+                        _ => None,
+                    };
+                    if let Some(action) = action {
+                        return cosmic::task::message(Message::Repository(action));
+                    }
+                }
                 if is_escape_press(&event) && !captured {
                     if self.transient_work_close.is_some() {
                         return cosmic::task::message(Message::CancelTransientWorkClose);
@@ -16337,6 +16619,22 @@ impl Application for Cagents {
                     }
                 }
                 if let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::F3),
+                    modifiers,
+                    ..
+                } = &event
+                    && !modifiers.control()
+                    && !modifiers.alt()
+                    && !modifiers.logo()
+                    && let Some(card) = self.focused_repository_card_with_find()
+                {
+                    return cosmic::task::message(Message::Repository(if modifiers.shift() {
+                        RepositoryAction::FindPrevious { card }
+                    } else {
+                        RepositoryAction::FindNext { card }
+                    }));
+                }
+                if let keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Enter),
                     modifiers,
                     ..
@@ -16345,7 +16643,13 @@ impl Application for Cagents {
                     && !modifiers.alt()
                     && !modifiers.logo()
                     && let Some(card) = self.workspace.focused()
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
+                    && match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => runtime.find_input_is_focused(),
+                        Some(CardRuntime::PullRequests(pane)) => {
+                            pane.runtime.find_input_is_focused()
+                        }
+                        _ => false,
+                    }
                 {
                     return cosmic::task::message(Message::Repository(if modifiers.shift() {
                         RepositoryAction::FindPrevious { card }
@@ -16363,6 +16667,28 @@ impl Application for Cagents {
                 }
                 if !captured && let Some(task) = self.chat_scroll_key(&event) {
                     return task;
+                }
+                if !captured
+                    && let keyboard::Event::KeyPressed {
+                        key,
+                        physical_key,
+                        modifiers,
+                        ..
+                    } = &event
+                    && let Some(card) = self.workspace.focused()
+                    && match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => runtime.shows_diff(),
+                        Some(CardRuntime::PullRequests(pane)) => pane.runtime.shows_diff(),
+                        _ => false,
+                    }
+                    && let Some(delta) =
+                        crate::interaction::font_zoom_chord(key, *physical_key, *modifiers)
+                {
+                    return self.update(Message::ZoomFont {
+                        card,
+                        delta,
+                        editor: true,
+                    });
                 }
                 if is_save_press(&event)
                     && let Some(card) = self.workspace.focused()
@@ -18317,6 +18643,7 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     #[test]
+
     fn git_mutation_queue_coalesces_neighbors_and_keeps_destructive_order() {
         use super::QueuedGitMutation as Queued;
         let selection = |name: &str| {
@@ -18368,6 +18695,33 @@ mod tests {
         assert!(report.contains("\n\nGit output:\n"));
         assert!(report.contains("hook output"));
         assert!(!report.contains("Some("));
+    }
+
+    #[test]
+
+    fn diff_find_completions_and_drag_cleanup_survive_modal_guards() {
+        let card = CardId::new();
+        assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::DiffFindLoaded {
+                card,
+                ticket: uuid::Uuid::new_v4(),
+                result: Ok(Some(Vec::new()))
+            }
+        ));
+        assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::EndDiffSelection { card }
+        ));
+        assert!(!repository_action_allowed_while_modal(
+            &RepositoryAction::DiffCommand {
+                card,
+                generation: 0,
+                revision: 0,
+                mode: crate::diff_view::DiffMode::Inline,
+                sources: [(0, 0); 2],
+                command: crate::diff_interaction::Command::Copy
+            }
+        ));
+
     }
 
     #[test]
@@ -25254,6 +25608,97 @@ mod tests {
                 Some(crate::settings_widgets::search_id())
             );
             assert_eq!(app.workspace.focused(), Some(pane));
+        }
+    }
+
+    #[test]
+    fn diff_working_location_keeps_focus_and_card_count_during_an_active_save() {
+        let (mut app,_) = pull_request_test_app(&[]);
+        let saving = app.workspace.focused().unwrap();
+        let (origin,task) = app.add_pull_requests_card(PathBuf::from("/repo"));
+        drop(task);
+        let (runtime,identity) = RepositoryRuntime::diff_snapshot_fixture(origin,"source.rs","old\n","new\n");
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&origin) else { panic!("review card") };
+        pane.runtime = runtime;
+        let (saving_runtime,_) = RepositoryRuntime::post_persist_failure_fixture(saving);
+        app.cards.insert(saving,CardRuntime::Repository(Box::new(saving_runtime)));
+        let update = app.workspace.focus(saving).unwrap();
+        drop(app.apply_viewport(update,false,false));
+        assert!(app.focused_repository_is_saving());
+        let count = app.cards.len();
+        drop(app.update(Message::Repository(RepositoryAction::OpenWorkingFileLocation { identity,line:0 })));
+        assert_eq!(app.workspace.focused(),Some(saving));
+        assert_eq!(app.cards.len(),count);
+        assert!(workspace_navigation_blocked_during_save(&Message::Repository(RepositoryAction::DiffCommand {
+            card:origin,generation:0,revision:0,mode:crate::diff_view::DiffMode::Inline,sources:[(0,0);2],
+            command:crate::diff_interaction::Command::OpenInEditor { row:0,side:crate::diff_interaction::Side::New },
+        })));
+    }
+
+    #[test]
+    fn opening_pr_diff_working_file_preserves_review_and_uses_editor_owned_card() {
+        let (mut app, _) = pull_request_test_app(&[]);
+        let directory = tempfile::tempdir().unwrap();
+        let (origin, task) = app.add_pull_requests_card(directory.path().to_path_buf());
+        drop(task);
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&origin) else {
+            panic!("review card")
+        };
+        let (mut runtime, mut identity) = RepositoryRuntime::diff_snapshot_fixture(
+            origin,
+            "source.rs",
+            "old\nkept\n",
+            "new\nkept\n",
+        );
+        runtime.descriptor.worktree = directory.path().to_path_buf();
+        runtime.descriptor.repository = directory.path().to_path_buf();
+        identity.worktree = directory.path().to_path_buf();
+        pane.runtime = runtime;
+        let mut stale = identity.clone();
+        stale.generation += 1;
+        drop(app.update(Message::Repository(
+            RepositoryAction::OpenWorkingFileLocation {
+                identity: stale,
+                line: 1,
+            },
+        )));
+        assert_eq!(app.workspace.focused(), Some(origin));
+        drop(app.update(Message::Repository(
+            RepositoryAction::OpenWorkingFileLocation { identity, line: 1 },
+        )));
+        let target = app.workspace.focused().unwrap();
+        assert_ne!(target, origin);
+        assert!(
+            matches!(app.cards.get(&origin),Some(CardRuntime::PullRequests(pane)) if pane.runtime.shows_diff() && pane.runtime.selected_path() == Some(Path::new("source.rs")))
+        );
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&target) else {
+            panic!("working source belongs to a repository editor")
+        };
+        assert_eq!(runtime.selected_path(), Some(Path::new("source.rs")));
+        assert_eq!(runtime.navigation().unwrap().editor.unwrap().caret.line, 1);
+    }
+
+    #[test]
+    fn viewport_transitions_hide_and_reveal_diff_work_without_a_repository_action() {
+        use crate::workspace::VisibilityTransition;
+        let (mut app, card) = editing_repository_app();
+        for (from, to, expected) in [
+            (VisibilityClass::Visible, VisibilityClass::Overscan, false),
+            (VisibilityClass::Overscan, VisibilityClass::Offscreen, false),
+            (VisibilityClass::Offscreen, VisibilityClass::Visible, true),
+        ] {
+            drop(app.apply_viewport(
+                ViewportUpdate {
+                    offset_changed: false,
+                    transitions: vec![VisibilityTransition { id: card, from, to }],
+                },
+                false,
+                false,
+            ));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                panic!("repository fixture")
+            };
+            assert_eq!(runtime.diff_surface_is_visible(), expected);
         }
     }
 
