@@ -4,6 +4,7 @@ use std::{fmt, io};
 mod types;
 mod fs;
 mod index;
+mod lifetime;
 pub(crate) use index::{InstallationIndex, Namespace, NamespaceRead, RegisteredBinding};
 pub(crate) use types::{AccountBindingData, BindingData, CacheIdentity, FileIdentity,
     SessionNamespace, SourceReadProofData, UnixPath};
