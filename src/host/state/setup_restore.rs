@@ -92,14 +92,14 @@ mod tests {
             store.save(&checkpoint).unwrap();
             let mut state = HostState::new(proof("replacement"));
             if has_pane {
-            let mut registry = super::super::super::model::Registry::at(&root.join("model.sqlite3")).unwrap();
-            registry.apply(&ModelEdit::OpenProject { repository: root.to_owned(), name: "setup".into(), kind: Default::default() }).unwrap();
-            let scope = Scope::Worktree { repository: root.to_owned(), path: root.to_owned() };
-            registry.apply(&ModelEdit::SeedView { scope, closed: Vec::new(), panes: vec![Pane {
-                id: CardId::new(), title: "Worktree setup".into(), user_title: None,
-                pending_terminal_start: true, width_fraction: 1.0, scope: Some(root.to_owned()),
-                kind: CardKind::Terminal(setup.clone()),
-            }] }).unwrap();
+                let mut registry = super::super::super::model::Registry::at(&root.join("model.sqlite3")).unwrap();
+                registry.apply(&ModelEdit::OpenProject { repository: root.to_owned(), name: "setup".into(), kind: Default::default() }).unwrap();
+                let scope = Scope::Worktree { repository: root.to_owned(), path: root.to_owned() };
+                registry.apply(&ModelEdit::SeedView { scope, closed: Vec::new(), panes: vec![Pane {
+                    id: CardId::new(), title: "Worktree setup".into(), user_title: None,
+                    pending_terminal_start: true, width_fraction: 1.0, scope: Some(root.to_owned()),
+                    kind: CardKind::Terminal(setup.clone()),
+                }] }).unwrap();
                 state.install_model(registry);
             }
             let host = Arc::new(HostLock::new(state));
