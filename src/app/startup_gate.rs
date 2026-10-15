@@ -31,9 +31,7 @@ impl Cagents {
                 card.existence.is_open()
                     && match &card.kind {
                         CardKind::Chat(session) => !session.is_unstarted(),
-                        CardKind::Terminal(session) => {
-                            !terminal_ended(session) && agent_ui::observes_terminal_agent(session)
-                        }
+                        CardKind::Terminal(session) => !terminal_ended(session),
                         _ => false,
                     }
             })
@@ -50,13 +48,15 @@ impl Cagents {
             .filter(|card| card.existence.is_open())
         {
             if let CardKind::Terminal(session) = &card.kind {
-                if terminal_ended(session) || !agent_ui::observes_terminal_agent(session) {
+                if terminal_ended(session) {
                     continue;
                 }
                 match self.cards.get(&card.id) {
                     Some(CardRuntime::Terminal(surface))
                         if surface.terminal_id() == session.id
-                            && surface.host_proof() == session.continuity.live_proof() => {}
+                            && session.continuity.live_proof().is_some_and(|proof| proof.is_complete()
+                                && surface.host_proof().as_ref() == Some(&proof))
+                            && !surface.snapshot().detached => {}
                     Some(CardRuntime::Loading) | None => pending = true,
                     _ => failures.push(card.id),
                 }
@@ -87,7 +87,7 @@ impl Cagents {
         }
         if !failures.is_empty() {
             return Err(format!(
-                "recovery-incomplete: {} saved conversations could not reconnect (panes {}). Open those chats and use Restart session or Resume conversation. Their drafts and recovery evidence are retained; this window remains available.",
+                "recovery-incomplete: {} saved panes could not reconnect (panes {}). Open the affected panes and use their recovery controls. Their drafts and recovery evidence are retained; this window remains available.",
                 failures.len(),
                 failures
                     .iter()
