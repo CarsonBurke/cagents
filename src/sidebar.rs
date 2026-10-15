@@ -4571,6 +4571,7 @@ impl SidebarState {
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
             | SidebarAction::NewWorktree { .. }
+            | SidebarAction::CreateProjectWorktree(_)
             | SidebarAction::NewChannel { .. }
             | SidebarAction::OpenChannel { .. }
             | SidebarAction::DeleteChannel { .. }
@@ -4793,6 +4794,9 @@ pub enum SidebarAction {
         project_id: ProjectId,
         repository: PathBuf,
     },
+    /// Captured project authority and branch; the host must validate this
+    /// original target before opening or submitting its creation dialog.
+    CreateProjectWorktree(commands::ProjectCreationTarget),
     /// Opens the project's PR browser, including PRs without local worktrees.
     BrowsePullRequests {
         project_id: ProjectId,
@@ -5252,6 +5256,7 @@ fn view_inner<'a>(
     utility_context: Option<&crate::workspace_widget::CommandContext>,
 ) -> Element<'a, SidebarAction> {
     let compact = mode == SidebarMode::Compact;
+    let creation_allowed = utility_context.is_none_or(|context| !context.save_in_flight && !context.remote_device);
     let width = effective_width(mode, persisted_width);
     let loading = matches!(&model.data_state, SidebarDataState::Loading);
     let header_loading = loading && !model.projects.is_empty();
@@ -5292,19 +5297,21 @@ fn view_inner<'a>(
                         cache.generation(model, state),
                         compact,
                         modal_open,
+                        creation_allowed,
                         crate::design::typography_revision(),
                         shortcut_generation,
                     ),
-                    move |_| project_list(model, state, compact, modal_open, &shortcuts),
+                    move |_| project_list_with_creation_allowed(model, state, compact, modal_open, &shortcuts, creation_allowed),
                 )
                 .into()
             } else {
-                body(
+                body_with_creation_allowed(
                     model,
                     state,
                     compact,
                     modal_open,
                     &Arc::new(shortcuts.clone()),
+                    creation_allowed,
                 )
             },
         )
@@ -5685,6 +5692,7 @@ fn filters(filter: SidebarFilter, modal_open: bool) -> Element<'static, SidebarA
     row.into()
 }
 
+#[cfg(test)]
 fn body<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
@@ -5692,25 +5700,48 @@ fn body<'a>(
     modal_open: bool,
     shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
 ) -> Element<'a, SidebarAction> {
+    body_with_creation_allowed(model, state, compact, modal_open, shortcuts, true)
+}
+
+fn body_with_creation_allowed<'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    compact: bool,
+    modal_open: bool,
+    shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
+    creation_allowed: bool,
+) -> Element<'a, SidebarAction> {
     match &model.data_state {
         SidebarDataState::Loading if !model.projects.is_empty() => {
-            project_list(model, state, compact, modal_open, shortcuts)
+            project_list_with_creation_allowed(model, state, compact, modal_open, shortcuts, creation_allowed)
         }
         SidebarDataState::Loading => loading(),
         SidebarDataState::Error(message) => error(message, compact, modal_open),
-        SidebarDataState::Ready => project_list(model, state, compact, modal_open, shortcuts),
+        SidebarDataState::Ready => project_list_with_creation_allowed(model, state, compact, modal_open, shortcuts, creation_allowed),
     }
 }
 
 /// The scrollable project list. `responsive` is avoided here because it does
 /// not forward child accessibility nodes, and every row in this list is a
 /// named a11y target.
+#[cfg(test)]
 fn project_list<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
     compact: bool,
     modal_open: bool,
     shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
+) -> Element<'static, SidebarAction> {
+    project_list_with_creation_allowed(model, state, compact, modal_open, shortcuts, true)
+}
+
+fn project_list_with_creation_allowed<'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    compact: bool,
+    modal_open: bool,
+    shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
+    creation_allowed: bool,
 ) -> Element<'static, SidebarAction> {
     let projects = filtered_projects(model, state, compact);
     if projects.is_empty() {
@@ -5743,6 +5774,7 @@ fn project_list<'a>(
             modal_open,
             sticky_viewport.clone(),
             shortcuts,
+            creation_allowed,
         ));
     }
 
@@ -6441,6 +6473,7 @@ fn project_view<'a>(
     modal_open: bool,
     sticky_viewport: row_interaction::StickyViewport,
     shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
+    creation_allowed: bool,
 ) -> Element<'static, SidebarAction> {
     let entity = project.project;
     let chrome = &entity.chrome;
@@ -6468,6 +6501,7 @@ fn project_view<'a>(
             modal_open,
             sticky_viewport,
             shortcuts,
+            creation_allowed,
         );
     }
 
@@ -6503,18 +6537,7 @@ fn project_view<'a>(
             .height(Length::Fixed(ICON_CONTROL_SIZE))
             .into()
     };
-    let add_worktree = project_icon_action(
-        Icon::WorktreeAdd,
-        chrome.new_worktree_name.to_string(),
-        gated(
-            SidebarAction::NewWorktree {
-                project_id,
-                repository: entity.repository.clone(),
-            },
-            modal_open,
-        ),
-        chrome.new_worktree_id.clone(),
-    );
+    let add_worktree = project_creation_control(entity, modal_open, creation_allowed);
     let add_channel = project_icon_action(
         Icon::ChannelAdd,
         chrome.new_channel_name.to_string(),
@@ -6565,6 +6588,7 @@ fn project_view<'a>(
         header,
         project_id,
         None,
+        project_creation_targets_when_allowed(entity, None, creation_allowed),
         modal_open,
         entity.kind == ProjectKind::Git,
         true,
@@ -6619,6 +6643,7 @@ fn project_view<'a>(
                     worktree_view(
                         project_id,
                         worktree,
+                        project_creation_targets_when_allowed(entity, Some(worktree.id), creation_allowed),
                         is_primary_worktree(&entity.repository, &worktree.path),
                         project.state.filter == SidebarFilter::PullRequests,
                         selection,
@@ -6699,6 +6724,7 @@ fn compact_project<'a>(
     modal_open: bool,
     sticky_viewport: row_interaction::StickyViewport,
     shortcuts: &Arc<crate::settings::KeyboardShortcuts>,
+    creation_allowed: bool,
 ) -> Element<'static, SidebarAction> {
     let entity = project.project;
     let selected = matches!(
@@ -6719,6 +6745,7 @@ fn compact_project<'a>(
         ),
         entity.id,
         None,
+        project_creation_targets_when_allowed(entity, None, creation_allowed),
         modal_open,
         entity.kind == ProjectKind::Git,
         true,
@@ -6793,6 +6820,7 @@ fn compact_project<'a>(
             worktree_view(
                 entity.id,
                 worktree,
+                project_creation_targets_when_allowed(entity, Some(worktree.id), creation_allowed),
                 is_primary_worktree(&entity.repository, &worktree.path),
                 project.state.filter == SidebarFilter::PullRequests,
                 selection,
@@ -7468,6 +7496,7 @@ fn worktree_indicator(
 fn worktree_view<'a>(
     project_id: ProjectId,
     worktree: &'a SidebarWorktree,
+    creation_targets: [Option<commands::ProjectCreationTarget>; 2],
     primary: bool,
     review_mode: bool,
     selection: Option<SidebarSelection>,
@@ -7674,6 +7703,7 @@ fn worktree_view<'a>(
             action,
             project_id,
             Some(worktree.id),
+            creation_targets,
             inert,
             true,
             worktree.branch.is_some(),
@@ -7759,12 +7789,17 @@ struct ContextCommand<'a>(
     Option<WorktreeId>,
     &'a ProjectCommand,
     Option<&'a [SelectionRow]>,
+    Option<&'a commands::ProjectCreationTarget>,
 );
 
 impl widget::menu::Action for ContextCommand<'_> {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
+        if matches!(self.2, ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch)
+            && let Some(target) = self.4 {
+            return commands::registered(SidebarAction::CreateProjectWorktree(target.clone()));
+        }
         if let Some(rows) = &self.3 {
             return commands::registered(SidebarAction::DeleteRows(rows.to_vec()));
         }
@@ -7789,10 +7824,33 @@ fn new_conversation_label(worktree_id: Option<WorktreeId>) -> &'static str {
     }
 }
 
+/// A press belongs to the published creation owner and its enabled state.
+/// Named button state must not survive replacing that owner under the same project ID.
+fn project_creation_control(project: &SidebarProject, modal_open: bool, allowed: bool) -> Element<'static, SidebarAction> {
+    let target = commands::ProjectCreationTarget::capture_project(project, None, false)
+        .filter(|_| !modal_open && allowed);
+    let enabled = target.is_some();
+    crate::interaction::owned_surface(project_icon_action(
+        Icon::WorktreeAdd,
+        project.chrome.new_worktree_name.to_string(),
+        target.map(SidebarAction::CreateProjectWorktree),
+        project.chrome.new_worktree_id.clone(),
+    ), (project.creation_binding, enabled))
+}
+
+fn project_creation_targets(project: &SidebarProject, worktree: Option<WorktreeId>) -> [Option<commands::ProjectCreationTarget>; 2] {
+    [false, true].map(|from_branch| commands::ProjectCreationTarget::capture_project(project, worktree, from_branch))
+}
+
+fn project_creation_targets_when_allowed(project: &SidebarProject, worktree: Option<WorktreeId>, allowed: bool) -> [Option<commands::ProjectCreationTarget>; 2] {
+    if allowed { project_creation_targets(project, worktree) } else { [None, None] }
+}
+
 fn context_controls<'a>(
     content: impl Into<Element<'a, SidebarAction>>,
     project_id: ProjectId,
     worktree_id: Option<WorktreeId>,
+    creation_targets: [Option<commands::ProjectCreationTarget>; 2],
     modal_open: bool,
     git: bool,
     has_branch: bool,
@@ -7809,6 +7867,7 @@ fn context_controls<'a>(
         worktree_id,
         MenuSelectionIdentity(selection_rows.clone()),
         editors.generation(),
+        creation_targets.clone(),
     );
     let shortcuts = Arc::clone(shortcuts);
     if modal_open || selection_count.is_none() {
@@ -7924,19 +7983,28 @@ fn context_controls<'a>(
             } else {
                 canonical
             };
-            let item = if !has_branch
+            let creation_target = match command {
+                ProjectCommand::NewWorktree => creation_targets[0].as_ref(),
+                ProjectCommand::NewWorktreeFromBranch => creation_targets[1].as_ref(),
+                _ => None,
+            };
+            let creation_unavailable = matches!(command, ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch)
+                && creation_target.is_none();
+            let item = if creation_unavailable || (!has_branch
                 && matches!(
                     command,
                     ProjectCommand::CopyBranch
                         | ProjectCommand::NewWorktreeFromBranch
                         | ProjectCommand::PullRequest
-                ) {
+                )) {
                 Item::ButtonDisabled
             } else {
                 Item::Button
             };
             entries.push(item(
-                if !has_branch
+                if creation_unavailable {
+                    format!("{label} (repository unavailable)")
+                } else if !has_branch
                     && matches!(
                         command,
                         ProjectCommand::CopyBranch
@@ -7957,6 +8025,7 @@ fn context_controls<'a>(
                         rows.len() > 1
                             && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove)
                     }),
+                    creation_target,
                 ),
             ));
         }
@@ -14479,7 +14548,7 @@ pub(crate) mod tests {
         settings.discard_selected_changes = vec!["Ctrl+Alt+F7".into()];
         let command = ProjectCommand::NewChannel;
         assert_hint(
-            ContextCommand(project_id(1), Some(WorktreeId::new()), &command, None),
+            ContextCommand(project_id(1), Some(WorktreeId::new()), &command, None, None),
             &settings,
         );
         assert_hint(
@@ -15051,6 +15120,7 @@ pub(crate) mod tests {
                 worktree_view(
                     project_id(1),
                     &worktree,
+                    [None, None],
                     false,
                     false,
                     None,
@@ -15115,6 +15185,7 @@ pub(crate) mod tests {
             let mut element = worktree_view(
                 project_id(1),
                 &worktree,
+                [None, None],
                 primary,
                 false,
                 None,
@@ -15597,6 +15668,7 @@ pub(crate) mod tests {
             let mut element = worktree_view(
                 project_id(1),
                 worktree,
+                [None, None],
                 true,
                 false,
                 None,
@@ -15703,6 +15775,7 @@ pub(crate) mod tests {
                     false,
                     row_interaction::StickyViewport::default(),
                     &Arc::new(crate::settings::KeyboardShortcuts::default()),
+                    true,
                 ),
                 width,
             )
@@ -16594,6 +16667,7 @@ pub(crate) mod tests {
             content,
             project_id(1),
             None,
+            [None, None],
             false,
             true,
             true,
@@ -17757,6 +17831,7 @@ pub(crate) mod tests {
                     .on_press_maybe((!modal).then_some(SidebarAction::OpenRepositoryPicker)),
                 project_id(1),
                 Some(WorktreeId::from_uuid(Uuid::from_u128(2))),
+                [None, None],
                 modal,
                 true,
                 true,
@@ -18255,6 +18330,106 @@ pub(crate) mod tests {
     /// pull requests came from the read that failed, so nothing built from
     /// them may be pressable.
     #[test]
+    fn project_context_creation_message_keeps_captured_branch_and_owner_after_model_replacement() {
+        use widget::menu::Action;
+        let mut model = panel_model();
+        model.projects[0].creation_binding = Some(crate::model::OperationId::new());
+        let project = model.projects[0].id; let worktree = model.projects[0].worktrees[0].id;
+        let targets = project_creation_targets(&model.projects[0], Some(worktree));
+        let command = ProjectCommand::NewWorktreeFromBranch;
+        let saved = ContextCommand(project, Some(worktree), &command, None, targets[1].as_ref()).message();
+        let SidebarAction::RunCommand { command, action } = saved else { panic!("context action must stay registered") };
+        let original = commands::CommandTarget::from_action(&action).unwrap();
+        assert!(original.accepts(&model, command, &action));
+        model.projects[0].worktrees[0].branch = Some("replacement-branch".into());
+        assert!(!original.accepts(&model, command, &action));
+        model.projects[0].creation_binding = Some(crate::model::OperationId::new());
+        assert!(!original.accepts(&model, command, &action));
+        assert_eq!(commands::CommandTarget::from_action(&action), Some(original));
+        let fresh = project_creation_targets(&model.projects[0], Some(worktree));
+        let current = fresh[1].as_ref().unwrap();
+        assert_eq!(current.branch.as_deref(), Some("replacement-branch"));
+        assert!(current.current_in(&model));
+    }
+
+    #[test]
+    fn project_creation_header_emits_original_published_target_and_disables_unknown_owner() {
+        let renderer = headless_renderer();
+        let mut entry = project();
+        entry.creation_binding = Some(crate::model::OperationId::new());
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let state = SidebarState::default();
+        let captures = |model: &SidebarModel| frame_enter_presses(&renderer,
+            body(model, &state, false, false, &default_menu_shortcuts())).into_iter()
+            .filter_map(|action| match action { SidebarAction::CreateProjectWorktree(target) => Some(target), _ => None }).collect::<Vec<_>>();
+        let old = captures(&model).into_iter().find(|target| target.worktree_id.is_none()).unwrap();
+        assert!(old.current_in(&model));
+        model.projects[0].creation_binding = Some(crate::model::OperationId::new());
+        assert!(!old.current_in(&model));
+        let current = captures(&model).into_iter().find(|target| target.worktree_id.is_none()).unwrap();
+        assert_ne!(old.binding, current.binding);
+        assert!(current.current_in(&model));
+        model.projects[0].creation_binding = None;
+        assert!(captures(&model).is_empty());
+    }
+
+    #[test]
+    fn project_creation_native_press_is_owned_across_retained_cache_replacement() {
+        use cosmic::iced::{Event, Point, advanced::{clipboard, mouse}, runtime::{UserInterface, user_interface::Cache}};
+        let mut renderer = headless_renderer();
+        let mut cache = Cache::default();
+        let mut entry = project();
+        entry.creation_binding = Some(crate::model::OperationId::new());
+        let first = entry.creation_binding.unwrap();
+        let cursor = Point::new(ICON_CONTROL_SIZE / 2.0, ICON_CONTROL_SIZE / 2.0);
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let mut feed = |entry: &SidebarProject, allowed, events: &[Event]| {
+            let mut ui = UserInterface::build(project_creation_control(entry, false, allowed),
+                Size::new(ICON_CONTROL_SIZE, ICON_CONTROL_SIZE), std::mem::take(&mut cache), &mut renderer);
+            let mut messages = Vec::new();
+            ui.update(events, mouse::Cursor::Available(cursor), &mut renderer, &mut clipboard::Null, &mut messages);
+            cache = ui.into_cache();
+            messages
+        };
+        assert!(feed(&entry, true, &[press.clone()]).is_empty());
+        let same = feed(&entry, true, &[release.clone()]);
+        assert!(matches!(same.as_slice(), [SidebarAction::CreateProjectWorktree(target)] if target.binding == first));
+        assert!(feed(&entry, true, &[press.clone()]).is_empty());
+        entry.creation_binding = Some(crate::model::OperationId::new());
+        assert!(feed(&entry, true, &[release.clone()]).is_empty(), "an A press cannot activate replacement B");
+        let fresh = feed(&entry, true, &[press.clone(), release.clone()]);
+        assert!(matches!(fresh.as_slice(), [SidebarAction::CreateProjectWorktree(target)] if Some(target.binding) == entry.creation_binding));
+        assert!(feed(&entry, true, &[press.clone()]).is_empty());
+        assert!(feed(&entry, false, &[]).is_empty());
+        assert!(feed(&entry, true, &[release]).is_empty(), "save admission changes also retire the old press");
+    }
+
+    #[test]
+    fn project_creation_availability_invalidates_navigation_without_blocking_reads() {
+        let renderer = headless_renderer();
+        let mut entry = project();
+        entry.creation_binding = Some(crate::model::OperationId::new());
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let state = SidebarState::default();
+        let cache = NavigationCache::default();
+        let first = cache.generation(&model, &state);
+        model.projects[0].creation_binding = Some(crate::model::OperationId::new());
+        assert_ne!(first, cache.generation(&model, &state));
+        let ready = cache.generation(&model, &state);
+        model.projects[0].reloading = true;
+        assert_ne!(ready, cache.generation(&model, &state));
+        model.projects[0].reloading = false;
+        let shortcuts = default_menu_shortcuts();
+        for compact in [false, true] {
+            let actions = frame_enter_presses(&renderer, body_with_creation_allowed(&model, &state, compact, false, &shortcuts, false));
+            assert!(!actions.iter().any(|action| matches!(action, SidebarAction::CreateProjectWorktree(_))));
+            assert!(actions.iter().any(|action| matches!(action, SidebarAction::OpenRepository { .. } | SidebarAction::OpenWorktree { .. })), "save/device gating preserves navigation");
+        }
+        assert!(project_creation_targets_when_allowed(&model.projects[0], Some(model.projects[0].worktrees[0].id), false).iter().all(Option::is_none));
+    }
+
+    #[test]
     fn folder_projects_remain_selectable_without_git_actions_in_both_sidebar_modes() {
         let renderer = headless_renderer();
         let mut entry = project().with_kind(ProjectKind::Folder);
@@ -18272,7 +18447,7 @@ pub(crate) mod tests {
             assert!(
                 !actions
                     .iter()
-                    .any(|action| matches!(action, SidebarAction::NewWorktree { .. }))
+                    .any(|action| matches!(action, SidebarAction::NewWorktree { .. } | SidebarAction::CreateProjectWorktree(_)))
             );
             let names = accessible_names(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
             assert!(!names.iter().any(|name| name.starts_with("New worktree")));
@@ -18770,6 +18945,7 @@ pub(crate) mod tests {
             let mut element = worktree_view(
                 project_id(1),
                 row,
+                [None, None],
                 false,
                 false,
                 None,

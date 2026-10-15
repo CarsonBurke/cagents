@@ -2,6 +2,50 @@
 use super::*;
 use crate::workspace_widget::GlobalShortcut as Command;
 
+/// Captured project-creation intent. This token is published only by the
+/// accepted original project authority; path/key equality never recreates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCreationTarget {
+    pub(crate) project_id: ProjectId,
+    pub(crate) binding: crate::model::OperationId,
+    pub(crate) worktree_id: Option<WorktreeId>,
+    pub(crate) branch: Option<Arc<str>>,
+}
+impl ProjectCreationTarget {
+    pub fn capture(model: &SidebarModel, project_id: ProjectId, worktree_id: Option<WorktreeId>, from_branch: bool) -> Option<Self> {
+        Self::capture_project(model.project(project_id)?, worktree_id, from_branch)
+    }
+    pub(super) fn capture_project(project: &SidebarProject, worktree_id: Option<WorktreeId>, from_branch: bool) -> Option<Self> {
+        if project.kind != ProjectKind::Git || project.reloading || project.unreachable.is_some()
+            || project.creation_unavailable_reason.is_some() { return None; }
+        let binding = project.creation_binding?;
+        let worktree = match worktree_id {
+            Some(id) => Some(project.worktrees.iter().find(|row| row.id == id && row.deletion.is_none())?),
+            None => None,
+        };
+        let branch = if from_branch {
+            Some(Arc::from(worktree?.branch.as_deref().filter(|branch| !branch.is_empty())?))
+        } else { None };
+        Some(Self { project_id: project.id, binding, worktree_id, branch })
+    }
+    pub fn capture_rows(model: &SidebarModel, rows: &[SelectionRow], from_branch: bool) -> Option<Self> {
+        let [row] = rows else { return None; };
+        match *row {
+            SelectionRow::Project(project) => Self::capture(model, project, None, from_branch),
+            SelectionRow::Worktree(project, worktree) => Self::capture(model, project, Some(worktree), from_branch),
+            SelectionRow::Channel(_) => None,
+        }
+    }
+    pub fn current_in(&self, model: &SidebarModel) -> bool {
+        // This fresh observation only compares against the original capture;
+        // it is never returned as a replacement intent.
+        Self::capture(model, self.project_id, self.worktree_id, self.branch.is_some()).as_ref() == Some(self)
+    }
+    pub fn command(&self) -> Command {
+        if self.branch.is_some() { Command::NewWorktreeFromBranch } else { Command::NewWorktree }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandTarget {
     History {
@@ -13,6 +57,7 @@ pub enum CommandTarget {
     },
     /// Focus belonged to a sidebar control that no longer resolves.
     Unavailable,
+    ProjectCreation(ProjectCreationTarget),
     Rows(Vec<SelectionRow>),
     File {
         key: ActiveWorktreeKey,
@@ -145,6 +190,7 @@ pub fn command_id(action: &SidebarAction) -> Option<Command> {
         return command_id(action);
     }
     Some(match action {
+        SidebarAction::CreateProjectWorktree(target) => target.command(),
         SidebarAction::HistoryCommand { command, .. } => history_command_id(*command),
         SidebarAction::ProjectCommand {
             worktree_id,
@@ -298,6 +344,8 @@ impl CommandTarget {
         binding: Option<crate::model::OperationId>,
     ) -> Option<Self> {
         Some(match action {
+            SidebarAction::CreateProjectWorktree(target) => Self::ProjectCreation(target.clone()),
+            SidebarAction::ProjectCommand { command: ProjectCommand::NewWorktree | ProjectCommand::NewWorktreeFromBranch, .. } => return None,
             SidebarAction::HistoryCommand {
                 key,
                 oid,
@@ -425,6 +473,8 @@ impl CommandTarget {
                 })
             }
             Self::Unavailable | Self::Changes { .. } => None,
+            Self::ProjectCreation(target) => (target.command() == command && target.current_in(model))
+                .then(|| SidebarAction::CreateProjectWorktree(target.clone())),
             Self::File { key, path, .. } => {
                 let source = model.source_control.as_ref()?;
                 if source.key != *key
@@ -500,9 +550,6 @@ impl CommandTarget {
                     {
                         ProjectCommand::PullRequest
                     }
-                    Command::NewWorktreeFromBranch if git && branch.is_some() => {
-                        ProjectCommand::NewWorktreeFromBranch
-                    }
                     Command::MoveProjectUp
                         if worktree.is_none()
                             && model
@@ -542,7 +589,6 @@ impl CommandTarget {
                     Command::NewTerminal => ProjectCommand::NewTerminal,
                     Command::NewChannel if worktree.is_none() => ProjectCommand::NewChannel,
                     Command::NewThread if worktree.is_some() => ProjectCommand::NewChannel,
-                    Command::NewWorktree if git => ProjectCommand::NewWorktree,
                     _ => return None,
                 };
                 Some(project_action(
@@ -703,6 +749,62 @@ impl CommandTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_creation_capture_refuses_replaced_owner_and_branch_without_rebinding_rows() {
+        let mut model = super::super::tests::panel_model();
+        let project = model.projects[0].id; let worktree = model.projects[0].worktrees[0].id;
+        model.projects[0].creation_binding = Some(crate::model::OperationId::new());
+        let row = SelectionRow::Worktree(project, worktree);
+        let saved = ProjectCreationTarget::capture_rows(&model, &[row], true).unwrap();
+        let target = CommandTarget::ProjectCreation(saved.clone());
+        let action = target.resolve(&model, Command::NewWorktreeFromBranch).unwrap();
+        assert_eq!(CommandTarget::from_action(&action), Some(target.clone()));
+        assert!(target.accepts(&model, Command::NewWorktreeFromBranch, &action));
+        model.projects[0].creation_binding = Some(crate::model::OperationId::new());
+        assert!(!saved.current_in(&model));
+        assert!(target.resolve(&model, Command::NewWorktreeFromBranch).is_none());
+        assert!(!target.accepts(&model, Command::NewWorktreeFromBranch, &action));
+        let current = ProjectCreationTarget::capture_rows(&model, &[row], true).unwrap();
+        assert!(current.current_in(&model));
+        model.projects[0].worktrees[0].branch = Some("changed-branch".into());
+        assert!(!current.current_in(&model));
+        assert!(CommandTarget::Rows(vec![row]).resolve(&model, Command::NewWorktreeFromBranch).is_none());
+        assert!(CommandTarget::Rows(vec![row]).resolve(&model, Command::NewWorktree).is_none());
+        assert!(CommandTarget::Rows(vec![row]).resolve(&model, Command::NewTerminal).is_some());
+    }
+
+    #[test]
+    fn project_creation_capture_requires_ready_git_owner_and_exact_single_undeleted_row() {
+        let mut model = super::super::tests::panel_model();
+        let project = model.projects[0].id; let worktree = model.projects[0].worktrees[0].id;
+        let row = SelectionRow::Worktree(project, worktree);
+        assert!(ProjectCreationTarget::capture_rows(&model, &[row], false).is_none());
+        model.projects[0].creation_binding = Some(crate::model::OperationId::new());
+        assert!(ProjectCreationTarget::capture_rows(&model, &[row], false).is_some());
+        assert!(ProjectCreationTarget::capture_rows(&model, &[], false).is_none());
+        assert!(ProjectCreationTarget::capture_rows(&model, &[row,row], false).is_none());
+        assert!(ProjectCreationTarget::capture_rows(&model, &[SelectionRow::Channel(ChannelId::new())], false).is_none());
+        assert!(ProjectCreationTarget::capture_rows(&model, &[SelectionRow::Project(project)], true).is_none());
+        let old_branch = model.projects[0].worktrees[0].branch.take();
+        assert!(ProjectCreationTarget::capture_rows(&model, &[row], true).is_none());
+        assert!(ProjectCreationTarget::capture_rows(&model, &[row], false).is_some());
+        model.projects[0].worktrees[0].branch = old_branch;
+        model.projects[0].worktrees[0].deletion = Some(RowDeletion::Deleting);
+        assert!(ProjectCreationTarget::capture_rows(&model, &[row], false).is_none());
+        model.projects[0].worktrees[0].deletion = None;
+        model.projects[0].reloading = true;
+        assert!(ProjectCreationTarget::capture_rows(&model, &[row], false).is_none());
+        model.projects[0].reloading = false;
+        model.projects[0].unreachable = Some("unreadable".into());
+        assert!(ProjectCreationTarget::capture_rows(&model, &[row], false).is_none());
+        model.projects[0].unreachable = None;
+        model.projects[0].creation_unavailable_reason = Some(Arc::from("read-only host"));
+        assert!(ProjectCreationTarget::capture_rows(&model, &[row], false).is_none());
+        model.projects[0].creation_unavailable_reason = None;
+        model.projects[0].kind = ProjectKind::Folder;
+        assert!(ProjectCreationTarget::capture_rows(&model, &[row], false).is_none());
+    }
 
     #[test]
     fn history_templates_keep_the_shown_commit_and_current_worktree_policy() {
