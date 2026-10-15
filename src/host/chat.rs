@@ -2194,6 +2194,26 @@ pub(super) fn process(
     })
 }
 
+/// Called only while this actor's transition gate is held. Full descriptors
+/// and privately retained restart aliases may identify the current actor;
+/// an arbitrary same-ID request cannot. Captured project rosters additionally
+/// fence their retained execution instance and actor in their close helper.
+fn subscribe_exact_close(host:&SharedHost,client:ClientId,source:&Session)->Result<(),ProtocolError>{
+    let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+    validate_proof(source.proof.as_ref(),state.proof())?;
+    let record=state.chats.get(&source.id).ok_or_else(||unavailable("Exact native chat is not hosted; no replacement was started"))?;
+    let mut published=record.session.clone();
+    published.launch.session_id=record.handle.session_id();
+    published.native_continuity=record.handle.native_continuity();
+    let issued=source==&record.session || source==&published
+        || state.chat_restarts.get(&source.id).is_some_and(|restart|restart.authorizes_close(source,&record.handle));
+    if !issued {return Err(error("The close does not identify the exact hosted conversation; no provider was stopped"));}
+    let record=state.chats.get_mut(&source.id).expect("validated record under host lock");
+    record.subscribers.entry(client).or_insert(false);
+    record.observations.entry(client).or_insert_with(||Observation{after_generation:record.handle.observe_next_update(),..Default::default()});
+    Ok(())
+}
+
 fn process_inner(
     host: &SharedHost,
     client: ClientId,
@@ -2202,7 +2222,7 @@ fn process_inner(
     // Keep explicit close/return and a restart's full pair publication mutually
     // exclusive. Weak entries retain only currently executing transitions.
     let transition = match &request {
-        ClientRequest::ChatStart {session,..}=>Some(session.id),
+        ClientRequest::ChatStart {session,..} | ClientRequest::ChatCloseSession {session}=>Some(session.id),
         ClientRequest::ChatClose {chat_id} | ClientRequest::ChatReturnTerminal {chat_id}=>Some(*chat_id),
         _=>None,
     }.map(|id|restart::transition_gate(host,id));
@@ -2211,6 +2231,15 @@ fn process_inner(
         Some(Err(std::sync::TryLockError::Poisoned(poison)))=>Some(poison.into_inner()),
         Some(Err(std::sync::TryLockError::WouldBlock))=>return Err(unavailable("This exact conversation already has a lifecycle transition in progress; retry its current pane")),
         None=>None,
+    };
+    // Normalize while the transition claim remains held: subscription never
+    // runs ChatAttach, whose completed-actor contract intentionally restarts.
+    let request = match request {
+        ClientRequest::ChatCloseSession {session} => {
+            subscribe_exact_close(host, client, &session)?;
+            ClientRequest::ChatClose {chat_id:session.id}
+        }
+        request=>request,
     };
     match request {
         ClientRequest::ChatPrepareResume { source } => {

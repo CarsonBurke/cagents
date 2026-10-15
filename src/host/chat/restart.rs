@@ -21,6 +21,10 @@ pub(in crate::host) struct Restart {
 }
 impl Restart {
     pub(in crate::host) fn pending(&self) -> bool { self.busy || self.receipt.is_none() }
+    pub(super) fn authorizes_close(&self,source:&Session,actor:&Handle)->bool {
+        !self.busy && self.actor.as_ref().is_some_and(|current|current.same_actor(actor))
+            && (self.aliases.contains(source) || self.receipt.as_ref().is_some_and(|receipt|receipt.replacement()==source))
+    }
 }
 
 struct Claim { host: SharedHost, id: TerminalId }
@@ -149,6 +153,7 @@ fn publish(host:&SharedHost,client:ClientId,source:&Session,actor:&Handle,receip
     if snapshot.session_id!=receipt.replacement().launch.session_id {return Err(unavailable("The restarted actor has not confirmed its exact conversation identity"));}
     let restart=state.chat_restarts.get_mut(&source.id).ok_or_else(||unavailable("The restart was closed before its receipt was published"))?;
     restart.receipt=Some(receipt.clone());
+    restart.plan.release_completed();
     Ok(ServerResponse::ChatRestarted{receipt,snapshot})
 }
 
@@ -245,7 +250,19 @@ for line in sys.stdin:
             assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap().lines().count(),generation+2);
             source=receipt.replacement().clone();actor=replacement;
         }
-        super::super::process(&host,1,ClientRequest::ChatClose{chat_id:source.id}).unwrap();
-        assert!(actor.is_completed());assert!(!host.lock().unwrap().chat_restarts.contains_key(&source.id));
+        // Finish with a completed actor. Management close must never route
+        // through ChatAttach, which would allocate generation four.
+        std::fs::write(root.join("crash"),b"1").unwrap();let _=actor.command(chat::Command::Refresh);
+        let deadline=Instant::now()+Duration::from_secs(5);
+        while !actor.is_completed(){assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(10));}
+        std::fs::remove_file(root.join("crash")).unwrap();
+        let mut forged=source.clone();forged.launch.recipe.environment.insert("OTHER_ACCOUNT".into(),"different".into());
+        assert!(super::super::process(&host,1,ClientRequest::ChatCloseSession{session:forged}).is_err());
+        assert!(host.lock().unwrap().chats[&source.id].handle.same_actor(&actor));
+        assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap().lines().count(),3);
+        super::super::process(&host,1,ClientRequest::ChatCloseSession{session:source.clone()}).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap().lines().count(),3);
+        assert!(actor.is_completed());assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+        assert!(!host.lock().unwrap().chat_restarts.contains_key(&source.id));
     }
 }
