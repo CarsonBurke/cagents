@@ -1,8 +1,8 @@
 //! Actual window inputs for the daemon-owned recovery placement reservation.
 //! Capture clones on the UI thread; directory and Git checks belong to workers.
 use super::*;
-use crate::fs_safety::Root;
-use std::{io, os::unix::fs::MetadataExt};
+use crate::fs_safety::{Root, RecoveryDirectoryStamp, recovery_directory_stamp};
+use std::io;
 
 const MAX_RECOVERY_ROOTS: usize = 256;
 
@@ -26,7 +26,7 @@ pub(super) struct ResolvedWindowRoots {
     /// for an already accepted cleanup lease.
     pub(super) required_projects: Vec<(PathBuf, u32)>,
     pub(super) edited_and_project_roots: Vec<Arc<Root>>,
-    common_directory_candidates: Vec<((u64, u64), Arc<Root>)>,
+    common_directory_candidates: Vec<(RecoveryDirectoryStamp, Arc<Root>)>,
 }
 
 impl Cagents {
@@ -72,8 +72,7 @@ impl ResolvedWindowRoots {
     /// A project's metadata is only a candidate for its own original source.
     /// The issuer/placement still must reject it if any checkout encloses it.
     pub(super) fn holding_candidates(&self, source: &Root) -> io::Result<Vec<Arc<Root>>> {
-        let identity = source.metadata()?;
-        let identity = (identity.dev(), identity.ino());
+        let identity = recovery_directory_stamp(source)?;
         Ok(self.common_directory_candidates.iter().filter_map(|(owner, root)|
             (*owner == identity).then(|| root.clone())).collect())
     }
@@ -95,16 +94,16 @@ impl WindowRecoveryRoots {
         for project in self.projects {
             check_cancelled()?;
             let (source, candidate) = project.recovery_roots().map_err(|error| io::Error::other(error.to_string()))?;
-            let identity = source.metadata()?;
-            common.push(((identity.dev(), identity.ino()), candidate));
+            let identity = recovery_directory_stamp(&source)?;
+            common.push((identity, candidate));
             roots.push(source);
         }
         let mut known = HashSet::new();
         let mut unique = Vec::new();
         for root in roots {
             check_cancelled()?;
-            let metadata = root.metadata()?;
-            if known.insert((metadata.dev(), metadata.ino())) { unique.push(root); }
+            let identity = recovery_directory_stamp(&root)?;
+            if known.insert(identity) { unique.push(root); }
         }
         if unique.len() > MAX_RECOVERY_ROOTS {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Recovery exceeds the bounded current-window root census; no file was changed."));
@@ -173,7 +172,7 @@ mod tests {
         };
         let a = root("source-a"); let b = root("source-b"); let foreign = root("source-c");
         let ma = root("metadata-a"); let mb = root("metadata-b");
-        let identity = |root: &Root| { let m = root.metadata().unwrap(); (m.dev(), m.ino()) };
+        let identity = |root: &Root| recovery_directory_stamp(root).unwrap();
         let census = ResolvedWindowRoots { registry: uuid::Uuid::new_v4(), required_projects: Vec::new(),
             edited_and_project_roots: vec![a.clone(), b.clone()],
             common_directory_candidates: vec![(identity(&a), ma.clone()), (identity(&b), mb.clone())],
