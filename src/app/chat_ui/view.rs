@@ -5146,6 +5146,41 @@ mod tests {
     }
 
     #[test]
+    fn attention_turn_markers_reproject_middle_bindings_and_role_changes_with_unchanged_edges() {
+        use chat::turn_outcomes::{TurnIdentity, TurnIdentityKind, TurnOutcome, TurnOutcomeProjection, VisibleTurnOutcome};
+        let item = |id: &str, role| chat::Item { id: id.into(), role, started_at: None, at: None,
+            content: ItemContent::Text { text: id.into(), thinking: false, phase: chat::Phase::Final } };
+        let items = [item("edge-first", chat::Role::User), item("part-A1", chat::Role::User),
+            item("part-B", chat::Role::Assistant), item("edge-last", chat::Role::Assistant)];
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.session_id = Some("proved-session".into());
+        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection { revision: 1, complete: true, records: vec![VisibleTurnOutcome {
+            outcome: TurnOutcome { identity: TurnIdentity { session_id: "proved-session".into(), kind: TurnIdentityKind::AcceptedInput, id: "confirmed".into() },
+                outcome: crate::agent::ActivityOutcome::Cancelled, finished_at: 1234 }, item_ids: vec!["part-A1".into(), "part-A2".into(), "part-B".into()],
+        }] });
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone()); runtime.refresh();
+        assert!(runtime.turn_outcome_markers.contains_key("part-A1"));
+        let projection = snapshot.turn_outcomes.clone();
+        snapshot.generation += 1;
+        snapshot.items[1] = Arc::new(item("part-A2", chat::Role::User));
+        handle.replace_snapshot_for_test(snapshot.clone()); runtime.refresh();
+        assert!(Arc::ptr_eq(&projection, &runtime.snapshot.turn_outcomes));
+        assert_eq!(runtime.snapshot.items.len(), 4);
+        assert_eq!(runtime.snapshot.items.first().unwrap().id, "edge-first");
+        assert_eq!(runtime.snapshot.items.last().unwrap().id, "edge-last");
+        assert!(!runtime.turn_outcome_markers.contains_key("part-A1"));
+        assert!(runtime.turn_outcome_markers.contains_key("part-A2"), "middle replacement must rebind without a new projection Arc");
+        snapshot.generation += 1;
+        snapshot.items[1] = Arc::new(item("part-A2", chat::Role::Assistant));
+        handle.replace_snapshot_for_test(snapshot); runtime.refresh();
+        assert!(Arc::ptr_eq(&projection, &runtime.snapshot.turn_outcomes));
+        assert!(!runtime.turn_outcome_markers.contains_key("part-A2"));
+        assert!(runtime.turn_outcome_markers.contains_key("part-B"), "role correction changes user preference without changing any item ID");
+    }
+
+    #[test]
     fn conversation_footer_requires_completion_evidence_and_tracks_delegated_waiting() {
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         assert_eq!(runtime.conversation_status(false).1, "Ready");

@@ -46,6 +46,18 @@ impl Marker {
     }
 }
 
+/// Item identity and role decide marker placement. Content bodies and reason
+/// strings do not participate in this once-per-snapshot window fingerprint.
+pub(super) fn window_signature(snapshot: &chat::Snapshot) -> u64 {
+    if snapshot.turn_outcomes.records.is_empty() { return 0; }
+    let mut hasher = std::hash::DefaultHasher::new();
+    snapshot.items.len().hash(&mut hasher);
+    for item in &snapshot.items {
+        (&item.id, item.role as u8, matches!(item.content, chat::ItemContent::Delivery { .. })).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// One marker per proved result, beside its last visible user part when one
 /// exists. Otherwise its last explicitly bound item carries it. This is only
 /// placement: no presentation group or ID spelling grants turn ownership.
