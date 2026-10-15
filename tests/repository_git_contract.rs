@@ -5628,6 +5628,78 @@ fn cancelling_sync_after_pull_reports_the_completed_local_step() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn recoverable_discard_preserves_original_access_despite_outside_default_acl() {
+    const NAME: &str = "recoverable_discard_preserves_original_access_despite_outside_default_acl";
+    if recovery_context::run_isolated_case(NAME) { return; }
+    use std::os::{fd::AsRawFd, unix::fs::{MetadataExt, PermissionsExt}};
+    fn acl(uid: u32) -> Vec<u8> {
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [(0x01u16,6u16,u32::MAX),(0x02,4,uid),
+            (0x04,0,u32::MAX),(0x10,4,u32::MAX),(0x20,0,u32::MAX)] {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&permissions.to_le_bytes());
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        bytes
+    }
+    fn set(file: &fs::File, name: &std::ffi::CStr, bytes: &[u8]) {
+        let result = unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), bytes.as_ptr().cast(), bytes.len(), 0) };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+    fn get(file: &fs::File) -> Option<Vec<u8>> {
+        let size = unsafe { libc::fgetxattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENODATA));
+            return None;
+        }
+        assert!(size <= 64 * 1024);
+        let mut bytes = vec![0u8; size as usize];
+        assert_eq!(unsafe { libc::fgetxattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr(), bytes.as_mut_ptr().cast(), bytes.len()) }, size);
+        Some(bytes)
+    }
+    for original_has_acl in [false, true] {
+        let fixture = Fixture::new().expect("this isolated recovery contract requires Git");
+        fixture.write("tracked.txt", b"base
+");
+        fixture.git_in_work(&["add", "--", "tracked.txt"]);
+        fixture.commit("base");
+        fixture.write("tracked.txt", b"uncommitted secret
+");
+        let original = fs::File::open(fixture.work().join("tracked.txt")).unwrap();
+        original.set_permissions(fs::Permissions::from_mode(0o640)).unwrap();
+        if original_has_acl { set(&original, c"system.posix_acl_access", &acl(12_345)); }
+        let policy = get(&original);
+        assert_eq!(policy.is_some(), original_has_acl);
+        let metadata = original.metadata().unwrap();
+        let context = fixture.recovery_context();
+        let outside = fs::File::open(context.placement().directory().path()).unwrap();
+        set(&outside, c"system.posix_acl_default", &acl(23_456));
+        let service = fixture.service().with_worktree_authority(
+            cagents::repository::WorktreeAuthority::capture(&fixture.work()).unwrap()).unwrap()
+            .with_recovery_context(context);
+        let cancel = CancellationToken::new();
+        let discarded = service.discard_recoverable(&DiscardRequest {
+            worktree: fixture.work(), tracked: vec![PathSelection::new(path("tracked.txt"))],
+            untracked: vec![], confirmed: true,
+        }, &cancel).unwrap();
+        assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }));
+        assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"base
+");
+        let outcome = service.undo_discard(&discarded.recovery, &cancel).unwrap();
+        assert!(matches!(outcome, MutationOutcome::Applied { .. }), "{outcome:?}");
+        let restored = fs::File::open(fixture.work().join("tracked.txt")).unwrap();
+        assert_eq!(get(&restored), policy, "outside named readers must not replace original ACL absence/presence");
+        let actual = restored.metadata().unwrap();
+        assert_eq!((actual.uid(), actual.gid(), actual.mode() & 0o7777),
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777));
+        assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"uncommitted secret
+");
+        assert!(!discarded.recovery.live_recovery.needs_resolution());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn recoverable_discard_restores_blob_under_restrictive_umask() {
     const NAME: &str = "recoverable_discard_restores_blob_under_restrictive_umask";
     if recovery_context::run_isolated_case(NAME) { return; }
