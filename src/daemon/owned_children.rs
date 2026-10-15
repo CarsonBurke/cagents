@@ -174,3 +174,55 @@ fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
     }
     Ok(children)
 }
+
+/// Proof available only after the dedicated sole reaper has no children.
+/// A root exit or an empty process census cannot construct this receipt.
+pub(crate) struct ReapedFamily(());
+
+/// Kill/reap children of a dedicated single-threaded subreaper. Never call in
+/// the daemon. Orphans of killed children become this owner's children, so
+/// repeated pinned direct-child passes cover detached sessions without PGIDs.
+pub(crate) fn terminate_owned_family(deadline: Instant) -> io::Result<Option<ReapedFamily>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut subreaper = 0i32;
+    if unsafe {libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut subreaper, 0, 0, 0)} != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if subreaper != 1 || std::fs::read_dir("/proc/self/task")?.collect::<io::Result<Vec<_>>>()?.len() != 1 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,"Family cleanup requires its dedicated single-threaded subreaper"));
+    }
+    loop {
+        for pid in direct_children()? {
+            if Instant::now() >= deadline { return Ok(None); }
+            let descriptor = unsafe {libc::syscall(libc::SYS_pidfd_open, pid, 0)};
+            if descriptor < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {continue;}
+                return Err(error);
+            }
+            let descriptor = unsafe {std::fs::File::from_raw_fd(descriptor as i32)};
+            // This helper is the only reaper. The child cannot recycle its PID
+            // between the kernel's children snapshot and opening its pidfd.
+            if unsafe {libc::syscall(libc::SYS_pidfd_send_signal, descriptor.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0)} < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {return Err(error);}
+            }
+        }
+        loop {
+            match unsafe {libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG)} {
+                pid if pid > 0 => continue,
+                0 => break,
+                _ => {
+                    let error = io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(libc::ECHILD) => return Ok(Some(ReapedFamily(()))),
+                        Some(libc::EINTR) => continue,
+                        _ => return Err(error),
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {return Ok(None);}
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
