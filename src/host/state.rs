@@ -4391,11 +4391,16 @@ mod tests {
         let mut state = test_host();
         state.register_client(1);
         state.reserve_spawn(session.id).unwrap();
+        let previous_handle=TerminalHandle::spawn(session.clone(),TerminalConfig::default(),|_|{}).unwrap();
+        let previous=state.finish_spawn(1,session.clone(),previous_handle.clone(),true).unwrap();
+        previous_handle.shutdown().unwrap();state.terminals.remove(&session.id).unwrap();
+        state.reserve_spawn(session.id).unwrap();
         let handle =
             TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
         let descriptor = state
             .finish_spawn(1, session.clone(), handle.clone(), true)
             .unwrap();
+        assert_ne!(previous.execution_instance,descriptor.execution_instance);
         let mut registry =
             super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
         registry
@@ -4463,7 +4468,7 @@ mod tests {
             state.spawning.remove(&session.id);
         }
         // Simulate the UI's older A receipt while this actual B was published.
-        let older_worker=uuid::Uuid::new_v4();
+        let older_worker=previous.execution_instance;
         handle.shutdown().unwrap();
         let retired=state.terminals.remove(&session.id).unwrap();
         assert_eq!(retired.handle.execution_instance(),descriptor.execution_instance);
@@ -4471,6 +4476,10 @@ mod tests {
         let old=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:snapshot.views[0].revision,operation:uuid::Uuid::new_v4(),change:Change::RemoveSource {registry:snapshot.identity,repository:directory.path().into(),before:pane.clone(),execution_instance:Some(older_worker)}};
         assert!(state.edit_model(1,old).is_err(),"retired successor B must not disappear behind absent resident inventory");
         assert_eq!(state.read_model().unwrap(),snapshot);
+        let history=std::mem::take(&mut state.published_terminal_workers);
+        let unknown=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:snapshot.views[0].revision,operation:uuid::Uuid::new_v4(),change:Change::RemoveSource {registry:snapshot.identity,repository:directory.path().into(),before:pane.clone(),execution_instance:Some(descriptor.execution_instance)}};
+        assert!(state.edit_model(1,unknown).is_err(),"unknown/restart-lost/evicted history cannot authenticate absence");
+        assert_eq!(state.read_model().unwrap(),snapshot);state.published_terminal_workers=history;
         let mut ended = pane.clone();
         if let CardKind::Terminal(source) = &mut ended.kind {
             source.continuity = TerminalContinuity::Exited {
