@@ -625,6 +625,27 @@ impl Handle {
             Owner::Remote(remote) => remote.preserve(),
         }
     }
+    pub(crate) fn preserve_for_restart_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        match &self.0 {
+            Owner::Local(local) => local.preserve_for_restart_until(deadline),
+            Owner::Remote(remote) => remote.preserve_until(deadline),
+        }
+    }
+
+    /// Close the provider before waiting on final semantic retirement.
+    pub(crate) fn shutdown_provider_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        match &self.0 {
+            Owner::Local(local) => local.close_until(deadline),
+            Owner::Remote(remote) => remote.shutdown_provider_until(deadline),
+        }
+    }
+
     pub(crate) fn close_for_resume(&self) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.close_for_resume(),

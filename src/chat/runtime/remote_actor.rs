@@ -1245,6 +1245,27 @@ impl RemoteActor {
             .take();
         Ok(())
     }
+    /// Daemon shutdown already retains this exact proxy/record. Await the
+    /// authenticated provider-close ACK without allocating another actor thread.
+    /// Final proxy publication and semantic retirement follow in the separately
+    /// owned finish-close phase; an IO timeout never proves provider cleanup.
+    pub(crate) fn shutdown_provider_until(&self, deadline: Instant) -> Result<(), String> {
+        let remaining = deadline.checked_duration_since(Instant::now())
+            .ok_or("Retained provider shutdown budget expired; its owner is retained")?;
+        let millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX).min(32_000);
+        let _publication: ClosePublication = self.call_until("close_until", json!([millis]), deadline)?;
+        Ok(())
+    }
+
+    /// Preserve is a one-winner helper transition. Only its authenticated ACK
+    /// authorizes marking this attachment preserved; installation alone cannot.
+    pub(crate) fn preserve_until(&self, deadline: Instant) -> Result<(), String> {
+        self.call_until::<()>("preserve", Value::Null, deadline)?;
+        self.0.preserved.store(true, Ordering::Release);
+        self.0.stop.store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub fn preserve(&self) -> Result<(), String> {
         self.call::<()>("preserve", Value::Null)?;
         self.0.preserved.store(true, Ordering::Release);

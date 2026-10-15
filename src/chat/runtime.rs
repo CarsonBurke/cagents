@@ -1722,6 +1722,28 @@ impl LocalHandle {
         self.close_inner(true, None)
     }
 
+    pub(crate) fn preserve_for_restart_until(&self, deadline: Instant) -> Result<(), String> {
+        if Instant::now() >= deadline {
+            return Err("Provider preservation budget expired; its original owner is retained".into());
+        }
+        if !matches!(self.try_close_identity()?.native_continuity,
+            super::NativeContinuity::Durable { .. }) {
+            return Err("This native provider has no verified durable owner".into());
+        }
+        let admission = match self.0.ownership_admission.try_lock() {
+            Ok(admission) => admission,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(
+                "Provider ownership admission is busy; its original owner remains retained".into()),
+        };
+        if self.0.release_native.load(Ordering::Acquire) {
+            return Err("Native provider session stop already owns cleanup".into());
+        }
+        self.0.preserve_native.store(true, Ordering::Release);
+        drop(admission);
+        self.close_inner(true, Some(deadline))
+    }
+
     fn claim_native_preservation(&self) -> Result<(), String> {
         let _admission = self
             .0
@@ -1829,7 +1851,10 @@ impl LocalHandle {
             deadline.unwrap_or_else(|| Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE),
         )?;
         if let Some(deadline) = deadline {
-            return self.reconcile_native_until(deadline);
+            // A preserved holder belongs to the successor. Never feed it into
+            // ordinary retained-close reconciliation merely to meet a budget.
+            return if preserving { self.close_result() }
+                else { self.reconcile_native_until(deadline) };
         }
         {
             let mut retained = self
