@@ -139,6 +139,8 @@ struct Holding {
     // This producer retains at most four file FDs plus the receipt's bounded
     // directory handles, below MAX_RECOVERY_DESCRIPTORS (16).
     files: Vec<File>,
+    // Removal and parent durability are distinct irreversible phases.
+    cleanup_sync_complete: bool,
 }
 impl Holding {
     fn create(parent: &Root, source: &File, context: &FilesystemRecoveryContext) -> Result<Self, FileIoError> {
@@ -161,6 +163,7 @@ impl Holding {
             context,
             slot: Some(slot),
             files: vec![source],
+            cleanup_sync_complete: false,
         })
     }
     fn root(&self) -> &Root { self.publication.directory() }
@@ -185,7 +188,9 @@ impl Holding {
         } else {
             self.context.placement().validate().map_err(io_error)?;
         }
-        fs_safety::sync_directory(self.context.placement().directory()).map_err(io_error)
+        sync_cleanup_parent(self.context.placement().directory()).map_err(io_error)?;
+        self.cleanup_sync_complete = true;
+        Ok(())
     }
     fn retain(mut self) -> RecoveryAuthority {
         let description = self.location();
@@ -218,6 +223,20 @@ impl Holding {
             self.root().path().display()
         )
     }
+}
+
+// Only the holding-removal durability boundary is injected in tests. Ordinary
+// source-parent Saved(Unconfirmed) handling remains independent.
+fn sync_cleanup_parent(parent: &Root) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.replace(false)) {
+        return Err(io::Error::other("injected outside holding parent sync failure"));
+    }
+    fs_safety::sync_directory(parent)
+}
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_CLEANUP_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The replacement is prepared privately, then the actual current destination
@@ -276,7 +295,7 @@ fn publish_with_hooks(
         after_publish,
         sync_parent,
     );
-    if holding.publication.is_removed() {
+    if holding.publication.is_removed() && holding.cleanup_sync_complete {
         return result;
     }
     // Publication cleanup may have acquired an unexpected entry. Preserve the
@@ -1152,6 +1171,56 @@ mod tests {
         error.recovery_authority().unwrap().retry().unwrap();
         assert_eq!(fs::read(foreign.join("foreign")).unwrap(), b"preserve");
         assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"base");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_acquisition_outer_result_keeps_removed_holding_parent_sync_custody() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) { FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.set(false)); }
+        }
+        for committed in [false, true] {
+            let (directory, root) = fixture();
+            let runtime = tempfile::tempdir().unwrap();
+            // Keep the unique old inode linked after committed replacement so
+            // parallel tests cannot reuse its inode number after FD release.
+            fs::hard_link(directory.path().join("file"), directory.path().join("inode-witness")).unwrap();
+            let original = fs::metadata(directory.path().join("file")).unwrap();
+            let original = (original.dev(), original.ino());
+            let original_file_is_pinned = || fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
+                fs::metadata(entry.unwrap().path()).is_ok_and(|metadata| metadata.is_file()
+                    && (metadata.dev(), metadata.ino()) == original)
+            });
+            let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), false).unwrap();
+            let fixture = fixture_context(&root);
+            let context = FilesystemRecoveryContext::new(&root, std::sync::Arc::new(Some(protection)), fixture.placement().clone()).unwrap();
+            drop(fixture);
+            let outside = context.placement().directory().path().to_owned();
+            FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.set(true));
+            let _reset = Reset;
+            let result = save_file_at_with_hooks_in_context(
+                &root, Path::new("file"), "mine", blake3::hash(b"base"), false,
+                || if committed { Ok(()) } else { Err(io::Error::other("before publication refusal")) },
+                fs_safety::sync_directory, &context,
+            );
+            assert!(!FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.get()), "the real holding-removal sync boundary must be reached");
+            let authority = match result {
+                Ok(SaveOutcome::Saved { durability: SaveDurability::Recovery { authority, .. }, .. }) if committed => authority,
+                Err(FileIoError::Recovery { authority, .. }) if !committed => authority,
+                other => panic!("the actual outer save result must retain pending cleanup: {other:?}"),
+            };
+            assert!(fs::read_dir(&outside).unwrap().next().is_none(), "the actual holding was already removed");
+            assert_eq!(fs::read(directory.path().join("file")).unwrap(), if committed { b"mine" } else { b"base" });
+            drop(context);
+            assert!(original_file_is_pinned(), "unresolved removal durability keeps original authenticated FD");
+            assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).is_err());
+            authority.retry().unwrap();
+            assert!(authority.is_resolved());
+            assert!(!original_file_is_pinned());
+            drop(crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true).unwrap());
+            assert_eq!(fs::read(directory.path().join("file")).unwrap(), if committed { b"mine" } else { b"base" });
+        }
     }
 
     #[test]
