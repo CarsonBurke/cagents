@@ -160,6 +160,11 @@ impl Handle {
     ) -> Result<super::remote_actor::ActorInspection, String> {
         RemoteActor::inspect(record, proof)
     }
+    /// Read-only authenticated census with one absolute connect/frame budget.
+    /// No attach epoch, source, provider input or ownership is changed.
+    pub(crate) fn inspect_remote_until(record:&crate::daemon::holder_registry::Record,proof:crate::model::HostSessionProof,deadline:std::time::Instant)->Result<super::remote_actor::ActorInspection,String> {
+        RemoteActor::inspect_until(record,proof,deadline)
+    }
     pub(crate) fn is_remote_record(record: &crate::daemon::holder_registry::Record) -> bool {
         RemoteActor::is_record(record)
     }

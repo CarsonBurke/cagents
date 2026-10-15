@@ -4,6 +4,7 @@ mod journal;
 pub(crate) mod restart;
 pub(crate) use restart::{RestartCleanup, RestartFailure, RestartReceipt, RestartState};
 pub(crate) mod final_snapshot;
+mod deadline_io;
 use super::{LocalHandle, Rejection, Update};
 use crate::{
     chat::{
@@ -596,25 +597,24 @@ impl RemoteActor {
         Ok(handle)
     }
     pub fn inspect(record: &Record, proof: HostSessionProof) -> Result<ActorInspection, String> {
+        Self::inspect_until(record,proof,Instant::now()+TIMEOUT)
+    }
+    pub fn inspect_until(record:&Record,proof:HostSessionProof,deadline:Instant)->Result<ActorInspection,String> {
+        let socket=registry::socket(&registry::directory(Kind::Native)?,record.terminal);
+        Self::inspect_at_until(record,proof,&socket,deadline)
+    }
+    fn inspect_at_until(record:&Record,proof:HostSessionProof,socket:&std::path::Path,deadline:Instant)->Result<ActorInspection,String> {
+        if Instant::now()>=deadline {return Err("Retained actor inspection deadline expired".into());}
         validate_record(record)?;
-        let control = registry::connect(&registry::socket(
-            &registry::directory(Kind::Native)?,
-            record.terminal,
-        ))
-        .map_err(|error| error.to_string())?;
-        verify_peer(&control, record)?;
-        send(
-            &control,
-            &Invocation {
-                proof,
-                epoch: None,
-                method: "inspect".into(),
-                args: Value::Null,
-            },
-            TIMEOUT,
-        )?;
-        let response: Result<ActorInspection, String> = receive(&control, TIMEOUT)?;
-        response
+        let control=registry::connect_until(socket,deadline).map_err(|error|error.to_string())?;
+        verify_peer(&control,record)?;
+        deadline_io::send_until(&control,&Invocation {proof,epoch:None,method:"inspect".into(),args:Value::Null},deadline)?;
+        let response:Result<ActorInspection,String>=deadline_io::receive_until(&control,deadline)?;
+        let response=response?;
+        if response.identity.record!=*record || response.source.id!=record.terminal {
+            return Err("Retained actor inspection returned another exact holder identity".into());
+        }
+        Ok(response)
     }
     pub fn adopt(
         record: &Record,
@@ -2913,6 +2913,33 @@ done"#;
         );
         release.send(()).unwrap();
         finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn read_only_inspection_of_a_stalled_exact_peer_obeys_one_budget_without_actor_changes() {
+        let fixture=resident_fixture();
+        let mut record=fixture.server.identity.record.clone();
+        record.boot=crate::daemon::read_boot_id().unwrap();
+        record.build.as_mut().unwrap().capabilities.push(CAPABILITY.into());
+        let socket=fixture._root.path().join("deadline-inspect.sock");
+        let listener=UnixListener::bind(&socket).unwrap();
+        let (release,wait)=crossbeam_channel::bounded(1);
+        let peer=thread::spawn(move|| {
+            let (control,_)=listener.accept().unwrap();
+            let request:Invocation=receive(&control,TIMEOUT).unwrap();
+            assert_eq!(request.method,"inspect");assert!(request.epoch.is_none());
+            // SO_PEERCRED has identified this exact Record.holder process, but
+            // its inspection response stalls. The client must still return.
+            let _=wait.recv_timeout(Duration::from_secs(2));
+        });
+        let epoch=fixture.server.epoch;let source=fixture.server.source.clone();
+        let started=Instant::now();
+        let error=RemoteActor::inspect_at_until(&record,fixture.server.proof.clone(),&socket,started+Duration::from_millis(40)).err().expect("stalled inspection must time out");
+        let elapsed=started.elapsed();let _=release.send(());peer.join().unwrap();
+        assert!(error.contains("deadline"));assert!(elapsed<Duration::from_millis(250));
+        assert_eq!(fixture.server.epoch,epoch);assert_eq!(fixture.server.source,source);
+        assert!(!fixture.server.actor.0.stop.load(Ordering::Acquire));
+        assert!(fixture.server.pending.is_empty());assert_eq!(fixture.server.journal.lock().unwrap().latest().unwrap(),0);
     }
 
     #[test]
