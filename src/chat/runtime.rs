@@ -161,39 +161,99 @@ impl Handle {
     /// and expose exact contradictions received from a helper.
     pub(crate) fn source_authority_conflict(&self)->Option<SourceAuthority> {None}
     pub(crate) fn refresh_source_authority(&self) {
-        let (authority,unavailable)={
-            let mut store=self.0.store.lock().unwrap_or_else(|p|p.into_inner());
-            let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
-            store.publish_source_authority(&mut state);
-            (store.source_authority(),store.source_authority_unavailable())
-        };
-        if unavailable.is_some() {
-            if !self.0.source_unavailable.swap(true,Ordering::AcqRel) {
-                self.0.source_dirty.store(true,Ordering::Release);
-                self.wake();
-            }
-            return;
-        }
-        if let Some(authority)=authority {
-            let changed={
-                let mut cached=self.0.source_authority.lock().unwrap_or_else(|p|p.into_inner());
-                if cached.is_some_and(|old|old.generation>authority.generation) || *cached==Some(authority) {false}
-                else {*cached=Some(authority);true}
-            };
-            if changed {
-                self.0.source_dirty.store(true,Ordering::Release);
-                self.wake();
-            }
-        }
+        let observer={self.0.store.lock().unwrap_or_else(|p|p.into_inner()).source_authority_observer()};
+        refresh_source_authority_observer(observer);
     }
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
+/// Only bounded source metadata and the wake descriptor survive an observer
+/// lookup. This capability owns no provider Handle, holder or cleanup lease.
+struct SourceRefreshContext {
+    store:Arc<Mutex<Store>>,
+    state:Arc<Mutex<Snapshot>>,
+    source_authority:Arc<Mutex<Option<SourceAuthority>>>,
+    source_dirty:Arc<AtomicBool>,
+    source_unavailable:Arc<AtomicBool>,
+    wake:Arc<UnixStream>,
+}
+impl SourceRefreshContext {
+    fn capture(inner:&Inner)->Self {
+        Self {store:inner.store.clone(),state:inner.state.clone(),source_authority:inner.source_authority.clone(),source_dirty:inner.source_dirty.clone(),source_unavailable:inner.source_unavailable.clone(),wake:inner.source_wake.clone()}
+    }
+    fn wake(&self) {
+        let byte=[1u8];
+        // The context owns the descriptor. A wake is a one-byte hint, and must
+        // not wait on another caller's wake mutex or a full socket buffer.
+        unsafe {libc::send(self.wake.as_raw_fd(),byte.as_ptr().cast(),byte.len(),libc::MSG_DONTWAIT|libc::MSG_NOSIGNAL);}
+    }
+    fn refresh(&self,expected:&std::sync::Weak<Inner>)->Result<(),std::sync::Weak<Inner>> {
+        let (authority,unavailable)={
+            let mut store=self.store.lock().unwrap_or_else(|p|p.into_inner());
+            let current=store.source_authority_observer();
+            if !current.ptr_eq(expected) {return Err(current);}
+            let mut state=self.state.lock().unwrap_or_else(|p|p.into_inner());
+            store.publish_source_authority(&mut state);
+            (store.source_authority(),store.source_authority_unavailable())
+        };
+        if unavailable.is_some() {
+            if !self.source_unavailable.swap(true,Ordering::AcqRel) {
+                self.source_dirty.store(true,Ordering::Release);
+                self.wake();
+            }
+            return Ok(());
+        }
+        if let Some(authority)=authority {
+            let changed={
+                let mut cached=self.source_authority.lock().unwrap_or_else(|p|p.into_inner());
+                if cached.is_some_and(|old|old.generation>authority.generation) || *cached==Some(authority) {false}
+                else {*cached=Some(authority);true}
+            };
+            if changed {
+                self.source_dirty.store(true,Ordering::Release);
+                self.wake();
+            }
+        }
+        Ok(())
+    }
+}
+/// Called after cache readers release Store and cursor locks. Upgrading only
+/// captures metadata; the strong process owner is dropped before any wait/SQL.
+fn refresh_source_authority_observer(observer:std::sync::Weak<Inner>) {
+    refresh_source_authority_observer_captured(observer,||{});
+}
+fn refresh_source_authority_observer_captured(mut observer:std::sync::Weak<Inner>,after_capture:impl FnOnce()) {
+    let mut after_capture=Some(after_capture);
+    for _ in 0..8 {
+        let Some(inner)=observer.upgrade() else {return;};
+        let context=SourceRefreshContext::capture(&inner);
+        drop(inner);
+        if let Some(after_capture)=after_capture.take() {after_capture();}
+        match context.refresh(&observer) {
+            Ok(())=>return,
+            // The replacement already reseeded Store under this same mutex.
+            // Re-select outside Store ownership; never drop a last Inner while
+            // holding the Store lock or retain it across metadata SQL.
+            Err(current)=>observer=current,
+        }
+    }
+    // Repeated actual rebinds already seed the latest authority themselves.
+    // Leave a bounded nonblocking service hint rather than pinning a provider
+    // through an unbounded retry loop. No token/ACK is manufactured here.
+    if let Some(inner)=observer.upgrade() {
+        let context=SourceRefreshContext::capture(&inner);
+        drop(inner);
+        context.source_dirty.store(true,Ordering::Release);
+        context.wake();
+    }
+}
+
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     urgent_commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
+    source_wake:Arc<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
@@ -355,6 +415,7 @@ impl Handle {
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
         nonblocking(&reader)?;
+        let source_wake=Arc::new(wake.try_clone().map_err(|error|error.to_string())?);
         let (commands, incoming) = crossbeam_channel::bounded(64);
         let (urgent_commands, urgent_incoming) = crossbeam_channel::bounded(1);
         let state = Arc::new(Mutex::new(Snapshot {
@@ -393,6 +454,7 @@ impl Handle {
             commands,
             urgent_commands,
             wake: Mutex::new(wake),
+            source_wake,
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
             source_authority: source_authority.clone(),
@@ -3862,6 +3924,55 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_observer_tail_does_not_retain_the_last_provider_owner_while_store_is_held() {
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step::default())}
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let marker=directory.path().join("provider.pid");
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sh".into(),arguments:vec!["-c".into(),"printf '%s' $$ > \"$1\"; exec /bin/cat".into(),"source-observer".into(),marker.to_str().unwrap().into()],working_directory:directory.path().into(),environment:Default::default()};
+        let mut initial=Step::default();
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Idle),initial,store,None,|_|{}).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(3);
+        let pid=loop {
+            if let Ok(value)=std::fs::read_to_string(&marker) {
+                if let Ok(pid)=value.parse::<u32>() {break pid;}
+            }
+            assert!(Instant::now()<deadline,"owned process did not publish its pid");
+            thread::sleep(Duration::from_millis(5));
+        };
+        let descriptor=unsafe {libc::syscall(libc::SYS_pidfd_open,pid,0)};
+        assert!(descriptor>=0);
+        let identity=unsafe {OwnedFd::from_raw_fd(descriptor as i32)};
+        let weak=Arc::downgrade(&handle.0);
+        let completed=handle.0.completed.clone();
+        let store=handle.0.store.clone();
+        let held=store.lock().unwrap();
+        let observer=held.source_authority_observer();
+        let (captured,capture)=crossbeam_channel::bounded(1);
+        let tail=thread::spawn(move ||refresh_source_authority_observer_captured(observer,||captured.send(()).unwrap()));
+        capture.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(weak.strong_count(),1,"observer must drop Inner before waiting on Store");
+        let before=Instant::now();
+        drop(handle);
+        assert!(before.elapsed()<Duration::from_millis(250));
+        assert_eq!(weak.strong_count(),0,"only metadata survives the blocked tail");
+        drop(held);
+        tail.join().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(3);
+        while !completed.load(Ordering::Acquire) {
+            assert!(Instant::now()<deadline,"actual actor teardown did not settle");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut fd=libc::pollfd {fd:identity.as_raw_fd(),events:libc::POLLIN,revents:0};
+        assert_eq!(unsafe {libc::poll(&mut fd,1,0)},1,"exact owned process must exit after Store is released");
+    }
+
     #[test]
     fn unchanged_idle_activity_publishes_new_outcomes_once_with_their_reason() {
         struct ActivityFixture;
