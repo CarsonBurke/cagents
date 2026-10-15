@@ -6673,7 +6673,7 @@ impl Cagents {
                 if !runtime.snapshot.native_helper.as_ref().is_some_and(|helper| helper.outdated) {
                     return Task::none();
                 }
-                runtime.error = Some("This provider cannot guarantee a safe automatic helper restart. Stop the session explicitly, then resume this saved conversation to use the updated helper. Your unsent draft is preserved.".into());
+                runtime.error = Some("Automatic helper updates are unavailable for this session. Explicitly end or close it, then reopen the saved provider conversation where supported. This action keeps your session and unsent draft open.".into());
                 return Task::none();
             }
             Action::Reconnect(target) => {
@@ -16509,7 +16509,7 @@ mod tests {
         handle.replace_snapshot_for_test(snapshot.clone());
         app.chat_runtime_mut(target).unwrap().refresh();
         drop(app.handle_chat_ui(Action::UpdateHelperInstructions(target)));
-        assert!(chat_runtime(&app, card).error.as_deref().is_some_and(|error| error.contains("Stop the session explicitly")));
+        assert!(chat_runtime(&app, card).error.as_deref().is_some_and(|error| error.contains("Explicitly end or close")));
         assert!(app.chat_ui.attempt(card).is_none(), "a running provider must not be closed");
         assert_eq!(chat_runtime(&app, card).composer.text(), "unsent helper-update draft");
         snapshot.busy = false;
