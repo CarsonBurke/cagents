@@ -166,6 +166,32 @@ impl Root {
     }
 }
 
+/// Internal worker-side ancestor observation through a retained directory.
+/// This intentional literal parent lookup is separate from confined public
+/// component resolution: `open_at` MUST continue rejecting user-supplied `..`.
+/// The returned descriptor alone does not grant placement/effect consent.
+#[cfg(target_os = "linux")]
+pub(crate) fn retained_parent_directory(root: &Root) -> io::Result<Root> {
+    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: the directory is retained, the ONLY lookup is this static NUL-
+    // terminated parent literal, and openat returns a fresh owned descriptor.
+    let descriptor = unsafe { libc::openat(root.descriptor(), c"..".as_ptr(), flags) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Root {
+        directory: unsafe { OwnedFd::from_raw_fd(descriptor) },
+        path: root.path().join(".."),
+    })
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn retained_parent_directory(_root: &Root) -> io::Result<Root> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Retained parent observation is unavailable on this platform.",
+    ))
+}
+
 /// Why a path could not be resolved beneath a root.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResolveError {
@@ -402,13 +428,13 @@ pub fn open_directory_beneath(root: &Root, relative: &Path) -> Result<Root, Reso
 
 #[path = "fs_safety/directory_creation.rs"]
 mod directory_creation;
+#[cfg(test)]
+pub(crate) use directory_creation::fixture_directory_preparation_failure;
 pub use directory_creation::{
     DirectoryCreateError, DirectoryCreation, DirectoryNamespace, DirectoryPreparation,
     DirectoryPublication, DirectoryRecovery, DirectoryStage, create_directory_beneath,
     create_directory_in_namespace, stage_directory_in_namespace,
 };
-#[cfg(test)]
-pub(crate) use directory_creation::fixture_directory_preparation_failure;
 
 /// Changes permissions through the exact retained directory descriptor.
 pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> {
@@ -469,6 +495,21 @@ pub fn remove_directory_within(directory: &Root, name: &OsStr) -> Result<(), Res
     }
     Ok(())
 }
+
+#[path = "fs_safety/recovery_placement.rs"]
+mod recovery_placement;
+pub(crate) use recovery_placement::{
+    RecoveryDirectoryStamp, RecoveryPlacement, recovery_directory_stamp,
+};
+
+#[path = "fs_safety/recovery_cache.rs"]
+mod recovery_cache;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use recovery_cache::fixture_recovery_directory_preparation_failure;
+pub(crate) use recovery_cache::{
+    RecoveryDirectoryError, RecoveryParentCandidates, prepare_recovery_directory_with_owner,
+    verify_recovery_directory_private,
+};
 
 /// Creates missing directory components without following symbolic links.
 /// Existing components must be real directories beneath the retained root.
