@@ -79,7 +79,10 @@ impl Client {
             .map_err(ControlError::Connect)?;
         let peer = Peer::observe(&stream, socket)
             .map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))?;
-        match ControlClient::from_stream_with_deadline(stream, Instant::now() + Duration::from_secs(5)) {
+        match ControlClient::from_stream_with_deadline(
+            stream,
+            Instant::now() + Duration::from_secs(5),
+        ) {
             Ok(client) => {
                 peer.verify(client.proof()).map_err(|error| {
                     ControlError::Configure(io::Error::other(error.to_string()))

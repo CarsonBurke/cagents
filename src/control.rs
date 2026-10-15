@@ -550,11 +550,17 @@ impl ControlClient {
         Self::from_stream_inner(stream, None)
     }
 
-    pub(crate) fn from_stream_with_deadline(stream: UnixStream, deadline: Instant) -> Result<Self, ControlError> {
+    pub(crate) fn from_stream_with_deadline(
+        stream: UnixStream,
+        deadline: Instant,
+    ) -> Result<Self, ControlError> {
         Self::from_stream_inner(stream, Some(deadline))
     }
 
-    fn from_stream_inner(stream: UnixStream, deadline: Option<Instant>) -> Result<Self, ControlError> {
+    fn from_stream_inner(
+        stream: UnixStream,
+        deadline: Option<Instant>,
+    ) -> Result<Self, ControlError> {
         stream
             .set_read_timeout(Some(if crate::device::is_remote() {
                 Duration::from_secs(30)
@@ -1715,18 +1721,31 @@ impl HandshakeClient {
             version: PROTOCOL_VERSION,
             request_id,
             proof: None,
-            request: ClientRequest::Connect { expected_host: None, resume: Vec::new() },
+            request: ClientRequest::Connect {
+                expected_host: None,
+                resume: Vec::new(),
+            },
         };
         match deadline {
-            Some(deadline) => write_frame(&mut DeadlineWriter { stream: &mut self.stream, deadline }, &request)?,
+            Some(deadline) => write_frame(
+                &mut DeadlineWriter {
+                    stream: &mut self.stream,
+                    deadline,
+                },
+                &request,
+            )?,
             None => write_frame(&mut self.stream, &request)?,
         }
         let timeout = self.stream.read_timeout().ok().flatten();
         let envelope: ServerEnvelope = match deadline {
-            Some(deadline) => read_frame(&mut DeadlineReader { stream: &mut self.stream, deadline }),
+            Some(deadline) => read_frame(&mut DeadlineReader {
+                stream: &mut self.stream,
+                deadline,
+            }),
             None => read_frame(&mut self.stream),
-        }.map_err(|error| reply_error(error, timeout))?
-            .ok_or(ControlError::ConnectionClosed)?;
+        }
+        .map_err(|error| reply_error(error, timeout))?
+        .ok_or(ControlError::ConnectionClosed)?;
         if envelope.version != PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedVersion {
                 actual: envelope.version,
@@ -4762,14 +4781,26 @@ mod tests {
             let (client, mut server) = UnixStream::pair().unwrap();
             let worker = std::thread::spawn(move || {
                 let _: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
-                let frame = if trickle_prefix { [4u32.to_be_bytes().as_slice(), b"body"].concat() }
-                else { server.write_all(&4u32.to_be_bytes()).unwrap(); b"body".to_vec() };
+                let frame = if trickle_prefix {
+                    [4u32.to_be_bytes().as_slice(), b"body"].concat()
+                } else {
+                    server.write_all(&4u32.to_be_bytes()).unwrap();
+                    b"body".to_vec()
+                };
                 for byte in frame {
-                    if server.write_all(&[byte]).is_err() { break; }
+                    if server.write_all(&[byte]).is_err() {
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(35));
                 }
             });
-            assert!(ControlClient::from_stream_with_deadline(client, Instant::now() + Duration::from_millis(55)).is_err());
+            assert!(
+                ControlClient::from_stream_with_deadline(
+                    client,
+                    Instant::now() + Duration::from_millis(55)
+                )
+                .is_err()
+            );
             worker.join().unwrap();
         }
     }
