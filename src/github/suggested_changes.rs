@@ -15,13 +15,15 @@ pub struct SuggestionRequest { pub comment: String, pub expected_body: String, p
 pub fn suggestions(body: &str) -> Vec<Suggestion> {
     let mut result = Vec::new(); let mut lines = body.lines();
     while let Some(line) = lines.next() {
-        let trimmed = line.trim();
+        let trimmed = line.trim_start_matches(' ');
+        if line.len()-trimmed.len()>3 || trimmed.starts_with('\t') { continue; }
+        let trimmed=trimmed.trim_end();
         let fence = trimmed.bytes().take_while(|byte| *byte == b'`').count();
         if fence < 3 { continue; }
         let Some(header) = trimmed[fence..].strip_prefix("suggestion") else {
             // Skip ordinary fenced code so embedded suggestion-looking text
             // cannot turn a quoted example into an actionable replacement.
-            for line in lines.by_ref() { if line.trim().bytes().all(|byte|byte==b'`') && line.trim().len()>=fence { break; } }
+            for line in lines.by_ref() { if closing_fence(line,fence) { break; } }
             continue;
         };
         let offsets = if header.is_empty() { Some((0, 0, false)) } else {
@@ -31,13 +33,19 @@ pub fn suggestions(body: &str) -> Vec<Suggestion> {
         };
         let mut replacement=Vec::new(); let mut complete=false;
         for line in lines.by_ref() {
-            let trimmed=line.trim();
-            if trimmed.len()>=fence && trimmed.bytes().all(|byte|byte==b'`') { complete=true; break; }
+            if closing_fence(line,fence) { complete=true; break; }
             replacement.push(line);
         }
         if let Some((before,after,explicit_range))=offsets && complete { result.push(Suggestion{replacement:replacement.join("\n"),before,after,explicit_range}); }
     }
     result
+}
+
+fn closing_fence(line: &str, minimum: usize) -> bool {
+    let trimmed=line.trim_start_matches(' ');
+    if line.len()-trimmed.len()>3 || trimmed.starts_with('\t') {return false;}
+    let trimmed=trimmed.trim_end();
+    trimmed.len()>=minimum && trimmed.bytes().all(|byte|byte==b'`')
 }
 
 pub fn suggestion_block(lines: &str) -> String {
@@ -114,7 +122,7 @@ impl<E:ProcessExecutor> GitHubService<E>{
 
 #[cfg(test)]mod tests{use super::*;
 use crate::repository::Oid;
-#[test]fn suggestion_fences_and_offsets_are_explicit(){assert_eq!(suggestions("```rust\nx\n```\n```suggestion:-1+2\nnew\n```"),vec![Suggestion{replacement:"new".into(),before:1,after:2,explicit_range:true}]);assert!(suggestions("```suggestion\nunfinished").is_empty());assert!(suggestions("```suggestion:-99999+2\nx\n```").is_empty());}
+#[test]fn suggestion_fences_and_offsets_are_explicit(){assert_eq!(suggestions("```rust\nx\n```\n```suggestion:-1+2\nnew\n```"),vec![Suggestion{replacement:"new".into(),before:1,after:2,explicit_range:true}]);assert!(suggestions("```suggestion\nunfinished").is_empty());assert!(suggestions("```suggestion:-99999+2\nx\n```").is_empty());assert!(suggestions("    ```suggestion\n    example\n    ```").is_empty());}
 #[test]fn inserted_suggestions_preserve_embedded_fences(){let source="before\n```rust\nx\n```\nafter";let block=suggestion_block(source);assert!(block.starts_with("````suggestion"));assert_eq!(suggestions(&block)[0].replacement,source);assert!(suggestions("````text\n```suggestion\nnot a suggestion\n```\n````").is_empty());}
 #[test]fn replacements_preserve_context_line_endings_and_eof(){assert_eq!(replace_lines("a\nb\nc\n",2,2,"x\ny").unwrap(),"a\nx\ny\nc\n");assert_eq!(replace_lines("a\r\nb\r\n",2,2,"x").unwrap(),"a\r\nx\r\n");assert_eq!(replace_lines("a\nb",2,2,"x").unwrap(),"a\nx");assert_eq!(replace_lines("a\nb\nc\n",2,2,"").unwrap(),"a\nc\n");assert!(replace_lines("a\n",0,1,"x").is_err());}
 }

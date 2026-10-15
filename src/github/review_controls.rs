@@ -23,6 +23,8 @@ pub struct ReviewControls {
     pub can_disable_auto_merge: bool,
     pub can_update: bool,
     pub is_draft: bool,
+    pub is_open: bool,
+    pub merged: bool,
     pub requested_reviewers: Vec<Reviewer>,
     pub reviewers_complete: bool,
     pub suggested_title: String,
@@ -55,14 +57,14 @@ impl<E: ProcessExecutor> GitHubService<E> {
             else if text("state")!="OPEN" {Some("This pull request is no longer open.".into())}
             else if flag(pr,"isDraft"){Some("Mark this draft ready for review before merging.".into())}
             else if text("mergeable")=="CONFLICTING" || text("mergeStateStatus")=="DIRTY" {Some("Merge conflicts must be resolved before merging.".into())}
-            else if ["BLOCKED","BEHIND","UNKNOWN"].contains(&text("mergeStateStatus").as_str()) {Some(match text("reviewDecision").as_str(){"CHANGES_REQUESTED"=>"A reviewer has requested changes.","REVIEW_REQUIRED"=>"Required approving reviews are missing.",_=>"Required checks, reviews, or branch updates are incomplete."}.into())}
+            else if text("mergeable")!="MERGEABLE" || !["CLEAN","UNSTABLE","HAS_HOOKS"].contains(&text("mergeStateStatus").as_str()) {Some(match text("reviewDecision").as_str(){"CHANGES_REQUESTED"=>"A reviewer has requested changes.","REVIEW_REQUIRED"=>"Required approving reviews are missing.",_=>"Required checks, reviews, or branch updates are incomplete."}.into())}
             else if allowed_methods.is_empty(){Some("The repository does not allow any merge method.".into())} else {None};
         let nodes:Vec<_>=pr.pointer("/reviewRequests/nodes").and_then(serde_json::Value::as_array).into_iter().flatten().collect();
         let requested_reviewers:Vec<_>=nodes.iter().filter_map(|node|node.get("requestedReviewer")).filter_map(reviewer).collect();
         let reviewers_complete=requested_reviewers.len()==nodes.len() && pr.pointer("/reviewRequests/pageInfo/hasNextPage").and_then(serde_json::Value::as_bool)!=Some(true);
         Ok(ReviewControls{pull_request_id:text("id"),head_oid:text("headRefOid"),allowed_methods,merge_blocked,
             auto_merge_allowed:flag(repository,"autoMergeAllowed"),auto_merge_enabled:pr.get("autoMergeRequest").is_some_and(|v|!v.is_null()),
-            can_enable_auto_merge:flag(pr,"viewerCanEnableAutoMerge"),can_disable_auto_merge:flag(pr,"viewerCanDisableAutoMerge"),can_update:flag(pr,"viewerCanUpdate"),is_draft:flag(pr,"isDraft"),requested_reviewers,reviewers_complete,
+            can_enable_auto_merge:flag(pr,"viewerCanEnableAutoMerge"),can_disable_auto_merge:flag(pr,"viewerCanDisableAutoMerge"),can_update:flag(pr,"viewerCanUpdate"),is_draft:flag(pr,"isDraft"),is_open:text("state")=="OPEN",merged:text("state")=="MERGED",requested_reviewers,reviewers_complete,
             suggested_title:text("viewerMergeHeadlineText"),suggested_body:text("viewerMergeBodyText")})
     }
 

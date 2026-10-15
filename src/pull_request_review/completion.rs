@@ -97,7 +97,7 @@ impl State {
                 let Some(method)=self.completion.method()else{return ActionTask::none();};
                 return self.mutate_completion(ReviewControlMutation::Merge{method,title:self.completion.title.clone(),body:self.completion.body.text(),expected_head:data.head_oid.clone()});
             }
-            Action::AutoMerge(enabled)=>{let Some(method)=self.completion.method()else{return ActionTask::none();};return self.mutate_completion(ReviewControlMutation::AutoMerge{method,enabled});}
+            Action::AutoMerge(enabled)=>{if enabled && (self.context.as_ref().is_none_or(|context|context.pending.is_some()||self.completion.data.as_ref().is_none_or(|data|data.head_oid!=context.head_oid))||self.discussion.composer.is_some()){return ActionTask::none();}let Some(method)=self.completion.method()else{return ActionTask::none();};return self.mutate_completion(ReviewControlMutation::AutoMerge{method,enabled});}
             Action::Draft(draft)=>return self.mutate_completion(ReviewControlMutation::Draft(draft)),
             Action::Reviewers=>{self.completion.reviewers_open=!self.completion.reviewers_open;if self.completion.reviewers_open{return self.load_reviewer_candidates(false);}}
             Action::TeamTab(teams)=>{self.completion.teams=teams;self.completion.query.clear();self.completion.next=None;self.completion.cancellation.cancel();self.completion.candidates_loading=false;return self.load_reviewer_candidates(false);}
@@ -191,9 +191,9 @@ impl State {
                         if comment.is_none_or(|comment|!comment.viewer_did_author||!comment.viewer_can_update||comment.is_pending()||Some(&comment.body)!=original.as_ref()){return Err("The comment changed or can no longer be edited. Refresh before trying again.".into());}
                     }
                     ReviewControlMutation::Merge{method,expected_head,..}=>{let context=api.review_context(&key,&cancellation).map_err(|error|error.to_string())?;if context.pending.is_some(){return Err("Submit or discard your pending review before merging.".into());}if fresh.head_oid!=*expected_head{return Err("The PR head changed; refresh and review it before merging.".into());}if let Some(reason)=fresh.merge_blocked{return Err(reason);}if !fresh.allowed_methods.contains(method){return Err("This merge method is no longer allowed by the repository.".into());}}
-                    ReviewControlMutation::Reviewers(_)=>{if !fresh.can_update||!fresh.reviewers_complete{return Err("GitHub does not permit changing this complete requested reviewer set.".into());}if Some(fresh.requested_reviewers.iter().map(|reviewer|reviewer.id.clone()).collect::<BTreeSet<_>>())!=expected_reviewers{return Err("Reviewer requests changed. Refresh before editing the requested set.".into());}}
-                    ReviewControlMutation::Draft(_)=>{if !fresh.can_update{return Err("GitHub does not permit changing this pull request.".into());}}
-                    ReviewControlMutation::AutoMerge{enabled:true,..}=>{if !fresh.auto_merge_allowed || !fresh.can_enable_auto_merge{return Err("Auto-merge cannot be enabled for this pull request.".into());}}
+                    ReviewControlMutation::Reviewers(_)=>{if !fresh.is_open||!fresh.can_update||!fresh.reviewers_complete{return Err("GitHub does not permit changing this complete requested reviewer set.".into());}if Some(fresh.requested_reviewers.iter().map(|reviewer|reviewer.id.clone()).collect::<BTreeSet<_>>())!=expected_reviewers{return Err("Reviewer requests changed. Refresh before editing the requested set.".into());}}
+                    ReviewControlMutation::Draft(_)=>{if !fresh.is_open||!fresh.can_update{return Err("GitHub does not permit changing this pull request.".into());}}
+                    ReviewControlMutation::AutoMerge{enabled:true,method}=>{let context=api.review_context(&key,&cancellation).map_err(|error|error.to_string())?;if context.pending.is_some(){return Err("Submit or discard your pending review before enabling auto-merge.".into());}if !fresh.is_open||!fresh.allowed_methods.contains(method)||!fresh.auto_merge_allowed || !fresh.can_enable_auto_merge{return Err("Auto-merge cannot be enabled for this pull request.".into());}}
                     ReviewControlMutation::AutoMerge{enabled:false,..}=>{if !fresh.can_disable_auto_merge{return Err("Auto-merge cannot be disabled for this pull request.".into());}}
                     _=>{}
                 }
@@ -208,8 +208,8 @@ impl State {
         rows.push(crate::ui_controls::button::quiet(if state.uncertain{"I checked GitHub; refresh"}else{"Refresh PR actions"}).on_press_maybe((!modal_open&&!state.busy).then_some(Action::Reload)).into());
         if state.loading{rows.push(design::caption("Loading PR actions…").into());}
         if let Some(data)=&state.data{
-            rows.push(crate::ui_controls::button::secondary(if data.is_draft{"Ready for review"}else{"Convert to draft"}).on_press_maybe((enabled&&data.can_update).then_some(Action::Draft(!data.is_draft))).into());
-            rows.push(crate::ui_controls::button::secondary("Request reviewers").on_press_maybe(enabled.then_some(Action::Reviewers)).into());
+            rows.push(crate::ui_controls::button::secondary(if data.is_draft{"Ready for review"}else{"Convert to draft"}).on_press_maybe((enabled&&data.is_open&&data.can_update).then_some(Action::Draft(!data.is_draft))).into());
+            rows.push(crate::ui_controls::button::secondary("Request reviewers").on_press_maybe((enabled&&data.is_open).then_some(Action::Reviewers)).into());
             if !data.requested_reviewers.is_empty(){rows.push(design::caption(format!("Requested: {}",data.requested_reviewers.iter().map(|r|r.label.as_str()).collect::<Vec<_>>().join(", "))).into());}
             if state.reviewers_open{
                 rows.push(widget::row::with_children(vec![crate::ui_controls::button::quiet("Users").on_press_maybe(enabled.then_some(Action::TeamTab(false))).into(),crate::ui_controls::button::quiet("Teams").on_press_maybe(enabled.then_some(Action::TeamTab(true))).into()]).spacing(space::XS).into());
