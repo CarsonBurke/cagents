@@ -21,13 +21,13 @@ impl PreparedRestart {
     /// Allow only the host's normal projection of THIS retained request after
     /// actual decoder confirmation. The issued recipe/account/console and the
     /// original helper restart envelope remain byte-for-byte unchanged.
-    fn is_confirmed_projection(&self, candidate: &Session, handle: &Handle) -> bool {
-        if handle.confirmed_session_id().as_deref() != Some(self.expected_session_id.as_str()) {
+    fn is_confirmed_projection(&self, candidate: &Session, observed: &chat::runtime::CloseIdentity) -> bool {
+        if observed.confirmed_session_id.as_deref() != Some(self.expected_session_id.as_str()) {
             return false;
         }
         let mut projected = self.source.clone();
         projected.launch.session_id = Some(self.expected_session_id.clone());
-        projected.native_continuity = handle.native_continuity();
+        projected.native_continuity = observed.native_continuity.clone();
         *candidate == projected
     }
 }
@@ -45,7 +45,7 @@ pub(in crate::host) fn restart_completed(
             "The retained restart request is missing its stable identity",
         ));
     }
-    let (handle, identity, cached) = {
+    let (handle, identity, cached, observed) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(source.proof.as_ref(), state.proof())?;
         let Some(record) = state.chats.get(&source.id) else {
@@ -58,20 +58,23 @@ pub(in crate::host) fn restart_completed(
         if cached.is_none() && !record.handle.is_completed() {
             return Ok(None);
         }
-        let ServerResponse::ChatAttached { session, .. } = session_snapshot(record) else {
-            unreachable!()
-        };
+        // Coherent nonblocking metadata only; never hydrate presentation or
+        // wait behind Store/confirmation publication while holding HostState.
+        let observed = record.handle.try_close_identity().map_err(unavailable)?;
+        let mut session = record.session.clone();
+        session.launch.session_id = observed.confirmed_session_id.clone();
+        session.native_continuity = observed.native_continuity.clone();
         let same_prepared_projection = cached.as_ref().is_some_and(|pending| {
             pending.request == request && pending.identity == identity
                 && pending.source == *source
-                && pending.is_confirmed_projection(&session, &record.handle)
+                && pending.is_confirmed_projection(&session, &observed)
         });
         if session != *source && !same_prepared_projection {
             return Err(error(
                 "The retained restart changed the exact issued conversation or console",
             ));
         }
-        (record.handle.clone(), identity, cached)
+        (record.handle.clone(), identity, cached, observed)
     };
     if cached
         .as_ref()
@@ -83,7 +86,7 @@ pub(in crate::host) fn restart_completed(
     }
     let prepared = if let Some(cached) = cached.filter(|cached| cached.request == request) {
         if cached.identity != identity || (cached.source != *source
-            && !cached.is_confirmed_projection(source, &handle)) {
+            && !cached.is_confirmed_projection(source, &observed)) {
             return Err(error(
                 "The restart receipt belongs to another exact retained owner",
             ));
@@ -276,6 +279,7 @@ pub(in crate::host) fn confirms_restart_projection(
     let request = super::super::restart::request_id(host, source.id)
         .map_err(|error| error.message)?;
     let Some(identity) = handle.actor_identity() else { return Ok(false); };
+    let observed = handle.try_close_identity()?;
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if source.proof.as_ref() != Some(state.proof())
         || state.chats.get(&source.id).is_none_or(|record| {
@@ -287,7 +291,7 @@ pub(in crate::host) fn confirms_restart_projection(
     Ok(state.native_actor_restarts.get(&source.id).is_some_and(|pending| {
         pending.request == request && pending.identity == identity
             && pending.source == *source && pending.settled && !pending.failed_proved
-            && pending.is_confirmed_projection(current, handle)
+            && pending.is_confirmed_projection(current, &observed)
     }))
 }
 
