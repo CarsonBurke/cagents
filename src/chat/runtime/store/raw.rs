@@ -95,6 +95,8 @@ impl Store {
         self.db.query_row("SELECT EXISTS(SELECT 1 FROM raw_tool_revoked WHERE agent=?1 AND id=?2)",params![agent(source),source.source_id],|row|row.get(0)).map_err(err)
     }
     fn raw_fence_identity(&mut self,source:&SourceKey)->Result<(),String>{
+        if self.pending_input.as_ref().is_some_and(|pending|pending.0==source.source_id){self.pending_input=None;}
+        if self.pending_text.as_ref().is_some_and(|pending|pending.0==source.source_id){self.pending_text=None;}
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;guard(&tx,self.raw_sources.nonce)?;
         tx.execute("INSERT OR IGNORE INTO raw_tool_revoked VALUES(?1,?2)",params![agent(source),source.source_id]).map_err(err)?;tx.commit().map_err(err)?;
         if let Some(length)=self.raw_sources.open.remove(source){self.raw_sources.open_bytes=self.raw_sources.open_bytes.saturating_sub(length);}
@@ -151,8 +153,7 @@ impl Store {
                 // A new stream cannot prove that it owns an already sealed
                 // native ID. Preserve old bodies while fencing every later
                 // placeholder/delta; never replace a patch with an empty call.
-                tx.execute("INSERT OR IGNORE INTO raw_tool_revoked VALUES(?1,?2)",params![agent(source),source.source_id]).map_err(err)?;
-                tx.commit().map_err(err)?;self.dirty=true;
+                drop(tx);self.raw_fence_identity(source)?;
                 return Ok(Some("Provider reused a completed original tool identity; its ambiguous stream was discarded".into()));
             }
             return Ok(None);
@@ -212,12 +213,12 @@ impl Store {
                 _=>Ok(None),
             },
             Event::InputDelta{id,offset,delta}=>self.raw_delta(id,*offset,delta),
-            Event::ItemsRemoved{ids}=>{self.raw_remove(ids)?;Ok(None)},
+            Event::ItemsRemoved{ids}=>{self.raw_remove(ids,true)?;Ok(None)},
             Event::Reset{..}=>{self.raw_reset()?;Ok(None)},
-            Event::Item(item) if !matches!(&item.content,ItemContent::Tool{..}|ItemContent::Command{..}|ItemContent::Changes{..})=>{self.raw_remove(std::slice::from_ref(&item.id))?;Ok(None)},
+            Event::Item(item) if !matches!(&item.content,ItemContent::Tool{..}|ItemContent::Command{..}|ItemContent::Changes{..})=>{self.raw_remove(std::slice::from_ref(&item.id),false)?;Ok(None)},
             Event::History{items,..}|Event::LatestHistory{items,..}=>{
                 let ids:Vec<_>=items.iter().filter(|item|!matches!(&item.content,ItemContent::Tool{..}|ItemContent::Command{..}|ItemContent::Changes{..})).map(|item|item.id.clone()).collect();
-                self.raw_remove(&ids)?;Ok(None)
+                self.raw_remove(&ids,false)?;Ok(None)
             },
             _=>Ok(None),
         };
@@ -227,16 +228,22 @@ impl Store {
             Err(message)=>Err(message),
         }
     }
-    fn raw_remove(&mut self,ids:&[String])->Result<(),String>{
+    fn raw_remove(&mut self,ids:&[String],explicit_removal:bool)->Result<(),String>{
         // These bytes have not entered SQLite. Flushing after publishing the
         // tombstone would either revive removed data or repeatedly fail every
         // later event against the same pending batch.
-        if self.pending_input.as_ref().is_some_and(|pending|ids.contains(&pending.0)){self.pending_input=None;}
-        if self.pending_text.as_ref().is_some_and(|pending|ids.contains(&pending.0)){self.pending_text=None;}
+        if explicit_removal&&self.pending_input.as_ref().is_some_and(|pending|ids.contains(&pending.0)){self.pending_input=None;}
+        if explicit_removal&&self.pending_text.as_ref().is_some_and(|pending|ids.contains(&pending.0)){self.pending_text=None;}
         let tx=self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;guard(&tx,self.raw_sources.nonce)?;
         for id in ids{
             let old:Option<(usize,usize)>=tx.query_row("SELECT cost,(SELECT count(*) FROM raw_tool_chunks c WHERE c.agent=s.agent AND c.id=s.id) FROM raw_tool_sources s WHERE agent='' AND id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
             let Some((cost,chunks))=old else{continue;};
+            // Ordinary prose/history is not a raw-call kind change. Only an
+            // actually captured identity authorizes discarding pending bytes.
+            if !explicit_removal {
+                if self.pending_input.as_ref().is_some_and(|pending|&pending.0==id){self.pending_input=None;}
+                if self.pending_text.as_ref().is_some_and(|pending|&pending.0==id){self.pending_text=None;}
+            }
             tx.execute("DELETE FROM raw_tool_chunks WHERE agent='' AND id=?1",[id]).map_err(err)?;
             tx.execute("DELETE FROM raw_tool_sources WHERE agent='' AND id=?1",[id]).map_err(err)?;
             tx.execute("INSERT OR IGNORE INTO raw_tool_revoked VALUES('',?1)",[id]).map_err(err)?;
@@ -505,5 +512,20 @@ mod pending_revocation_tests {
     fn removing_one_key_preserves_unrelated_pending_input(){
         let mut store=Store::new().unwrap();start(&mut store,"removed");start(&mut store,"retained");store.apply(Event::InputDelta{id:"retained".into(),offset:0,delta:"r".repeat(50)}).unwrap();
         store.apply(Event::ItemsRemoved{ids:vec!["removed".into()]}).unwrap();assert_eq!(store.db.query_row("SELECT len0 FROM items WHERE id='retained'",[],|r|r.get::<_,usize>(0)).unwrap(),50);assert_eq!(store.field("retained",0,0,50).unwrap(),vec![b'r';50]);
+    }
+}
+
+#[cfg(test)]
+mod ordinary_prose_tests {
+    use super::*;
+    fn prose(text:&str)->Item{Item{id:"ordinary".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Text{text:text.into(),thinking:false,phase:Phase::Final}}}
+    #[test]
+    fn raw_kind_detection_does_not_discard_uncaptured_prose_pending_before_history_overlap(){
+        for latest in [true,false]{
+            let mut store=Store::new().unwrap();store.apply(Event::Item(prose("already stored"))).unwrap();
+            store.apply(Event::TextDelta{id:"ordinary".into(),role:Role::Assistant,thinking:false,delta:" plus new streamed bytes".into()}).unwrap();assert!(store.pending_text.is_some());
+            let items=vec![prose("already stored")];let event=if latest{Event::LatestHistory{items,has_earlier:false}}else{Event::History{items,has_earlier:false}};
+            store.apply(event).unwrap();assert!(store.pending_text.is_none());let window=store.window().unwrap();assert!(matches!(&window.items[0].content,ItemContent::Text{text,..} if text=="already stored plus new streamed bytes"));
+        }
     }
 }
