@@ -248,7 +248,7 @@ pub fn handoff_source_matches(expected:&Pane,receipt:&crate::terminal::ipc::Term
     !receipt.operation.is_nil() && !receipt.source_execution_instance.is_nil()
         && !receipt.source_binding.backend.is_nil()
         && receipt.source_binding.execution_instance==receipt.source_execution_instance
-        && receipt.source_binding.source==receipt.source
+        && handoff_chat_source_matches(&receipt.source_binding.source,&receipt.source)
         && !receipt.terminal.execution_instance.is_nil()
         && receipt.terminal.session.continuity.live_proof().is_some_and(|proof|proof.is_complete())
         && handoff_chat_source_matches(issued,&receipt.source)
@@ -646,6 +646,10 @@ pub(crate) mod handoff_tests {
         assert!(view.panes.is_empty());assert_eq!(before,original);
         let mut learned=before.clone();learned.kind=CardKind::Chat(receipt.source.clone());
         assert!(same_removal_pane_source(&before,&learned,Some(&receipt)));
+        let mut promoted=receipt.clone();promoted.source.native_continuity=crate::chat::NativeContinuity::Durable {provider_version:"same-backend".into()};
+        assert!(same_removal_pane_source(&before,&current,Some(&promoted)),"metadata promotion does not replace the concrete source backend");
+        promoted.source_binding.source.launch.session_id=Some("other-known-thread".into());
+        assert!(!same_removal_pane_source(&before,&current,Some(&promoted)),"known backend conversation remains exact");
         for variant in 0..7 {
             let mut changed=current.clone();let mut proof=receipt.clone();
             match variant {
