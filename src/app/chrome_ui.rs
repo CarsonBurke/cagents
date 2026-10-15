@@ -274,12 +274,23 @@ mod tests {
         let mut shortcuts = crate::settings::KeyboardShortcuts::default();
         shortcuts.close_focused_column = vec!["Ctrl+Alt+F5".into()];
         let bindings = pane_menu_bindings(id, true, &shortcuts);
-        let (key, action) = bindings.iter().find(|(_, action)| matches!(action.1, PaneMenuCommand::Close)).unwrap();
-        assert!(key.matches(keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT, &keyboard::Key::Named(keyboard::key::Named::F5), None));
+        let (key, action) = bindings
+            .iter()
+            .find(|(_, action)| matches!(action.1, PaneMenuCommand::Close))
+            .unwrap();
+        assert!(key.matches(
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            &keyboard::Key::Named(keyboard::key::Named::F5),
+            None
+        ));
         assert!(matches!(action.message(), Message::CloseCard(target) if target == id));
         assert!(pane_menu_bindings(id, false, &shortcuts).is_empty());
         shortcuts.close_focused_column.clear();
-        assert!(!pane_menu_bindings(id, true, &shortcuts).values().any(|action| matches!(action.1, PaneMenuCommand::Close)));
+        assert!(
+            !pane_menu_bindings(id, true, &shortcuts)
+                .values()
+                .any(|action| matches!(action.1, PaneMenuCommand::Close))
+        );
     }
 
     /// Retain the actual Settings pane while rename and palette modals change.
@@ -984,13 +995,27 @@ struct PaneMenu(CardId, PaneMenuCommand);
 
 // These shortcuts act on the focused pane. Do not advertise them on an
 // unrelated tab's context menu as if they targeted that tab.
-fn pane_menu_bindings(id: CardId, focused: bool, shortcuts: &crate::settings::KeyboardShortcuts)
-    -> HashMap<widget::menu::KeyBind, PaneMenu> {
-    if !focused { return HashMap::new(); }
+fn pane_menu_bindings(
+    id: CardId,
+    focused: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+) -> HashMap<widget::menu::KeyBind, PaneMenu> {
+    if !focused {
+        return HashMap::new();
+    }
     crate::interaction::menu_shortcuts([
-        (shortcuts.rename_pane.as_slice(), PaneMenu(id, PaneMenuCommand::Rename)),
-        (shortcuts.clone_pane.as_slice(), PaneMenu(id, PaneMenuCommand::Clone)),
-        (shortcuts.close_focused_column.as_slice(), PaneMenu(id, PaneMenuCommand::Close)),
+        (
+            shortcuts.rename_pane.as_slice(),
+            PaneMenu(id, PaneMenuCommand::Rename),
+        ),
+        (
+            shortcuts.clone_pane.as_slice(),
+            PaneMenu(id, PaneMenuCommand::Clone),
+        ),
+        (
+            shortcuts.close_focused_column.as_slice(),
+            PaneMenu(id, PaneMenuCommand::Close),
+        ),
     ])
 }
 
@@ -2342,11 +2367,27 @@ impl Cagents {
             .on_exit(Message::ChromeUi(Action::HoverTab(None)));
         crate::interaction::context_menu_lazy(tab, move || {
             let mut entries: Vec<widget::menu::Item<PaneMenu, String>> = vec![
-                widget::menu::Item::Button("Rename…".into(), Some(Icon::Rename.handle()), PaneMenu(id, PaneMenuCommand::Rename)),
-                widget::menu::Item::Button("Clone pane".into(), Some(Icon::Duplicate.handle()), PaneMenu(id, PaneMenuCommand::Clone)),
+                widget::menu::Item::Button(
+                    "Rename…".into(),
+                    Some(Icon::Rename.handle()),
+                    PaneMenu(id, PaneMenuCommand::Rename),
+                ),
+                widget::menu::Item::Button(
+                    "Clone pane".into(),
+                    Some(Icon::Duplicate.handle()),
+                    PaneMenu(id, PaneMenuCommand::Clone),
+                ),
                 widget::menu::Item::Divider,
-                widget::menu::Item::Button("Copy path".into(), Some(Icon::CopyPath.handle()), PaneMenu(id, PaneMenuCommand::CopyPath)),
-                widget::menu::Item::Button("Reveal in Projects".into(), Some(Icon::OpenFolder.handle()), PaneMenu(id, PaneMenuCommand::Reveal)),
+                widget::menu::Item::Button(
+                    "Copy path".into(),
+                    Some(Icon::CopyPath.handle()),
+                    PaneMenu(id, PaneMenuCommand::CopyPath),
+                ),
+                widget::menu::Item::Button(
+                    "Reveal in Projects".into(),
+                    Some(Icon::OpenFolder.handle()),
+                    PaneMenu(id, PaneMenuCommand::Reveal),
+                ),
             ];
             if self.chat_switch_available(id) && self.chat_switch_ready(id) {
                 entries.push(widget::menu::Item::Button(
@@ -2390,11 +2431,26 @@ impl Cagents {
             }
             entries.push(widget::menu::Item::Divider);
             entries.extend([
-                widget::menu::Item::Button("Close other panes".into(), Some(Icon::Close.handle()), PaneMenu(id, PaneMenuCommand::CloseOthers)),
-                widget::menu::Item::Button("Close panes to the right".into(), Some(Icon::Close.handle()), PaneMenu(id, PaneMenuCommand::CloseToRight)),
-                widget::menu::Item::Button("Close pane".into(), Some(Icon::Close.handle()), PaneMenu(id, PaneMenuCommand::Close)),
+                widget::menu::Item::Button(
+                    "Close other panes".into(),
+                    Some(Icon::Close.handle()),
+                    PaneMenu(id, PaneMenuCommand::CloseOthers),
+                ),
+                widget::menu::Item::Button(
+                    "Close panes to the right".into(),
+                    Some(Icon::Close.handle()),
+                    PaneMenu(id, PaneMenuCommand::CloseToRight),
+                ),
+                widget::menu::Item::Button(
+                    "Close pane".into(),
+                    Some(Icon::Close.handle()),
+                    PaneMenu(id, PaneMenuCommand::Close),
+                ),
             ]);
-            widget::menu::items(&pane_menu_bindings(id, focused, &self.settings.keyboard_shortcuts), entries)
+            widget::menu::items(
+                &pane_menu_bindings(id, focused, &self.settings.keyboard_shortcuts),
+                entries,
+            )
         })
     }
 
