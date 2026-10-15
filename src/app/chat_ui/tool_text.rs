@@ -34,6 +34,7 @@ impl Language {
 
 pub(super) struct ToolText {
     key: u64,
+    reader_source: reader_source::Source,
     language: Language,
     pub(super) text: Arc<str>,
     syntax: std::cell::RefCell<Option<(crate::settings::EditorSyntaxTheme, prose::CodeBlock)>>,
@@ -188,15 +189,17 @@ impl ToolText {
         // does. It is only a cheap rejection filter: exact text equality is
         // still required before retaining the previous presentation.
         let key = tail_digest(language as u64, text);
-        if let Some(previous) = previous
-            && previous.key == key
+        if previous.as_ref().is_some_and(|previous| previous.key == key
             && previous.language == language
-            && previous.text.as_ref() == text
+            && previous.text.as_ref() == text)
         {
-            return previous;
+            return previous.unwrap();
         }
+        let reader_source = previous.as_ref().filter(|previous| previous.language == language)
+            .map_or_else(|| reader_source::Source::new(text), |previous| reader_source::Source::updated(&previous.reader_source, &previous.text, text));
         Self {
             key,
+            reader_source,
             language,
             text: Arc::from(text),
             syntax: std::cell::RefCell::new(None),
@@ -300,7 +303,7 @@ impl ToolText {
         });
         let logical_id = logical.as_ref().map(|logical| logical.identity);
         let previous_width = reader.as_ref().map_or(0.0, |(memory, context, identity)|
-            memory.reader_width(context.as_deref(), scroll::reader_key(*identity, scroll::ReaderAxis::Horizontal)));
+            memory.reader_width_for(context.as_deref(), scroll::reader_key(*identity, scroll::ReaderAxis::Horizontal), &self.reader_source));
         let body = widget::container(prose::code_text(
             self.text.clone(), spans, design::TEXT_BODY.into(), iced::Font::MONOSPACE,
             target, find, logical,
@@ -320,8 +323,8 @@ impl ToolText {
                 scroll::reader_key(identity, scroll::ReaderAxis::Horizontal)));
         }
         let body: Element<'static, Message> = match &reader {
-            Some((memory, context, identity)) => scroll::block(horizontal, memory.clone(), context.clone(),
-                scroll::reader_key(*identity, scroll::ReaderAxis::Horizontal), false),
+            Some((memory, context, identity)) => scroll::block_source(horizontal, memory.clone(), context.clone(),
+                scroll::reader_key(*identity, scroll::ReaderAxis::Horizontal), false, Some(self.reader_source.clone())),
             None => horizontal.into(),
         };
         // Find reveals the matching source in the outer transcript. A nested
@@ -344,8 +347,8 @@ impl ToolText {
             scroll::tool_output(scrolled.anchor_bottom())
         } else { scroll::viewport(scrolled) };
         let scrolled = match reader {
-            Some((memory, context, identity)) => scroll::block(scrolled, memory, context,
-                scroll::reader_key(identity, scroll::ReaderAxis::Vertical), follows),
+            Some((memory, context, identity)) => scroll::block_source(scrolled, memory, context,
+                scroll::reader_key(identity, scroll::ReaderAxis::Vertical), follows, Some(self.reader_source.clone())),
             None => scrolled,
         };
         widget::container(scrolled).max_height(height).into()

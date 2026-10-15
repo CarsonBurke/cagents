@@ -2,7 +2,7 @@
 //! authoritative for wheel, thumb, keyboard and touch input.
 mod block;
 mod viewport;
-pub(super) use block::block;
+pub(super) use block::{block, block_source};
 pub(super) use viewport::viewport;
 
 use super::view::Scroll;
@@ -90,6 +90,11 @@ impl Memory {
     }
     pub fn reader_width(&self, context: Option<&str>, identity: u64) -> f32 {
         self.1.borrow().entries.get(&(context.map(str::to_owned), identity))
+            .map_or(0.0, |saved| saved.content_width).max(0.0)
+    }
+    pub fn reader_width_for(&self, context: Option<&str>, identity: u64, source: &super::reader_source::Source) -> f32 {
+        self.1.borrow().entries.get(&(context.map(str::to_owned), identity))
+            .filter(|saved| saved.source.is_some_and(|digest| source.accepts(digest)))
             .map_or(0.0, |saved| saved.content_width).max(0.0)
     }
     pub fn retained_rows(&self) -> usize { self.0.borrow().contexts.iter().map(|context| context.rows.len()).sum() }

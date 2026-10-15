@@ -24,18 +24,11 @@ COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
-use cosmic::iced::widget::{span, text};
 use cosmic::iced::{Font, font};
-pub use cosmic::widget::markdown::{HeadingLevel, Settings, Style};
-use std::{
-    borrow::BorrowMut,
-    cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
-    mem,
-    ops::Range,
-    rc::Rc,
-    sync::Arc,
-};
+use cosmic::iced::widget::{span, text};
+use std::{borrow::BorrowMut, cell::{Cell, RefCell}, collections::{HashMap, HashSet},
+    mem, ops::Range, rc::Rc, sync::Arc};
+pub use cosmic::widget::markdown::{Settings, Style, HeadingLevel};
 pub type Uri = String;
 
 /// A bunch of Markdown that has been parsed.
@@ -81,8 +74,7 @@ impl Content {
         // A syntax-free single-line paragraph cannot change interpretation
         // while more ordinary text arrives. Delimiters/newlines return to the
         // CommonMark path, including markers split across provider deltas.
-        if self.open_plain
-            && markdown.chars().all(plain_character)
+        if self.open_plain && markdown.chars().all(plain_character)
             && let Some(Item::Paragraph(text)) = self.items.last_mut()
         {
             self.state.leftover.push_str(markdown);
@@ -96,9 +88,10 @@ impl Content {
         if !markdown.contains(['\r', '\0'])
             && let Some(mut fence) = self.open_fence.take()
             && !fence.advance(markdown)
-            && let Some(Item::CodeBlock { code, .. }) = self.items.last_mut()
+            && let Some(Item::CodeBlock { code, reader_source, .. }) = self.items.last_mut()
         {
             self.state.leftover.push_str(markdown);
+            reader_source.append(code, markdown);
             code.push_str(markdown);
             self.open_fence = Some(fence);
             return;
@@ -115,11 +108,11 @@ impl Content {
         };
 
         #[cfg(test)]
-        {
-            self.parsed_bytes += input.len();
-        }
-        // Pop the last item
-        let _ = self.items.pop();
+        { self.parsed_bytes += input.len(); }
+        // Retain only enough prior parser state to prove a rendered styled
+        // prefix after reparsing. Raw-source append alone is insufficient.
+        let previous_index = self.items.len().saturating_sub(1);
+        let previous = self.items.pop();
 
         // Re-parse last item and new text
         for (item, source, broken_links) in parse_with(&mut self.state, input) {
@@ -139,18 +132,11 @@ impl Content {
         self.state.leftover.push_str(&leftover[input.len()..]);
 
         self.open_fence = self.items.last().and_then(|item| {
-            let Item::CodeBlock { code, .. } = item else {
-                return None;
-            };
+            let Item::CodeBlock { code, .. } = item else { return None; };
             OpenFence::detect(&self.state.leftover, code)
         });
 
-        self.open_plain = self
-            .state
-            .leftover
-            .chars()
-            .next()
-            .is_some_and(char::is_alphabetic)
+        self.open_plain = self.state.leftover.chars().next().is_some_and(char::is_alphabetic)
             && self.state.leftover.chars().all(plain_character)
             && matches!(self.items.last(), Some(Item::Paragraph(text)) if text.is_plain_source(&self.state.leftover));
 
@@ -187,6 +173,17 @@ impl Content {
                 !section.broken_links.is_empty()
             });
         }
+        if let (Some(previous), Some(current)) = (previous.as_ref(), self.items.get_mut(previous_index)) {
+            match (previous, current) {
+                (Item::Paragraph(previous), Item::Paragraph(current)) => current.record_prefix(previous),
+                (Item::Heading(old_level, previous), Item::Heading(level, current)) if old_level == level => current.record_prefix(previous),
+                (Item::CodeBlock { language: old_language, code: old, reader_source: previous, .. },
+                 Item::CodeBlock { language, code, reader_source, .. }) if old_language == language => {
+                    *reader_source = super::reader_source::Source::updated(previous, old, code);
+                }
+                _ => {},
+            }
+        }
     }
 
     /// Returns the Markdown items, ready to be rendered.
@@ -203,11 +200,7 @@ impl Content {
 }
 
 fn plain_character(ch: char) -> bool {
-    ch.is_alphanumeric()
-        || matches!(
-            ch,
-            ' ' | '.' | ',' | ':' | ';' | '?' | '!' | '/' | '(' | ')' | '=' | '+' | '-'
-        )
+    ch.is_alphanumeric() || matches!(ch, ' ' | '.' | ',' | ':' | ';' | '?' | '!' | '/' | '(' | ')' | '=' | '+' | '-')
 }
 
 /// Only a zero-indented top-level fence is fast-pathed. Nested/indented
@@ -225,49 +218,24 @@ impl OpenFence {
     fn detect(source: &str, code: &str) -> Option<Self> {
         let (header, body) = source.split_once('\n')?;
         let marker = *header.as_bytes().first()?;
-        if !matches!(marker, b'`' | b'~') || body.contains(['\r', '\0']) || body != code {
-            return None;
-        }
+        if !matches!(marker, b'`' | b'~') || body.contains(['\r', '\0']) || body != code { return None; }
         let length = header.bytes().take_while(|byte| *byte == marker).count();
-        if length < 3 {
-            return None;
-        }
-        let mut fence = Self {
-            marker,
-            length,
-            leading: 0,
-            markers: 0,
-            trailing: false,
-            other: false,
-        };
-        if fence.advance(body) {
-            None
-        } else {
-            Some(fence)
-        }
+        if length < 3 { return None; }
+        let mut fence = Self { marker, length, leading: 0, markers: 0, trailing: false, other: false };
+        if fence.advance(body) { None } else { Some(fence) }
     }
     /// A possible closing fence delegates the complete block to CommonMark;
     /// otherwise only finite line-prefix state is needed across appends.
     fn advance(&mut self, text: &str) -> bool {
         for byte in text.bytes() {
             if byte == b'\n' {
-                if !self.other && self.markers >= self.length {
-                    return true;
-                }
-                self.leading = 0;
-                self.markers = 0;
-                self.trailing = false;
-                self.other = false;
+                if !self.other && self.markers >= self.length { return true; }
+                self.leading = 0; self.markers = 0; self.trailing = false; self.other = false;
             } else if !self.other {
-                if self.markers == 0 && byte == b' ' && self.leading < 3 {
-                    self.leading += 1;
-                } else if byte == self.marker && !self.trailing {
-                    self.markers += 1;
-                } else if matches!(byte, b' ' | b'\t') && self.markers > 0 {
-                    self.trailing = true;
-                } else {
-                    self.other = true;
-                }
+                if self.markers == 0 && byte == b' ' && self.leading < 3 { self.leading += 1; }
+                else if byte == self.marker && !self.trailing { self.markers += 1; }
+                else if matches!(byte, b' ' | b'\t') && self.markers > 0 { self.trailing = true; }
+                else { self.other = true; }
             }
         }
         !self.other && self.markers >= self.length
@@ -289,6 +257,8 @@ pub enum Item {
         code: String,
         /// The styled lines of text in the code block.
         lines: Vec<Text>,
+        /// Stable source digest and bounded append proof for nested reader geometry.
+        reader_source: super::reader_source::Source,
     },
     /// A list.
     List {
@@ -338,26 +308,30 @@ pub struct Row {
 /// A bunch of parsed Markdown text.
 #[derive(Debug, Clone)]
 pub struct Text {
-    spans: Vec<Span>,
+    spans: Arc<Vec<Span>>,
     starts: Arc<[usize]>,
     plain: std::cell::OnceCell<Arc<str>>,
     last_style: Cell<Option<Style>>,
     last_styled_spans: RefCell<Arc<[text::Span<'static, Uri>]>>,
+    lineage: Arc<std::sync::Mutex<StyledLineage>>,
+}
+#[derive(Debug, Default)]
+struct StyledLineage {
+    edges: std::collections::VecDeque<(std::sync::Weak<Vec<Span>>, std::sync::Weak<Vec<Span>>)>,
 }
 
 impl Text {
     fn new(spans: Vec<Span>) -> Self {
         let mut starts = Vec::with_capacity(spans.len() + 1);
         starts.push(0);
-        for span in &spans {
-            starts.push(starts.last().copied().unwrap() + span.text().len());
-        }
+        for span in &spans { starts.push(starts.last().copied().unwrap() + span.text().len()); }
         Self {
-            spans,
+            spans: spans.into(),
             starts: starts.into(),
             plain: std::cell::OnceCell::new(),
             last_style: Cell::default(),
             last_styled_spans: RefCell::default(),
+            lineage: Default::default(),
         }
     }
 
@@ -366,53 +340,64 @@ impl Text {
             link: None, strong: false, emphasis: false, code: false }] if text == source)
     }
     fn append_plain(&mut self, suffix: &str) {
-        let [Span::Standard { text, .. }] = self.spans.as_mut_slice() else {
-            unreachable!("plain append requires one plain span")
-        };
+        let previous = Arc::downgrade(&self.spans);
+        let [Span::Standard { text, .. }] = Arc::make_mut(&mut self.spans).as_mut_slice() else { unreachable!("plain append requires one plain span") };
         text.push_str(suffix);
         let length = self.starts.last().copied().unwrap_or_default() + suffix.len();
         self.starts = Arc::from([0, length]);
         self.plain.take();
         self.last_style.set(None);
         *self.last_styled_spans.get_mut() = Arc::from([]);
+        self.record_edge(previous);
+    }
+
+    fn record_edge(&mut self, previous: std::sync::Weak<Vec<Span>>) {
+        let mut lineage = self.lineage.lock().unwrap_or_else(|poison| poison.into_inner());
+        if lineage.edges.len() == 256 { lineage.edges.pop_front(); }
+        lineage.edges.push_back((previous, Arc::downgrade(&self.spans)));
+    }
+    fn record_prefix(&mut self, previous: &Text) {
+        if self.spans.len() < previous.spans.len() { return; }
+        if !previous.spans.iter().zip(self.spans.iter()).enumerate().all(|(index, (old, new))|
+            old.prefix_of(new, index + 1 == previous.spans.len())) { return; }
+        self.lineage = previous.lineage.clone();
+        self.record_edge(Arc::downgrade(&previous.spans));
+    }
+    /// Bounded, lineage-only proof for a previously rendered styled prefix.
+    /// This never scans text or materializes plain/styled spans. Reparsing
+    /// records exact conservative proofs before publication; rewrites and
+    /// Markdown reinterpretation establish a new lineage instead.
+    pub fn append_proven(&self, previous: &Text) -> bool {
+        if Arc::ptr_eq(&self.spans, &previous.spans) { return true; }
+        if !Arc::ptr_eq(&self.lineage, &previous.lineage) { return false; }
+        let mut cursor = Arc::downgrade(&previous.spans);
+        let target = Arc::downgrade(&self.spans);
+        let lineage = self.lineage.lock().unwrap_or_else(|poison| poison.into_inner());
+        for (old, next) in &lineage.edges {
+            if !old.ptr_eq(&cursor) { continue; }
+            if next.ptr_eq(&target) { return true; }
+            cursor = next.clone();
+        }
+        false
     }
 
     /// Logical text without constructing styled presentation spans. Shared by
     /// the active transcript's selection/find index and bounded visible rows.
     pub fn plain(&self) -> Arc<str> {
-        self.plain
-            .get_or_init(|| self.spans.iter().map(Span::text).collect::<String>().into())
-            .clone()
+        self.plain.get_or_init(|| self.spans.iter().map(Span::text).collect::<String>().into()).clone()
     }
-    pub fn len(&self) -> usize {
-        self.starts.last().copied().unwrap_or_default()
-    }
+    pub fn len(&self) -> usize { self.starts.last().copied().unwrap_or_default() }
 
     /// Style just a bounded rendered byte range; hidden chunks never populate
     /// the AST's whole-paragraph styled-spans cache.
-    pub fn spans_range(
-        &self,
-        style: Style,
-        range: Range<usize>,
-    ) -> Arc<[text::Span<'static, Uri>]> {
-        let first = self
-            .starts
-            .partition_point(|start| *start <= range.start)
-            .saturating_sub(1);
-        self.spans
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take_while(|(index, _)| self.starts[*index] < range.end)
+    pub fn spans_range(&self, style: Style, range: Range<usize>) -> Arc<[text::Span<'static, Uri>]> {
+        let first = self.starts.partition_point(|start| *start <= range.start).saturating_sub(1);
+        self.spans.iter().enumerate().skip(first).take_while(|(index, _)| self.starts[*index] < range.end)
             .filter_map(|(index, span)| {
                 let start = range.start.saturating_sub(self.starts[index]);
-                let end = range
-                    .end
-                    .saturating_sub(self.starts[index])
-                    .min(span.text().len());
+                let end = range.end.saturating_sub(self.starts[index]).min(span.text().len());
                 (start < end).then(|| span.view_part(&style, start..end))
-            })
-            .collect()
+            }).collect()
     }
 
     /// Returns the [`rich_text()`] spans ready to be used for the given style.
@@ -444,11 +429,12 @@ enum Span {
 }
 
 impl Span {
-    fn text(&self) -> &str {
-        match self {
-            Self::Standard { text, .. } => text,
-        }
+    fn prefix_of(&self, new: &Self, last: bool) -> bool {
+        let Self::Standard { text: old, strikethrough: a, link: b, strong: c, emphasis: d, code: e } = self;
+        let Self::Standard { text: new, strikethrough: f, link: g, strong: h, emphasis: i, code: j } = new;
+        (a,b,c,d,e) == (f,g,h,i,j) && if last { new.starts_with(old) } else { new == old }
     }
+    fn text(&self) -> &str { match self { Self::Standard { text, .. } => text } }
     fn view(&self, style: &Style) -> text::Span<'static, Uri> {
         self.view_part(style, 0..self.text().len())
     }
@@ -571,6 +557,7 @@ fn parse_with<'a>(
     let mut image = None;
     let mut stack = Vec::new();
 
+
     let parser = pulldown_cmark::Parser::new_with_broken_link_callback(
         markdown,
         pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
@@ -583,7 +570,9 @@ fn parse_with<'a>(
             let broken_links = broken_links.clone();
 
             Some(move |broken_link: pulldown_cmark::BrokenLink<'_>| {
-                if let Some(reference) = references.get(broken_link.reference.as_ref()) {
+                if let Some(reference) =
+                    references.get(broken_link.reference.as_ref())
+                {
                     Some((
                         pulldown_cmark::CowStr::from(reference.to_owned()),
                         broken_link.reference.into_static(),
@@ -601,10 +590,14 @@ fn parse_with<'a>(
     let references = &mut state.borrow_mut().references;
 
     for reference in parser.reference_definitions().iter() {
-        let _ = references.insert(reference.0.to_owned(), reference.1.dest.to_string());
+        let _ = references
+            .insert(reference.0.to_owned(), reference.1.dest.to_string());
     }
 
-    let produce = move |state: &mut State, stack: &mut Vec<Scope>, item, source: Range<usize>| {
+    let produce = move |state: &mut State,
+                        stack: &mut Vec<Scope>,
+                        item,
+                        source: Range<usize>| {
         if let Some(scope) = stack.last_mut() {
             match scope {
                 Scope::List(list) => {
@@ -700,11 +693,13 @@ fn parse_with<'a>(
 
                 prev
             }
-            pulldown_cmark::Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(language))
-                if !metadata =>
-            {
+            pulldown_cmark::Tag::CodeBlock(
+                pulldown_cmark::CodeBlockKind::Fenced(language),
+            ) if !metadata => {
+
                 code_block = true;
-                code_language = (!language.is_empty()).then(|| language.into_string());
+                code_language =
+                    (!language.is_empty()).then(|| language.into_string());
 
                 if spans.is_empty() {
                     None
@@ -816,7 +811,12 @@ fn parse_with<'a>(
                     return None;
                 };
 
-                produce(state.borrow_mut(), &mut stack, Item::Quote(quote), source)
+                produce(
+                    state.borrow_mut(),
+                    &mut stack,
+                    Item::Quote(quote),
+                    source,
+                )
             }
             pulldown_cmark::TagEnd::Image if !metadata => {
                 let (url, title) = image.take()?;
@@ -825,16 +825,23 @@ fn parse_with<'a>(
                 let state = state.borrow_mut();
                 let _ = state.images.insert(url.clone());
 
-                produce(state, &mut stack, Item::Image { url, title, alt }, source)
+                produce(
+                    state,
+                    &mut stack,
+                    Item::Image { url, title, alt },
+                    source,
+                )
             }
             pulldown_cmark::TagEnd::CodeBlock if !metadata => {
                 code_block = false;
+
 
                 produce(
                     state.borrow_mut(),
                     &mut stack,
                     Item::CodeBlock {
                         language: code_language.take(),
+                        reader_source: super::reader_source::Source::new(&code),
                         code: mem::take(&mut code),
                         lines: code_lines.drain(..).collect(),
                     },
@@ -903,6 +910,8 @@ fn parse_with<'a>(
             if code_block {
                 code.push_str(&text);
 
+
+
                 return None;
             }
 
@@ -954,7 +963,9 @@ fn parse_with<'a>(
             });
             None
         }
-        pulldown_cmark::Event::InlineHtml(h) if !metadata && h.eq_ignore_ascii_case("<br>") => {
+        pulldown_cmark::Event::InlineHtml(h)
+            if !metadata && h.eq_ignore_ascii_case("<br>") =>
+        {
             spans.push(Span::Standard {
                 text: String::from("\n"),
                 strikethrough,
@@ -965,7 +976,9 @@ fn parse_with<'a>(
             });
             None
         }
-        pulldown_cmark::Event::Rule => produce(state.borrow_mut(), &mut stack, Item::Rule, source),
+        pulldown_cmark::Event::Rule => {
+            produce(state.borrow_mut(), &mut stack, Item::Rule, source)
+        }
         pulldown_cmark::Event::TaskListMarker(done) => {
             if let Some(Scope::List(list)) = stack.last_mut()
                 && let Some(item) = list.bullets.last_mut()
@@ -983,6 +996,7 @@ fn parse_with<'a>(
     })
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,56 +1009,28 @@ mod tests {
                 let mut out = Vec::new();
                 for item in items {
                     match item {
-                        $module::Item::Heading(level, text) => {
-                            out.push(format!("heading {level:?} {}", ($plain)(text)))
-                        }
-                        $module::Item::Paragraph(text) => {
-                            out.push(format!("paragraph {}", ($plain)(text)))
-                        }
-                        $module::Item::CodeBlock { language, code, .. } => {
-                            out.push(format!("code {language:?} {code}"))
-                        }
-                        $module::Item::Quote(items) => {
-                            out.push("quote".into());
-                            out.extend($name(items));
-                            out.push("/quote".into());
-                        }
+                        $module::Item::Heading(level, text) => out.push(format!("heading {level:?} {}", ($plain)(text))),
+                        $module::Item::Paragraph(text) => out.push(format!("paragraph {}", ($plain)(text))),
+                        $module::Item::CodeBlock { language, code, .. } => out.push(format!("code {language:?} {code}")),
+                        $module::Item::Quote(items) => { out.push("quote".into()); out.extend($name(items)); out.push("/quote".into()); }
                         $module::Item::List { start, bullets } => {
                             out.push(format!("list {start:?}"));
                             for bullet in bullets {
                                 let items = match bullet {
-                                    $module::Bullet::Point { items } => {
-                                        out.push("bullet".into());
-                                        items
-                                    }
-                                    $module::Bullet::Task { items, done } => {
-                                        out.push(format!("task {done}"));
-                                        items
-                                    }
+                                    $module::Bullet::Point { items } => { out.push("bullet".into()); items },
+                                    $module::Bullet::Task { items, done } => { out.push(format!("task {done}")); items },
                                 };
-                                out.extend($name(items));
-                                out.push("/bullet".into());
+                                out.extend($name(items)); out.push("/bullet".into());
                             }
                             out.push("/list".into());
                         }
                         $module::Item::Table { columns, rows } => {
                             out.push("table".into());
-                            for column in columns {
-                                out.push(format!("column {:?}", column.alignment));
-                                out.extend($name(&column.header));
-                            }
-                            for row in rows {
-                                out.push("row".into());
-                                for cell in &row.cells {
-                                    out.push("cell".into());
-                                    out.extend($name(cell));
-                                }
-                            }
+                            for column in columns { out.push(format!("column {:?}", column.alignment)); out.extend($name(&column.header)); }
+                            for row in rows { out.push("row".into()); for cell in &row.cells { out.push("cell".into()); out.extend($name(cell)); } }
                             out.push("/table".into());
                         }
-                        $module::Item::Image { url, title, alt } => {
-                            out.push(format!("image {url} {title} {}", ($plain)(alt)))
-                        }
+                        $module::Item::Image { url, title, alt } => out.push(format!("image {url} {title} {}", ($plain)(alt))),
                         $module::Item::Rule => out.push("rule".into()),
                     }
                 }
@@ -1052,16 +1038,53 @@ mod tests {
             }
         };
     }
-    outline!(native_outline, native, |text: &native::Text| text
-        .plain()
-        .to_string());
+    outline!(native_outline, native, |text: &native::Text| text.plain().to_string());
     outline!(original_outline, original, |text: &original::Text| {
         let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
-        text.spans(style)
-            .iter()
-            .map(|span| span.text.as_ref())
-            .collect::<String>()
+        text.spans(style).iter().map(|span| span.text.as_ref()).collect::<String>()
     });
+
+    fn paragraph_text(content: &Content) -> Text {
+        match content.items() { [Item::Paragraph(text)] => text.clone(), other => panic!("expected paragraph: {other:?}") }
+    }
+
+    #[test]
+    fn styled_append_lineage_accepts_coalesced_prefixes_and_releases_old_bodies() {
+        let mut content = Content::parse(&"words ".repeat(1000));
+        let first = paragraph_text(&content);
+        content.push_str("more words");
+        let middle = paragraph_text(&content);
+        let released = Arc::downgrade(&middle.spans);
+        content.push_str(" still more");
+        let latest = paragraph_text(&content);
+        assert!(latest.append_proven(&first));
+        assert!(latest.append_proven(&middle));
+        drop(middle);
+        assert!(released.upgrade().is_none(), "proof edges must not own source bodies");
+        let mut styled = Content::parse("word **bold** tail");
+        let previous = paragraph_text(&styled);
+        styled.push_str(" continuing");
+        assert!(paragraph_text(&styled).append_proven(&previous),
+            "unchanged emphasis/link/style prefix may complete progressively");
+    }
+
+    #[test]
+    fn styled_append_lineage_rejects_reinterpretation_rewrites_and_expired_proofs() {
+        let mut content = Content::parse("word **bold");
+        let previous = paragraph_text(&content);
+        content.push_str("**");
+        assert!(!paragraph_text(&content).append_proven(&previous),
+            "raw append that changes emphasis is not a rendered prefix");
+        let previous = paragraph_text(&Content::parse("[label](https://old.example) tail"));
+        let changed = paragraph_text(&Content::parse("[label](https://new.example) tail"));
+        assert!(!changed.append_proven(&previous));
+        let mut content = Content::parse("plain words");
+        let first = paragraph_text(&content);
+        for _ in 0..300 { content.push_str(" more"); }
+        let latest = paragraph_text(&content);
+        assert!(!latest.append_proven(&first), "expired proof requires worker-side exact fallback");
+        assert!(latest.lineage.lock().unwrap().edges.len() <= 256);
+    }
 
     const CASES: &[&str] = &[
         "# Heading\n\nA **bold** and *italic* [link](https://example.com), `inline code`, ~~strike~~.\n",
@@ -1079,15 +1102,9 @@ mod tests {
         for source in CASES {
             let native = Content::parse(source);
             let original = original::Content::parse(source);
-            assert_eq!(
-                native_outline(native.items()),
-                original_outline(original.items()),
-                "{source:?}"
-            );
+            assert_eq!(native_outline(native.items()), original_outline(original.items()), "{source:?}");
             for item in native.items() {
-                if let Item::CodeBlock { lines, .. } = item {
-                    assert!(lines.is_empty());
-                }
+                if let Item::CodeBlock { lines, .. } = item { assert!(lines.is_empty()); }
             }
         }
     }
@@ -1099,21 +1116,11 @@ mod tests {
             for stride in [1, 2, 7, 31] {
                 let mut content = Content::new();
                 let mut previous = 0;
-                for end in (1..=source.len())
-                    .filter(|end| source.is_char_boundary(*end))
-                    .step_by(stride)
-                    .chain(std::iter::once(source.len()))
-                {
-                    if end > previous {
-                        content.push_str(&source[previous..end]);
-                        previous = end;
-                    }
+                for end in (1..=source.len()).filter(|end| source.is_char_boundary(*end)).step_by(stride)
+                    .chain(std::iter::once(source.len())) {
+                    if end > previous { content.push_str(&source[previous..end]); previous = end; }
                 }
-                assert_eq!(
-                    native_outline(content.items()),
-                    expected,
-                    "stride {stride}, {source:?}"
-                );
+                assert_eq!(native_outline(content.items()), expected, "stride {stride}, {source:?}");
             }
         }
     }
@@ -1123,48 +1130,18 @@ mod tests {
         let mut content = Content::parse("Answer");
         let before = content.parsed_bytes;
         let mut source = "Answer".to_owned();
-        for _ in 0..10000 {
-            content.push_str(" more ordinary α text");
-            source.push_str(" more ordinary α text");
-        }
+        for _ in 0..10000 { content.push_str(" more ordinary α text"); source.push_str(" more ordinary α text"); }
         assert_eq!(content.parsed_bytes, before);
-        for suffix in [
-            " **",
-            "bold",
-            "**",
-            "\n",
-            "- item",
-            "\n\n",
-            "[link",
-            "](https://example.com)",
-        ] {
-            content.push_str(suffix);
-            source.push_str(suffix);
-            assert_eq!(
-                native_outline(content.items()),
-                original_outline(original::Content::parse(&source).items()),
-                "suffix {suffix:?}"
-            );
+        for suffix in [" **", "bold", "**", "\n", "- item", "\n\n", "[link", "](https://example.com)"] {
+            content.push_str(suffix); source.push_str(suffix);
+            assert_eq!(native_outline(content.items()), original_outline(original::Content::parse(&source).items()), "suffix {suffix:?}");
         }
-        for source in [
-            "Alpha ordinary text.",
-            "Alpha **strong** text",
-            "Alpha &amp; entity",
-            "Alpha <tag>text</tag>",
-            "Alpha `code` end",
-            "Alpha\n---",
-            "Alpha [link](https://example.com)",
-        ] {
+        for source in ["Alpha ordinary text.", "Alpha **strong** text", "Alpha &amp; entity", "Alpha <tag>text</tag>", "Alpha `code` end", "Alpha\n---", "Alpha [link](https://example.com)"] {
             let mut content = Content::new();
             for end in (1..=source.len()).filter(|end| source.is_char_boundary(*end)) {
                 let previous = source[..end].char_indices().last().unwrap().0;
                 content.push_str(&source[previous..end]);
-                assert_eq!(
-                    native_outline(content.items()),
-                    original_outline(original::Content::parse(&source[..end]).items()),
-                    "prefix {:?}",
-                    &source[..end]
-                );
+                assert_eq!(native_outline(content.items()), original_outline(original::Content::parse(&source[..end]).items()), "prefix {:?}", &source[..end]);
             }
         }
     }
@@ -1174,57 +1151,25 @@ mod tests {
         let mut content = Content::parse("```rust\nfn main() {}\n");
         let before = content.parsed_bytes;
         let mut source = "```rust\nfn main() {}\n".to_owned();
-        for _ in 0..10000 {
-            content.push_str("let value = 42;\n");
-            source.push_str("let value = 42;\n");
-        }
-        assert_eq!(
-            content.parsed_bytes, before,
-            "the open body never re-enters CommonMark"
-        );
-        content.push_str("```\n\nAfter the fence.\n");
-        source.push_str("```\n\nAfter the fence.\n");
-        assert_eq!(
-            native_outline(content.items()),
-            original_outline(original::Content::parse(&source).items())
-        );
-        assert!(
-            content.parsed_bytes < source.len() * 2,
-            "closing costs one linear parse, not quadratic appends"
-        );
+        for _ in 0..10000 { content.push_str("let value = 42;\n"); source.push_str("let value = 42;\n"); }
+        assert_eq!(content.parsed_bytes, before, "the open body never re-enters CommonMark");
+        content.push_str("```\n\nAfter the fence.\n"); source.push_str("```\n\nAfter the fence.\n");
+        assert_eq!(native_outline(content.items()), original_outline(original::Content::parse(&source).items()));
+        assert!(content.parsed_bytes < source.len() * 2, "closing costs one linear parse, not quadratic appends");
     }
 
     #[test]
     fn extracting_a_visible_span_range_does_not_style_the_hidden_paragraph() {
-        let source = format!(
-            "{} **linked [αβ](https://example.com)** {}",
-            "plain ".repeat(10000),
-            "tail ".repeat(10000)
-        );
+        let source = format!("{} **linked [αβ](https://example.com)** {}", "plain ".repeat(10000), "tail ".repeat(10000));
         let content = Content::parse(&source);
-        let Item::Paragraph(text) = &content.items()[0] else {
-            panic!("paragraph")
-        };
+        let Item::Paragraph(text) = &content.items()[0] else { panic!("paragraph") };
         let plain = text.plain();
         let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
         let at = plain.find("linked").unwrap();
         let spans = text.spans_range(style, at..at + "linked αβ".len());
-        assert_eq!(
-            spans
-                .iter()
-                .map(|span| span.text.as_ref())
-                .collect::<String>(),
-            "linked αβ"
-        );
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.link.as_deref() == Some("https://example.com"))
-        );
-        assert!(
-            text.last_style.get().is_none(),
-            "hidden text has no styled-span cache"
-        );
+        assert_eq!(spans.iter().map(|span| span.text.as_ref()).collect::<String>(), "linked αβ");
+        assert!(spans.iter().any(|span| span.link.as_deref() == Some("https://example.com")));
+        assert!(text.last_style.get().is_none(), "hidden text has no styled-span cache");
         assert!(text.last_styled_spans.borrow().is_empty());
     }
 }

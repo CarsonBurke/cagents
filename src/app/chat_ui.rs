@@ -25,6 +25,7 @@ mod images;
 mod layout;
 mod markdown;
 mod markdown_source;
+mod reader_source;
 mod monospace;
 mod permissions;
 mod prose;
