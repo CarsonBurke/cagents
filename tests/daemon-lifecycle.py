@@ -76,8 +76,8 @@ class Instance:
             self.close()
             raise
 
-    def cli(self, *args):
-        result = subprocess.run([str(self.binaries / "cagents"), "--json", *args],
+    def cli(self, *args, executable=None):
+        result = subprocess.run([str(executable or self.binaries / "cagents"), "--json", *args],
                                 env=self.env, capture_output=True, text=True, timeout=15)
         if result.returncode:
             raise AssertionError(f"CLI {args!r} failed: {result.stdout}\n{result.stderr}")
@@ -107,6 +107,8 @@ class Instance:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-directory", required=True, type=Path)
+    parser.add_argument("--legacy-bin-directory", type=Path,
+                        help="Matched older development pair without the idle-only cleanup capability")
     parser.add_argument("--evidence", required=True, type=Path)
     args = parser.parse_args()
     binaries = args.bin_directory.resolve()
@@ -115,6 +117,12 @@ def main():
         assert (binaries / product).is_file(), f"Missing matched {product}"
         with (binaries / product).open("rb") as executable:
             products[product] = hashlib.file_digest(executable, "sha256").hexdigest()
+    legacy = args.legacy_bin_directory.resolve() if args.legacy_bin_directory else None
+    legacy_products = {}
+    if legacy:
+        for product in ("cagents", "cagentsd"):
+            with (legacy / product).open("rb") as executable:
+                legacy_products[product] = hashlib.file_digest(executable, "sha256").hexdigest()
     args.evidence.mkdir(parents=True, exist_ok=False)
     checks = []
     with tempfile.TemporaryDirectory(prefix="cagents-lifecycle-", dir="/var/tmp") as temporary:
@@ -177,11 +185,32 @@ def main():
                                    "terminal": terminal})
                 finally:
                     instance.close()
+            if legacy:
+                version = root / "legacy-version"
+                version.mkdir()
+                for product in ("cagents", "cagentsd"):
+                    try:
+                        os.link(legacy / product, version / product)
+                    except OSError:
+                        shutil.copy2(legacy / product, version / product)
+                instance = Instance(root / "stale-legacy", version)
+                try:
+                    (version / "cagentsd").unlink()
+                    result = instance.cli("daemon", "cleanup-stale-development",
+                                          executable=binaries / "cagents")
+                    assert not result["stopped"], result
+                    assert instance.process.poll() is None, "unsupported old daemon received a stop signal"
+                    assert not instance.terminals()
+                    checks.append({"contract": "unsupported_old_development_daemon_is_preserved",
+                                   "pid": instance.process.pid, "stopped": False})
+                finally:
+                    instance.close()
         finally:
             # Preserve failure evidence before TemporaryDirectory removes the
             # isolated state; no fixture binary copies are retained.
             shutil.copytree(root, args.evidence / "instances", ignore=evidence_ignores)
-            (args.evidence / "result.json").write_text(json.dumps({"products": products, "checks": checks, "completed": len(checks) == 5}, indent=2) + "\n")
+            (args.evidence / "result.json").write_text(json.dumps({"products": products, "legacy_products": legacy_products,
+                "checks": checks, "completed": len(checks) == 5 + bool(legacy)}, indent=2) + "\n")
     print(json.dumps({"passed": len(checks), "evidence": str(args.evidence)}))
 
 
