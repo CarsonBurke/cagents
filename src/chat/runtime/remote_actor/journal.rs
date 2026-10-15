@@ -51,6 +51,7 @@ pub(super) struct Journal {
     run_ids: std::collections::BTreeSet<crate::model::RunId>,
     finished_runs: std::collections::BTreeMap<crate::model::RunId, u64>,
     input_sequence: u64,
+    acknowledged_inputs: std::collections::BTreeSet<u64>,
     outcome_ack: u64,
     outcome_latest: u64,
 }
@@ -84,6 +85,7 @@ impl Journal {
             run_ids: Default::default(),
             finished_runs: Default::default(),
             input_sequence: 0,
+            acknowledged_inputs: Default::default(),
             outcome_ack: 0,
             outcome_latest: 0,
         })
@@ -422,7 +424,20 @@ impl Journal {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        if matches!(state,InputState::Acknowledged(_)) {self.acknowledged_inputs.insert(identity.sequence);}
         Ok(())
+    }
+    pub fn acknowledged_input_count(&self)->usize {self.acknowledged_inputs.len()}
+    pub fn acknowledged_input_page(&self)->Result<Vec<InputReceipt>,String> {
+        let mut page=Vec::new();
+        for sequence in self.acknowledged_inputs.iter().take(64) {
+            let (id,hash,state):(String,Vec<u8>,Vec<u8>)=self.db.query_row("SELECT id,hash,state FROM inputs WHERE sequence=?1",[sequence],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|error|error.to_string())?;
+            let identity=InputIdentity {sequence:*sequence,id:uuid::Uuid::parse_str(&id).map_err(|error|error.to_string())?,hash:hash.try_into().map_err(|_|"Invalid retained input digest")?};
+            let state=serde_json::from_slice(&state).map_err(|error|error.to_string())?;
+            if !matches!(state,InputState::Acknowledged(_)) {return Err("Input acknowledgement cache lost its terminal-state proof".into());}
+            page.push(InputReceipt {identity,state});
+        }
+        Ok(page)
     }
     /// Retire exact terminal receipts independently: an earlier unknown or
     /// partially written input must not block cleanup of unrelated outcomes.
@@ -447,7 +462,9 @@ impl Journal {
         }
         let transaction=self.db.transaction().map_err(|error|error.to_string())?;
         for identity in identities {transaction.execute("DELETE FROM inputs WHERE sequence=?1",[identity.sequence]).map_err(|error|error.to_string())?;}
-        transaction.commit().map_err(|error|error.to_string())
+        transaction.commit().map_err(|error|error.to_string())?;
+        for identity in identities {self.acknowledged_inputs.remove(&identity.sequence);}
+        Ok(())
     }
 
     pub fn retire_inputs(&mut self, through: u64) -> Result<(), String> {
@@ -470,6 +487,7 @@ impl Journal {
         self.db
             .execute("DELETE FROM inputs WHERE sequence<=?1", [through])
             .map_err(|error| error.to_string())?;
+        self.acknowledged_inputs.retain(|sequence|*sequence>through);
         Ok(())
     }
     pub fn next_input(&self) -> Result<u64, String> {
@@ -634,6 +652,10 @@ mod tests {
         let mut last=None;
         for sequence in 3..(MAX_INPUTS as u64+35) {
             let input=identity(sequence);journal.admit(&input).unwrap();journal.finish(&input,InputState::Acknowledged(Ok(()))).unwrap();
+            let page=journal.acknowledged_input_page().unwrap();assert_eq!(page.len(),1);assert_eq!(page[0].identity,input);
+            assert!(matches!(&page[0].state,InputState::Acknowledged(Ok(()))));
+            assert!(journal.retire_acknowledged_inputs(&[input.clone(),unknown.clone()]).is_err());
+            assert_eq!(journal.acknowledged_input_count(),1,"failed batch cannot remove an earlier terminal receipt");
             let mut changed=input.clone();changed.hash=[8;32];
             assert!(journal.retire_acknowledged_inputs(&[changed]).is_err());
             assert!(journal.input(&input).unwrap().is_some());
@@ -646,11 +668,17 @@ mod tests {
         assert!(journal.retire_acknowledged_inputs(std::slice::from_ref(&unknown)).is_err());
         assert_eq!(journal.input(&accepted).unwrap().unwrap().state,InputState::Accepted);
         assert!(matches!(journal.input(&unknown).unwrap().unwrap().state,InputState::Unknown(_)));
-        let next=journal.next_input().unwrap();drop(journal);
-        let mut reopened=Journal::open(directory.path()).unwrap();
-        assert_eq!(reopened.next_input().unwrap(),next);
-        assert!(reopened.admit(&last.unwrap()).is_err());
-        assert_eq!(reopened.input(&accepted).unwrap().unwrap().state,InputState::Accepted);
+        assert_eq!(journal.acknowledged_input_count(),0);
+        assert!(journal.acknowledged_input_page().unwrap().is_empty());
+        let next=journal.next_input().unwrap();let retired=last.unwrap();drop(journal);
+        // Reopening the live actor itself is intentionally forbidden. Inspect
+        // its durable high-water tombstone without reconstructing a reducer.
+        let database=Connection::open(directory.path().join("actor-journal.sqlite")).unwrap();
+        let highwater:String=database.query_row("SELECT value FROM metadata WHERE key='input_sequence'",[],|row|row.get(0)).unwrap();
+        assert_eq!(highwater.parse::<u64>().unwrap()+1,next);
+        let count:u64=database.query_row("SELECT COUNT(*) FROM inputs WHERE sequence=?1",[retired.sequence],|row|row.get(0)).unwrap();assert_eq!(count,0);
+        let state:Vec<u8>=database.query_row("SELECT state FROM inputs WHERE sequence=?1",[accepted.sequence],|row|row.get(0)).unwrap();
+        assert_eq!(serde_json::from_slice::<InputState>(&state).unwrap(),InputState::Accepted);
     }
 
     #[test]
