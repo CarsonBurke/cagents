@@ -24,7 +24,9 @@ history retained for a native session while its daemon is unavailable. Replay
 records retire after the daemon durably acknowledges them.
 
 Native conversation previews use semantic provider events, independently of the
-transcript page a window is viewing. They prefer prose over fenced code, omit
+transcript page a window is viewing. When the provider supplies no conversation
+name, a bounded label from the current live message identifies the work; it is
+also hidden while previews are disabled. They prefer prose over fenced code, omit
 reasoning and raw tool output, remove control sequences and bound the excerpt to
 240 characters. A code-only response keeps a short code excerpt. Request previews
 never include secret field values. Observed CLI sessions can supply a conversation

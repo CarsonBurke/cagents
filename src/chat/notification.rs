@@ -6,6 +6,7 @@ const RETAINED_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Preview {
+    topic: String,
     id: String,
     text: String,
     final_response: bool,
@@ -16,6 +17,15 @@ impl Preview {
     pub(super) fn observe(&mut self, event: &Event) {
         match event {
             Event::TurnStarted | Event::Reset { .. } => *self = Self::default(),
+            Event::Item(item) if item.role == Role::User && self.topic.is_empty() => {
+                if let ItemContent::Text { text, thinking: false, .. } = &item.content {
+                    // A provider may have no conversation title. Use only its
+                    // current live message as a short opt-in label; this is
+                    // turn context, not a persisted canonical channel name.
+                    // Never page history or read request answers/defaults.
+                    self.topic = presentation::title(&presentation::preview(text));
+                }
+            }
             Event::Item(item) if item.role == Role::Assistant => match &item.content {
                 ItemContent::Text {
                     text,
@@ -71,6 +81,13 @@ impl Preview {
     }
 }
 
+impl Preview {
+    fn conversation(&self, provider_title: Option<&str>) -> String {
+        let title = presentation::title(provider_title.unwrap_or_default());
+        if title.is_empty() { self.topic.clone() } else { title }
+    }
+}
+
 fn tool_verb(status: ToolStatus, noun: &str) -> String {
     format!(
         "{noun} {}",
@@ -111,7 +128,7 @@ impl FrameContext {
     }
     fn content(&self, kind: Kind) -> Content {
         Content {
-            conversation: self.conversation.clone(),
+            conversation: self.preview.conversation(Some(&self.conversation)),
             preview: response_preview(&self.preview, Some(&self.error), kind),
             request: None,
         }
@@ -267,7 +284,7 @@ impl Snapshot {
 
     pub(crate) fn notification_content(&self, kind: Kind) -> Content {
         let mut content = Content {
-            conversation: presentation::title(self.title.as_deref().unwrap_or_default()),
+            conversation: self.notification_preview.conversation(self.title.as_deref()),
             preview: String::new(),
             request: None,
         };
@@ -360,6 +377,26 @@ mod tests {
         let content = snapshot.notification_content(Kind::Waiting);
         assert!(content.preview.chars().count() <= 240);
         assert!(!content.preview.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn notification_topic_fallback_is_bounded_and_fenced_to_the_live_turn() {
+        let mut state = Snapshot::default();
+        let message = |text: &str| Event::Item(super::super::Item {
+            id: "current-user".into(), role: Role::User, at: None, started_at: None,
+            content: ItemContent::Text { text: text.into(), thinking: false, phase: Phase::Final },
+        });
+        Arc::make_mut(&mut state.notification_preview).observe(&message("Repair `config_file.rs`"));
+        assert_eq!(state.notification_content(Kind::Waiting).conversation, "Repair config_file.rs");
+        state.title = Some("Provider conversation name".into());
+        assert_eq!(state.notification_content(Kind::Succeeded).conversation, "Provider conversation name");
+        state.title = None;
+        Arc::make_mut(&mut state.notification_preview).observe(&Event::TurnStarted);
+        assert!(state.notification_content(Kind::Waiting).conversation.is_empty());
+        Arc::make_mut(&mut state.notification_preview).observe(&message(&"🦀".repeat(100_000)));
+        assert!(state.notification_content(Kind::Succeeded).conversation.chars().count() <= presentation::TITLE_LIMIT);
+        Arc::make_mut(&mut state.notification_preview).observe(&Event::Reset { reason: "Fixture new conversation".into() });
+        assert!(state.notification_content(Kind::Succeeded).conversation.is_empty());
     }
 
     #[test]

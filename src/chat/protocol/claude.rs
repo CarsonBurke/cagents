@@ -8418,6 +8418,32 @@ mod tests {
     }
 
     #[test]
+    fn notification_without_provider_title_uses_its_current_message_label() {
+        let receipts = crate::chat::runtime::notification_frames_for_test(
+            Box::new(Claude { busy: true, ready: true, ..Default::default() }),
+            vec![
+                json!({"type":"user","uuid":"notification-topic-user","session_id":"notification-topic-session",
+                    "message":{"role":"user","content":[{"type":"text","text":"Repair `config_file.rs`"}]}}),
+                json!({"type":"assistant","uuid":"notification-topic-answer","session_id":"notification-topic-session",
+                    "message":{"role":"assistant","content":[{"type":"text","text":"The configuration is ready to review."}]}}),
+                json!({"type":"result","uuid":"notification-topic-result","session_id":"notification-topic-session","is_error":false}),
+            ], false,
+        );
+        let (evidence, content) = receipts.last().expect("real actor publishes completion");
+        assert_eq!(evidence.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(content.conversation, "Repair config_file.rs");
+        assert_eq!(content.preview, "The configuration is ready to review.");
+        let mut event = crate::notifications::Event::session(
+            crate::model::TerminalId::new(), crate::agent::Provider::Claude,
+            "/project".into(), evidence.clone(),
+        );
+        event.content = Some(content.clone());
+        event.validate().unwrap();
+        assert_eq!(crate::notifications::presentation::message(&event, true).title, "Repair config_file.rs");
+        assert!(!crate::notifications::presentation::message(&event, false).title.contains("config_file"));
+    }
+
+    #[test]
     fn notification_callback_sees_the_failed_result_diagnosis() {
         let adapter = Claude {
             busy: true,
