@@ -1147,6 +1147,11 @@ mod tests {
         let generation = app.automation_approval.page_generation;
         drop(app.update_automation_approval(Action::Page { generation, after:Some(uuid::Uuid::from_u128(64)),offset:64 }));
         let old_page = app.automation_approval.page_generation;
+        app.automation_proposals_reconnected();
+        drop(app.sync_automation_proposal_page(identity,1,1_000,request_page(&proposal,1,64)));
+        drop(app.update_automation_approval(Action::PageLoaded {generation:old_page,after:Some(uuid::Uuid::from_u128(64)),offset:64,result:Arc::new(Ok(request_page(&proposal,65,128)))}));
+        assert_eq!(app.automation_approval.page_offset,0);
+        assert_eq!(app.automation_approval.pending[0].id,uuid::Uuid::from_u128(1));
         app.automation_approval.available = Some(proposal.clone());
         drop(app.update_automation_approval(Action::Open { id:proposal.id,revision:proposal.revision }));
         drop(app.sync_automation_proposal_page(identity,2,1_000,request_page(&proposal,1,64)));
@@ -1161,9 +1166,6 @@ mod tests {
         let mut stale = proposal.clone(); stale.state=ProposalState::Declined;
         drop(app.update_automation_approval(Action::ReviewRefreshed {generation:review,pushed:old_push,result:Arc::new(Ok(stale))}));
         assert!(app.automation_approval_open(),"old daemon receipt cannot retire the current review");
-        drop(app.update_automation_approval(Action::PageLoaded {generation:old_page,after:Some(uuid::Uuid::from_u128(64)),offset:64,result:Arc::new(Ok(request_page(&proposal,65,128)))}));
-        assert_eq!(app.automation_approval.page_offset,0);
-        assert_eq!(app.automation_approval.pending[0].id,uuid::Uuid::from_u128(1));
         drop(app.update_automation_approval(Action::ReviewRefreshed {generation:review,pushed:new_push,result:Arc::new(Ok(proposal))}));
         assert!(app.automation_approval_open());
         assert!(app.automation_approval.review_refresh.is_none());
