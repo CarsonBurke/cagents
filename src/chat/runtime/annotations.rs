@@ -14,6 +14,45 @@ pub(super) struct Authority {
 }
 impl Authority {
     pub(super) fn new(scope:Result<LaunchAccountScope,String>)->Self{Self{scope,session:None,latest_proven:None,store:None,notice:None,retry_at:None,#[cfg(test)] root:None}}
+    fn pending_store(&self)->Result<annotations::storage::Store,String>{
+        let scope=self.scope.as_ref().map_err(Clone::clone)?;
+        #[cfg(test)]
+        if let Some(root)=&self.root{return annotations::storage::Store::pending_for_test(root,scope);}
+        annotations::storage::Store::pending_installation(scope)
+    }
+    /// Captures immutable operator bytes before any provider dispatch. Mutation
+    /// of attachment paths happens only after the complete durable publication.
+    pub(super) fn prepare(&mut self,command:&mut crate::chat::Command,cwd:&std::path::Path)->Result<Option<String>,OriginalError>{
+        let crate::chat::Command::Prompt{text,attachments,..}=command else{return Ok(None);};
+        let mut pending=self.pending_store().map_err(OriginalError::Unavailable)?;
+        let mut captured_text=pending.capture_text(text)?;
+        let mut captures=attachments.iter().map(|attachment|pending.retain_attachment(&if attachment.path.is_absolute(){attachment.path.clone()}else{cwd.join(&attachment.path)})).collect::<Result<Vec<_>,_>>()?;
+        let id=uuid::Uuid::new_v4().to_string();
+        let prepared=pending.prepare_command(&id,self.session.as_deref(),&mut captured_text,&mut captures)?;
+        for (attachment,capture) in attachments.iter_mut().zip(prepared.attachments){attachment.path=capture.path;}
+        Ok(Some(id))
+    }
+    pub(super) fn abandon(&mut self,id:&str)->Result<(),String>{
+        self.pending_store()?.abandon_command(id).map_err(|error|format!("{error:?}"))
+    }
+    pub(super) fn originals(&mut self,updates:Vec<annotations::OriginalUpdate>)->Option<String>{
+        for update in updates {
+            let result=match update {
+                annotations::OriginalUpdate::Settings{command_id,settings}=>self.pending_store().and_then(|mut store|store.prepared_settings(&command_id,&settings).map_err(|error|format!("{error:?}"))),
+                annotations::OriginalUpdate::Rejected{command_id}=>self.abandon(&command_id),
+                annotations::OriginalUpdate::Accepted{command_id,session_id,user_id,turn_id,aliases}=>{
+                    if self.session.as_deref()!=Some(session_id.as_str()){Err("Original acceptance does not match the confirmed provider conversation".into())}
+                    else if let Some(store)=&mut self.store{store.accept_prepared(&command_id,&user_id,&turn_id,&aliases).map_err(|error|format!("{error:?}"))}
+                    else{Err("Qualified original command storage is unavailable".into())}
+                },
+                annotations::OriginalUpdate::Latest{session_id,user_id}=>{
+                    if self.session.as_deref()!=Some(session_id.as_str()){Err("Latest user belongs to another provider conversation".into())}else{self.latest_user(&user_id)}
+                },
+            };
+            if let Err(error)=result{return self.warning(error);}
+        }
+        None
+    }
     pub(super) fn original(&self,user:Option<&str>,offset:usize,limit:usize)->Result<OriginalPage,OriginalError>{
         let store=self.store.as_ref().ok_or_else(||OriginalError::Unavailable(self.notice.clone().or_else(||self.scope.as_ref().err().cloned()).unwrap_or_else(||"No qualified provider-confirmed original command is available".into())))?;
         let user=user.or(self.latest_proven.as_deref()).ok_or_else(||OriginalError::Unavailable("The provider's current latest user message has not been confirmed".into()))?;
@@ -187,6 +226,29 @@ mod tests {
         assert_eq!(authority.original(Some(&original.user_id),0,4).unwrap().text,"text");
         authority.latest_user(&original.user_id).unwrap();assert_eq!(authority.original(None,0,4).unwrap().text,"text");
         authority.latest_user("newer-unannotated-provider-user").unwrap();assert!(matches!(authority.original(None,0,4),Err(OriginalError::Unavailable(_))));
+    }
+
+    #[test]
+    fn same_actor_prepare_releases_capture_leases_before_early_acceptance_and_scoped_deletion(){
+        use annotations::{OriginalSettings,OriginalUpdate,Setting};
+        let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();
+        let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
+        let storage=root.path().join("annotations");let mut authority=Authority::new(Ok(scope));authority.root=Some(storage);
+        std::fs::write(root.path().join("image.png"),b"original image").unwrap();
+        let mut command=Command::Prompt{text:"original /command".into(),attachments:vec![crate::chat::Attachment{path:"image.png".into()}],mode:crate::chat::PromptMode::Send};
+        let id=authority.prepare(&mut command,root.path()).unwrap().unwrap();
+        let path=if let Command::Prompt{attachments,..}=&command{attachments[0].path.clone()}else{unreachable!()};assert!(path.is_absolute());
+        authority.apply(Some(&Some("confirmed-session".into())),vec![],&mut vec![]);
+        let settings=OriginalSettings{model:Setting::Value("reported".into()),reasoning:Setting::Value("low".into()),fast:Setting::Unsupported,permission:Setting::Value("ask".into())};
+        assert!(authority.originals(vec![OriginalUpdate::Settings{command_id:id.clone(),settings},OriginalUpdate::Accepted{command_id:id,session_id:"confirmed-session".into(),user_id:"actual-user".into(),turn_id:"actual-turn".into(),aliases:vec![]}]).is_none(),"same actor must not retain capture flocks after prepare");
+        assert_eq!(authority.original(Some("actual-user"),0,1024).unwrap().text,"original /command");assert!(path.exists());
+        let mut second=Command::Prompt{text:"accepted but settings unavailable".into(),attachments:vec![],mode:crate::chat::PromptMode::Send};
+        authority.session=None;let id=authority.prepare(&mut second,root.path()).unwrap().unwrap();
+        let pending=authority.pending_store().unwrap().prepared(&id).unwrap();let pending_path=pending.text.path;
+        authority.session=Some("confirmed-session".into());
+        assert!(authority.originals(vec![OriginalUpdate::Accepted{command_id:id.clone(),session_id:"confirmed-session".into(),user_id:"actual-second-user".into(),turn_id:"actual-second-turn".into(),aliases:vec![]}]).is_some());
+        assert_eq!(authority.pending_store().unwrap().prepared(&id).unwrap().expected_session.as_deref(),Some("confirmed-session"));
+        authority.store.as_mut().unwrap().purge_for_test().unwrap();assert!(!path.exists());assert!(!pending_path.exists());
     }
 
 }

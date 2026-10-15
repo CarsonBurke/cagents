@@ -65,8 +65,11 @@ impl Store {
     /// entire outbox nor any conversation body is hydrated into actor memory.
     pub(crate) fn accept_prepared(&mut self,id:&str,user_id:&str,turn_id:&str,aliases:&[String])->Result<(),OriginalError>{
         let session=self.confirmed().map_err(OriginalError::Unavailable)?.to_owned();
+        // Only the caller's exact provider acceptance proof permits binding
+        // a pre-first-session intent. A Session event alone cannot attribute
+        // other unknown-session commands to this conversation.
+        self.bind_prepared(id,&session)?;
         let command=self.prepared(id)?;
-        if command.expected_session.as_deref().is_some_and(|expected|expected!=session){return Err(OriginalError::Changed);}
         let settings=command.settings.ok_or_else(||OriginalError::Unavailable("No fresh settings evidence is bound to this original dispatch".into()))?;
         let mut text=PendingText(self.restore_capture(command.text)?);
         let mut captures=command.attachments.into_iter().map(|attachment|self.restore_capture(attachment)).collect::<Result<Vec<_>,_>>()?;
@@ -74,6 +77,15 @@ impl Store {
         let file=crate::secure_file::open_existing_private_file(&text.0.attachment.path).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
         self.accept_reader(&original,file,text.0.attachment.sha256,aliases,&mut captures,Some(id))?;
         text.0.retained=false;
+        Ok(())
+    }
+    fn bind_prepared(&mut self,id:&str,session:&str)->Result<(),OriginalError>{
+        let mut command=self.prepared(id)?;
+        if command.expected_session.as_deref().is_some_and(|expected|expected!=session){return Err(OriginalError::Changed);}
+        command.expected_session=Some(session.to_owned());
+        let metadata=postcard::to_stdvec(&command).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
+        if metadata.len()>META_BYTES{return Err(OriginalError::TooLarge);}
+        if self.db.execute("UPDATE pending_commands SET expected_session=?2,metadata=?3 WHERE command_id=?1 AND (expected_session IS NULL OR expected_session=?2)",params![id,session,metadata]).map_err(storage_error)?!=1{return Err(OriginalError::Changed);}
         Ok(())
     }
     fn restore_capture(&self,attachment:OriginalAttachment)->Result<PendingAttachment,OriginalError>{

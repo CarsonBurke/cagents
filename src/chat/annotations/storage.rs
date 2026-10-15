@@ -121,6 +121,8 @@ impl Store {
     pub(crate) fn pending_installation(scope:&LaunchAccountScope)->Result<Self,String>{Self::open(&installation_root()?,scope,None)}
     #[cfg(test)]
     pub(crate) fn for_test(root:&Path,scope:&LaunchAccountScope,session:&str)->Result<Self,String>{Self::at(root,scope,session)}
+    #[cfg(test)]
+    pub(crate) fn pending_for_test(root:&Path,scope:&LaunchAccountScope)->Result<Self,String>{Self::open(root,scope,None)}
     fn at(root:&Path,scope:&LaunchAccountScope,session:&str)->Result<Self,String>{Self::open(root,scope,Some(session))}
     fn confirmed(&self)->Result<&str,String>{self.session.as_deref().ok_or_else(||"Pending command storage has no confirmed conversation authority".into())}
     fn open(root:&Path,scope:&LaunchAccountScope,session:Option<&str>)->Result<Self,String> {
@@ -156,6 +158,8 @@ impl Store {
         store.recover_pending()?;
         Ok(store)
     }
+    #[cfg(test)]
+    pub(crate) fn purge_for_test(&mut self)->Result<(),String>{self.purge_current_session()}
     fn purge_current_session(&mut self)->Result<(),String>{
         self.scope.revalidate()?;let session=self.confirmed()?.to_owned();
         let transaction=self.db.transaction().map_err(|e|e.to_string())?;

@@ -2058,6 +2058,7 @@ impl Actor {
             } else {
                 None
             };
+            let mut command=command;
             let starts_turn = matches!(&command, Command::Prompt { .. });
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -2089,6 +2090,16 @@ impl Actor {
                 let _ = reply.send(Err(error));
                 continue;
             }
+            // Original capture is optional product metadata. A capture failure
+            // leaves the ordinary command and picker paths intact, and cannot
+            // prevent the user from sending work to the provider.
+            let original=if run.is_none() && self.adapter.supports_original_commands(){
+                match self.annotations.lock().unwrap_or_else(|p|p.into_inner()).prepare(&mut command,&self.working_directory){
+                    Ok(id)=>id,
+                    Err(error)=>{tracing::warn!(?error,"original command capture unavailable");None},
+                }
+            }else{None};
+            self.adapter.original_command(original.clone());
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
@@ -2115,6 +2126,10 @@ impl Actor {
                     }
                 }
                 Err(message) => {
+                    // Adapter refusal occurred before any Step was queued: it
+                    // is safe to retire this never-dispatched intent.
+                    if let Some(id)=original && let Err(error)=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).abandon(&id){tracing::warn!(%error,"original refusal cleanup unavailable");}
+                    self.adapter.original_command(None);
                     self.apply(Event::Error {
                         message: message.clone(),
                         fatal: false,
@@ -2232,6 +2247,8 @@ impl Actor {
             // diagnostics so it cannot replace the turn's actual root cause.
             tracing::warn!(%message,"conversation annotation storage unavailable");
         }
+        let originals=self.adapter.take_original_updates();
+        if let Some(message)=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).originals(originals){tracing::warn!(%message,"original command metadata unavailable");}
         for value in step.writes {
             let mut frame = BoundedFrame(Vec::new());
             serde_json::to_writer(&mut frame, &value)
