@@ -196,7 +196,7 @@ mod tests {
             open: true,
             query: "needle".into(),
             request: 7,
-            matches: vec![matched(100, 10), matched(100, 20)].into(),
+            matches: vec![matched(100, 1), matched(100, 10), matched(100, 20)].into(),
             selected: 1,
             background_results: true,
             ..Find::default()
@@ -205,12 +205,12 @@ mod tests {
             card,
             7,
             "needle".into(),
-            vec![matched(103, 2), matched(103, 7), matched(103, 17)],
+            vec![matched(103, 7), matched(103, 17), matched(103, 27)],
             false,
         );
         let find = &app.terminal_find[&card];
-        assert_eq!(find.selected, 2, "preserve the original text, not its old result index");
-        assert_eq!(find.matches[find.selected], matched(103, 17));
+        assert_eq!(find.selected, 0, "preserve the original text, not its old result index");
+        assert_eq!(find.matches[find.selected], matched(103, 7));
         assert!(!find.focused);
     }
 
