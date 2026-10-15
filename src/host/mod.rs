@@ -175,6 +175,11 @@ pub fn run_automation_helper() -> Option<Result<(), String>> {
     automations::helper_entry()
 }
 
+mod upgrade_inspect;
+pub fn run_upgrade_inspection_helper() -> Option<Result<(), String>> {
+    upgrade_inspect::entry()
+}
+
 /// Holds launch exclusion until the daemon listener is ready.
 pub struct DaemonAdmission {
     _guard: crate::instance::DaemonAdmissionGuard,

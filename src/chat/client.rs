@@ -390,11 +390,10 @@ fn restore(
                     && restored.proof.as_ref() == Some(proof)
                     && restored.launch.provider == session.launch.provider =>
             {
-                if session.launch.session_id.is_some()
-                    && (session.launch.session_id != restored.launch.session_id
-                        || session.launch.recipe != restored.launch.recipe)
-                {
-                    if !super::is_upgrade_recovery(&session, &restored) {
+                if session != restored {
+                    if !(super::is_upgrade_recovery(&session, &restored)
+                        || super::is_upgrade_identity_learning(&session, &restored))
+                    {
                         return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
                     }
                     *upgrade_recovery = Some((session, restored.clone()));
@@ -505,6 +504,23 @@ impl ClientHandle {
         inner.proof = proof;
         inner.upgrade_recovery = Some((source, session));
         handle
+    }
+
+    /// Drives the production connect/lineage/attach path for UI writer tests.
+    #[cfg(test)]
+    pub(crate) fn fixture_upgrade_handshake(
+        source: Session,
+        session: Session,
+        snapshot: Snapshot,
+    ) -> Result<Self, StartFailure> {
+        tests::restore_with_lineage(source, Some(session), move |request| {
+            let ClientRequest::ChatAttach { session } = request else {
+                panic!("expected exact upgrade attach");
+            };
+            ServerMessage::Response {
+                response: ServerResponse::ChatAttached { session, snapshot },
+            }
+        })
     }
 
     /// Publishes `snapshot` as the reader thread would on a presentation
@@ -1170,6 +1186,10 @@ impl ClientHandle {
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
         self.inner.upgrade_recovery.as_ref()
     }
+    pub(crate) fn is_connected(&self) -> bool {
+        self.inner.alive.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner
             .snapshot
@@ -2451,10 +2471,24 @@ mod tests {
         };
         assert_eq!(session, restored);
 
+        let mut wrong_thread = restored.clone();
+        wrong_thread.launch.session_id = Some("different-known-thread".into());
+        let (outcome, _) = negotiate(
+            &live,
+            saved.clone(),
+            ServerMessage::Response {
+                response: ServerResponse::UpgradeChatResolved {
+                    session: wrong_thread,
+                },
+            },
+        );
+        assert!(
+            outcome.is_err(),
+            "a confirmed replacement cannot change a saved known thread"
+        );
+
         // A replacement for a different chat proves nothing about this one.
-        // The conversation identifier deliberately is not part of that
-        // comparison: the daemon reports the conversation its restarted writer
-        // actually holds, which is the answer being asked for.
+        // A known conversation identifier remains part of its exact source.
         let mut other = restored.clone();
         other.id = TerminalId::new();
         let (outcome, _) = negotiate(
@@ -2506,13 +2540,16 @@ mod tests {
         restore_with_lineage(session, None, answer)
     }
 
-    fn restore_with_lineage(
+    pub(super) fn restore_with_lineage(
         session: Session,
         resolved: Option<Session>,
         answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
     ) -> Result<ClientHandle, StartFailure> {
         use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
-        let live = host_proof("live");
+        let live = resolved
+            .as_ref()
+            .and_then(|session| session.proof.clone())
+            .unwrap_or_else(|| host_proof("live"));
         let (client, mut server) = UnixStream::pair().unwrap();
         let proof = live.clone();
         let worker = thread::spawn(move || {
@@ -2591,7 +2628,7 @@ mod tests {
     #[test]
     fn upgrade_provenance_requires_the_exact_attached_descriptor_and_confirmation() {
         for mismatch in 0..3 {
-            let source = omp_card(Some("prior-conversation"), Some(host_proof("prior")));
+            let source = omp_card(Some(CONVERSATION), Some(host_proof("prior")));
             let mut resolved = source.clone();
             resolved.proof = Some(host_proof("live"));
             resolved.launch.session_id = Some(CONVERSATION.into());

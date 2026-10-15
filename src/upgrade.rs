@@ -761,6 +761,22 @@ pub(crate) mod handoff {
                                 .is_some_and(|source| source.id == terminal.source.id)
                             && chat.launch.terminal_recipe().as_ref() == Some(&terminal.recipe)
                     });
+                if paired_codex {
+                    let original = chat.source.terminal.as_ref().expect("checked pair");
+                    let terminal = self
+                        .terminals
+                        .iter()
+                        .find(|terminal| terminal.source.id == original.id)
+                        .expect("checked paired terminal");
+                    let mut replacement = terminal.source.clone();
+                    replacement.launch = terminal.recipe.clone();
+                    replacement.continuity = original.continuity.clone();
+                    if &replacement != original {
+                        return Err(
+                            "Paired Codex terminal descriptor would change during restart".into(),
+                        );
+                    }
+                }
                 if !chat_ids.insert(chat.source.id)
                     || (!ids.insert(chat.source.id) && !paired_codex)
                     || chat.source.proof.as_ref() != Some(&self.proof)
@@ -850,8 +866,15 @@ pub(crate) mod handoff {
     }
 
     #[cfg(any(feature = "host", test))]
-    fn validate_chat_source(source: &chat::Session, launch: &chat::Launch) -> Result<(), String> {
-        if !source.has_valid_native_continuity() {
+    /// Check the immutable descriptor against the separate effective restart.
+    /// Call while the old provider and windows are still usable, before handoff.
+    pub(crate) fn validate_chat_source(
+        source: &chat::Session,
+        launch: &chat::Launch,
+    ) -> Result<(), String> {
+        if !source.has_valid_native_continuity()
+            || (source.owned_codex_listener.is_some() && !source.owns_codex_listener())
+        {
             return Err("Upgrade native continuity evidence is inconsistent".into());
         }
         let mut confirmed = source.launch.clone();
@@ -872,7 +895,63 @@ pub(crate) mod handoff {
         {
             return Err("Upgrade native terminal ownership is inconsistent".into());
         }
+        // A legacy Codex attachment restarts from its paired terminal. That
+        // terminal's issued descriptor is part of the saved chat identity;
+        // normalizing fresh/shell argv to resume argv would change it after
+        // the source has stopped. Retained pairs keep their original worker.
+        if source.launch.provider == crate::agent::Provider::Codex
+            && !matches!(
+                source.native_continuity,
+                chat::NativeContinuity::Durable { .. }
+            )
+            && let Some(terminal) = &source.terminal
+            && Some(&terminal.launch) != launch.terminal_recipe().as_ref()
+        {
+            return Err("Paired Codex terminal needs a different restart recipe; close or recover its paired view before upgrading".into());
+        }
         Ok(())
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn issued_chat_matches(saved: &chat::Session, source: &chat::Session) -> bool {
+        source.proof.is_some()
+            && saved.proof == source.proof
+            && saved.id == source.id
+            && saved.launch.provider == source.launch.provider
+            && saved.launch.recipe == source.launch.recipe
+            && source
+                .launch
+                .session_id
+                .as_ref()
+                .is_none_or(|id| saved.launch.session_id.as_ref() == Some(id))
+            && saved.owned_codex_listener == source.owned_codex_listener
+            && saved.terminal == source.terminal
+    }
+
+    /// An early pane may have learned the exact effective thread after its
+    /// immutable descriptor was issued. Only identities recorded by this
+    /// authenticated source or its effective restart qualify as that alias.
+    #[cfg(feature = "host")]
+    pub(crate) fn issued_chat_source_matches(saved: &ChatSource, source: &chat::Session) -> bool {
+        if issued_chat_matches(&saved.source, source) {
+            return true;
+        }
+        let mut confirmed = saved.source.clone();
+        confirmed.launch.session_id = saved.launch.session_id.clone();
+        issued_chat_matches(&confirmed, source)
+    }
+
+    /// Publish the descriptor windows were issued, with only its confirmed
+    /// presentation identity advanced. Resume argv belongs to `launch` alone.
+    #[cfg(feature = "host")]
+    pub(crate) fn restored_chat(
+        source: &chat::Session,
+        launch: &chat::Launch,
+    ) -> Result<chat::Session, String> {
+        validate_chat_source(source, launch)?;
+        let mut restored = source.clone();
+        restored.launch.session_id = launch.session_id.clone();
+        Ok(restored)
     }
 
     /// The durable record of retained native conversations that an upgrade
@@ -933,6 +1012,19 @@ pub(crate) mod handoff {
     struct UnattachedReport<T> {
         version: u16,
         conversations: T,
+    }
+
+    // Completed execution checkpoints are not replay authority. Keep their
+    // issued aliases beside the authenticated replacement until panes have
+    // attached or the conversation is explicitly closed.
+    const RECOVERED_FILE: &str = "daemon-upgrade.recovered.json";
+    #[cfg(any(feature = "host", test))]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(crate) struct RecoveredChat {
+        pub evidence: Chat,
+        pub replacement: chat::Session,
+        #[serde(default)]
+        pub aliases: Vec<chat::Session>,
     }
 
     /// Budget sequential provider confirmation without parsing session payloads.
@@ -1125,6 +1217,188 @@ pub(crate) mod handoff {
                 let _ = fs_safety::unlink_within(&self.root, &temporary);
             }
             result
+        }
+
+        #[cfg(any(feature = "host", test))]
+        fn read_recovered(&self) -> Result<Vec<RecoveredChat>, String> {
+            let Some(bytes) = self.read_named(RECOVERED_FILE)? else {
+                return Ok(Vec::new());
+            };
+            let report: UnattachedReport<Vec<RecoveredChat>> =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if report.version != 1 || report.conversations.len() > MAX_CHATS {
+                return Err("Unsupported recovered conversation evidence; it was preserved".into());
+            }
+            Ok(report.conversations)
+        }
+
+        /// Preserve aliases after the replay checkpoint is consumed. This file
+        /// is read only to verify a live replacement, never to start a writer.
+        #[cfg(any(feature = "host", test))]
+        pub(crate) fn record_recovered(&self, entries: &[RecoveredChat]) -> Result<(), String> {
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            let bytes = self.recovered_bytes(entries)?;
+            self.write_named(RECOVERED_FILE, &bytes)
+        }
+
+        #[cfg(feature = "host")]
+        pub(crate) fn preflight_recovered(&self, chats: &[Chat]) -> Result<(), String> {
+            let entries = chats
+                .iter()
+                .map(|chat| {
+                    let replacement = restored_chat(&chat.source, &chat.launch)?;
+                    Ok(RecoveredChat {
+                        evidence: chat.clone(),
+                        replacement,
+                        aliases: Vec::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            let bytes = self.recovered_bytes(&entries)?;
+            // Exercise the actual evidence storage before stopping source
+            // owners, including permissions and available disk space. This
+            // temporary file never becomes recovery or replay authority.
+            let (mut file, temporary) = fs_safety::create_temporary_in(&self.root, 0o600)
+                .map_err(|error| error.to_string())?;
+            let result = file
+                .write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| error.to_string());
+            let removed = fs_safety::unlink_within(&self.root, &temporary)
+                .map_err(|error| error.to_string())
+                .and_then(|()| {
+                    fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
+                });
+            result.and(removed)
+        }
+
+        #[cfg(any(feature = "host", test))]
+        fn recovered_bytes(&self, entries: &[RecoveredChat]) -> Result<Vec<u8>, String> {
+            let mut previous = self.read_recovered()?;
+            for entry in entries {
+                validate_chat_source(&entry.evidence.source, &entry.evidence.launch)?;
+                if entry.replacement.id != entry.evidence.source.id
+                    || entry.replacement.launch.provider != entry.evidence.launch.provider
+                    || entry.replacement.launch.session_id != entry.evidence.launch.session_id
+                    || entry.replacement.owned_codex_listener
+                        != entry.evidence.source.owned_codex_listener
+                    || (entry.replacement.launch.recipe != entry.evidence.source.launch.recipe
+                        && !chat::is_upgrade_recovery(&entry.evidence.source, &entry.replacement))
+                {
+                    return Err("Recovered conversation evidence changed its exact identity".into());
+                }
+                let mut entry = entry.clone();
+                if let Some(old) = previous
+                    .iter()
+                    .find(|old| old.replacement.id == entry.replacement.id)
+                {
+                    for previous in
+                        old.evidence
+                            .previous_sources
+                            .iter()
+                            .chain(std::iter::once(&ChatSource {
+                                source: old.evidence.source.clone(),
+                                launch: old.evidence.launch.clone(),
+                            }))
+                    {
+                        let mut confirmed = previous.source.clone();
+                        confirmed.launch.session_id = previous.launch.session_id.clone();
+                        if !entry.aliases.contains(&confirmed) {
+                            entry.aliases.push(confirmed);
+                        }
+                    }
+                    for alias in old
+                        .aliases
+                        .iter()
+                        .chain(
+                            old.evidence
+                                .previous_sources
+                                .iter()
+                                .map(|previous| &previous.source),
+                        )
+                        .chain([&old.evidence.source, &old.replacement])
+                    {
+                        if !entry.aliases.contains(alias) {
+                            entry.aliases.push(alias.clone());
+                        }
+                    }
+                }
+                previous.retain(|old| old.replacement.id != entry.replacement.id);
+                previous.push(entry);
+            }
+            if previous.len() > MAX_CHATS {
+                return Err("Unconfirmed pane recovery evidence reached its capacity; existing evidence was preserved".into());
+            }
+            let bytes = serde_json::to_vec(&UnattachedReport {
+                version: 1,
+                conversations: previous,
+            })
+            .map_err(|error| error.to_string())?;
+            if bytes.len() as u64 > MAX_BYTES {
+                return Err("Unconfirmed pane recovery evidence exceeds its byte limit; existing evidence was preserved".into());
+            }
+            Ok(bytes)
+        }
+
+        #[cfg(feature = "host")]
+        pub(crate) fn recovered_sources(
+            &self,
+            source: &chat::Session,
+            replacement: &chat::Session,
+        ) -> Result<Option<Vec<ChatSource>>, String> {
+            for entry in self.read_recovered()? {
+                if entry.replacement.id != replacement.id
+                    || entry.replacement.launch != replacement.launch
+                    || entry.replacement.owned_codex_listener != replacement.owned_codex_listener
+                    || !(entry.replacement == *replacement
+                        || chat::is_upgrade_recovery(&entry.replacement, replacement))
+                {
+                    continue;
+                }
+                let mut aliases = entry.evidence.previous_sources;
+                aliases.extend(entry.aliases.into_iter().map(|source| ChatSource {
+                    source,
+                    launch: entry.evidence.launch.clone(),
+                }));
+                aliases.push(ChatSource {
+                    source: entry.evidence.source,
+                    launch: entry.evidence.launch.clone(),
+                });
+                aliases.push(ChatSource {
+                    source: entry.replacement,
+                    launch: entry.evidence.launch,
+                });
+                if aliases
+                    .iter()
+                    .any(|alias| issued_chat_source_matches(alias, source))
+                {
+                    return Ok(Some(aliases));
+                }
+            }
+            Ok(None)
+        }
+
+        #[cfg(any(feature = "host", test))]
+        pub(crate) fn retire_recovered(&self, id: crate::model::TerminalId) -> Result<(), String> {
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            let mut entries = self.read_recovered()?;
+            let before = entries.len();
+            entries.retain(|entry| entry.replacement.id != id);
+            if entries.len() == before {
+                return Ok(());
+            }
+            if entries.is_empty() {
+                fs_safety::unlink_within(&self.root, OsStr::new(RECOVERED_FILE))
+                    .map_err(|error| error.to_string())?;
+                return fs_safety::sync_directory(&self.root).map_err(|error| error.to_string());
+            }
+            let bytes = serde_json::to_vec(&UnattachedReport {
+                version: 1,
+                conversations: entries,
+            })
+            .map_err(|error| error.to_string())?;
+            self.write_named(RECOVERED_FILE, &bytes)
         }
 
         /// Where retained conversations that could not be reattached are
@@ -1790,6 +2064,116 @@ mod tests {
         )
         .unwrap();
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "host")]
+    fn legacy_codex_migration_separates_issued_and_effective_recipes_and_refuses_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = checkpoint(directory.path());
+        let mut source = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec![
+                        "--remote".into(),
+                        "unix://".into(),
+                        "--model".into(),
+                        "fixture-luna".into(),
+                    ],
+                    working_directory: directory.path().into(),
+                    environment: [("CODEX_HOME".into(), "/fixture/managed-account".into())].into(),
+                    unset_environment: ["OPENAI_API_KEY".into()].into(),
+                },
+                session_id: None,
+            },
+            proof: Some(checkpoint.proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        assert!(source.claim_owned_codex_listener(directory.path(), &checkpoint.proof));
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let mut effective = source.launch.clone();
+        effective.recipe = effective.terminal_recipe().unwrap();
+        assert_ne!(effective.recipe, source.launch.recipe);
+        let restored = handoff::restored_chat(&source, &effective).unwrap();
+        assert_eq!(restored, source);
+        let store = Store::open(directory.path()).unwrap();
+        let mut replacement = restored.clone();
+        replacement.proof.as_mut().unwrap().host_incarnation = "second-daemon".into();
+        store
+            .record_recovered(&[handoff::RecoveredChat {
+                evidence: handoff::Chat {
+                    source: source.clone(),
+                    launch: effective.clone(),
+                    previous_sources: Vec::new(),
+                },
+                replacement: replacement.clone(),
+                aliases: Vec::new(),
+            }])
+            .unwrap();
+        let mut third = replacement.clone();
+        third.proof.as_mut().unwrap().host_incarnation = "third-daemon".into();
+        assert!(store.recovered_sources(&source, &third).unwrap().is_some());
+        assert!(
+            store
+                .recovered_sources(&replacement, &third)
+                .unwrap()
+                .is_some()
+        );
+        let mut unrelated = third.clone();
+        unrelated
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), "/another-account".into());
+        assert!(
+            store
+                .recovered_sources(&source, &unrelated)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store.load().unwrap().is_none(),
+            "completed evidence cannot be replayed as an execution checkpoint"
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join("daemon-upgrade.recovered.json"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        store.retire_recovered(source.id).unwrap();
+        assert!(store.recovered_sources(&source, &third).unwrap().is_none());
+        for mutation in 0..6 {
+            let mut changed = effective.clone();
+            match mutation {
+                0 => changed.recipe.program = "another-codex".into(),
+                1 => changed.recipe.working_directory = "/another-project".into(),
+                2 => {
+                    changed
+                        .recipe
+                        .environment
+                        .insert("CODEX_HOME".into(), "/another-account".into());
+                }
+                3 => {
+                    changed.recipe.unset_environment.clear();
+                }
+                4 => changed.recipe.arguments.push("--different-option".into()),
+                _ => changed.provider = crate::agent::Provider::Claude,
+            }
+            assert!(
+                handoff::restored_chat(&source, &changed).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let mut changed = source.clone();
+        changed.owned_codex_listener.as_mut().unwrap().socket = "/another-listener".into();
+        assert!(handoff::restored_chat(&changed, &effective).is_err());
     }
 
     #[test]
