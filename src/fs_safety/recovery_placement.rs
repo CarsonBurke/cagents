@@ -36,6 +36,18 @@ pub trait RecoveryRegistrationLease: Send + Sync {
     /// Admission/registration exclusion must span validation through effects;
     /// three sequential checks alone do not provide that domain exclusion.
     fn register_payload(&self, payload: &Root) -> io::Result<()>;
+    /// Atomically admit one new holding against retirement. The actual lease
+    /// seals creation admission and waits for all original guards to drop
+    /// before releasing its server reservation. Existing cleanup/enrollment
+    /// stays usable while sealed; linked/unknown server obligations still
+    /// independently prevent release. Keep this SAME guard in the already-
+    /// reserved recovery slot BEFORE mkdir, through enrollment/error custody.
+    /// The guard must perform no I/O on Drop; all local native descriptors it
+    /// retains must already fit descriptor_budget(). A counter-only guard adds
+    /// no descriptors. The default refuses unsupported admission before effects.
+    fn begin_payload_creation(&self) -> io::Result<Arc<dyn Send + Sync>> {
+        Err(unsupported("This recovery lease cannot admit new holding creation; no directory was created."))
+    }
     /// Hard upper bound for all LOCAL native descriptors retained by this
     /// lease/same-process guards, including future local enrollment handles.
     /// Reject growth beyond the reservation. A remote daemon must independently
@@ -48,6 +60,7 @@ pub trait RecoveryRegistrationLease: Send + Sync {
 pub struct RecoveryRegistryCheck {
     check: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
     register_payload: Option<Arc<dyn Fn(&Root) -> io::Result<()> + Send + Sync>>,
+    begin_payload_creation: Option<Arc<dyn Fn() -> io::Result<Arc<dyn Send + Sync>> + Send + Sync>>,
     retained_descriptors: usize,
 }
 impl RecoveryRegistryCheck {
@@ -55,7 +68,7 @@ impl RecoveryRegistryCheck {
     /// opaque callback/lease. The domain must measure it, including shared
     /// handles not present in the explicit Root set; do not charge an Arc zero.
     pub fn new(check: Arc<dyn Fn() -> io::Result<()> + Send + Sync>, retained_descriptors: usize) -> Self {
-        Self { check, register_payload: None, retained_descriptors }
+        Self { check, register_payload: None, begin_payload_creation: None, retained_descriptors }
     }
     /// Real domain issuance retains an owned registration/adoption lease.
     /// The callback-only constructor supports isolated static predicate tests;
@@ -63,9 +76,11 @@ impl RecoveryRegistryCheck {
     pub fn from_lease(lease: Arc<dyn RecoveryRegistrationLease>) -> Self {
         let retained_descriptors = lease.descriptor_budget();
         let validator = lease.clone();
+        let creator = lease.clone();
         Self {
             check: Arc::new(move || validator.validate()),
             register_payload: Some(Arc::new(move |payload| lease.register_payload(payload))),
+            begin_payload_creation: Some(Arc::new(move || creator.begin_payload_creation())),
             retained_descriptors,
         }
     }
@@ -179,6 +194,17 @@ impl RecoveryPlacement {
         }
         self.validate()
     }
+    /// Worker-only creation admission, distinct from capability preflight.
+    /// Retain the returned SAME guard in the recovery slot before any mkdir.
+    /// A failed post-admission check drops this unused guard without effects.
+    /// This does not resolve an existing holding or release server obligations.
+    pub fn begin_payload_creation(&self) -> io::Result<Arc<dyn Send + Sync>> {
+        self.require_payload_registration()?;
+        let begin = self.registry.begin_payload_creation.as_ref().ok_or_else(|| unsupported("Recovery holding creation requires an owned admission lease; no directory was created."))?;
+        let guard = begin()?;
+        self.validate()?;
+        Ok(guard)
+    }
     /// The holding already exists. On any failure, the producer must retain its
     /// exact publication AND this lease in its pre-reserved recovery slot;
     /// neither an error string nor a fresh pathname grants cleanup authority.
@@ -268,6 +294,7 @@ mod tests {
         let placement = RecoveryPlacement::acquire(root(&tree.path().join("outside")), source.clone(), vec![source].into(), registry()).unwrap();
         assert_eq!(placement.retained_descriptor_count(), 3);
         assert!(placement.require_payload_registration().is_err(), "predicate-only fixture callback grants no payload creation capability");
+        assert!(placement.begin_payload_creation().is_err());
         fs::rename(tree.path().join("outside"), tree.path().join("retired")).unwrap();
         fs::create_dir(tree.path().join("outside")).unwrap();
         placement.validate().unwrap();
@@ -366,6 +393,7 @@ mod tests {
         let lease = Arc::new(Lease { payload: std::sync::Mutex::new(None), uncertain: AtomicBool::new(true) });
         let placement = RecoveryPlacement::acquire(root(&tree.path().join("outside")), root(&tree.path().join("source")), Arc::from([]), RecoveryRegistryCheck::from_lease(lease.clone())).unwrap();
         placement.require_payload_registration().unwrap();
+        assert!(placement.begin_payload_creation().is_err(), "enrollment alone cannot grant unsupported creation admission");
         assert_eq!(placement.retained_descriptor_count(), 4, "future local enrollment descriptor is reserved before effects");
         let DirectoryCreation::Published(publication) = create_directory_in_namespace(placement.namespace(), placement.directory(), Path::new("holding"), 0o700).unwrap() else { panic!("fixture must own the holding"); };
         assert!(placement.register_payload_root(publication.directory()).is_err());
@@ -377,6 +405,54 @@ mod tests {
         let DirectoryCreation::Published(other) = create_directory_in_namespace(placement.namespace(), placement.directory(), Path::new("other"), 0o700).unwrap() else { panic!("fixture must own the second holding"); };
         assert!(placement.register_payload_root(other.directory()).is_err());
         assert_eq!(recovery_directory_stamp(lease.payload.lock().unwrap().as_ref().unwrap()).unwrap(), recovery_directory_stamp(publication.directory()).unwrap());
+    }
+
+    #[test]
+    fn creation_guard_fences_retirement_and_releases_failed_admission() {
+        #[derive(Default)]
+        struct State { sealed: bool, inflight: usize }
+        struct Guard(Arc<std::sync::Mutex<State>>);
+        impl Drop for Guard {
+            fn drop(&mut self) { self.0.lock().unwrap().inflight -= 1; }
+        }
+        struct Lease {
+            state: Arc<std::sync::Mutex<State>>,
+            valid: AtomicBool,
+            invalidate_on_begin: AtomicBool,
+        }
+        impl RecoveryRegistrationLease for Lease {
+            fn validate(&self) -> io::Result<()> {
+                if self.valid.load(Ordering::Acquire) { Ok(()) } else { Err(unsupported("fixture invalidated")) }
+            }
+            fn descriptor_budget(&self) -> usize { 0 }
+            fn register_payload(&self, _payload: &Root) -> io::Result<()> { self.validate() }
+            fn begin_payload_creation(&self) -> io::Result<Arc<dyn Send + Sync>> {
+                let mut state = self.state.lock().unwrap();
+                if state.sealed { return Err(unsupported("fixture sealed")); }
+                state.inflight += 1;
+                self.valid.store(!self.invalidate_on_begin.load(Ordering::Acquire), Ordering::Release);
+                Ok(Arc::new(Guard(self.state.clone())))
+            }
+        }
+        let tree = tempfile::tempdir().unwrap();
+        for path in ["source", "outside"] { fs::create_dir(tree.path().join(path)).unwrap(); }
+        let lease = Arc::new(Lease { state: Arc::default(), valid: AtomicBool::new(true), invalidate_on_begin: AtomicBool::new(false) });
+        let placement = RecoveryPlacement::acquire(root(&tree.path().join("outside")), root(&tree.path().join("source")), Arc::from([]), RecoveryRegistryCheck::from_lease(lease.clone())).unwrap();
+        let guard = placement.begin_payload_creation().unwrap();
+        let retained = guard.clone();
+        lease.state.lock().unwrap().sealed = true;
+        assert!(placement.begin_payload_creation().is_err());
+        drop(guard);
+        assert_eq!(lease.state.lock().unwrap().inflight, 1, "retained recovery slot still prevents retirement");
+        placement.validate().unwrap();
+        drop(retained);
+        assert_eq!(lease.state.lock().unwrap().inflight, 0);
+        lease.state.lock().unwrap().sealed = false;
+        lease.invalidate_on_begin.store(true, Ordering::Release);
+        assert!(placement.begin_payload_creation().is_err());
+        assert_eq!(lease.state.lock().unwrap().inflight, 0, "failed post-admission validation releases unused guard");
+        assert!(!tree.path().join("outside/holding").exists());
+        eprintln!("RECOVERY_CREATION_ADMISSION_GUARD_VERIFIED");
     }
 
     #[test]
