@@ -143,7 +143,11 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+/// Isolated version 88 appends native terminal title metadata to every
+/// TerminalDescriptor carrier (Connect/List/Spawn/Attach/TerminalCreated).
+/// Positional postcard peers require this matched layout; serde(default)
+/// preserves older JSON records, not older binary frames.
+pub const PROTOCOL_VERSION: u16 = 88;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -1914,6 +1918,35 @@ mod tests {
             Some("next frame".into())
         );
         assert_eq!(codec.read::<String>(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn terminal_title_round_trips_through_every_descriptor_carrier() {
+        for title in [None, Some(String::new()), Some("Native terminal 界".to_owned())] {
+            let mut terminal = TerminalDescriptor::relaunchable(TerminalId::new(), LaunchRecipe {
+                program: "/bin/sh".into(), arguments: vec![], working_directory: "/fixture".into(),
+                environment: Default::default(), unset_environment: Default::default(),
+            }, None);
+            terminal.title = title.clone();
+            let peer = proof("title-peer", "private-boot", "private-incarnation");
+            for message in [
+                ServerMessage::Response { response: ServerResponse::Connected { proof: peer.clone(), resumed: vec![terminal.clone()] } },
+                ServerMessage::Response { response: ServerResponse::Listed { terminals: vec![terminal.clone()] } },
+                ServerMessage::Response { response: ServerResponse::Spawned { terminal: terminal.clone() } },
+                ServerMessage::Response { response: ServerResponse::Attached { terminal: terminal.clone() } },
+                ServerMessage::TerminalCreated { terminal: terminal.clone() },
+            ] {
+                let envelope = ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(1), proof: peer.clone(), message };
+                let mut bytes = Vec::new();
+                write_frame(&mut bytes, &envelope).unwrap();
+                let decoded: ServerEnvelope = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+                assert_eq!(decoded, envelope);
+            }
+            let mut old_json = serde_json::to_value(&terminal).unwrap();
+            old_json.as_object_mut().unwrap().remove("title");
+            let decoded: TerminalDescriptor = serde_json::from_value(old_json).unwrap();
+            assert_eq!(decoded.title, None, "only JSON omission has a default");
+        }
     }
 
     #[test]
