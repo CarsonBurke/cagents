@@ -134,6 +134,17 @@ pub(crate) fn confirmed_owner(expected: &Record, proof: &HostSessionProof) -> Re
     confirmed_receipt(expected, proof, None)
 }
 
+/// Classifies an exact private discovery receipt after its resident record has
+/// been retired. Only a strong v5 family receipt can exclude this former writer
+/// from an ownership census. This supplies no source alias, account/session
+/// association, purge authority, or authorization to close another process.
+/// The census caller must independently validate its bounded private inventory
+/// and revalidate it after this check; a filename or parsed Record alone is not
+/// cleanup proof. The verifier rereads the canonical receipt under our lease.
+pub(crate) fn retired_for_census(expected: &Record, proof: &HostSessionProof) -> Result<bool, String> {
+    confirmed_receipt(expected, proof, None)
+}
+
 fn confirmed_receipt(
     expected: &Record,
     proof: &HostSessionProof,

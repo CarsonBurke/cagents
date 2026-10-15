@@ -2779,14 +2779,20 @@ mod tests {
         let receipt = holders.join(format!("{}-{}-{}.closed",record.terminal,record.holder.pid,record.holder.start));
         let positive = std::fs::read(&receipt).unwrap();
         let mut legacy:serde_json::Value=serde_json::from_slice(&positive).unwrap();
+        // No resident TerminalRecord or retained source is needed to exclude
+        // this exact positively retired writer from a later deletion census.
+        let census_record:Record=serde_json::from_value(legacy["record"].clone()).unwrap();
+        assert!(registry::cleanup::retired_for_census(&census_record,&final_proof).unwrap());
         assert_eq!(legacy["family_reaped"],true);
         legacy.as_object_mut().unwrap().remove("family_reaped");
         std::fs::write(&receipt,serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(!registry::cleanup::confirmed(&original,&record,&final_proof).unwrap(),"root-only legacy receipt cannot authorize family cleanup");
+        assert!(!registry::cleanup::retired_for_census(&census_record,&final_proof).unwrap(),"a parsed record and dead processes cannot replace strong family proof");
         std::fs::write(&receipt,positive).unwrap();
         assert!(registry::cleanup::confirmed(&original,&record,&final_proof).unwrap());
         let mut replacement = record.clone();
         replacement.holder.start += 1;
+        assert!(!registry::cleanup::retired_for_census(&replacement,&final_proof).unwrap(),"only the exact retired incarnation may be excluded");
         assert!(
             !registry::cleanup::confirmed(&original, &replacement, &final_proof).unwrap(),
             "same terminal descriptor does not prove a different holder's cleanup"
