@@ -3129,7 +3129,9 @@ mod tests {
             for (config, body) in [(&issued_config, "issued-A-body"), (&actual_config, "effective-B-body")] {
                 let path = config.join("projects").join(&project).join(format!("{CONVERSATION}.jsonl"));
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(&path, json!({"type":"user","uuid":"private-prompt","parentUuid":null,"sessionId":CONVERSATION,"message":{"role":"user","content":body}}).to_string()+"\n").unwrap();
+                std::fs::write(&path, format!("{}\n{}\n",
+                    json!({"type":"user","uuid":"private-prompt","parentUuid":null,"sessionId":CONVERSATION,"cwd":cwd,"message":{"role":"user","content":body}}),
+                    json!({"type":"custom-title","sessionId":CONVERSATION,"customTitle":format!("{body} title")}))).unwrap();
                 if config == &issued_config { issued_file = Some(path); }
             }
             let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
@@ -3160,6 +3162,14 @@ mod tests {
             let items: Vec<_> = initial.events.iter().filter_map(|event| if let chat::Event::History {items, ..} = event {Some(items)} else {None}).flatten().collect();
             assert!(items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text {text, ..} if text == "effective-B-body")));
             assert!(!items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text {text, ..} if text == "issued-A-body")));
+            // The real adapter's confirmed result samples its title reader.
+            // The same prepared origin must supply both history and metadata.
+            let result = adapter.receive(json!({"type":"result","session_id":CONVERSATION})).unwrap();
+            assert!(result.events.iter().any(|event| matches!(event,
+                chat::Event::Session {id, title:Some(title)}
+                    if id == CONVERSATION && title == "effective-B-body title")));
+            assert!(!result.events.iter().any(|event| matches!(event,
+                chat::Event::Session {title:Some(title), ..} if title == "issued-A-body title")));
             let mut bytes = [0_u8; 256];
             assert_eq!(watcher.read(&mut bytes).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "issued transcript must never be opened/indexed");
             assert_eq!(launch, issued);
