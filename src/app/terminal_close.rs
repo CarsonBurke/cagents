@@ -59,6 +59,7 @@ pub(super) fn same_chat_removal_source(
         && expected.proof == current.proof
         && expected.owned_codex_listener == current.owned_codex_listener
         && expected.terminal == current.terminal
+        && expected.archive_report == current.archive_report
 }
 pub(super) fn same_removal_source(expected: &CardKind, current: &CardKind) -> bool {
     crate::workspace_model::views::same_card_source(expected, current)
@@ -1754,6 +1755,32 @@ mod tests {
         descriptor.session = captured.source.clone();
         descriptor.execution_instance = captured.execution_instance;
         descriptor
+    }
+
+    #[test]
+    fn captured_chat_removal_cannot_switch_saved_report_references() {
+        let (_app,_card,captured)=bound_fixture();
+        let mut session=crate::chat::Session {
+            id:TerminalId::new(),launch:crate::chat::Launch {provider:crate::agent::Provider::Claude,recipe:captured.source.launch,session_id:Some("closed-thread".into())},
+            proof:Some(captured.proof),terminal:None,owned_codex_listener:None,native_continuity:Default::default(),archive_report:None,
+        };
+        let ordinary=session.clone();
+        session.archive_report=Some(crate::chat::ArchiveReportReference {format:1,registry:uuid::Uuid::new_v4(),agent:crate::model::AgentId::new(),source_operation:uuid::Uuid::new_v4()});
+        assert!(!same_chat_removal_source(&ordinary,&session));
+        assert!(same_chat_removal_source(&session,&session));
+        for variant in 0..5 {
+            let mut replacement=session.clone();
+            let reference=replacement.archive_report.as_mut().unwrap();
+            match variant {
+                0=>reference.source_operation=uuid::Uuid::new_v4(),
+                1=>reference.registry=uuid::Uuid::new_v4(),
+                2=>reference.agent=crate::model::AgentId::new(),
+                3=>reference.format=2,
+                _=>replacement.archive_report=None,
+            }
+            assert!(!same_chat_removal_source(&session,&replacement));
+            assert!(!crate::workspace_model::views::same_card_source(&CardKind::Chat(session.clone()),&CardKind::Chat(replacement)));
+        }
     }
 
     #[test]

@@ -174,6 +174,7 @@ impl ReservedProject {
                         Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => {
                             self.pane(pane)
                         }
+                        Change::InsertArchiveReport {repository,pane,..} => self.directory(repository) || self.pane(pane),
                         Change::Update { before, pane } => self.pane(before) || self.pane(pane),
                         Change::RemoveSource {
                             before, repository, ..
