@@ -14,11 +14,10 @@ where
     Theme: 'a,
     Renderer: core::Renderer + 'a,
 {
-    use crate::core::layout::{self, Layout};
-    use crate::core::mouse;
-    use crate::core::renderer;
-    use crate::core::widget::tree::{self, Tree};
-    use crate::core::{Event, Rectangle, Shell, Size};
+    use cosmic::iced::advanced::{
+        Shell, layout::{self, Layout}, mouse, renderer, widget::tree::{self, Tree},
+    };
+    use cosmic::iced::{Event, Rectangle, Size};
 
     struct Hover<'a, Message, Theme, Renderer> {
         base: Element<'a, Message, Theme, Renderer>,
@@ -271,7 +270,7 @@ where
             layout: core::Layout<'b>,
             renderer: &Renderer,
             viewport: &Rectangle,
-            translation: core::Vector,
+            translation: cosmic::iced::Vector,
         ) -> Option<core::overlay::Element<'b, Message, Theme, Renderer>>
         {
             let mut overlays = [&mut self.base, &mut self.top]
