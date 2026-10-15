@@ -117,18 +117,10 @@ fn mount_identity(root: &Root) -> io::Result<u64> {
     }
     Ok(metadata.stx_mnt_id)
 }
-#[cfg(target_os = "linux")]
-fn parent_of(root: &Root) -> io::Result<Root> {
-    let directory = open_at(root.descriptor(), OsStr::new(".."), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)?;
-    Ok(Root { directory, path: root.path().join("..") })
-}
+fn parent_of(root: &Root) -> io::Result<Root> { retained_parent_directory(root) }
 #[cfg(not(target_os = "linux"))]
 fn mount_identity(_root: &Root) -> io::Result<u64> {
     Err(unsupported("Strong recovery placement is unavailable without qualified native mount-identity ancestry inspection."))
-}
-#[cfg(not(target_os = "linux"))]
-fn parent_of(_root: &Root) -> io::Result<Root> {
-    Err(unsupported("Strong recovery placement is unavailable on this platform."))
 }
 impl RecoveryPlacement {
     /// Captures an already-held candidate, never reconstructing an effect path.
