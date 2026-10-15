@@ -775,7 +775,13 @@ impl Residence {
 
     fn orphan(&mut self) -> bool {
         loop {
-            if wait_for_control(self.listener.socket.as_raw_fd(), &self.child, &self.child_events).is_err() {
+            if wait_for_control(
+                self.listener.socket.as_raw_fd(),
+                &self.child,
+                &self.child_events,
+            )
+            .is_err()
+            {
                 return false;
             }
             let (control, _) = match self.listener.socket.accept() {
@@ -850,7 +856,10 @@ impl ChildEvents {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
                 return Err(error);
             }
-            Ok(Self { fd: std::fs::File::from_raw_fd(fd), previous })
+            Ok(Self {
+                fd: std::fs::File::from_raw_fd(fd),
+                previous,
+            })
         }
     }
 
@@ -859,7 +868,7 @@ impl ChildEvents {
         loop {
             match (&self.fd).read(&mut event) {
                 Ok(0) => return Ok(()),
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
@@ -871,7 +880,9 @@ impl ChildEvents {
 impl Drop for ChildEvents {
     fn drop(&mut self) {
         // SAFETY: restore the mask on the same single holder thread.
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut()); }
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+        }
     }
 }
 
@@ -887,8 +898,18 @@ fn wait_for_control(
             // A transient inspection failure must not tear down a durable server.
             eprintln!("Native holder could not reap exited tools: {error}");
         }
-        let mut poll = [libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: child_events.fd.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        let mut poll = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: child_events.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
         // SAFETY: the array and both owned descriptors remain live throughout
         // poll. No timer is armed: an idle holder sleeps indefinitely.
         match unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, -1) } {
@@ -898,11 +919,15 @@ fn wait_for_control(
                     // A simultaneous control event must not postpone reaping.
                     children.reap_exited_descendants()?;
                 }
-                if poll[0].revents != 0 { return Ok(()); }
-            },
+                if poll[0].revents != 0 {
+                    return Ok(());
+                }
+            }
             _ => {
                 let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted { return Err(error); }
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
             }
         }
     }
@@ -1169,15 +1194,17 @@ mod tests {
             ]).env(STAGE, "1");
             // All libtest threads must inherit the blocked signal. Blocking
             // only this test thread would let the harness consume SIGCHLD.
-            unsafe { fixture.pre_exec(|| {
-                let mut mask = std::mem::zeroed();
-                libc::sigemptyset(&mut mask);
-                libc::sigaddset(&mut mask, libc::SIGCHLD);
-                if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            }); }
+            unsafe {
+                fixture.pre_exec(|| {
+                    let mut mask = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    libc::sigaddset(&mut mask, libc::SIGCHLD);
+                    if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
             let output = fixture.output().unwrap();
             assert!(output.status.success(), "{output:?}");
             return;
@@ -1221,8 +1248,10 @@ mod tests {
                 let listener = UnixListener::bind(&path).unwrap();
                 let connector = std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(500));
-                    assert!(!observed_tool.is_current(), "orphan was not reaped on SIGCHLD");
-                    UnixStream::connect(path).unwrap()
+                    let reaped = !observed_tool.is_current();
+                    let stream = UnixStream::connect(path).unwrap();
+                    assert!(reaped, "orphan was not reaped on SIGCHLD");
+                    stream
                 });
                 wait_for_control(listener.as_raw_fd(), &server, &child_events).unwrap();
                 let _peer = connector.join().unwrap();
@@ -1231,7 +1260,10 @@ mod tests {
                 let (reader, mut writer) = UnixStream::pair().unwrap();
                 let sender = std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(500));
-                    assert!(!observed_tool.is_current(), "tool was not reaped on SIGCHLD");
+                    assert!(
+                        !observed_tool.is_current(),
+                        "tool was not reaped on SIGCHLD"
+                    );
                     writer.write_all(b"x").unwrap();
                 });
                 wait_for_control(reader.as_raw_fd(), &server, &child_events).unwrap();

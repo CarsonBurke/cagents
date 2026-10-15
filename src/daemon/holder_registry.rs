@@ -50,8 +50,11 @@ impl BuildIdentity {
     pub(crate) fn current(kind: Kind) -> Self {
         Self {
             version: crate::VERSION.into(),
-            commit: crate::VERSION.split("+local.").nth(1)
-                .and_then(|metadata| metadata.split('.').next()).map(str::to_owned),
+            commit: crate::VERSION
+                .split("+local.")
+                .nth(1)
+                .and_then(|metadata| metadata.split('.').next())
+                .map(str::to_owned),
             capabilities: match kind {
                 Kind::Native => vec!["event-driven-orphan-reaping".into()],
                 Kind::Terminal => Vec::new(),
@@ -163,8 +166,11 @@ impl Record {
     pub(crate) fn is_outdated(&self) -> bool {
         self.build.as_ref().is_none_or(|build| {
             build.version != crate::VERSION
-                || (self.kind == Kind::Native && !build.capabilities.iter()
-                    .any(|capability| capability == "event-driven-orphan-reaping"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "event-driven-orphan-reaping"))
         })
     }
 
@@ -174,17 +180,27 @@ impl Record {
         if !self.holder.is_current() {
             return Err(io::Error::other("holder process identity changed"));
         }
-        let children = fs::read_to_string(format!("/proc/{}/task/{}/children",
-            self.holder.pid, self.holder.pid))?;
-        let zombies = children.split_whitespace().filter(|pid| {
-            pid.parse::<i32>().ok().and_then(|pid| fs::read_to_string(format!("/proc/{pid}/stat")).ok())
-                .and_then(|stat| stat.rsplit_once(')').map(|(_, fields)| {
-                    let mut fields = fields.split_whitespace();
-                    fields.next() == Some("Z")
-                        && fields.next().and_then(|parent| parent.parse::<i32>().ok()) == Some(self.holder.pid)
-                }))
-                .unwrap_or(false)
-        }).count();
+        let children = fs::read_to_string(format!(
+            "/proc/{}/task/{}/children",
+            self.holder.pid, self.holder.pid
+        ))?;
+        let zombies = children
+            .split_whitespace()
+            .filter(|pid| {
+                pid.parse::<i32>()
+                    .ok()
+                    .and_then(|pid| fs::read_to_string(format!("/proc/{pid}/stat")).ok())
+                    .and_then(|stat| {
+                        stat.rsplit_once(')').map(|(_, fields)| {
+                            let mut fields = fields.split_whitespace();
+                            fields.next() == Some("Z")
+                                && fields.next().and_then(|parent| parent.parse::<i32>().ok())
+                                    == Some(self.holder.pid)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
         if !self.holder.is_current() {
             return Err(io::Error::other("holder process identity changed"));
         }
@@ -323,21 +339,33 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    if !metadata.is_dir() || metadata.uid() != crate::daemon::current_uid()
-        || metadata.mode() & 0o077 != 0 {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe holder directory"));
+    if !metadata.is_dir()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe holder directory",
+        ));
     }
     let boot = crate::daemon::read_boot_id()?;
     let mut records = Vec::new();
     for (index, entry) in fs::read_dir(&directory)?.enumerate() {
-        if index >= 8192 { return Err(io::Error::other("holder discovery limit exceeded")); }
+        if index >= 8192 {
+            return Err(io::Error::other("holder discovery limit exceeded"));
+        }
         let path = entry?.path();
-        if path.extension().is_none_or(|extension| extension != "json") { continue; }
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
         let record = read(&path)?;
-        if record.kind == kind && record.supported_version()
+        if record.kind == kind
+            && record.supported_version()
             && record.application == crate::instance::APPLICATION_ID
-            && record.boot == boot && record.path(&directory) == path
-            && record.holder.is_current() {
+            && record.boot == boot
+            && record.path(&directory) == path
+            && record.holder.is_current()
+        {
             records.push(record);
         }
     }
@@ -643,14 +671,27 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            assert_eq!(unsafe { libc::waitid(libc::P_PID, child.id(), &mut status,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) }, 0);
-            if unsafe { status.si_pid() } != 0 { break; }
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child.id(),
+                        &mut status,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            if unsafe { status.si_pid() } != 0 {
+                break;
+            }
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(record().zombie_children().unwrap() >= 1);
-        assert!(child.wait().unwrap().success(), "diagnostics consumed the exit status");
+        assert!(
+            child.wait().unwrap().success(),
+            "diagnostics consumed the exit status"
+        );
     }
-
 }
