@@ -368,7 +368,7 @@ impl Store {
             body0.len() as i64
         };
         let history_proof=if older { self.history_origins.get(&item.id).and_then(|proof|proof.as_ref()) } else {None};
-        let native_session=if older {history_proof.map(|proof|&proof.session_id)} else {self.turn_session.as_ref()};
+        let native_session=if older {history_proof.map(|proof|&proof.session_id)} else {self.turn_session.as_ref().filter(|id|!id.is_empty()&&id.len()<=crate::chat::turn_outcomes::MAX_TURN_ID_BYTES)};
         let history_account=history_proof.map(|proof|postcard::to_stdvec(&proof.account)).transpose().map_err(|error|error.to_string())?;
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
@@ -1547,6 +1547,10 @@ mod tests {
         store.apply(Event::Item(text("unconfirmed-item","later rewrite must not promote unknown origin"))).unwrap();
         store.window().unwrap();
         assert!(store.visible_turn_origins.iter().any(|origin|origin.origin.item_id=="unconfirmed-item"&&origin.session_id.is_none()));
+        store.turn_session=Some("s".repeat(crate::chat::turn_outcomes::MAX_TURN_ID_BYTES+1));
+        store.apply(Event::Item(text("oversized-session","still readable transcript"))).unwrap();
+        store.window().unwrap();
+        assert!(store.visible_turn_origins.iter().any(|origin|origin.origin.item_id=="oversized-session"&&origin.session_id.is_none()));
     }
 
     #[test]

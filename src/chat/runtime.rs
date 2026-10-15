@@ -2444,7 +2444,8 @@ impl Actor {
             // diagnostics so it cannot replace the turn's actual root cause.
             tracing::warn!(%message,"conversation annotation storage unavailable");
         }
-        let turn_session=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).session().map(str::to_owned);
+        let turn_session=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).session()
+            .filter(|id|!id.is_empty()&&id.len()<=crate::chat::turn_outcomes::MAX_TURN_ID_BYTES).map(str::to_owned);
         {
             let mut store=self.store.lock().unwrap_or_else(|p|p.into_inner());
             store.turn_session=turn_session;
