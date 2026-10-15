@@ -11178,6 +11178,41 @@ mod tests {
     }
 
     #[test]
+    fn palette_chat_control_availability_matches_live_capabilities_and_pending_start() {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session.launch.provider = Provider::Codex;
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.models.clear();
+            snapshot.capabilities.model_selection = false;
+            snapshot.capabilities.permission_modes.clear();
+        }
+        for command in [Command::ChatAccount, Command::ChatModel, Command::ChatPermissions] {
+            assert!(!app.command_available(command), "unavailable live control: {command:?}");
+        }
+        {
+            let snapshot = Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot);
+            snapshot.capabilities.model_selection = true;
+            snapshot.models = vec![fixture_model("fixture-model", &[])];
+            snapshot.capabilities.permission_modes = vec!["default".into()];
+            snapshot.busy = false;
+        }
+        assert!(app.command_available(Command::ChatModel));
+        assert!(app.command_available(Command::ChatPermissions));
+        assert!(!app.command_available(Command::ChatAccount), "live conversations cannot select a draft account");
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+        assert!(!app.command_available(Command::ChatPermissions), "busy Codex cannot change permissions");
+        app.chat_runtime_mut(target).unwrap().attachment_chooser_pending = true;
+        for command in [Command::ChatAccount, Command::ChatModel, Command::ChatPermissions] {
+            assert!(!app.command_available(command), "pending start control: {command:?}");
+        }
+    }
+
+    #[test]
     fn chat_selection_commands_open_exclusive_pickers_without_changing_the_draft() {
         use crate::workspace_widget::GlobalShortcut;
         let mut app = crate::app::tests::context_inspector_test_app(false);

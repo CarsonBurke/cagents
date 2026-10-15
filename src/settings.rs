@@ -472,48 +472,85 @@ impl KeyboardShortcuts {
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
+    /// The same stable order as `actions`, used by record/reassign and reset.
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 71] {
+        [
+            &mut self.new_terminal,
+            &mut self.new_channel,
+            &mut self.clone_pane,
+            &mut self.close_focused_column,
+            &mut self.search_projects,
+            &mut self.find_in_pane,
+            &mut self.previous_column,
+            &mut self.next_column,
+            &mut self.cycle_pane_width,
+            &mut self.previous_workspace,
+            &mut self.next_workspace,
+            &mut self.review_toggle_viewed,
+            &mut self.review_next_file,
+            &mut self.review_previous_file,
+            &mut self.review_next_unviewed,
+            &mut self.review_next_change,
+            &mut self.review_previous_change,
+            &mut self.command_palette,
+            &mut self.new_native_thread,
+            &mut self.chat_permissions,
+            &mut self.chat_model,
+            &mut self.chat_account,
+            &mut self.toggle_inspector,
+            &mut self.open_settings,
+            &mut self.move_pane_left,
+            &mut self.move_pane_right,
+            &mut self.reopen_pane,
+            &mut self.focus_pane_1,
+            &mut self.focus_pane_2,
+            &mut self.focus_pane_3,
+            &mut self.focus_pane_4,
+            &mut self.focus_pane_5,
+            &mut self.focus_pane_6,
+            &mut self.focus_pane_7,
+            &mut self.focus_pane_8,
+            &mut self.focus_pane_9,
+            &mut self.toggle_projects,
+            &mut self.rename_pane,
+            &mut self.new_browser,
+            &mut self.open_folder,
+            &mut self.new_worktree,
+            &mut self.close_other_panes,
+            &mut self.close_panes_to_right,
+            &mut self.copy_path,
+            &mut self.reveal_in_projects,
+            &mut self.fork_conversation,
+            &mut self.focus_sidebar_tree,
+            &mut self.restart_daemon,
+            &mut self.toggle_theme,
+            &mut self.resume_conversation,
+            &mut self.switch_pane,
+            &mut self.review_conversation_changes,
+            &mut self.focus_project_1,
+            &mut self.focus_project_2,
+            &mut self.focus_project_3,
+            &mut self.focus_project_4,
+            &mut self.focus_project_5,
+            &mut self.focus_project_6,
+            &mut self.focus_project_7,
+            &mut self.focus_project_8,
+            &mut self.focus_project_9,
+            &mut self.settings_general,
+            &mut self.settings_appearance,
+            &mut self.settings_terminal,
+            &mut self.settings_links,
+            &mut self.settings_keyboard,
+            &mut self.settings_native_chat,
+            &mut self.settings_editor,
+            &mut self.settings_accounts,
+            &mut self.settings_notifications,
+            &mut self.settings_about,
+        ]
+    }
+
     pub fn set_action(&mut self, index: usize, chords: Vec<String>) {
-        match index {
-            0 => self.new_terminal = chords,
-            1 => self.new_channel = chords,
-            2 => self.clone_pane = chords,
-            3 => self.close_focused_column = chords,
-            4 => self.search_projects = chords,
-            5 => self.find_in_pane = chords,
-            6 => self.previous_column = chords,
-            7 => self.next_column = chords,
-            8 => self.cycle_pane_width = chords,
-            9 => self.previous_workspace = chords,
-            10 => self.next_workspace = chords,
-            11 => self.review_toggle_viewed = chords,
-            12 => self.review_next_file = chords,
-            13 => self.review_previous_file = chords,
-            14 => self.review_next_unviewed = chords,
-            15 => self.review_next_change = chords,
-            16 => self.review_previous_change = chords,
-            17 => self.command_palette = chords,
-            18 => self.new_native_thread = chords,
-            19 => self.chat_permissions = chords,
-            20 => self.chat_model = chords,
-            21 => self.chat_account = chords,
-            22 => self.toggle_inspector = chords,
-            23 => self.open_settings = chords,
-            24 => self.move_pane_left = chords,
-            25 => self.move_pane_right = chords,
-            26 => self.reopen_pane = chords,
-            27 => self.focus_pane_1 = chords,
-            28 => self.focus_pane_2 = chords,
-            29 => self.focus_pane_3 = chords,
-            30 => self.focus_pane_4 = chords,
-            31 => self.focus_pane_5 = chords,
-            32 => self.focus_pane_6 = chords,
-            33 => self.focus_pane_7 = chords,
-            34 => self.focus_pane_8 = chords,
-            35 => self.focus_pane_9 = chords,
-            36 => self.toggle_projects = chords,
-            37 => self.rename_pane = chords,
-            _ => panic!("unknown shortcut action"),
-        }
+        *self.actions_mut().into_iter().nth(index).expect("known shortcut action") = chords;
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
@@ -3054,6 +3091,18 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mutable_shortcut_order_matches_serialized_registry() {
+        for (index, name) in SHORTCUT_ACTIONS.iter().enumerate() {
+            let mut shortcuts = KeyboardShortcuts::default();
+            let chords = vec!["Ctrl+Alt+Shift+K".to_owned()];
+            shortcuts.set_action(index, chords.clone());
+            let serialized = toml::Value::try_from(&shortcuts).unwrap();
+            assert_eq!(serialized.get(*name).unwrap().as_array().unwrap(), &[toml::Value::String(chords[0].clone())]);
+            assert_eq!(shortcuts.actions()[index], &chords);
+        }
+    }
+
     #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
