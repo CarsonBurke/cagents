@@ -60,23 +60,21 @@ fn service() -> Result<&'static Service, String> {
             let mut active: Vec<Arc<PublishedState>> = Vec::with_capacity(capacity());
             loop {
                 active.extend(pending.try_iter());
-                let mut retry_at = None;
+                let mut next: Option<Instant> = None;
                 let observed_at = Instant::now();
+                let mut schedule = |deadline| next = Some(next.map_or(deadline, |old|old.min(deadline)));
                 active.retain(|owner| {
                     if matches!(owner.worker_join.load(Ordering::Acquire), 2 | 3) { return false; }
-                    if owner.join_escalation_at.get().is_some_and(|deadline| observed_at >= *deadline) {
-                        // Handoff and signaling share ownership admission.
-                        // Retry only an expired, currently contended fence.
-                        if !escalate_owned_root(owner) {
-                            retry_at = Some(Instant::now()+Duration::from_millis(5));
-                            return true;
-                        }
-                        return false;
+                    let Some(deadline) = owner.join_escalation_at.get() else {return true;};
+                    if *deadline>observed_at {schedule(*deadline);return true;}
+                    match escalate_owned_root(owner) {
+                        Escalation::Done => false,
+                        Escalation::Contended => {schedule(observed_at+Duration::from_millis(5));true},
+                        // A provisional handoff may fail and reopen. Keep its
+                        // ticket parked until ownership changes or actual join.
+                        Escalation::Handoff => true,
                     }
-                    true
                 });
-                let next = active.iter().filter_map(|owner|owner.join_escalation_at.get().copied())
-                    .filter(|deadline|*deadline>observed_at).chain(retry_at).min();
                 let timer = next.map(|deadline|crossbeam_channel::after(deadline.saturating_duration_since(Instant::now())))
                     .unwrap_or_else(crossbeam_channel::never);
                 crossbeam_channel::select! {
@@ -111,10 +109,9 @@ pub(super) fn initialize() -> Result<(), String> { service().map(|_| ()) }
 /// task retains that slot and pidfd beyond the caller's deadline. Concurrent
 /// callers report pending rather than waiting behind the first caller's join.
 pub(super) fn join_until(worker: &WorkerSlot, published: &Arc<PublishedState>, deadline: Instant, escalate: bool, wait: bool) -> bool {
-    if escalate && published.join_escalation_at.set(deadline).is_ok()
-        && let Some(Ok(service)) = SERVICE.get()
-    {
-        let _ = service.changed.try_send(());
+    if escalate {
+        let _ = published.join_escalation_at.set(deadline);
+        ownership_changed();
     }
     match published.worker_join.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {},
@@ -152,16 +149,23 @@ pub(super) fn join_until(worker: &WorkerSlot, published: &Arc<PublishedState>, d
     }
 }
 
-// A contended ownership fence keeps the supervisor ticket alive for retry.
-// Known handoff disarms escalation without inventing actual join completion.
-fn escalate_owned_root(published: &PublishedState) -> bool {
+/// Wake a parked join when a known failed handoff restores this owner.
+pub(super) fn ownership_changed() {
+    if let Some(Ok(service))=SERVICE.get() {let _=service.changed.try_send(());}
+}
+
+enum Escalation {Done,Contended,Handoff}
+// A contended fence or provisional handoff keeps its ticket until ownership
+// changes. Only an actual signal admission retires escalation responsibility.
+fn escalate_owned_root(published: &PublishedState) -> Escalation {
     let order = match published.input_order.try_lock() {
         Ok(order) => order,
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return false,
+        Err(std::sync::TryLockError::WouldBlock) => return Escalation::Contended,
     };
-    if !order.handoff && let Some(pidfd) = published.shutdown_pidfd.get() {
+    if order.handoff {return Escalation::Handoff;}
+    if let Some(pidfd) = published.shutdown_pidfd.get() {
         let _ = close_processes::signal(pidfd, libc::SIGKILL);
     }
-    true
+    Escalation::Done
 }
