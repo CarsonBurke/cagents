@@ -975,6 +975,17 @@ impl HostState {
         self.reserve_spawn_for_view(terminal_id, None)
     }
 
+    /// Fresh native starts cannot adopt any existing or reserved identity,
+    /// including completed records retained for explicit recovery.
+    pub(super) fn contains_session_identity(&self, id: TerminalId) -> bool {
+        self.terminals.contains_key(&id)
+            || self.spawning.contains(&id)
+            || self.chats.contains_key(&id)
+            || self.chat_spawning.contains_key(&id)
+            || self.chat_handoffs.contains_key(&id)
+            || self.native_closing.contains_key(&id)
+    }
+
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
         let record = self.terminals.remove(&terminal_id)?;
         self.notification_closed.remove(&terminal_id);

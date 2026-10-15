@@ -1,0 +1,1324 @@
+//! Provider launch preferences shared by the CLI, daemon and native composer.
+use crate::{agent::Provider, model::LaunchRecipe};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, ffi::CString, os::unix::ffi::OsStrExt, path::Path};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentLaunchSettings {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub permission_mode: Option<String>,
+    pub executable: Option<String>,
+    pub arguments: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+}
+
+pub fn provider_key(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "claude",
+        Provider::Codex => "codex",
+        Provider::Omp => "omp",
+    }
+}
+
+/// Saved provider launch preferences, including unavailable pins that must
+/// remain visible and must never silently fall back to another executable.
+pub fn provider_settings(provider: Provider) -> Result<AgentLaunchSettings, String> {
+    let path = super::default_path().map_err(|error| error.to_string())?;
+    let settings = super::load(path).map_err(|error| error.to_string())?;
+    Ok(settings
+        .agents
+        .get(provider_key(provider))
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Account discovery and authentication use the same pinned CLI as launches.
+#[cfg(any(feature = "ui", feature = "host"))]
+pub fn provider_executable(
+    provider: Provider,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Result<std::path::PathBuf, String> {
+    provider_settings(provider)?.resolve_executable(provider, search_path)
+}
+
+pub fn permission_modes(provider: Provider) -> &'static [&'static str] {
+    match provider {
+        Provider::Claude => &[
+            "manual",
+            "acceptEdits",
+            "auto",
+            "plan",
+            "dontAsk",
+            "bypassPermissions",
+        ],
+        Provider::Codex => &["readOnly", "workspaceWrite", "yolo"],
+        Provider::Omp => &[],
+    }
+}
+
+/// Explicit CLI requests also accept provider approval policies that are not
+/// conversation presets. Keep this distinct from the saved composer choices.
+pub fn validate_permission_override(provider: Provider, mode: &str) -> Result<(), String> {
+    let supported = permission_modes(provider).contains(&mode)
+        || match provider {
+            Provider::Claude => mode == "default",
+            // Preserve approval-policy values understood by recorded Codex recipes,
+            // including policies from older CLI versions.
+            Provider::Codex => matches!(mode, "on-request" | "on-failure" | "untrusted" | "never"),
+            Provider::Omp => matches!(mode, "always-ask" | "write" | "yolo"),
+        };
+    if supported {
+        Ok(())
+    } else {
+        Err(format!(
+            "Choose a permission mode offered by {}.",
+            provider.label()
+        ))
+    }
+}
+
+/// Executable paths are absolute so a launch in another worktree means the
+/// same thing. `access` checks the current user's actual execute permission.
+pub fn executable_path_syntax(path: &str) -> bool {
+    Path::new(path).is_absolute() && !path.contains('\0')
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXECUTABLE_CHECKS_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Prove reducer paths cannot acquire filesystem metadata; worker threads
+/// have their own guard state and still perform the real availability check.
+#[cfg(test)]
+pub(crate) fn without_executable_checks<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXECUTABLE_CHECKS_FORBIDDEN.set(self.0);
+        }
+    }
+    let _restore = Restore(EXECUTABLE_CHECKS_FORBIDDEN.replace(true));
+    f()
+}
+
+pub fn executable_available(path: &str) -> bool {
+    #[cfg(test)]
+    EXECUTABLE_CHECKS_FORBIDDEN.with(|forbidden| {
+        assert!(
+            !forbidden.get(),
+            "filesystem availability check on reducer thread"
+        )
+    });
+    let path = Path::new(path);
+    path.is_absolute()
+        && path.is_file()
+        && CString::new(path.as_os_str().as_bytes()).is_ok_and(|path| {
+            // SAFETY: this is a live, NUL-terminated path and access retains no pointer.
+            unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+        })
+}
+
+pub fn environment_name_valid(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+pub fn environment_reserved(provider: Provider, name: &str) -> bool {
+    name.starts_with("CAGENTS_")
+        || matches!(name, "CLAUDE_CONFIG_DIR" | "CODEX_HOME")
+        || crate::account::credential_overrides(provider).contains(&name)
+}
+
+impl AgentLaunchSettings {
+    /// Resolve from this immutable policy capture so probes cannot pair an
+    /// executable from one settings revision with arguments from another.
+    /// A provider's explicit PATH applies to discovery as it does to launch.
+    #[cfg(any(feature = "ui", feature = "host"))]
+    pub fn resolve_executable(
+        &self,
+        provider: Provider,
+        search_path: Option<&std::ffi::OsStr>,
+    ) -> Result<std::path::PathBuf, String> {
+        if let Some(executable) = &self.executable {
+            if !executable_available(executable) {
+                return Err(format!(
+                    "{} executable must be an absolute path to an executable file.",
+                    provider.label()
+                ));
+            }
+            return Ok(executable.into());
+        }
+        self.validate_provider_path()?;
+        let search_path = self
+            .environment
+            .get("PATH")
+            .map(|path| std::ffi::OsStr::new(path))
+            .or(search_path);
+        crate::account::probe::find_executable(provider.executable(), search_path)
+            .ok_or_else(|| format!("{} is not installed", provider.label()))
+    }
+
+    /// Authentication and discovery consume execution policy without model,
+    /// effort or permission defaults, which are conversation choices.
+    pub fn validate_execution(&self, provider: Provider) -> Result<(), String> {
+        self.validate_execution_fields(provider)?;
+        self.validate_provider_path()
+    }
+
+    // A pin fixes program identity even when a provider needs relative PATH
+    // entries for its own tools. Without one, discovery cannot resolve a
+    // project-relative entry without knowing the eventual launch directory.
+    fn validate_provider_path(&self) -> Result<(), String> {
+        if self.executable.is_none()
+            && self.environment.get("PATH").is_some_and(|path| {
+                std::env::split_paths(path).any(|directory| !directory.is_absolute())
+            })
+        {
+            return Err("Set a provider executable or use only absolute directories in PATH; empty and relative entries depend on the launch directory.".into());
+        }
+        Ok(())
+    }
+
+    fn validate_execution_fields(&self, provider: Provider) -> Result<(), String> {
+        self.validate_execution_fields_with_availability(provider, true)
+    }
+
+    fn validate_execution_fields_with_availability(
+        &self,
+        provider: Provider,
+        availability: bool,
+    ) -> Result<(), String> {
+        if self.executable.as_deref().is_some_and(|path| {
+            if availability {
+                !executable_available(path)
+            } else {
+                !executable_path_syntax(path)
+            }
+        }) {
+            return Err(format!(
+                "{} executable must be an absolute path to an executable file.",
+                provider.label()
+            ));
+        }
+        for (name, value) in &self.environment {
+            if !environment_name_valid(name) {
+                return Err("Environment names must start with a letter or underscore and contain only letters, numbers and underscores.".into());
+            }
+            if environment_reserved(provider, name) {
+                return Err(format!(
+                    "{name} is reserved for account isolation and cannot be overridden."
+                ));
+            }
+            if value.contains('\0') {
+                return Err("Environment values cannot contain a NUL character.".into());
+            }
+        }
+        if self
+            .arguments
+            .iter()
+            .any(|argument| argument.contains('\0'))
+        {
+            return Err("Arguments cannot contain a NUL character.".into());
+        }
+        Ok(())
+    }
+
+    /// Validate the recorded policy's syntax without probing a filesystem.
+    /// Availability is checked by save/launch workers on the owning device.
+    pub fn validate_syntax(&self, provider: Provider) -> Result<(), String> {
+        self.validate_fields_with_availability(provider, false)?;
+        if self
+            .executable
+            .as_deref()
+            .is_some_and(|path| !executable_path_syntax(path))
+        {
+            return Err(format!(
+                "{} executable must be an absolute path to an executable file.",
+                provider.label()
+            ));
+        }
+        self.validate_provider_path()
+    }
+
+    pub fn validate(&self, provider: Provider) -> Result<(), String> {
+        self.validate_fields(provider)?;
+        self.validate_provider_path()
+    }
+
+    fn validate_fields(&self, provider: Provider) -> Result<(), String> {
+        self.validate_fields_with_availability(provider, true)
+    }
+
+    fn validate_fields_with_availability(
+        &self,
+        provider: Provider,
+        availability: bool,
+    ) -> Result<(), String> {
+        self.validate_execution_fields_with_availability(provider, availability)?;
+        for value in self.model.iter().chain(self.effort.iter()) {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(
+                    "Model and effort must be non-empty names without control characters.".into(),
+                );
+            }
+        }
+        if self
+            .permission_mode
+            .as_deref()
+            .is_some_and(|mode| !permission_modes(provider).contains(&mode))
+        {
+            return Err(format!(
+                "Choose a permission mode offered by {}.",
+                provider.label()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate changed fields independently so retained invalid siblings can
+    /// be repaired one control at a time without weakening launch validation.
+    pub fn validate_changes(&self, previous: &Self, provider: Provider) -> Result<(), String> {
+        self.validate_changes_with_availability(previous, provider, true)
+    }
+
+    pub fn validate_changes_syntax(
+        &self,
+        previous: &Self,
+        provider: Provider,
+    ) -> Result<(), String> {
+        self.validate_changes_with_availability(previous, provider, false)
+    }
+
+    fn validate_changes_with_availability(
+        &self,
+        previous: &Self,
+        provider: Provider,
+        availability: bool,
+    ) -> Result<(), String> {
+        Self {
+            model: (self.model != previous.model)
+                .then(|| self.model.clone())
+                .flatten(),
+            effort: (self.effort != previous.effort)
+                .then(|| self.effort.clone())
+                .flatten(),
+            permission_mode: (self.permission_mode != previous.permission_mode)
+                .then(|| self.permission_mode.clone())
+                .flatten(),
+            executable: (self.executable != previous.executable)
+                .then(|| self.executable.clone())
+                .flatten(),
+            arguments: if self.arguments != previous.arguments {
+                self.arguments.clone()
+            } else {
+                vec![]
+            },
+            environment: if self.environment != previous.environment {
+                self.environment.clone()
+            } else {
+                Default::default()
+            },
+        }
+        .validate_fields_with_availability(provider, availability)?;
+        if self.executable != previous.executable
+            || self.environment.get("PATH") != previous.environment.get("PATH")
+        {
+            // Use the effective pin, including an unchanged pin, rather than
+            // the field-only validation projection above. Unchanged invalid
+            // execution policy must not prevent unrelated repairs.
+            self.validate_provider_path()?;
+        }
+        Ok(())
+    }
+
+    /// Apply before account isolation. The selected home and credential
+    /// removals always have the final say over inherited launch environment.
+    pub fn apply_launch(&self, recipe: &mut LaunchRecipe) {
+        if let Some(executable) = &self.executable {
+            recipe.program.clone_from(executable);
+        }
+        recipe.arguments.extend(self.arguments.iter().cloned());
+        recipe.environment.extend(self.environment.clone());
+    }
+
+    pub fn append_options(
+        &self,
+        provider: Provider,
+        arguments: &mut Vec<String>,
+        overrides: LaunchDefaults<'_>,
+    ) {
+        if let Some(model) = overrides.model.or(self.model.as_deref()) {
+            set_option(arguments, "--model", model);
+        }
+        if let Some(effort) = overrides.effort.or(self.effort.as_deref()) {
+            match provider {
+                Provider::Claude => set_option(arguments, "--effort", effort),
+                Provider::Omp => set_option(arguments, "--thinking", effort),
+                Provider::Codex => {
+                    let key = crate::chat::CODEX_REASONING_EFFORT_KEY;
+                    remove_config_key(arguments, key);
+                    arguments.extend(["--config".into(), format!("{key}={effort}")]);
+                }
+            }
+        }
+        if let Some(mode) = overrides
+            .permission_mode
+            .or(self.permission_mode.as_deref())
+        {
+            match provider {
+                Provider::Claude => {
+                    arguments.retain(|argument| argument != "--dangerously-skip-permissions");
+                    set_option(
+                        arguments,
+                        "--permission-mode",
+                        if mode == "manual" { "default" } else { mode },
+                    );
+                }
+                Provider::Codex => {
+                    arguments.retain(|argument| {
+                        !matches!(
+                            argument.as_str(),
+                            "--yolo" | "--dangerously-bypass-approvals-and-sandbox"
+                        )
+                    });
+                    if mode == "yolo" {
+                        arguments.push("--dangerously-bypass-approvals-and-sandbox".into());
+                    } else if matches!(mode, "readOnly" | "workspaceWrite") {
+                        set_option(
+                            arguments,
+                            "--sandbox",
+                            if mode == "readOnly" {
+                                "read-only"
+                            } else {
+                                "workspace-write"
+                            },
+                        );
+                        set_option(arguments, "--ask-for-approval", "on-request");
+                    } else {
+                        set_option(arguments, "--ask-for-approval", mode);
+                    }
+                }
+                Provider::Omp => set_option(arguments, "--approval-mode", mode),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct LaunchDefaults<'a> {
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub permission_mode: Option<&'a str>,
+}
+
+fn remove_option(arguments: &mut Vec<String>, flag: &str) {
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == flag {
+            arguments.remove(index);
+            if index < arguments.len() {
+                arguments.remove(index);
+            }
+        } else if arguments[index]
+            .strip_prefix(flag)
+            .is_some_and(|suffix| suffix.starts_with('='))
+        {
+            arguments.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn set_option(arguments: &mut Vec<String>, flag: &str, value: &str) {
+    remove_option(arguments, flag);
+    arguments.extend([flag.into(), value.into()]);
+}
+
+/// Record the composer/provider-confirmed selection in the launch recipe.
+/// None deliberately clears a configured default when the user chooses Automatic.
+pub fn set_model_options(
+    arguments: &mut Vec<String>,
+    provider: Provider,
+    model: Option<&str>,
+    effort: Option<&str>,
+) {
+    remove_option(arguments, "--model");
+    match provider {
+        Provider::Claude => remove_option(arguments, "--effort"),
+        Provider::Omp => remove_option(arguments, "--thinking"),
+        Provider::Codex => remove_config_key(arguments, crate::chat::CODEX_REASONING_EFFORT_KEY),
+    }
+    AgentLaunchSettings::default().append_options(
+        provider,
+        arguments,
+        LaunchDefaults {
+            model,
+            effort,
+            permission_mode: None,
+        },
+    );
+}
+
+fn remove_config_key(arguments: &mut Vec<String>, key: &str) {
+    let matches_key = |value: &str| {
+        value
+            .split_once('=')
+            .is_some_and(|(name, _)| name.trim() == key)
+    };
+    let mut index = 0;
+    while index < arguments.len() {
+        if matches!(arguments[index].as_str(), "-c" | "--config")
+            && arguments
+                .get(index + 1)
+                .is_some_and(|value| matches_key(value))
+        {
+            arguments.drain(index..index + 2);
+        } else if arguments[index]
+            .strip_prefix("--config=")
+            .is_some_and(matches_key)
+        {
+            arguments.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn ambiguous_provider_path_requires_a_pin_without_blocking_independent_repairs() {
+        let previous = AgentLaunchSettings {
+            environment: BTreeMap::from([("PATH".into(), "tools:/usr/bin".into())]),
+            ..Default::default()
+        };
+        assert!(
+            previous
+                .validate_execution(Provider::Claude)
+                .unwrap_err()
+                .contains("absolute")
+        );
+        for path in ["", ":/usr/bin", "/usr/bin:", "/usr/bin:tools", "."] {
+            let mut ambiguous = previous.clone();
+            ambiguous.environment.insert("PATH".into(), path.into());
+            assert!(ambiguous.validate(Provider::Claude).is_err(), "{path:?}");
+        }
+        let mut repaired = previous.clone();
+        repaired.model = Some("fixture-model".into());
+        repaired
+            .validate_changes(&previous, Provider::Claude)
+            .unwrap();
+        repaired
+            .environment
+            .insert("FIXTURE_TOOL".into(), "value".into());
+        repaired
+            .validate_changes(&previous, Provider::Claude)
+            .unwrap();
+        repaired.executable = Some("/bin/sh".into());
+        repaired
+            .validate_changes(&previous, Provider::Claude)
+            .unwrap();
+        repaired.validate_execution(Provider::Claude).unwrap();
+        let pinned = repaired.clone();
+        repaired
+            .environment
+            .insert("PATH".into(), "relative-tools".into());
+        repaired
+            .validate_changes(&pinned, Provider::Claude)
+            .unwrap();
+        let pinned = repaired.clone();
+        repaired.executable = None;
+        assert!(
+            repaired
+                .validate_changes(&pinned, Provider::Claude)
+                .is_err()
+        );
+        repaired
+            .environment
+            .insert("PATH".into(), "/usr/bin".into());
+        repaired
+            .validate_changes(&pinned, Provider::Claude)
+            .unwrap();
+        repaired.validate_execution(Provider::Claude).unwrap();
+
+        let missing_pin = AgentLaunchSettings {
+            executable: Some("/missing/provider".into()),
+            ..previous
+        };
+        let mut repair_environment = missing_pin.clone();
+        repair_environment
+            .environment
+            .insert("PATH".into(), "other-tools".into());
+        repair_environment
+            .validate_changes(&missing_pin, Provider::Claude)
+            .unwrap();
+        assert!(
+            repair_environment
+                .validate_execution(Provider::Claude)
+                .is_err()
+        );
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn relative_provider_path_is_refused_before_launch_or_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = directory.path().join("host");
+        let tools = directory.path().join("tools");
+        for (root, marker) in [(&host, "host"), (&tools, "project")] {
+            std::fs::create_dir(root).unwrap();
+            let binary = root.join(Provider::Claude.executable());
+            std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{marker}'\n")).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = format!("tools:{}", host.display());
+        let mut configuration = AgentLaunchSettings {
+            environment: BTreeMap::from([("PATH".into(), path.clone())]),
+            ..Default::default()
+        };
+        // This is the mismatch that execution policy must refuse: launching
+        // a bare name sees the project CLI while discovery skips relative PATH.
+        let output = std::process::Command::new(Provider::Claude.executable())
+            .current_dir(directory.path())
+            .env_clear()
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"project\n");
+        assert_eq!(
+            crate::account::probe::find_executable(
+                Provider::Claude.executable(),
+                Some(std::ffi::OsStr::new(&path))
+            )
+            .unwrap(),
+            host.join(Provider::Claude.executable())
+        );
+        assert!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .is_err()
+        );
+        assert!(
+            crate::chat::fresh_session_configured(
+                Provider::Claude,
+                crate::model::TerminalId::new(),
+                directory.path().into(),
+                &crate::account::Account::system(Provider::Claude),
+                &configuration,
+                LaunchDefaults::default(),
+            )
+            .is_err()
+        );
+        configuration.executable = Some(
+            tools
+                .join(Provider::Claude.executable())
+                .to_str()
+                .unwrap()
+                .into(),
+        );
+        configuration.validate_execution(Provider::Claude).unwrap();
+        assert_eq!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .unwrap(),
+            tools.join(Provider::Claude.executable())
+        );
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn provider_path_selects_the_same_binary_for_launch_and_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = directory.path().join("host");
+        let configured = directory.path().join("configured");
+        let host_program = host.join(Provider::Claude.executable());
+        let configured_program = configured.join(Provider::Claude.executable());
+        for (root, marker) in [(&host, "host"), (&configured, "configured")] {
+            std::fs::create_dir(root).unwrap();
+            let binary = root.join(Provider::Claude.executable());
+            std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{marker}'\n")).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut configuration = AgentLaunchSettings::default();
+        assert_eq!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .unwrap(),
+            host_program
+        );
+        configuration
+            .environment
+            .insert("PATH".into(), configured.to_str().unwrap().into());
+        let discovered = configuration
+            .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+            .unwrap();
+        assert_eq!(discovered, configured_program);
+        let mut recipe = LaunchRecipe {
+            program: Provider::Claude.executable().into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        configuration.apply_launch(&mut recipe);
+        for program in [Path::new(&recipe.program), discovered.as_path()] {
+            let output = std::process::Command::new(program)
+                .args(&recipe.arguments)
+                .current_dir(&recipe.working_directory)
+                .env_clear()
+                .envs(&recipe.environment)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"configured\n");
+        }
+        configuration.executable = Some(host_program.to_str().unwrap().into());
+        assert_eq!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .unwrap(),
+            host_program
+        );
+        configuration.executable = Some(directory.path().join("missing").to_str().unwrap().into());
+        assert!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .is_err()
+        );
+        configuration.executable = None;
+        configuration
+            .environment
+            .insert("PATH".into(), String::new());
+        assert!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_tables_round_trip_and_reject_unsafe_launch_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("provider-wrapper");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let configuration = AgentLaunchSettings {
+            executable: Some(executable.to_string_lossy().into_owned()),
+            model: Some("fixture-model".into()),
+            effort: Some("low".into()),
+            permission_mode: Some("plan".into()),
+            arguments: vec!["--fixture".into(), "two words".into()],
+            environment: BTreeMap::from([("PROXY_URL".into(), "http://localhost:8080".into())]),
+        };
+        let settings = super::super::AppSettings {
+            agents: BTreeMap::from([("claude".into(), configuration.clone())]),
+            default_shell: Some("/bin/sh".into()),
+            ..Default::default()
+        };
+        let path = directory.path().join("settings.toml");
+        super::super::save(&path, &settings).unwrap();
+        assert_eq!(super::super::load(&path).unwrap(), settings);
+        let mut invalid = configuration.clone();
+        invalid.executable = Some(
+            directory
+                .path()
+                .join("missing")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(invalid.validate(Provider::Claude).is_err());
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(configuration.validate(Provider::Claude).is_err());
+        for name in [
+            "INVALID-NAME",
+            "9NAME",
+            "CLAUDE_CONFIG_DIR",
+            "CAGENTS_AUTO_ACCOUNT",
+            "ANTHROPIC_API_KEY",
+        ] {
+            let invalid = AgentLaunchSettings {
+                environment: BTreeMap::from([(name.into(), "value".into())]),
+                ..Default::default()
+            };
+            assert!(invalid.validate(Provider::Claude).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn unavailable_saved_paths_preserve_policy_and_refuse_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let settings = super::super::AppSettings::default();
+        let mut value = toml::Value::try_from(&settings).unwrap();
+        // Optional keys are absent from the serialized defaults; Value's
+        // IndexMut only replaces an existing key rather than inserting one.
+        value.as_table_mut().unwrap().insert(
+            "default_shell".into(),
+            toml::Value::String(
+                directory
+                    .path()
+                    .join("missing-shell")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+        value.as_table_mut().unwrap().insert(
+            "agents".into(),
+            toml::Value::Table(toml::Table::from_iter([
+                (
+                    "claude".into(),
+                    toml::Value::try_from(AgentLaunchSettings {
+                        executable: Some(
+                            directory
+                                .path()
+                                .join("missing-provider")
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        model: Some("pinned-model".into()),
+                        permission_mode: Some("plan".into()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+                (
+                    "codex".into(),
+                    toml::Value::try_from(AgentLaunchSettings {
+                        model: Some("keep-model".into()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+            ])),
+        );
+        std::fs::write(&path, toml::to_string(&value).unwrap()).unwrap();
+        let loaded = super::super::load(&path).unwrap();
+        assert_eq!(
+            loaded.default_shell.as_deref(),
+            value.get("default_shell").and_then(toml::Value::as_str)
+        );
+        assert!(loaded.agents["claude"].validate(Provider::Claude).is_err());
+        assert_eq!(
+            loaded.agents["claude"].model.as_deref(),
+            Some("pinned-model")
+        );
+        assert_eq!(
+            loaded.agents["claude"].permission_mode.as_deref(),
+            Some("plan")
+        );
+        assert!(
+            loaded.clone().validate().is_err(),
+            "new saves must still refuse unusable launch settings"
+        );
+        assert_eq!(loaded.agents["codex"].model.as_deref(), Some("keep-model"));
+    }
+
+    #[test]
+    fn multiple_unavailable_paths_can_be_repaired_and_saved_one_at_a_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let settings = super::super::AppSettings {
+            default_shell: Some("/missing/configured-shell".into()),
+            agents: BTreeMap::from([
+                (
+                    "claude".into(),
+                    AgentLaunchSettings {
+                        executable: Some("/missing/claude-wrapper".into()),
+                        permission_mode: Some("plan".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "codex".into(),
+                    AgentLaunchSettings {
+                        executable: Some("/missing/codex-wrapper".into()),
+                        permission_mode: Some("readOnly".into()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        std::fs::write(&path, toml::to_string(&settings).unwrap()).unwrap();
+        let mut current = super::super::load(&path).unwrap();
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut repaired = current.clone();
+            repaired
+                .agents
+                .get_mut(provider_key(provider))
+                .unwrap()
+                .executable = Some("/bin/sh".into());
+            repaired.clone().validate_transition(&current).unwrap();
+            super::super::save_merged(&path, &current, &repaired).unwrap();
+            current = super::super::load(&path).unwrap();
+            assert_eq!(
+                current.agents[provider_key(provider)].executable.as_deref(),
+                Some("/bin/sh")
+            );
+        }
+        let mut repaired = current.clone();
+        repaired.default_shell = Some("/bin/sh".into());
+        super::super::save_merged(&path, &current, &repaired).unwrap();
+        let loaded = super::super::load(&path).unwrap();
+        assert_eq!(loaded, repaired);
+        assert_eq!(
+            loaded.agents["claude"].permission_mode.as_deref(),
+            Some("plan")
+        );
+        assert_eq!(
+            loaded.agents["codex"].permission_mode.as_deref(),
+            Some("readOnly")
+        );
+        loaded.validate().unwrap();
+    }
+
+    #[test]
+    fn recorded_policy_syntax_is_independent_of_executable_availability() {
+        let root = tempfile::tempdir().unwrap();
+        let mut configuration = AgentLaunchSettings {
+            executable: Some(root.path().join("missing-wrapper").to_str().unwrap().into()),
+            environment: BTreeMap::from([("PATH".into(), "relative-tools".into())]),
+            ..Default::default()
+        };
+        assert!(configuration.validate_syntax(Provider::Claude).is_ok());
+        assert!(configuration.validate(Provider::Claude).is_err());
+        configuration.executable = Some("relative-wrapper".into());
+        assert!(configuration.validate_syntax(Provider::Claude).is_err());
+        configuration.executable =
+            Some(root.path().join("missing-wrapper").to_str().unwrap().into());
+        configuration.permission_mode = Some("unknown-mode".into());
+        assert!(configuration.validate_syntax(Provider::Claude).is_err());
+    }
+
+    #[test]
+    fn configured_shell_is_used_by_ui_and_cli_recipe_factories() {
+        const MARKER: &str = "CAGENTS_TEST_CONFIGURED_SHELL_DIRECTORY";
+        let root = if let Some(root) = std::env::var_os(MARKER) {
+            std::path::PathBuf::from(root)
+        } else {
+            let directory = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "settings::agents::tests::configured_shell_is_used_by_ui_and_cli_recipe_factories", "--nocapture", "--test-threads=1"])
+                .env(MARKER, directory.path()).env("XDG_CONFIG_HOME", directory.path().join("config")).env("XDG_STATE_HOME", directory.path().join("state")).env("XDG_DATA_HOME", directory.path().join("data")).env("XDG_CACHE_HOME", directory.path().join("cache")).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        };
+        let shell = root.join("configured-shell");
+        std::fs::write(&shell, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let settings = super::super::AppSettings {
+            default_shell: Some(shell.to_string_lossy().into_owned()),
+            agents: BTreeMap::from([(
+                "claude".into(),
+                AgentLaunchSettings {
+                    executable: Some(shell.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        super::super::save(super::super::default_path().unwrap(), &settings).unwrap();
+        let ui = LaunchRecipe::shell(root.clone()).unwrap();
+        let cli = crate::control::terminal_spawn_recipe(root.clone(), vec![]).unwrap();
+        assert_eq!(ui.program, shell.to_string_lossy());
+        assert_eq!(cli.program, ui.program);
+        #[cfg(any(feature = "ui", feature = "host"))]
+        assert_eq!(
+            provider_executable(
+                Provider::Claude,
+                Some(std::ffi::OsStr::new("/missing/provider/bin"))
+            )
+            .unwrap(),
+            shell
+        );
+        let explicit = crate::control::terminal_spawn_recipe(
+            root.clone(),
+            vec!["/bin/echo".into(), "explicit".into()],
+        )
+        .unwrap();
+        assert_eq!(explicit.program, "/bin/echo");
+        assert_eq!(explicit.arguments, ["explicit"]);
+        let path = super::super::default_path().unwrap();
+        let valid_file = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "[invalid external edit").unwrap();
+        assert_eq!(
+            crate::model::terminal_shell(),
+            Err(crate::model::LoginShellError::PreferencesUnavailable)
+        );
+        assert!(
+            crate::control::terminal_spawn_recipe(root.clone(), vec![]).is_err(),
+            "fresh CLI must not silently choose another shell when preferences cannot be read"
+        );
+        let captured = LaunchRecipe::shell_with_settings(root.clone(), &settings).unwrap();
+        assert_eq!(
+            captured.program,
+            shell.to_string_lossy(),
+            "running UI keeps its captured last valid shell policy"
+        );
+        assert!(
+            crate::control::terminal_spawn_recipe(root.clone(), vec!["/bin/echo".into()]).is_ok()
+        );
+        #[cfg(feature = "host")]
+        {
+            let crate::device_service::Reply::Home {
+                shell, shell_error, ..
+            } = crate::device_service::execute(crate::device_service::Operation::Home).unwrap()
+            else {
+                panic!("device identity reply");
+            };
+            assert!(shell.is_empty());
+            assert!(
+                shell_error.is_some(),
+                "remote identity remains available and records terminal policy refusal"
+            );
+        }
+        std::fs::write(&path, valid_file).unwrap();
+        std::fs::remove_file(&shell).unwrap();
+        #[cfg(any(feature = "ui", feature = "host"))]
+        assert!(
+            provider_executable(
+                Provider::Claude,
+                Some(std::ffi::OsStr::new("/usr/bin:/bin"))
+            )
+            .is_err()
+        );
+        assert_eq!(
+            crate::model::terminal_shell(),
+            Err(crate::model::LoginShellError::ConfiguredUnavailable)
+        );
+        assert!(
+            crate::model::login_shell().is_ok(),
+            "a terminal-only stale pin cannot disable login-environment discovery"
+        );
+        #[cfg(feature = "host")]
+        {
+            let crate::device_service::Reply::Home {
+                shell: reported, ..
+            } = crate::device_service::execute(crate::device_service::Operation::Home).unwrap()
+            else {
+                panic!("device identity reply");
+            };
+            assert_eq!(
+                reported,
+                shell.to_string_lossy(),
+                "remote identity must preserve unavailable pin without blocking unrelated operations"
+            );
+        }
+        assert!(
+            crate::control::terminal_spawn_recipe(root, vec![]).is_err(),
+            "a missing pinned shell cannot silently switch to the login shell"
+        );
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn explicit_permissions_refuse_unknown_and_cross_provider_modes() {
+        let root = tempfile::tempdir().unwrap();
+        for (provider, mode) in [
+            (Provider::Claude, "readOnly"),
+            (Provider::Claude, "future-mode"),
+            (Provider::Codex, "plan"),
+            (Provider::Codex, "future-mode"),
+            (Provider::Omp, "workspaceWrite"),
+            (Provider::Omp, "future-mode"),
+        ] {
+            let result = crate::chat::fresh_session_configured(
+                provider,
+                crate::model::TerminalId::new(),
+                root.path().into(),
+                &crate::account::Account::system(provider),
+                &AgentLaunchSettings::default(),
+                LaunchDefaults {
+                    permission_mode: Some(mode),
+                    ..Default::default()
+                },
+            );
+            assert!(result.is_err(), "{provider:?} must refuse {mode}");
+        }
+        for (provider, modes) in [
+            (Provider::Claude, &["default", "plan"][..]),
+            (
+                Provider::Codex,
+                &[
+                    "on-request",
+                    "on-failure",
+                    "untrusted",
+                    "never",
+                    "workspaceWrite",
+                ][..],
+            ),
+            (Provider::Omp, &["always-ask", "write", "yolo"][..]),
+        ] {
+            for mode in modes {
+                crate::chat::fresh_session_configured(
+                    provider,
+                    crate::model::TerminalId::new(),
+                    root.path().into(),
+                    &crate::account::Account::system(provider),
+                    &AgentLaunchSettings::default(),
+                    LaunchDefaults {
+                        permission_mode: Some(mode),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_first_provider_edits_merge_fields_without_losing_launch_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let base = super::super::AppSettings::default();
+        let mut launch_window = base.clone();
+        launch_window.agents.insert(
+            "claude".into(),
+            AgentLaunchSettings {
+                executable: Some("/bin/sh".into()),
+                arguments: vec!["--append-system-prompt".into(), "fixture".into()],
+                environment: BTreeMap::from([("PROVIDER_FIXTURE_VALUE".into(), "kept".into())]),
+                ..Default::default()
+            },
+        );
+        super::super::save_merged(&path, &base, &launch_window).unwrap();
+        let mut model_window = base.clone();
+        model_window.agents.insert(
+            "claude".into(),
+            AgentLaunchSettings {
+                model: Some("chosen-model".into()),
+                ..Default::default()
+            },
+        );
+        super::super::save_merged(&path, &base, &model_window).unwrap();
+        let merged = super::super::load(&path).unwrap();
+        let expected = AgentLaunchSettings {
+            model: Some("chosen-model".into()),
+            ..launch_window.agents["claude"].clone()
+        };
+        assert_eq!(merged.agents["claude"], expected);
+        let mut reset = merged.clone();
+        reset.agents.remove("claude");
+        super::super::save_merged(&path, &merged, &reset).unwrap();
+        assert!(
+            !super::super::load(&path)
+                .unwrap()
+                .agents
+                .contains_key("claude"),
+            "explicit provider-table reset must still remove it"
+        );
+    }
+
+    #[test]
+    fn account_execution_validation_ignores_conversation_defaults_only() {
+        let configuration = AgentLaunchSettings {
+            model: Some("future\nmodel".into()),
+            permission_mode: Some("future-mode".into()),
+            ..Default::default()
+        };
+        assert!(configuration.validate(Provider::Claude).is_err());
+        configuration.validate_execution(Provider::Claude).unwrap();
+        let invalid = AgentLaunchSettings {
+            executable: Some("/missing/pinned-wrapper".into()),
+            ..configuration
+        };
+        assert!(invalid.validate_execution(Provider::Claude).is_err());
+    }
+
+    #[test]
+    fn explicit_conversation_options_replace_defaults_without_duplicate_flags() {
+        let configuration = AgentLaunchSettings {
+            model: Some("default-model".into()),
+            effort: Some("low".into()),
+            permission_mode: Some("plan".into()),
+            ..Default::default()
+        };
+        let mut arguments = vec![
+            "--model".into(),
+            "argument-model".into(),
+            "--effort=high".into(),
+        ];
+        configuration.append_options(
+            Provider::Claude,
+            &mut arguments,
+            LaunchDefaults {
+                model: Some("conversation-model"),
+                effort: Some("medium"),
+                permission_mode: Some("manual"),
+            },
+        );
+        assert_eq!(
+            arguments,
+            [
+                "--model",
+                "conversation-model",
+                "--effort",
+                "medium",
+                "--permission-mode",
+                "default"
+            ]
+        );
+        let configuration = AgentLaunchSettings {
+            effort: Some("low".into()),
+            permission_mode: Some("workspaceWrite".into()),
+            ..Default::default()
+        };
+        let mut arguments = vec![
+            "--config".into(),
+            "unrelated=true".into(),
+            "--config=model_reasoning_effort=high".into(),
+        ];
+        configuration.append_options(Provider::Codex, &mut arguments, Default::default());
+        assert_eq!(
+            arguments,
+            [
+                "--config",
+                "unrelated=true",
+                "--config",
+                "model_reasoning_effort=low",
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request"
+            ]
+        );
+    }
+
+    #[test]
+    fn composer_selection_replaces_or_clears_configured_model_and_effort() {
+        let mut arguments = vec![
+            "--model=default-model".into(),
+            "--effort".into(),
+            "low".into(),
+            "--fixture".into(),
+        ];
+        set_model_options(
+            &mut arguments,
+            Provider::Claude,
+            Some("chosen-model"),
+            Some("high"),
+        );
+        assert_eq!(
+            arguments,
+            ["--fixture", "--model", "chosen-model", "--effort", "high"]
+        );
+        set_model_options(&mut arguments, Provider::Claude, None, None);
+        assert_eq!(arguments, ["--fixture"]);
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn explicit_choices_override_retained_invalid_defaults_before_launch_validation() {
+        let configuration = AgentLaunchSettings {
+            model: Some("bad\nmodel".into()),
+            permission_mode: Some("future-permission-mode".into()),
+            ..Default::default()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let account = crate::account::Account::system(Provider::Claude);
+        assert!(
+            crate::chat::fresh_session_configured(
+                Provider::Claude,
+                crate::model::TerminalId::new(),
+                root.path().into(),
+                &account,
+                &configuration,
+                Default::default()
+            )
+            .is_err()
+        );
+        let session = crate::chat::fresh_session_configured(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            root.path().into(),
+            &account,
+            &configuration,
+            LaunchDefaults {
+                model: Some("chosen-model"),
+                permission_mode: Some("plan"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            session
+                .launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--model", "chosen-model"])
+        );
+        assert!(
+            session
+                .launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "plan"])
+        );
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn configured_launch_records_executable_arguments_environment_and_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let configuration = AgentLaunchSettings {
+            executable: Some("/bin/sh".into()),
+            model: Some("fixture-model".into()),
+            effort: Some("low".into()),
+            permission_mode: Some("plan".into()),
+            arguments: vec!["--fixture-launch".into()],
+            environment: BTreeMap::from([("PROXY_URL".into(), "http://localhost:8080".into())]),
+        };
+        let session = crate::chat::fresh_session_configured(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            directory.path().into(),
+            &crate::account::Account::system(Provider::Claude),
+            &configuration,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(session.launch.recipe.program, "/bin/sh");
+        assert!(
+            session
+                .launch
+                .recipe
+                .arguments
+                .contains(&"--fixture-launch".to_owned())
+        );
+        assert!(
+            session
+                .launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--model", "fixture-model"])
+        );
+        assert_eq!(
+            session
+                .launch
+                .recipe
+                .environment
+                .get("PROXY_URL")
+                .map(String::as_str),
+            Some("http://localhost:8080")
+        );
+    }
+}
