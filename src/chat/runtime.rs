@@ -42,6 +42,7 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
+    RetainedProvider {run:Option<crate::model::RunId>,command:Command,effects:Arc<std::sync::atomic::AtomicU8>},
     CaptureExecutionDirectory {
         directory: std::path::PathBuf,
         proof: crossbeam_channel::Sender<Result<DirectoryProof, String>>,
@@ -198,6 +199,13 @@ fn capture_account_scope(spec:&ProcessSpec,provider:crate::agent::Provider)->Res
     if matches!(spec.transport,TransportSpec::History) {return Err("Read-only history has no authenticated provider launch scope".into());}
     crate::account::scope::LaunchAccountScope::resolve(provider,&spec.working_directory,|name|(!spec.unset_environment.contains(name)).then(||spec.environment.get(name).map(std::ffi::OsString::from)).flatten())
 }
+/// A retained input is retryable only when preparation provably never reached
+/// the actor step that can publish events or queue provider bytes.
+struct InputEffects(Option<Arc<std::sync::atomic::AtomicU8>>);
+impl InputEffects {
+    fn possible(&mut self) {if let Some(state)=self.0.take() {state.store(2,Ordering::Release);}}
+}
+impl Drop for InputEffects {fn drop(&mut self) {if let Some(state)=self.0.take() {state.store(1,Ordering::Release);}}}
 enum NativeOwnership {
     New(super::Session, BTreeMap<String, String>),
     Adopted(
@@ -693,7 +701,7 @@ impl LocalHandle {
     fn enqueue_actor(&self,command:ActorCommand)->Result<crossbeam_channel::Receiver<Result<(),String>>,String> {
         if self.is_completed() || self.0.draining.load(Ordering::Acquire) {return Err("Provider process exited; restart the session to continue".into());}
         if self.0.stop.load(Ordering::Acquire) {return Err("Chat is closing".into());}
-        let urgent=matches!(&command,ActorCommand::Interrupt {..}|ActorCommand::Provider {command:Command::Interrupt,..});
+        let urgent=matches!(&command,ActorCommand::Interrupt {..}|ActorCommand::Provider {command:Command::Interrupt,..}|ActorCommand::RetainedProvider {command:Command::Interrupt,..});
         let (reply,response)=crossbeam_channel::bounded(1);
         let sender=if urgent {&self.0.urgent_commands} else {&self.0.commands};
         sender.try_send((command,reply)).map_err(|error|format!("Chat command queue unavailable: {error}"))?;
@@ -2215,6 +2223,10 @@ impl Actor {
                 (self.queued<=QUEUE_BACKPRESSURE).then(||self.incoming.try_recv().ok()).flatten()
             });
             let Some((command,reply))=request else {break;};
+            let (command,mut effects)=match command {
+                ActorCommand::RetainedProvider {run,command,effects}=>(ActorCommand::Provider {run,command},InputEffects(Some(effects))),
+                command=>(command,InputEffects(None)),
+            };
             if closing || self.stop.load(Ordering::Acquire) {
                 let _ = reply.send(Err("Chat is closing".into()));
                 continue;
@@ -2230,6 +2242,7 @@ impl Actor {
                     let _ = reply.send(Ok(()));
                     continue;
                 }
+                ActorCommand::RetainedProvider {..} => unreachable!("retained input was unwrapped before dispatch"),
                 ActorCommand::Provider { run, command } => (run, command),
                 ActorCommand::RelocateExecutionDirectory(directory) => {
                     let result: Result<(), String> = (|| {
@@ -2406,6 +2419,7 @@ impl Actor {
             };
             match prepared {
                 Ok(step) => {
+                    effects.possible();
                     let acknowledgement = self.adapter.command_ack();
                     let observed_boundary=step.events.iter().any(|event|matches!(event,Event::TurnStarted|Event::TurnFinished{..}|Event::Exited{..}|Event::Error{fatal:true,..}));
                     if login_recovery.is_some() {
@@ -3561,6 +3575,28 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_input_classifies_idle_and_directory_refusal_before_effects() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let selected=directory.path().join("selected");std::fs::create_dir(&selected).unwrap();
+        let context=Arc::new(super::super::protocol::ExecutionContext::capture(&selected).unwrap());
+        let spec=ProcessSpec {execution:Some(context),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:selected.clone(),environment:BTreeMap::new()};
+        let mut adapter:Box<dyn Adapter>=Box::new(Echo);let mut initial=adapter.initialize().unwrap();let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,adapter,initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
+        for missing in [false,true] {
+            if missing {std::fs::rename(&selected,directory.path().join("moved")).unwrap();} else {handle.0.state.lock().unwrap().busy=true;}
+            let effects=Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let response=handle.enqueue_actor(ActorCommand::RetainedProvider {run:Some(crate::model::RunId::new()),command:Command::Prompt {text:"must not execute".into(),attachments:Vec::new(),mode:super::super::PromptMode::Send},effects:effects.clone()}).unwrap();
+            assert!(response.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+            let deadline=Instant::now()+Duration::from_secs(1);while effects.load(Ordering::Acquire)==0 {assert!(Instant::now()<deadline);thread::yield_now();}
+            assert_eq!(effects.load(Ordering::Acquire),1);
+            handle.0.state.lock().unwrap().busy=false;
+        }
+        handle.close().unwrap();
+        let state=Arc::new(std::sync::atomic::AtomicU8::new(0));let mut guard=InputEffects(Some(state.clone()));guard.possible();drop(guard);
+        assert_eq!(state.load(Ordering::Acquire),2,"after possible effects a later error never grants replay or retirement");
+    }
+
     #[test]
     fn account_scope_captures_actual_startup_environment_after_unsets() {
         let directory = tempfile::tempdir().unwrap();
