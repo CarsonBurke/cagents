@@ -4279,7 +4279,9 @@ impl Cagents {
             runtime.account_switch_recheck = false;
             return Task::none();
         };
-        let observation = runtime.handle().and_then(|handle| handle.account_switch_readiness_observation());
+        let observation = runtime
+            .handle()
+            .and_then(|handle| handle.account_switch_readiness_observation());
         if runtime.account_switch_checking {
             // A successful old busy-read may arrive after newer readiness
             // metadata. Preserve one query hint, never close authority.
@@ -7404,7 +7406,9 @@ impl Cagents {
                         handle.take_account_usage();
                     }
                     if matches!(wake, Wake::Activity)
-                        && let Some(handle) = self.chat_runtime_mut(target).and_then(|runtime| runtime.handle())
+                        && let Some(handle) = self
+                            .chat_runtime_mut(target)
+                            .and_then(|runtime| runtime.handle())
                     {
                         // A refused account handoff can preserve this exact
                         // attachment. Release its coalesced edge so future
@@ -12323,7 +12327,9 @@ mod tests {
                 assert!(current(&app, card).account_switch_checking);
                 if parked {
                     app.chat_runtime_mut(target).unwrap().show(false);
-                    let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else { panic!("chat") };
+                    let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+                        panic!("chat")
+                    };
                     app.chat_ui.parked.insert(card, runtime);
                 }
                 if outcome != "no-wake" {
@@ -12341,10 +12347,22 @@ mod tests {
                     assert!(!current(&app, card).account_switch_recheck);
                 }
                 let response_target = if outcome == "stale" {
-                    Target { generation: target.generation.wrapping_add(1), ..target }
-                } else { target };
-                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(response_target, alternate.clone(),
-                    if outcome == "error" { Err("Read-only transport failed".into()) } else { Ok(None) })));
+                    Target {
+                        generation: target.generation.wrapping_add(1),
+                        ..target
+                    }
+                } else {
+                    target
+                };
+                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+                    response_target,
+                    alternate.clone(),
+                    if outcome == "error" {
+                        Err("Read-only transport failed".into())
+                    } else {
+                        Ok(None)
+                    },
+                )));
                 let runtime = current(&app, card);
                 assert_eq!(runtime.session, source);
                 assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
@@ -12353,12 +12371,19 @@ mod tests {
                 assert!(app.chat_ui.retiring.is_empty());
                 match outcome {
                     "none" => {
-                        assert!(runtime.account_switch_checking, "fresh idle wake schedules one new read");
+                        assert!(
+                            runtime.account_switch_checking,
+                            "fresh idle wake schedules one new read"
+                        );
                         assert!(!runtime.account_switch_recheck);
                         assert_eq!(runtime.account_switch_checked_observation, Some(2));
                         // No newer semantic idle observation: a second busy
                         // response must quiesce instead of spinning.
-                        drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
+                        drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+                            target,
+                            alternate.clone(),
+                            Ok(None),
+                        )));
                         assert!(!current(&app, card).account_switch_checking);
                         assert!(!current(&app, card).account_switch_recheck);
                     }
@@ -12374,7 +12399,10 @@ mod tests {
                         assert!(runtime.pending_account_switch.is_none());
                     }
                     "no-wake" => assert!(!runtime.account_switch_checking),
-                    "stale" => assert!(runtime.account_switch_checking, "stale result cannot consume the current request"),
+                    "stale" => assert!(
+                        runtime.account_switch_checking,
+                        "stale result cannot consume the current request"
+                    ),
                     _ => unreachable!(),
                 }
             }
@@ -12384,11 +12412,18 @@ mod tests {
     #[test]
     fn hidden_account_switch_keeps_a_real_activity_frame_before_the_old_busy_reply() {
         use crate::agent::ActivityState;
-        use crate::terminal_ipc::{ClientEnvelope, ClientRequest, FrameCodec, ServerEnvelope, ServerMessage, ServerResponse, PROTOCOL_VERSION};
+        use crate::terminal_ipc::{
+            ClientEnvelope, ClientRequest, FrameCodec, PROTOCOL_VERSION, ServerEnvelope,
+            ServerMessage, ServerResponse,
+        };
         use std::{os::unix::net::UnixStream, sync::mpsc, thread, time::Duration};
         for (completed, mode) in [
-            (false, "hidden"), (false, "parked"), (false, "starting"),
-            (true, "hidden"), (true, "parked"), (true, "starting"),
+            (false, "hidden"),
+            (false, "parked"),
+            (false, "starting"),
+            (true, "hidden"),
+            (true, "parked"),
+            (true, "starting"),
         ] {
             let parked = mode == "parked";
             let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -12402,8 +12437,11 @@ mod tests {
             initial.busy = true;
             initial.ready = true;
             initial.items = vec![Arc::new(chat::Item {
-                id: "hidden-account-history".into(), role: chat::Role::Assistant,
-                content: text("Original hidden history"), started_at: None, at: None,
+                id: "hidden-account-history".into(),
+                role: chat::Role::Assistant,
+                content: text("Original hidden history"),
+                started_at: None,
+                at: None,
             })];
             assert!(initial.transcript_bytes() > 0);
             let attached_snapshot = initial.clone();
@@ -12411,33 +12449,81 @@ mod tests {
             let (emit_tx, emit_rx) = mpsc::channel::<(ActivityState, u64)>();
             let (done_tx, done_rx) = mpsc::channel();
             let worker = thread::spawn(move || {
-                server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let mut codec = FrameCodec::new(crate::terminal_ipc::MAX_FRAME_BYTES);
                 let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
                 assert!(matches!(connect.request, ClientRequest::Connect { .. }));
-                codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION,
-                    request_id: Some(connect.request_id), proof: proof.clone(),
-                    message: ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: Vec::new() } } }).unwrap();
+                codec
+                    .write(
+                        &mut server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(connect.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof: proof.clone(),
+                                    resumed: Vec::new(),
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
                 let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-                let ClientRequest::ChatStart { mut session, .. } = start.request else { panic!("native start") };
+                let ClientRequest::ChatStart { mut session, .. } = start.request else {
+                    panic!("native start")
+                };
                 session.proof = Some(proof.clone());
                 let chat_id = session.id;
-                codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION,
-                    request_id: Some(start.request_id), proof: proof.clone(),
-                    message: ServerMessage::Response { response: ServerResponse::ChatAttached {
-                        session, snapshot: attached_snapshot, account_home: None } } }).unwrap();
+                codec
+                    .write(
+                        &mut server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(start.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::ChatAttached {
+                                    session,
+                                    snapshot: attached_snapshot,
+                                    account_home: None,
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
                 for _ in 0..(if completed { 4 } else { 3 }) {
                     let (state, generation) = emit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(),
-                        message: ServerMessage::ChatActivity { chat_id, state, generation } }).unwrap();
+                    codec
+                        .write(
+                            &mut server,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: None,
+                                proof: proof.clone(),
+                                message: ServerMessage::ChatActivity {
+                                    chat_id,
+                                    state,
+                                    generation,
+                                },
+                            },
+                        )
+                        .unwrap();
                 }
                 done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             });
             let (wake_tx, wake_rx) = mpsc::channel();
-            let handle = Arc::new(ClientHandle::fixture_stream(client, source.clone(), move |wake| {
-                let _ = wake_tx.send(wake);
-            }).unwrap());
+            let handle = Arc::new(
+                ClientHandle::fixture_stream(client, source.clone(), move |wake| {
+                    let _ = wake_tx.send(wake);
+                })
+                .unwrap(),
+            );
             let runtime = app.chat_runtime_mut(target).unwrap();
             runtime.connection = Connection::Live(handle.clone());
             runtime.snapshot = Arc::new(initial);
@@ -12447,14 +12533,24 @@ mod tests {
             drop(app.probe_queued_account_switch(target));
             assert!(chat_runtime(&app, card).account_switch_checking);
             if parked {
-                let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else { panic!("chat") };
+                let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+                    panic!("chat")
+                };
                 app.chat_ui.parked.insert(card, runtime);
             }
             if mode == "starting" {
-                app.chat_ui.phases.insert(card, Phase::Starting(Attempt {
-                    target: Target { generation: target.generation.wrapping_add(1), ..target },
-                    session: source.clone(), recovery: None, upgrade_committed: false,
-                }));
+                app.chat_ui.phases.insert(
+                    card,
+                    Phase::Starting(Attempt {
+                        target: Target {
+                            generation: target.generation.wrapping_add(1),
+                            ..target
+                        },
+                        session: source.clone(),
+                        recovery: None,
+                        upgrade_committed: false,
+                    }),
+                );
             }
             // A parked surface must consume this earlier coalesced edge;
             // otherwise the subsequent Idle frame cannot wake it at all.
@@ -12472,14 +12568,24 @@ mod tests {
             emit_tx.send((ActivityState::Idle, 3)).unwrap();
             let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(matches!(wake, Wake::Activity));
-            assert!(handle.snapshot().busy, "hidden activity never refreshed the old body snapshot");
+            assert!(
+                handle.snapshot().busy,
+                "hidden activity never refreshed the old body snapshot"
+            );
             assert_eq!(handle.snapshot().generation, 1);
             assert_eq!(handle.snapshot().transcript_bytes(), 0);
             assert_eq!(handle.account_switch_readiness_observation(), Some(3));
             drop(app.handle_chat_ui(Action::Wake(target, wake)));
-            drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
+            drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+                target,
+                alternate.clone(),
+                Ok(None),
+            )));
             let runtime = app.chat_runtime_mut(target).unwrap();
-            assert!(runtime.account_switch_checking, "one newer hidden idle edge schedules one new read");
+            assert!(
+                runtime.account_switch_checking,
+                "one newer hidden idle edge schedules one new read"
+            );
             assert!(!runtime.account_switch_recheck);
             assert_eq!(runtime.account_switch_checked_observation, Some(3));
             assert_eq!(runtime.session, source);
@@ -12491,13 +12597,21 @@ mod tests {
             // remaining Idle, or end and report Unknown. Either newer small
             // observation must survive an older still-unready query, including
             // while parked. Neither observation authorizes an account switch.
-            let next = if completed { ActivityState::Unknown } else { ActivityState::Idle };
+            let next = if completed {
+                ActivityState::Unknown
+            } else {
+                ActivityState::Idle
+            };
             emit_tx.send((next, 4)).unwrap();
             let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(matches!(wake, Wake::Activity));
             drop(app.handle_chat_ui(Action::Wake(target, wake)));
             assert!(app.chat_runtime_mut(target).unwrap().account_switch_recheck);
-            drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
+            drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+                target,
+                alternate.clone(),
+                Ok(None),
+            )));
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert!(runtime.account_switch_checking);
             assert_eq!(runtime.account_switch_checked_observation, Some(4));
@@ -12510,11 +12624,24 @@ mod tests {
                 assert!(matches!(wake, Wake::Activity));
                 drop(app.handle_chat_ui(Action::Wake(target, wake)));
                 assert!(app.chat_runtime_mut(target).unwrap().account_switch_recheck);
-                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
-                assert_eq!(app.chat_runtime_mut(target).unwrap().account_switch_checked_observation, Some(5));
+                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+                    target,
+                    alternate.clone(),
+                    Ok(None),
+                )));
+                assert_eq!(
+                    app.chat_runtime_mut(target)
+                        .unwrap()
+                        .account_switch_checked_observation,
+                    Some(5)
+                );
                 // The completed source's actual RPC can refuse ownership;
                 // Unknown itself never becomes a fabricated idle generation.
-                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate, Err("Completed source requires explicit continuation".into()))));
+                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+                    target,
+                    alternate,
+                    Err("Completed source requires explicit continuation".into()),
+                )));
                 let runtime = app.chat_runtime_mut(target).unwrap();
                 assert!(runtime.pending_account_switch.is_none());
                 assert!(runtime.account_switch_fallback.is_some());
@@ -12522,9 +12649,17 @@ mod tests {
                 assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
             } else {
                 // Without another activity edge, a further None must not spin.
-                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate, Ok(None))));
+                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+                    target,
+                    alternate,
+                    Ok(None),
+                )));
             }
-            assert!(!app.chat_runtime_mut(target).unwrap().account_switch_checking);
+            assert!(
+                !app.chat_runtime_mut(target)
+                    .unwrap()
+                    .account_switch_checking
+            );
             assert!(app.chat_ui.retiring.is_empty());
             assert!(handle.snapshot().busy);
             assert_eq!(handle.snapshot().generation, 1);
@@ -12535,7 +12670,10 @@ mod tests {
 
     #[test]
     fn disconnected_account_wait_uses_real_eof_and_ignores_late_query_replies() {
-        use crate::terminal_ipc::{ClientEnvelope, ClientRequest, FrameCodec, ServerEnvelope, ServerMessage, ServerResponse, PROTOCOL_VERSION};
+        use crate::terminal_ipc::{
+            ClientEnvelope, ClientRequest, FrameCodec, PROTOCOL_VERSION, ServerEnvelope,
+            ServerMessage, ServerResponse,
+        };
         use std::{os::unix::net::UnixStream, sync::mpsc, thread, time::Duration};
         for parked in [false, true] {
             for late_ready in [false, true] {
@@ -12553,47 +12691,98 @@ mod tests {
                     let (client, mut server) = UnixStream::pair().unwrap();
                     let (close_tx, close_rx) = mpsc::channel();
                     let worker = thread::spawn(move || {
-                        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                        server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                        server
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        server
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
                         let mut codec = FrameCodec::new(crate::terminal_ipc::MAX_FRAME_BYTES);
                         let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
                         assert!(matches!(connect.request, ClientRequest::Connect { .. }));
-                        codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION,
-                            request_id: Some(connect.request_id), proof: proof.clone(),
-                            message: ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: Vec::new() } } }).unwrap();
+                        codec
+                            .write(
+                                &mut server,
+                                &ServerEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id: Some(connect.request_id),
+                                    proof: proof.clone(),
+                                    message: ServerMessage::Response {
+                                        response: ServerResponse::Connected {
+                                            proof: proof.clone(),
+                                            resumed: Vec::new(),
+                                        },
+                                    },
+                                },
+                            )
+                            .unwrap();
                         let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-                        let ClientRequest::ChatStart { mut session, .. } = start.request else { panic!("native start") };
+                        let ClientRequest::ChatStart { mut session, .. } = start.request else {
+                            panic!("native start")
+                        };
                         session.proof = Some(proof.clone());
-                        codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION,
-                            request_id: Some(start.request_id), proof: proof.clone(),
-                            message: ServerMessage::Response { response: ServerResponse::ChatAttached {
-                                session, snapshot: attached, account_home: None } } }).unwrap();
+                        codec
+                            .write(
+                                &mut server,
+                                &ServerEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id: Some(start.request_id),
+                                    proof: proof.clone(),
+                                    message: ServerMessage::Response {
+                                        response: ServerResponse::ChatAttached {
+                                            session,
+                                            snapshot: attached,
+                                            account_home: None,
+                                        },
+                                    },
+                                },
+                            )
+                            .unwrap();
                         close_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                         server.shutdown(std::net::Shutdown::Both).unwrap();
                     });
                     let (wake_tx, wake_rx) = mpsc::channel();
-                    let handle = Arc::new(ClientHandle::fixture_stream(client, source.clone(), move |wake| {
-                        let _ = wake_tx.send(wake);
-                    }).unwrap());
+                    let handle = Arc::new(
+                        ClientHandle::fixture_stream(client, source.clone(), move |wake| {
+                            let _ = wake_tx.send(wake);
+                        })
+                        .unwrap(),
+                    );
                     let runtime = app.chat_runtime_mut(target).unwrap();
                     runtime.connection = Connection::Live(handle.clone());
                     runtime.snapshot = Arc::new(snapshot);
-                    runtime.replace_draft(text_editor::Content::with_text("Preserve disconnected request"));
+                    runtime.replace_draft(text_editor::Content::with_text(
+                        "Preserve disconnected request",
+                    ));
                     runtime.set_visible(false).unwrap();
                     drop(app.choose_chat_account(target, alternate.clone()));
                     drop(app.probe_queued_account_switch(target));
-                    assert!(app.chat_runtime_mut(target).unwrap().account_switch_checking);
+                    assert!(
+                        app.chat_runtime_mut(target)
+                            .unwrap()
+                            .account_switch_checking
+                    );
                     if parked {
-                        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else { panic!("chat") };
+                        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+                            panic!("chat")
+                        };
                         app.chat_ui.parked.insert(card, runtime);
                     }
                     close_tx.send(()).unwrap();
                     let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    let Wake::Disconnected(error) = wake else { panic!("actual EOF wake") };
+                    let Wake::Disconnected(error) = wake else {
+                        panic!("actual EOF wake")
+                    };
                     worker.join().unwrap();
                     if stale_wake {
-                        let stale = Target { generation: target.generation.wrapping_add(1), ..target };
-                        drop(app.handle_chat_ui(Action::Wake(stale, Wake::Disconnected(error.clone()))));
+                        let stale = Target {
+                            generation: target.generation.wrapping_add(1),
+                            ..target
+                        };
+                        drop(app.handle_chat_ui(Action::Wake(
+                            stale,
+                            Wake::Disconnected(error.clone()),
+                        )));
                         let runtime = app.chat_runtime_mut(target).unwrap();
                         assert!(runtime.pending_account_switch.is_some());
                         assert!(runtime.account_switch_checking);
@@ -12602,7 +12791,11 @@ mod tests {
                     drop(app.handle_chat_ui(Action::Wake(target, Wake::Disconnected(error))));
                     // A delayed old query, including an old positive idle
                     // generation, cannot recreate an intent or retire source.
-                    drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(late_ready.then_some(2)))));
+                    drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+                        target,
+                        alternate.clone(),
+                        Ok(late_ready.then_some(2)),
+                    )));
                     let runtime = app.chat_runtime_mut(target).unwrap();
                     assert!(runtime.disconnected);
                     assert!(runtime.pending_account_switch.is_none());
@@ -12620,7 +12813,12 @@ mod tests {
                     // A new picker selection on the already disconnected,
                     // stale-busy source must not recreate the waiting chip.
                     drop(app.choose_chat_account(target, alternate.clone()));
-                    assert!(app.chat_runtime_mut(target).unwrap().pending_account_switch.is_none());
+                    assert!(
+                        app.chat_runtime_mut(target)
+                            .unwrap()
+                            .pending_account_switch
+                            .is_none()
+                    );
                     if parked {
                         let runtime = app.chat_ui.parked.remove(&card).unwrap();
                         app.cards.insert(card, CardRuntime::Chat(runtime));
@@ -12631,7 +12829,10 @@ mod tests {
                     assert_ne!(added, card);
                     assert_ne!(chat_runtime(&app, added).session.id, source.id);
                     assert_eq!(chat_runtime(&app, card).session, source);
-                    assert!(Arc::ptr_eq(chat_runtime(&app, card).handle().unwrap(), &handle));
+                    assert!(Arc::ptr_eq(
+                        chat_runtime(&app, card).handle().unwrap(),
+                        &handle
+                    ));
                     assert!(app.chat_ui.retiring.is_empty());
                 }
             }

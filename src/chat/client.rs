@@ -623,7 +623,16 @@ impl ClientHandle {
         session: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
-        Self::connect_on(stream, session, Intent::Start, None, false, None, None, wake)
+        Self::connect_on(
+            stream,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            wake,
+        )
     }
 
     /// Models trusted attachment metadata before binding any cached reader.
@@ -1572,14 +1581,27 @@ impl ClientHandle {
     /// Borrow only control metadata, without retaining/hydrating transcript.
     pub(crate) fn account_switch_readiness_observation(&self) -> Option<u64> {
         let (generation, idle) = {
-            let snapshot = self.inner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
-            (snapshot.generation, (snapshot.ready || snapshot.exited)
-                && !snapshot.busy && !snapshot.waiting
-                && snapshot.requests.is_empty() && snapshot.queued_messages.is_empty())
+            let snapshot = self
+                .inner
+                .snapshot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            (
+                snapshot.generation,
+                (snapshot.ready || snapshot.exited)
+                    && !snapshot.busy
+                    && !snapshot.waiting
+                    && snapshot.requests.is_empty()
+                    && snapshot.queued_messages.is_empty(),
+            )
         };
         // Hidden subscriptions receive activity metadata without a new body
         // publication. Do not consume its pending edge or hydrate snapshot.
-        let activity = self.inner.activity.lock().unwrap_or_else(|p| p.into_inner());
+        let activity = self
+            .inner
+            .activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if activity.generation > generation && activity.state == ActivityState::Unknown {
             // An ended or unavailable actor can publish Unknown while its
             // hidden body remains busy. This newer metadata only schedules

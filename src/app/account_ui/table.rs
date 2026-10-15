@@ -1402,7 +1402,11 @@ mod tests {
                 &renderer,
                 &Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 4000.0)),
             );
-            assert!(node.size().height >= minimum, "minimum={minimum}, actual={:?}", node.size());
+            assert!(
+                node.size().height >= minimum,
+                "minimum={minimum}, actual={:?}",
+                node.size()
+            );
         }
         let reason = "A visible account failure reason must wrap without clipping. ".repeat(12);
         let mut element = line(
