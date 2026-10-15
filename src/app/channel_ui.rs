@@ -264,6 +264,15 @@ impl State {
 }
 
 impl Cagents {
+    /// Utility panes and closed chats do not own the channel conversation name.
+    pub(super) fn channel_primary_chat(&self, channel: &ProjectChannel) -> Option<CardId> {
+        channel.cards.iter().copied().find(|id| {
+            self.card_state(*id).is_some_and(|card| {
+                card.existence.is_open() && matches!(card.kind, CardKind::Chat(_))
+            })
+        })
+    }
+
     fn open_channel_with_default(&mut self, id: ChannelId) -> Task<Message> {
         let scope = self.select_channel(id);
         if self.durable.active_channel != Some(id) {
