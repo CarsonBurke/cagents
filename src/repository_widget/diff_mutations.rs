@@ -203,6 +203,21 @@ impl RepositoryRuntime {
         runtime
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn selected_diff_fixture_from_source(
+        card: CardId,
+        descriptor: RepositoryView,
+        source: crate::repository::GitReadSource,
+    ) -> Self {
+        let mut runtime = tests::selected_mutation_fixture_from_source(card, descriptor, source);
+        runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(
+            runtime.diff_mode,
+            crate::diff_interaction::Side::New,
+            0,
+        ));
+        runtime
+    }
+
     #[cfg(test)]
     pub(crate) fn selected_diff_fixture_at(card: CardId, worktree: &Path) -> Self {
         let mut runtime = Self::selected_diff_fixture(card);
@@ -1104,10 +1119,24 @@ mod tests {
         assert!(!runtime.is_dirty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn partial_change_patch_targets_the_followed_file_while_identity_stays_on_the_selected_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        crate::repository::read_source::tests::git(root, &["init", "-b", "main"]);
+        std::fs::write(root.join("target.sh"), "old\n").unwrap();
+        std::os::unix::fs::symlink("target.sh", root.join("new.sh")).unwrap();
+        crate::repository::read_source::tests::git(root, &["add", "target.sh", "new.sh"]);
+        std::fs::write(root.join("target.sh"), "new\n").unwrap();
+        let source = crate::repository::GitReadSource::new(
+            crate::model::OperationId::new(),
+            crate::repository::WorktreeAuthority::capture(root).unwrap(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
         let card = CardId::new();
-        let (mut runtime, identity) = added_file_runtime(card, Path::new("/repo"), "new\n");
+        let (mut runtime, _) = added_file_runtime(card, root, "new\n");
+        runtime.git_read_source = Some(source.clone());
         let DocumentState::Editable(document) = &mut runtime.document else {
             unreachable!();
         };
@@ -1120,12 +1149,18 @@ mod tests {
             unstaged: true,
             ..RepositoryFile::default()
         });
+        let content = crate::diff_view::load_repository_diff_with_read_source(
+            root, Path::new("target.sh"), &DiffBasis::IndexToWorktree, None,
+            crate::settings::EditorSyntaxTheme::default(), false, Font::MONOSPACE,
+            &CancellationToken::default(), Some(&source),
+        );
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content));
         runtime.working_diff.applied = runtime.wanted_working_diff();
         runtime.working_diff.desired = runtime.wanted_working_diff();
+        let identity = runtime.current_identity(card, "new.sh".into());
         let request = runtime.diff_mutation_request(card, 0..1).unwrap();
-        let capture = runtime
-            .capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request))
-            .unwrap();
+        let capture = runtime.capture_diff_mutation(card, git_patch::Kind::Stage, Some(&request)).unwrap();
+        assert!(capture.git_read_receipt().unwrap().matches_source(&source));
         assert_eq!(capture.identity, identity);
         assert_eq!(capture.new_path.as_path(), Path::new("target.sh"));
         assert_eq!(capture.old_path.as_path(), Path::new("target.sh"));
@@ -1224,6 +1259,32 @@ mod tests {
                 new_label: "Working tree".into(),
             }
         };
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content));
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        runtime.working_diff.desired = runtime.wanted_working_diff();
+        runtime.working_diff.applied_rich = true;
+        runtime.working_diff.desired_rich = true;
+        runtime
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn selected_mutation_fixture_from_source(
+        card: CardId,
+        descriptor: RepositoryView,
+        source: crate::repository::GitReadSource,
+    ) -> RepositoryRuntime {
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.txt", "changed\nkeep\n");
+        // Install the original owner before any read, never over an already
+        // qualified model from a different temporary repository.
+        runtime.descriptor = descriptor;
+        runtime.git_read_source = Some(source);
+        runtime.source_surface = SourceSurface::Diff;
+        let content = crate::diff_view::load_repository_diff_with_read_source(
+            &runtime.descriptor.worktree, Path::new("file.txt"), &DiffBasis::IndexToWorktree, None,
+            crate::settings::EditorSyntaxTheme::default(), false, Font::MONOSPACE,
+            &CancellationToken::default(), runtime.git_read_source(),
+        );
+        assert!(matches!(&content, RenderedDiff::Text { model, .. } if model.git_read_receipt().is_some()));
         runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content));
         runtime.working_diff.applied = runtime.wanted_working_diff();
         runtime.working_diff.desired = runtime.wanted_working_diff();
