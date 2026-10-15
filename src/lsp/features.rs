@@ -372,6 +372,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn command_acknowledgement_survives_its_own_workspace_edit(){
+        let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
+        store.register(LspDocumentId(1),&uri,&key,2,Arc::from("fixed"));
+        let request=PendingRequest{id:LspRequestId(9),doc:LspDocumentId(1),uri,worktree:Arc::from(Path::new("/repo")),kind:RequestKind::ExecuteCommand,position:lsp_types::Position::default(),version:1,args:RequestArgs::None,timeout:Duration::from_secs(15),observed_versions:HashMap::new()};
+        assert!(matches!(convert_result(&store,&request,RawResult::Feature(RawFeatureResult::CommandExecuted(None))),LspEvent::CommandExecuted{request:LspRequestId(9),..}));
+    }
+
+    #[test]
     fn informational_notice_flood_does_not_replace_staged_error(){
         let mut pending=PendingInner::default();let doc=LspDocumentId(1);
         pending.stage(LspEvent::ServerMessage{doc,level:LspMessageLevel::Error,message:"workspace failed".into()});

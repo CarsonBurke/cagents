@@ -2924,6 +2924,11 @@ impl SessionState {
 // ---------------------------------------------------------------------------
 
 fn convert_result(snapshots: &SnapshotStore, request: &PendingRequest, raw: RawResult) -> LspEvent {
+    // A command may legitimately complete after its server-initiated edit
+    // changed the document. Its acknowledgement carries no coordinates.
+    if matches!(&raw,RawResult::Feature(features::RawFeatureResult::CommandExecuted(_))) {
+        return LspEvent::CommandExecuted {request:request.id,doc:request.doc};
+    }
     let Some(current) = snapshots
         .latest(&request.uri)
         .map(|snapshot| snapshot.version)
