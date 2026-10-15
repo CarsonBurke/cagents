@@ -2300,7 +2300,7 @@ fn process_inner(
             };
             session.launch.session_id = handle.confirmed_session_id();
             let snapshot = handle.snapshot(None).expect("unconditional snapshot");
-            let recipe = session.launch.terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
+            let recipe = session.launch.terminal_recipe_with_current_options(snapshot.selected_model.as_deref(), snapshot.reasoning.as_deref(), snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
                 "Wait for the provider's confirmed exact conversation before returning to terminal",
             ))?;
             if session.launch.provider == Provider::Codex
@@ -2366,7 +2366,7 @@ fn process_inner(
             // shuts down. The final confirmed snapshot wins over launch flags.
             let recipe = session
                 .launch
-                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
+                .terminal_recipe_with_current_options(snapshot.selected_model.as_deref(), snapshot.reasoning.as_deref(), snapshot.permission_mode.as_deref())
                 .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
             terminal.launch = recipe.clone();
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {

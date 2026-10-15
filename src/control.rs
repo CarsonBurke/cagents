@@ -2837,6 +2837,16 @@ pub enum StopReport {
     Failed { error: String },
 }
 
+pub(crate) fn terminal_spawn_recipe(cwd: PathBuf, argv: Vec<String>) -> Result<LaunchRecipe, AppError> {
+    if argv.is_empty() {
+        let mut recipe = LaunchRecipe::shell(cwd).map_err(|error| AppError::new("login_shell", error))?;
+        if let Some(shell) = crate::device::shell() { recipe.program = shell.to_owned(); }
+        Ok(recipe)
+    } else {
+        Ok(LaunchRecipe { unset_environment: Default::default(), program: argv[0].clone(), arguments: argv[1..].to_vec(), working_directory: cwd, environment: BTreeMap::new() })
+    }
+}
+
 fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError> {
     let socket =
         terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
@@ -2872,22 +2882,7 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         TerminalCommand::Spawn { cwd, argv } => {
             let cwd = absolute_working_directory(cwd)
                 .map_err(|error| AppError::new("working_directory", error))?;
-            let recipe = if argv.is_empty() {
-                let mut recipe = LaunchRecipe::shell(cwd)
-                    .map_err(|error| AppError::new("login_shell", error))?;
-                if let Some(shell) = crate::device::shell() {
-                    recipe.program = shell.to_owned();
-                }
-                recipe
-            } else {
-                LaunchRecipe {
-                    unset_environment: Default::default(),
-                    program: argv[0].clone(),
-                    arguments: argv[1..].to_vec(),
-                    working_directory: cwd,
-                    environment: BTreeMap::new(),
-                }
-            };
+            let recipe = terminal_spawn_recipe(cwd, argv)?;
             let session = TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,

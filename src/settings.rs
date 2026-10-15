@@ -1,3 +1,5 @@
+pub mod agents;
+pub use agents::AgentLaunchSettings;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
@@ -795,6 +797,10 @@ pub struct AppSettings {
     pub schema_version: u32,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
+    #[serde(default)]
+    pub agents: std::collections::BTreeMap<String, AgentLaunchSettings>,
+    #[serde(default)]
+    pub default_shell: Option<String>,
     #[serde(default = "default_focus_follows_mouse")]
     pub focus_follows_mouse: bool,
     #[serde(default)]
@@ -931,6 +937,8 @@ impl Default for AppSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
+            agents: Default::default(),
+            default_shell: None,
             focus_follows_mouse: default_focus_follows_mouse(),
             app_theme: AppTheme::default(),
             terminal_scroll_speed: default_terminal_scroll_speed(),
@@ -1587,6 +1595,12 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        if self.default_shell.as_deref().is_some_and(|path| !agents::executable_available(path)) { return Err(SettingsError::AgentLaunch("Default shell must be an absolute path to an executable file.".into())); }
+        for (key, configuration) in &self.agents {
+            if let Some(provider) = crate::agent::Provider::ALL.into_iter().find(|provider| agents::provider_key(*provider) == key) {
+                configuration.validate(provider).map_err(SettingsError::AgentLaunch)?;
+            }
+        }
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -1825,6 +1839,8 @@ fn is_relative_marker(marker: &str) -> bool {
 
 #[derive(Debug, Error)]
 pub enum SettingsError {
+    #[error("{0}")]
+    AgentLaunch(String),
     #[error("cagents configuration directory is unavailable")]
     DirectoryUnavailable,
     #[error("failed to access settings: {0}")]
@@ -2353,6 +2369,21 @@ fn invalid_setting(
     defaults: &toml::Value,
     error: &SettingsError,
 ) -> Option<Vec<Segment>> {
+    // Optional shell paths have no serialized default. Preserve an invalid
+    // saved value as foreign data while allowing the remaining settings to load.
+    if matches!(error, SettingsError::AgentLaunch(_))
+        && read.get("default_shell").and_then(toml::Value::as_str).is_some_and(|path| !agents::executable_available(path))
+    {
+        return Some(vec![Segment::Key("default_shell".into())]);
+    }
+    if matches!(error, SettingsError::AgentLaunch(_)) {
+        for provider in crate::agent::Provider::ALL {
+            let key = agents::provider_key(provider);
+            if read.get("agents").and_then(|agents| agents.get(key)).cloned().and_then(|entry| entry.try_into::<AgentLaunchSettings>().ok()).is_some_and(|configuration| configuration.validate(provider).is_err()) {
+                return Some(vec![Segment::Key("agents".into()), Segment::Key(key.into())]);
+            }
+        }
+    }
     let failure = error.to_string();
     read.as_table()?
         .keys()
