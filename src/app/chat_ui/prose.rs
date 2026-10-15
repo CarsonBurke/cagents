@@ -1108,6 +1108,15 @@ fn code_line(
     find: Option<Arc<str>>,
     logical: Option<selectable_prose::Logical>,
 ) -> Element<'static, Message> {
+    // The pinned shaping API has no context-aware horizontal range layout.
+    // Preserve physical-line Bidi, joining, clusters and tab origin rather
+    // than independently shaping a complex run at artificial boundaries.
+    // These lines remain an explicit performance qualification requirement.
+    if !text[range.clone()].is_ascii() || text[range.clone()].contains('\t') {
+        let styled = if spans.is_empty() { vec![Span::new(text[range.clone()].to_owned())].into() }
+            else { sliced_spans(&spans, &starts, range) };
+        return leaf_text(styled, size, font, target, find.as_deref(), logical);
+    }
     let pieces = if range.len() <= 2048 {
         vec![0..range.len()]
     } else {
@@ -1175,6 +1184,7 @@ fn code_line(
             row
         })
         .collect();
+
     virtualized::row(chunks, size.0 * 1.3, Default::default())
 }
 
@@ -1254,15 +1264,8 @@ fn paragraph(
     find: Option<&str>,
     logical: Option<selectable_prose::Logical>,
 ) -> Element<'static, Message> {
-    if text.len() <= 2048 {
-        return leaf_text(
-            text.spans(settings.style),
-            settings.text_size,
-            settings.style.font,
-            target,
-            find,
-            logical,
-        );
+    if text.len() <= 2048 || !text.plain().is_ascii() || text.plain().contains('\t') {
+        return leaf_text(text.spans(settings.style), settings.text_size, settings.style.font, target, find, logical);
     }
     let plain = text.plain();
     let text = Arc::new(text.clone());
@@ -1523,6 +1526,8 @@ mod tests {
             "a".repeat(6000),
             format!("{}e\u{301}{}", "a".repeat(2047), "z".repeat(4000)),
             format!("{}👩‍💻{}", "a".repeat(2047), "z".repeat(4000)),
+            format!("{}\t{}", "a".repeat(2047), "z".repeat(4000)),
+            format!("{}العربية עברית{}", "a".repeat(2047), "z".repeat(4000)),
             "line\n".repeat(1000),
             "first\n\nthird\n".repeat(400),
             "first\r\nsecond\r\n".repeat(400),
