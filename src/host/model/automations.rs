@@ -515,6 +515,7 @@ impl Registry {
     pub(super) fn automation_dispatch_allowed_in(
         tx: &Transaction<'_>,
         accepted: &crate::agent_execution::Accepted,
+        current_agent: &crate::agent_execution::Agent,
         now_ms: u64,
     ) -> Result<bool, String> {
         let crate::agent_execution::Origin::Automation { id } = &accepted.agent.origin else {
@@ -562,8 +563,8 @@ impl Registry {
                 params![run.id.to_string(), run.revision, encode(&run)?],
             )
             .map_err(|error| error.to_string())?;
-            if accepted.agent.session.is_none() {
-                let mut agent = accepted.agent.clone();
+            if current_agent.session.is_none() {
+                let mut agent = current_agent.clone();
                 agent.closed = true;
                 tx.execute(
                     "UPDATE agents SET closed=1,record=?2 WHERE id=?1",
@@ -2207,6 +2208,26 @@ mod tests {
             )
             .unwrap();
         let accepted = claim.accepted.unwrap();
+        // Placement may advance after acceptance; cancellation must preserve
+        // the current record rather than copying the acceptance snapshot back.
+        let destination = crate::model::ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: destination,
+                repository: accepted.agent.spec.target.repository.clone(),
+                title: "moved".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let mut current = registry.agent(accepted.agent.id).unwrap();
+        current.placement = crate::agent_execution::Placement::Channel(destination);
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![current.id.to_string(), encode(&current).unwrap()],
+            )
+            .unwrap();
         registry
             .set_automation_enabled(automation.id, 1, None, false, 201)
             .unwrap();
@@ -2216,6 +2237,10 @@ mod tests {
             crate::agent_execution::State::Cancelled
         );
         assert!(registry.agent(accepted.agent.id).unwrap().closed);
+        assert_eq!(
+            registry.agent(accepted.agent.id).unwrap().placement,
+            current.placement
+        );
         assert!(
             registry
                 .automation(automation.id)

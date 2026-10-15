@@ -755,7 +755,9 @@ mod tests {
     fn transfer_commits_agent_placement_with_pane_ownership_and_preserves_the_live_session() {
         use crate::{
             agent::Provider,
-            agent_execution::{Destination, HostedSession, Origin, Spec, Submit, Surface, Target},
+            agent_execution::{
+                Destination, HostedSession, Origin, Spec, State, Submit, Surface, Target, Update,
+            },
         };
         for native_chat in [false, true] {
             let (mut r, dir, a, b) = setup();
@@ -819,6 +821,38 @@ mod tests {
                 HostedSession::Terminal(terminal)
             };
             let original = r.bind_agent(accepted.agent.id, None, live.clone()).unwrap();
+            let started = r
+                .update_agent_run(
+                    accepted.run.id,
+                    accepted.run.revision,
+                    Update::Started {
+                        provider_key: "initial-turn".into(),
+                    },
+                    2,
+                )
+                .unwrap();
+            r.update_agent_run(
+                started.id,
+                started.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: Default::default(),
+                },
+                3,
+            )
+            .unwrap();
+            let followup = r
+                .submit_agent(
+                    &Origin::User,
+                    &Submit {
+                        name: None,
+                        destination: Destination::Existing(original.id),
+                        prompt: "Continue working".into(),
+                        idempotency_key: "followup".into(),
+                    },
+                    4,
+                )
+                .unwrap();
             let kind = match &live {
                 HostedSession::Chat(session) => CardKind::Chat(session.clone()),
                 HostedSession::Terminal(session) => CardKind::Terminal(session.clone()),
@@ -863,13 +897,37 @@ mod tests {
                 "move must not rewrite the accepted launch request"
             );
             assert_eq!(owner(&r.db, p.id).unwrap(), Some(Scope::Channel(b)));
-            assert_eq!(read(&r.db, &Scope::Channel(b)).unwrap().panes, vec![p]);
+            assert_eq!(
+                read(&r.db, &Scope::Channel(b)).unwrap().panes,
+                vec![p.clone()]
+            );
             assert!(read(&r.db, &Scope::Channel(a)).unwrap().panes.is_empty());
             assert!(!r.apply(&transfer).unwrap().changed);
-            let replay = r.submit_agent(&Origin::User, &request, 2).unwrap();
+            r.validate_agent_dispatch(&followup).unwrap();
+            assert!(r.claim_agent_dispatch(&followup, 5).unwrap());
+            assert!(!r.claim_agent_dispatch(&followup, 6).unwrap());
+            let back = edit(
+                &mut r,
+                b,
+                Change::Transfer {
+                    id: p.id,
+                    destination: Scope::Channel(a),
+                    before: None,
+                },
+            );
+            r.apply(&back).unwrap();
+            r.validate_agent_dispatch(&followup).unwrap();
+            let mut replaced = followup.clone();
+            replaced.agent.session = None;
+            assert!(
+                r.validate_agent_dispatch(&replaced).is_err(),
+                "only placement may differ from the accepted execution"
+            );
+            assert!(r.claim_agent_dispatch(&replaced, 7).is_err());
+            let replay = r.submit_agent(&Origin::User, &request, 8).unwrap();
             assert!(!replay.created);
             assert_eq!(replay.run.id, accepted.run.id);
-            assert_eq!(replay.agent.placement, Scope::Channel(b));
+            assert_eq!(replay.agent.placement, Scope::Channel(a));
         }
     }
 }
