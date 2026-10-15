@@ -328,7 +328,9 @@ mod tests {
             let selected = selected_content(&model,&after,mode,start..end,false).unwrap();
             assert_eq!(selected,before.replace("    line 20\n","\tchanged 20\n"));
             let undo = selected_content(&model,&after,mode,start..end,true).unwrap();
-            let expected = after.replace("changed 20\n","line 20\n");
+            // The selected row returns to its exact old bytes; ignored
+            // whitespace outside that selected hunk stays on the new side.
+            let expected = after.replace("\tchanged 20\n","    line 20\n");
             assert_eq!(undo,expected);
             let temp = tempfile::tempdir().unwrap();
             git(temp.path(),&["init","-q"],None);
