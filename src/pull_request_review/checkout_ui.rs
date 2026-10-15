@@ -247,6 +247,7 @@ impl State {
             } else {
                 match plan.disposition() {
                     PrCheckoutDisposition::OpenPreservingLocal => "Keep existing local work",
+                    PrCheckoutDisposition::RepairTrackingPreservingLocal => "Configure upstream and open local work",
                     PrCheckoutDisposition::AlreadyCurrent => "Verify existing checkout",
                     PrCheckoutDisposition::FastForward => "Update checkout",
                     PrCheckoutDisposition::RepairTracking => "Set PR upstream",
@@ -501,6 +502,15 @@ mod tests {
 
     #[test]
     fn preserving_ahead_and_dirty_local_work_requires_confirmation_and_a_matching_typed_receipt() {
+        preserve_ahead_and_dirty_local_work(false);
+    }
+
+    #[test]
+    fn configuring_missing_upstream_while_preserving_local_work_requires_explicit_confirmation() {
+        preserve_ahead_and_dirty_local_work(true);
+    }
+
+    fn preserve_ahead_and_dirty_local_work(repair_tracking: bool) {
         let directory = tempfile::tempdir().unwrap();
         let repository = directory.path().join("repository");
         let remote = directory.path().join("remote.git");
@@ -517,6 +527,9 @@ mod tests {
         git(&repository, &["remote", "add", "origin", url]);
         git(&repository, &["config", &format!("url.{}.insteadOf", remote.display()), url]);
         git(&repository, &["push", "--set-upstream", "origin", "feature"]);
+        if repair_tracking {
+            git(&repository, &["config", "--remove-section", "branch.feature"]);
+        }
         std::fs::write(repository.join("README"), "A committed local fix\n").unwrap();
         git(&repository, &["add", "README"]);
         git(&repository, &["commit", "-m", "Unpublished local fix"]);
@@ -525,6 +538,7 @@ mod tests {
         git(&repository, &["add", "README"]);
         std::fs::write(repository.join("README"), "Unstaged local work\n").unwrap();
         let config = std::fs::read(repository.join(".git/config")).unwrap();
+        let config_values = git(&repository, &["config", "--local", "--list"]);
         let index = std::fs::read(repository.join(".git/index")).unwrap();
         let key = GitHubRepoKey::new("fixture.invalid", None, "owner", "repo").unwrap();
         let request = ExistingPrCheckoutRequest {
@@ -537,7 +551,8 @@ mod tests {
         let cancel = CancellationToken::new();
         assert!(service.prepare_existing_pr_checkout(&request, &cancel).is_err());
         let plan = checkout::prepare_existing_confirmation(&service, &request, &cancel).unwrap();
-        assert_eq!(plan.disposition(), PrCheckoutDisposition::OpenPreservingLocal);
+        let disposition = if repair_tracking { PrCheckoutDisposition::RepairTrackingPreservingLocal } else { PrCheckoutDisposition::OpenPreservingLocal };
+        assert_eq!(plan.disposition(), disposition);
         assert_eq!(plan.local_head(), &local);
         let target = CheckoutTarget { repository: repository.clone(), number: 7, head: reviewed.clone(),
             pull_request: Some(PullRequestKey::new(key.clone(), 7).unwrap()), head_ref_name: "feature".into() };
@@ -555,6 +570,8 @@ mod tests {
         });
         state.load = LoadState::Ready;
         state.offer_existing_checkout(target.clone(), plan.clone(), plan.notice().into());
+        assert_eq!(std::fs::read(repository.join(".git/config")).unwrap(), config,
+            "offering the explicit upstream repair does not authorize configuration writes");
         drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
         assert!(state.take_effects().is_empty(), "preparing or opening before confirmation grants no navigation");
         let original_pr = Arc::clone(&state.target.as_ref().unwrap().pull_request);
@@ -580,7 +597,7 @@ mod tests {
         drop(state.update(reply));
         let receipt = state.existing_checkout.completed.as_ref().unwrap();
         assert_eq!(receipt.head(), &local);
-        assert_eq!(receipt.disposition(), PrCheckoutDisposition::OpenPreservingLocal);
+        assert_eq!(receipt.disposition(), disposition);
         let mut writer_request = request;
         writer_request.expected_head = local.clone();
         let writer_plan = service.prepare_existing_pr_checkout(&writer_request, &cancel).unwrap();
@@ -596,7 +613,15 @@ mod tests {
         drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
         assert_eq!(state.take_effects(), vec![Effect::OpenCheckout(repository.canonicalize().unwrap())]);
         assert_eq!(git(&repository, &["rev-parse", "HEAD"]), local.as_str());
-        assert_eq!(std::fs::read(repository.join(".git/config")).unwrap(), config);
+        if repair_tracking {
+            assert_eq!(git(&repository, &["config", "--local", "--get", "branch.feature.remote"]), "origin");
+            assert_eq!(git(&repository, &["config", "--local", "--get", "branch.feature.merge"]), "refs/heads/feature");
+            let after = git(&repository, &["config", "--local", "--list"]);
+            let unrelated = after.lines().filter(|line| !line.starts_with("branch.feature.remote=") && !line.starts_with("branch.feature.merge=")).collect::<Vec<_>>().join("\n");
+            assert_eq!(unrelated, config_values);
+        } else {
+            assert_eq!(std::fs::read(repository.join(".git/config")).unwrap(), config);
+        }
         assert_eq!(std::fs::read(repository.join(".git/index")).unwrap(), index);
         assert_eq!(std::fs::read_to_string(repository.join("README")).unwrap(), "Unstaged local work\n");
     }

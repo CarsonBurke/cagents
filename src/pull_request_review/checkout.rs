@@ -56,7 +56,7 @@ pub fn verified_existing_path(
     receipt: &VerifiedPrCheckout,
 ) -> Result<PathBuf, String> {
     let request = plan.request();
-    let expected_local_head = if plan.disposition() == PrCheckoutDisposition::OpenPreservingLocal {
+    let expected_local_head = if matches!(plan.disposition(), PrCheckoutDisposition::OpenPreservingLocal | PrCheckoutDisposition::RepairTrackingPreservingLocal) {
         plan.local_head()
     } else {
         &request.expected_head
@@ -185,7 +185,7 @@ pub fn prepare(
     Ok(prepared)
 }
 
-/// Both alternatives only prepare a confirmation. Opening preserved local work
+/// All alternatives only prepare a confirmation. Opening preserved local work
 /// must remain an explicit decision and still needs a verified worker receipt.
 pub(super) fn prepare_existing_confirmation<E: ProcessExecutor>(
     service: &RepositoryService<E>,
@@ -195,8 +195,12 @@ pub(super) fn prepare_existing_confirmation<E: ProcessExecutor>(
     match service.prepare_existing_pr_checkout(request, cancellation) {
         Ok(plan) => Ok(plan),
         Err(error) if cancellation.is_cancelled() => Err(error.to_string()),
-        Err(error) => service.prepare_existing_pr_checkout_preserving_local(request, cancellation)
-            .map_err(|preserve| format!("{error} Opening the existing checkout without updating it is also unavailable: {preserve}")),
+        Err(error) => match service.prepare_existing_pr_checkout_preserving_local(request, cancellation) {
+            Ok(plan) => Ok(plan),
+            Err(preserve) if cancellation.is_cancelled() => Err(preserve.to_string()),
+            Err(preserve) => service.prepare_existing_pr_checkout_repairing_tracking_and_preserving_local(request, cancellation)
+                .map_err(|repair| format!("{error} Opening without changes is unavailable: {preserve} Configuring only the missing upstream while keeping local work is also unavailable: {repair}")),
+        },
     }
 }
 

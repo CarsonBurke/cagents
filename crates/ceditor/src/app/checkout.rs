@@ -537,6 +537,7 @@ impl Editor {
                 } else {
                     match plan.disposition() {
                         PrCheckoutDisposition::OpenPreservingLocal => "Keep existing local work",
+                        PrCheckoutDisposition::RepairTrackingPreservingLocal => "Configure upstream and open local work",
                         PrCheckoutDisposition::AlreadyCurrent => "Verify existing worktree",
                         PrCheckoutDisposition::FastForward => "Update existing worktree",
                         PrCheckoutDisposition::RepairTracking => "Set PR upstream",
