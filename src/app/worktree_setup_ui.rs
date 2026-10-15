@@ -362,6 +362,8 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(true);
         let path = PathBuf::from("/repo/setup");
         let current = OperationId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(ProjectId::new(), RepositoryId::new(), "repo".into(), "/repo".into(),
+            vec![SidebarWorktree::from_durable(crate::model::WorktreeId::new(), path.clone(), Some("setup".into()))], vec![]));
         let mut old = fresh_terminal_session(LaunchRecipe::shell(path.clone()).unwrap());
         old.launch.environment.insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
         old.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), OperationId::new().to_string());
@@ -378,6 +380,7 @@ mod tests {
         next.kind = CardKind::Terminal(session);
         Arc::make_mut(&mut app.durable).cards.push(next);
         app.refresh_worktree_setup_rows();
+        assert_eq!(app.setup_ui.terminals[&path].0, 100);
         app.recover_worktree_setup(current, path.clone(), SetupIntent { run_id: Some(current), ..Default::default() });
         assert_eq!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Succeeded);
         assert_eq!(app.setup_ui.terminals[&path].1, expected);
