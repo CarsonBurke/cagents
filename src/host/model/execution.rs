@@ -1116,11 +1116,20 @@ impl Registry {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if let Some(pending) = pending
-            && !decode::<HostedSession>(&pending)?.same_process(&session)
-        {
-            return Err("The provider does not match the committed launch intent".into());
-        }
+        let session = if let Some(pending) = pending {
+            let pending: HostedSession = decode(&pending)?;
+            if !pending.same_process(&session) {
+                return Err("The provider does not match the committed launch intent".into());
+            }
+            // The exact owned observer may have advanced the private launch
+            // after ChatAttached was captured. Publish that authenticated row
+            // verbatim; deleting it must not roll thread/pair metadata back to
+            // the caller's older presentation. The caller uses this returned
+            // Agent and then forces its stamped observer for any newer edge.
+            pending
+        } else {
+            session
+        };
         require_agent_placement(&tx, &agent)?;
         agent.session = Some(session);
         tx.execute(
@@ -2638,6 +2647,63 @@ mod tests {
         assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(after.clone()));
         assert_eq!(registry.register_agent_authority(&after).unwrap(), token);
         assert_eq!(registry.execution_sequence().unwrap(), sequence);
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
+    }
+
+    #[test]
+    fn agent_bind_cannot_overwrite_thread_confirmed_after_attached_capture() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let mut captured = source();
+        let HostedSession::Chat(chat) = &mut captured else { unreachable!() };
+        chat.launch.session_id = None;
+        registry.reserve_agent_launch(accepted.agent.id, &captured).unwrap();
+        let token = registry.register_agent_authority(&captured).unwrap();
+        // This commit models confirmation after ChatAttached was captured,
+        // before dispatch publishes the Agent. The real observer's stamp and
+        // location checks belong to its composed host fixture.
+        let confirmed = confirmed_thread(&captured);
+        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        assert!(!observe_owned_thread_in(&tx, &captured, &confirmed).unwrap());
+        tx.commit().unwrap();
+        let bound = registry.bind_agent(accepted.agent.id, None, captured).unwrap();
+        assert_eq!(bound.session, Some(confirmed.clone()));
+        assert!(registry.pending_agent_launch(accepted.agent.id).unwrap().is_none());
+        assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(confirmed.clone()));
+        // An idempotent forced observer and a later real /clear are both able
+        // to advance all accepted rows; no stranded None thread remains.
+        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        assert!(!observe_owned_thread_in(&tx, &confirmed, &confirmed).unwrap());
+        tx.commit().unwrap();
+        let next = confirmed_thread(&confirmed);
+        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        assert!(observe_owned_thread_in(&tx, &confirmed, &next).unwrap());
+        tx.commit().unwrap();
+        assert_eq!(registry.agent(accepted.agent.id).unwrap().session, Some(next.clone()));
+        assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(next));
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
+    }
+
+    #[test]
+    fn agent_bind_keeps_latest_authenticated_launch_metadata_and_refuses_another_process() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let captured = source();
+        registry.reserve_agent_launch(accepted.agent.id, &captured).unwrap();
+        let token = registry.register_agent_authority(&captured).unwrap();
+        let mut latest = captured.clone();
+        let HostedSession::Chat(chat) = &mut latest else { unreachable!() };
+        chat.native_continuity = crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 1 };
+        registry.adopt_authenticated_agent_session(std::slice::from_ref(&captured), &latest).unwrap();
+        let mut wrong_process = captured.clone();
+        let HostedSession::Chat(chat) = &mut wrong_process else { unreachable!() };
+        chat.proof.as_mut().unwrap().host_incarnation = crate::model::HostIncarnation::new("replacement");
+        assert!(registry.bind_agent(accepted.agent.id, None, wrong_process).is_err());
+        assert!(registry.agent(accepted.agent.id).unwrap().session.is_none());
+        assert_eq!(registry.pending_agent_launch(accepted.agent.id).unwrap(), Some(latest.clone()));
+        let bound = registry.bind_agent(accepted.agent.id, None, captured).unwrap();
+        assert_eq!(bound.session, Some(latest.clone()));
+        assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(latest));
         assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
     }
 
