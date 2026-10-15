@@ -7319,7 +7319,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7414,7 +7415,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -11147,14 +11149,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11173,7 +11180,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
@@ -15501,9 +15511,15 @@ mod tests {
             drop(app.handle_chat_ui(Action::Wake(target, Wake::Observed)));
             assert!(Arc::ptr_eq(&retained, &app.durable));
             assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &app.durable));
-            assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source.clone()));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
         }
-        assert!(app.lifecycle.state(card).is_none(), "attachment still completes hydration");
+        assert!(
+            app.lifecycle.state(card).is_none(),
+            "attachment still completes hydration"
+        );
         assert_eq!(chat_runtime(&app, card).target, target);
         assert!(!app.chat_start_pending(card));
     }
@@ -15519,7 +15535,15 @@ mod tests {
         let retained = app.durable.clone();
         assert_eq!(app.install_chat_session(card, source.clone()), None);
         assert!(!Arc::ptr_eq(&retained, &app.durable));
-        assert_eq!(retained.cards.iter().find(|state| state.id == card).unwrap().residency, Residency::Cold);
+        assert_eq!(
+            retained
+                .cards
+                .iter()
+                .find(|state| state.id == card)
+                .unwrap()
+                .residency,
+            Residency::Cold
+        );
         assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
         assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
         assert!(app.lifecycle.state(card).is_none());
@@ -15535,7 +15559,15 @@ mod tests {
         let retained = app.durable.clone();
         assert_eq!(app.install_chat_session(card, changed.clone()), Some(false));
         assert!(!Arc::ptr_eq(&retained, &app.durable));
-        assert_eq!(retained.cards.iter().find(|state| state.id == card).unwrap().kind, CardKind::Chat(original));
+        assert_eq!(
+            retained
+                .cards
+                .iter()
+                .find(|state| state.id == card)
+                .unwrap()
+                .kind,
+            CardKind::Chat(original)
+        );
         assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(changed));
         assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
     }
