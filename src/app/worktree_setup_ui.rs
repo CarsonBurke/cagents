@@ -31,7 +31,7 @@ pub(super) struct ReviewSnapshot {
 #[derive(Debug)]
 pub(super) enum ReviewCompletion {
     Local { creation: OperationId, path: PathBuf, intent: SetupIntent },
-    Remote { path: PathBuf, setup: Option<crate::worktree_control::Setup>, warnings: Vec<String>, skipped: bool },
+    Remote { path: PathBuf, run_id: OperationId, setup: Option<crate::worktree_control::Setup>, warnings: Vec<String>, skipped: bool },
 }
 
 impl Drop for Review { fn drop(&mut self) { self.token.cancel(); } }
@@ -44,6 +44,7 @@ pub(super) struct State {
     recovered: HashMap<PathBuf, (OperationId, SetupIntent)>,
     authorized_runs: std::sync::Mutex<HashSet<OperationId>>,
     expected_runs: HashMap<PathBuf, OperationId>,
+    review_requests: HashMap<PathBuf, OperationId>,
 }
 
 impl Drop for State {
@@ -219,7 +220,7 @@ impl Cagents {
             && self.dirty_repository_close.is_none() && self.sidebar_selection_ui.dialog.is_none()
     }
     pub(super) fn forget_worktree_setup(&mut self, path: &Path) {
-        self.setup_ui.recovered.remove(path); self.setup_ui.statuses.remove(path); self.setup_ui.terminals.remove(path); self.setup_ui.expected_runs.remove(path);
+        self.setup_ui.recovered.remove(path); self.setup_ui.statuses.remove(path); self.setup_ui.terminals.remove(path); self.setup_ui.expected_runs.remove(path); self.setup_ui.review_requests.remove(path);
     }
     pub(super) fn recover_worktree_setup(&mut self, creation: OperationId, path: PathBuf, intent: SetupIntent) {
         let status = if intent.skip { WorktreeSetupStatus::Skipped }
@@ -250,6 +251,8 @@ impl Cagents {
         let (creation, intent) = local.unwrap_or_else(|| (OperationId::new(), SetupIntent::default()));
         let request = OperationId::new();
         let token = CancellationToken::new();
+        self.setup_ui.review_requests.insert(path.clone(), request);
+        let store = self.session.as_ref().map(SessionRuntime::operation_store);
         self.worktree_dialog = None;
         self.project_ui.show_setup_review(Review { request, creation, path: path.clone(), expected: intent.clone(), current: intent.clone(), remote: remote.clone(), active: false, loading: true, trusted: false, approved: false, error: None, token: token.clone() });
         let load = cosmic::task::future(async move {
@@ -258,6 +261,10 @@ impl Cagents {
                 if let Some(repository) = remote {
                     return daemon_setup_review(&repository, &path);
                 }
+                let store = store.ok_or("The setup journal is unavailable")?;
+                let report = RepositoryService::system("git").worktree_setup_creation(&store, creation)
+                    .map_err(|error| error.to_string())?.ok_or("The setup creation is no longer recorded")?;
+                let intent = report.request.and_then(|request| request.setup_intent).ok_or("The saved setup intent is unavailable")?;
                 let primary = intent.primary.as_ref().ok_or("The primary checkout is unavailable")?;
                 let plan = crate::worktree_setup::load(primary).map_err(|error| error.to_string())?;
                 let trusted = match &plan { Some(plan) => crate::worktree_setup::is_trusted(primary, plan, &token).map_err(|error| error.to_string())?, None => true };
@@ -309,11 +316,11 @@ impl Cagents {
                         repository, path: path.clone(), expected_run_id: expected.run_id,
                         expected_plan_fingerprint: fingerprint, trust: approve, skip: intent.skip,
                     })?;
-                    let crate::worktree_control::Reply::SetupPrepared { path: returned, setup, warnings } = reply else {
+                    let crate::worktree_control::Reply::SetupPrepared { path: returned, setup, warnings, run_id } = reply else {
                         return Err("Unexpected worktree setup recovery response".into());
                     };
                     if returned != path { return Err("The daemon resumed a different worktree setup".into()); }
-                    return Ok(ReviewCompletion::Remote { path, setup, warnings, skipped: intent.skip });
+                    return Ok(ReviewCompletion::Remote { path, run_id, setup, warnings, skipped: intent.skip });
                 }
                 let store = store.ok_or("The setup journal is unavailable")?;
                 verify_local_setup_resume(&store, creation, &path, &expected, &token)?;
@@ -328,6 +335,10 @@ impl Cagents {
     }
 
     pub(super) fn setup_review_ready(&mut self, request: OperationId, result: Result<ReviewCompletion, String>) -> Task<Message> {
+        if let Ok(completion) = &result {
+            let path = match completion { ReviewCompletion::Local { path, .. } | ReviewCompletion::Remote { path, .. } => path };
+            if self.setup_ui.review_requests.get(path) != Some(&request) { return Task::none(); }
+        }
         if !self.project_ui.setup_review.as_ref().is_some_and(|review| review.request == request) {
             if let Ok(completion) = result { self.retain_setup_completion(completion); }
             return Task::none();
@@ -359,7 +370,8 @@ impl Cagents {
     fn retain_setup_completion(&mut self, completion: ReviewCompletion) {
         match completion {
             ReviewCompletion::Local { creation, path, intent } => self.recover_worktree_setup(creation, path, intent),
-            ReviewCompletion::Remote { path, setup, warnings, skipped } => {
+            ReviewCompletion::Remote { path, run_id, setup, warnings, skipped } => {
+                self.setup_ui.expected_runs.insert(path.clone(), run_id);
                 self.setup_ui.terminals.remove(&path);
                 let status = if skipped { WorktreeSetupStatus::Skipped }
                 else if let Some(setup) = setup {
@@ -571,6 +583,23 @@ mod tests {
         let session = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());
         assert!(matches!(terminal_status(&session, true, false), WorktreeSetupStatus::Interrupted(_)));
         assert_eq!(terminal_status(&session, true, true), WorktreeSetupStatus::Running);
+    }
+
+    #[test]
+    fn a_late_daemon_resume_receipt_cannot_replace_a_newer_review_run() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let path = PathBuf::from("/repo/setup");
+        app.sidebar_model.projects.push(SidebarProject::new(ProjectId::new(), RepositoryId::new(), "repo".into(), "/repo".into(),
+            vec![SidebarWorktree::from_durable(crate::model::WorktreeId::new(), path.clone(), Some("setup".into()))], vec![]));
+        let first_request = OperationId::new(); let second_request = OperationId::new();
+        let first_run = OperationId::new(); let second_run = OperationId::new();
+        app.setup_ui.review_requests.insert(path.clone(), second_request);
+        // Both dialogs were dismissed; only the last review retains authority
+        // to publish a completion into this window's status cache.
+        drop(app.setup_review_ready(second_request, Ok(ReviewCompletion::Remote { path: path.clone(), run_id: second_run, setup: None, warnings: vec![], skipped: true })));
+        drop(app.setup_review_ready(first_request, Ok(ReviewCompletion::Remote { path: path.clone(), run_id: first_run, setup: None, warnings: vec![], skipped: false })));
+        assert_eq!(app.setup_ui.expected_runs[&path], second_run);
+        assert_eq!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Skipped);
     }
 
     #[test]
