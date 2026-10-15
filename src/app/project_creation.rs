@@ -54,7 +54,8 @@ impl Cagents {
     pub(super) fn publish_project_creation_source(&mut self, project: ProjectId, generation: u64,
         source: Option<WorktreeCreationSource>, bare: bool) {
         if self.repository_generations.get(&project) != Some(&generation) {
-            if let Some(source) = source { source.invalidate(); }
+            // A stale read may hold the same actor as a newer read or accepted
+            // creation. Dropping that read's clone grants no retirement right.
             return;
         }
         // A verified refresh carries the SAME source. Keep its logical
