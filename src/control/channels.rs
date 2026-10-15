@@ -181,6 +181,7 @@ mod tests {
         agent::Provider,
         agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target},
         model::{AgentId, BootId, HostIncarnation, HostSessionId},
+        terminal::ipc::ProtocolError,
     };
 
     fn fixture() -> (WorkspaceModel, Pane, ChannelId) {
