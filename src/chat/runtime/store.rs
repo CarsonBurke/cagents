@@ -691,11 +691,13 @@ impl Store {
                 _ => {}
             }
         }
+        let filtered_raw=self.raw_filter_history(&mut event)?;
         if self.raw_event_revoked(&event)? {
             return Ok(vec![nonfatal("Original tool source was removed; its late update was discarded".into())]);
         }
         let raw_warning=self.cache_raw_call(&event)?;
-        if matches!(&event,Event::Item(_)|Event::History{..}|Event::LatestHistory{..})&&self.raw_event_revoked(&event)?{
+        let filtered_raw=filtered_raw|self.raw_filter_history(&mut event)?;
+        if matches!(&event,Event::Item(_))&&self.raw_event_revoked(&event)?{
             return Ok(vec![nonfatal("An original tool identity changed kind; its private source was revoked and the ambiguous update discarded".into())]);
         }
         if matches!(&event,Event::RawToolCapture(_)) {
@@ -706,6 +708,7 @@ impl Store {
         }
         let mut out = self.cache_child_tool(&event)?.into_iter().map(nonfatal).collect::<Vec<_>>();
         out.extend(raw_warning.into_iter().map(nonfatal));
+        if filtered_raw{out.push(nonfatal("Removed or ambiguous original tool identities were discarded from the history batch; unrelated history was retained".into()));}
         self.index_child_event(&event)?;
         self.cache_child_source(&event)?;
 

@@ -254,10 +254,18 @@ impl Store {
             Event::RawToolCapture(capture) if capture.source().agent_id.is_none()=>vec![&capture.source().source_id],
             Event::Item(item)=>vec![&item.id],
             Event::InputDelta{id,..}|Event::OutputDelta{id,..}=>vec![id],
-            Event::History{items,..}|Event::LatestHistory{items,..}=>items.iter().map(|item|item.id.as_str()).collect(),
             _=>return Ok(false),
         };
         for id in ids{if self.raw_revoked(&key("",id))?{return Ok(true);}}Ok(false)
+    }
+    pub(super) fn raw_filter_history(&self,event:&mut Event)->Result<bool,String>{
+        let (Event::History{items,..}|Event::LatestHistory{items,..})=event else{return Ok(false);};
+        self.raw_guard()?;
+        let mut removed=false;let mut retained=Vec::with_capacity(items.len());
+        for item in std::mem::take(items){
+            if self.raw_revoked(&key("",&item.id))?{removed=true;}else{retained.push(item);}
+        }
+        *items=retained;Ok(removed)
     }
     pub(super) fn raw_parts(&self,id:&str)->Result<Vec<RawSourcePart>,String>{
         let _read=self.db.unchecked_transaction().map_err(err)?;
@@ -452,5 +460,26 @@ mod write_budget_tests {
         let mut store=Store::new().unwrap();store.db.execute("UPDATE raw_source_schema SET bytes=?1",[DISK_BYTES]).unwrap();
         let warnings=store.apply(Event::RawToolCapture(RawToolCapture::Full{source:key("","refused"),name:"Write".into(),input:"null".into(),command:None})).unwrap();assert!(warnings.iter().any(|event|matches!(event,Event::Error{fatal:false,..})));assert!(store.raw_source_page(RawSourceQuery{source:key("","refused"),field:RawSourceField::ToolInput,offset:0,limit:256,expected_epoch:None,until:None}).is_err());
         store.apply(Event::Reset{reason:"new conversation".into()}).unwrap();store.apply(Event::RawToolCapture(RawToolCapture::Full{source:key("","refused"),name:"Write".into(),input:"null".into(),command:None})).unwrap();assert_eq!(store.raw_original(&key("","refused")).unwrap(),Some(("Write".into(),"null".into())));
+    }
+}
+
+#[cfg(test)]
+mod mixed_history_tests {
+    use super::*;
+    fn ordinary(id:&str)->Item{Item{id:id.into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Text{text:"unrelated history".into(),thinking:false,phase:Phase::Final}}}
+    fn captured(store:&mut Store){store.apply(Event::RawToolCapture(RawToolCapture::Full{source:key("","private"),name:"Write".into(),input:"null".into(),command:None})).unwrap();store.apply(Event::Item(Item{id:"private".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Changes{changes:Vec::new(),status:crate::chat::ToolStatus::Succeeded}})).unwrap();}
+    #[test]
+    fn a_revoked_history_member_never_discards_unrelated_history_or_recovery_bookkeeping(){
+        for earlier in [true,false]{
+            let mut store=Store::new().unwrap();captured(&mut store);store.apply(Event::ItemsRemoved{ids:vec!["private".into()]}).unwrap();
+            let items=vec![ordinary("private"),ordinary("valid")];let event=if earlier{Event::History{items,has_earlier:false}}else{store.apply(Event::LatestHistoryStarted).unwrap();Event::LatestHistory{items,has_earlier:false}};
+            let out=store.apply(event).unwrap();assert!(out.iter().any(|event|matches!(event,Event::HistoryRecovered)));assert!(store.exists("valid").unwrap());assert!(!store.exists("private").unwrap());assert!(!store.provider_earlier);assert!(store.latest_boundary.is_none());assert!(store.pending_earlier.is_none());
+        }
+    }
+    #[test]
+    fn ambiguous_kind_change_filters_only_its_own_history_member(){
+        let mut store=Store::new().unwrap();captured(&mut store);
+        let out=store.apply(Event::LatestHistory{items:vec![ordinary("private"),ordinary("valid")],has_earlier:false}).unwrap();assert!(out.iter().any(|event|matches!(event,Event::HistoryRecovered)));assert!(store.exists("valid").unwrap());
+        let metadata:Vec<u8>=store.db.query_row("SELECT metadata FROM items WHERE id='private'",[],|r|r.get(0)).unwrap();let item:Item=postcard::from_bytes(&metadata).unwrap();assert!(matches!(item.content,ItemContent::Changes{..}));assert!(store.raw_revoked(&key("","private")).unwrap());
     }
 }
