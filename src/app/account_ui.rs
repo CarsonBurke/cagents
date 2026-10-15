@@ -170,6 +170,7 @@ impl OmpRecord {
 }
 
 impl State {
+    #[cfg(test)]
     pub(super) fn probe_owner(&self, id: &AccountId) -> Option<u64> {
         self.account(id).map(|state| state.owner)
     }

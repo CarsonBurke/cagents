@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-#[cfg(any(feature = "host", feature = "ui"))]
+#[cfg(feature = "host")]
 pub(crate) mod bundled;
 pub mod directory;
 pub mod mailbox;

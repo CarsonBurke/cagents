@@ -194,6 +194,7 @@ impl Cagents {
         }
     }
 
+    #[cfg(test)]
     fn local_view_panes(&self, scope: &Scope) -> Vec<Pane> {
         self.local_view_cards(scope)
             .into_iter()
@@ -803,6 +804,7 @@ impl Cagents {
             .insert(pane.id, terminal.id);
     }
 
+    #[cfg(test)]
     fn project_shared_view(&mut self, view: &View, owned: &HashSet<CardId>) -> Task<Message> {
         let current = self.local_view_cards(&view.scope);
         self.project_shared_view_with_cards(view, owned, current)

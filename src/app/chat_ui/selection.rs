@@ -208,6 +208,7 @@ impl std::ops::Deref for Ranges {
 struct Block {
     identity: u64,
     plain: Arc<str>,
+    #[cfg(test)]
     bounds: Rectangle,
     visible: Option<Rectangle>,
     hit: usize,
@@ -638,6 +639,7 @@ impl Operation for Read {
             lists,
             cell,
             plain: prose.plain.clone(),
+            #[cfg(test)]
             bounds,
             visible: self
                 .clip

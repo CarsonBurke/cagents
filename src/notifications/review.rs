@@ -1,6 +1,6 @@
 //! Exact GitHub review-request authority, independent of a provider session.
 use serde::{Deserialize, Serialize};
-#[cfg(any(feature = "host", feature = "ui", test))]
+#[cfg(any(feature = "host", test))]
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -68,7 +68,7 @@ impl ReviewRequest {
 
     /// Request IDs are immutable GitHub nodes. Route text may change (repository
     /// rename), but the same viewer/request must never be charged a second alert.
-    #[cfg(any(feature = "host", feature = "ui", test))]
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn storage_key(&self) -> String {
         let mut digest = Sha256::new();
         for part in [

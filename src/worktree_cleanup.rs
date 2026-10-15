@@ -41,7 +41,7 @@ pub(crate) struct PreparedRemoval {
     directory_identity: (u64, u64),
 }
 
-#[cfg(any(feature = "host", feature = "ui"))]
+#[cfg(any(feature = "host", all(feature = "ui", test)))]
 fn exact_merged_head(request: &RemovalRequest, pr: &crate::github::PullRequest) -> bool {
     pr.state.0 == "MERGED"
         && pr.number == request.pull_request.number

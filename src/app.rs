@@ -83,7 +83,7 @@ use url::Url;
 
 use crate::{
     account::{self, Account},
-    design::{self, DockLayout, InspectorLayout, space},
+    design::{self, InspectorLayout, space},
     github::{
         CreatePullRequestRequest, GitHubAvailability, GitHubRepoKey, GitHubService,
         ListPullRequestsRequest, PullRequestCreationOutcome, PullRequestStateFilter,
@@ -1489,6 +1489,7 @@ static STARTING_DIRECTORY: LazyLock<PathBuf> = LazyLock::new(|| {
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
 });
+#[cfg(test)]
 static STARTING_DIRECTORY_CAPTION: LazyLock<String> =
     LazyLock::new(|| format!("Starting directory: {}", display_path(&STARTING_DIRECTORY)));
 
@@ -13152,7 +13153,6 @@ impl Application for Cagents {
                 Message::ResumeConversation(_)
                 | Message::Repository(_)
                 | Message::ProjectUi(_)
-                | Message::GitUi(_)
                 | Message::SubmitWorktree => {
                     self.status = Some(TransientNotice::warning(
                         "Use Device files for remote files and Git operations",

@@ -14,7 +14,7 @@ use cosmic::iced::clipboard::mime::AllowedMimeTypes;
 /// An image offered by the system clipboard. The MIME type decides the file
 /// extension; `save` checks the actual bytes before making an attachment.
 #[derive(Debug, Clone)]
-pub(super) struct Image {
+pub struct Image {
     bytes: Vec<u8>,
     mime: String,
 }

@@ -572,7 +572,7 @@ pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
 /// inherit the person's approval merely by acquiring the same lock pathname.
 #[cfg(feature = "ui")]
 #[derive(Debug)]
-pub(crate) struct RestartTarget {
+pub struct RestartTarget {
     process: File,
     proof: HostSessionProof,
 }

@@ -6153,6 +6153,7 @@ pub(crate) struct GitFileLock {
 
 impl GitFileLock {
     /// Git removed the containing administrative directory itself.
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn retired_with_directory(&mut self) {
         self.active = false;
     }

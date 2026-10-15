@@ -11,7 +11,7 @@ use std::{
 use tokio::sync::watch;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) enum State {
+pub enum State {
     #[default]
     Responsive,
     Unresponsive {

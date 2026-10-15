@@ -202,14 +202,14 @@ pub(super) struct State {
     outstanding: HashMap<uuid::Uuid, CardId>,
 }
 #[derive(Clone)]
-pub(super) struct Permit(Arc<Mutex<Option<transcript_location::ValidatedTranscript>>>);
+pub struct Permit(Arc<Mutex<Option<transcript_location::ValidatedTranscript>>>);
 impl std::fmt::Debug for Permit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ValidatedTranscriptPermit")
     }
 }
 #[derive(Debug, Clone)]
-pub(super) enum Action {
+pub enum Action {
     Copy(CardId),
     Reveal(CardId),
     Probed {

@@ -49,7 +49,7 @@ struct Pixels {
 /// image worker, and only real permit release (including last widget/gallery
 /// owners) can satisfy it. Semaphore admission remains the memory authority.
 #[derive(Clone)]
-pub(in crate::app) struct Pressure {
+pub struct Pressure {
     resource: Arc<tokio::sync::Semaphore>,
     permits: u32,
     retained: bool,
@@ -97,7 +97,7 @@ impl AsRef<[u8]> for Pixels {
     }
 }
 #[derive(Clone)]
-pub(in crate::app) enum Loaded {
+pub enum Loaded {
     Ready(iced::widget::image::Handle),
     Unavailable,
     Deferred(Pressure),

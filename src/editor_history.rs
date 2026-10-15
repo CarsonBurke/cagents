@@ -436,6 +436,7 @@ fn breaks(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
 }
 
 /// The position reached by inserting `text` at `start`.
+#[cfg(test)]
 pub fn advance(start: Position, text: &str) -> Position {
     let mut lines = 0;
     let mut tail = 0;

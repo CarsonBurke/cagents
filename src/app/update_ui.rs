@@ -85,7 +85,6 @@ pub(super) struct UpdateSummary {
     pub status: String,
     /// Whether `status` reports a failed check.
     pub failed: bool,
-    pub checking: bool,
     /// Whether "Check for updates" can run now.
     pub can_check: bool,
     /// A newer release: its version and release notes.
@@ -670,7 +669,6 @@ impl Cagents {
         UpdateSummary {
             status,
             failed,
-            checking: state.checking,
             can_check: !development && !state.checking && !state.updating(),
             apply_blocker: available
                 .as_ref()

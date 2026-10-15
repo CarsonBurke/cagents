@@ -60,7 +60,7 @@ pub(crate) fn sign_in_verification_detail(message: &str) -> Option<&str> {
         .map(|(_, detail)| detail)
 }
 
-#[cfg(any(feature = "host", feature = "ui", test))]
+#[cfg(any(feature = "host", test))]
 pub(crate) fn sign_in_verification_failure(failure: &str, detail: &str) -> String {
     let original = failure
         .split_once(SIGN_IN_VERIFICATION_MARKER)
