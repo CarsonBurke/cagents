@@ -14,6 +14,28 @@ struct LocalViews {
     panes: HashMap<Scope, Vec<Pane>>,
 }
 
+/// Observed descriptors belong to an actor, while names and widths belong to
+/// its pane. A later process at the same pane ID must keep its own descriptor.
+fn same_pane_update_target(before: &CardKind, current: &CardKind) -> bool {
+    use crate::agent_execution::HostedSession;
+    let same_process = |before: HostedSession, current: HostedSession| {
+        before.has_complete_proof() && current.has_complete_proof()
+            && before.same_process(&current)
+    };
+    match (before, current) {
+        (CardKind::Terminal(before), CardKind::Terminal(current)) =>
+            same_process(HostedSession::Terminal(before.clone()), HostedSession::Terminal(current.clone())),
+        (CardKind::Chat(before), CardKind::Chat(current)) =>
+            same_process(HostedSession::Chat(before.clone()), HostedSession::Chat(current.clone())),
+        (CardKind::Browser(before), CardKind::Browser(current)) => before.id == current.id,
+        (CardKind::Repository(before), CardKind::Repository(current)) =>
+            before.repository == current.repository && before.worktree == current.worktree,
+        (CardKind::PullRequests(before), CardKind::PullRequests(current)) =>
+            before.repository == current.repository,
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 pub(super) struct State {
     baseline: HashMap<Scope, Vec<Pane>>,
@@ -674,14 +696,26 @@ impl Cagents {
             .chain(acknowledged).collect();
         if moving.is_empty() { return; }
         let mut edits = Vec::new();
+        let mut discarded = HashSet::new();
+        let mut stale_actor = false;
         for (operation, scope, change) in &mut self.shared_views.pending {
-            let Change::Update { pane, .. } = change else { continue; };
+            let Change::Update { before, pane } = change else { continue; };
             let card = pane.id;
             if !moving.contains(&card) { continue; }
             let mut owners = self.workspace_model.views.iter()
                 .filter(|view| view.panes.iter().any(|candidate| candidate.id == card));
             let Some(owner) = owners.next() else { continue; };
             if owners.next().is_some() || owner.scope == *scope { continue; }
+            let current = owner.panes.iter().find(|pane| pane.id == card).unwrap();
+            if before.kind != pane.kind && !same_pane_update_target(&before.kind, &current.kind) {
+                before.kind = current.kind.clone();
+                pane.kind = current.kind.clone();
+                stale_actor = true;
+            }
+            if before == pane {
+                discarded.insert(*operation);
+                continue;
+            }
             *operation = uuid::Uuid::new_v4();
             *scope = owner.scope.clone();
             edits.push(ModelEdit::ChangeView {
@@ -689,7 +723,13 @@ impl Cagents {
                 operation: *operation, change: change.clone(),
             });
         }
+        self.shared_views.pending.retain(|(operation, _, _)| !discarded.contains(operation));
         for edit in edits { self.publish_model_edit(edit); }
+        if stale_actor {
+            self.notices.record(TransientNotice::warning(
+                "Kept the current pane session because an incoming session update could not be verified"
+            ));
+        }
     }
 
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
@@ -1501,6 +1541,16 @@ mod tests {
         pane
     }
 
+    fn moving_terminal_kind() -> CardKind {
+        let mut session = fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap());
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("move-host"),
+            boot_id: crate::model::BootId::new("move-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("move-incarnation"),
+        };
+        CardKind::Terminal(session)
+    }
+
     fn assert_moving_metadata(app: &Cagents, expected: &Pane) {
         let card = app.card_state(expected.id).unwrap();
         assert_eq!(card.title, expected.title);
@@ -1513,7 +1563,7 @@ mod tests {
     fn accepted_channel_move_retargets_user_and_observed_descriptor_edits_before_projection() {
         use super::super::workspace_model_sync::ModelUpdate;
         for watcher_first in [false, true] {
-            let kind = CardKind::Terminal(fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap()));
+            let kind = moving_terminal_kind();
             let (mut app, source, destination, pane) = channel_move_fixture_with_kind(Some(kind));
             let (tx, rx) = async_channel::unbounded();
             app.workspace_model_tx = tx;
@@ -1578,7 +1628,7 @@ mod tests {
     #[test]
     fn refused_channel_move_keeps_metadata_edits_in_the_original_scope() {
         use super::super::workspace_model_sync::ModelUpdate;
-        let kind = CardKind::Terminal(fresh_terminal_session(LaunchRecipe::shell("/repo".into()).unwrap()));
+        let kind = moving_terminal_kind();
         let (mut app, source, destination, pane) = channel_move_fixture_with_kind(Some(kind));
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
@@ -1595,6 +1645,72 @@ mod tests {
         assert_eq!(app.shared_views.pending, pending);
         assert!(app.durable.channels.iter().find(|channel| channel.id == source).unwrap().cards.contains(&pane.id));
         assert!(rx.try_recv().is_err(), "a refused transfer must not retarget or duplicate metadata operations");
+    }
+
+    #[test]
+    fn channel_move_keeps_replacement_actor_and_independent_user_edits() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for replacement in ["session", "proof", "unproved-before", "unproved-current", "incomplete-both"] {
+            let mut kind = moving_terminal_kind();
+            let CardKind::Terminal(session) = &mut kind else { panic!("terminal"); };
+            if replacement == "unproved-before" {
+                session.continuity = TerminalContinuity::RelaunchAvailable {
+                    recipe: session.launch.clone(), last_exit: None,
+                };
+            } else if replacement == "incomplete-both" {
+                let TerminalContinuity::Live { boot_id, .. } = &mut session.continuity else { panic!("proof"); };
+                *boot_id = crate::model::BootId::new("");
+            }
+            let (mut app, source, destination, pane) = channel_move_fixture_with_kind(Some(kind));
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            drop(app.move_pane_to_channel(pane.id, destination));
+            let ModelEdit::ChangeView { operation: transfer, .. } = rx.try_recv().unwrap() else { panic!("transfer"); };
+            let mut expected = edit_moving_terminal(&mut app, pane.id, source);
+            while rx.try_recv().is_ok() {}
+            let mut model = app.workspace_model.clone();
+            views::transfer(&mut model.views, &Scope::Channel(source), pane.id, &Scope::Channel(destination), None).unwrap();
+            let destination_view = model.views.iter_mut().find(|view| view.scope == Scope::Channel(destination)).unwrap();
+            let current = &mut destination_view.panes[0].kind;
+            let CardKind::Terminal(session) = current else { panic!("terminal"); };
+            match replacement {
+                "session" => session.id = TerminalId::new(),
+                "proof" => {
+                    let TerminalContinuity::Live { host_incarnation, .. } = &mut session.continuity else { panic!("proof"); };
+                    *host_incarnation = crate::model::HostIncarnation::new("replacement-incarnation");
+                }
+                "unproved-current" => session.continuity = TerminalContinuity::RelaunchAvailable {
+                    recipe: session.launch.clone(), last_exit: None,
+                },
+                _ => {}
+            }
+            session.resume_hint = Some("authoritative-current-session".into());
+            expected.kind = current.clone();
+            model.sequence += 1;
+            drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::ViewApplied {
+                scope: Scope::Channel(source), operation: Some(transfer), model: model.clone(),
+            })));
+            assert_moving_metadata(&app, &expected);
+            assert!(app.notices.recent().any(|entry| entry.notice.message.contains("incoming session update could not be verified")), "{replacement}");
+            let mut retried = Vec::new();
+            while let Ok(edit) = rx.try_recv() {
+                if let ModelEdit::ChangeView { scope, operation, change: Change::Update { before, pane: after }, .. } = edit {
+                    assert_eq!(scope, Scope::Channel(destination));
+                    assert_eq!(before.kind, after.kind, "an old actor must not overwrite its replacement: {replacement}");
+                    retried.push((operation, Change::Update { before, pane: after }));
+                }
+            }
+            assert!(!retried.is_empty(), "title and width intentions still need acknowledgment");
+            for (operation, change) in retried {
+                model.views.iter_mut().find(|view| view.scope == Scope::Channel(destination)).unwrap().apply(&change).unwrap();
+                model.sequence += 1;
+                drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                    scope: Scope::Channel(destination), operation: Some(operation), model: model.clone(),
+                }));
+                assert_moving_metadata(&app, &expected);
+            }
+            assert!(app.shared_views.pending.is_empty());
+        }
     }
 
     #[test]
