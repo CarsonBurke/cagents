@@ -16529,6 +16529,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn keyboard_change_ranges_reveal_the_target_beyond_a_large_virtual_viewport() {
+        let mut source = source_control();
+        let template = source.group(ChangeArea::Unstaged).unwrap().rows()[0].entry.clone();
+        let rows = (0..40_000).map(|index| {
+            let mut entry = template.clone();
+            entry.path = repo_path(&format!("src/m{index}.rs"));
+            ChangeRow::new(source.key.worktree_id, &entry)
+        }).collect();
+        source.groups = vec![ChangeGroup::new(source.key.worktree_id, ChangeArea::Unstaged, rows)];
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let order = change_selection_order(&source, &state);
+        assert_eq!(order.len(), 40_000);
+        state.select_change_rows(order[3].clone(), SelectionIntent::Navigate, &order);
+        let target = order[35_000].clone();
+        state.select_change_rows(target.clone(), SelectionIntent::Range { extend: false }, &order);
+        let (scroll_id, offset) = state.reveal_change_row(&source, &target).unwrap();
+        let scope = ChangeTreeScope::Area(ChangeArea::Unstaged);
+        let first = state.change_first_rows[&scope];
+        assert!(first > 34_000);
+        assert_eq!(scroll_id, change_scroll_id(&source.key, scope, state.change_scroll_epoch));
+        assert_eq!(offset, first as f32 * PANEL_ROW_HEIGHT);
+        let (visible, _) = change_viewport_rows(&source.groups[0].tree, None, false, first);
+        assert!(visible.len() <= MAX_VISIBLE_CHANGE_ROWS);
+        assert!(visible.iter().any(|row| row.path == target.path));
+        assert_eq!(state.selected_change_count(), 35_000 - 3 + 1);
+        assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
+        assert!(state.change_first_rows.is_empty());
+        assert_eq!(state.selected_change_count(), 0);
+        assert_ne!(scroll_id, change_scroll_id(&source.key, scope, state.change_scroll_epoch));
+    }
+
+    #[test]
     fn fresh_full_group_selections_are_never_cut_to_the_display_limit() {
         let selected = (0..40_000).map(|index| PathSelection::new(repo_path(&format!("src/m{index}.rs")))).collect::<Vec<_>>();
         let last = selected.last().unwrap().path.clone();
