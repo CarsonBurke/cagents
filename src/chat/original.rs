@@ -60,9 +60,6 @@ pub(crate) fn validate_page(
     {
         return Err(OriginalError::Changed);
     }
-    if !page.original.settings.is_exact() {
-        return Err(OriginalError::Unavailable("The accepted provider settings are unknown".into()));
-    }
     Ok(())
 }
 
@@ -129,6 +126,14 @@ mod tests {
             else {assert_eq!(reader.push(end).unwrap_err(),OriginalError::Changed);}
         }
     }
+    #[test]
+    fn accepted_input_with_unknown_settings_can_be_read_for_edit_without_granting_retry() {
+        let mut reader=Assembly::new(None,None).unwrap();
+        let mut captured=page(0,"accepted exact input",20);captured.original.settings.fast=Setting::Unknown;
+        assert!(reader.push(captured).unwrap());let value=reader.finish().unwrap();
+        assert_eq!(value.text,"accepted exact input");assert!(!value.original.settings.is_exact());
+    }
+
     fn page(offset: usize, text: &str, total: usize) -> OriginalPage {
         OriginalPage {source_incarnation:None, session_id: "confirmed-session".into(), original: OriginalPrompt {
             user_id: "native-user".into(), turn_id: "native-turn".into(), text_bytes: total,
