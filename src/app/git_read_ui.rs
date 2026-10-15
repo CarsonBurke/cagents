@@ -60,12 +60,20 @@ impl Cagents {
         let view = pending.view.clone();
         let original = pending.binding.id;
         self.refresh_ui.pane_readers.remove(&card);
-        if self.exit.is_some() || self.update_prepared
+        if self.exit.is_some()
             || !matches!(self.cards.get(&card), Some(CardRuntime::Loading))
             || !self.card_state(card).is_some_and(|state| state.existence.is_open()
                 && matches!(&state.kind, CardKind::Repository(current) if *current == view))
             || self.repository_view_key(&view).is_none()
         { return Task::none(); }
+        if self.update_prepared {
+            // The read completed behind an update freeze. Settle visibly so
+            // cancelling the update leaves the real pane Retry route, rather
+            // than a Loading card whose exact request has already been spent.
+            self.fail_runtime(card,
+                "Opening this file was paused for the update. Retry this pane after cancelling the update.".into());
+            return Task::none();
+        }
         match result {
             Ok(binding) if binding.id == original && binding.key.project_id == view.project
                 && self.repository_view_key(&view).as_ref() == Some(&binding.key)
@@ -226,6 +234,49 @@ mod tests {
         drop(app.update(message));
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
         assert!(!app.refresh_ui.pane_reader_keys.contains_key(&card));
+    }
+
+    #[tokio::test]
+    async fn update_prepare_ready_cancel_leaves_an_actual_retryable_pane() {
+        let directory = tempfile::tempdir().unwrap();
+        git_binding::tests::init(directory.path(), "original\n");
+        let (source_app, key) = git_binding::tests::app_for(directory.path());
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_model = source_app.sidebar_model;
+        let view = RepositoryView { project: key.project_id, repository: directory.path().to_owned(),
+            worktree: directory.path().to_owned(), selected_file: Some("file.txt".into()) };
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(view.clone());
+        let binding = git_binding::Binding::new(key.clone());
+        app.sidebar_model.source_control.as_mut().unwrap().set_command_binding_id(binding.id);
+        app.refresh_ui.source_binding = Some(binding);
+        let task = app.attach_repository_pane(card, view.clone());
+        let held = worker(task).await;
+        let Message::RepositoryReaderReady { result: Ok(ready), .. } = &held else { panic!() };
+        let original = ready.read_source.as_ref().unwrap().clone();
+        let (response, _receiver) = std::sync::mpsc::sync_channel(1);
+        drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+            action: instance::UiUpdateAction::Prepare, response,
+        })));
+        assert!(app.update_prepared);
+        drop(app.update(held));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        assert!(!app.refresh_ui.pane_readers.contains_key(&card));
+        assert!(original.is_available(), "this pane cannot retire the strip's reader");
+        assert!(app.source_control_mutations.is_empty());
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+            action: instance::UiUpdateAction::Cancel, response,
+        })));
+        assert_eq!(receiver.try_recv().unwrap(), "ok");
+        assert!(!app.update_prepared);
+        let retry = app.update(Message::RetryCard(card));
+        let ready = worker(retry).await;
+        drop(app.update(ready));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!() };
+        assert_eq!(runtime.descriptor, view);
+        assert!(runtime.git_read_source().unwrap().same_source(&original));
     }
 
     #[test]
