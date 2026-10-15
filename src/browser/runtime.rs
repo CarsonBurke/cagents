@@ -72,10 +72,59 @@ pub(crate) struct Registration {
     pub teardown: Sender<()>,
 }
 
-/// The live engine thread's registration channel, tagged with a generation so a
-/// retiring engine can never evict its successor.
-static ENGINE: Mutex<Option<(u64, Sender<Registration>)>> = Mutex::new(None);
+/// The process keeps its engine parked between cards, but must join it before
+/// C++ process destructors run. In particular SpiderMonkey's static mutexes
+/// cannot be destroyed while its runtime is still alive on a detached thread.
+struct EngineThread {
+    generation: u64,
+    sender: Sender<Registration>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct EngineRegistry {
+    live: Option<EngineThread>,
+    shutting_down: bool,
+}
+
+static ENGINE: Mutex<EngineRegistry> = Mutex::new(EngineRegistry {
+    live: None,
+    shutting_down: false,
+});
 static ENGINE_GENERATIONS: AtomicU64 = AtomicU64::new(1);
+
+/// Final-process cleanup, installed around the native application's run loop.
+///
+/// Individual card/window teardown must still release Wayland parents first.
+/// This guard then stops the parked engine and waits for Servo's own shutdown
+/// on its owning thread, before main returns to C/C++ process destructors.
+/// Closing the last tab deliberately does not perform this irreversible step.
+pub struct ProcessShutdown;
+
+impl Drop for ProcessShutdown {
+    fn drop(&mut self) {
+        shutdown_registry(&ENGINE);
+    }
+}
+
+fn shutdown_registry(registry: &Mutex<EngineRegistry>) {
+    let engine = {
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.shutting_down = true;
+        registry.live.take()
+    };
+    if let Some(EngineThread { sender, thread, .. }) = engine {
+        // Disconnecting wakes even an idle engine with no cards. Never hold
+        // the registry mutex while joining: orderly retirement acquires it.
+        drop(sender);
+        if let Some(thread) = thread
+            && thread.join().is_err()
+        {
+            tracing::error!("browser engine panicked during final process shutdown");
+        }
+    }
+}
 
 pub(crate) fn on_engine_thread() -> bool {
     crate::runtime_state::on_browser_engine_thread()
@@ -92,8 +141,11 @@ pub(crate) fn on_engine_thread() -> bool {
 /// painter and its own Wayland subsurface.
 pub(crate) fn register(registration: Registration) -> Result<(), BrowserError> {
     let mut slot = lock_registry();
-    let registration = match slot.as_ref() {
-        Some((_, sender)) => match sender.send(registration) {
+    if slot.shutting_down {
+        return Err(BrowserError::ThreadStopped);
+    }
+    let registration = match slot.live.as_ref() {
+        Some(engine) => match engine.sender.send(registration) {
             Ok(()) => return Ok(()),
             // Only reachable if the engine thread died without retiring.
             Err(crossbeam_channel::SendError(registration)) => registration,
@@ -104,11 +156,15 @@ pub(crate) fn register(registration: Registration) -> Result<(), BrowserError> {
     let generation = ENGINE_GENERATIONS.fetch_add(1, Ordering::Relaxed);
     let (sender, receiver) = crossbeam_channel::unbounded();
     let _ = sender.send(registration);
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("cagents-servo-engine".into())
         .spawn(move || Engine::run(generation, receiver))
         .map_err(|error| BrowserError::Servo(format!("could not start browser thread: {error}")))?;
-    *slot = Some((generation, sender));
+    slot.live = Some(EngineThread {
+        generation,
+        sender,
+        thread: Some(thread),
+    });
     Ok(())
 }
 
@@ -123,19 +179,22 @@ fn retire(generation: u64, registrations: &Receiver<Registration>) -> bool {
     if !registrations.is_empty() {
         return false;
     }
-    if slot.as_ref().is_some_and(|(live, _)| *live == generation) {
-        *slot = None;
+    if slot
+        .live
+        .as_ref()
+        .is_some_and(|live| live.generation == generation)
+    {
+        slot.live = None;
     }
     true
 }
 
 /// Locks the engine registry, ignoring poisoning.
 ///
-/// The registry holds one `Option<Sender>` and is only ever locked by `register`
-/// and `retire`, neither of which can leave it half-updated. Treating a poisoned
-/// lock as fatal would instead make one unrelated panic permanently prevent
-/// every browser card from starting.
-fn lock_registry() -> std::sync::MutexGuard<'static, Option<(u64, Sender<Registration>)>> {
+/// The registry changes only during registration, retirement and final-process
+/// shutdown. Treating a poisoned lock as fatal would instead make one unrelated
+/// panic permanently prevent every browser card from starting or stopping.
+fn lock_registry() -> std::sync::MutexGuard<'static, EngineRegistry> {
     ENGINE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -275,7 +334,7 @@ impl Engine {
             // An empty card list is not a reason to leave. The runtime cannot
             // be constructed again, so this thread stays registered and the
             // next card joins it. The thread ends only once its registration
-            // channel is gone, which is a replacement, not a closed tab.
+            // channel is gone during final process shutdown, not a closed tab.
             if self.cards.is_empty() && self.registrations.is_none() {
                 break;
             }
@@ -310,6 +369,13 @@ impl Engine {
                         return;
                     }
                     self.registrations = None;
+                    // Final process shutdown also releases any card still
+                    // queued/live. Their barriers disconnect before Servo is
+                    // dropped on this owning thread.
+                    self.import = None;
+                    for card in &mut self.cards {
+                        card.closed = true;
+                    }
                     return;
                 }
             }
@@ -1025,6 +1091,10 @@ impl CardSession {
     }
 
     fn paint(&mut self, events: &EventBus) {
+        if let Err(error) = self.rendering.prepare_for_paint() {
+            events.semantic(BrowserEvent::Error(error));
+            return;
+        }
         self.webview.paint();
         // The viewport source rectangle may only grow together with the buffer
         // it crops, and the rendering context's present attaches that buffer
@@ -1786,7 +1856,10 @@ mod tests {
     }
 
     fn engine_generation() -> Option<u64> {
-        lock_registry().as_ref().map(|(generation, _)| *generation)
+        lock_registry()
+            .live
+            .as_ref()
+            .map(|engine| engine.generation)
     }
 
     fn crash_reasons(events: &EventBus) -> Vec<String> {
@@ -1796,6 +1869,62 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn final_process_shutdown_joins_cleanup_without_holding_registry_lock() {
+        let registry = Arc::new(Mutex::new(EngineRegistry {
+            live: None,
+            shutting_down: false,
+        }));
+        let (sender, receiver) = crossbeam_channel::unbounded::<Registration>();
+        let cleanup_finished = Arc::new(AtomicBool::new(false));
+        let worker_registry = registry.clone();
+        let finished = cleanup_finished.clone();
+        let thread = std::thread::spawn(move || {
+            assert!(receiver.recv().is_err());
+            // The real engine needs this lock to retire after disconnect.
+            assert!(worker_registry.try_lock().is_ok());
+            finished.store(true, Ordering::Release);
+        });
+        registry.lock().unwrap().live = Some(EngineThread {
+            generation: 0,
+            sender,
+            thread: Some(thread),
+        });
+        shutdown_registry(&registry);
+        assert!(cleanup_finished.load(Ordering::Acquire));
+        assert!(registry.lock().unwrap().shutting_down);
+        shutdown_registry(&registry);
+        assert!(registry.lock().unwrap().live.is_none());
+    }
+
+    #[test]
+    fn final_process_shutdown_releases_queued_dormant_cards() {
+        let generation = ENGINE_GENERATIONS.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let (teardown, done) = crossbeam_channel::bounded(0);
+        sender
+            .send(Registration {
+                mailbox: CommandMailbox::new(),
+                events: EventBus::new(),
+                restore: restore_state(),
+                visible: false,
+                fallback_factory: None,
+                teardown,
+            })
+            .unwrap();
+        let thread = std::thread::spawn(move || Engine::run(generation, receiver));
+        let registry = Mutex::new(EngineRegistry {
+            live: Some(EngineThread {
+                generation,
+                sender,
+                thread: Some(thread),
+            }),
+            shutting_down: false,
+        });
+        shutdown_registry(&registry);
+        assert!(matches!(done.try_recv(), Err(TryRecvError::Disconnected)));
     }
 
     /// `retire` never runs on the panic path, so the registry keeps pointing at
@@ -1809,7 +1938,11 @@ mod tests {
         let (dead_sender, dead_receiver) = crossbeam_channel::unbounded();
         drop(dead_receiver);
         let dead_generation = ENGINE_GENERATIONS.fetch_add(1, Ordering::Relaxed);
-        *lock_registry() = Some((dead_generation, dead_sender));
+        lock_registry().live = Some(EngineThread {
+            generation: dead_generation,
+            sender: dead_sender,
+            thread: None,
+        });
 
         let events = EventBus::new();
         let (teardown, teardown_done) = crossbeam_channel::bounded(0);
@@ -1840,8 +1973,9 @@ mod tests {
         );
         assert!(
             lock_registry()
+                .live
                 .as_ref()
-                .is_none_or(|(live, _)| *live != dead_generation),
+                .is_none_or(|live| live.generation != dead_generation),
             "the dead generation must not survive in the registry"
         );
     }

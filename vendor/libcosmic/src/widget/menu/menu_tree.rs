@@ -149,7 +149,11 @@ where
             .height(Length::Fill)
             .width(Length::Fill),
     )
-    .height(Length::Fixed(36.0))
+    // Preserve the ordinary row height while allowing the default text's
+    // relative line box and vertical padding at larger interface sizes.
+    .height(Length::Fixed(
+        36.0_f32.max((widget::text::default_size() * 1.3 + 8.0).ceil()),
+    ))
     .padding([4, 16])
     .width(Length::Fill)
     .class(theme::Button::MenuItem)

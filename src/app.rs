@@ -36,6 +36,7 @@ mod review_request_ui;
 mod safety_tests;
 mod session_recovery;
 mod settings_ui;
+mod settings_watch;
 mod shared_views;
 mod sidebar_selection_ui;
 mod terminal_adoption;
@@ -274,6 +275,9 @@ impl NoticeSeverity {
 struct TransientNotice {
     severity: NoticeSeverity,
     message: String,
+    key: Option<String>,
+    details: Option<String>,
+    targets: Vec<CardId>,
 }
 
 /// Notices retained for review. Bounded because nothing else bounds them: the
@@ -288,6 +292,8 @@ struct LoggedNotice {
     /// Repeats of an identical message collapse onto one entry rather than
     /// flooding the log; a failing poll would otherwise evict everything else.
     repeats: u32,
+    expires_at: Option<Instant>,
+    details_open: bool,
 }
 
 /// The shell's notice history: a bounded ring plus the identity counter that
@@ -299,7 +305,36 @@ struct NoticeLog {
 }
 
 impl NoticeLog {
+    fn resolve(&mut self, key: &str) {
+        self.entries
+            .retain(|entry| entry.notice.key.as_deref() != Some(key));
+    }
+
+    fn resolve_target(&mut self, key: &str, card: CardId) {
+        self.entries.retain_mut(|entry| {
+            if entry.notice.key.as_deref() != Some(key) {
+                return true;
+            }
+            entry.notice.targets.retain(|target| *target != card);
+            !entry.notice.targets.is_empty()
+        });
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.entries
+            .retain(|entry| entry.expires_at.is_none_or(|expiry| expiry > now));
+    }
+
     fn record(&mut self, notice: TransientNotice) {
+        self.record_at(notice, Instant::now());
+    }
+
+    fn record_at(&mut self, notice: TransientNotice, now: Instant) {
+        let expires_at =
+            (notice.severity == NoticeSeverity::Success).then(|| now + Duration::from_secs(6));
+        if let Some(key) = notice.key.as_deref() {
+            self.resolve(key);
+        }
         // Scanning the whole log rather than only its tail is what makes
         // deduplication survive interleaving: a poll that raises two failures
         // in turn would otherwise alternate them forever and fill the log with
@@ -308,6 +343,7 @@ impl NoticeLog {
         if let Some(index) = self.entries.iter().position(|entry| entry.notice == notice) {
             let mut entry = self.entries.remove(index).expect("index came from the log");
             entry.repeats = entry.repeats.saturating_add(1);
+            entry.expires_at = expires_at;
             self.entries.push_back(entry);
             return;
         }
@@ -316,13 +352,19 @@ impl NoticeLog {
             id: self.next_id,
             notice,
             repeats: 1,
+            expires_at,
+            details_open: false,
         });
         while self.entries.len() > NOTICE_LOG_CAPACITY {
-            // Keep unresolved failures visible when transient server messages
-            // arrive faster than their expiry. Within a severity, retire oldest.
-            let oldest = self.entries.iter().enumerate()
+            // Short-lived success traffic must not hide an unresolved failure.
+            // Within one severity, evict the oldest entry to keep the log bounded.
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
                 .min_by_key(|(_, entry)| entry.notice.severity)
-                .map(|(index, _)| index).expect("overflowing log is nonempty");
+                .map(|(index, _)| index)
+                .expect("an overflowing notice log is nonempty");
             self.entries.remove(oldest);
         }
     }
@@ -337,9 +379,8 @@ impl NoticeLog {
 
     /// Newest first: the log reads downward from the most recent event.
     ///
-    /// Nothing retires on a timer. A notice the user never saw is worse than
-    /// one that waits: the header carries the severity until it is dismissed,
-    /// and capacity is what bounds the log.
+    /// Successes retire after a short acknowledgement; failures remain until
+    /// the owning operation resolves them or the user dismisses them.
     fn recent(&self) -> impl Iterator<Item = &LoggedNotice> {
         self.entries.iter().rev()
     }
@@ -463,7 +504,25 @@ impl TransientNotice {
         Self {
             severity,
             message: message.into(),
+            key: None,
+            details: None,
+            targets: Vec::new(),
         }
+    }
+
+    fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    fn details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
+    }
+
+    fn targets(mut self, targets: impl IntoIterator<Item = CardId>) -> Self {
+        self.targets = targets.into_iter().collect();
+        self
     }
 
     fn success(message: impl Into<String>) -> Self {
@@ -566,7 +625,8 @@ fn notice_surface<'a>(
 /// foreground and the detail lines in the ambient one.
 fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_BODY)
+        .font(design::interface_font())
+        .size(design::interface_size())
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .into()
@@ -577,7 +637,8 @@ fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
 /// `notice_surface_detail`.
 fn notice_detail<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_CAPTION)
+        .font(design::interface_font())
+        .size(design::scaled_interface_size(design::TEXT_CAPTION))
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Custom(design::muted_text))
@@ -594,7 +655,8 @@ fn notice_surface_detail<'a>(
     text: impl Into<Cow<'a, str>> + 'a,
 ) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_CAPTION)
+        .font(design::interface_font())
+        .size(design::scaled_interface_size(design::TEXT_CAPTION))
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Color(severity.detail_color()))
@@ -2096,11 +2158,13 @@ struct SettingsSave {
     generation: u64,
     path: PathBuf,
     base: AppSettings,
+    base_observed_at: Option<Instant>,
     desired: AppSettings,
     view: WindowView,
     store: Option<Arc<crate::persistence::StateStore>>,
     lane: Arc<std::sync::Mutex<Option<SettingsSaved>>>,
-    reset: bool,
+    reset: Option<u64>,
+    reset_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2108,6 +2172,13 @@ pub struct SettingsSaved {
     generation: u64,
     path: PathBuf,
     settings: AppSettings,
+    captured_base: AppSettings,
+    desired: AppSettings,
+    reload_error: Option<String>,
+    observed_at: Instant,
+    undo: bool,
+    backup: Option<PathBuf>,
+    reset: Option<u64>,
 }
 
 impl SettingsSave {
@@ -2121,23 +2192,84 @@ impl SettingsSave {
         {
             return Ok(saved.clone());
         }
+        let base = if self.reset.is_some() && self.reset_keys.is_empty() {
+            self.base.clone()
+        } else {
+            // Earlier queued saves can contain edits this capture reverses.
+            // Rebase those edits onto this capture's observed external baseline;
+            // completion time alone cannot make an old snapshot authoritative.
+            match lane.as_ref().filter(|saved| {
+                !saved.undo
+                    && self
+                        .base_observed_at
+                        .is_none_or(|at| at < saved.observed_at)
+            }) {
+                Some(saved) => {
+                    settings::merge_live(&saved.captured_base, &saved.desired, &self.base)
+                        .map_err(|error| error.to_string())?
+                }
+                None => self.base.clone(),
+            }
+        };
         if let Some(store) = self.store {
             let value = serde_json::to_string(&self.view).map_err(|error| error.to_string())?;
             store
                 .save_window_view(&value)
                 .map_err(|error| error.to_string())?;
         }
-        if self.reset {
-            settings::save(&self.path, &self.desired)
+        let (backup, observed) = if let Some(reset) = self.reset {
+            if let Some(backup) = lane
+                .as_ref()
+                .filter(|saved| saved.reset == Some(reset))
+                .and_then(|saved| saved.backup.clone())
+            {
+                if self.reset_keys.is_empty() {
+                    settings::save(&self.path, &self.desired).map_err(|error| error.to_string())?;
+                } else {
+                    settings::save_merged_observed(&self.path, &base, &self.desired)
+                        .map_err(|error| error.to_string())?;
+                }
+                (Some(backup), settings::load_live_observed(&self.path))
+            } else {
+                let backup = if self.reset_keys.is_empty() {
+                    settings::reset_with_backup(&self.path, &self.desired)
+                } else {
+                    settings::reset_keys_merged_with_backup(
+                        &self.path,
+                        &base,
+                        &self.desired,
+                        &self.reset_keys,
+                    )
+                }
+                .map_err(|error| error.to_string())?;
+                (Some(backup), settings::load_live_observed(&self.path))
+            }
         } else {
-            let base = lane.as_ref().map_or(&self.base, |saved| &saved.settings);
-            settings::save_merged(&self.path, base, &self.desired)
-        }
-        .map_err(|error| error.to_string())?;
+            let saved = settings::save_merged_observed(&self.path, &base, &self.desired)
+                .map_err(|error| error.to_string())?;
+            (
+                None,
+                settings::LiveSettings {
+                    result: saved.reload_error.map_or(Ok(saved.settings), Err),
+                    observed_at: saved.observed_at,
+                },
+            )
+        };
+        let (settings, reload_error) = match observed.result {
+            Ok(settings) => (settings, None),
+            Err(error) => (self.desired.clone(), Some(error)),
+        };
         let saved = SettingsSaved {
             generation: self.generation,
             path: self.path,
-            settings: self.desired,
+            settings,
+            captured_base: self.base,
+            desired: self.desired,
+            reload_error,
+            observed_at: observed.observed_at,
+            undo: false,
+            backup,
+            reset: self.reset,
         };
         *lane = Some(saved.clone());
         Ok(saved)
@@ -2520,7 +2652,11 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SettingsSearchChanged(_)
         | Message::SettingsChanged { .. }
         | Message::SettingsDraftChanged { .. }
+        | Message::SettingsNumberDraftChanged { .. }
         | Message::ResetSettings
+        | Message::ResetSettingsCategory(_)
+        | Message::OpenSettingsFile { .. }
+        | Message::UndoSettingsReset
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
@@ -2584,6 +2720,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::SettingsSearchChanged(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
+                | Message::SettingsNumberDraftChanged { .. }
                 | Message::ResetSettings
                 | Message::ConfirmResetSettings
                 | Message::CancelResetSettings
@@ -2635,7 +2772,9 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::PullRequestUi(
                 pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
             )
-            | Message::ChromeUi(chrome_ui::Action::Launch(_))
+            | Message::ChromeUi(
+                chrome_ui::Action::Launch(_) | chrome_ui::Action::FocusNoticeCard(_)
+            )
             | Message::FocusCard(_)
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
@@ -2735,6 +2874,10 @@ pub enum SettingsField {
     Notifications(crate::notifications::Field),
     AppTheme,
     UiScale,
+    InterfaceFontFamily,
+    InterfaceFontSize,
+    ChatFontFamily,
+    ChatFontSize,
     TerminalLineHeight,
     TerminalPadding,
     TerminalScrollSize,
@@ -2816,6 +2959,91 @@ pub enum SettingsField {
 }
 
 impl SettingsField {
+    const PREFERENCES: &[Self] = &[
+        Self::AppTheme,
+        Self::UiScale,
+        Self::InterfaceFontFamily,
+        Self::InterfaceFontSize,
+        Self::ChatFontFamily,
+        Self::ChatFontSize,
+        Self::TerminalLineHeight,
+        Self::TerminalPadding,
+        Self::TerminalScrollSize,
+        Self::TerminalScrollSpeed,
+        Self::TerminalCursorStyle,
+        Self::TerminalTheme,
+        Self::MaxHotCards,
+        Self::HibernationDelayMs,
+        Self::TerminalFontSize,
+        Self::TerminalFontFamily,
+        Self::ConfirmMultilinePaste,
+        Self::BrowserSearchUrl,
+        Self::EditorFontFamily,
+        Self::EditorFontSize,
+        Self::TerminalScrollbackLines,
+        Self::ManagedWorktreeDirectory,
+        Self::AutoDeleteMergedWorktrees,
+        Self::WorktreeSort,
+        Self::DefaultWorktreePane,
+        Self::DefaultChannelPane,
+        Self::DefaultColumnFraction,
+        Self::LinkOpenDestination,
+        Self::EditorAutoSave,
+        Self::EditorWrapLines,
+        Self::DiffHideUnchanged,
+        Self::ChatEnterSends,
+        Self::ChatExpandToolGroups,
+        Self::ChatContentFraction,
+        Self::DefaultNativePaneFraction,
+        Self::ShowStatusBar,
+        Self::ShowWorktreeChangesIcons,
+        Self::RelaunchAgentsOnUpgrade,
+        Self::CheckForUpdates,
+        Self::EditorSyntaxTheme,
+        Self::ConfirmTerminalClose,
+        Self::FocusFollowsMouse,
+        Self::LinkOpenGesture,
+        Self::PullRequestOpenTarget,
+    ];
+
+    fn config_key(self) -> String {
+        if let Self::Notifications(field) = self {
+            use crate::notifications::Field;
+            let key = match field {
+                Field::Enabled => "enabled",
+                Field::Success => "success",
+                Field::Failure => "failure",
+                Field::Waiting => "waiting",
+                Field::WhileFocused => "while_focused",
+                Field::ReviewRequests => "review_requests",
+            };
+            return format!("notifications.{key}");
+        }
+        let name = format!("{self:?}");
+        if let Some(action) = name.strip_prefix("Shortcut") {
+            let action = match action {
+                "NewThread" => "NewNativeThread",
+                other => other,
+            };
+            let mut key = String::from("keyboard_shortcuts.");
+            for (index, ch) in action.chars().enumerate() {
+                if index > 0 && (ch.is_uppercase() || ch.is_ascii_digit()) {
+                    key.push('_');
+                }
+                key.extend(ch.to_lowercase());
+            }
+            return key;
+        }
+        let mut key = String::new();
+        for (index, ch) in name.chars().enumerate() {
+            if index > 0 && ch.is_uppercase() {
+                key.push('_');
+            }
+            key.extend(ch.to_lowercase());
+        }
+        key
+    }
+
     /// The shortcut table in `KeyboardShortcuts::actions` order.
     const SHORTCUTS: [Self; 38] = [
         Self::ShortcutNewTerminal,
@@ -2870,6 +3098,10 @@ impl SettingsField {
             Self::Notifications(Field::ReviewRequests) => "Review requests",
             Self::Notifications(Field::WhileFocused) => "Notify while focused",
             Self::AppTheme => "App theme",
+            Self::InterfaceFontFamily => "Interface font family",
+            Self::InterfaceFontSize => "Interface font size",
+            Self::ChatFontFamily => "Chat font family",
+            Self::ChatFontSize => "Chat font size",
             Self::UiScale => "Interface scale",
             Self::TerminalLineHeight => "Line height",
             Self::TerminalPadding => "Inner padding",
@@ -2878,7 +3110,7 @@ impl SettingsField {
             Self::TerminalCursorStyle => "Cursor shape",
             Self::TerminalTheme => "Color theme",
             Self::MaxHotCards => "Maximum hot panes",
-            Self::HibernationDelayMs => "Hibernation delay (ms)",
+            Self::HibernationDelayMs => "Hibernation delay",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
             Self::TerminalScrollbackLines => "Scrollback lines",
@@ -2958,9 +3190,10 @@ impl SettingsField {
             Self::Notifications(_) => SettingsCategory::Notifications,
             Self::AppTheme
             | Self::UiScale
+            | Self::InterfaceFontFamily
+            | Self::InterfaceFontSize
             | Self::ShowStatusBar
             | Self::ShowWorktreeChangesIcons
-            | Self::AutoDeleteMergedWorktrees
             | Self::DefaultColumnFraction => SettingsCategory::Appearance,
             Self::TerminalLineHeight
             | Self::TerminalPadding
@@ -2974,16 +3207,19 @@ impl SettingsField {
             | Self::ConfirmTerminalClose
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
-            Self::MaxHotCards
+            Self::AutoDeleteMergedWorktrees
+            | Self::MaxHotCards
             | Self::HibernationDelayMs
             | Self::ManagedWorktreeDirectory
             | Self::WorktreeSort
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
             | Self::FocusFollowsMouse => SettingsCategory::General,
-            Self::ChatEnterSends | Self::ChatExpandToolGroups | Self::ChatContentFraction => {
-                SettingsCategory::NativeChat
-            }
+            Self::ChatFontFamily
+            | Self::ChatFontSize
+            | Self::ChatEnterSends
+            | Self::ChatExpandToolGroups
+            | Self::ChatContentFraction => SettingsCategory::NativeChat,
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
             Self::EditorAutoSave
             | Self::EditorWrapLines
@@ -3144,9 +3380,15 @@ impl ShortcutDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
+    /// Exact numeric text shown while editing, before unit conversion.
+    numeric_display: HashMap<SettingsField, String>,
     notifications: crate::notifications::Preferences,
     app_theme: String,
     ui_scale: String,
+    interface_font_family: String,
+    interface_font_size: String,
+    chat_font_family: String,
+    chat_font_size: String,
     terminal_line_height: String,
     terminal_padding: String,
     terminal_scroll_size: String,
@@ -3194,9 +3436,14 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
+            numeric_display: HashMap::new(),
             notifications: settings.notifications,
             app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
+            interface_font_family: settings.interface_font_family.clone(),
+            interface_font_size: settings.interface_font_size.to_string(),
+            chat_font_family: settings.chat_font_family.clone(),
+            chat_font_size: settings.chat_font_size.to_string(),
             terminal_line_height: settings.terminal_line_height.to_string(),
             terminal_padding: settings.terminal_padding.to_string(),
             terminal_scroll_size: settings.terminal_scroll_size.to_string(),
@@ -3261,6 +3508,10 @@ impl SettingsDraft {
             SettingsField::Notifications(field) => self.notifications.set(field, value == "true"),
             SettingsField::AppTheme => self.app_theme = value,
             SettingsField::UiScale => self.ui_scale = value,
+            SettingsField::InterfaceFontFamily => self.interface_font_family = value,
+            SettingsField::InterfaceFontSize => self.interface_font_size = value,
+            SettingsField::ChatFontFamily => self.chat_font_family = value,
+            SettingsField::ChatFontSize => self.chat_font_size = value,
             SettingsField::TerminalLineHeight => self.terminal_line_height = value,
             SettingsField::TerminalPadding => self.terminal_padding = value,
             SettingsField::TerminalScrollSize => self.terminal_scroll_size = value,
@@ -3412,6 +3663,277 @@ impl SettingsDraft {
             }
         }
     }
+    /// Refresh unrelated controls while keeping only text the user is still editing.
+    fn preserve_field(&mut self, previous: &Self, field: SettingsField) {
+        match field {
+            SettingsField::Notifications(field) => self
+                .notifications
+                .set(field, previous.notifications.get(field)),
+            SettingsField::AppTheme => self.app_theme = previous.app_theme.clone(),
+            SettingsField::UiScale => self.ui_scale = previous.ui_scale.clone(),
+            SettingsField::InterfaceFontFamily => {
+                self.interface_font_family = previous.interface_font_family.clone()
+            }
+            SettingsField::InterfaceFontSize => {
+                self.interface_font_size = previous.interface_font_size.clone()
+            }
+            SettingsField::ChatFontFamily => {
+                self.chat_font_family = previous.chat_font_family.clone()
+            }
+            SettingsField::ChatFontSize => self.chat_font_size = previous.chat_font_size.clone(),
+            SettingsField::TerminalLineHeight => {
+                self.terminal_line_height = previous.terminal_line_height.clone()
+            }
+            SettingsField::TerminalPadding => {
+                self.terminal_padding = previous.terminal_padding.clone()
+            }
+            SettingsField::TerminalScrollSize => {
+                self.terminal_scroll_size = previous.terminal_scroll_size.clone()
+            }
+            SettingsField::TerminalScrollSpeed => {
+                self.terminal_scroll_speed = previous.terminal_scroll_speed.clone()
+            }
+            SettingsField::TerminalTheme => self.terminal_theme = previous.terminal_theme.clone(),
+            SettingsField::TerminalCursorStyle => {
+                self.terminal_cursor_style = previous.terminal_cursor_style.clone()
+            }
+            SettingsField::MaxHotCards => self.max_hot_cards = previous.max_hot_cards.clone(),
+            SettingsField::HibernationDelayMs => {
+                self.hibernation_delay_ms = previous.hibernation_delay_ms.clone()
+            }
+            SettingsField::TerminalFontSize => {
+                self.terminal_font_size = previous.terminal_font_size.clone()
+            }
+            SettingsField::TerminalFontFamily => {
+                self.terminal_font_family = previous.terminal_font_family.clone()
+            }
+            SettingsField::ConfirmMultilinePaste => {
+                self.confirm_multiline_paste = previous.confirm_multiline_paste
+            }
+            SettingsField::BrowserSearchUrl => {
+                self.browser_search_url = previous.browser_search_url.clone()
+            }
+            SettingsField::EditorFontFamily => {
+                self.editor_font_family = previous.editor_font_family.clone()
+            }
+            SettingsField::EditorFontSize => {
+                self.editor_font_size = previous.editor_font_size.clone()
+            }
+            SettingsField::TerminalScrollbackLines => {
+                self.terminal_scrollback_lines = previous.terminal_scrollback_lines.clone()
+            }
+            SettingsField::ManagedWorktreeDirectory => {
+                self.managed_worktree_directory = previous.managed_worktree_directory.clone()
+            }
+            SettingsField::AutoDeleteMergedWorktrees => {
+                self.auto_delete_merged_worktrees = previous.auto_delete_merged_worktrees
+            }
+            SettingsField::WorktreeSort => self.worktree_sort = previous.worktree_sort.clone(),
+            SettingsField::DefaultWorktreePane => {
+                self.default_worktree_pane = previous.default_worktree_pane
+            }
+            SettingsField::DefaultChannelPane => {
+                self.default_channel_pane = previous.default_channel_pane
+            }
+            SettingsField::DefaultColumnFraction => {
+                self.default_column_fraction = previous.default_column_fraction.clone()
+            }
+            SettingsField::EditorAutoSave => self.editor_auto_save = previous.editor_auto_save,
+            SettingsField::EditorWrapLines => self.editor_wrap_lines = previous.editor_wrap_lines,
+            SettingsField::DiffHideUnchanged => {
+                self.diff_hide_unchanged = previous.diff_hide_unchanged
+            }
+            SettingsField::ConfirmTerminalClose => {
+                self.confirm_terminal_close = previous.confirm_terminal_close
+            }
+            SettingsField::ChatEnterSends => self.chat_enter_sends = previous.chat_enter_sends,
+            SettingsField::ChatExpandToolGroups => {
+                self.chat_expand_tool_groups = previous.chat_expand_tool_groups
+            }
+            SettingsField::ChatContentFraction => {
+                self.chat_content_fraction = previous.chat_content_fraction.clone()
+            }
+            SettingsField::DefaultNativePaneFraction => {
+                self.default_native_pane_fraction = previous.default_native_pane_fraction.clone()
+            }
+            SettingsField::ShowStatusBar => self.show_status_bar = previous.show_status_bar,
+            SettingsField::ShowWorktreeChangesIcons => {
+                self.show_worktree_changes_icons = previous.show_worktree_changes_icons
+            }
+            SettingsField::RelaunchAgentsOnUpgrade => {
+                self.relaunch_agents_on_upgrade = previous.relaunch_agents_on_upgrade
+            }
+            SettingsField::CheckForUpdates => self.check_for_updates = previous.check_for_updates,
+            SettingsField::EditorSyntaxTheme => {
+                self.editor_syntax_theme = previous.editor_syntax_theme
+            }
+            SettingsField::FocusFollowsMouse => {
+                self.focus_follows_mouse = previous.focus_follows_mouse
+            }
+            SettingsField::LinkOpenDestination => {
+                self.link_open_destination = previous.link_open_destination
+            }
+            SettingsField::LinkOpenGesture => self.link_open_gesture = previous.link_open_gesture,
+            SettingsField::ShortcutNewTerminal => {
+                self.keyboard_shortcuts.new_terminal =
+                    previous.keyboard_shortcuts.new_terminal.clone()
+            }
+            SettingsField::ShortcutToggleProjects => {
+                self.keyboard_shortcuts.toggle_projects =
+                    previous.keyboard_shortcuts.toggle_projects.clone()
+            }
+            SettingsField::ShortcutRenamePane => {
+                self.keyboard_shortcuts.rename_pane =
+                    previous.keyboard_shortcuts.rename_pane.clone()
+            }
+            SettingsField::ShortcutCommandPalette => {
+                self.keyboard_shortcuts.command_palette =
+                    previous.keyboard_shortcuts.command_palette.clone()
+            }
+            SettingsField::ShortcutNewThread => {
+                self.keyboard_shortcuts.new_native_thread =
+                    previous.keyboard_shortcuts.new_native_thread.clone()
+            }
+            SettingsField::ShortcutChatPermissions => {
+                self.keyboard_shortcuts.chat_permissions =
+                    previous.keyboard_shortcuts.chat_permissions.clone()
+            }
+            SettingsField::ShortcutChatModel => {
+                self.keyboard_shortcuts.chat_model = previous.keyboard_shortcuts.chat_model.clone()
+            }
+            SettingsField::ShortcutChatAccount => {
+                self.keyboard_shortcuts.chat_account =
+                    previous.keyboard_shortcuts.chat_account.clone()
+            }
+            SettingsField::ShortcutToggleInspector => {
+                self.keyboard_shortcuts.toggle_inspector =
+                    previous.keyboard_shortcuts.toggle_inspector.clone()
+            }
+            SettingsField::ShortcutOpenSettings => {
+                self.keyboard_shortcuts.open_settings =
+                    previous.keyboard_shortcuts.open_settings.clone()
+            }
+            SettingsField::ShortcutMovePaneLeft => {
+                self.keyboard_shortcuts.move_pane_left =
+                    previous.keyboard_shortcuts.move_pane_left.clone()
+            }
+            SettingsField::ShortcutMovePaneRight => {
+                self.keyboard_shortcuts.move_pane_right =
+                    previous.keyboard_shortcuts.move_pane_right.clone()
+            }
+            SettingsField::ShortcutReopenPane => {
+                self.keyboard_shortcuts.reopen_pane =
+                    previous.keyboard_shortcuts.reopen_pane.clone()
+            }
+            SettingsField::ShortcutFocusPane1 => {
+                self.keyboard_shortcuts.focus_pane_1 =
+                    previous.keyboard_shortcuts.focus_pane_1.clone()
+            }
+            SettingsField::ShortcutFocusPane2 => {
+                self.keyboard_shortcuts.focus_pane_2 =
+                    previous.keyboard_shortcuts.focus_pane_2.clone()
+            }
+            SettingsField::ShortcutFocusPane3 => {
+                self.keyboard_shortcuts.focus_pane_3 =
+                    previous.keyboard_shortcuts.focus_pane_3.clone()
+            }
+            SettingsField::ShortcutFocusPane4 => {
+                self.keyboard_shortcuts.focus_pane_4 =
+                    previous.keyboard_shortcuts.focus_pane_4.clone()
+            }
+            SettingsField::ShortcutFocusPane5 => {
+                self.keyboard_shortcuts.focus_pane_5 =
+                    previous.keyboard_shortcuts.focus_pane_5.clone()
+            }
+            SettingsField::ShortcutFocusPane6 => {
+                self.keyboard_shortcuts.focus_pane_6 =
+                    previous.keyboard_shortcuts.focus_pane_6.clone()
+            }
+            SettingsField::ShortcutFocusPane7 => {
+                self.keyboard_shortcuts.focus_pane_7 =
+                    previous.keyboard_shortcuts.focus_pane_7.clone()
+            }
+            SettingsField::ShortcutFocusPane8 => {
+                self.keyboard_shortcuts.focus_pane_8 =
+                    previous.keyboard_shortcuts.focus_pane_8.clone()
+            }
+            SettingsField::ShortcutFocusPane9 => {
+                self.keyboard_shortcuts.focus_pane_9 =
+                    previous.keyboard_shortcuts.focus_pane_9.clone()
+            }
+            SettingsField::ShortcutNewChannel => {
+                self.keyboard_shortcuts.new_channel =
+                    previous.keyboard_shortcuts.new_channel.clone()
+            }
+            SettingsField::ShortcutClonePane => {
+                self.keyboard_shortcuts.clone_pane = previous.keyboard_shortcuts.clone_pane.clone()
+            }
+            SettingsField::ShortcutCloseFocusedColumn => {
+                self.keyboard_shortcuts.close_focused_column =
+                    previous.keyboard_shortcuts.close_focused_column.clone()
+            }
+            SettingsField::ShortcutFindInPane => {
+                self.keyboard_shortcuts.find_in_pane =
+                    previous.keyboard_shortcuts.find_in_pane.clone()
+            }
+            SettingsField::ShortcutSearchProjects => {
+                self.keyboard_shortcuts.search_projects =
+                    previous.keyboard_shortcuts.search_projects.clone()
+            }
+            SettingsField::ShortcutPreviousColumn => {
+                self.keyboard_shortcuts.previous_column =
+                    previous.keyboard_shortcuts.previous_column.clone()
+            }
+            SettingsField::ShortcutNextColumn => {
+                self.keyboard_shortcuts.next_column =
+                    previous.keyboard_shortcuts.next_column.clone()
+            }
+            SettingsField::ShortcutCyclePaneWidth => {
+                self.keyboard_shortcuts.cycle_pane_width =
+                    previous.keyboard_shortcuts.cycle_pane_width.clone()
+            }
+            SettingsField::ShortcutPreviousWorkspace => {
+                self.keyboard_shortcuts.previous_workspace =
+                    previous.keyboard_shortcuts.previous_workspace.clone()
+            }
+            SettingsField::ShortcutNextWorkspace => {
+                self.keyboard_shortcuts.next_workspace =
+                    previous.keyboard_shortcuts.next_workspace.clone()
+            }
+            SettingsField::PullRequestOpenTarget => {
+                self.pull_request_open_target = previous.pull_request_open_target
+            }
+            SettingsField::ShortcutReviewToggleViewed => {
+                self.keyboard_shortcuts.review_toggle_viewed =
+                    previous.keyboard_shortcuts.review_toggle_viewed.clone()
+            }
+            SettingsField::ShortcutReviewNextFile => {
+                self.keyboard_shortcuts.review_next_file =
+                    previous.keyboard_shortcuts.review_next_file.clone()
+            }
+            SettingsField::ShortcutReviewPreviousFile => {
+                self.keyboard_shortcuts.review_previous_file =
+                    previous.keyboard_shortcuts.review_previous_file.clone()
+            }
+            SettingsField::ShortcutReviewNextUnviewed => {
+                self.keyboard_shortcuts.review_next_unviewed =
+                    previous.keyboard_shortcuts.review_next_unviewed.clone()
+            }
+            SettingsField::ShortcutReviewNextChange => {
+                self.keyboard_shortcuts.review_next_change =
+                    previous.keyboard_shortcuts.review_next_change.clone()
+            }
+            SettingsField::ShortcutReviewPreviousChange => {
+                self.keyboard_shortcuts.review_previous_change =
+                    previous.keyboard_shortcuts.review_previous_change.clone()
+            }
+        }
+        if let Some(raw) = previous.numeric_display.get(&field) {
+            self.numeric_display.insert(field, raw.clone());
+        } else {
+            self.numeric_display.remove(&field);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3429,6 +3951,22 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::InterfaceFontFamily => {
+            next.interface_font_family = value.into();
+            Ok(())
+        }
+        SettingsField::InterfaceFontSize => value
+            .parse::<f32>()
+            .map(|size| next.interface_font_size = size)
+            .map_err(|_| "Enter a font size between 10 and 24.".into()),
+        SettingsField::ChatFontFamily => {
+            next.chat_font_family = value.into();
+            Ok(())
+        }
+        SettingsField::ChatFontSize => value
+            .parse::<f32>()
+            .map(|size| next.chat_font_size = size)
+            .map_err(|_| "Enter a font size between 8 and 40.".into()),
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
             Ok(())
@@ -3657,7 +4195,8 @@ fn settings_update(
                     Ok(())
                 }
                 None => Err(
-                    "Choose a preset or configure custom_terminal_theme in settings.toml.".into(),
+                    "Choose a preset, or configure a custom terminal palette in the settings file."
+                        .into(),
                 ),
             }
         }
@@ -3823,10 +4362,10 @@ fn settings_update(
     let attempted = next.clone();
     let next = match next.validate() {
         Ok(next) => next,
-        Err(error) => {
-            return SettingsDecision::Invalid(
-                refusal(field, &attempted).unwrap_or_else(|| error.to_string()),
-            );
+        Err(_) => {
+            return SettingsDecision::Invalid(refusal(field, &attempted).unwrap_or_else(|| {
+                format!("Choose a valid value for {}.", field.label().to_lowercase())
+            }));
         }
     };
     if next == *current {
@@ -3856,7 +4395,35 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
         ),
         SettingsField::MaxHotCards => format!("{label} must be a whole number, at least 1."),
         SettingsField::HibernationDelayMs => {
-            "Hibernation delay must be a whole number of milliseconds.".to_owned()
+            "Hibernation delay must be a non-negative number of seconds.".to_owned()
+        }
+        SettingsField::InterfaceFontSize => "Font size must be between 10 and 24.".to_owned(),
+        SettingsField::EditorFontSize
+        | SettingsField::ChatFontSize
+        | SettingsField::TerminalFontSize => "Font size must be between 8 and 40.".to_owned(),
+        SettingsField::EditorFontFamily
+        | SettingsField::InterfaceFontFamily
+        | SettingsField::ChatFontFamily => {
+            "Enter a font family name of at most 128 bytes, or leave it blank to use the default."
+                .to_owned()
+        }
+        SettingsField::BrowserSearchUrl => {
+            "Search URL must use HTTP or HTTPS and include {query}.".to_owned()
+        }
+        SettingsField::UiScale => "Interface scale must be between 80% and 150%.".to_owned(),
+        SettingsField::TerminalLineHeight => {
+            "Line height must be between 1 and 2 times the font size.".to_owned()
+        }
+        SettingsField::TerminalPadding => {
+            "Inner padding must be between 0 and 24 pixels.".to_owned()
+        }
+        SettingsField::TerminalScrollSpeed => {
+            "Scroll speed must be between 0.25 and 4 times the default.".to_owned()
+        }
+        SettingsField::ChatContentFraction
+        | SettingsField::DefaultNativePaneFraction
+        | SettingsField::DefaultColumnFraction => {
+            "Width must be a number between 25% and 100%.".to_owned()
         }
         SettingsField::TerminalFontFamily
             if attempted.terminal_font_family.len() > settings::MAX_TERMINAL_FONT_FAMILY_BYTES =>
@@ -3890,6 +4457,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
 fn shortcut_refusal(action: usize, shortcuts: &KeyboardShortcuts) -> Option<String> {
     let fault = shortcuts.fault()?;
     let Some(owner) = fault.conflicts_with else {
+        if fault.action != action {
+            return None;
+        }
         let settings::SettingsError::InvalidShortcut(reason) = fault.error else {
             return None;
         };
@@ -4332,6 +4902,10 @@ pub enum Message {
         field: SettingsField,
         value: String,
     },
+    SettingsNumberDraftChanged {
+        field: SettingsField,
+        value: String,
+    },
     SettingsAutosave {
         field: SettingsField,
         generation: u64,
@@ -4364,6 +4938,18 @@ pub enum Message {
     DocumentToneStale,
     /// Opens the confirmation; `ConfirmResetSettings` performs the reset.
     ResetSettings,
+    ResetSettingsCategory(SettingsCategory),
+    OpenSettingsFile {
+        reveal: bool,
+    },
+    SettingsFileOpened(Result<(), String>),
+    SettingsReloaded(settings::LiveSettings),
+    UndoSettingsReset,
+    SettingsResetUndone {
+        generation: u64,
+        backup: PathBuf,
+        result: Result<Option<settings::LiveSettings>, String>,
+    },
     ConfirmResetSettings,
     CancelResetSettings,
     SessionSaveHealthChanged(SessionSaveHealthEvent),
@@ -4376,6 +4962,8 @@ pub enum Message {
     DismissStatus,
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
+    ToggleNoticeDetails(u64),
+    ExpireNotices(Instant),
     DismissAllNotices,
 }
 
@@ -4877,6 +5465,7 @@ pub struct Cagents {
     settings_save_generation: u64,
     settings_ack_generation: u64,
     settings_reset_generation: Option<u64>,
+    settings_reset_keys: Vec<String>,
     settings_save_lane: Arc<std::sync::Mutex<Option<SettingsSaved>>>,
     update_prepared: bool,
     update_flush_pending: bool,
@@ -4912,6 +5501,9 @@ pub struct Cagents {
     window_height: f32,
     core: Core,
     settings_path: Option<PathBuf>,
+    settings_reload_error: Option<String>,
+    settings_observed_at: Option<Instant>,
+    settings_backup: Option<PathBuf>,
     settings_write_blocked: bool,
     /// Bounded notice history, fed from `status` at the end of every `update`.
     notices: NoticeLog,
@@ -5010,6 +5602,7 @@ pub struct Cagents {
     workspace_cycle_modifiers: keyboard::Modifiers,
     keyboard_modifiers: keyboard::Modifiers,
     settings_draft: SettingsDraft,
+    settings_font_choices: settings_ui::FontChoices,
     settings_feedback: Option<SettingsFeedback>,
     /// Whether the settings pane held focus after the last update, so the
     /// update that moves focus away can flush the drafts typed into it.
@@ -9305,7 +9898,11 @@ impl Cagents {
                 &self.settings_search,
                 settings_ui::SettingsContext {
                     feedback: self.settings_feedback.as_ref(),
+                    reload_error: self.settings_reload_error.as_deref(),
+                    can_undo: self.settings_backup.is_some(),
                     invalid: &self.settings_invalid,
+                    fonts: &self.settings_font_choices,
+                    terminal_font_size: self.settings.terminal_font_size,
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
@@ -12454,31 +13051,68 @@ impl Cagents {
             generation: self.settings_save_generation,
             path,
             base: self.settings_base.clone(),
+            base_observed_at: self.settings_observed_at,
             desired: self.settings.clone(),
             view,
             store: self.session.as_ref().map(SessionRuntime::operation_store),
             lane: Arc::clone(&self.settings_save_lane),
-            reset: self.settings_reset_generation.is_some(),
+            reset: self.settings_reset_generation,
+            reset_keys: self.settings_reset_keys.clone(),
         })
     }
 
-    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) {
-        if saved.generation >= self.settings_ack_generation {
-            self.settings_ack_generation = saved.generation;
-            self.settings_base = saved.settings;
-            self.settings_path = Some(saved.path);
-            if self
-                .settings_reset_generation
-                .is_some_and(|generation| saved.generation >= generation)
-            {
-                self.settings_reset_generation = None;
-            }
+    fn record_settings_save(&mut self, saved: &SettingsSaved) -> bool {
+        if saved.generation < self.settings_ack_generation {
+            return false;
         }
+        if let Some(backup) = saved.backup.clone() {
+            self.settings_backup = Some(backup);
+        }
+        self.settings_ack_generation = saved.generation;
+        self.settings_path = Some(saved.path.clone());
+        if self
+            .settings_reset_generation
+            .is_some_and(|generation| saved.generation >= generation)
+        {
+            self.settings_reset_generation = None;
+        }
+        true
+    }
+
+    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) -> Task<Message> {
+        if !self.record_settings_save(&saved) {
+            return Task::none();
+        }
+        // The save's UI snapshot is the baseline for edits made while it ran;
+        // actual merged values may include a different window's preferences.
+        if saved.reload_error.is_some()
+            && self
+                .settings_observed_at
+                .is_none_or(|last| saved.observed_at >= last)
+        {
+            self.settings_base = saved.desired.clone();
+        }
+        self.apply_observed_settings(
+            settings::LiveSettings {
+                result: saved.reload_error.map_or(Ok(saved.settings), Err),
+                observed_at: saved.observed_at,
+            },
+            Some(saved.desired),
+        )
     }
 
     fn save_settings_now(&mut self) -> Result<(), String> {
         let saved = self.capture_settings_save()?.run()?;
-        self.acknowledge_settings_save(saved);
+        // Drop folds drafts without live effects. Do not start hibernation,
+        // editor saves or theme work while the application is shutting down.
+        if self.record_settings_save(&saved)
+            && self
+                .settings_observed_at
+                .is_none_or(|last| saved.observed_at >= last)
+        {
+            self.settings_base = saved.settings;
+            self.settings_observed_at = Some(saved.observed_at);
+        }
         Ok(())
     }
 
@@ -12658,6 +13292,12 @@ impl Cagents {
         };
     }
 
+    fn queue_number_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
+        let stored = settings_ui::number_setting_value(field, &value);
+        self.settings_draft.numeric_display.insert(field, value);
+        self.queue_setting_input(field, stored)
+    }
+
     fn queue_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_draft.set(field, value.clone());
         self.settings_generation = self.settings_generation.wrapping_add(1);
@@ -12724,6 +13364,47 @@ impl Cagents {
         }
     }
 
+    /// Retry refused shortcut drafts against the newly saved table. A different
+    /// row may have released the chord they were waiting for.
+    fn retry_shortcut_drafts(&mut self) {
+        loop {
+            let mut progressed = false;
+            let fields: Vec<_> = SettingsField::SHORTCUTS
+                .into_iter()
+                .filter(|field| self.settings_invalid.contains_key(field))
+                .collect();
+            for field in fields {
+                let action = field.shortcut_action().expect("shortcut field");
+                let value = self
+                    .settings_draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered shortcut")
+                    .1
+                    .to_owned();
+                match settings_update(&self.settings, field, &value) {
+                    SettingsDecision::Persist(settings) => {
+                        self.settings = settings;
+                        self.settings_invalid.remove(&field);
+                        progressed = true;
+                    }
+                    SettingsDecision::Unchanged => {
+                        self.settings_invalid.remove(&field);
+                        progressed = true;
+                    }
+                    SettingsDecision::Invalid(reason) => {
+                        self.settings_invalid.insert(field, reason);
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_pending.remove(&field);
         self.settings_draft.set(field, value.clone());
@@ -12735,15 +13416,26 @@ impl Cagents {
             }
             SettingsDecision::Unchanged => {
                 self.settings_invalid.remove(&field);
-                if self.settings_save_error.is_some() {
-                    return self.save_settings_task(false);
-                }
+                let previous = self.settings.clone();
+                self.retry_shortcut_drafts();
+                let changed = previous != self.settings;
+                let save = if changed || self.settings_save_error.is_some() {
+                    self.save_settings_task(false)
+                } else {
+                    Task::none()
+                };
                 self.refresh_settings_feedback();
-                Task::none()
+                let effect = if changed {
+                    self.synchronize_settings(&previous)
+                } else {
+                    Task::none()
+                };
+                Task::batch([save, effect])
             }
             SettingsDecision::Persist(settings) => {
                 let previous = std::mem::replace(&mut self.settings, settings);
                 self.settings_invalid.remove(&field);
+                self.retry_shortcut_drafts();
                 let save = self.save_settings_task(false);
                 self.refresh_settings_feedback();
                 let effect = self.synchronize_settings(&previous);
@@ -12794,7 +13486,9 @@ impl Cagents {
         {
             // Also re-applies the terminal theme.
             tasks.push(self.synchronize_appearance(previous.ui_scale));
-        } else if previous.terminal_theme != self.settings.terminal_theme {
+        } else if previous.terminal_theme != self.settings.terminal_theme
+            || previous.custom_terminal_theme != self.settings.custom_terminal_theme
+        {
             self.synchronize_terminal_theme();
         }
         let (wrap_lines, syntax_theme) = (
@@ -12948,7 +13642,173 @@ impl Cagents {
         iced::widget::operation::focus(target).map(cosmic::Action::App)
     }
 
+    fn reload_settings(&mut self, observed: settings::LiveSettings) -> Task<Message> {
+        self.apply_observed_settings(observed, None)
+    }
+
+    fn apply_observed_settings(
+        &mut self,
+        observed: settings::LiveSettings,
+        pending_base: Option<AppSettings>,
+    ) -> Task<Message> {
+        if self
+            .settings_observed_at
+            .is_some_and(|last| observed.observed_at < last)
+        {
+            return Task::none();
+        }
+        self.settings_observed_at = Some(observed.observed_at);
+        let observed_at = observed.observed_at;
+        match observed.result {
+            Err(error) => {
+                self.status = Some(
+                    TransientNotice::error(
+                        "Could not reload settings.toml; your working settings are still active.",
+                    )
+                    .key("settings-reload")
+                    .details(error.clone()),
+                );
+                self.settings_reload_error = Some(error);
+                Task::none()
+            }
+            Ok(mut loaded) => {
+                // Geometry belongs to this window's saved view, not another
+                // window or the bootstrap snapshot watched on subscription.
+                loaded.sidebar_width = self.settings.sidebar_width;
+                loaded.inspector_width = self.settings.inspector_width;
+                self.notices.resolve("settings-reload");
+                if self
+                    .status
+                    .as_ref()
+                    .is_some_and(|notice| notice.key.as_deref() == Some("settings-reload"))
+                {
+                    self.status = None;
+                }
+                self.settings_reload_error = None;
+                self.settings_write_blocked = false;
+                // Keep local changes that are still waiting for their save lane;
+                // this avoids an external write racing a debounced UI edit.
+                let next = match settings::merge_live(
+                    pending_base.as_ref().unwrap_or(&self.settings_base),
+                    &self.settings,
+                    &loaded,
+                ) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        return self.reload_settings(settings::LiveSettings {
+                            result: Err(error.to_string()),
+                            observed_at,
+                        });
+                    }
+                };
+                self.settings_base = loaded;
+                let previous = std::mem::replace(&mut self.settings, next);
+                let before_retry = self.settings.clone();
+                self.retry_shortcut_drafts();
+                let retry_changed = before_retry != self.settings;
+                self.refresh_settings_feedback();
+                // An acknowledgement/own-file notification with identical values
+                // must not normalize the spelling the user is still editing.
+                if previous != self.settings {
+                    let mut draft = SettingsDraft::from_settings(&self.settings);
+                    for field in self
+                        .settings_pending
+                        .keys()
+                        .chain(self.settings_invalid.keys())
+                        .copied()
+                    {
+                        draft.preserve_field(&self.settings_draft, field);
+                    }
+                    // An unrelated external edit must not erase a valid raw
+                    // numeric spelling (for example `1.` between keystrokes).
+                    if !self.settings_draft.numeric_display.is_empty()
+                        && let (Ok(before), Ok(after)) = (
+                            toml::Value::try_from(&previous),
+                            toml::Value::try_from(&self.settings),
+                        )
+                    {
+                        for field in self.settings_draft.numeric_display.keys().copied() {
+                            let key = field.config_key();
+                            if before.get(key.as_str()) == after.get(key.as_str()) {
+                                draft.preserve_field(&self.settings_draft, field);
+                            }
+                        }
+                    }
+                    self.settings_draft = draft;
+                }
+                let save = if retry_changed {
+                    self.save_settings_task(false)
+                } else {
+                    Task::none()
+                };
+                Task::batch([save, self.synchronize_settings(&previous)])
+            }
+        }
+    }
+
+    fn reset_settings_category(&mut self, category: SettingsCategory) -> Task<Message> {
+        let Ok(mut next) = toml::Value::try_from(&self.settings) else {
+            return Task::none();
+        };
+        let Ok(defaults) = toml::Value::try_from(AppSettings::default()) else {
+            return Task::none();
+        };
+        let table = next.as_table_mut().expect("settings table");
+        let mut keys: Vec<_> = SettingsField::PREFERENCES
+            .iter()
+            .filter(|field| field.category() == category)
+            .map(|field| field.config_key())
+            .collect();
+        if category == SettingsCategory::Keyboard {
+            keys.push("keyboard_shortcuts".into());
+        }
+        if category == SettingsCategory::Notifications {
+            keys.push("notifications".into());
+        }
+        if category == SettingsCategory::Terminal {
+            keys.push("custom_terminal_theme".into());
+        }
+        if category == SettingsCategory::Editor {
+            keys.push("language_servers".into());
+        }
+        self.settings_reset_keys = keys.clone();
+        for key in keys {
+            if let Some(default) = defaults.get(&key) {
+                table.insert(key, default.clone());
+            } else {
+                table.remove(&key);
+            }
+        }
+        let Ok(next) = next.try_into::<AppSettings>() else {
+            return Task::none();
+        };
+        let Ok(next) = next.validate() else {
+            return Task::none();
+        };
+        let previous = std::mem::replace(&mut self.settings, next);
+        let mut draft = SettingsDraft::from_settings(&self.settings);
+        for field in self
+            .settings_pending
+            .keys()
+            .chain(self.settings_invalid.keys())
+            .copied()
+            .filter(|field| field.category() != category)
+        {
+            draft.preserve_field(&self.settings_draft, field);
+        }
+        self.settings_draft = draft;
+        self.settings_pending
+            .retain(|field, _| field.category() != category);
+        self.settings_invalid
+            .retain(|field, _| field.category() != category);
+        Task::batch([
+            self.save_settings_task(true),
+            self.synchronize_settings(&previous),
+        ])
+    }
+
     fn reset_settings(&mut self) -> Task<Message> {
+        self.settings_reset_keys.clear();
         let previous = std::mem::take(&mut self.settings);
         self.settings_draft = SettingsDraft::from_settings(&self.settings);
         self.settings_pending.clear();
@@ -13149,6 +14009,7 @@ impl Application for Cagents {
             settings_save_generation: 0,
             settings_ack_generation: 0,
             settings_reset_generation: None,
+            settings_reset_keys: Vec::new(),
             settings_save_lane: Arc::new(std::sync::Mutex::new(None)),
             update_prepared: false,
             update_flush_pending: false,
@@ -13172,6 +14033,9 @@ impl Application for Cagents {
             window_width: 1_600.0,
             window_height: 900.0,
             settings_path,
+            settings_reload_error: status.clone(),
+            settings_observed_at: None,
+            settings_backup: None,
             settings_write_blocked,
             notices: NoticeLog::default(),
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
@@ -13269,6 +14133,7 @@ impl Application for Cagents {
             workspace_cycle_modifiers: keyboard::Modifiers::empty(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
+            settings_font_choices: settings_ui::FontChoices::new(),
             settings_feedback: None,
             settings_pane_focused: false,
             reopen_utility: None,
@@ -13276,7 +14141,11 @@ impl Application for Cagents {
             settings_generation: 0,
             settings_invalid: HashMap::new(),
             settings_save_error: None,
-            status: status.map(TransientNotice::error),
+            status: status.map(|error| {
+                TransientNotice::error("Could not load settings.toml; defaults are active.")
+                    .key("settings-reload")
+                    .details(error)
+            }),
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
@@ -13287,8 +14156,15 @@ impl Application for Cagents {
         // by message, so distinct failures stay distinct and a repeated one
         // collapses into a count. The alternative this replaces was losing
         // cards with no diagnostic anywhere in the UI.
-        for warning in restore_warnings.into_iter().chain(settings_warnings) {
+        for warning in restore_warnings {
             app.notices.record(TransientNotice::warning(warning));
+        }
+        if !settings_warnings.is_empty() {
+            app.notices.record(
+                TransientNotice::warning("Some settings could not be read.")
+                    .key("settings-reload")
+                    .details(settings_warnings.join("\n")),
+            );
         }
         if let Some(view) = window_view {
             app.sidebar_state.restore_view(view.sidebar);
@@ -15065,34 +15941,39 @@ impl Application for Cagents {
                 Task::batch([drafts, open])
             }
             Message::NewWindowOpened { saved, result } => {
-                if let Ok(saved) = saved {
-                    self.acknowledge_settings_save(saved);
-                }
+                let settings = saved.map_or_else(
+                    |_| Task::none(),
+                    |saved| self.acknowledge_settings_save(saved),
+                );
                 if let Err(error) = result {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not open a new window: {error}"
                     )));
                 }
-                Task::none()
+                settings
             }
             Message::SettingsSaved { generation, result } => {
+                let mut settings = Task::none();
                 match result {
                     Ok(saved) => {
                         if saved.generation >= self.settings_ack_generation {
                             self.settings_save_error = None;
+                            self.notices.resolve("settings-save");
                         }
-                        self.acknowledge_settings_save(saved);
+                        settings = self.acknowledge_settings_save(saved);
                     }
                     Err(error) if generation >= self.settings_ack_generation => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "Could not save settings: {error}"
-                        )));
+                        self.status = Some(
+                            TransientNotice::warning("Could not save settings.")
+                                .key("settings-save")
+                                .details(error.clone()),
+                        );
                         self.settings_save_error = Some(error);
                     }
                     Err(_) => {}
                 }
                 self.refresh_settings_feedback();
-                Task::none()
+                settings
             }
             Message::UiUpdate(request) => match request.action {
                 instance::UiUpdateAction::Prepare => {
@@ -15186,7 +16067,7 @@ impl Application for Cagents {
                 result,
             } => {
                 if let Ok(saved) = saved {
-                    self.acknowledge_settings_save(saved);
+                    drop(self.acknowledge_settings_save(saved));
                 }
                 if generation != self.update_generation || !self.update_prepared {
                     let _ =
@@ -16061,6 +16942,9 @@ impl Application for Cagents {
                         ));
                     }
                 }
+                if let Some(task) = self.palette_key_event(&event) {
+                    return task;
+                }
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
                 }
@@ -16095,9 +16979,6 @@ impl Application for Cagents {
                         return self.apply_viewport(update, true, false);
                     }
                     return Task::none();
-                }
-                if let Some(task) = self.palette_key_event(&event) {
-                    return task;
                 }
                 if let Some(task) = self.chrome_key_event(&event) {
                     return task;
@@ -16405,9 +17286,16 @@ impl Application for Cagents {
                 self.settings_search = query;
                 crate::settings_widgets::reveal_content_start()
             }
-            Message::SettingsChanged { field, value } => self.apply_setting_input(field, value),
+            Message::SettingsChanged { field, value } => {
+                self.settings_draft.numeric_display.remove(&field);
+                self.apply_setting_input(field, value)
+            }
             Message::SettingsDraftChanged { field, value } => {
+                self.settings_draft.numeric_display.remove(&field);
                 self.queue_setting_input(field, value)
+            }
+            Message::SettingsNumberDraftChanged { field, value } => {
+                self.queue_number_setting_input(field, value)
             }
             Message::SettingsAutosave { field, generation } => {
                 self.autosave_setting(field, generation)
@@ -16497,6 +17385,145 @@ impl Application for Cagents {
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::SettingsReloaded(result) => self.reload_settings(result),
+            Message::ResetSettingsCategory(category) => self.reset_settings_category(category),
+            Message::UndoSettingsReset => {
+                let (Some(path), Some(backup)) =
+                    (self.settings_path.clone(), self.settings_backup.clone())
+                else {
+                    return Task::none();
+                };
+                let lane = self.settings_save_lane.clone();
+                self.settings_save_generation += 1;
+                let generation = self.settings_save_generation;
+                self.settings_ack_generation = generation;
+                self.settings_reset_generation = None;
+                self.settings_base = self.settings.clone();
+                self.settings_pending.clear();
+                self.settings_invalid.clear();
+                let fallback = self.settings.clone();
+                cosmic::task::future(async move {
+                    let source = backup.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let mut saved = lane
+                            .lock()
+                            .map_err(|_| "Settings save lane unavailable".to_owned())?;
+                        // A later UI save may have acquired the lane while this
+                        // task was waiting to run. Never roll its generation back.
+                        if saved
+                            .as_ref()
+                            .is_some_and(|saved| saved.generation > generation)
+                        {
+                            return Ok(None);
+                        }
+                        settings::restore_backup(&path, source)
+                            .map_err(|error| error.to_string())?;
+                        let result = settings::load_live_observed(&path);
+                        // Captured saves from before Undo cannot rewrite the
+                        // restored bytes after this lock is released.
+                        *saved = Some(SettingsSaved {
+                            generation,
+                            path,
+                            settings: result.result.as_ref().unwrap_or(&fallback).clone(),
+                            captured_base: fallback.clone(),
+                            desired: fallback,
+                            reload_error: result.result.as_ref().err().cloned(),
+                            observed_at: result.observed_at,
+                            undo: true,
+                            backup: None,
+                            reset: None,
+                        });
+                        Ok::<_, String>(Some(result))
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::SettingsResetUndone {
+                        generation,
+                        backup,
+                        result,
+                    }
+                })
+            }
+            Message::SettingsResetUndone {
+                generation,
+                backup,
+                result,
+            } => {
+                match result {
+                    Ok(Some(observed)) => {
+                        // A newer reset can have installed a different backup
+                        // while the restore was running. Consume only this one.
+                        if self.settings_backup.as_ref() == Some(&backup) {
+                            self.settings_backup = None;
+                        }
+                        self.notices.resolve("settings-reset-undo");
+                        self.reload_settings(observed)
+                    }
+                    Ok(None) => {
+                        if generation >= self.settings_ack_generation {
+                            self.status = Some(TransientNotice::warning("Undo was skipped because newer settings were saved. You can try Undo again.").key("settings-reset-undo"));
+                        }
+                        Task::none()
+                    }
+                    Err(error) => {
+                        if generation >= self.settings_ack_generation {
+                            self.status = Some(
+                                TransientNotice::error(
+                                    "Could not undo the settings reset. You can try again.",
+                                )
+                                .key("settings-reset-undo")
+                                .details(error),
+                            );
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            Message::OpenSettingsFile { reveal } => {
+                let path = self
+                    .settings_path
+                    .clone()
+                    .or_else(|| settings::default_path().ok());
+                let current = self.settings.clone();
+                cosmic::task::future(async move {
+                    let result = async {
+                        let path =
+                            path.ok_or_else(|| "Settings directory is unavailable".to_owned())?;
+                        let destination = path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            settings::ensure_file(destination, &current)
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())?;
+                        if reveal {
+                            file_manager::reveal(&path).await.map(|_| ())
+                        } else {
+                            open_system_url(
+                                url::Url::from_file_path(&path)
+                                    .map_err(|_| "Settings path is invalid".to_owned())?,
+                            )
+                            .await
+                        }
+                    }
+                    .await;
+                    Message::SettingsFileOpened(result)
+                })
+            }
+            Message::SettingsFileOpened(result) => {
+                if result.is_ok() {
+                    self.notices.resolve("settings-file");
+                }
+                if let Err(error) = result {
+                    self.status = Some(
+                        TransientNotice::error("Could not open settings.toml")
+                            .key("settings-file")
+                            .details(error),
+                    );
+                }
+                Task::none()
+            }
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();
@@ -16540,6 +17567,9 @@ impl Application for Cagents {
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DaemonHealth(health) => {
+                if !health.unavailable() {
+                    self.notices.resolve("daemon-connectivity");
+                }
                 self.daemon_health_ui.health = health;
                 if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
                 {
@@ -16561,6 +17591,16 @@ impl Application for Cagents {
                 // after the Dismiss all control that held focus is gone.
                 let reconciled = self.reconcile_notice_popup();
                 Task::batch([reconciled, self.refocus_notices()])
+            }
+            Message::ExpireNotices(now) => {
+                self.notices.expire(now);
+                self.reconcile_notice_popup()
+            }
+            Message::ToggleNoticeDetails(id) => {
+                if let Some(entry) = self.notices.entries.iter_mut().find(|entry| entry.id == id) {
+                    entry.details_open = !entry.details_open;
+                }
+                Task::none()
             }
             Message::DismissNotice(id) => {
                 self.notices.dismiss(id);
@@ -16798,6 +17838,22 @@ impl Application for Cagents {
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
+            if self
+                .notices
+                .entries
+                .iter()
+                .any(|entry| entry.expires_at.is_some())
+            {
+                iced::time::every(Duration::from_secs(1)).map(Message::ExpireNotices)
+            } else {
+                Subscription::none()
+            },
+            self.settings_path
+                .clone()
+                .map_or_else(Subscription::none, |path| {
+                    Subscription::run_with(path, settings_watch::stream)
+                        .map(Message::SettingsReloaded)
+                }),
             self.chat_subscription(),
             self.notification_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
@@ -17023,7 +18079,7 @@ impl Application for Cagents {
                              terminal font and theme, editor syntax theme, interface scale, \
                              pane widths, and the configured language servers.",
                         ),
-                        notice_detail("This cannot be undone."),
+                        notice_detail("A backup is saved before resetting. Use Undo reset in Settings to restore it."),
                         widget::row::with_children(vec![
                             iced::widget::Space::new().width(Length::Fill).into(),
                             crate::ui_controls::button::secondary("Cancel")
@@ -17282,6 +18338,12 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        design::configure_typography(
+            &self.settings.interface_font_family,
+            self.settings.interface_font_size,
+            &self.settings.chat_font_family,
+            self.settings.chat_font_size,
+        );
         let window_width = self.window_width;
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
@@ -17620,6 +18682,7 @@ impl Application for Cagents {
         let surface: Element<'_, Message> = widget::column::with_children(vec![
             surface,
             self.daemon_health_banner(),
+            self.settings_reload_banner(),
             self.automation_approval_banner(),
             bar,
         ])
@@ -19669,7 +20732,9 @@ mod tests {
                 if let Some(mut stream) = iced::runtime::task::into_stream(task) {
                     while let Some(action) = stream.next().await {
                         if let iced::runtime::Action::Output(cosmic::Action::App(
-                            message @ Message::SettingsSaved { .. },
+                            message @ (Message::SettingsSaved { .. }
+                            | Message::SettingsReloaded(_)
+                            | Message::SettingsResetUndone { .. }),
                         )) = action
                         {
                             let _ = app.update(message);
@@ -19677,6 +20742,235 @@ mod tests {
                     }
                 }
             });
+    }
+
+    #[test]
+    fn external_settings_edits_apply_in_every_window_and_reject_invalid_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut first = context_inspector_test_app(false);
+        let mut second = context_inspector_test_app(false);
+        for app in [&mut first, &mut second] {
+            app.settings_path = Some(path.clone());
+            app.settings_write_blocked = false;
+        }
+        first.settings.terminal_font_size = 21.0;
+        first.save_settings_now().unwrap();
+        drop(
+            second.update(Message::SettingsReloaded(settings::load_live_observed(
+                &path,
+            ))),
+        );
+        assert_eq!(second.settings.terminal_font_size, 21.0);
+        std::fs::write(&path, "schema_version = 3\nterminal_font_size = -5\n").unwrap();
+        drop(
+            second.update(Message::SettingsReloaded(settings::load_live_observed(
+                &path,
+            ))),
+        );
+        assert_eq!(second.settings.terminal_font_size, 21.0);
+        assert!(second.settings_reload_error.is_some());
+        assert!(
+            second
+                .notices
+                .recent()
+                .any(|entry| entry.notice.key.as_deref() == Some("settings-reload"))
+        );
+        settings::save(&path, &first.settings).unwrap();
+        drop(
+            second.update(Message::SettingsReloaded(settings::load_live_observed(
+                &path,
+            ))),
+        );
+        assert!(second.settings_reload_error.is_none());
+        assert!(
+            !second
+                .notices
+                .recent()
+                .any(|entry| entry.notice.key.as_deref() == Some("settings-reload"))
+        );
+    }
+
+    #[test]
+    fn settings_late_save_ack_never_replaces_a_newer_external_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        app.settings.terminal_font_size = 18.0;
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        let mut external = settings::load_live(&path).unwrap();
+        external.terminal_font_family = "monospace".into();
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        drop(app.acknowledge_settings_save(saved));
+        external.terminal_font_family = "Different mono".into();
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert_eq!(app.settings.terminal_font_family, "Different mono");
+        assert_eq!(app.settings_base.terminal_font_family, "Different mono");
+    }
+
+    #[test]
+    fn settings_save_after_external_reload_keeps_later_external_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 14.0;
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        drop(app.acknowledge_settings_save(saved));
+
+        let mut external = settings::load_live(&path).unwrap();
+        external.terminal_font_size = 16.0;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert_eq!(app.settings.terminal_font_size, 16.0);
+
+        // A later write has not reached this window's watcher yet. The adopted
+        // 16-point baseline is not a local edit against the old 14-point save.
+        external.terminal_font_size = 18.0;
+        settings::save(&path, &external).unwrap();
+        app.settings.show_status_bar = !external.show_status_bar;
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        assert_eq!(saved.settings.terminal_font_size, 18.0);
+        assert_eq!(saved.settings.show_status_bar, app.settings.show_status_bar);
+        drop(app.acknowledge_settings_save(saved));
+        assert_eq!(app.settings.terminal_font_size, 18.0);
+        assert_eq!(settings::load_live(&path).unwrap(), app.settings);
+    }
+
+    #[test]
+    fn settings_captured_before_earlier_save_completes_rebases_its_external_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 14.0;
+        app.save_settings_now().unwrap();
+        app.settings.show_status_bar = !app.settings.show_status_bar;
+        let first = app.capture_settings_save().unwrap();
+
+        let mut external = settings::load_live(&path).unwrap();
+        external.terminal_font_size = 16.0;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        app.settings.terminal_padding = 12.0;
+        let second = app.capture_settings_save().unwrap();
+        let first_ack = first.run().unwrap();
+        assert_eq!(first_ack.settings.terminal_font_size, 16.0);
+
+        external = settings::load_live(&path).unwrap();
+        external.terminal_font_size = 18.0;
+        settings::save(&path, &external).unwrap();
+        let second_ack = second.run().unwrap();
+        assert_eq!(second_ack.settings.terminal_font_size, 18.0);
+        assert_eq!(second_ack.settings.terminal_padding, 12.0);
+        assert_eq!(
+            second_ack.settings.show_status_bar,
+            app.settings.show_status_bar
+        );
+        drop(app.acknowledge_settings_save(second_ack));
+        drop(app.acknowledge_settings_save(first_ack));
+        assert_eq!(app.settings.terminal_font_size, 18.0);
+    }
+
+    #[test]
+    fn settings_save_ack_applies_merged_values_and_retains_later_local_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let stale = settings::load_live_observed(&path);
+        let mut external = settings::load_live(&path).unwrap();
+        external.terminal_font_family = "monospace".into();
+        settings::save(&path, &external).unwrap();
+        app.settings.terminal_font_size = 18.0;
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        assert_eq!(saved.settings.terminal_font_family, "monospace");
+        app.settings.terminal_font_size = 20.0;
+        drop(app.acknowledge_settings_save(saved));
+        drop(app.reload_settings(stale));
+        assert_eq!(app.settings.terminal_font_size, 20.0);
+        assert_eq!(app.settings.terminal_font_family, "monospace");
+        app.save_settings_now().unwrap();
+        let persisted = settings::load_live(&path).unwrap();
+        assert_eq!(persisted.terminal_font_size, 20.0);
+        assert_eq!(persisted.terminal_font_family, "monospace");
+    }
+
+    #[test]
+    fn settings_unchanged_save_ack_preserves_numeric_display_spelling() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 20.0;
+        app.settings_draft.terminal_font_size = "20.00".into();
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        drop(app.acknowledge_settings_save(saved));
+        assert_eq!(app.settings_draft.terminal_font_size, "20.00");
+    }
+
+    #[test]
+    fn settings_stale_invalid_snapshot_cannot_restore_a_resolved_banner() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        let invalid = settings::LiveSettings::now(Err("invalid TOML".into()));
+        let valid = settings::LiveSettings::now(Ok(app.settings.clone()));
+        drop(app.reload_settings(valid));
+        drop(app.reload_settings(invalid));
+        assert!(app.settings_reload_error.is_none());
+    }
+
+    #[test]
+    fn settings_category_reset_keeps_undo_when_another_category_remains_invalid() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        std::fs::write(&path, "schema_version = 3\nterminal_font_size = -5\n").unwrap();
+        app.settings_reset_generation = Some(app.settings_save_generation + 1);
+        app.settings_reset_keys = vec!["chat_enter_sends".into()];
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        drop(app.acknowledge_settings_save(saved));
+        assert!(
+            app.settings_backup
+                .as_ref()
+                .is_some_and(|backup| backup.exists())
+        );
+        assert!(app.settings_reload_error.is_some());
+    }
+
+    #[test]
+    fn settings_reset_save_records_recoverable_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let original = format!(
+            "# retained comment\n{}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        std::fs::write(&path, &original).unwrap();
+        app.settings_reset_generation = Some(app.settings_save_generation + 1);
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        drop(app.acknowledge_settings_save(saved));
+        let backup = app.settings_backup.as_ref().unwrap();
+        assert_eq!(std::fs::read(backup).unwrap(), original.as_bytes());
+        settings::restore_backup(&path, backup).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
     }
 
     #[test]
@@ -19692,9 +20986,9 @@ mod tests {
         let newer = app.capture_settings_save().unwrap();
         let newer_ack = newer.run().unwrap();
         let older_ack = older.run().unwrap();
-        app.acknowledge_settings_save(newer_ack);
+        drop(app.acknowledge_settings_save(newer_ack));
         app.settings.terminal_font_size = 22.0;
-        app.acknowledge_settings_save(older_ack);
+        drop(app.acknowledge_settings_save(older_ack));
         assert_eq!(settings::load(&path).unwrap().terminal_font_size, 20.0);
         assert_eq!(app.settings.terminal_font_size, 22.0);
         app.save_settings_now().unwrap();
@@ -19715,9 +21009,239 @@ mod tests {
         let second = app.capture_settings_save().unwrap();
         let first_ack = first.run().unwrap();
         let second_ack = second.run().unwrap();
-        app.acknowledge_settings_save(second_ack);
-        app.acknowledge_settings_save(first_ack);
+        drop(app.acknowledge_settings_save(second_ack));
+        drop(app.acknowledge_settings_save(first_ack));
         assert_eq!(settings::load(&path).unwrap().terminal_font_size, original);
+    }
+
+    #[test]
+    fn settings_category_reset_preserves_unobserved_external_and_local_other_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 14.0;
+        app.save_settings_now().unwrap();
+        let mut external = settings::load_live(&path).unwrap();
+        external.terminal_font_size = 18.0;
+        settings::save(&path, &external).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        app.settings.terminal_padding = 12.0;
+        app.settings.keyboard_shortcuts.command_palette.clear();
+        let reset = app.reset_settings_category(SettingsCategory::Keyboard);
+        settle_settings_task(&mut app, reset);
+        let saved = settings::load_live(&path).unwrap();
+        assert_eq!(saved.terminal_font_size, 18.0);
+        assert_eq!(saved.terminal_padding, 12.0);
+        assert_eq!(saved.keyboard_shortcuts, KeyboardShortcuts::default());
+        assert_eq!(app.settings.terminal_font_size, 18.0);
+        assert_eq!(
+            std::fs::read(app.settings_backup.as_ref().unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn settings_unrelated_reload_preserves_autosaved_decimal_spelling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let field = SettingsField::TerminalScrollSpeed;
+        drop(app.queue_number_setting_input(field, "1.".into()));
+        drop(app.autosave_setting(field, app.settings_generation));
+        assert!(!app.settings_pending.contains_key(&field));
+        assert!(!app.settings_invalid.contains_key(&field));
+        let mut external = settings::load_live(&path).unwrap();
+        external.show_status_bar = !external.show_status_bar;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert_eq!(
+            app.settings_draft.numeric_display.get(&field).unwrap(),
+            "1."
+        );
+        external.terminal_scroll_speed = 2.0;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert!(!app.settings_draft.numeric_display.contains_key(&field));
+        assert_eq!(app.settings_draft.terminal_scroll_speed, "2");
+    }
+
+    #[test]
+    fn settings_category_reset_preserves_other_categories_unfinished_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.settings_draft.terminal_font_size = "unfinished".into();
+        app.settings_invalid
+            .insert(SettingsField::TerminalFontSize, "Enter a number".into());
+        app.settings_draft.terminal_font_family = "Pending mono".into();
+        app.settings_pending.insert(
+            SettingsField::TerminalFontFamily,
+            (1, "Pending mono".into()),
+        );
+        drop(app.reset_settings_category(SettingsCategory::Links));
+        assert_eq!(app.settings_draft.terminal_font_size, "unfinished");
+        assert_eq!(app.settings_draft.terminal_font_family, "Pending mono");
+        assert!(
+            app.settings_invalid
+                .contains_key(&SettingsField::TerminalFontSize)
+        );
+        assert!(
+            app.settings_pending
+                .contains_key(&SettingsField::TerminalFontFamily)
+        );
+    }
+
+    #[test]
+    fn settings_delayed_undo_cannot_overwrite_a_later_saved_edit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 18.0;
+        app.save_settings_now().unwrap();
+        let reset = app.reset_settings();
+        settle_settings_task(&mut app, reset);
+        let undo = app.update(Message::UndoSettingsReset);
+        app.settings.terminal_font_size = 24.0;
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        let generation = saved.generation;
+        drop(app.acknowledge_settings_save(saved));
+        settle_settings_task(&mut app, undo);
+        assert_eq!(settings::load_live(&path).unwrap().terminal_font_size, 24.0);
+        assert_eq!(
+            app.settings_save_lane
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .generation,
+            generation
+        );
+        assert!(app.settings_backup.is_some());
+    }
+
+    #[test]
+    fn settings_edit_captured_during_undo_preserves_restored_other_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_family = "Original mono".into();
+        app.save_settings_now().unwrap();
+        let reset = app.reset_settings();
+        settle_settings_task(&mut app, reset);
+        let undo = app.update(Message::UndoSettingsReset);
+        app.settings.terminal_font_size = 24.0;
+        let later = app.capture_settings_save().unwrap();
+        settle_settings_task(&mut app, undo);
+        let saved = later.run().unwrap();
+        drop(app.acknowledge_settings_save(saved));
+        let persisted = settings::load_live(&path).unwrap();
+        assert_eq!(persisted.terminal_font_size, 24.0);
+        assert_eq!(persisted.terminal_font_family, "Original mono");
+    }
+
+    #[test]
+    fn settings_failed_undo_retains_its_backup_for_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let original = format!(
+            "# retained exact bytes\n{}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        std::fs::write(&path, &original).unwrap();
+        let reset = app.reset_settings();
+        settle_settings_task(&mut app, reset);
+        let backup = app.settings_backup.clone().unwrap();
+        let unavailable = backup.with_extension("temporarily-unavailable");
+        std::fs::rename(&backup, &unavailable).unwrap();
+        let undo = app.update(Message::UndoSettingsReset);
+        settle_settings_task(&mut app, undo);
+        assert_eq!(app.settings_backup.as_ref(), Some(&backup));
+        assert!(
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.key.as_deref() == Some("settings-reset-undo"))
+        );
+        std::fs::rename(unavailable, &backup).unwrap();
+        let retry = app.update(Message::UndoSettingsReset);
+        settle_settings_task(&mut app, retry);
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        assert!(app.settings_backup.is_none());
+        assert!(
+            !app.notices
+                .recent()
+                .any(|entry| entry.notice.key.as_deref() == Some("settings-reset-undo"))
+        );
+    }
+
+    #[test]
+    fn settings_undo_action_restores_bytes_and_fences_earlier_saves() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let original = format!(
+            "# my configuration\n{}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        std::fs::write(&path, &original).unwrap();
+        let reset = app.reset_settings();
+        settle_settings_task(&mut app, reset);
+        assert!(app.settings_backup.is_some());
+        app.settings.terminal_font_size = 24.0;
+        let older_save = app.capture_settings_save().unwrap();
+        let undo = app.update(Message::UndoSettingsReset);
+        settle_settings_task(&mut app, undo);
+        older_save.run().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn settings_external_reload_refreshes_controls_but_preserves_invalid_drafts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        let field = SettingsField::TerminalFontSize;
+        app.settings_draft.set(field, "unfinished".into());
+        app.settings_invalid
+            .insert(field, "Enter a valid number".into());
+        let mut external = app.settings.clone();
+        external.custom_terminal_theme = Some(crate::terminal::TerminalTheme::Dark.palette());
+        drop(app.reload_settings(settings::LiveSettings::now(Ok(external))));
+        assert!(app.settings_draft.has_custom_terminal_theme);
+        assert_eq!(app.settings_draft.terminal_font_size, "unfinished");
+    }
+
+    #[test]
+    fn repeated_settings_reset_saves_keep_the_first_recovery_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        app.settings_reset_generation = Some(app.settings_save_generation + 1);
+        let first = app.capture_settings_save().unwrap().run().unwrap();
+        app.settings.terminal_font_size = 22.0;
+        let second = app.capture_settings_save().unwrap().run().unwrap();
+        assert_eq!(first.backup, second.backup);
+        assert_eq!(std::fs::read(second.backup.unwrap()).unwrap(), original);
     }
 
     #[test]
@@ -19754,6 +21278,85 @@ mod tests {
             settings::load(&path).unwrap().managed_worktree_directory,
             "../trees/"
         );
+    }
+
+    #[test]
+    fn settings_releasing_a_conflict_retries_the_other_rows_refused_draft() {
+        let mut app = context_inspector_test_app(false);
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        let field = SettingsField::ShortcutToggleProjects;
+        drop(app.apply_setting_input(field, chord.clone()));
+        assert!(app.settings_invalid.contains_key(&field));
+        drop(app.apply_setting_input(SettingsField::ShortcutCommandPalette, String::new()));
+        assert!(app.settings_invalid.is_empty());
+        assert_eq!(app.settings.keyboard_shortcuts.toggle_projects, [chord]);
+        assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
+    }
+
+    #[test]
+    fn settings_external_shortcut_release_retries_and_persists_refused_draft() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        let field = SettingsField::ShortcutToggleProjects;
+        drop(app.apply_setting_input(field, chord.clone()));
+        assert!(app.settings_invalid.contains_key(&field));
+        let mut external = settings::load_live(&path).unwrap();
+        external.keyboard_shortcuts.command_palette.clear();
+        settings::save(&path, &external).unwrap();
+        let reload = app.reload_settings(settings::load_live_observed(&path));
+        settle_settings_task(&mut app, reload);
+        assert!(app.settings_invalid.is_empty());
+        assert_eq!(app.settings.keyboard_shortcuts.toggle_projects, [chord]);
+        assert_eq!(
+            settings::load_live(&path).unwrap().keyboard_shortcuts,
+            app.settings.keyboard_shortcuts
+        );
+        assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
+    }
+
+    #[test]
+    fn settings_reload_preserves_only_unfinished_font_values_and_display() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let field = SettingsField::InterfaceFontSize;
+        app.settings_draft.interface_font_size = "20".into();
+        app.settings_draft
+            .numeric_display
+            .insert(field, "20.00".into());
+        app.settings_pending.insert(field, (1, "20".into()));
+        app.settings_draft.chat_font_family = "pending family".into();
+        app.settings_invalid
+            .insert(SettingsField::ChatFontFamily, "test refusal".into());
+        let mut external = settings::load_live(&path).unwrap();
+        external.chat_font_size = 18.0;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert_eq!(app.settings_draft.interface_font_size, "20");
+        assert_eq!(
+            app.settings_draft.numeric_display.get(&field).unwrap(),
+            "20.00"
+        );
+        assert_eq!(app.settings_draft.chat_font_family, "pending family");
+        assert_eq!(app.settings_draft.chat_font_size, "18");
+        assert_eq!(app.settings.chat_font_size, 18.0);
+        for (field, key) in [
+            (SettingsField::InterfaceFontFamily, "interface_font_family"),
+            (SettingsField::InterfaceFontSize, "interface_font_size"),
+            (SettingsField::ChatFontFamily, "chat_font_family"),
+            (SettingsField::ChatFontSize, "chat_font_size"),
+        ] {
+            assert!(SettingsField::PREFERENCES.contains(&field));
+            assert_eq!(field.config_key(), key);
+        }
     }
 
     #[test]
@@ -20167,6 +21770,93 @@ mod tests {
     /// and capacity is the only thing bounding it: the shell raises notices
     /// from a per-poll path, so a repeating failure must not evict the history.
     #[test]
+    fn keyed_notices_replace_and_resolve_failures() {
+        let mut log = NoticeLog::default();
+        log.record(TransientNotice::error("Could not reopen").key("chat:1"));
+        log.record(TransientNotice::error("Try again").key("chat:1"));
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.recent().next().unwrap().notice.message, "Try again");
+        log.record(TransientNotice::success("Reopened").key("chat:1"));
+        assert_eq!(log.severity(), Some(NoticeSeverity::Success));
+        log.resolve("chat:1");
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn unkeyed_notices_keep_distinct_object_details() {
+        let mut log = NoticeLog::default();
+        log.record(
+            TransientNotice::warning("Interrupted")
+                .details("first")
+                .targets([CardId::new()]),
+        );
+        log.record(
+            TransientNotice::warning("Interrupted")
+                .details("second")
+                .targets([CardId::new()]),
+        );
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn keyed_notice_targets_resolve_individually() {
+        let first = CardId::new();
+        let second = CardId::new();
+        let mut log = NoticeLog::default();
+        log.record(
+            TransientNotice::warning("Some turns were interrupted")
+                .key("daemon-interrupted-turns")
+                .targets([first, second]),
+        );
+        log.resolve_target("daemon-interrupted-turns", first);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.recent().next().unwrap().notice.targets, [second]);
+        log.resolve_target("daemon-interrupted-turns", second);
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn successes_expire_and_errors_remain() {
+        let mut log = NoticeLog::default();
+        let now = Instant::now();
+        log.record_at(TransientNotice::success("Account added"), now);
+        log.record_at(TransientNotice::error("Could not reopen"), now);
+        log.expire(now + Duration::from_secs(7));
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+    }
+
+    #[test]
+    fn success_notice_flood_preserves_unresolved_errors_and_warnings() {
+        let mut log = NoticeLog::default();
+        let now = Instant::now();
+        log.record_at(
+            TransientNotice::error("Still disconnected").key("error"),
+            now,
+        );
+        log.record_at(
+            TransientNotice::warning("Turn interrupted").key("warning"),
+            now,
+        );
+        for index in 0..NOTICE_LOG_CAPACITY * 2 {
+            log.record_at(
+                TransientNotice::success(format!("Information {index}")),
+                now,
+            );
+            assert!(log.len() <= NOTICE_LOG_CAPACITY);
+        }
+        log.expire(now + Duration::from_secs(7));
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+        for key in ["error", "warning"] {
+            assert!(
+                log.recent()
+                    .any(|entry| entry.notice.key.as_deref() == Some(key))
+            );
+        }
+    }
+
+    #[test]
     fn the_notice_log_collapses_repeats_and_bounds_itself() {
         let mut log = NoticeLog::default();
         for message in ["first failure", "second failure"] {
@@ -20197,12 +21887,25 @@ mod tests {
         log.dismiss(newest);
         assert_eq!(log.len(), 1);
 
-        // Distinct messages past capacity drop the oldest, never grow.
+        // Lower-severity traffic stays bounded without hiding an unresolved error.
         for index in 0..NOTICE_LOG_CAPACITY * 2 {
             log.record(TransientNotice::warning(format!("failure {index}")));
         }
         assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
-        // The surviving error was evicted, so the header must stop claiming one.
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+        let error = log
+            .recent()
+            .find(|entry| entry.notice.message == "first failure")
+            .expect("warning traffic must preserve the unresolved error")
+            .id;
+        assert!(
+            !log.recent()
+                .any(|entry| entry.notice.message == "failure 0")
+        );
+        assert!(log.recent().any(
+            |entry| entry.notice.message == format!("failure {}", NOTICE_LOG_CAPACITY * 2 - 1)
+        ));
+        log.dismiss(error);
         assert_eq!(log.severity(), Some(NoticeSeverity::Warning));
 
         log.clear();
@@ -25651,10 +27354,12 @@ mod tests {
             save_health: None,
             session_recovery: session_recovery::State::default(),
             settings_draft: SettingsDraft::from_settings(&settings),
+            settings_font_choices: settings_ui::FontChoices::new(),
             settings_base: settings.clone(),
             settings_save_generation: 0,
             settings_ack_generation: 0,
             settings_reset_generation: None,
+            settings_reset_keys: Vec::new(),
             settings_save_lane: Arc::new(std::sync::Mutex::new(None)),
             update_prepared: false,
             update_flush_pending: false,
@@ -25683,6 +27388,9 @@ mod tests {
             window_height: 900.0,
             core,
             settings_path: None,
+            settings_reload_error: None,
+            settings_observed_at: None,
+            settings_backup: None,
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),
             retained_outputs: HashMap::new(),

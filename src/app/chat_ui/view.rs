@@ -3,7 +3,8 @@ use super::*;
 
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
-        .size(design::TEXT_BODY)
+        .font(design::chat_font())
+        .size(design::chat_size())
         .width(Length::Fill)
         .into()
 }
@@ -11,8 +12,8 @@ pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Messag
 fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, Message> {
     widget::container(selectable_prose::plain(
         text,
-        design::TEXT_BODY,
-        iced::Font::default(),
+        design::chat_size(),
+        design::chat_font(),
         target,
     ))
     .width(Length::Fill)
@@ -377,8 +378,8 @@ fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
                         .color(design::warning_color(&cosmic::theme::active())),
                 ]
                 .into(),
-                design::TEXT_CAPTION.into(),
-                iced::Font::default(),
+                (design::interface_size() * design::TEXT_CAPTION / design::TEXT_BODY).into(),
+                design::interface_font(),
                 target,
                 None,
             ))
@@ -903,7 +904,11 @@ impl Cagents {
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
                     &self.settings.keyboard_shortcuts,
-                    self.workspace.viewport_width() * self.settings.chat_content_fraction,
+                    self.workspace
+                        .presentation_geometry()
+                        .card(card)
+                        .map_or(self.workspace.viewport_width(), |card| card.width())
+                        .min(design::READABLE_MEASURE + 2.0 * step::GAP_M),
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
@@ -1168,7 +1173,7 @@ impl Runtime {
                         .width(Length::Fill)
                         .into(),
                     design::heading(Self::native_child_status(agent))
-                        .size(design::TEXT_CAPTION)
+                        .size(design::scaled_interface_size(design::TEXT_CAPTION))
                         .into(),
                 ])
                 .spacing(step::GAP_S)
@@ -1381,15 +1386,12 @@ impl Runtime {
             content.push(
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
-                        crate::ui_controls::field::search(
-                            "Find in conversation",
-                            query,
-                        )
-                        .id(card_control_id(target.card, "chat-find"))
-                        .on_input(move |query| action(Action::Find(target, query)))
-                        .on_focus(action(Action::FindFocused(target, true)))
-                        .on_unfocus(action(Action::FindFocused(target, false)))
-                        .width(Length::Fill),
+                        crate::ui_controls::field::search("Find in conversation", query)
+                            .id(card_control_id(target.card, "chat-find"))
+                            .on_input(move |query| action(Action::Find(target, query)))
+                            .on_focus(action(Action::FindFocused(target, true)))
+                            .on_unfocus(action(Action::FindFocused(target, false)))
+                            .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
@@ -1423,8 +1425,11 @@ impl Runtime {
                 .into(),
             );
         }
+        // The symmetric inset already exceeds the scrollbar rail. Reserving
+        // the rail a second time would make transcript rows narrower than the
+        // composer even though their outer column is shared.
         let transcript = widget::column::with_children(transcript.children)
-            .padding(design::with_vertical_rail(iced::Padding::new(step::GAP_M)))
+            .padding(iced::Padding::new(step::GAP_M))
             .width(Length::Fill);
         let transcript_index = content.len();
         content.push(selection::transcript(
@@ -1841,7 +1846,9 @@ impl Runtime {
         // which counting newlines could not see. The ceiling keeps a very
         // long paste from squeezing the transcript out, past which the editor
         // scrolls as before.
-        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING;
+        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT * design::chat_size()
+            / design::TEXT_PROSE
+            + 2.0 * COMPOSER_PADDING;
         let suggestion = if available && !transitioning {
             self.prompt_suggestion()
         } else {
@@ -1851,7 +1858,7 @@ impl Runtime {
         let placeholder = suggestion.map_or(placeholder, |suggestion| suggestion.text.as_str());
         let suggestion_hint: Element<'_, Message> = if suggestion.is_some() {
             widget::text("Tab to use suggestion")
-                .size(design::TEXT_CAPTION)
+                .size(design::scaled_interface_size(design::TEXT_CAPTION))
                 .into()
         } else {
             iced::widget::Space::new().height(0).into()
@@ -1886,7 +1893,8 @@ impl Runtime {
             crate::ui_controls::field::editor("Message", &self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
-                .size(design::TEXT_PROSE)
+                .size(design::chat_size())
+                .font(design::chat_font())
                 .height(Length::Shrink)
                 .max_height(composer_ceiling)
                 // The editor scrolls once the draft passes the ceiling, and
@@ -2171,7 +2179,7 @@ impl Runtime {
                 } else {
                     state.to_owned()
                 })
-                .size(design::TEXT_CAPTION)
+                .size(design::scaled_interface_size(design::TEXT_CAPTION))
                 .class(
                     if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none() {
                         cosmic::theme::Text::Custom(design::warning_text)
@@ -2325,7 +2333,6 @@ impl Runtime {
                     iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
                 )
                 .into(),
-            content_width.max(1.0),
         ))
         .width(Length::Fill)
         .height(Length::Fill);
@@ -2857,7 +2864,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+        let label = if self
+            .snapshot
+            .fast_mode
+            .as_ref()
+            .is_some_and(|mode| mode.enabled())
+        {
             Cow::Owned(format!("{label} · Fast"))
         } else {
             label
@@ -2947,14 +2959,18 @@ impl Runtime {
             crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
                 action(Action::Command(
                     self.target,
-                    Command::SetFastMode { enabled: !mode.enabled() },
+                    Command::SetFastMode {
+                        enabled: !mode.enabled(),
+                    },
                 ))
             })),
             fast_mode_tooltip(mode),
         );
-        Some(widget::column::with_children(vec![models, control])
-            .spacing(step::GAP_XS)
-            .into())
+        Some(
+            widget::column::with_children(vec![models, control])
+                .spacing(step::GAP_XS)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -3029,7 +3045,13 @@ impl Runtime {
     fn turn_fingerprint_at(&self, turn: &turn::Turn, dark: bool, now: Option<u64>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
-        (self.target, dark, self.syntax_theme as u8).hash(&mut hasher);
+        (
+            self.target,
+            dark,
+            self.syntax_theme as u8,
+            design::typography_revision(),
+        )
+            .hash(&mut hasher);
         (
             &turn.key,
             &turn.summary,
@@ -3487,8 +3509,8 @@ impl Runtime {
         let mut rows: Vec<Element<'a, Message>> = vec![
             widget::container(selectable_prose::plain(
                 queued.text.trim_end(),
-                design::TEXT_PROSE,
-                iced::Font::default(),
+                design::chat_size(),
+                design::chat_font(),
                 self.target,
             ))
             .class(design::surface(
@@ -3577,8 +3599,8 @@ impl Runtime {
                 widget::icon(Icon::Attachment.handle()).size(12).into(),
                 selectable_prose::plain(
                     text,
-                    design::TEXT_CAPTION,
-                    iced::Font::default(),
+                    design::interface_size() * design::TEXT_CAPTION / design::TEXT_BODY,
+                    design::interface_font(),
                     self.target,
                 ),
             ])
@@ -3588,8 +3610,8 @@ impl Runtime {
         } else {
             let text = selectable_prose::plain(
                 text,
-                design::TEXT_PROSE,
-                iced::Font::default(),
+                design::chat_size(),
+                design::chat_font(),
                 self.target,
             );
             if long {
@@ -4231,7 +4253,7 @@ fn field_view<'a>(
         )))
         .name(field.label.as_str())
         .secure(field.secret)
-        .size(design::TEXT_BODY)
+        .size(design::interface_size())
         .on_input_maybe(available.then_some(move |value| {
             action(Action::Field(
                 target,
@@ -5765,6 +5787,147 @@ mod tests {
                 let bounds = probe.bounds.expect("composer editor");
                 assert_eq!(bounds.x, step::GAP_M);
                 assert_eq!(bounds.width, width - 2.0 * step::GAP_M);
+            }
+        }
+    }
+
+    #[test]
+    fn reading_column_is_stable_across_transcript_states() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        struct Probe {
+            composer: widget::Id,
+            transcript: widget::Id,
+            editor: Option<iced::Rectangle>,
+            viewport: Option<iced::Rectangle>,
+            answer: Option<iced::Rectangle>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.composer) {
+                    self.editor = Some(bounds);
+                }
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                if id == Some(&scroll::item_id("0-answer")) {
+                    self.answer = Some(bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                _: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.transcript) {
+                    self.viewport = Some(bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for width in [280.0_f32, 600.0, 956.0, 1440.0] {
+            let mut baseline = None;
+            for state in 0..7 {
+                let mut items = if state == 0 {
+                    vec![]
+                } else {
+                    frame_cost::transcript(1)
+                };
+                if state == 5 || state == 6 {
+                    if let ItemContent::Text { text, .. } = &mut items.last_mut().unwrap().content {
+                        *text = if state == 5 {
+                            "w".repeat(3000)
+                        } else {
+                            format!("```rust\n{}\n```", "long_code_token".repeat(1000))
+                        };
+                    }
+                }
+                let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+                if state == 2 {
+                    Arc::make_mut(&mut runtime.snapshot)
+                        .requests
+                        .push(chat::Request {
+                            kind: chat::RequestKind::Approval,
+                            id: "approval".into(),
+                            title: "Command approval".into(),
+                            description: "Run cargo test".into(),
+                            fields: vec![],
+                            actions: vec![],
+                        });
+                }
+                if state == 3 {
+                    runtime.opened.insert(runtime.turns[0].key.clone(), true);
+                }
+                if state == 4 {
+                    Arc::make_mut(&mut runtime.snapshot).ready = false;
+                }
+                let mut element = runtime.view(
+                    None,
+                    false,
+                    true,
+                    &shortcuts,
+                    width,
+                    Place {
+                        channel: None,
+                        name: "Fixture".into(),
+                        branch: None,
+                    },
+                    true,
+                    None,
+                    vec![],
+                );
+                let mut tree = Tree::new(&element);
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 700.0)),
+                );
+                let mut probe = Probe {
+                    composer: card_control_id(runtime.target.card, "chat-composer"),
+                    transcript: card_control_id(runtime.target.card, "chat-transcript"),
+                    editor: None,
+                    viewport: None,
+                    answer: None,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut probe,
+                );
+                let editor = probe.editor.expect("composer");
+                let viewport = probe.viewport.expect("transcript");
+                if state != 0 {
+                    let answer = probe.answer.expect("answer row");
+                    assert_eq!(
+                        (answer.x, answer.width),
+                        (editor.x, editor.width),
+                        "transcript rows and composer share the same column in state {state}"
+                    );
+                }
+                let column_width = width.min(design::READABLE_MEASURE + 2.0 * step::GAP_M);
+                let geometry = (viewport.x, viewport.width, editor.x, editor.width);
+                assert_eq!(viewport.width, column_width, "state {state}");
+                assert_eq!(editor.x, viewport.x + step::GAP_M, "state {state}");
+                assert_eq!(
+                    editor.width,
+                    viewport.width - 2.0 * step::GAP_M,
+                    "state {state}"
+                );
+                assert_eq!(*baseline.get_or_insert(geometry), geometry, "state {state}");
             }
         }
     }
@@ -7349,8 +7512,14 @@ mod tests {
                 iced::mouse::Cursor::Unavailable,
             );
             assert!(
-                !accessible.root().iter().chain(accessible.children()).any(|node|
-                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                !accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
             for label in ["Send message", "Close"] {
@@ -7600,10 +7769,11 @@ mod tests {
                     message,
                     Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
                 )));
-                assert!(!messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChatUi(Action::Interrupt(..))
-                )));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(
