@@ -35,7 +35,7 @@ mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -557,6 +557,10 @@ fn migrate_through(
     if version < 12 && target >= 12 {
         mailbox::migrate_attention(tx)?;
         schema::migration_checkpoint(12)?;
+    }
+    if version < 13 && target >= 13 {
+        views::migrate_terminal_sources(tx)?;
+        schema::migration_checkpoint(13)?;
     }
     Ok(())
 }
