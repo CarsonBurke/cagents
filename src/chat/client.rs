@@ -32,8 +32,12 @@ pub(crate) use provider_exit::Output as ProviderExitOutput;
 mod diagnostic_read;
 pub(crate) use diagnostic_read::{
     DiagnosticAuthority, DiagnosticCompletion, DiagnosticCopyCompletion, DiagnosticCopyInterest,
-    DiagnosticCopyReceipt, DiagnosticCopySummary, DiagnosticOutput, DiagnosticReadRequest, DiagnosticSource,
+    DiagnosticCopyReceipt, DiagnosticCopySummary, DiagnosticOutput, DiagnosticReadRequest,
+    DiagnosticResourceUsage, DiagnosticSource, diagnostic_resource_usage,
 };
+
+#[cfg(test)]
+pub(crate) use diagnostic_read::diagnostic_test_guard;
 
 // Keep ordinary request IDs below the local-query namespace. This prevents
 // an expired diagnostic reply from becoming an unrelated conversation error.

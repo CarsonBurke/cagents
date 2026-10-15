@@ -42,6 +42,8 @@ struct Lane {
     owned_capacity: AtomicUsize,
     peak_capacity: AtomicUsize,
     retirement_failed: AtomicBool,
+    retiring_capacity: AtomicUsize,
+    response_owners: AtomicUsize,
 }
 fn lane() -> &'static Lane {
     static LANE: OnceLock<Lane> = OnceLock::new();
@@ -52,7 +54,36 @@ fn lane() -> &'static Lane {
         owned_capacity: AtomicUsize::new(0),
         peak_capacity: AtomicUsize::new(0),
         retirement_failed: AtomicBool::new(false),
+        retiring_capacity: AtomicUsize::new(0),
+        response_owners: AtomicUsize::new(0),
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DiagnosticResourceUsage {
+    pub queued_owners: usize,
+    pub worker_slots: usize,
+    pub weighted_capacity: usize,
+    /// Includes conservative decoded-response reservations, not an RSS value.
+    pub reserved_layout_capacity: usize,
+    pub peak_reserved_layout_capacity: usize,
+    pub retiring_capacity: usize,
+    pub response_owners: usize,
+    pub retirement_failed: bool,
+}
+pub(crate) fn diagnostic_resource_usage() -> DiagnosticResourceUsage {
+    let lane=lane();
+    DiagnosticResourceUsage {
+        queued_owners:QUEUED_JOBS-lane.queued.available_permits(),worker_slots:WORKERS-lane.workers.available_permits(),
+        weighted_capacity:CAPACITY_LIMIT-lane.bytes.available_permits()*UNIT,
+        reserved_layout_capacity:lane.owned_capacity.load(Ordering::Acquire),peak_reserved_layout_capacity:lane.peak_capacity.load(Ordering::Acquire),
+        retiring_capacity:lane.retiring_capacity.load(Ordering::Acquire),response_owners:lane.response_owners.load(Ordering::Acquire),retirement_failed:lane.retirement_failed.load(Ordering::Acquire),
+    }
+}
+#[cfg(test)]
+pub(crate) fn diagnostic_test_guard() -> std::sync::MutexGuard<'static,()> {
+    static GUARD:Mutex<()>=Mutex::new(());
+    GUARD.lock().unwrap_or_else(|e|e.into_inner())
 }
 
 #[derive(Default)]
@@ -250,6 +281,7 @@ fn start_reclaimer_with(spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Resu
         for value in rx {
             let Retired { body, charge, worker, request } = value;
             drop(body); // Return capacity only AFTER the actual allocation.
+            lane().retiring_capacity.fetch_sub(charge.capacity,Ordering::AcqRel);
             drop(charge); drop(worker); drop(request);
         }
     });
@@ -276,6 +308,7 @@ fn try_retire(value: Retired, reclaimer: &Reclaimer) -> Result<(), Retired> {
     }
 }
 fn retire(value: Retired) {
+    lane().retiring_capacity.fetch_add(value.charge.capacity,Ordering::AcqRel);
     if let Err(value) = try_retire(value, reclaimer()) {
         // Fail closed even if initialization failed: preserve the ENTIRE
         // body/charge/worker/queue owner. Never unwind/drop heavy data inline.
@@ -648,6 +681,15 @@ pub(super) struct DiagnosticResponseCharge {
     _charge: Charge,
     _request: DiagnosticReadRequest,
 }
+impl DiagnosticResponseCharge {
+    fn new(charge:Charge,request:DiagnosticReadRequest)->Self {
+        lane().response_owners.fetch_add(1,Ordering::AcqRel);
+        Self { _charge:charge,_request:request }
+    }
+}
+impl Drop for DiagnosticResponseCharge {
+    fn drop(&mut self) { lane().response_owners.fetch_sub(1,Ordering::AcqRel); }
+}
 
 impl ClientHandle {
     fn read_diagnostic(
@@ -708,7 +750,7 @@ impl ClientHandle {
             if pending.len() >= 8 {
                 return Err("Provider output requests are busy; try again shortly".into());
             }
-            pending.insert(id, provider_exit::PendingReply { reply:Some(reply), ownership:Some(DiagnosticResponseCharge { _charge:page_charge, _request:request.clone() }) });
+            pending.insert(id, provider_exit::PendingReply { reply:Some(reply), ownership:Some(DiagnosticResponseCharge::new(page_charge,request.clone())) });
         }
         let posted=std::cell::Cell::new(false);
         struct PendingPage<'a> { pending: &'a provider_exit::Pending, id:u64, posted:&'a std::cell::Cell<bool> }
@@ -927,6 +969,12 @@ impl ClientHandle {
     }
 }
 #[cfg(test)]
+impl DiagnosticCompletion {
+    pub(crate) fn contains_text_for_test(&self, expected:&str)->bool {
+        self.inner.lock().unwrap_or_else(|e|e.into_inner()).as_ref().is_some_and(|finished|finished.result.as_ref().is_ok_and(|output|output.as_str().contains(expected)))
+    }
+}
+#[cfg(test)]
 impl DiagnosticCopyCompletion {
     pub(crate) fn contains_text_for_test(&self, expected:&str)->bool {
         self.result.lock().unwrap_or_else(|e|e.into_inner()).as_ref().is_some_and(|result|result.as_ref().is_ok_and(|buffer|buffer.contains(expected)))
@@ -980,7 +1028,7 @@ mod tests {
     }
     fn wait_capacity(expected: usize) {
         let until = Instant::now() + Duration::from_secs(5);
-        while lane().owned_capacity.load(Ordering::Acquire) != expected && Instant::now() < until {
+        while (lane().owned_capacity.load(Ordering::Acquire) != expected || (expected == 0 && lane().workers.available_permits() != WORKERS)) && Instant::now() < until {
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(lane().owned_capacity.load(Ordering::Acquire), expected);
@@ -1002,6 +1050,7 @@ mod tests {
     }
     #[test]
     fn cancelled_before_admission_reserves_no_raw_capacity() {
+        let _guard=diagnostic_test_guard();
         wait_capacity(0);
         let job = request(Duration::from_secs(1), false, true);
         job.cancel();
@@ -1013,6 +1062,7 @@ mod tests {
     }
     #[test]
     fn queued_cancel_wakes_before_worker_and_never_allocates() {
+        let _guard=diagnostic_test_guard();
         wait_capacity(0);
         let first = worker();
         let second = worker();
@@ -1032,6 +1082,7 @@ mod tests {
     }
     #[test]
     fn queue_and_byte_admission_reject_before_allocator() {
+        let _guard=diagnostic_test_guard();
         wait_capacity(0);
         let mut jobs = Vec::new();
         while lane().queued.available_permits() > 0 {
@@ -1054,6 +1105,7 @@ mod tests {
     }
     #[test]
     fn latest_copy_interest_withdrawal_keeps_visible_disclosure_and_ignores_old_token() {
+        let _guard=diagnostic_test_guard();
         let job = request(Duration::from_secs(1), true, true);
         let old = job.copy_interest();
         let latest = job.copy_interest();
@@ -1071,6 +1123,7 @@ mod tests {
     }
     #[test]
     fn delayed_wire_mutex_obeys_whole_operation_deadline_and_cancel() {
+        let _guard=diagnostic_test_guard();
         for cancel in [false, true] {
             let (stream, _peer) = UnixStream::pair().unwrap();
             let wire = Arc::new(Mutex::new(Wire {
@@ -1093,6 +1146,7 @@ mod tests {
     }
     #[test]
     fn full_socket_write_obeys_deadline_without_changing_shared_flags() {
+        let _guard=diagnostic_test_guard();
         use std::os::fd::AsRawFd;
         let (stream, _peer) = UnixStream::pair().unwrap();
         let chunk = [0u8; 8192];
@@ -1124,6 +1178,7 @@ mod tests {
     }
     #[test]
     fn fixed_capacity_lossy_cleanup_matches_sanitizer_and_reports_real_layouts() {
+        let _guard=diagnostic_test_guard();
         wait_capacity(0);
         lane().peak_capacity.store(0, Ordering::Release);
         let before = rss_kib();
@@ -1151,6 +1206,7 @@ mod tests {
     }
     #[test]
     fn completed_body_is_charged_until_real_last_owner_retirement() {
+        let _guard=diagnostic_test_guard();
         wait_capacity(0);
         let job = request(Duration::from_secs(1), true, false);
         let worker = worker();
@@ -1177,6 +1233,7 @@ mod tests {
     }
     #[test]
     fn copy_completion_and_effect_receipt_keep_capacity_until_actual_release() {
+        let _guard=diagnostic_test_guard();
         wait_capacity(0);
         let job = request(Duration::from_secs(2), true, true);
         let worker = worker();
@@ -1215,6 +1272,7 @@ mod tests {
     }
     #[test]
     fn cancelled_queued_completion_retires_buffer_without_publishing_or_leaking_charge() {
+        let _guard=diagnostic_test_guard();
         wait_capacity(0);
         let job = request(Duration::from_secs(2), false, true);
         let worker = worker();
@@ -1227,4 +1285,63 @@ mod tests {
         drop(job);
         wait_capacity(0);
     }
+    #[test]
+    fn reclaimer_spawn_failure_preserves_last_body_and_all_charges() {
+        let _guard=diagnostic_test_guard();
+        wait_capacity(0);
+        struct Probe { _bytes:Vec<u8>, dropped:Arc<AtomicUsize> }
+        impl Drop for Probe { fn drop(&mut self) { self.dropped.fetch_add(1,Ordering::AcqRel); } }
+        let failed=start_reclaimer_with(|_task|Err(io::Error::other("injected spawn failure")));
+        assert!(failed.is_err());
+        let job=request(Duration::from_secs(1),false,true);let worker=worker();
+        let charge=Charge::reserve(UNIT,&job).unwrap();let dropped=Arc::new(AtomicUsize::new(0));
+        let value=Retired { body:Box::new(Probe { _bytes:vec![0;UNIT],dropped:dropped.clone() }),charge,worker:Some(worker.clone()),request:job.clone() };
+        let retained=match try_retire(value,&failed) { Ok(())=>panic!("failed reclaimer cannot consume owner"),Err(value)=>value };
+        assert_eq!(dropped.load(Ordering::Acquire),0);
+        assert_eq!(lane().owned_capacity.load(Ordering::Acquire),UNIT);
+        // Test cleanup explicitly happens on a joined worker; production fail
+        // closed instead retains this entire charged owner until process exit.
+        thread::spawn(move||drop(retained)).join().unwrap();
+        assert_eq!(dropped.load(Ordering::Acquire),1);drop(job);drop(worker);wait_capacity(0);
+    }
+    #[test]
+    fn summary_is_bounded_before_async_admission_even_with_large_input_capacity() {
+        let _guard=diagnostic_test_guard();
+        wait_capacity(0);let mut oversized_capacity=String::with_capacity(8*1024*1024);oversized_capacity.push_str("Readable failure");
+        let summary=DiagnosticCopySummary::new(&oversized_capacity).unwrap();drop(oversized_capacity);
+        assert_eq!(summary.as_str(),"Readable failure");
+        assert!(DiagnosticCopySummary::new(&"€".repeat(512)).is_err());
+        assert_eq!(lane().owned_capacity.load(Ordering::Acquire),0);
+    }
+    #[test]
+    fn ready_body_copy_keeps_original_receiver_and_authority_with_fresh_deadline() {
+        let _guard=diagnostic_test_guard();
+        wait_capacity(0);
+        let session=super::super::tests::omp_card(None,None);
+        let original=ClientHandle::fixture(session.clone(),Snapshot::default());
+        let replacement=ClientHandle::fixture(session,Snapshot::default());
+        let card=CardId::new();let log=super::super::super::ProviderExitLog { id:"same-metadata".into(),bytes:4,omitted:0 };
+        let original_current=Arc::new(AtomicBool::new(true));let original_check=original_current.clone();
+        let mut old=original.diagnostic_request(card,7,3,log.clone(),true,false,Arc::new(move||original_check.load(Ordering::Acquire))).unwrap();
+        Arc::get_mut(&mut old.0).unwrap().deadline=Instant::now()+Duration::from_millis(20);
+        let worker=worker();let text=normalize(raw(b"body",&old,&worker),&old,&worker).unwrap();text.installed();
+        let output=DiagnosticOutput { text:Arc::new(text),omitted:0,source:old.source().clone() };
+        thread::sleep(Duration::from_millis(30));assert!(old.check().is_err());
+        let fresh=original.diagnostic_request(card,7,3,log.clone(),false,true,Arc::new(||true)).unwrap();
+        assert!(output.current_for(&fresh),"fresh copy may reuse immutable body on the SAME proved source without the old deadline");
+        let substituted=replacement.diagnostic_request(card,7,3,log,false,true,Arc::new(||true)).unwrap();
+        assert_eq!(fresh.source(),substituted.source());assert!(!output.current_for(&substituted));
+        original_current.store(false,Ordering::Release);assert!(!output.current_for(&fresh));
+        drop(output);drop(old);drop(fresh);drop(substituted);drop(worker);wait_capacity(0);
+    }
+    #[test]
+    fn at_quota_fresh_request_refuses_before_allocate_and_retries_after_owner_release() {
+        let _guard=diagnostic_test_guard();
+        wait_capacity(0);let handle=ClientHandle::fixture(super::super::tests::omp_card(None,None),Snapshot::default());
+        let mut owners=Vec::new();while lane().queued.available_permits()>0 { owners.push(request(Duration::from_secs(1),true,false)); }
+        let make=||handle.diagnostic_request(CardId::new(),1,1,super::super::super::ProviderExitLog { id:"ready-copy".into(),bytes:4,omitted:0 },false,true,Arc::new(||true));
+        assert!(make().is_err());assert_eq!(lane().owned_capacity.load(Ordering::Acquire),0);
+        drop(owners.pop());let retry=make().unwrap();drop(retry);drop(owners);wait_capacity(0);
+    }
+
 }
