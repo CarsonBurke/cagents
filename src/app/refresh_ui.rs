@@ -24,7 +24,10 @@ pub(super) struct State {
     pub(super) focused: bool,
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,
-    pub(super) source_cache: Option<(PathBuf, Arc<std::sync::Mutex<crate::repository::SnapshotCache>>)>,
+    pub(super) source_cache: Option<(
+        PathBuf,
+        Arc<std::sync::Mutex<crate::repository::SnapshotCache>>,
+    )>,
     pub(super) source_invalidated: Arc<std::sync::atomic::AtomicU8>,
     pub(super) source_last_refresh: Instant,
     pub(super) source_expanded: Vec<RepoPath>,
