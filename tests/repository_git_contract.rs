@@ -6141,3 +6141,61 @@ fn undo_discard_refuses_a_same_size_substituted_unpack_file_and_preserves_it() {
     assert_eq!(fs::read(fixture.work().join(&holding).join("foreign")).unwrap(), b"preserve");
     assert_eq!(fs::read(parked.join("tracked.txt")).unwrap(), b"base");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_permission_recovery() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct ChangeParentMode { root: PathBuf, changed: AtomicBool }
+    impl ProcessExecutor for ChangeParentMode {
+        fn execute(&self, command: &CommandSpec, cancellation: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if output.success && command.arguments.iter().any(|argument| argument == "unpack-file")
+                && !self.changed.swap(true, Ordering::AcqRel)
+            {
+                fs::set_permissions(self.root.join("a"), fs::Permissions::from_mode(0o711)).unwrap();
+            }
+            Ok(output)
+        }
+    }
+    let Some(fixture) = Fixture::new() else { return; };
+    fixture.write("seed", b"initial\n");
+    fixture.git_in_work(&["add", "."]); fixture.commit("initial");
+    fixture.write("a/one", b"first work\n");
+    fixture.write("b/two", b"second work\n");
+    for directory in ["a", "b"] { fs::set_permissions(fixture.work().join(directory), fs::Permissions::from_mode(0o750)).unwrap(); }
+    fixture.git_in_work(&["add", "--", "a/one", "b/two"]);
+    let patch = fixture.git_in_work(&["diff", "--cached", "--binary"]);
+    fixture.git_in_work(&["reset", "HEAD", "--", "a/one", "b/two"]);
+    let cancel = CancellationToken::new();
+    let mut receipt = fixture.service().apply_patch_recoverable(&fixture.work(), &patch, true, None, &cancel).unwrap().recovery;
+    assert!(!fixture.work().join("a").exists());
+    assert!(!fixture.work().join("b").exists());
+    let executor = Arc::new(ChangeParentMode { root: fixture.work(), changed: AtomicBool::new(false) });
+    let service = RepositoryService::new("git", executor.clone());
+    let first = service.undo_discard(&receipt, &cancel).unwrap();
+    let MutationOutcome::PartiallyApplied { paths, failures } = first else { panic!("partial outcome required: {first:?}"); };
+    assert_eq!(paths, vec![path("a/one")]);
+    assert!(!failures.is_empty());
+    assert_eq!(fs::read(fixture.work().join("a/one")).unwrap(), b"first work\n");
+    assert!(!fixture.work().join("b").exists(), "remaining paths stop at the unresolved permission boundary");
+    assert_eq!(receipt.remaining_paths(), 1);
+    assert!(receipt.live_recovery.needs_resolution());
+    assert!(receipt.undo_deadline_unix_ms().is_none());
+    receipt.expires_unix_ms = 0;
+    assert!(receipt.can_undo(), "an unresolved receipt must not expire");
+    assert!(service.resolve_discard_recovery(&receipt, &cancel).is_err());
+    fs::set_permissions(fixture.work().join("a"), fs::Permissions::from_mode(0o700)).unwrap();
+    let resolved = service.resolve_discard_recovery(&receipt, &cancel).unwrap();
+    assert_eq!(resolved.remaining_paths, 1);
+    assert!(!receipt.live_recovery.needs_resolution());
+    assert!(receipt.can_undo());
+    assert_eq!(fs::metadata(fixture.work().join("a")).unwrap().mode() & 0o7777, 0o750);
+    assert!(!fixture.work().join("b").exists(), "cleanup alone must not pretend to perform the remaining Undo");
+    assert!(matches!(service.undo_discard(&receipt, &cancel).unwrap(), MutationOutcome::Applied { paths } if paths == vec![path("b/two")]));
+    assert_eq!(fs::read(fixture.work().join("a/one")).unwrap(), b"first work\n");
+    assert_eq!(fs::read(fixture.work().join("b/two")).unwrap(), b"second work\n");
+    assert_eq!(receipt.remaining_paths(), 0);
+    assert!(!receipt.can_undo());
+}

@@ -1570,6 +1570,32 @@ mod directory_frontier_tests {
     }
 
     #[test]
+    fn discard_recovery_requires_explicit_ack_even_when_an_authority_clone_already_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery = DiscardRecovery {
+            live_recovery: LiveDiscardRecovery::default(), worktree: dir.path().join("not-a-repository"),
+            worktree_identity: (0,0), directories: BTreeMap::new(), expires_unix_ms: 0,
+            entries: vec![DiscardRecoveryEntry { path: path("remaining"), before: SavedEntry::Absent,
+                after: SavedEntry::Absent, after_version: None, trash: None }],
+        };
+        let slot = crate::recovery_authority::RecoverySlot::reserve().unwrap();
+        recovery.live_recovery.retain(slot.retain("owned test recovery".into(), || Ok(())));
+        let service = RepositoryService::system("git");
+        let cancel = CancellationToken::new();
+        service.resolve_recovery(&recovery.live_recovery.authority().unwrap(), &cancel).unwrap();
+        assert!(!recovery.live_recovery.is_pending());
+        assert!(recovery.live_recovery.needs_resolution());
+        assert!(recovery.can_undo());
+        assert!(matches!(service.undo_discard(&recovery, &cancel).unwrap(), MutationOutcome::NotApplied { .. }),
+            "the admission guard must refuse before opening the nonexistent worktree");
+        let resolution = service.resolve_discard_recovery(&recovery, &cancel).unwrap();
+        assert_eq!(resolution.remaining_paths, 1);
+        assert!(!recovery.live_recovery.needs_resolution());
+        assert!(recovery.can_undo());
+        assert!(recovery.undo_deadline_unix_ms().unwrap() > unix_ms());
+    }
+
+    #[test]
     fn recovery_directory_frontier_never_chmods_existing_or_unverified_parents() {
         for unverified in [false, true] {
             let dir = tempfile::tempdir().unwrap();
