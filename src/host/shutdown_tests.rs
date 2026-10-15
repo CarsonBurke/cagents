@@ -70,9 +70,9 @@ impl Drop for RootPin {
     }
 }
 
-fn start_time(pid: u32) -> String {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-    stat.rsplit_once(')').unwrap().1.split_whitespace().nth(19).unwrap().into()
+fn start_time(pid: u32) -> io::Result<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    Ok(stat.rsplit_once(')').unwrap().1.split_whitespace().nth(19).unwrap().into())
 }
 
 #[test]
@@ -150,12 +150,12 @@ fn shutdown_batch_continues_after_an_unfinished_worker() {
         assert!(Instant::now() < ready_by, "private PTY root did not start");
         thread::sleep(Duration::from_millis(5));
     };
-    let original_start = start_time(pid);
+    let original_start = start_time(pid).unwrap();
     assert_eq!(fs::read_link(format!("/proc/{pid}/cwd")).unwrap(), root);
     let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     assert!(descriptor >= 0, "{}", io::Error::last_os_error());
     let root_pin = RootPin(unsafe { File::from_raw_fd(descriptor as i32) });
-    assert_eq!(start_time(pid), original_start);
+    assert_eq!(start_time(pid).unwrap(), original_start);
     let (handles, _) = state.graceful_shutdown();
     assert_eq!(handles.len(), 2);
 
@@ -172,7 +172,13 @@ fn shutdown_batch_continues_after_an_unfinished_worker() {
         // The wedged worker is first in HostState's terminal-ID order. Its
         // five-second join budget must not postpone the healthy PTY's request.
         let healthy_by = started + Duration::from_secs(3);
-        while Path::new(&format!("/proc/{pid}")).exists() {
+        loop {
+            match start_time(pid) {
+                Ok(start) if start == original_start => {}
+                Ok(_) => break, // The original was reaped before PID reuse.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) => panic!("could not inspect the private PTY root: {error}"),
+            }
             assert!(Instant::now() < healthy_by, "healthy PTY root was not reaped while the first worker was blocked");
             thread::sleep(Duration::from_millis(5));
         }
