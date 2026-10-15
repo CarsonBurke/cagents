@@ -90,3 +90,7 @@ mod tests {
         assert!(std::fs::read_dir(other.path()).unwrap().next().is_none());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "filesystem_recovery_context/fixtures.rs"]
+pub(crate) mod fixtures;
