@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod execution;
+mod annotations;
 mod store;
 mod websocket;
 use store::Store;
@@ -131,6 +132,7 @@ struct Inner {
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    annotations: Arc<Mutex<annotations::Authority>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -316,6 +318,7 @@ impl Handle {
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let annotations=Arc::new(Mutex::new(annotations::Authority::new(launch_account_scope.clone())));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -327,6 +330,7 @@ impl Handle {
             wake: Mutex::new(wake),
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
+            annotations:annotations.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -369,6 +373,7 @@ impl Handle {
                     adapter,
                     state,
                     confirmed_session,
+                    annotations,
                     store,
                     visible,
                     observe_next,
@@ -939,6 +944,11 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+    /// Cache-only metadata lookup. The host must release its actor-map lock
+    /// before calling; this neither sends provider work nor hydrates snapshots.
+    pub(crate) fn original_prompt(&self,user:Option<&str>,offset:usize,limit:usize)->Result<super::annotations::OriginalPage,super::annotations::OriginalError>{
+        self.0.annotations.lock().unwrap_or_else(|p|p.into_inner()).original(user,offset,limit)
     }
     pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         self.0.execution_environment.clone()
@@ -1543,6 +1553,7 @@ struct Actor {
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
+    annotations:Arc<Mutex<annotations::Authority>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -2202,7 +2213,7 @@ impl Actor {
     }
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
-    fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
+    fn apply_step(&mut self, mut step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
@@ -2214,6 +2225,9 @@ impl Actor {
         {
             context.verify_directory(&self.working_directory)?;
         }
+        let updates=self.adapter.take_approval_updates();
+        let warning=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).apply(confirmed.as_ref(),updates,&mut step.events);
+        if let Some(message)=warning{step.events.push(Event::Error{message,fatal:false});}
         for value in step.writes {
             let mut frame = BoundedFrame(Vec::new());
             serde_json::to_writer(&mut frame, &value)

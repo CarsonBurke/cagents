@@ -111,6 +111,8 @@ impl Store {
     pub(crate) fn installation(scope: &LaunchAccountScope, session: &str) -> Result<Self,String> {
         Self::at(&installation_root()?,scope,session)
     }
+    #[cfg(test)]
+    pub(crate) fn for_test(root:&Path,scope:&LaunchAccountScope,session:&str)->Result<Self,String>{Self::at(root,scope,session)}
     fn at(root:&Path,scope:&LaunchAccountScope,session:&str)->Result<Self,String> {
         scope.revalidate()?;
         if !valid_id(session) {return Err("Invalid confirmed conversation identity".into());}

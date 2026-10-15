@@ -83,6 +83,8 @@ pub(crate) enum ApprovalDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ApprovalUpdate {
+    /// Adapter conversation identity at the exact live request/answer boundary.
+    pub session_id:Option<String>,
     pub key: ApprovalKey,
     pub request_id: String,
     pub decision: ApprovalDecision,

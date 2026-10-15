@@ -217,6 +217,12 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    /// Explicit live provider requests and user answers, separate from replayed
+    /// transcript item states. Drained synchronously after each adapter step.
+    fn take_approval_updates(&mut self) -> Vec<crate::chat::annotations::ApprovalUpdate> {
+        Vec::new()
+    }
+
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.

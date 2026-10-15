@@ -298,6 +298,7 @@ enum ReportTask {
 
 #[derive(Default)]
 struct Claude {
+    annotation_updates: Vec<chat::annotations::ApprovalUpdate>,
     session_id: Option<String>,
     /// Whether this process was launched to resume `session_id`, as opposed
     /// to being handed a new one that names nothing until its first prompt.
@@ -768,6 +769,14 @@ impl Claude {
             ],
             events: vec![],
         };
+        if let Some(tool_id)=request["tool_use_id"].as_str().filter(|_|string(request,"tool_name")!="AskUserQuestion") {
+            self.annotation_updates.push(chat::annotations::ApprovalUpdate {
+                session_id:self.session_id.clone(),
+                key:chat::annotations::ApprovalKey{agent_id:None,item_id:tool_id.to_owned()},
+                request_id:id.clone(),
+                decision:if action=="deny"{chat::annotations::ApprovalDecision::Denied}else{chat::annotations::ApprovalDecision::Allowed},
+            });
+        }
         self.retire(id, &mut step);
         let tool_id = request["tool_use_id"].as_str().map(str::to_owned);
         if let Some(tool_id) = tool_id {
@@ -910,6 +919,11 @@ impl Claude {
         };
         let mut events = vec![Event::Request(event)];
         if !question && let Some(tool_id) = request["tool_use_id"].as_str() {
+            self.annotation_updates.push(chat::annotations::ApprovalUpdate {
+                session_id:self.session_id.clone(),
+                key:chat::annotations::ApprovalKey{agent_id:None,item_id:tool_id.to_owned()},
+                request_id:id.clone(),decision:chat::annotations::ApprovalDecision::Awaiting,
+            });
             let mut item = self.tools.get(tool_id).cloned().unwrap_or_else(|| Item {
                 id: tool_id.to_owned(),
                 role: Role::Assistant,
@@ -1591,6 +1605,9 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn take_approval_updates(&mut self) -> Vec<chat::annotations::ApprovalUpdate> {
+        std::mem::take(&mut self.annotation_updates)
+    }
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
