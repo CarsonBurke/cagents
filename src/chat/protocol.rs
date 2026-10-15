@@ -8,6 +8,8 @@ mod claude_edits;
 mod claude_permissions;
 pub mod codex;
 pub mod omp;
+mod tool_cache;
+pub use tool_cache::{ItemKey as CanonicalItemKey,ItemReader as CanonicalItemReader};
 pub(crate) use super::terminal_output;
 
 #[derive(Debug, Clone)]
@@ -207,6 +209,11 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Optional exact canonical source for byte-budgeted adapter caches.
+    fn bind_item_reader(&mut self,_reader:std::sync::Arc<dyn CanonicalItemReader>) {}
+    /// The runtime has committed this Step into its canonical Store. Resident
+    /// caches may now retire bodies without losing same-frame correlation.
+    fn committed(&mut self) {}
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
     fn command_for_run(

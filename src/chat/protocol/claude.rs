@@ -2,7 +2,8 @@
 //! Wire reference: anthropics/claude-agent-sdk-python, _internal/query.py,
 //! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
-use super::{Adapter, ProcessSpec, Step};
+use super::{Adapter, ProcessSpec, Step,CanonicalItemKey};
+use super::tool_cache::{ToolCache,Reader};
 use crate::account::{self, LiveReport};
 use crate::agent::Provider;
 use crate::chat;
@@ -351,7 +352,8 @@ struct Claude {
     carrier_order: VecDeque<String>,
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
-    tools: HashMap<String, Item>,
+    tools: ToolCache,
+    item_reader:Option<Reader>,
     /// Synthetic task rows shown before their Agent tool is known. Bounded by
     /// the same cache as task tools, so late correlation can retract one row.
     visible_task_rows: HashSet<String>,
@@ -359,12 +361,12 @@ struct Claude {
     /// no place for the name, and an edit that fails is shown as its call
     /// again; the input says which tool that was only while it is still
     /// held, which a large write's never is.
-    edit_tools: HashMap<String, String>,
-    tool_inputs: HashMap<String, String>,
-    tool_input_order: VecDeque<String>,
+    edit_tools: HashMap<CanonicalItemKey, String>,
+    tool_inputs: HashMap<CanonicalItemKey, String>,
+    tool_input_order: VecDeque<CanonicalItemKey>,
     dismissed_denials: VecDeque<String>,
     permissions: Option<super::claude_permissions::Snapshot>,
-    tool_order: VecDeque<String>,
+    tool_order: VecDeque<CanonicalItemKey>,
     /// Running background tasks, oldest first.
     tasks: VecDeque<String>,
     /// Report-producing tasks, oldest first. Preserve their explicit native
@@ -637,19 +639,30 @@ impl Claude {
             step.events.push(Event::PastTurnFinished { key, outcome });
         }
     }
-    fn tool(&mut self, item: Item) {
-        if !self.tools.contains_key(&item.id) {
-            self.tool_order.push_back(item.id.clone());
-        }
-        self.tools.insert(item.id.clone(), item);
-        while self.tool_order.len() > MAX_TOOLS {
-            if let Some(id) = self.tool_order.pop_front() {
-                self.tools.remove(&id);
-                self.visible_task_rows.remove(&id);
-                self.edit_tools.remove(&id);
-                self.tool_inputs.remove(&id);
+    fn tool(&mut self,parent:Option<&str>,item:Item) {
+        let key=CanonicalItemKey::new(parent,&item.id);
+        if key.item_id.len()>4096 || key.agent_id.as_ref().is_some_and(|id|id.len()>4096) {return;}
+        if !self.tool_order.contains(&key) {self.tool_order.push_back(key);}
+        self.tools.insert(parent,item);
+        while self.tool_order.len()>MAX_TOOLS {
+            if let Some(key)=self.tool_order.pop_front() {
+                self.tools.remove(key.agent_id.as_deref(),&key.item_id);
+                self.visible_task_rows.remove(&key.item_id);
+                self.edit_tools.remove(&key);
+                self.tool_inputs.remove(&key);
             }
         }
+    }
+    fn cached_tool(&self,parent:Option<&str>,id:&str)->Result<Option<Item>,String> {
+        if let Some(item)=self.tools.get(parent,id) {return Ok(Some(item.clone()));}
+        let key=CanonicalItemKey::new(parent,id);
+        let Some(reader)=&self.item_reader else {
+            return if self.tool_order.contains(&key) {Err("Original tool source is unavailable; its stored call was preserved".into())} else {Ok(None)};
+        };
+        let item=reader.read(&key)?;
+        if item.is_none() && self.tool_order.contains(&key) {return Err("Original tool source is unavailable; its stored call was preserved".into());}
+        if item.as_ref().is_some_and(|item|item.id!=id) {return Err("Original tool source identity changed; refusing mismatched classification".into());}
+        Ok(item)
     }
     fn task_rows_for_agent(&mut self, tool: &str) -> Vec<String> {
         self.agent_task_calls
@@ -659,14 +672,14 @@ impl Claude {
             .filter(|id| self.visible_task_rows.remove(id))
             .collect()
     }
-    fn remember_tool_input(&mut self, id: &str, input: &Value) -> Result<(), String> {
+    fn remember_tool_input(&mut self,parent:Option<&str>, id: &str, input: &Value) -> Result<(), String> {
         if !input.is_object() || encoded_len(input)? > chat::PermissionDenial::INPUT_LIMIT {
             return Ok(());
         }
-        if !self.tool_inputs.contains_key(id) {
-            self.tool_input_order.push_back(id.into());
-        }
-        self.tool_inputs.insert(id.into(), input.to_string());
+        let key=CanonicalItemKey::new(parent,id);
+        if key.item_id.len()>4096 || key.agent_id.as_ref().is_some_and(|id|id.len()>4096) {return Ok(());}
+        if !self.tool_inputs.contains_key(&key) {self.tool_input_order.push_back(key.clone());}
+        self.tool_inputs.insert(key,input.to_string());
         while self.tool_input_order.len() > chat::PermissionDenial::LIMIT {
             if let Some(expired) = self.tool_input_order.pop_front() {
                 self.tool_inputs.remove(&expired);
@@ -1308,7 +1321,7 @@ impl Claude {
                     }
                     "tool_use" | "server_tool_use" => {
                         let tool_id = required(block, "id")?.to_owned();
-                        self.remember_tool_input(&tool_id, &block["input"])?;
+                        self.remember_tool_input(child,&tool_id, &block["input"])?;
                         let item = Item {
                             id: tool_id.clone(),
                             role: Role::Assistant,
@@ -1321,7 +1334,11 @@ impl Claude {
                             at: None,
                         };
                         // Replayed assistant envelopes must not reset a completed tool result.
-                        if !self.tools.get(&item.id).is_some_and(|old| {
+                        let cached=match self.cached_tool(child,&item.id) {
+                            Ok(cached)=>cached,
+                            Err(message)=> {step.events.push(Event::Error {message,fatal:false});continue;}
+                        };
+                        if !cached.as_ref().is_some_and(|old| {
                             old.content
                                 .status()
                                 .is_some_and(|status| status != ToolStatus::Running)
@@ -1347,28 +1364,32 @@ impl Claude {
                             }
                             if matches!(item.content, ItemContent::Changes { .. }) {
                                 self.edit_tools
-                                    .insert(tool_id.clone(), string(block, "name").into());
+                                    .insert(CanonicalItemKey::new(child,&tool_id), string(block, "name").into());
                             }
-                            self.tool(item.clone());
+                            self.tool(child,item.clone());
                             step.events.push(Event::Item(item));
                         } else if history {
                             // Keep the original call position as an overlap
                             // anchor without changing its confirmed outcome.
-                            if let Some(completed) = self.tools.get(&tool_id) {
+                            if let Some(completed) = cached {
                                 step.events.push(Event::Item(completed.clone()));
                             }
                         }
                     }
                     "tool_result" => {
                         let tool_id = required(block, "tool_use_id")?.to_owned();
-                        let needs_call=self.tools.get(&tool_id).is_none_or(|old|matches!(&old.content,ItemContent::Tool{name,input,..} if name=="Tool"&&input.is_empty()));
+                        let cached=match self.cached_tool(child,&tool_id) {
+                            Ok(cached)=>cached,
+                            Err(message)=> {step.events.push(Event::Error {message,fatal:false});continue;}
+                        };
+                        let needs_call=cached.as_ref().is_none_or(|old|matches!(&old.content,ItemContent::Tool{name,input,..} if name=="Tool"&&input.is_empty()));
                         let recovered = if needs_call {
                             if let Some(call) = correlated_call {
-                                self.remember_tool_input(&tool_id, &call["input"])?;
+                                self.remember_tool_input(child,&tool_id, &call["input"])?;
                                 let name = required(call, "name")?;
                                 let content = tool_content(name, &call["input"], &self.cwd);
                                 if matches!(&content, ItemContent::Changes { .. }) {
-                                    self.edit_tools.insert(tool_id.clone(), name.into());
+                                    self.edit_tools.insert(CanonicalItemKey::new(child,&tool_id), name.into());
                                 }
                                 Some(content)
                             } else {
@@ -1385,7 +1406,7 @@ impl Claude {
                                 started_at: None,
                                 at: None,
                             })
-                            .or_else(|| self.tools.get(&tool_id).cloned())
+                            .or(cached)
                             .unwrap_or(Item {
                                 id: tool_id.clone(),
                                 role: Role::Assistant,
@@ -1402,8 +1423,8 @@ impl Claude {
                             &mut item.content,
                             content_text(&block["content"]),
                             block["is_error"].as_bool() == Some(true),
-                            self.edit_tools.get(&tool_id).map(String::as_str),
-                            self.tool_inputs.get(&tool_id).map(String::as_str),
+                            self.edit_tools.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str),
+                            self.tool_inputs.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str),
                             // The structured result is the frame's, so it is
                             // this block's only when the frame has no other.
                             if content.len() == 1 {
@@ -1460,7 +1481,7 @@ impl Claude {
                                 }));
                             }
                         }
-                        self.tool(item.clone());
+                        self.tool(child,item.clone());
                         step.events.push(Event::Item(item));
                     }
                     "image" => step.events.push(Event::Item(Item {
@@ -1615,7 +1636,8 @@ impl Claude {
             self.remember_retracted(carrier);
         }
         for id in ids.iter().chain(child_ids.values().flatten()) {
-            self.tools.remove(id);
+            if ids.contains(id) {self.tools.remove(None,id);}
+            for (parent,children) in &child_ids {if children.contains(id) {self.tools.remove(Some(parent),id);}}
             self.blocks.retain(|_, item| &item.id != id);
         }
         if !ids.is_empty() {
@@ -1676,6 +1698,8 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn bind_item_reader(&mut self,reader:std::sync::Arc<dyn super::CanonicalItemReader>) {self.item_reader=Some(reader);}
+    fn committed(&mut self) {self.tools.trim();}
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
@@ -3917,13 +3941,13 @@ impl Claude {
                         // accumulate as a plain tool call and the richer
                         // mapping happens here rather than against a prefix.
                         let content = tool_content(name, &parsed, &self.cwd);
-                        self.remember_tool_input(&item.id, &parsed)?;
+                        self.remember_tool_input(Some(&parent),&item.id, &parsed)?;
                         if matches!(content, ItemContent::Changes { .. }) {
-                            self.edit_tools.insert(item.id.clone(), name.clone());
+                            self.edit_tools.insert(CanonicalItemKey::new(Some(&parent),&item.id), name.clone());
                         }
                         item.content = content;
                         step.events.push(Event::Item(item.clone()));
-                        self.tool(item);
+                        self.tool(Some(&parent),item);
                     }
                 }
             }
@@ -3970,7 +3994,7 @@ impl Claude {
         let input = if frame["tool_input"].is_object() {
             Some(frame["tool_input"].to_string())
         } else {
-            self.tool_inputs.get(id).cloned()
+            self.tool_inputs.get(&CanonicalItemKey::new(frame["parent_tool_use_id"].as_str(),id)).cloned()
         }
         .filter(|input| input.len() <= chat::PermissionDenial::INPUT_LIMIT);
         let bounded = |value: &str| {
@@ -4042,7 +4066,10 @@ impl Claude {
             "task_started" | "task_progress" | "task_notification" | "task_updated" => {
                 let task = required(frame, "task_id")?;
                 let id = format!("claude-task:{task}");
-                let previous = self.tools.get(&id).cloned();
+                let previous=match self.cached_tool(None,&id) {
+                    Ok(previous)=>previous,
+                    Err(message)=> {step.events.push(Event::Error {message,fatal:false});return Ok(());}
+                };
                 let mut item = previous.unwrap_or(Item {
                     id,
                     role: Role::Assistant,
@@ -4130,7 +4157,7 @@ impl Claude {
                     .as_deref()
                     .or_else(|| frame["tool_use_id"].as_str())
                     .is_some_and(|tool| {
-                        self.tools.get(tool).is_some_and(|item|
+                        self.tools.get(None,tool).is_some_and(|item|
                         matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"))
                     });
                 if let Some(tool) = &known_tool {
@@ -4177,7 +4204,7 @@ impl Claude {
                         background: None,
                     });
                 }
-                self.tool(item.clone());
+                self.tool(None,item.clone());
                 if represented {
                     if self.visible_task_rows.remove(&item.id) {
                         step.events.push(Event::ItemsRemoved {
@@ -7128,13 +7155,13 @@ mod tests {
             {"type":"tool_use","id":"write","name":"Write","input":{"file_path":"big.txt","content":content}},
             {"type":"tool_use","id":"edit","name":"MultiEdit","input":{"file_path":"src/app.rs","edits":[{"old_string":"missing","new_string":"found"}]}},
         ]}})).unwrap();
-        assert!(!adapter.tool_inputs.contains_key("write"));
+        assert!(!adapter.tool_inputs.contains_key(&CanonicalItemKey::new(None,"write")));
         for call in 0..chat::PermissionDenial::LIMIT {
             adapter.receive(json!({"type":"assistant","uuid":format!("b{call}"),"message":{"id":format!("msg-b{call}"),"content":[
                 {"type":"tool_use","id":format!("read-{call}"),"name":"Read","input":{"file_path":"src/app.rs"}},
             ]}})).unwrap();
         }
-        assert!(!adapter.tool_inputs.contains_key("edit"));
+        assert!(!adapter.tool_inputs.contains_key(&CanonicalItemKey::new(None,"edit")));
         for (id, name, path) in [
             ("write", "Write", "big.txt"),
             ("edit", "MultiEdit", "src/app.rs"),
