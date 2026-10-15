@@ -61,6 +61,16 @@ pub(crate) fn has_outstanding_ownership() -> bool {
     }
 }
 
+/// Preserved originals can outlive their former terminal record. This excludes
+/// ordinary caller-held spawn reservations, which remain covered by the normal
+/// terminal inventory and its explicit shutdown confirmation contract.
+pub(crate) fn has_retained_ownership() -> bool {
+    match SERVICE.get() {
+        Some(Ok(service)) => service.has_retained_ownership(),
+        None | Some(Err(_)) => false,
+    }
+}
+
 pub(crate) type RetainError = (io::Error, Child, File, Reservation);
 impl Reservation {
     /// Failure returns every ownership object intact. Insertion and wakeup are
@@ -145,6 +155,10 @@ impl Service {
     fn has_outstanding_ownership(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.free.len() != state.entries.len()
+    }
+
+    fn has_retained_ownership(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).entries.iter().any(Option::is_some)
     }
 
     fn start(capacity: usize) -> io::Result<(Arc<Self>, JoinHandle<()>)> {
@@ -431,14 +445,17 @@ mod tests {
         assert!(!reaper.service.has_outstanding_ownership());
         let reservation = reaper.service.reserve().unwrap();
         assert!(reaper.service.has_outstanding_ownership(), "pre-registry spawn ownership must fence idle exit");
+        assert!(!reaper.service.has_retained_ownership(), "a caller-held credit is not an independent retained child");
         assert_eq!(reaper.service.reserve().unwrap_err().kind(), io::ErrorKind::WouldBlock);
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
         owned.handoff(reservation);
+        assert!(reaper.service.has_retained_ownership());
         assert_eq!(reaper.free(), 0);
         assert_eq!(reaper.service.reserve().unwrap_err().kind(), io::ErrorKind::WouldBlock);
         owned.signal(libc::SIGKILL);
         reaper.await_free(1);
         assert!(!reaper.service.has_outstanding_ownership(), "only exact reaping releases the idle ownership fence");
+        assert!(!reaper.service.has_retained_ownership());
         assert!(reaper.service.reserve().is_ok());
     }
 
@@ -521,6 +538,7 @@ mod tests {
         let child = owned.child.take().unwrap(); let pid = child.id();
         reservation.preserve_suspended(child, None, "spawn-time pidfd capture failed");
         assert!(reaper.service.has_outstanding_ownership(), "missing registry/pidfd cannot make an owned child disappear from the idle census");
+        assert!(reaper.service.has_retained_ownership());
         let state = reaper.service.state.lock().unwrap();
         let entry = state.entries[0].as_ref().unwrap();
         assert_eq!(entry.child.id(), pid);
