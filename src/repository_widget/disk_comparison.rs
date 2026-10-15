@@ -135,8 +135,9 @@ mod tests {
             let card = CardId::new(); let mut runtime = fixture(card);
             let task = runtime.update(RepositoryAction::CompareDisk { card });
             if freeze {
-                let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
-                document.workspace_edit = Some(77);
+                let (path, snapshot) = runtime.workspace_edit_snapshot().unwrap();
+                let plan = crate::editor_workspace_edit::DocumentPlan { path: path.clone(), relative: "note.rs".into(), before: snapshot.text.clone(), after: snapshot.text.clone(), before_hash: blake3::hash(snapshot.text.as_bytes()), version: Some(snapshot.version), protocol_version: snapshot.protocol_version, open: true, open_paths: vec![path], edits: Vec::new() };
+                runtime.begin_workspace_edit(77, &plan).unwrap();
             } else { runtime.dismiss_disk_comparison(); }
             assert!(runtime.disk_comparison_job.is_some());
             drop(runtime.update(completion(task).await));
