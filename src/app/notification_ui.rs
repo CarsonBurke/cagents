@@ -762,7 +762,7 @@ impl Cagents {
         }
         let requested: Vec<_> = agent.session.iter().filter(|owner| owner.id() == session).cloned()
             .chain(agent.console.iter().filter(|owner| owner.id == session).cloned().map(HostedSession::Terminal))
-            .filter(|owner| owner.same_process(owner)).collect();
+            .filter(HostedSession::has_complete_proof).collect();
         let requested_owner = requested.first()?.clone();
         let display = crate::workspace_model::views::ManagedDisplayIndex::new(&self.workspace_model)
             .resolve_activation(agent, &requested_owner)?;
@@ -776,11 +776,7 @@ impl Cagents {
             Some(_) => return None,
             None => requested_owner,
         };
-        let proven = match &owner {
-            HostedSession::Chat(session) => session.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete),
-            HostedSession::Terminal(session) => session.continuity.live_proof().is_some_and(|proof| proof.is_complete()),
-        };
-        if !proven { return None; }
+        if !owner.has_complete_proof() { return None; }
         let repository = match &display.scope {
             Placement::Channel(id) => {
                 let shared = self.workspace_model.channel(*id)?;

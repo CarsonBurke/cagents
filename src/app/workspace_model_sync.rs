@@ -760,6 +760,7 @@ impl Cagents {
         session: crate::agent_execution::HostedSession,
     ) -> Option<Task<Message>> {
         use crate::agent_execution::HostedSession;
+        if !session.has_complete_proof() { return None; }
         let owned = agent.session.as_ref().is_some_and(|current| current.same_process(&session))
             || agent.console.as_ref().is_some_and(|current| HostedSession::Terminal(current.clone()).same_process(&session));
         let saved_matches = match display.pane.as_ref().map(|pane| &pane.kind) {

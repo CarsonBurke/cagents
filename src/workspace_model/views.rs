@@ -146,7 +146,7 @@ impl<'a> ManagedDisplayIndex<'a> {
     /// request rather than inferring a session from its original launch surface.
     pub fn resolve_activation(&self, agent: &crate::agent_execution::Agent, requested: &crate::agent_execution::HostedSession) -> Option<ManagedDisplay> {
         use crate::agent_execution::HostedSession;
-        if agent.closed { return None; }
+        if agent.closed || !requested.has_complete_proof() { return None; }
         let owned = agent.session.as_ref().is_some_and(|current| current.same_process(requested))
             || agent.console.as_ref().is_some_and(|current| HostedSession::Terminal(current.clone()).same_process(requested));
         if !owned { return None; }
@@ -687,6 +687,18 @@ mod managed_display_tests {
             assert!(ManagedDisplayIndex::new(&model).resolve_activation(&agent, &stale).is_none());
             if let HostedSession::Chat(session) = &mut stale { session.proof = None; }
             assert!(ManagedDisplayIndex::new(&model).resolve_activation(&agent, &stale).is_none());
+            if let HostedSession::Chat(session) = &mut stale {
+                session.proof = Some(HostSessionProof { host_session_id: HostSessionId::new(""), boot_id: BootId::new(""), host_incarnation: HostIncarnation::new("") });
+            }
+            assert!(ManagedDisplayIndex::new(&model).resolve_activation(&agent, &stale).is_none());
+            let mut unproved_agent = agent.clone();
+            unproved_agent.session = Some(stale.clone());
+            assert!(ManagedDisplayIndex::new(&model).resolve_activation(&unproved_agent, &stale).is_none(),
+                "matching empty current and requested proofs cannot authorize the proved console pane");
+            if let HostedSession::Chat(session) = &mut stale { session.proof = None; }
+            unproved_agent.session = Some(stale.clone());
+            assert!(ManagedDisplayIndex::new(&model).resolve_activation(&unproved_agent, &stale).is_none(),
+                "matching absent proofs are equality, not issued live ownership");
             model.views.push(model.views[0].clone());
             assert!(ManagedDisplayIndex::new(&model).resolve_activation(&agent, &current_native).is_none());
             model.views.truncate(1);
