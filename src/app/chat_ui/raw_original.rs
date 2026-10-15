@@ -54,10 +54,10 @@ struct Loaded {record:ResidentRaw,view:tool_text::ToolText}
 struct Entry {part:RawSourcePart,revision:u64,opened:bool,attempt:Option<u64>,loaded:Option<Loaded>,restored:Option<Arc<str>>,error:Option<String>}
 impl Entry {fn new(part:RawSourcePart)->Self {Self {part,revision:next_revision(),opened:false,attempt:None,loaded:None,restored:None,error:None}}}
 #[derive(Default)]
-pub(super) struct State {entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,selected:Option<String>,revision:u64,restore_error:Option<String>}
+pub(super) struct State {entries:HashMap<Key,Entry>,aliases:HashMap<String,Vec<Key>>,context:u64,next:u64,actor:Option<std::sync::Weak<ClientHandle>>,session:Option<String>,selected:Option<String>,revision:u64,restore_error:Option<String>,notice_revision:u64}
 impl State {
     pub(super) fn clear(&mut self) {
-        let entries=std::mem::take(&mut self.entries);for (_,entry) in entries {retire_entry(entry);}self.aliases.clear();self.actor=None;self.session=None;self.selected=None;self.restore_error=None;
+        let entries=std::mem::take(&mut self.entries);for (_,entry) in entries {retire_entry(entry);}self.aliases.clear();self.actor=None;self.session=None;self.selected=None;self.restore_error=None;self.notice_revision=0;
         self.context=self.context.wrapping_add(1);self.revision=self.revision.wrapping_add(1);
     }
     fn sync(&mut self,snapshot:&Snapshot,selected:Option<&str>,actor:Option<&Arc<ClientHandle>>) {
@@ -98,7 +98,10 @@ impl State {
     }
     pub(super) fn revision(&self)->u64 {self.revision}
     pub(super) fn item_revision(&self,item:&str)->u64 {
-        self.aliases.get(item).into_iter().flatten().filter_map(|key|self.entries.get(key)).map(|entry|entry.revision).max().unwrap_or(0)
+        self.aliases.get(item).into_iter().flatten().filter_map(|key|self.entries.get(key)).map(|entry|entry.revision.max(self.notice_revision)).max().unwrap_or(0)
+    }
+    fn restore_notice(&mut self,error:Option<String>) {
+        if self.restore_error!=error {self.restore_error=error;self.notice_revision=next_revision();}
     }
     pub(super) fn render_ready(&mut self,ready:impl Fn(&tool_text::ToolText)->bool)->bool {
         let mut changed=false;
@@ -127,7 +130,7 @@ impl State {
             let key=Key {source:proof.source,field:proof.field};let entry=self.entries.get_mut(&key).expect("validated raw source");
             entry.opened=true;if let Some(old)=entry.restored.replace(text) {retire(old);}entry.revision=next_revision();self.next=self.next.wrapping_add(1);entry.attempt=Some(self.next);
         }
-        self.restore_error=None;self.revision=self.revision.wrapping_add(1);Ok(())
+        self.restore_notice(None);self.revision=self.revision.wrapping_add(1);Ok(())
     }
 }
 impl Drop for State {fn drop(&mut self) {self.clear();}}
@@ -222,7 +225,7 @@ fn retire_entry(mut entry:Entry) {
 }
 pub(super) fn restore(runtime:&mut Runtime,view:ResidentRawCalls) {
     sync(runtime);
-    if let Err(error)=runtime.raw_original.restore(view) {runtime.raw_original.restore_error=Some(error);for entry in runtime.raw_original.entries.values_mut() {entry.revision=next_revision();}}
+    if let Err(error)=runtime.raw_original.restore(view) {runtime.raw_original.restore_notice(Some(error));}
 }
 fn retire(value:impl Send+'static) {
     type Retired=Box<dyn std::any::Any+Send>;
@@ -408,6 +411,17 @@ mod tests {
         state.toggle(&first.item_id,first.field);assert!(state.item_revision(&first.item_id)>first_before);
         assert_eq!(state.item_revision(&second.item_id),second_before,"unrelated turns retain their presentation");
         assert_eq!(state.item_revision(&first.source.source_id),state.item_revision(&first.item_id));
+    }
+    #[test]
+    fn clearing_a_scoped_restore_notice_invalidates_all_rows_that_displayed_it_even_for_empty_restore() {
+        let first=part("first");let mut second=part("second");second.source.source_id="second-root".into();second.item_id="second-visible".into();
+        let snapshot=Snapshot {raw_source_parts:vec![first.clone(),second.clone()],..Default::default()};let mut state=State::default();state.sync(&snapshot,None,None);
+        state.restore_notice(Some("The offline original source changed.".into()));
+        let before=[state.item_revision(&first.item_id),state.item_revision(&second.item_id)];
+        state.restore(ResidentRawCalls::default()).unwrap();assert!(state.restore_error.is_none());
+        assert!(state.item_revision(&first.item_id)>before[0]);assert!(state.item_revision(&second.item_id)>before[1]);
+        let stable=state.item_revision(&second.item_id);state.toggle(&first.item_id,first.field);
+        assert_eq!(state.item_revision(&second.item_id),stable,"ordinary disclosure still has item-local invalidation");
     }
     #[test]
     fn source_reader_and_retirement_payloads_require_safe_send() {
