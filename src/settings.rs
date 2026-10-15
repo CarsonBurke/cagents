@@ -1912,8 +1912,7 @@ fn save_merged_observed_unlocked(path: &Path, base: &AppSettings, desired: &AppS
     // Unknown values are preserved by saving. A known-but-invalid foreign
     // value in another category must keep its banner after this save too.
     let loaded = load_unlocked(path)?;
-    let warnings: Vec<_> = loaded.set_aside().collect();
-    let reload_error = (!warnings.is_empty()).then(|| warnings.join("\n"));
+    let reload_error = live_validation_error(&loaded);
     Ok(SavedSettings { settings: loaded.settings, reload_error, observed_at: std::time::Instant::now() })
 }
 
@@ -2009,12 +2008,22 @@ pub fn load_live_observed(path: impl AsRef<Path>) -> LiveSettings {
     let result = (|| {
         let _lock = settings_lock(path).map_err(|error| error.to_string())?;
         let result = load_unlocked(path).map_err(|error| error.to_string()).and_then(|loaded| {
-            let warnings: Vec<_> = loaded.set_aside().collect();
-            if warnings.is_empty() { Ok(loaded.settings) } else { Err(warnings.join("\n")) }
+            match live_validation_error(&loaded) {
+                Some(error) => Err(error),
+                None => Ok(loaded.settings),
+            }
         });
         Ok::<_, String>(LiveSettings::now(result))
     })();
     result.unwrap_or_else(|error| LiveSettings::now(Err(error)))
+}
+
+fn live_validation_error(loaded: &Loaded) -> Option<String> {
+    let errors: Vec<_> = loaded.foreign.iter().filter_map(|setting| match &setting.reason {
+        ForeignReason::UnknownKey => None,
+        ForeignReason::UnreadableValue(error) => Some(format!("settings.toml: “{}” is invalid ({error}).", dotted(&setting.path))),
+    }).collect();
+    (!errors.is_empty()).then(|| errors.join("\n"))
 }
 
 /// Save a byte-for-byte recovery copy before resetting any preferences.
@@ -2971,7 +2980,9 @@ mod tests {
         save(&path, &AppSettings::default()).unwrap();
         let original = std::fs::read_to_string(&path).unwrap().replace("terminal_font_size = 14.0", "terminal_font_size = -5.0");
         std::fs::write(&path, format!("{original}\n[future_preferences]\nkeep = true\n")).unwrap();
-        assert!(load_live(&path).is_err());
+        let error = load_live(&path).unwrap_err();
+        assert!(error.contains("terminal_font_size"));
+        assert!(!error.contains("default is in effect"));
         reset_keys_with_backup(&path, &AppSettings::default(), &["terminal_font_size".into()]).unwrap();
         assert!(load_live(&path).is_ok());
         assert!(std::fs::read_to_string(path).unwrap().contains("[future_preferences]"));
