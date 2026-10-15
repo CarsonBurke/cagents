@@ -2005,7 +2005,12 @@ impl Adapter for Claude {
             });
         }
         match string(&frame, "type") {
-            "control_request" => return self.permission(frame),
+            "control_request" => {
+                let permission=self.permission(frame)?;
+                step.writes.extend(permission.writes);
+                step.events.extend(permission.events);
+                return Ok(step);
+            },
             "control_cancel_request" => {
                 self.retire(required(&frame, "request_id")?.into(), &mut step);
             }
@@ -5092,6 +5097,8 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
     Ok(value)
 }
 
+#[cfg(test)]
+pub(crate) fn annotation_test_adapter()->Box<dyn Adapter>{Box::new(Claude{ready:true,cwd:std::env::temp_dir(),..Claude::default()})}
 #[cfg(test)]
 mod tests {
     use super::*;

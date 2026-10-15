@@ -7,17 +7,29 @@ pub(super) struct Authority {
     session:Option<String>,
     store:Option<annotations::storage::Store>,
     notice:Option<String>,
+    retry_at:Option<std::time::Instant>,
+    #[cfg(test)]
+    root:Option<std::path::PathBuf>,
 }
 impl Authority {
-    pub(super) fn new(scope:Result<LaunchAccountScope,String>)->Self{Self{scope,session:None,store:None,notice:None}}
+    pub(super) fn new(scope:Result<LaunchAccountScope,String>)->Self{Self{scope,session:None,store:None,notice:None,retry_at:None,#[cfg(test)] root:None}}
     pub(super) fn original(&self,user:Option<&str>,offset:usize,limit:usize)->Result<OriginalPage,OriginalError>{
         self.store.as_ref().ok_or_else(||OriginalError::Unavailable("No qualified provider-confirmed original command is available".into()))?.original(user,offset,limit)
     }
     pub(super) fn apply(&mut self,confirmed:Option<&Option<String>>,updates:Vec<ApprovalUpdate>,events:&mut Vec<Event>)->Option<String>{
         if let Some(identity)=confirmed && self.session.as_ref()!=identity.as_ref(){
-            self.session=identity.clone();self.store=None;self.notice=None;
+            self.session=identity.clone();self.store=None;self.notice=None;self.retry_at=None;
+        }
+        if self.store.is_none() && self.retry_at.is_none_or(|at|std::time::Instant::now()>=at){
             if let (Ok(scope),Some(session))=(&self.scope,&self.session){
-                match annotations::storage::Store::installation(scope,session){Ok(store)=>self.store=Some(store),Err(error)=>return self.warning(error)}
+                #[cfg(test)]
+                let opened=if let Some(root)=&self.root{annotations::storage::Store::for_test(root,scope,session)}else{annotations::storage::Store::installation(scope,session)};
+                #[cfg(not(test))]
+                let opened=annotations::storage::Store::installation(scope,session);
+                match opened {
+                    Ok(store)=>{self.store=Some(store);self.retry_at=None;self.notice=None;},
+                    Err(error)=>{self.retry_at=Some(std::time::Instant::now()+std::time::Duration::from_secs(1));return self.warning(error);},
+                }
             }
         }
         let Some(store)=&mut self.store else{return None;};
@@ -99,4 +111,34 @@ mod tests {
         let step=adapter.command(Command::Answer{request_id:"901".into(),action:"decision-0".into(),answers:vec![]}).unwrap();ingest(&mut durable,&mut cache,adapter.as_mut(),step);
         let step=adapter.receive(completed("thread-exact",0)).unwrap();ingest(&mut durable,&mut cache,adapter.as_mut(),step);assert_eq!(cached_status(&mut cache,"turn/tool-0"),ToolStatus::Failed);
     }
+    #[test]
+    fn first_claude_control_request_confirms_scope_before_awaiting_and_denied_capture(){
+        let root=tempfile::tempdir().unwrap();let home=root.path().join("claude-home");std::fs::create_dir(&home).unwrap();
+        let scope=LaunchAccountScope::resolve(crate::agent::Provider::Claude,root.path(),|key|(key=="CLAUDE_CONFIG_DIR").then(||home.as_os_str().to_owned())).unwrap();
+        let mut authority=Authority::new(Ok(scope.clone()));authority.root=Some(root.path().join("annotations"));
+        let mut adapter=protocol::claude::annotation_test_adapter();
+        let session="00000000-0000-4000-8000-000000000001";
+        let frame=json!({"type":"control_request","session_id":session,"request_id":"first-request","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-exact","input":{"command":"git status"}}});
+        let mut step=adapter.receive(frame.clone()).unwrap();
+        let confirmed=step.events.iter().find_map(|event|if let Event::Session{id,..}=event{Some(Some(id.clone()))}else{None});assert_eq!(confirmed,Some(Some(session.into())));
+        assert!(authority.apply(confirmed.as_ref(),adapter.take_approval_updates(),&mut step.events).is_none());
+        let mut answer=adapter.command(Command::Answer{request_id:"first-request".into(),action:"deny".into(),answers:vec![]}).unwrap();
+        assert!(authority.apply(None,adapter.take_approval_updates(),&mut answer.events).is_none());
+        let key=ApprovalKey{agent_id:None,item_id:"tool-exact".into()};assert!(authority.store.as_ref().unwrap().denied(&key).unwrap());
+        drop(authority);drop(adapter);
+        let mut cold=Authority::new(Ok(scope));cold.root=Some(root.path().join("annotations"));let mut adapter=protocol::claude::annotation_test_adapter();let mut step=adapter.receive(frame).unwrap();
+        let confirmed=Some(session.to_owned());assert!(cold.apply(Some(&confirmed),adapter.take_approval_updates(),&mut step.events).is_none());
+        assert!(step.events.iter().any(|event|matches!(event,Event::Item(item) if item.content.status()==Some(ToolStatus::Denied))));
+    }
+    #[test]
+    fn transient_open_failure_retries_same_qualified_session_after_backoff(){
+        let root=tempfile::tempdir().unwrap();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();
+        let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
+        let storage=root.path().join("annotations");std::fs::write(&storage,b"not a directory").unwrap();let mut authority=Authority::new(Ok(scope));authority.root=Some(storage.clone());
+        let confirmed=Some("confirmed-session".to_owned());assert!(authority.apply(Some(&confirmed),vec![],&mut vec![]).is_some());assert!(authority.store.is_none());
+        assert!(authority.apply(Some(&confirmed),vec![],&mut vec![]).is_none(),"backoff must avoid repeated open attempts/warnings");
+        std::fs::remove_file(storage).unwrap();authority.retry_at=Some(std::time::Instant::now());
+        assert!(authority.apply(Some(&confirmed),vec![],&mut vec![]).is_none());assert!(authority.store.is_some(),"same session must recover once storage is available");
+    }
+
 }
