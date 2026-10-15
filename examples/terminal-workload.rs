@@ -511,7 +511,9 @@ struct PaneToggleWindow {
 impl PaneToggleWindow {
     fn record(&mut self, cycle_started: std::time::Instant) -> Result<(), String> {
         if !self.sealed && self.start.is_some_and(|start| cycle_started >= start) {
-            self.completed = self.completed.checked_add(1)
+            self.completed = self
+                .completed
+                .checked_add(1)
                 .ok_or_else(|| "pane-toggle measurement counter overflowed".to_owned())?;
         }
         Ok(())
@@ -597,7 +599,9 @@ impl PaneToggles {
                 cycles += 1;
                 // Both IPC edits have returned after commit. Selection and
                 // sealing use this same tiny mutex, never any IO or HostState.
-                measured.lock().map_err(|_| "pane-toggle window is unavailable")?
+                measured
+                    .lock()
+                    .map_err(|_| "pane-toggle window is unavailable")?
                     .record(cycle_started)?;
                 if cycles == 1 {
                     let _ = started.send(());
@@ -625,12 +629,22 @@ impl PaneToggles {
         Ok(toggles)
     }
     fn begin_measurement(&self, start: std::time::Instant) -> Result<(), String> {
-        let mut window = self.window.lock().map_err(|_| "pane-toggle window is unavailable")?;
-        *window = PaneToggleWindow { start: Some(start), completed: 0, sealed: false };
+        let mut window = self
+            .window
+            .lock()
+            .map_err(|_| "pane-toggle window is unavailable")?;
+        *window = PaneToggleWindow {
+            start: Some(start),
+            completed: 0,
+            sealed: false,
+        };
         Ok(())
     }
     fn end_measurement(&self) -> Result<u64, String> {
-        let mut window = self.window.lock().map_err(|_| "pane-toggle window is unavailable")?;
+        let mut window = self
+            .window
+            .lock()
+            .map_err(|_| "pane-toggle window is unavailable")?;
         // Only cycles recorded before this serialized cut count. A cycle that
         // finishes later cannot turn a warmup-only run into concurrent evidence.
         window.sealed = true;
