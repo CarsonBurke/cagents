@@ -228,3 +228,46 @@ fn return_admission_refuses_full_receipt_capacity_before_creating_a_request() {
     assert!(!app.terminal_start_in_flight(card));
     assert_eq!(app.card_state(card).unwrap().kind, source);
 }
+
+#[test]
+fn receipt_owned_issued_thread_learning_keeps_the_original_end_and_pins_known_threads() {
+    for known_other in [false, true] {
+        let (mut app, card, target, receipt) = returning();
+        let CardKind::Chat(issued) = &mut app.card_state_mut(card).unwrap().kind else { panic!("issued chat"); };
+        issued.launch.session_id = known_other.then(|| "0199a2b4-5c6d-7e8f-9a0b-1c2d3e4f5a6c".into());
+        super::tests::request_end_chat(&mut app, card);
+        assert!(app.chat_ui.end_requests.contains_key(&target));
+        if !known_other {
+            // The ordinary descriptor adopts already-confirmed thread metadata
+            // while the exact typed Return answer is still in flight.
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(receipt.source.clone());
+        }
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(receipt.clone())))));
+        assert_eq!(app.durable.terminal_handoff_receipts[&receipt.operation].converted, !known_other);
+        assert_eq!(app.chat_ui.handoff_closes.contains_key(&card), !known_other);
+        assert!(app.chat_ui.phases.is_empty(), "accepted End still waits for its actual attachment");
+        if known_other { assert!(matches!(app.card_state(card).unwrap().kind, CardKind::Chat(_))); }
+    }
+}
+
+#[test]
+fn held_old_attachment_cannot_retire_a_new_attachment_of_the_same_receipt() {
+    let (mut app, card, target, receipt) = returning();
+    super::tests::request_end_chat(&mut app, card);
+    drop(app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(receipt.clone())))));
+    let first = app.terminal_start_operation(card).unwrap();
+    app.begin_terminal_start(card);
+    let second = app.terminal_start_operation(card).unwrap();
+    assert_ne!(first, second);
+    app.chat_ui.handoff_closes.get_mut(&card).unwrap().attachment_operation = second;
+    let peer = Peer::attach(receipt.terminal.clone(), receipt.source.proof.clone().unwrap());
+    drop(app.update(Message::ChatUi(Action::HandoffAttached(card, first, Arc::new(receipt.clone()), Ok(peer.started(&receipt))))));
+    assert_eq!(app.terminal_start_operation(card), Some(second));
+    assert_eq!(app.chat_ui.handoff_closes[&card].attachment_operation, second);
+    assert!(!app.chat_ui.handoff_closes[&card].attached);
+    assert!(app.chat_ui.phases.is_empty());
+    drop(app.update(Message::ChatUi(Action::HandoffAttached(card, second, Arc::new(receipt.clone()), Ok(peer.started(&receipt))))));
+    assert!(!app.terminal_start_in_flight(card));
+    assert!(app.chat_ui.handoff_closes.is_empty());
+    assert!(matches!(app.chat_ui.phases[&card], Phase::Closing { restart: None, .. }));
+}
