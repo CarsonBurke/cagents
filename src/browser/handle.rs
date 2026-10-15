@@ -1067,12 +1067,13 @@ mod tests {
         ] {
             for reverse in [false, true] {
                 let mailbox = CommandMailbox::new();
+                let expected_modifiers = BrowserModifiers {
+                    control: kind == 0, shift: kind == 1,
+                    alt: kind == 2, meta: kind == 3, ..Default::default()
+                };
                 let input = |state, code, location| BrowserInput::Key {
                     state, key: name.into(), code: format!("{code:?}"), location,
-                    modifiers: BrowserModifiers {
-                        control: kind == 0, shift: kind == 1,
-                        alt: kind == 2, meta: kind == 3, ..Default::default()
-                    },
+                    modifiers: expected_modifiers,
                     repeat: false, composing: false,
                 };
                 let mut keys = [(left, BrowserKeyLocation::Left),
@@ -1094,7 +1095,7 @@ mod tests {
                 assert_eq!(releases[0].1, keys[1].1);
                 assert_eq!(releases[1].0, format!("{:?}", keys[0].0));
                 assert_eq!(releases[1].1, keys[0].1);
-                assert_ne!(releases[0].2, BrowserModifiers::default());
+                assert_eq!(releases[0].2, expected_modifiers);
                 assert_eq!(releases[1].2, BrowserModifiers::default());
             }
         }
