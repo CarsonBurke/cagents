@@ -34,7 +34,7 @@ use cagents::{
     chat::{Command as ChatCommand, NativeContinuity, Session, Snapshot},
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
-        ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+        ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
         ServerResponse, read_frame, write_frame,
     },
 };
@@ -311,9 +311,13 @@ impl Window {
     }
 
     fn request(&mut self, request: ClientRequest) -> ServerResponse {
+        self.request_result(request).unwrap_or_else(|error| panic!("the daemon refused a request: {error:?}"))
+    }
+
+    fn request_result(&mut self, request: ClientRequest) -> Result<ServerResponse, ProtocolError> {
         let request_id = self.next;
         self.next += 1;
-        exchange(
+        exchange_result(
             &mut self.stream,
             request_id,
             Some(self.proof.clone()),
@@ -374,6 +378,16 @@ fn exchange(
     proof: Option<HostSessionProof>,
     request: ClientRequest,
 ) -> ServerResponse {
+    exchange_result(stream, request_id, proof, request)
+        .unwrap_or_else(|error| panic!("the daemon refused a request: {error:?}"))
+}
+
+fn exchange_result(
+    stream: &mut UnixStream,
+    request_id: u64,
+    proof: Option<HostSessionProof>,
+    request: ClientRequest,
+) -> Result<ServerResponse, ProtocolError> {
     write_frame(
         stream,
         &ClientEnvelope {
@@ -392,8 +406,8 @@ fn exchange(
             continue;
         }
         match envelope.message {
-            ServerMessage::Response { response } => return response,
-            ServerMessage::Error(error) => panic!("the daemon refused a request: {error:?}"),
+            ServerMessage::Response { response } => return Ok(response),
+            ServerMessage::Error(error) => return Err(error),
             _ => {}
         }
     }
@@ -1091,11 +1105,54 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
     close(&fixture, &mut window, &chat);
 }
 
+/// Local idle is not an atomic backend quiescence barrier. A refused update
+/// must leave the genuinely older owner, its conversation and history usable.
+#[test]
+#[ignore = "needs matched old binaries and native Codex; no remote model calls"]
+fn an_observed_idle_old_helper_is_preserved_when_safe_replacement_cannot_be_proved() {
+    let old_cli = std::env::var_os("CAGENTS_QUALIFY_OLD_CLI").expect("set CAGENTS_QUALIFY_OLD_CLI");
+    let old_daemon = std::env::var_os("CAGENTS_QUALIFY_OLD_DAEMON").expect("set CAGENTS_QUALIFY_OLD_DAEMON");
+    let mut fixture = Fixture::with_products(Path::new(&old_cli), Path::new(&old_daemon));
+    fixture.start("long", "never");
+    until(Duration::from_secs(30), "the older provider turn", || (!fixture.model.requests().is_empty()).then_some(()));
+    let old_servers = fixture.servers();
+    assert_eq!(old_servers.len(), 1);
+    fixture.replace_daemon();
+    let mut window = fixture.window();
+    let chat = fixture.durable_chat(&mut window);
+    let attached = window.attach(chat.clone());
+    assert!(attached.native_helper.as_ref().is_some_and(|helper| helper.outdated));
+    until(Duration::from_secs(COMMAND_SECONDS + 30), "the old turn to finish", || {
+        let snapshot = window.read(chat.id);
+        (!snapshot.busy && snapshot.ready && !snapshot.exited && snapshot.requests.is_empty()).then_some(snapshot)
+    });
+    let requests = fixture.model.requests().len();
+    let idle = until(Duration::from_secs(20), "the exact idle-generation safety refusal", || {
+        let idle = window.read(chat.id);
+        let error = window.request_result(ClientRequest::ChatRestartHelper { source: chat.clone(), generation: idle.generation })
+            .expect_err("an observed idle snapshot must not authorize automatic provider replacement");
+        assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        if error.message.contains("cannot prove safe automatic replacement") { Some(idle) }
+        else {
+            assert!(error.message.contains("Provider state changed before conditional idle close"), "{error:?}");
+            None
+        }
+    });
+    let after = window.read(chat.id);
+    assert!(after.ready && !after.exited);
+    assert_eq!(after.session_id, idle.session_id);
+    assert!(after.items.len() >= idle.items.len());
+    assert_eq!(fixture.servers(), old_servers, "a refused replacement must keep the same provider incarnation");
+    assert_eq!(fixture.model.requests().len(), requests, "refusal must not replay a prompt");
+    assert!(window.chats().contains(&chat), "the issued session must remain published after refusal");
+    close(&fixture, &mut window, &chat);
+}
+
 /// Uses genuine binaries of the previous build, then replaces only its private
 /// fixture daemon. The old durable holder remains alive until the idle restart
 /// request proves cleanup and starts the same external thread in a new helper.
 #[test]
-#[ignore = "needs matched old binaries and native Codex; no remote model calls"]
+#[ignore = "unmet acceptance: needs a verified provider conditional-close barrier, matched old binaries and native Codex"]
 fn an_old_helper_is_flagged_and_rolls_over_without_changing_its_conversation() {
     let old_cli = std::env::var_os("CAGENTS_QUALIFY_OLD_CLI").expect("set CAGENTS_QUALIFY_OLD_CLI to the matched older CLI");
     let old_daemon = std::env::var_os("CAGENTS_QUALIFY_OLD_DAEMON").expect("set CAGENTS_QUALIFY_OLD_DAEMON to the matched older daemon");
