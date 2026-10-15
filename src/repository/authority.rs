@@ -321,7 +321,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::Io(format!("Recovery holding publication requires resolution: {error}")).into());
         }
         let (holding_path, holding_file) = inherited_directory_scope(holding.directory())?;
-        let root_path = child_directory_path(&source.child_root)?;
         let git_path = child_directory_path(&source.child_git)?;
         let common_path = child_directory_path(&source.child_common)?;
         let mut command = CommandSpec::new(&self.git);
@@ -333,7 +332,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         command = command.args([
             OsString::from("--no-replace-objects"),
             OsString::from(format!("--git-dir={}", git_path.display())),
-            OsString::from(format!("--work-tree={}", root_path.display())),
+            // RUN_SETUP may chdir to --work-tree when cwd is beneath it.
+            // Object-only operations intentionally use the held private
+            // directory for BOTH cwd and work-tree; metadata stays original.
+            OsString::from(format!("--work-tree={}", holding_path.display())),
             OsString::from("-C"), holding_path.into_os_string(),
         ]).args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"])
             .env("GIT_COMMON_DIR", common_path.into_os_string())
@@ -537,6 +539,27 @@ mod authority_tests {
         assert_eq!(service.hash_recovery_object(&authority, &holding, &file, &cancel).unwrap(), oid);
         assert_eq!(fs::read(holding.directory().path().join(path)).unwrap(), b"recovery proof");
         assert!(!source.join(path).exists(), "unpack-file must not create a shared worktree temporary");
+    }
+
+    #[test]
+    fn recovery_object_helper_inside_worktree_or_gitdir_never_materializes_in_shared_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        actual_git(&source, &["init", "-b", "main"]);
+        fs::write(source.join("file"), b"private bytes").unwrap();
+        let output = actual_git(&source, &["hash-object", "-w", "--", "file"]);
+        let oid = Oid::parse_object(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+        let service = RepositoryService::system("git");
+        let authority = WorktreeAuthority::capture(&source).unwrap();
+        for parent in [source.clone(), source.join(".git")] {
+            let holding = recovery_holding(&parent);
+            let output = service.unpack_recovery_object(&authority, &holding, &oid, &CancellationToken::new()).unwrap();
+            let name = Path::new(OsStr::from_bytes(output.stdout.strip_suffix(b"\n").unwrap()));
+            assert_eq!(fs::read(holding.directory().path().join(name)).unwrap(), b"private bytes");
+            assert!(!source.join(name).exists(), "RUN_SETUP must not chdir into the shared worktree");
+            assert!(!source.join(".git").join(name).exists());
+        }
     }
 
     #[test]
