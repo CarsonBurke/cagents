@@ -3786,20 +3786,23 @@ impl RepositoryRuntime {
                 .find_matches
                 .get(self.find_index)
                 .expect("current find occurrence");
+            let limit = crate::editor_search::replacement_budget(document.content.text_len())
+                - (document.content.text_len() - (end.column - start.column));
             let replacement = document.content.with_line(start.line, |line, _| {
-                crate::editor_search::replacement(
-                    line,
-                    start.column,
-                    end.column,
+                crate::editor_search::Replacement::new(
                     &self.find_query,
                     &self.replace_query,
                     self.find_options,
                     self.replace_preserve_case,
-                )
+                ).and_then(|replacement| replacement.expand_bounded(line, start.column, end.column, limit))
             });
             let replacement = match replacement {
                 Some(Ok(replacement)) => replacement,
-                _ => {
+                Some(Err(error)) => {
+                    self.find_error = Some(error);
+                    return Task::none();
+                }
+                None => {
                     self.find_error = Some("The selected match changed; search again.".into());
                     return Task::none();
                 }
@@ -18887,6 +18890,39 @@ mod tests {
         assert_eq!(buffer_text(&runtime), "xxxxfoo bar foo");
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(buffer_text(&runtime), "xxxxfoo foo foo");
+    }
+
+    #[test]
+    fn replacement_output_refusal_preserves_buffer_history_revision_and_selection() {
+        let card = CardId::new();
+        for (original, all, replacement_bytes) in [
+            ("a".to_owned(), false, crate::editor::MAX_EDITABLE_FILE_BYTES as usize + 1),
+            ("aa".to_owned(), true, crate::editor::MAX_EDITABLE_FILE_BYTES as usize / 2 + 1),
+            (format!("aa{}", "x".repeat(70_000)), true, crate::editor::MAX_EDITABLE_FILE_BYTES as usize / 2),
+            (format!("{}{}", "a".repeat(257), "x".repeat(70_000)), true, 40_000),
+        ] {
+            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", &original);
+            drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('!')) }));
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(buffer_text(&runtime), original);
+            update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
+            update_find_settled(&mut runtime, RepositoryAction::FindQueryChanged { card, query: "a".into() });
+            update_find_settled(&mut runtime, RepositoryAction::ReplaceQueryChanged { card, query: "z".repeat(replacement_bytes) });
+            let DocumentState::Editable(document) = &runtime.document else { unreachable!() };
+            let cursor = document.content.cursor();
+            let revision = document.history.revision();
+            let undo = document.history.can_undo();
+            let redo = document.history.can_redo();
+            assert!(redo, "refusal must preserve an existing redo transaction");
+            update_find_settled(&mut runtime, RepositoryAction::ReplaceMatch { card, all });
+            assert!(runtime.find_error.as_deref().unwrap().contains("result size limit"));
+            let DocumentState::Editable(document) = &runtime.document else { unreachable!() };
+            assert_eq!(document.content.cursor(), cursor);
+            assert_eq!(document.history.revision(), revision);
+            assert_eq!(document.history.can_undo(), undo);
+            assert_eq!(document.history.can_redo(), redo);
+            assert_eq!(buffer_text(&runtime), original);
+        }
     }
 
     #[test]
