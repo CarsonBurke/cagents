@@ -2,8 +2,8 @@
 //! Wire reference: anthropics/claude-agent-sdk-python, _internal/query.py,
 //! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
-use super::{Adapter, ProcessSpec, Step,CanonicalItemKey};
-use super::tool_cache::{ToolCache,Reader};
+use super::tool_cache::{Reader, ToolCache};
+use super::{Adapter, CanonicalItemKey, ProcessSpec, Step};
 use crate::account::{self, LiveReport};
 use crate::agent::Provider;
 use crate::chat;
@@ -358,7 +358,7 @@ struct Claude {
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
     tools: ToolCache,
-    item_reader:Option<Reader>,
+    item_reader: Option<Reader>,
     /// Synthetic task rows shown before their Agent tool is known. Bounded by
     /// the same cache as task tools, so late correlation can retract one row.
     visible_task_rows: HashSet<String>,
@@ -644,30 +644,50 @@ impl Claude {
             step.events.push(Event::PastTurnFinished { key, outcome });
         }
     }
-    fn tool(&mut self,parent:Option<&str>,item:Item) {
-        let key=CanonicalItemKey::new(parent,&item.id);
-        if key.item_id.len()>4096 || key.agent_id.as_ref().is_some_and(|id|id.len()>4096) {return;}
-        if !self.tool_order.contains(&key) {self.tool_order.push_back(key);}
-        self.tools.insert(parent,item);
-        while self.tool_order.len()>MAX_TOOLS {
-            if let Some(key)=self.tool_order.pop_front() {
-                self.tools.remove(key.agent_id.as_deref(),&key.item_id);
+    fn tool(&mut self, parent: Option<&str>, item: Item) {
+        let key = CanonicalItemKey::new(parent, &item.id);
+        if key.item_id.len() > 4096 || key.agent_id.as_ref().is_some_and(|id| id.len() > 4096) {
+            return;
+        }
+        if !self.tool_order.contains(&key) {
+            self.tool_order.push_back(key);
+        }
+        self.tools.insert(parent, item);
+        while self.tool_order.len() > MAX_TOOLS {
+            if let Some(key) = self.tool_order.pop_front() {
+                self.tools.remove(key.agent_id.as_deref(), &key.item_id);
                 self.visible_task_rows.remove(&key.item_id);
                 self.edit_tools.remove(&key);
                 self.tool_inputs.remove(&key);
             }
         }
     }
-    fn cached_tool(&self,parent:Option<&str>,id:&str)->Result<Option<Item>,String> {
-        let key=CanonicalItemKey::new(parent,id);
-        if let Some(reader)=&self.item_reader {reader.validate_key(&key)?;}
-        if let Some(item)=self.tools.get(parent,id) {return Ok(Some(item.clone()));}
-        let Some(reader)=&self.item_reader else {
-            return if self.tool_order.contains(&key) {Err("Original tool source is unavailable; its stored call was preserved".into())} else {Ok(None)};
+    fn cached_tool(&self, parent: Option<&str>, id: &str) -> Result<Option<Item>, String> {
+        let key = CanonicalItemKey::new(parent, id);
+        if let Some(reader) = &self.item_reader {
+            reader.validate_key(&key)?;
+        }
+        if let Some(item) = self.tools.get(parent, id) {
+            return Ok(Some(item.clone()));
+        }
+        let Some(reader) = &self.item_reader else {
+            return if self.tool_order.contains(&key) {
+                Err("Original tool source is unavailable; its stored call was preserved".into())
+            } else {
+                Ok(None)
+            };
         };
-        let item=reader.read(&key)?;
-        if item.is_none() && self.tool_order.contains(&key) {return Err("Original tool source is unavailable; its stored call was preserved".into());}
-        if item.as_ref().is_some_and(|item|item.id!=id) {return Err("Original tool source identity changed; refusing mismatched classification".into());}
+        let item = reader.read(&key)?;
+        if item.is_none() && self.tool_order.contains(&key) {
+            return Err(
+                "Original tool source is unavailable; its stored call was preserved".into(),
+            );
+        }
+        if item.as_ref().is_some_and(|item| item.id != id) {
+            return Err(
+                "Original tool source identity changed; refusing mismatched classification".into(),
+            );
+        }
         Ok(item)
     }
     fn task_rows_for_agent(&mut self, tool: &str) -> Vec<String> {
@@ -678,14 +698,23 @@ impl Claude {
             .filter(|id| self.visible_task_rows.remove(id))
             .collect()
     }
-    fn remember_tool_input(&mut self,parent:Option<&str>, id: &str, input: &Value) -> Result<(), String> {
+    fn remember_tool_input(
+        &mut self,
+        parent: Option<&str>,
+        id: &str,
+        input: &Value,
+    ) -> Result<(), String> {
         if !input.is_object() || encoded_len(input)? > chat::PermissionDenial::INPUT_LIMIT {
             return Ok(());
         }
-        let key=CanonicalItemKey::new(parent,id);
-        if key.item_id.len()>4096 || key.agent_id.as_ref().is_some_and(|id|id.len()>4096) {return Ok(());}
-        if !self.tool_inputs.contains_key(&key) {self.tool_input_order.push_back(key.clone());}
-        self.tool_inputs.insert(key,input.to_string());
+        let key = CanonicalItemKey::new(parent, id);
+        if key.item_id.len() > 4096 || key.agent_id.as_ref().is_some_and(|id| id.len() > 4096) {
+            return Ok(());
+        }
+        if !self.tool_inputs.contains_key(&key) {
+            self.tool_input_order.push_back(key.clone());
+        }
+        self.tool_inputs.insert(key, input.to_string());
         while self.tool_input_order.len() > chat::PermissionDenial::LIMIT {
             if let Some(expired) = self.tool_input_order.pop_front() {
                 self.tool_inputs.remove(&expired);
@@ -1328,16 +1357,24 @@ impl Claude {
                     }
                     "tool_use" | "server_tool_use" => {
                         let tool_id = required(block, "id")?.to_owned();
-                        let native_name=required(block,"name")?;
-                        let projected=tool_content(native_name,&block["input"],&self.cwd);
+                        let native_name = required(block, "name")?;
+                        let projected = tool_content(native_name, &block["input"], &self.cwd);
                         if child.is_none() {
-                            step.events.push(Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Full{
-                                source:crate::chat::cache::SourceKey{agent_id:None,source_id:tool_id.clone()},
-                                name:native_name.into(),input:block["input"].to_string(),
-                                command:crate::chat::cache::raw::RawCommandCall::from_content(&projected),
-                            }));
+                            step.events.push(Event::RawToolCapture(
+                                crate::chat::cache::raw::RawToolCapture::Full {
+                                    source: crate::chat::cache::SourceKey {
+                                        agent_id: None,
+                                        source_id: tool_id.clone(),
+                                    },
+                                    name: native_name.into(),
+                                    input: block["input"].to_string(),
+                                    command: crate::chat::cache::raw::RawCommandCall::from_content(
+                                        &projected,
+                                    ),
+                                },
+                            ));
                         }
-                        self.remember_tool_input(child,&tool_id, &block["input"])?;
+                        self.remember_tool_input(child, &tool_id, &block["input"])?;
                         let item = Item {
                             id: tool_id.clone(),
                             role: Role::Assistant,
@@ -1346,9 +1383,15 @@ impl Claude {
                             at: None,
                         };
                         // Replayed assistant envelopes must not reset a completed tool result.
-                        let cached=match self.cached_tool(child,&item.id) {
-                            Ok(cached)=>cached,
-                            Err(message)=> {step.events.push(Event::Error {message,fatal:false});continue;}
+                        let cached = match self.cached_tool(child, &item.id) {
+                            Ok(cached) => cached,
+                            Err(message) => {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                                continue;
+                            }
                         };
                         if !cached.as_ref().is_some_and(|old| {
                             old.content
@@ -1375,10 +1418,12 @@ impl Claude {
                                 });
                             }
                             if matches!(item.content, ItemContent::Changes { .. }) {
-                                self.edit_tools
-                                    .insert(CanonicalItemKey::new(child,&tool_id), string(block, "name").into());
+                                self.edit_tools.insert(
+                                    CanonicalItemKey::new(child, &tool_id),
+                                    string(block, "name").into(),
+                                );
                             }
-                            self.tool(child,item.clone());
+                            self.tool(child, item.clone());
                             step.events.push(Event::Item(item));
                         } else if history {
                             // Keep the original call position as an overlap
@@ -1393,30 +1438,50 @@ impl Claude {
                         // A history result may be on this page while its proven
                         // original call is older. Capture that exact selected
                         // call as source before grouping the page's items.
-                        if child.is_none()&&let Some(call)=correlated_call {
-                            let name=required(call,"name")?;
-                            let projected=tool_content(name,&call["input"],&self.cwd);
-                            step.events.push(Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Full{
-                                source:crate::chat::cache::SourceKey{agent_id:None,source_id:tool_id.clone()},
-                                name:name.into(),input:call["input"].to_string(),command:crate::chat::cache::raw::RawCommandCall::from_content(&projected),
-                            }));
+                        if child.is_none()
+                            && let Some(call) = correlated_call
+                        {
+                            let name = required(call, "name")?;
+                            let projected = tool_content(name, &call["input"], &self.cwd);
+                            step.events.push(Event::RawToolCapture(
+                                crate::chat::cache::raw::RawToolCapture::Full {
+                                    source: crate::chat::cache::SourceKey {
+                                        agent_id: None,
+                                        source_id: tool_id.clone(),
+                                    },
+                                    name: name.into(),
+                                    input: call["input"].to_string(),
+                                    command: crate::chat::cache::raw::RawCommandCall::from_content(
+                                        &projected,
+                                    ),
+                                },
+                            ));
                         }
-                        let cached=match self.cached_tool(child,&tool_id) {
-                            Ok(cached)=>cached,
+                        let cached = match self.cached_tool(child, &tool_id) {
+                            Ok(cached) => cached,
                             // History supplied this result's exact original
                             // call from the selected visible chain. It can
                             // recover presentation without a cache source.
-                            Err(_) if correlated_call.is_some()=>None,
-                            Err(message)=> {step.events.push(Event::Error {message,fatal:false});continue;}
+                            Err(_) if correlated_call.is_some() => None,
+                            Err(message) => {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                                continue;
+                            }
                         };
                         let needs_call=cached.as_ref().is_none_or(|old|matches!(&old.content,ItemContent::Tool{name,input,..} if name=="Tool"&&input.is_empty()));
                         let recovered = if needs_call {
                             if let Some(call) = correlated_call {
-                                self.remember_tool_input(child,&tool_id, &call["input"])?;
+                                self.remember_tool_input(child, &tool_id, &call["input"])?;
                                 let name = required(call, "name")?;
                                 let content = tool_content(name, &call["input"], &self.cwd);
                                 if matches!(&content, ItemContent::Changes { .. }) {
-                                    self.edit_tools.insert(CanonicalItemKey::new(child,&tool_id), name.into());
+                                    self.edit_tools.insert(
+                                        CanonicalItemKey::new(child, &tool_id),
+                                        name.into(),
+                                    );
                                 }
                                 Some(content)
                             } else {
@@ -1446,18 +1511,54 @@ impl Claude {
                                 started_at: None,
                                 at: None,
                             });
-                        let failed=block["is_error"].as_bool()==Some(true);
-                        let original_input=if failed {correlated_call.map(|call|call["input"].to_string())} else {None};
-                        let original=if failed && child.is_none() && matches!(&item.content,ItemContent::Changes {..}) && original_input.is_none() {
-                            match self.item_reader.as_ref().map(|reader|reader.original_call(&CanonicalItemKey::new(child,&tool_id))).transpose() {
-                                Ok(value)=>value.flatten(),
-                                Err(message)=>{step.events.push(Event::Error{message,fatal:false});None}
+                        let failed = block["is_error"].as_bool() == Some(true);
+                        let original_input = if failed {
+                            correlated_call.map(|call| call["input"].to_string())
+                        } else {
+                            None
+                        };
+                        let original = if failed
+                            && child.is_none()
+                            && matches!(&item.content, ItemContent::Changes { .. })
+                            && original_input.is_none()
+                        {
+                            match self
+                                .item_reader
+                                .as_ref()
+                                .map(|reader| {
+                                    reader.original_call(&CanonicalItemKey::new(child, &tool_id))
+                                })
+                                .transpose()
+                            {
+                                Ok(value) => value.flatten(),
+                                Err(message) => {
+                                    step.events.push(Event::Error {
+                                        message,
+                                        fatal: false,
+                                    });
+                                    None
+                                }
                             }
-                        } else {None};
-                        let edit=self.edit_tools.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or_else(||correlated_call.and_then(|call|call["name"].as_str())).or_else(||original.as_ref().map(|call|call.0.as_str()));
-                        let input=self.tool_inputs.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or(original_input.as_deref()).or_else(||original.as_ref().map(|call|call.1.as_str()));
-                        if failed && (edit.is_none()||input.is_none()) && matches!(&item.content,ItemContent::Changes {..}) {
-                            let missing=if edit.is_none(){"identity"}else{"input"};
+                        } else {
+                            None
+                        };
+                        let edit = self
+                            .edit_tools
+                            .get(&CanonicalItemKey::new(child, &tool_id))
+                            .map(String::as_str)
+                            .or_else(|| correlated_call.and_then(|call| call["name"].as_str()))
+                            .or_else(|| original.as_ref().map(|call| call.0.as_str()));
+                        let input = self
+                            .tool_inputs
+                            .get(&CanonicalItemKey::new(child, &tool_id))
+                            .map(String::as_str)
+                            .or(original_input.as_deref())
+                            .or_else(|| original.as_ref().map(|call| call.1.as_str()));
+                        if failed
+                            && (edit.is_none() || input.is_none())
+                            && matches!(&item.content, ItemContent::Changes { .. })
+                        {
+                            let missing = if edit.is_none() { "identity" } else { "input" };
                             step.events.push(Event::Error {message:format!("Tool failed: {}. Its original tool {missing} is unavailable; the failed attempted changes were preserved.",super::preview(content_text(&block["content"]).as_bytes(),512)),fatal:false});
                         }
                         apply_result(
@@ -1522,7 +1623,7 @@ impl Claude {
                                 }));
                             }
                         }
-                        self.tool(child,item.clone());
+                        self.tool(child, item.clone());
                         step.events.push(Event::Item(item));
                     }
                     "image" => step.events.push(Event::Item(Item {
@@ -1677,12 +1778,23 @@ impl Claude {
             self.remember_retracted(carrier);
         }
         for id in ids.iter().chain(child_ids.values().flatten()) {
-            if ids.contains(id) {self.tools.remove(None,id);}
-            for (parent,children) in &child_ids {if children.contains(id) {self.tools.remove(Some(parent),id);}}
+            if ids.contains(id) {
+                self.tools.remove(None, id);
+            }
+            for (parent, children) in &child_ids {
+                if children.contains(id) {
+                    self.tools.remove(Some(parent), id);
+                }
+            }
         }
-        self.blocks.retain(|(parent,_,_),item| {
-            if parent.is_empty() {!ids.contains(&item.id)}
-            else {!child_ids.get(parent).is_some_and(|ids|ids.contains(&item.id))}
+        self.blocks.retain(|(parent, _, _), item| {
+            if parent.is_empty() {
+                !ids.contains(&item.id)
+            } else {
+                !child_ids
+                    .get(parent)
+                    .is_some_and(|ids| ids.contains(&item.id))
+            }
         });
         self.recount_blocks();
         if !ids.is_empty() {
@@ -1743,8 +1855,12 @@ impl Claude {
 }
 
 impl Adapter for Claude {
-    fn bind_item_reader(&mut self,reader:std::sync::Arc<dyn super::CanonicalItemReader>) {self.item_reader=Some(reader);}
-    fn committed(&mut self) {self.tools.trim();}
+    fn bind_item_reader(&mut self, reader: std::sync::Arc<dyn super::CanonicalItemReader>) {
+        self.item_reader = Some(reader);
+    }
+    fn committed(&mut self) {
+        self.tools.trim();
+    }
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
@@ -2062,7 +2178,10 @@ impl Adapter for Claude {
                     PromptMode::Send,
                 )
             }
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. } | Command::LoadRawSource { .. } => {
+            Command::LoadFileChanges { .. }
+            | Command::LoadFileChangePatches { .. }
+            | Command::LoadSource { .. }
+            | Command::LoadRawSource { .. } => {
                 return Err("File changes are served by the transcript cache".into());
             }
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
@@ -2085,16 +2204,23 @@ impl Adapter for Claude {
                     self.history_message(&frame, &mut step)?;
                 }
                 self.background_agents = running;
-                let mut items=Vec::new();let mut captures=Vec::new();
+                let mut items = Vec::new();
+                let mut captures = Vec::new();
                 for event in step.events {
                     match event {
-                        Event::Item(item)=>items.push(item),
-                        Event::RawToolCapture(_)=>captures.push(event),
-                        _=>{},
+                        Event::Item(item) => items.push(item),
+                        Event::RawToolCapture(_) => captures.push(event),
+                        _ => {}
                     }
                 }
-                captures.push(Event::History{items:settled(items),has_earlier});
-                Ok(Step{events:captures,..Step::default()})
+                captures.push(Event::History {
+                    items: settled(items),
+                    has_earlier,
+                });
+                Ok(Step {
+                    events: captures,
+                    ..Step::default()
+                })
             }
         }
     }
@@ -2163,7 +2289,7 @@ impl Adapter for Claude {
                 self.streams.clear();
                 self.blocks.clear();
                 self.closed_blocks.clear();
-                self.raw_block_bytes=0;
+                self.raw_block_bytes = 0;
                 self.carrier_offsets.clear();
                 self.message_offsets.clear();
                 self.message_order.clear();
@@ -2517,7 +2643,7 @@ impl Adapter for Claude {
                     &mut step,
                 );
                 if let Some(stream) = self.streams.remove("") {
-                    self.settle("",&stream.message);
+                    self.settle("", &stream.message);
                 }
                 // Result input totals span multiple API calls; they are not the
                 // context occupancy of the last individual model call.
@@ -3612,14 +3738,19 @@ fn apply_result(
         // An edit that failed changed nothing, and why it failed is the one
         // thing a reader needs: a patch has nowhere to say it, so the step
         // goes back to being the tool call it was, carrying the message.
-        ItemContent::Changes {status,..} => {
-            if let (Some(name),Some(input))=(edit,input) {
-                *content=ItemContent::Tool{name:name.into(),input:input.into(),output:text,status:result};
+        ItemContent::Changes { status, .. } => {
+            if let (Some(name), Some(input)) = (edit, input) {
+                *content = ItemContent::Tool {
+                    name: name.into(),
+                    input: input.into(),
+                    output: text,
+                    status: result,
+                };
             } else {
                 // A known native name alone cannot reconstruct its arguments.
                 // Keep the complete attempted patch instead of replacing it
                 // with a filepath-shaped placeholder.
-                *status=result;
+                *status = result;
             }
         }
         // Only a shell command's result is what a terminal was written to: a
@@ -3813,44 +3944,60 @@ fn encoded_len(value: &impl serde::Serialize) -> Result<usize, String> {
     Ok(counter.0)
 }
 
-fn raw_block_cost(item:&Item)->usize {
+fn raw_block_cost(item: &Item) -> usize {
     match &item.content {
-        ItemContent::Text{text,..}=>text.capacity(),
-        ItemContent::Tool{input,output,..}=>input.capacity().saturating_add(output.capacity()),
-        _=>0,
+        ItemContent::Text { text, .. } => text.capacity(),
+        ItemContent::Tool { input, output, .. } => {
+            input.capacity().saturating_add(output.capacity())
+        }
+        _ => 0,
     }
 }
-fn append_raw_block(body:&mut String,value:&str,total:&mut usize)->Result<(),String> {
-    if body.len().saturating_add(value.len())>MAX_PAYLOAD {return Err("Claude streamed body exceeds the 30 MiB item limit".into());}
-    let before=body.capacity();
-    let required=body.len()+value.len();
-    if required>before {
+fn append_raw_block(body: &mut String, value: &str, total: &mut usize) -> Result<(), String> {
+    if body.len().saturating_add(value.len()) > MAX_PAYLOAD {
+        return Err("Claude streamed body exceeds the 30 MiB item limit".into());
+    }
+    let before = body.capacity();
+    let required = body.len() + value.len();
+    if required > before {
         // Geometric growth keeps tiny deltas linear; reserve_exact is used
         // only at capacity boundaries and caps spare space at the item limit.
-        let capacity=required.max(before.saturating_mul(2)).max(64).min(MAX_PAYLOAD);
-        body.try_reserve_exact(capacity-body.len()).map_err(|_|"Claude could not reserve its bounded streaming body")?;
+        let capacity = required
+            .max(before.saturating_mul(2))
+            .max(64)
+            .min(MAX_PAYLOAD);
+        body.try_reserve_exact(capacity - body.len())
+            .map_err(|_| "Claude could not reserve its bounded streaming body")?;
     }
-    let after=total.saturating_sub(before).saturating_add(body.capacity());
-    if after>MAX_RAW_BLOCK_BYTES {
-        *body=String::new();
-        *total=total.saturating_sub(before);
+    let after = total.saturating_sub(before).saturating_add(body.capacity());
+    if after > MAX_RAW_BLOCK_BYTES {
+        *body = String::new();
+        *total = total.saturating_sub(before);
         return Err("Claude simultaneous streaming bodies exceed the 64 MiB retained limit".into());
     }
-    body.push_str(value);*total=after;Ok(())
+    body.push_str(value);
+    *total = after;
+    Ok(())
 }
 
 impl Claude {
     fn stream(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
         let event = &frame["event"];
         let parent = string(frame, "parent_tool_use_id").to_owned();
-        if parent.len()>MAX_BLOCK_ID_BYTES {return Err("Claude streaming parent identity exceeds its bounded limit".into());}
+        if parent.len() > MAX_BLOCK_ID_BYTES {
+            return Err("Claude streaming parent identity exceeds its bounded limit".into());
+        }
         match string(event, "type") {
             "message_start" => {
                 if self.streams.len() >= MAX_PENDING && !self.streams.contains_key(&parent) {
                     return Err("Too many simultaneous Claude streams".into());
                 }
                 let id = required(&event["message"], "id")?.to_owned();
-                if id.len()>MAX_BLOCK_ID_BYTES {return Err("Claude streaming message identity exceeds its bounded limit".into());}
+                if id.len() > MAX_BLOCK_ID_BYTES {
+                    return Err(
+                        "Claude streaming message identity exceeds its bounded limit".into(),
+                    );
+                }
                 if self
                     .streams
                     .get(&parent)
@@ -3863,7 +4010,7 @@ impl Claude {
                     // A message interrupted before its `message_stop` is
                     // abandoned once its stream moves on.
                     if let Some(abandoned) = self.streams.insert(parent.clone(), stream) {
-                        self.settle(&parent,&abandoned.message);
+                        self.settle(&parent, &abandoned.message);
                     }
                 }
                 if parent.is_empty() {
@@ -3926,17 +4073,37 @@ impl Claude {
                         return Ok(());
                     }
                 };
-                if item.id.len()>MAX_BLOCK_ID_BYTES+32 || matches!(&item.content,ItemContent::Tool{name,..} if name.len()>MAX_BLOCK_ID_BYTES || item.id.len()>MAX_BLOCK_ID_BYTES) {return Err("Claude streaming block identity exceeds its bounded limit".into());}
-                let key=(parent.clone(),message,index);
-                let previous=self.blocks.get(&key).map_or(0,raw_block_cost);
-                let bytes=self.raw_block_bytes.saturating_sub(previous).saturating_add(raw_block_cost(&item));
-                if bytes>MAX_RAW_BLOCK_BYTES {return Err("Claude simultaneous streaming bodies exceed the 64 MiB retained limit".into());}
-                self.raw_block_bytes=bytes;
+                if item.id.len() > MAX_BLOCK_ID_BYTES + 32
+                    || matches!(&item.content,ItemContent::Tool{name,..} if name.len()>MAX_BLOCK_ID_BYTES || item.id.len()>MAX_BLOCK_ID_BYTES)
+                {
+                    return Err("Claude streaming block identity exceeds its bounded limit".into());
+                }
+                let key = (parent.clone(), message, index);
+                let previous = self.blocks.get(&key).map_or(0, raw_block_cost);
+                let bytes = self
+                    .raw_block_bytes
+                    .saturating_sub(previous)
+                    .saturating_add(raw_block_cost(&item));
+                if bytes > MAX_RAW_BLOCK_BYTES {
+                    return Err(
+                        "Claude simultaneous streaming bodies exceed the 64 MiB retained limit"
+                            .into(),
+                    );
+                }
+                self.raw_block_bytes = bytes;
                 self.closed_blocks.remove(&key);
-                if parent.is_empty() && let ItemContent::Tool{name,..}=&item.content {
-                    step.events.push(Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Start{
-                        source:crate::chat::cache::SourceKey{agent_id:None,source_id:item.id.clone()},name:name.clone(),
-                    }));
+                if parent.is_empty()
+                    && let ItemContent::Tool { name, .. } = &item.content
+                {
+                    step.events.push(Event::RawToolCapture(
+                        crate::chat::cache::raw::RawToolCapture::Start {
+                            source: crate::chat::cache::SourceKey {
+                                agent_id: None,
+                                source_id: item.id.clone(),
+                            },
+                            name: name.clone(),
+                        },
+                    ));
                 }
                 step.events.push(Event::Item(item.clone()));
                 self.blocks.insert(key, item);
@@ -3951,9 +4118,9 @@ impl Claude {
                 if matches!(string(delta, "type"), "signature_delta" | "citations_delta") {
                     return Ok(());
                 }
-                let key=(parent.clone(),stream.message.clone(),index);
+                let key = (parent.clone(), stream.message.clone(), index);
                 if self.closed_blocks.contains(&key) {
-                    self.warn_unknown("delta after closed block",string(delta,"type"));
+                    self.warn_unknown("delta after closed block", string(delta, "type"));
                     return Ok(());
                 }
                 let Some(item) = self.blocks.get_mut(&key) else {
@@ -3968,7 +4135,7 @@ impl Claude {
                         let value = delta[if *thinking { "thinking" } else { "text" }]
                             .as_str()
                             .ok_or("Claude text delta has no string payload")?;
-                        append_raw_block(text,value,&mut self.raw_block_bytes)?;
+                        append_raw_block(text, value, &mut self.raw_block_bytes)?;
                         step.events.push(Event::TextDelta {
                             id: item.id.clone(),
                             role: Role::Assistant,
@@ -3979,7 +4146,7 @@ impl Claude {
                     (ItemContent::Tool { input, .. }, "input_json_delta") => {
                         let value = string(delta, "partial_json");
                         let offset = input.len();
-                        append_raw_block(input,value,&mut self.raw_block_bytes)?;
+                        append_raw_block(input, value, &mut self.raw_block_bytes)?;
                         step.events.push(Event::InputDelta {
                             id: item.id.clone(),
                             offset,
@@ -3999,14 +4166,24 @@ impl Claude {
                 let index = event["index"]
                     .as_u64()
                     .ok_or("Claude block stop has no index")?;
-                let key=(parent.clone(),message,index);
-                if !self.blocks.contains_key(&key) || !self.closed_blocks.insert(key.clone()) {return Ok(());}
+                let key = (parent.clone(), message, index);
+                if !self.blocks.contains_key(&key) || !self.closed_blocks.insert(key.clone()) {
+                    return Ok(());
+                }
                 if let Some(mut item) = self.blocks.get(&key).cloned() {
                     // Index matching for later assistant carriers needs the
                     // tool ID/name, not another copy of its completed input.
-                    if let Some(Item {content:ItemContent::Tool {input,output,..},..})=self.blocks.get_mut(&key) {
-                        self.raw_block_bytes=self.raw_block_bytes.saturating_sub(input.capacity()).saturating_sub(output.capacity());
-                        *input=String::new();*output=String::new();
+                    if let Some(Item {
+                        content: ItemContent::Tool { input, output, .. },
+                        ..
+                    }) = self.blocks.get_mut(&key)
+                    {
+                        self.raw_block_bytes = self
+                            .raw_block_bytes
+                            .saturating_sub(input.capacity())
+                            .saturating_sub(output.capacity());
+                        *input = String::new();
+                        *output = String::new();
                     }
                     if let ItemContent::Tool { name, input, .. } = &item.content {
                         let parsed = if input.is_empty() {
@@ -4028,23 +4205,44 @@ impl Claude {
                         // mapping happens here rather than against a prefix.
                         let content = tool_content(name, &parsed, &self.cwd);
                         if parent.is_empty() {
-                            use sha2::{Digest,Sha256};
-                            use crate::chat::cache::{SourceKey,raw::{RawCommandCall,RawToolCapture}};
-                            let source=SourceKey{agent_id:None,source_id:item.id.clone()};
-                            let command=RawCommandCall::from_content(&content);
-                            let canonical=parsed.to_string();
-                            let capture=if input.is_empty(){RawToolCapture::Full{source,name:name.clone(),input:canonical,command}}else{
-                                RawToolCapture::Seal{source,input_len:input.len(),canonical_hash:Sha256::digest(canonical.as_bytes()).into(),command}
+                            use crate::chat::cache::{
+                                SourceKey,
+                                raw::{RawCommandCall, RawToolCapture},
+                            };
+                            use sha2::{Digest, Sha256};
+                            let source = SourceKey {
+                                agent_id: None,
+                                source_id: item.id.clone(),
+                            };
+                            let command = RawCommandCall::from_content(&content);
+                            let canonical = parsed.to_string();
+                            let capture = if input.is_empty() {
+                                RawToolCapture::Full {
+                                    source,
+                                    name: name.clone(),
+                                    input: canonical,
+                                    command,
+                                }
+                            } else {
+                                RawToolCapture::Seal {
+                                    source,
+                                    input_len: input.len(),
+                                    canonical_hash: Sha256::digest(canonical.as_bytes()).into(),
+                                    command,
+                                }
                             };
                             step.events.push(Event::RawToolCapture(capture));
                         }
-                        self.remember_tool_input(Some(&parent),&item.id, &parsed)?;
+                        self.remember_tool_input(Some(&parent), &item.id, &parsed)?;
                         if matches!(content, ItemContent::Changes { .. }) {
-                            self.edit_tools.insert(CanonicalItemKey::new(Some(&parent),&item.id), name.clone());
+                            self.edit_tools.insert(
+                                CanonicalItemKey::new(Some(&parent), &item.id),
+                                name.clone(),
+                            );
                         }
                         item.content = content;
                         step.events.push(Event::Item(item.clone()));
-                        self.tool(Some(&parent),item);
+                        self.tool(Some(&parent), item);
                     }
                 }
             }
@@ -4055,7 +4253,7 @@ impl Claude {
             }
             "message_stop" => {
                 if let Some(stream) = self.streams.remove(&parent) {
-                    self.settle(&parent,&stream.message);
+                    self.settle(&parent, &stream.message);
                 }
             }
             "ping" => {}
@@ -4074,13 +4272,15 @@ impl Claude {
         Ok(())
     }
     /// Forget a message that will stream no further blocks.
-    fn settle(&mut self, parent:&str,message: &str) {
-        self.blocks.retain(|(scope,id,_), _| scope!=parent || id!=message);
+    fn settle(&mut self, parent: &str, message: &str) {
+        self.blocks
+            .retain(|(scope, id, _), _| scope != parent || id != message);
         self.recount_blocks();
     }
     fn recount_blocks(&mut self) {
-        self.closed_blocks.retain(|key|self.blocks.contains_key(key));
-        self.raw_block_bytes=self.blocks.values().map(raw_block_cost).sum();
+        self.closed_blocks
+            .retain(|key| self.blocks.contains_key(key));
+        self.raw_block_bytes = self.blocks.values().map(raw_block_cost).sum();
     }
 
     fn permission_denied(&self, frame: &Value, step: &mut Step) -> Result<(), String> {
@@ -4096,7 +4296,12 @@ impl Claude {
         let input = if frame["tool_input"].is_object() {
             Some(frame["tool_input"].to_string())
         } else {
-            self.tool_inputs.get(&CanonicalItemKey::new(frame["parent_tool_use_id"].as_str(),id)).cloned()
+            self.tool_inputs
+                .get(&CanonicalItemKey::new(
+                    frame["parent_tool_use_id"].as_str(),
+                    id,
+                ))
+                .cloned()
         }
         .filter(|input| input.len() <= chat::PermissionDenial::INPUT_LIMIT);
         let bounded = |value: &str| {
@@ -4168,10 +4373,17 @@ impl Claude {
             "task_started" | "task_progress" | "task_notification" | "task_updated" => {
                 let task = required(frame, "task_id")?;
                 let id = format!("claude-task:{task}");
-                let mut presentation_known=true;
-                let previous=match self.cached_tool(None,&id) {
-                    Ok(previous)=>previous,
-                    Err(message)=> {step.events.push(Event::Error {message,fatal:false});presentation_known=false;None}
+                let mut presentation_known = true;
+                let previous = match self.cached_tool(None, &id) {
+                    Ok(previous) => previous,
+                    Err(message) => {
+                        step.events.push(Event::Error {
+                            message,
+                            fatal: false,
+                        });
+                        presentation_known = false;
+                        None
+                    }
                 };
                 let mut item = previous.unwrap_or(Item {
                     id,
@@ -4256,21 +4468,36 @@ impl Claude {
                 });
                 // Lifecycle bookkeeping and notification summaries still need
                 // the synthetic tool. Only its duplicate presentation is hidden.
-                let represented=if let Some(tool)=known_tool.as_deref().or_else(||frame["tool_use_id"].as_str()) {
-                    let mut owners=self.tool_order.iter().filter(|key|key.item_id==tool);
-                    let owner=owners.next().cloned();
+                let represented = if let Some(tool) = known_tool
+                    .as_deref()
+                    .or_else(|| frame["tool_use_id"].as_str())
+                {
+                    let mut owners = self.tool_order.iter().filter(|key| key.item_id == tool);
+                    let owner = owners.next().cloned();
                     if owners.next().is_some() {
                         step.events.push(Event::Error {message:"Original task tool scope is ambiguous; preserving its existing source".into(),fatal:false});
-                        presentation_known=false;false
+                        presentation_known = false;
+                        false
                     } else {
-                        let scope=owner.as_ref().and_then(|key|key.agent_id.as_deref());
-                        match self.cached_tool(scope,tool) {
-                            Ok(Some(item))=>matches!(&item.content,ItemContent::Tool {name,..} if name=="Agent"),
-                            Ok(None)=>false,
-                            Err(message)=> {step.events.push(Event::Error {message,fatal:false});presentation_known=false;false}
+                        let scope = owner.as_ref().and_then(|key| key.agent_id.as_deref());
+                        match self.cached_tool(scope, tool) {
+                            Ok(Some(item)) => {
+                                matches!(&item.content,ItemContent::Tool {name,..} if name=="Agent")
+                            }
+                            Ok(None) => false,
+                            Err(message) => {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                                presentation_known = false;
+                                false
+                            }
                         }
                     }
-                } else {false};
+                } else {
+                    false
+                };
                 if let Some(tool) = &known_tool {
                     if string(frame, "subtype") == "task_started" {
                         self.stopped_agents.retain(|known| known != tool);
@@ -4319,17 +4546,17 @@ impl Claude {
                 // lifecycle proof. Preserve the old source rather than emit a
                 // newly fabricated task row, and keep processing completion.
                 if presentation_known {
-                self.tool(None,item.clone());
-                if represented {
-                    if self.visible_task_rows.remove(&item.id) {
-                        step.events.push(Event::ItemsRemoved {
-                            ids: vec![item.id.clone()],
-                        });
+                    self.tool(None, item.clone());
+                    if represented {
+                        if self.visible_task_rows.remove(&item.id) {
+                            step.events.push(Event::ItemsRemoved {
+                                ids: vec![item.id.clone()],
+                            });
+                        }
+                    } else {
+                        self.visible_task_rows.insert(item.id.clone());
+                        step.events.push(Event::Item(item.clone()));
                     }
-                } else {
-                    self.visible_task_rows.insert(item.id.clone());
-                    step.events.push(Event::Item(item.clone()));
-                }
                 }
                 if string(frame, "subtype") == "task_started"
                     && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
@@ -7271,19 +7498,36 @@ mod tests {
             {"type":"tool_use","id":"write","name":"Write","input":{"file_path":"big.txt","content":content}},
             {"type":"tool_use","id":"edit","name":"MultiEdit","input":{"file_path":"src/app.rs","edits":[{"old_string":"missing","new_string":"found"}]}},
         ]}})).unwrap();
-        assert!(!adapter.tool_inputs.contains_key(&CanonicalItemKey::new(None,"write")));
+        assert!(
+            !adapter
+                .tool_inputs
+                .contains_key(&CanonicalItemKey::new(None, "write"))
+        );
         for call in 0..chat::PermissionDenial::LIMIT {
             adapter.receive(json!({"type":"assistant","uuid":format!("b{call}"),"message":{"id":format!("msg-b{call}"),"content":[
                 {"type":"tool_use","id":format!("read-{call}"),"name":"Read","input":{"file_path":"src/app.rs"}},
             ]}})).unwrap();
         }
-        assert!(!adapter.tool_inputs.contains_key(&CanonicalItemKey::new(None,"edit")));
-        for (id,name) in [("write","Write"),("edit","MultiEdit")] {
-            let mut expected=adapter.tools[id].content.clone();
-            let ItemContent::Changes{status,..}=&mut expected else{panic!("native edit must retain attempted patch");};*status=ToolStatus::Failed;
-            assert_eq!(adapter.edit_tools.get(&CanonicalItemKey::new(None,id)).map(String::as_str),Some(name));
+        assert!(
+            !adapter
+                .tool_inputs
+                .contains_key(&CanonicalItemKey::new(None, "edit"))
+        );
+        for (id, name) in [("write", "Write"), ("edit", "MultiEdit")] {
+            let mut expected = adapter.tools[id].content.clone();
+            let ItemContent::Changes { status, .. } = &mut expected else {
+                panic!("native edit must retain attempted patch");
+            };
+            *status = ToolStatus::Failed;
+            assert_eq!(
+                adapter
+                    .edit_tools
+                    .get(&CanonicalItemKey::new(None, id))
+                    .map(String::as_str),
+                Some(name)
+            );
             let failed = adapter.receive(json!({"type":"user","uuid":format!("u-{id}"),"message":{"content":[{"type":"tool_result","tool_use_id":id,"is_error":true,"content":"denied"}]}})).unwrap();
-            assert_eq!(items(&failed),vec![expected]);
+            assert_eq!(items(&failed), vec![expected]);
             assert!(failed.events.iter().any(|event|matches!(event,Event::Error{message,fatal:false} if message.contains("original tool input is unavailable"))));
         }
         // The name is let go of with the call.
@@ -8010,74 +8254,133 @@ mod tests {
 
     #[test]
     fn closed_tool_blocks_keep_identity_without_retaining_or_regrowing_raw_input() {
-        let mut adapter=Claude::default();
-        let frame=|event:Value|json!({"type":"stream_event","event":event});
-        adapter.receive(frame(json!({"type":"message_start","message":{"id":"one-message"}}))).unwrap();
-        let input=json!({"file_path":"large.txt","content":"x".repeat(3*1024*1024)}).to_string();
+        let mut adapter = Claude::default();
+        let frame = |event: Value| json!({"type":"stream_event","event":event});
+        adapter
+            .receive(frame(
+                json!({"type":"message_start","message":{"id":"one-message"}}),
+            ))
+            .unwrap();
+        let input = json!({"file_path":"large.txt","content":"x".repeat(3*1024*1024)}).to_string();
         for index in 0..3 {
-            let id=format!("write-{index}");
+            let id = format!("write-{index}");
             adapter.receive(frame(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":"Write"}}))).unwrap();
             adapter.receive(frame(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":input}}))).unwrap();
-            assert!(adapter.raw_block_bytes>=input.len());
-            let stopped=adapter.receive(frame(json!({"type":"content_block_stop","index":index}))).unwrap();
+            assert!(adapter.raw_block_bytes >= input.len());
+            let stopped = adapter
+                .receive(frame(json!({"type":"content_block_stop","index":index})))
+                .unwrap();
             assert!(stopped.events.iter().any(|event|matches!(event,Event::Item(Item {id:actual,content:ItemContent::Changes {changes,..},..}) if actual==&id && changes[0].diff.len()>3*1024*1024)),"full source is emitted before raw retention ends");
             adapter.committed();
-            assert_eq!(adapter.raw_block_bytes,0,"closed blocks retain no raw input even before message_stop");
-            assert!(matches!(&adapter.blocks[&("".into(),"one-message".into(),index)].content,ItemContent::Tool {input,output,..} if input.capacity()==0 && output.capacity()==0));
+            assert_eq!(
+                adapter.raw_block_bytes, 0,
+                "closed blocks retain no raw input even before message_stop"
+            );
+            assert!(
+                matches!(&adapter.blocks[&("".into(),"one-message".into(),index)].content,ItemContent::Tool {input,output,..} if input.capacity()==0 && output.capacity()==0)
+            );
             let late=adapter.receive(frame(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":"do not regrow"}}))).unwrap();
             assert!(late.events.is_empty());
-            assert_eq!(adapter.raw_block_bytes,0);
+            assert_eq!(adapter.raw_block_bytes, 0);
         }
-        assert_eq!(adapter.blocks.len(),3);
-        adapter.receive(frame(json!({"type":"message_stop"}))).unwrap();
-        assert!(adapter.blocks.is_empty());assert!(adapter.closed_blocks.is_empty());assert_eq!(adapter.raw_block_bytes,0);
+        assert_eq!(adapter.blocks.len(), 3);
+        adapter
+            .receive(frame(json!({"type":"message_stop"})))
+            .unwrap();
+        assert!(adapter.blocks.is_empty());
+        assert!(adapter.closed_blocks.is_empty());
+        assert_eq!(adapter.raw_block_bytes, 0);
     }
 
     #[test]
     fn streaming_blocks_with_equal_native_ids_remain_in_their_exact_child_scope() {
-        let mut adapter=Claude::default();
-        let frame=|parent:&str,event:Value|json!({"type":"stream_event","parent_tool_use_id":parent,"event":event});
-        for parent in ["one","two"] {
-            adapter.receive(frame(parent,json!({"type":"message_start","message":{"id":"shared-message"}}))).unwrap();
+        let mut adapter = Claude::default();
+        let frame = |parent: &str, event: Value| json!({"type":"stream_event","parent_tool_use_id":parent,"event":event});
+        for parent in ["one", "two"] {
+            adapter
+                .receive(frame(
+                    parent,
+                    json!({"type":"message_start","message":{"id":"shared-message"}}),
+                ))
+                .unwrap();
             adapter.receive(frame(parent,json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"shared-tool","name":"Write"}}))).unwrap();
             adapter.receive(frame(parent,json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":json!({"file_path":format!("{parent}.txt"),"content":parent}).to_string()}}))).unwrap();
         }
-        let first=adapter.receive(frame("one",json!({"type":"content_block_stop","index":0}))).unwrap();
+        let first = adapter
+            .receive(frame("one", json!({"type":"content_block_stop","index":0})))
+            .unwrap();
         assert!(first.events.iter().any(|event|matches!(event,Event::SubagentItem {id,item:Item {content:ItemContent::Changes {changes,..},..}} if id=="one" && changes[0].path.ends_with("one.txt"))));
-        adapter.receive(frame("one",json!({"type":"message_stop"}))).unwrap();
-        assert_eq!(adapter.blocks.len(),1,"settling one child must retain another child's exact source");
-        let second=adapter.receive(frame("two",json!({"type":"content_block_stop","index":0}))).unwrap();
+        adapter
+            .receive(frame("one", json!({"type":"message_stop"})))
+            .unwrap();
+        assert_eq!(
+            adapter.blocks.len(),
+            1,
+            "settling one child must retain another child's exact source"
+        );
+        let second = adapter
+            .receive(frame("two", json!({"type":"content_block_stop","index":0})))
+            .unwrap();
         assert!(second.events.iter().any(|event|matches!(event,Event::SubagentItem {id,item:Item {content:ItemContent::Changes {changes,..},..}} if id=="two" && changes[0].path.ends_with("two.txt"))));
-        adapter.receive(frame("two",json!({"type":"message_stop"}))).unwrap();
-        assert!(adapter.blocks.is_empty());assert_eq!(adapter.raw_block_bytes,0);
+        adapter
+            .receive(frame("two", json!({"type":"message_stop"})))
+            .unwrap();
+        assert!(adapter.blocks.is_empty());
+        assert_eq!(adapter.raw_block_bytes, 0);
     }
 
     #[test]
     fn raw_stream_budget_counts_capacity_and_tiny_deltas_grow_geometrically() {
-        let mut body=String::new();let mut total=0;let mut growths=0;
+        let mut body = String::new();
+        let mut total = 0;
+        let mut growths = 0;
         for _ in 0..20_972 {
-            let before=body.capacity();append_raw_block(&mut body,&"x".repeat(50),&mut total).unwrap();
-            growths+=usize::from(body.capacity()!=before);
-            assert_eq!(total,body.capacity());
+            let before = body.capacity();
+            append_raw_block(&mut body, &"x".repeat(50), &mut total).unwrap();
+            growths += usize::from(body.capacity() != before);
+            assert_eq!(total, body.capacity());
         }
-        assert_eq!(body.len(),1_048_600);
-        assert!(growths<=20,"50-byte deltas must not reallocate every growing prefix");
-        let before=body.capacity();
-        total=MAX_RAW_BLOCK_BYTES-before+body.capacity();
-        let extra=body.capacity()-body.len()+1;
-        assert!(append_raw_block(&mut body,&"x".repeat(extra),&mut total).is_err());
-        assert_eq!(body.capacity(),0,"refused capacity growth cannot remain resident");
-        assert_eq!(total,MAX_RAW_BLOCK_BYTES-before);
+        assert_eq!(body.len(), 1_048_600);
+        assert!(
+            growths <= 20,
+            "50-byte deltas must not reallocate every growing prefix"
+        );
+        let before = body.capacity();
+        total = MAX_RAW_BLOCK_BYTES - before + body.capacity();
+        let extra = body.capacity() - body.len() + 1;
+        assert!(append_raw_block(&mut body, &"x".repeat(extra), &mut total).is_err());
+        assert_eq!(
+            body.capacity(),
+            0,
+            "refused capacity growth cannot remain resident"
+        );
+        assert_eq!(total, MAX_RAW_BLOCK_BYTES - before);
     }
 
     #[test]
     fn stream_block_indexes_and_text_correlation_survive_closed_tool_body_release() {
-        let mut adapter=Claude::default();
-        let blocks=[json!({"type":"text","text":"before"}),json!({"type":"tool_use","id":"write","name":"Write","input":{"file_path":"file.txt","content":"body"}}),json!({"type":"text","text":"after"})];
-        let events=stream_message(&mut adapter,None,"message",&blocks);
-        let ids:Vec<_>=events.iter().filter_map(|event|match event {Event::Item(Item {id,content:ItemContent::Text {text,..},..}) if !text.is_empty()=>Some(id.as_str()),_=>None}).collect();
-        assert!(ids.contains(&"message:0"));assert!(ids.contains(&"message:2"));
-        assert!(adapter.blocks.is_empty());assert_eq!(adapter.raw_block_bytes,0);
+        let mut adapter = Claude::default();
+        let blocks = [
+            json!({"type":"text","text":"before"}),
+            json!({"type":"tool_use","id":"write","name":"Write","input":{"file_path":"file.txt","content":"body"}}),
+            json!({"type":"text","text":"after"}),
+        ];
+        let events = stream_message(&mut adapter, None, "message", &blocks);
+        let ids: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(Item {
+                    id,
+                    content: ItemContent::Text { text, .. },
+                    ..
+                }) if !text.is_empty() => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.contains(&"message:0"));
+        assert!(ids.contains(&"message:2"));
+        assert!(adapter.blocks.is_empty());
+        assert_eq!(adapter.raw_block_bytes, 0);
     }
 
     #[test]
@@ -10103,23 +10406,68 @@ mod tests {
         History::index(file, session).unwrap()
     }
     #[test]
-    fn native_history_grouping_retains_raw_originals_on_restart_and_older_pages(){
-        use crate::chat::cache::{SourceKey,raw::{RawSourceQuery,RawSourceField,RawRepresentation}};
-        let earlier=json!({"file_path":"/project/earlier.txt","content":"earlier native input"});let old=json!({"file_path":"/project/old.txt","content":"native input joined from an older call"});
-        let call=|id:&str,input:Value|json!({"type":"assistant","uuid":format!("carrier-{id}"),"message":{"content":[{"type":"tool_use","id":id,"name":"Write","input":input}]}});
-        let mut frames=vec![call("earlier",earlier.clone()),call("old",old.clone())];
-        for index in 0..110{frames.push(json!({"type":"assistant","uuid":format!("filler-{index}"),"message":{"content":"filler"}}));}
+    fn native_history_grouping_retains_raw_originals_on_restart_and_older_pages() {
+        use crate::chat::cache::{
+            SourceKey,
+            raw::{RawRepresentation, RawSourceField, RawSourceQuery},
+        };
+        let earlier = json!({"file_path":"/project/earlier.txt","content":"earlier native input"});
+        let old = json!({"file_path":"/project/old.txt","content":"native input joined from an older call"});
+        let call = |id: &str, input: Value| json!({"type":"assistant","uuid":format!("carrier-{id}"),"message":{"content":[{"type":"tool_use","id":id,"name":"Write","input":input}]}});
+        let mut frames = vec![call("earlier", earlier.clone()), call("old", old.clone())];
+        for index in 0..110 {
+            frames.push(json!({"type":"assistant","uuid":format!("filler-{index}"),"message":{"content":"filler"}}));
+        }
         frames.push(json!({"type":"user","uuid":"old-result","message":{"content":[{"type":"tool_result","tool_use_id":"old","content":"saved","is_error":false}]}}));
-        let mut adapter=Claude{history:Some(correlation_history(frames)),..Claude::default()};
-        let mut initial=adapter.initialize().unwrap();
+        let mut adapter = Claude {
+            history: Some(correlation_history(frames)),
+            ..Claude::default()
+        };
+        let mut initial = adapter.initialize().unwrap();
         assert!(initial.events.iter().any(|event|matches!(event,Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Full{source,..}) if source.source_id=="old")),"latest result must retain its exact older call dependency");
-        let spec=ProcessSpec{execution:None,messages:None,unset_environment:Default::default(),transport:super::super::TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:std::env::temp_dir(),environment:Default::default()};
-        let mut store=crate::chat::runtime::preflight(&spec,&mut initial).unwrap();
-        let query=|id:&str|RawSourceQuery{source:SourceKey{agent_id:None,source_id:id.into()},field:RawSourceField::ToolInput,offset:0,limit:256*1024,expected_epoch:None,until:None};
-        let page=store.raw_source_page(query("old")).unwrap();assert_eq!(page.text,old.to_string());assert_eq!(page.metadata.tool_name,"Write");assert_eq!(page.metadata.representation,RawRepresentation::CanonicalJson);
-        let older=adapter.command(Command::LoadEarlier).unwrap();assert!(older.events.iter().any(|event|matches!(event,Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Full{source,..}) if source.source_id=="earlier")));
-        for event in older.events{store.apply(event).unwrap();}
-        assert_eq!(store.raw_source_page(query("earlier")).unwrap().text,earlier.to_string());assert_eq!(store.raw_source_page(query("old")).unwrap().epoch,page.epoch,"equivalent older replay preserves original source epoch");
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: super::super::TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: Default::default(),
+        };
+        let mut store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let query = |id: &str| RawSourceQuery {
+            source: SourceKey {
+                agent_id: None,
+                source_id: id.into(),
+            },
+            field: RawSourceField::ToolInput,
+            offset: 0,
+            limit: 256 * 1024,
+            expected_epoch: None,
+            until: None,
+        };
+        let page = store.raw_source_page(query("old")).unwrap();
+        assert_eq!(page.text, old.to_string());
+        assert_eq!(page.metadata.tool_name, "Write");
+        assert_eq!(
+            page.metadata.representation,
+            RawRepresentation::CanonicalJson
+        );
+        let older = adapter.command(Command::LoadEarlier).unwrap();
+        assert!(older.events.iter().any(|event|matches!(event,Event::RawToolCapture(crate::chat::cache::raw::RawToolCapture::Full{source,..}) if source.source_id=="earlier")));
+        for event in older.events {
+            store.apply(event).unwrap();
+        }
+        assert_eq!(
+            store.raw_source_page(query("earlier")).unwrap().text,
+            earlier.to_string()
+        );
+        assert_eq!(
+            store.raw_source_page(query("old")).unwrap().epoch,
+            page.epoch,
+            "equivalent older replay preserves original source epoch"
+        );
     }
 
     fn correlation_call(id: &str, path: &str) -> Value {
@@ -10160,7 +10508,12 @@ mod tests {
         while adapter.history.as_ref().unwrap().offset > 0 {
             let step = adapter.command(Command::LoadEarlier).unwrap();
             pages += 1;
-            let Event::History { items: page, .. } = step.events.into_iter().find(|event|matches!(event,Event::History{..})).unwrap() else {
+            let Event::History { items: page, .. } = step
+                .events
+                .into_iter()
+                .find(|event| matches!(event, Event::History { .. }))
+                .unwrap()
+            else {
                 panic!("history")
             };
             for item in page {
@@ -10301,17 +10654,32 @@ mod tests {
         adapter.bind_item_reader(std::sync::Arc::new(MissingSource));
         let record = HistoryRecord {
             frame: json!({"type":"user","uuid":"result","message":{"content":[correlation_result("wanted",false)]},"toolUseResult":actual_patch()}),
-            tool_calls: [(0, std::sync::Arc::new(correlation_call("wanted", "/project/wanted.rs")))].into(),
+            tool_calls: [(
+                0,
+                std::sync::Arc::new(correlation_call("wanted", "/project/wanted.rs")),
+            )]
+            .into(),
         };
         let mut step = Step::default();
         adapter.history_message(&record, &mut step).unwrap();
-        assert!(!step.events.iter().any(|event| matches!(event, Event::Error { .. })));
-        let item = step.events.iter().find_map(|event| match event {
-            Event::Item(item) if item.id == "wanted" => Some(item),
-            _ => None,
-        }).unwrap();
-        assert!(matches!(&item.content, ItemContent::Changes { status: ToolStatus::Succeeded, changes, .. }
-            if changes.len() == 1 && changes[0].path == "/project/wanted.rs"));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        let item = step
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::Item(item) if item.id == "wanted" => Some(item),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(&item.content, ItemContent::Changes { status: ToolStatus::Succeeded, changes, .. }
+            if changes.len() == 1 && changes[0].path == "/project/wanted.rs")
+        );
     }
 
     #[test]
@@ -10390,16 +10758,19 @@ mod tests {
             history: Some(history),
             ..Claude::default()
         };
-        adapter.tool(None,Item {
-            id: "confirmed".into(),
-            role: Role::Assistant,
-            started_at: None,
-            at: None,
-            content: ItemContent::Changes {
-                changes: vec![],
-                status: ToolStatus::Succeeded,
+        adapter.tool(
+            None,
+            Item {
+                id: "confirmed".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Changes {
+                    changes: vec![],
+                    status: ToolStatus::Succeeded,
+                },
             },
-        });
+        );
         assert!(adapter.command(Command::LoadEarlier).is_err());
         assert_eq!(adapter.history.as_ref().unwrap().offset, prior);
         assert_eq!(

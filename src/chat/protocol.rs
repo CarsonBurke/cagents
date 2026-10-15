@@ -9,8 +9,8 @@ mod claude_permissions;
 pub mod codex;
 pub mod omp;
 mod tool_cache;
-pub use tool_cache::{ItemKey as CanonicalItemKey,ItemReader as CanonicalItemReader};
 pub(crate) use super::terminal_output;
+pub use tool_cache::{ItemKey as CanonicalItemKey, ItemReader as CanonicalItemReader};
 
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
@@ -210,7 +210,7 @@ pub struct ServerIdentity {
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
     /// Optional exact canonical source for byte-budgeted adapter caches.
-    fn bind_item_reader(&mut self,_reader:std::sync::Arc<dyn CanonicalItemReader>) {}
+    fn bind_item_reader(&mut self, _reader: std::sync::Arc<dyn CanonicalItemReader>) {}
     /// The runtime has committed this Step into its canonical Store. Resident
     /// caches may now retire bodies without losing same-frame correlation.
     fn committed(&mut self) {}

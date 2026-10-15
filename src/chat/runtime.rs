@@ -683,7 +683,10 @@ impl Handle {
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadSource { .. } | Command::LoadRawSource { .. }
+            Command::LoadFileChanges { .. }
+                | Command::LoadFileChangePatches { .. }
+                | Command::LoadSource { .. }
+                | Command::LoadRawSource { .. }
         ) {
             return Err(Rejection::Refused(
                 "File cache reads require a requester-specific reply".into(),
@@ -893,11 +896,25 @@ impl Handle {
         lease.read(offset)
     }
     /// Read only the ingestion cache, including after the actor exits.
-    pub(crate) fn source_query(&self, query: super::cache::SourceQuery) -> Result<super::cache::SourcePage, super::cache::SourceError> {
-        self.0.store.lock().unwrap_or_else(|p|p.into_inner()).source_page(query)
+    pub(crate) fn source_query(
+        &self,
+        query: super::cache::SourceQuery,
+    ) -> Result<super::cache::SourcePage, super::cache::SourceError> {
+        self.0
+            .store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .source_page(query)
     }
-    pub(crate) fn raw_source_query(&self,query:super::cache::raw::RawSourceQuery)->Result<super::cache::raw::RawSourcePage,super::cache::SourceError>{
-        self.0.store.lock().unwrap_or_else(|p|p.into_inner()).raw_source_page(query)
+    pub(crate) fn raw_source_query(
+        &self,
+        query: super::cache::raw::RawSourceQuery,
+    ) -> Result<super::cache::raw::RawSourcePage, super::cache::SourceError> {
+        self.0
+            .store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .raw_source_page(query)
     }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {
@@ -922,9 +939,11 @@ impl Handle {
         if store.dirty {
             match store.window_reusing(&mut state.items) {
                 Ok(window) => {
-                    state.source_parts.retain(|part|part.source.agent_id.is_some());
+                    state
+                        .source_parts
+                        .retain(|part| part.source.agent_id.is_some());
                     state.source_parts.extend(window.source_parts);
-                    state.raw_source_parts=window.raw_source_parts;
+                    state.raw_source_parts = window.raw_source_parts;
                     state.items = window.items;
                     state.has_earlier = window.has_earlier;
                     state.has_later = window.has_later;
@@ -934,7 +953,9 @@ impl Handle {
                 }
             }
         }
-        if let Err(error)=store.publish_source_parts(&mut state) {state.error=Some(format!("Cannot identify original prose: {error}"));}
+        if let Err(error) = store.publish_source_parts(&mut state) {
+            state.error = Some(format!("Cannot identify original prose: {error}"));
+        }
         if refresh_publication {
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
@@ -972,9 +993,11 @@ impl Handle {
             let changes = if store.dirty {
                 match store.window_reusing(&mut state.items) {
                     Ok(window) => {
-                        state.source_parts.retain(|part|part.source.agent_id.is_some());
+                        state
+                            .source_parts
+                            .retain(|part| part.source.agent_id.is_some());
                         state.source_parts.extend(window.source_parts);
-                        state.raw_source_parts=window.raw_source_parts;
+                        state.raw_source_parts = window.raw_source_parts;
                         state.items = window.items;
                         state.has_earlier = window.has_earlier;
                         state.has_later = window.has_later;
@@ -988,7 +1011,9 @@ impl Handle {
             } else {
                 Vec::new()
             };
-            if let Err(error)=store.publish_source_parts(&mut state) {state.error=Some(format!("Cannot identify original prose: {error}"));}
+            if let Err(error) = store.publish_source_parts(&mut state) {
+                state.error = Some(format!("Cannot identify original prose: {error}"));
+            }
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
                 .map(|base_generation| {
@@ -2684,7 +2709,8 @@ impl Actor {
             }
         }
         if source_reset {
-            self.adapter.bind_item_reader(store::adapter_item_reader(&self.store));
+            self.adapter
+                .bind_item_reader(store::adapter_item_reader(&self.store));
         }
         // Every source item in this Step is now canonical, including items
         // that another block/result in the same frame refers back to.
@@ -3139,7 +3165,10 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 _ => state.outcome.take(),
             };
         }
-        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished { .. } | Event::RawToolCapture(_) => {}
+        Event::TurnSettled
+        | Event::Execution { .. }
+        | Event::PastTurnFinished { .. }
+        | Event::RawToolCapture(_) => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -5887,27 +5916,92 @@ mod tests {
     }
 
     #[test]
-    fn presentation_publishes_and_removes_original_call_descriptors_after_a_snapshot_baseline(){
-        struct RawUpdates{remove:bool}
-        impl Adapter for RawUpdates{
-            fn initialize(&mut self)->Result<Step,String>{Ok(Step{events:vec![Event::Ready(true)],..Step::default()})}
-            fn command(&mut self,_:Command)->Result<Step,String>{
-                let events=if self.remove{vec![Event::ItemsRemoved{ids:vec!["raw-call".into()]}]}else{
-                    self.remove=true;
-                    vec![Event::RawToolCapture(super::super::cache::raw::RawToolCapture::Full{source:super::super::cache::SourceKey{agent_id:None,source_id:"raw-call".into()},name:"Opaque".into(),input:"{\"original\":true}".into(),command:None}),Event::Item(Item{id:"raw-call".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool{name:"Opaque".into(),input:"{\"original\":true}".into(),output:String::new(),status:ToolStatus::Running}})]
-                };Ok(Step{events,..Step::default()})
-            }
-            fn receive(&mut self,_:Value)->Result<Step,String>{Ok(Step::default())}
+    fn presentation_publishes_and_removes_original_call_descriptors_after_a_snapshot_baseline() {
+        struct RawUpdates {
+            remove: bool,
         }
-        let spec=ProcessSpec{execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:std::env::temp_dir(),environment:BTreeMap::new()};
-        let mut adapter:Box<dyn Adapter>=Box::new(RawUpdates{remove:false});let mut initial=adapter.initialize().unwrap();let store=preflight(&spec,&mut initial).unwrap();let handle=Handle::start(spec,adapter,initial,store,None,|_|{}).unwrap();
-        let baseline=until(&handle,|snapshot|snapshot.ready);assert!(baseline.raw_source_parts.is_empty());let id=crate::model::TerminalId::new();
+        impl Adapter for RawUpdates {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Step::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                let events = if self.remove {
+                    vec![Event::ItemsRemoved {
+                        ids: vec!["raw-call".into()],
+                    }]
+                } else {
+                    self.remove = true;
+                    vec![
+                        Event::RawToolCapture(super::super::cache::raw::RawToolCapture::Full {
+                            source: super::super::cache::SourceKey {
+                                agent_id: None,
+                                source_id: "raw-call".into(),
+                            },
+                            name: "Opaque".into(),
+                            input: "{\"original\":true}".into(),
+                            command: None,
+                        }),
+                        Event::Item(Item {
+                            id: "raw-call".into(),
+                            role: Role::Assistant,
+                            started_at: None,
+                            at: None,
+                            content: ItemContent::Tool {
+                                name: "Opaque".into(),
+                                input: "{\"original\":true}".into(),
+                                output: String::new(),
+                                status: ToolStatus::Running,
+                            },
+                        }),
+                    ]
+                };
+                Ok(Step {
+                    events,
+                    ..Step::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(RawUpdates { remove: false });
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let baseline = until(&handle, |snapshot| snapshot.ready);
+        assert!(baseline.raw_source_parts.is_empty());
+        let id = crate::model::TerminalId::new();
         handle.command(Command::Refresh).unwrap();
-        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate{update,..})=handle.presentation(id,Some(baseline.generation)) else{panic!("live raw source update expected");};
-        let current=update.apply(&baseline).unwrap();assert_eq!(current.raw_source_parts.len(),1);assert_eq!(current.raw_source_parts[0].source.source_id,"raw-call");
+        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) =
+            handle.presentation(id, Some(baseline.generation))
+        else {
+            panic!("live raw source update expected");
+        };
+        let current = update.apply(&baseline).unwrap();
+        assert_eq!(current.raw_source_parts.len(), 1);
+        assert_eq!(current.raw_source_parts[0].source.source_id, "raw-call");
         handle.command(Command::Refresh).unwrap();
-        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate{update,..})=handle.presentation(id,Some(current.generation)) else{panic!("live source removal update expected");};
-        let removed=update.apply(&current).unwrap();assert!(removed.raw_source_parts.is_empty());assert!(removed.items.is_empty());
+        let Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) =
+            handle.presentation(id, Some(current.generation))
+        else {
+            panic!("live source removal update expected");
+        };
+        let removed = update.apply(&current).unwrap();
+        assert!(removed.raw_source_parts.is_empty());
+        assert!(removed.items.is_empty());
         handle.close().unwrap();
     }
 

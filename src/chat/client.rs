@@ -86,14 +86,50 @@ type Pending = Arc<
 >;
 type FilePending =
     Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<super::FileChangeReply, String>>>>>;
-type SourcePending = Arc<Mutex<BTreeMap<u64, tokio::sync::oneshot::Sender<Result<super::cache::SourcePage, super::cache::SourceError>>>>>;
-struct SourceRequest<'a> { pending: &'a SourcePending, id: u64 }
-impl Drop for SourceRequest<'_> {
-    fn drop(&mut self) { self.pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&self.id); }
+type SourcePending = Arc<
+    Mutex<
+        BTreeMap<
+            u64,
+            tokio::sync::oneshot::Sender<
+                Result<super::cache::SourcePage, super::cache::SourceError>,
+            >,
+        >,
+    >,
+>;
+struct SourceRequest<'a> {
+    pending: &'a SourcePending,
+    id: u64,
 }
-type RawSourcePending = Arc<Mutex<BTreeMap<u64,tokio::sync::oneshot::Sender<Result<super::cache::raw::RawSourcePage,super::cache::SourceError>>>>>;
-struct RawSourceRequest<'a>{pending:&'a RawSourcePending,id:u64}
-impl Drop for RawSourceRequest<'_>{fn drop(&mut self){self.pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&self.id);}}
+impl Drop for SourceRequest<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
+}
+type RawSourcePending = Arc<
+    Mutex<
+        BTreeMap<
+            u64,
+            tokio::sync::oneshot::Sender<
+                Result<super::cache::raw::RawSourcePage, super::cache::SourceError>,
+            >,
+        >,
+    >,
+>;
+struct RawSourceRequest<'a> {
+    pending: &'a RawSourcePending,
+    id: u64,
+}
+impl Drop for RawSourceRequest<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
+}
 /// A daemon timestamp paired with local receipt time. It survives delayed UI
 /// hydration and advances while the provider is quiet without relying on the
 /// display machine's wall clock.
@@ -278,32 +314,64 @@ async fn transmit_async(
     request: ClientRequest,
 ) -> Result<(), String> {
     let mut frame = Vec::new();
-    FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES).write(&mut frame, &ClientEnvelope {
-        version: PROTOCOL_VERSION, request_id: id, proof: Some(proof.clone()), request,
-    }).map_err(|error| error.to_string())?;
+    FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES)
+        .write(
+            &mut frame,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: id,
+                proof: Some(proof.clone()),
+                request,
+            },
+        )
+        .map_err(|error| error.to_string())?;
     loop {
-        if try_transmit_frame(wire, alive, &frame)? { return Ok(()); }
+        if try_transmit_frame(wire, alive, &frame)? {
+            return Ok(());
+        }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
-fn try_transmit_frame(wire: &Mutex<Wire>, alive: &AtomicBool, frame: &[u8]) -> Result<bool, String> {
+fn try_transmit_frame(
+    wire: &Mutex<Wire>,
+    alive: &AtomicBool,
+    frame: &[u8],
+) -> Result<bool, String> {
     use std::{os::fd::AsRawFd, sync::TryLockError};
-    if !alive.load(Ordering::Acquire) { return Err("Chat is disconnected".into()); }
+    if !alive.load(Ordering::Acquire) {
+        return Err("Chat is disconnected".into());
+    }
     let wire = match wire.try_lock() {
         Ok(wire) => wire,
         Err(TryLockError::WouldBlock) => return Ok(false),
         Err(TryLockError::Poisoned(error)) => error.into_inner(),
     };
-    if !alive.load(Ordering::Acquire) { return Err("Chat is disconnected".into()); }
+    if !alive.load(Ordering::Acquire) {
+        return Err("Chat is disconnected".into());
+    }
     // MSG_DONTWAIT affects only this call. Setting O_NONBLOCK would also alter
     // the cloned descriptor used by the blocking response reader.
     // SAFETY: the wire guard owns a live socket; frame remains valid for send.
-    let sent = unsafe { libc::send(wire.stream.as_raw_fd(), frame.as_ptr().cast(), frame.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
-    if sent == frame.len() as isize { return Ok(true); }
+    let sent = unsafe {
+        libc::send(
+            wire.stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
+    if sent == frame.len() as isize {
+        return Ok(true);
+    }
     if sent < 0 {
         let error = io::Error::last_os_error();
-        if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) { return Ok(false); }
+        if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            return Ok(false);
+        }
         alive.store(false, Ordering::Release);
         let _ = wire.stream.shutdown(Shutdown::Both);
         return Err(error.to_string());
@@ -1010,7 +1078,7 @@ impl ClientHandle {
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
         let source_pending: SourcePending = Arc::default();
-        let raw_source_pending: RawSourcePending=Arc::default();
+        let raw_source_pending: RawSourcePending = Arc::default();
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
         let inner = Arc::new(Inner {
             id,
@@ -1032,7 +1100,7 @@ impl ClientHandle {
             pending: pending.clone(),
             file_pending: file_pending.clone(),
             source_pending: source_pending.clone(),
-            raw_source_pending:raw_source_pending.clone(),
+            raw_source_pending: raw_source_pending.clone(),
             visibility_tx,
             visibility_worker: Mutex::new(None),
         });
@@ -1447,52 +1515,153 @@ impl ClientHandle {
     }
     /// Fetch a bounded original-text page on this connection's own reply channel.
     /// The existing reader resolves the future; no request spawns an actor or thread.
-    pub async fn source_page(&self, query: super::cache::SourceQuery) -> Result<super::cache::SourcePage, super::cache::SourceError> {
-        self.source_page_with_timeout(query,Duration::from_secs(40)).await
+    pub async fn source_page(
+        &self,
+        query: super::cache::SourceQuery,
+    ) -> Result<super::cache::SourcePage, super::cache::SourceError> {
+        self.source_page_with_timeout(query, Duration::from_secs(40))
+            .await
     }
-    async fn source_page_with_timeout(&self,query:super::cache::SourceQuery,timeout:Duration)->Result<super::cache::SourcePage,super::cache::SourceError>{
+    async fn source_page_with_timeout(
+        &self,
+        query: super::cache::SourceQuery,
+        timeout: Duration,
+    ) -> Result<super::cache::SourcePage, super::cache::SourceError> {
         use super::cache::SourceError;
-        if !self.inner.alive.load(Ordering::Acquire) {return Err(SourceError::Transport("Chat is disconnected".into()));}
-        let id=self.inner.next.fetch_add(1,Ordering::Relaxed);
-        let (reply,response)=tokio::sync::oneshot::channel();
-        {
-            let mut pending=self.inner.source_pending.lock().unwrap_or_else(|p|p.into_inner());
-            if !self.inner.alive.load(Ordering::Acquire){return Err(SourceError::Transport("Chat is disconnected".into()));}
-            if pending.len()>=64 {return Err(SourceError::Transport("Source request capacity reached".into()));}
-            pending.insert(id,reply);
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return Err(SourceError::Transport("Chat is disconnected".into()));
         }
-        let _request=SourceRequest{pending:&self.inner.source_pending,id};
-        tokio::time::timeout(timeout,async{
-            transmit_async(&self.inner.wire,&self.inner.alive,&self.inner.proof,id,ClientRequest::ChatCommand{chat_id:self.inner.id,command:Command::LoadSource{query}}).await.map_err(SourceError::Transport)?;
-            response.await.map_err(|_|SourceError::Transport("Source request disconnected".into()))?
-        }).await.map_err(|_|SourceError::Transport("Source request timed out".into()))?
+        let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let (reply, response) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self
+                .inner
+                .source_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !self.inner.alive.load(Ordering::Acquire) {
+                return Err(SourceError::Transport("Chat is disconnected".into()));
+            }
+            if pending.len() >= 64 {
+                return Err(SourceError::Transport(
+                    "Source request capacity reached".into(),
+                ));
+            }
+            pending.insert(id, reply);
+        }
+        let _request = SourceRequest {
+            pending: &self.inner.source_pending,
+            id,
+        };
+        tokio::time::timeout(timeout, async {
+            transmit_async(
+                &self.inner.wire,
+                &self.inner.alive,
+                &self.inner.proof,
+                id,
+                ClientRequest::ChatCommand {
+                    chat_id: self.inner.id,
+                    command: Command::LoadSource { query },
+                },
+            )
+            .await
+            .map_err(SourceError::Transport)?;
+            response
+                .await
+                .map_err(|_| SourceError::Transport("Source request disconnected".into()))?
+        })
+        .await
+        .map_err(|_| SourceError::Transport("Source request timed out".into()))?
     }
     /// Request one original-call page through this authenticated connection's
     /// existing reply reader. Cancellation removes its bounded pending credit.
-    pub async fn raw_source_page(&self,query:super::cache::raw::RawSourceQuery)->Result<super::cache::raw::RawSourcePage,super::cache::SourceError>{
-        use super::cache::{SourceError,raw::RAW_SOURCE_BYTES,PAGE_BYTES};
-        if !(4..=PAGE_BYTES).contains(&query.limit)||query.source.source_id.len()>4096||query.source.source_id.is_empty()||query.source.agent_id.as_ref().is_some_and(|id|id.len()>4096||id.is_empty())
-            ||(query.offset>0&&(query.until.is_none()||query.expected_epoch.is_none()))||(query.until.is_some()&&query.expected_epoch.is_none()){return Err(SourceError::InvalidRange);}
-        if !self.inner.alive.load(Ordering::Acquire){return Err(SourceError::Transport("Chat is disconnected".into()));}
-        let id=self.inner.next.fetch_add(1,Ordering::Relaxed);let (reply,response)=tokio::sync::oneshot::channel();
+    pub async fn raw_source_page(
+        &self,
+        query: super::cache::raw::RawSourceQuery,
+    ) -> Result<super::cache::raw::RawSourcePage, super::cache::SourceError> {
+        use super::cache::{PAGE_BYTES, SourceError, raw::RAW_SOURCE_BYTES};
+        if !(4..=PAGE_BYTES).contains(&query.limit)
+            || query.source.source_id.len() > 4096
+            || query.source.source_id.is_empty()
+            || query
+                .source
+                .agent_id
+                .as_ref()
+                .is_some_and(|id| id.len() > 4096 || id.is_empty())
+            || (query.offset > 0 && (query.until.is_none() || query.expected_epoch.is_none()))
+            || (query.until.is_some() && query.expected_epoch.is_none())
         {
-            let mut pending=self.inner.raw_source_pending.lock().unwrap_or_else(|p|p.into_inner());
-            if !self.inner.alive.load(Ordering::Acquire){return Err(SourceError::Transport("Chat is disconnected".into()));}
-            if pending.len()>=64{return Err(SourceError::Transport("Original source request capacity reached".into()));}
-            pending.insert(id,reply);
+            return Err(SourceError::InvalidRange);
         }
-        let _request=RawSourceRequest{pending:&self.inner.raw_source_pending,id};
-        let requested=query.clone();
-        let page=tokio::time::timeout(Duration::from_secs(40),async{
-            transmit_async(&self.inner.wire,&self.inner.alive,&self.inner.proof,id,ClientRequest::ChatCommand{chat_id:self.inner.id,command:Command::LoadRawSource{query}}).await.map_err(SourceError::Transport)?;
-            response.await.map_err(|_|SourceError::Transport("Original source request disconnected".into()))?
-        }).await.map_err(|_|SourceError::Transport("Original source request timed out".into()))??;
-        if page.source!=requested.source||page.field!=requested.field||page.offset!=requested.offset||page.text.len()>requested.limit||page.source_len>RAW_SOURCE_BYTES
-            ||page.next_offset!=page.offset.saturating_add(page.text.len())||page.next_offset>page.source_len||page.complete!=(page.next_offset==page.source_len)
-            ||page.metadata.tool_name.is_empty()||page.metadata.tool_name.len()>4096
-            ||(page.field==super::cache::raw::RawSourceField::CommandCall)!=(page.metadata.representation==super::cache::raw::RawRepresentation::CommandMetadataJson)
-            ||(page.text.is_empty()&&!page.complete)||requested.expected_epoch.is_some_and(|epoch|epoch!=page.epoch)||requested.until.is_some_and(|until|until!=page.source_len){
-            return Err(SourceError::Transport("Original source reply did not match its exact request".into()));
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return Err(SourceError::Transport("Chat is disconnected".into()));
+        }
+        let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let (reply, response) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self
+                .inner
+                .raw_source_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !self.inner.alive.load(Ordering::Acquire) {
+                return Err(SourceError::Transport("Chat is disconnected".into()));
+            }
+            if pending.len() >= 64 {
+                return Err(SourceError::Transport(
+                    "Original source request capacity reached".into(),
+                ));
+            }
+            pending.insert(id, reply);
+        }
+        let _request = RawSourceRequest {
+            pending: &self.inner.raw_source_pending,
+            id,
+        };
+        let requested = query.clone();
+        let page = tokio::time::timeout(Duration::from_secs(40), async {
+            transmit_async(
+                &self.inner.wire,
+                &self.inner.alive,
+                &self.inner.proof,
+                id,
+                ClientRequest::ChatCommand {
+                    chat_id: self.inner.id,
+                    command: Command::LoadRawSource { query },
+                },
+            )
+            .await
+            .map_err(SourceError::Transport)?;
+            response.await.map_err(|_| {
+                SourceError::Transport("Original source request disconnected".into())
+            })?
+        })
+        .await
+        .map_err(|_| SourceError::Transport("Original source request timed out".into()))??;
+        if page.source != requested.source
+            || page.field != requested.field
+            || page.offset != requested.offset
+            || page.text.len() > requested.limit
+            || page.source_len > RAW_SOURCE_BYTES
+            || page.next_offset != page.offset.saturating_add(page.text.len())
+            || page.next_offset > page.source_len
+            || page.complete != (page.next_offset == page.source_len)
+            || page.metadata.tool_name.is_empty()
+            || page.metadata.tool_name.len() > 4096
+            || (page.field == super::cache::raw::RawSourceField::CommandCall)
+                != (page.metadata.representation
+                    == super::cache::raw::RawRepresentation::CommandMetadataJson)
+            || (page.text.is_empty() && !page.complete)
+            || requested
+                .expected_epoch
+                .is_some_and(|epoch| epoch != page.epoch)
+            || requested
+                .until
+                .is_some_and(|until| until != page.source_len)
+        {
+            return Err(SourceError::Transport(
+                "Original source reply did not match its exact request".into(),
+            ));
         }
         Ok(page)
     }
@@ -3391,112 +3560,335 @@ mod tests {
     }
     #[test]
     fn raw_source_replies_remain_requester_specific_without_snapshot_hydration() {
-        use super::super::cache::{SourceKey,raw::{RawSourceQuery,RawSourcePage,RawSourceMetadata,RawRepresentation,RawSourceField}};
-        let (client,mut server)=UnixStream::pair().unwrap();
-        let (done,finished)=std::sync::mpsc::channel();
-        let worker=thread::spawn(move || {
-            server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let proof=host_proof("raw-source-query");
-            let mut codec=FrameCodec::new(ipc::MAX_FRAME_BYTES);
-            let respond=|codec:&mut FrameCodec,server:&mut UnixStream,request_id,response| {
-                codec.write(server,&ServerEnvelope{version:PROTOCOL_VERSION,request_id,proof:proof.clone(),message:ServerMessage::Response{response}}).unwrap();
+        use super::super::cache::{
+            SourceKey,
+            raw::{
+                RawRepresentation, RawSourceField, RawSourceMetadata, RawSourcePage, RawSourceQuery,
+            },
+        };
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("raw-source-query");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond =
+                |codec: &mut FrameCodec, server: &mut UnixStream, request_id, response| {
+                    codec
+                        .write(
+                            server,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id,
+                                proof: proof.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                        .unwrap();
+                };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: vec![],
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("start expected")
             };
-            let connect:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
-            respond(&mut codec,&mut server,Some(connect.request_id),ServerResponse::Connected{proof:proof.clone(),resumed:vec![]});
-            let start:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
-            let ClientRequest::ChatStart{session,..}=start.request else {panic!("start expected")};
-            let chat_id=session.id;
-            respond(&mut codec,&mut server,Some(start.request_id),ServerResponse::ChatAttached{session,snapshot:Snapshot{generation:7,..Default::default()}});
-            let first:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
-            let second:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
-            for request in [second,first] {
-                let ClientRequest::ChatCommand{command:Command::LoadRawSource{query},..}=request.request else {panic!("source expected")};
-                let text=query.source.source_id.clone();
-                respond(&mut codec,&mut server,Some(request.request_id),ServerResponse::ChatRawSource{chat_id,result:Ok(RawSourcePage{source:query.source,field:query.field,epoch:super::super::cache::SourceEpoch{incarnation:uuid::Uuid::new_v4(),revision:1},source_len:text.len(),offset:0,next_offset:text.len(),text,complete:true,metadata:RawSourceMetadata{tool_name:"Write".into(),representation:RawRepresentation::CanonicalJson,complete_call:true}})});
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerResponse::ChatAttached {
+                    session,
+                    snapshot: Snapshot {
+                        generation: 7,
+                        ..Default::default()
+                    },
+                },
+            );
+            let first: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let second: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            for request in [second, first] {
+                let ClientRequest::ChatCommand {
+                    command: Command::LoadRawSource { query },
+                    ..
+                } = request.request
+                else {
+                    panic!("source expected")
+                };
+                let text = query.source.source_id.clone();
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(request.request_id),
+                    ServerResponse::ChatRawSource {
+                        chat_id,
+                        result: Ok(RawSourcePage {
+                            source: query.source,
+                            field: query.field,
+                            epoch: super::super::cache::SourceEpoch {
+                                incarnation: uuid::Uuid::new_v4(),
+                                revision: 1,
+                            },
+                            source_len: text.len(),
+                            offset: 0,
+                            next_offset: text.len(),
+                            text,
+                            complete: true,
+                            metadata: RawSourceMetadata {
+                                tool_name: "Write".into(),
+                                representation: RawRepresentation::CanonicalJson,
+                                complete_call: true,
+                            },
+                        }),
+                    },
+                );
             }
             finished.recv_timeout(Duration::from_secs(5)).unwrap();
         });
-        let handle=ClientHandle::connect_on(client,omp_card(None,None),Intent::Start,None,false,None,None,|_|{}).unwrap();
-        let runtime=tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
         runtime.block_on(async {
-            let mut tasks=Vec::new();
-            for id in ["one","two"] {
-                let handle=handle.clone();
+            let mut tasks = Vec::new();
+            for id in ["one", "two"] {
+                let handle = handle.clone();
                 tasks.push(tokio::spawn(async move {
-                    let page=handle.raw_source_page(RawSourceQuery{field:RawSourceField::ToolInput,source:SourceKey{agent_id:None,source_id:id.into()},offset:0,limit:256,expected_epoch:None,until:None}).await.unwrap();
-                    assert_eq!(page.text,id);assert_eq!(page.source.source_id,id);
+                    let page = handle
+                        .raw_source_page(RawSourceQuery {
+                            field: RawSourceField::ToolInput,
+                            source: SourceKey {
+                                agent_id: None,
+                                source_id: id.into(),
+                            },
+                            offset: 0,
+                            limit: 256,
+                            expected_epoch: None,
+                            until: None,
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(page.text, id);
+                    assert_eq!(page.source.source_id, id);
                 }));
             }
-            for task in tasks {task.await.unwrap();}
+            for task in tasks {
+                task.await.unwrap();
+            }
         });
-        assert_eq!(handle.snapshot().generation,7);
+        assert_eq!(handle.snapshot().generation, 7);
         assert!(handle.snapshot().items.is_empty());
         assert!(handle.inner.raw_source_pending.lock().unwrap().is_empty());
-        done.send(()).unwrap();worker.join().unwrap();
+        done.send(()).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]
     fn source_replies_are_async_correlated_and_do_not_hydrate_snapshot() {
-        use super::super::cache::{SourceKey,SourceQuery,SourcePage};
-        let (client,mut server)=UnixStream::pair().unwrap();
-        let (done,finished)=std::sync::mpsc::channel();
-        let worker=thread::spawn(move || {
-            server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let proof=host_proof("source-query");
-            let mut codec=FrameCodec::new(ipc::MAX_FRAME_BYTES);
-            let respond=|codec:&mut FrameCodec,server:&mut UnixStream,request_id,response| {
-                codec.write(server,&ServerEnvelope{version:PROTOCOL_VERSION,request_id,proof:proof.clone(),message:ServerMessage::Response{response}}).unwrap();
+        use super::super::cache::{SourceKey, SourcePage, SourceQuery};
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("source-query");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond =
+                |codec: &mut FrameCodec, server: &mut UnixStream, request_id, response| {
+                    codec
+                        .write(
+                            server,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id,
+                                proof: proof.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                        .unwrap();
+                };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: vec![],
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("start expected")
             };
-            let connect:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
-            respond(&mut codec,&mut server,Some(connect.request_id),ServerResponse::Connected{proof:proof.clone(),resumed:vec![]});
-            let start:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
-            let ClientRequest::ChatStart{session,..}=start.request else {panic!("start expected")};
-            let chat_id=session.id;
-            respond(&mut codec,&mut server,Some(start.request_id),ServerResponse::ChatAttached{session,snapshot:Snapshot{generation:7,..Default::default()}});
-            let first:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
-            let second:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
-            for request in [second,first] {
-                let ClientRequest::ChatCommand{command:Command::LoadSource{query},..}=request.request else {panic!("source expected")};
-                let text=query.source.source_id.clone();
-                respond(&mut codec,&mut server,Some(request.request_id),ServerResponse::ChatSource{chat_id,result:Ok(SourcePage{source:query.source,epoch:super::super::cache::SourceEpoch{incarnation:uuid::Uuid::new_v4(),revision:1},source_len:text.len(),offset:0,next_offset:text.len(),text,complete:true,metadata:super::super::cache::SourceMetadata{role:super::super::Role::Assistant,thinking:false,phase:super::super::Phase::Final,at:None,started_at:None}})});
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerResponse::ChatAttached {
+                    session,
+                    snapshot: Snapshot {
+                        generation: 7,
+                        ..Default::default()
+                    },
+                },
+            );
+            let first: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let second: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            for request in [second, first] {
+                let ClientRequest::ChatCommand {
+                    command: Command::LoadSource { query },
+                    ..
+                } = request.request
+                else {
+                    panic!("source expected")
+                };
+                let text = query.source.source_id.clone();
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(request.request_id),
+                    ServerResponse::ChatSource {
+                        chat_id,
+                        result: Ok(SourcePage {
+                            source: query.source,
+                            epoch: super::super::cache::SourceEpoch {
+                                incarnation: uuid::Uuid::new_v4(),
+                                revision: 1,
+                            },
+                            source_len: text.len(),
+                            offset: 0,
+                            next_offset: text.len(),
+                            text,
+                            complete: true,
+                            metadata: super::super::cache::SourceMetadata {
+                                role: super::super::Role::Assistant,
+                                thinking: false,
+                                phase: super::super::Phase::Final,
+                                at: None,
+                                started_at: None,
+                            },
+                        }),
+                    },
+                );
             }
             finished.recv_timeout(Duration::from_secs(5)).unwrap();
         });
-        let handle=ClientHandle::connect_on(client,omp_card(None,None),Intent::Start,None,false,None,None,|_|{}).unwrap();
-        let runtime=tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
         runtime.block_on(async {
-            let mut tasks=Vec::new();
-            for id in ["one","two"] {
-                let handle=handle.clone();
+            let mut tasks = Vec::new();
+            for id in ["one", "two"] {
+                let handle = handle.clone();
                 tasks.push(tokio::spawn(async move {
-                    let page=handle.source_page(SourceQuery{source:SourceKey{agent_id:None,source_id:id.into()},offset:0,limit:256,expected_epoch:None,until:None}).await.unwrap();
-                    assert_eq!(page.text,id);assert_eq!(page.source.source_id,id);
+                    let page = handle
+                        .source_page(SourceQuery {
+                            source: SourceKey {
+                                agent_id: None,
+                                source_id: id.into(),
+                            },
+                            offset: 0,
+                            limit: 256,
+                            expected_epoch: None,
+                            until: None,
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(page.text, id);
+                    assert_eq!(page.source.source_id, id);
                 }));
             }
-            for task in tasks {task.await.unwrap();}
+            for task in tasks {
+                task.await.unwrap();
+            }
         });
-        assert_eq!(handle.snapshot().generation,7);
+        assert_eq!(handle.snapshot().generation, 7);
         assert!(handle.snapshot().items.is_empty());
         assert!(handle.inner.source_pending.lock().unwrap().is_empty());
-        done.send(()).unwrap();worker.join().unwrap();
+        done.send(()).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]
     fn cancelled_source_future_releases_pending_request() {
-        use super::super::cache::{SourceKey,SourceQuery};
-        let handle=ClientHandle::fixture(omp_card(None,None),Snapshot::default());
-        let runtime=tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        use super::super::cache::{SourceKey, SourceQuery};
+        let handle = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
         runtime.block_on(async {
-            let requester=handle.clone();
-            let task=tokio::spawn(async move {requester.source_page(SourceQuery{source:SourceKey{agent_id:None,source_id:"cancelled".into()},offset:0,limit:256,expected_epoch:None,until:None}).await});
+            let requester = handle.clone();
+            let task = tokio::spawn(async move {
+                requester
+                    .source_page(SourceQuery {
+                        source: SourceKey {
+                            agent_id: None,
+                            source_id: "cancelled".into(),
+                        },
+                        offset: 0,
+                        limit: 256,
+                        expected_epoch: None,
+                        until: None,
+                    })
+                    .await
+            });
             tokio::task::yield_now().await;
-            assert_eq!(handle.inner.source_pending.lock().unwrap().len(),1);
-            task.abort();assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(handle.inner.source_pending.lock().unwrap().len(), 1);
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
             assert!(handle.inner.source_pending.lock().unwrap().is_empty());
         });
     }
 
-    fn source_query()->super::super::cache::SourceQuery{super::super::cache::SourceQuery{source:super::super::cache::SourceKey{agent_id:None,source_id:"bounded-source".into()},offset:0,limit:256,expected_epoch:None,until:None}}
+    fn source_query() -> super::super::cache::SourceQuery {
+        super::super::cache::SourceQuery {
+            source: super::super::cache::SourceKey {
+                agent_id: None,
+                source_id: "bounded-source".into(),
+            },
+            offset: 0,
+            limit: 256,
+            expected_epoch: None,
+            until: None,
+        }
+    }
     #[test]
     fn source_query_deadline_includes_shared_wire_admission() {
         use super::super::cache::SourceError;
@@ -3510,21 +3902,31 @@ mod tests {
             let _ = released.recv_timeout(Duration::from_secs(2));
         });
         acquired.recv().unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
         let started = Instant::now();
-        let result = runtime.block_on(handle.source_page_with_timeout(source_query(),Duration::from_millis(50)));
+        let result = runtime
+            .block_on(handle.source_page_with_timeout(source_query(), Duration::from_millis(50)));
         let elapsed = started.elapsed();
-        release.send(()).unwrap(); holder.join().unwrap();
-        assert!(matches!(result, Err(SourceError::Transport(message)) if message.contains("timed out")));
-        assert!(elapsed < Duration::from_secs(1), "wire admission blocked for {elapsed:?}");
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            matches!(result, Err(SourceError::Transport(message)) if message.contains("timed out"))
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "wire admission blocked for {elapsed:?}"
+        );
         assert!(handle.inner.source_pending.lock().unwrap().is_empty());
         assert!(handle.inner.alive.load(Ordering::Acquire));
     }
 
     #[test]
     fn source_query_deadline_and_cancellation_cover_socket_backpressure() {
-        use std::os::fd::AsRawFd;
         use super::super::cache::SourceError;
+        use std::os::fd::AsRawFd;
         let handle = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
         {
             let wire = handle.inner.wire.lock().unwrap();
@@ -3533,7 +3935,14 @@ mod tests {
             let byte = [0u8];
             loop {
                 // SAFETY: the wire owns the socket and byte is a live buffer.
-                let sent = unsafe { libc::send(wire.stream.as_raw_fd(), byte.as_ptr().cast(), byte.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+                let sent = unsafe {
+                    libc::send(
+                        wire.stream.as_raw_fd(),
+                        byte.as_ptr().cast(),
+                        byte.len(),
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
                 if sent < 0 {
                     assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
                     break;
@@ -3541,18 +3950,26 @@ mod tests {
                 assert_eq!(sent, 1);
             }
         }
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
-        let result = runtime.block_on(handle.source_page_with_timeout(source_query(),Duration::from_millis(50)));
-        assert!(matches!(result, Err(SourceError::Transport(message)) if message.contains("timed out")));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let result = runtime
+            .block_on(handle.source_page_with_timeout(source_query(), Duration::from_millis(50)));
+        assert!(
+            matches!(result, Err(SourceError::Transport(message)) if message.contains("timed out"))
+        );
         assert!(handle.inner.source_pending.lock().unwrap().is_empty());
         assert!(handle.inner.alive.load(Ordering::Acquire));
         runtime.block_on(async {
             let requester = handle.clone();
             let request = tokio::spawn(async move { requester.source_page(source_query()).await });
-            while handle.inner.source_pending.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
-            request.abort(); assert!(request.await.unwrap_err().is_cancelled());
+            while handle.inner.source_pending.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
             assert!(handle.inner.source_pending.lock().unwrap().is_empty());
         });
     }
-
 }

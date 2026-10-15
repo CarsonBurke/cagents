@@ -1,11 +1,11 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
-mod file_changes;
 mod adapter_items;
 mod child_tools;
+mod file_changes;
 pub(super) use adapter_items::reader as adapter_item_reader;
-mod source;
 mod raw;
+mod source;
 
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
@@ -161,11 +161,13 @@ impl Store {
                 CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL,running INTEGER NOT NULL DEFAULT 0,source_shortened INTEGER NOT NULL DEFAULT 0);
                 CREATE INDEX running_tools ON items(id) WHERE running=1;
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
-            db.execute_batch(source::SCHEMA).map_err(|e| e.to_string())?;
+            db.execute_batch(source::SCHEMA)
+                .map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
-            db.execute_batch(child_tools::SCHEMA).map_err(|e| e.to_string())?;
-            let raw_sources=raw::initialize(&mut db)?;
+            db.execute_batch(child_tools::SCHEMA)
+                .map_err(|e| e.to_string())?;
+            let raw_sources = raw::initialize(&mut db)?;
             Ok(Self {
                 raw_sources,
                 canonical_generation: uuid::Uuid::new_v4(),
@@ -386,8 +388,16 @@ impl Store {
             body0.len() as i64
         };
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
-        raw::guard(&transaction,self.raw_sources.nonce)?;
-        if raw::revoked(&transaction,&crate::chat::cache::SourceKey{agent_id:None,source_id:item.id.clone()})?{return Err("Removed original tool identity cannot be rewritten".into());}
+        raw::guard(&transaction, self.raw_sources.nonce)?;
+        if raw::revoked(
+            &transaction,
+            &crate::chat::cache::SourceKey {
+                agent_id: None,
+                source_id: item.id.clone(),
+            },
+        )? {
+            return Err("Removed original tool identity cannot be rewritten".into());
+        }
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
         transaction.execute("INSERT INTO items(id,ordinal,metadata,len0,len1,len2,spans,running,source_shortened) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans,running=excluded.running,source_shortened=MAX(items.source_shortened,excluded.source_shortened)", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans,item.content.status()==Some(crate::chat::ToolStatus::Running),shortened]).map_err(|e| e.to_string())?;
@@ -406,7 +416,14 @@ impl Store {
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
         transaction.commit().map_err(|e| e.to_string())?;
-        if is_text || previous.as_ref().is_some_and(|(_,metadata,_)|postcard::from_bytes::<Item>(metadata).is_ok_and(|old|matches!(old.content,ItemContent::Text{..}))) {self.source_changed()?;}
+        if is_text
+            || previous.as_ref().is_some_and(|(_, metadata, _)| {
+                postcard::from_bytes::<Item>(metadata)
+                    .is_ok_and(|old| matches!(old.content, ItemContent::Text { .. }))
+            })
+        {
+            self.source_changed()?;
+        }
         if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
             self.file_index_incomplete = true;
             self.files_removed(std::slice::from_ref(&item.id))?;
@@ -677,10 +694,10 @@ impl Store {
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
-        if matches!(&event,Event::Reset {..}) {
+        if matches!(&event, Event::Reset { .. }) {
             // Revoke before the first destructive operation, including a
             // failing child/index cleanup. Old readers must never revive.
-            self.canonical_generation=uuid::Uuid::new_v4();
+            self.canonical_generation = uuid::Uuid::new_v4();
         }
         if let Some(seal) = &self.messages {
             match &mut event {
@@ -691,24 +708,32 @@ impl Store {
                 _ => {}
             }
         }
-        let filtered_raw=self.raw_filter_history(&mut event)?;
+        let filtered_raw = self.raw_filter_history(&mut event)?;
         if self.raw_event_revoked(&event)? {
-            return Ok(vec![nonfatal("Original tool source was removed; its late update was discarded".into())]);
+            return Ok(vec![nonfatal(
+                "Original tool source was removed; its late update was discarded".into(),
+            )]);
         }
-        let raw_warning=self.cache_raw_call(&event)?;
-        let filtered_raw=filtered_raw|self.raw_filter_history(&mut event)?;
-        if matches!(&event,Event::Item(_))&&self.raw_event_revoked(&event)?{
+        let raw_warning = self.cache_raw_call(&event)?;
+        let filtered_raw = filtered_raw | self.raw_filter_history(&mut event)?;
+        if matches!(&event, Event::Item(_)) && self.raw_event_revoked(&event)? {
             return Ok(vec![nonfatal("An original tool identity changed kind; its private source was revoked and the ambiguous update discarded".into())]);
         }
-        if matches!(&event,Event::RawToolCapture(_)) {
+        if matches!(&event, Event::RawToolCapture(_)) {
             return Ok(raw_warning.into_iter().map(nonfatal).collect());
         }
         if self.revoked_child_tool_event(&event)? {
             return Ok(vec![nonfatal("Delegated tool source was removed; a late update was discarded without recreating its private body".into())]);
         }
-        let mut out = self.cache_child_tool(&event)?.into_iter().map(nonfatal).collect::<Vec<_>>();
+        let mut out = self
+            .cache_child_tool(&event)?
+            .into_iter()
+            .map(nonfatal)
+            .collect::<Vec<_>>();
         out.extend(raw_warning.into_iter().map(nonfatal));
-        if filtered_raw{out.push(nonfatal("Removed or ambiguous original tool identities were discarded from the history batch; unrelated history was retained".into()));}
+        if filtered_raw {
+            out.push(nonfatal("Removed or ambiguous original tool identities were discarded from the history batch; unrelated history was retained".into()));
+        }
         self.index_child_event(&event)?;
         self.cache_child_source(&event)?;
 
@@ -838,7 +863,9 @@ impl Store {
                 thinking,
                 delta,
             } => {
-                if !delta.is_empty() {self.source_changed()?;}
+                if !delta.is_empty() {
+                    self.source_changed()?;
+                }
                 if self.pending_text.as_ref().is_some_and(|pending| {
                     pending.0 != id
                         || pending.1 != role
@@ -861,7 +888,9 @@ impl Store {
                 self.dirty = true;
             }
             Event::ItemsRemoved { ids } => {
-                if self.removes_text_sources(&ids)? {self.source_changed()?;}
+                if self.removes_text_sources(&ids)? {
+                    self.source_changed()?;
+                }
                 self.files_removed(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
@@ -1029,8 +1058,16 @@ impl Store {
         item.at = at;
         let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
-        raw::guard(&transaction,self.raw_sources.nonce)?;
-        if raw::revoked(&transaction,&crate::chat::cache::SourceKey{agent_id:None,source_id:id.into()})?{return Err("Removed original tool input cannot be appended".into());}
+        raw::guard(&transaction, self.raw_sources.nonce)?;
+        if raw::revoked(
+            &transaction,
+            &crate::chat::cache::SourceKey {
+                agent_id: None,
+                source_id: id.into(),
+            },
+        )? {
+            return Err("Removed original tool input cannot be appended".into());
+        }
         insert_body(&transaction, &id, field, offset as i64, &delta)?;
         let update = if field == 0 {
             "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1"
@@ -1265,14 +1302,14 @@ impl Store {
         let mut items = Vec::new();
         let mut source_parts = Vec::new();
         let mut raw_source_parts = Vec::new();
-        let mut raw_part_bytes=0usize;
+        let mut raw_part_bytes = 0usize;
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
         'records: for (id, ordinal, metadata, len0, len1, len2, spans, source_epoch) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
-            let original_parts=self.raw_parts(&id)?;
+            let original_parts = self.raw_parts(&id)?;
             let patch = matches!(base.content, ItemContent::Changes { .. });
             let cut = |target: usize| {
                 if patch {
@@ -1311,21 +1348,31 @@ impl Store {
                 // A part's identity carries its field ranges and layout so
                 // disclosure state cannot move to different bytes on rewrite.
                 let item_id = if part > 0 {
-                    let base_id=format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
-                    let mut candidate=base_id.clone();
-                    let mut attempt=0_u64;
+                    let base_id =
+                        format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
+                    let mut candidate = base_id.clone();
+                    let mut attempt = 0_u64;
                     // A provider's real ID may resemble any generated suffix.
                     // Escape only synthetic aliases, preserving opaque root IDs.
                     // The private cache nonce keeps aliases stable across pages.
                     while self.exists(&candidate)? {
-                        candidate=format!("{base_id}:native-alias:{}:{attempt}",self.directory.file_name().unwrap().to_string_lossy());
-                        attempt=attempt.checked_add(1).ok_or("Native alias capacity exhausted")?;
+                        candidate = format!(
+                            "{base_id}:native-alias:{}:{attempt}",
+                            self.directory.file_name().unwrap().to_string_lossy()
+                        );
+                        attempt = attempt
+                            .checked_add(1)
+                            .ok_or("Native alias capacity exhausted")?;
                     }
                     std::borrow::Cow::Owned(candidate)
                 } else {
                     std::borrow::Cow::Borrowed(base.id.as_str())
                 };
-                let source_bytes = if kind=="text" {item_id.len()+id.len()+64} else {0};
+                let source_bytes = if kind == "text" {
+                    item_id.len() + id.len() + 64
+                } else {
+                    0
+                };
                 let attached =
                     if len2 > 0 && metadata.len() + end - start + len2 + 128 <= WINDOW_BYTES {
                         len2
@@ -1337,13 +1384,39 @@ impl Store {
                 {
                     break 'records;
                 }
-                if kind=="text" {
-                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,epoch:crate::chat::cache::SourceEpoch{incarnation:self.source_incarnation,revision:source_epoch},metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
+                if kind == "text" {
+                    source_parts.push(crate::chat::cache::SourcePart {
+                        item_id: item_id.to_string(),
+                        source: crate::chat::cache::SourceKey {
+                            agent_id: None,
+                            source_id: id.clone(),
+                        },
+                        start: start0,
+                        end: end0,
+                        source_len: len0,
+                        replacement: false,
+                        epoch: crate::chat::cache::SourceEpoch {
+                            incarnation: self.source_incarnation,
+                            revision: source_epoch,
+                        },
+                        metadata: crate::chat::cache::SourceMetadata::from_item(&base).unwrap(),
+                    });
                 }
                 for original in &original_parts {
-                    let cost=original.source.source_id.len()+item_id.len()+original.metadata.tool_name.len()+128;
-                    if raw_source_parts.len()>=crate::chat::cache::raw::RAW_PARTS||raw_part_bytes.saturating_add(cost)>crate::chat::cache::raw::RAW_PART_BYTES {break;}
-                    let mut original=original.clone();original.item_id=item_id.to_string();raw_source_parts.push(original);raw_part_bytes+=cost;
+                    let cost = original.source.source_id.len()
+                        + item_id.len()
+                        + original.metadata.tool_name.len()
+                        + 128;
+                    if raw_source_parts.len() >= crate::chat::cache::raw::RAW_PARTS
+                        || raw_part_bytes.saturating_add(cost)
+                            > crate::chat::cache::raw::RAW_PART_BYTES
+                    {
+                        break;
+                    }
+                    let mut original = original.clone();
+                    original.item_id = item_id.to_string();
+                    raw_source_parts.push(original);
+                    raw_part_bytes += cost;
                 }
                 if self
                     .changed
