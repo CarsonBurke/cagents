@@ -16491,7 +16491,11 @@ pub(crate) mod tests {
         element
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut unchanged);
-        assert_eq!(unchanged.0, Some(640.0), "ordinary rebuilds retain scrolling");
+        assert_eq!(
+            unchanged.0,
+            Some(640.0),
+            "ordinary rebuilds retain scrolling"
+        );
         assert_eq!(state.change_scroll_epoch, epoch);
         drop(element);
         state.apply(&SidebarAction::SetChangeListMode {
