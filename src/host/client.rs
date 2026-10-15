@@ -428,6 +428,12 @@ pub(super) fn process_request(
         ClientRequest::DeviceOperation { operation } => {
             match &operation {
                 crate::device_service::Operation::AccountLifecycle { .. } => return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest, "Account operations require daemon admission", false)),
+                crate::device_service::Operation::Skills { launch } => {
+                    super::account_lifecycle::ensure_launch(host, &launch.recipe.working_directory,
+                        &launch.recipe.environment, &Default::default(), true)?;
+                    super::account_lifecycle::ensure_launch(host, &launch.recipe.working_directory,
+                        &launch.recipe.environment, &crate::account::launch_credential_overrides(&launch.recipe), true)?;
+                }
                 crate::device_service::Operation::AccountsUpdate { registry, .. } => {
                     let proposed = serde_json::from_value(registry.clone()).map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, format!("Invalid account preferences: {error}"), false))?;
                     super::account_lifecycle::ensure_update(host, &proposed)?;

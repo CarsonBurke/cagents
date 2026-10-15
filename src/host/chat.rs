@@ -972,6 +972,11 @@ fn start_with_execution(
         ));
     }
     let process_launch = restart_launch.unwrap_or(&session.launch);
+    // Existing main adapters inspect raw recorded selectors while constructing
+    // history. Guard those operands as well as the effective/unset spawn roots;
+    // this admission cut does not reinterpret an earlier history source.
+    super::account_lifecycle::ensure_launch(host, &process_launch.recipe.working_directory,
+        &process_launch.recipe.environment, &Default::default(), true)?;
     super::account_lifecycle::ensure_launch_at_directory(host, &process_launch.recipe.working_directory,
         &process_launch.recipe.environment, &crate::account::launch_credential_overrides(&process_launch.recipe), true,
         execution.as_ref().and_then(|context|context.directory.as_deref()))?;
@@ -2289,6 +2294,7 @@ fn process_inner(
             Ok(response)
         }
         ClientRequest::ChatReturnTerminal { chat_id } => {
+            super::account_lifecycle::ensure_idle(host)?;
             let (handle, mut session) = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.shutting_down {
