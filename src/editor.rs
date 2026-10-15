@@ -11,10 +11,12 @@ use thiserror::Error;
 use crate::fs_safety::{self, ResolveError, Root};
 
 mod presence;
+mod save_publication;
 pub use crate::recovery_authority::RecoveryAuthority;
 pub(crate) use crate::recovery_authority::{RecoverySlot, RecoveryContext};
 pub use presence::FileRestoration;
 pub(crate) use presence::{PresenceSave, save_document_file, save_document_file_at, save_document_file_at_in_context, capture_restoration_at, capture_restoration_at_in_context};
+use save_publication::{SaveBaseline, publish_replacement};
 
 /// Builds a worker-side recovery context from the EXACT pre-acquired physical
 /// cleanup lease. No named-path reacquisition occurs after a failure.
@@ -326,9 +328,9 @@ pub enum SaveOutcome {
 pub enum SaveDurability {
     /// The replacement and its parent-directory entry were synced.
     Durable,
-    /// The destination was replaced, but syncing its parent directory failed.
-    /// The new bytes are the live disk baseline even though crash durability is
-    /// not guaranteed.
+    /// The destination was replaced, but durability or recovery-artifact
+    /// cleanup could not be confirmed. The new bytes are the live disk
+    /// baseline; the diagnostic describes any retained artifact.
     Unconfirmed { error: String },
     /// Live bytes are committed; producer-owned cleanup/recovery still needs
     /// resolution. The UI must retain this authority rather than only its text.
@@ -358,31 +360,61 @@ pub fn validate_repo_path(path: &Path) -> Result<(), FileIoError> {
 /// navigation. The caller mounts it as read-only; it never enters the save
 /// path. A parent-directory descriptor fences the bounded regular-file read.
 pub fn load_external_source(path: &Path) -> Result<LoadedFile, FileIoError> {
-    if !path.is_absolute() { return Err(FileIoError::InvalidRepositoryPath); }
-    let canonical = std::fs::canonicalize(path).map_err(|error| FileIoError::Io(error.to_string()))?;
-    let parent = canonical.parent().ok_or(FileIoError::InvalidRepositoryPath)?;
-    let name = canonical.file_name().ok_or(FileIoError::InvalidRepositoryPath)?;
-    let root = crate::fs_safety::Root::open(parent).map_err(|error| FileIoError::Io(error.to_string()))?;
-    let file = crate::fs_safety::open_beneath(&root, Path::new(name)).map_err(|error| FileIoError::Io(error.to_string()))?;
-    let metadata = file.metadata().map_err(|error| FileIoError::Io(error.to_string()))?;
-    let content = if !metadata.is_file() { FileContent::ReadOnly(ReadOnlyReason::NotRegularFile) }
-    else if metadata.len() > MAX_EDITABLE_FILE_BYTES {
-        FileContent::ReadOnly(ReadOnlyReason::Oversize { bytes: metadata.len(), limit: MAX_EDITABLE_FILE_BYTES, kind: OversizeKind::Editable })
+    if !path.is_absolute() {
+        return Err(FileIoError::InvalidRepositoryPath);
+    }
+    let canonical =
+        std::fs::canonicalize(path).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let parent = canonical
+        .parent()
+        .ok_or(FileIoError::InvalidRepositoryPath)?;
+    let name = canonical
+        .file_name()
+        .ok_or(FileIoError::InvalidRepositoryPath)?;
+    let root =
+        crate::fs_safety::Root::open(parent).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let file = crate::fs_safety::open_beneath(&root, Path::new(name))
+        .map_err(|error| FileIoError::Io(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| FileIoError::Io(error.to_string()))?;
+    let content = if !metadata.is_file() {
+        FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)
+    } else if metadata.len() > MAX_EDITABLE_FILE_BYTES {
+        FileContent::ReadOnly(ReadOnlyReason::Oversize {
+            bytes: metadata.len(),
+            limit: MAX_EDITABLE_FILE_BYTES,
+            kind: OversizeKind::Editable,
+        })
     } else {
         let mut bytes = Vec::new();
         use std::io::Read;
-        file.take(MAX_EDITABLE_FILE_BYTES + 1).read_to_end(&mut bytes).map_err(|error| FileIoError::Io(error.to_string()))?;
+        file.take(MAX_EDITABLE_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| FileIoError::Io(error.to_string()))?;
         if bytes.len() as u64 > MAX_EDITABLE_FILE_BYTES {
-            FileContent::ReadOnly(ReadOnlyReason::Oversize { bytes: bytes.len() as u64, limit: MAX_EDITABLE_FILE_BYTES, kind: OversizeKind::Editable })
-        } else if bytes.contains(&0) { FileContent::ReadOnly(ReadOnlyReason::Binary) }
-        else {
+            FileContent::ReadOnly(ReadOnlyReason::Oversize {
+                bytes: bytes.len() as u64,
+                limit: MAX_EDITABLE_FILE_BYTES,
+                kind: OversizeKind::Editable,
+            })
+        } else if bytes.contains(&0) {
+            FileContent::ReadOnly(ReadOnlyReason::Binary)
+        } else {
             match String::from_utf8(bytes) {
-                Ok(text) => FileContent::Editable { content_hash: blake3::hash(text.as_bytes()), text, markdown: false },
+                Ok(text) => FileContent::Editable {
+                    content_hash: blake3::hash(text.as_bytes()),
+                    text,
+                    markdown: false,
+                },
                 Err(_) => FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8),
             }
         }
     };
-    Ok(LoadedFile { source: path.to_path_buf(), content })
+    Ok(LoadedFile {
+        source: path.to_path_buf(),
+        content,
+    })
 }
 
 /// Whether the open file begins with a PDF header, leaving it rewound.
@@ -427,7 +459,11 @@ pub fn load_file(
     load_file_at(&root, relative_path, tone)
 }
 
-pub(crate) fn load_file_at(root: &Root, relative_path: &Path, tone: PdfTone) -> Result<LoadedFile, FileIoError> {
+pub(crate) fn load_file_at(
+    root: &Root,
+    relative_path: &Path,
+    tone: PdfTone,
+) -> Result<LoadedFile, FileIoError> {
     validate_repo_path(relative_path)?;
     let worktree = root.path();
     let mut source = relative_path.to_path_buf();
@@ -1009,7 +1045,6 @@ pub fn save_file(
     expected_disk_hash: blake3::Hash,
     overwrite: bool,
 ) -> Result<SaveOutcome, FileIoError> {
-    let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
     save_file_with_hooks(
         worktree,
         relative_path,
@@ -1031,9 +1066,26 @@ pub(crate) fn save_file_at(
     expected_disk_hash: blake3::Hash,
     overwrite: bool,
 ) -> Result<SaveOutcome, FileIoError> {
-    // The workspace planner retains its cleanup protection with this Root
-    // from preparation through rollback, even if the directory is renamed.
-    save_file_at_with_hooks(root, relative_path, text, expected_disk_hash, overwrite, || Ok(()), fs_safety::sync_directory)
+    let protection = std::sync::Arc::new(
+        crate::worktree_cleanup::protect(root.path()).map_err(io_error)?
+    );
+    let context = recovery_context_at(root, protection)?;
+    save_file_at_in_context(root, relative_path, text, expected_disk_hash, overwrite, &context)
+}
+
+/// Retains the caller's original cleanup lease with any unresolved publication.
+pub(crate) fn save_file_at_in_context(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    context: &RecoveryContext,
+) -> Result<SaveOutcome, FileIoError> {
+    save_file_at_with_hooks_in_context(
+        root, relative_path, text, expected_disk_hash, overwrite,
+        || Ok(()), fs_safety::sync_directory, context,
+    )
 }
 
 fn save_file_with_hooks(
@@ -1046,11 +1098,24 @@ fn save_file_with_hooks(
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(relative_path)?;
+    let protection = std::sync::Arc::new(
+        crate::worktree_cleanup::protect(worktree).map_err(io_error)?
+    );
     let root = worktree_root(worktree)?;
-    save_file_at_with_hooks(&root, relative_path, text, expected_disk_hash, overwrite, before_publish, sync_parent)
+    let context = recovery_context_at(&root, protection)?;
+    save_file_at_with_hooks_in_context(
+        &root,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        before_publish,
+        sync_parent,
+        &context,
+    )
 }
 
-fn save_file_at_with_hooks(
+pub(crate) fn save_file_at_with_hooks(
     root: &Root,
     relative_path: &Path,
     text: &str,
@@ -1059,6 +1124,24 @@ fn save_file_at_with_hooks(
     before_publish: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveOutcome, FileIoError> {
+    let protection = std::sync::Arc::new(
+        crate::worktree_cleanup::protect(root.path()).map_err(io_error)?
+    );
+    let context = recovery_context_at(root, protection)?;
+    save_file_at_with_hooks_in_context(root, relative_path, text, expected_disk_hash,
+        overwrite, before_publish, sync_parent, &context)
+}
+
+pub(crate) fn save_file_at_with_hooks_in_context(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+    context: &RecoveryContext,
+) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(relative_path)?;
     let (parent, name) =
         fs_safety::open_parent_beneath(root, relative_path).map_err(resolve_error)?;
@@ -1066,8 +1149,8 @@ fn save_file_at_with_hooks(
     // The destination is classified by name once, only to refuse a symlink
     // without opening it, and then opened; every decision that follows — its
     // mode, its ACL, its attributes and the bytes the conflict check hashes —
-    // is taken from that one descriptor, so nothing can be swapped in behind
-    // the name between the check and the save.
+    // is taken from that descriptor. Publication separately acquires the
+    // current named entry and verifies it against this same baseline.
     let listed = fs_safety::metadata_beneath(&parent, name).map_err(resolve_error)?;
     if listed.file_type().is_symlink() {
         return Err(FileIoError::Io(
@@ -1082,7 +1165,15 @@ fn save_file_at_with_hooks(
         ));
     }
 
-    // A forced save compares nothing, so it reads nothing. An ordinary save
+    let baseline = SaveBaseline::capture(&destination, (!overwrite).then_some(expected_disk_hash))?;
+    baseline.ensure_initial(&metadata)?;
+    if !save_publication::same_file(&listed, &metadata) {
+        return Err(FileIoError::Io(
+            "The destination changed while opening the save target.".into(),
+        ));
+    }
+    // A forced save replaces the loaded baseline with a coherent digest of
+    // the current disk file; acquisition still fences later changes. An ordinary save
     // bounds the read the way `load_file` does rather than reading whatever is
     // there now: this worktree is shared with coding agents, so the
     // destination can have been replaced by a file far larger than the editor
@@ -1104,6 +1195,8 @@ fn save_file_at_with_hooks(
         &destination,
         text.as_bytes(),
         metadata.permissions(),
+        &baseline,
+        context,
         before_publish,
         sync_parent,
     )?;
@@ -1115,17 +1208,26 @@ fn save_file_at_with_hooks(
 
 /// Recreates a document the user explicitly chose to save after deletion.
 /// Publication refuses any replacement that appeared meanwhile.
-pub fn save_missing_file(worktree: &Path, path: &Path, text: &str) -> Result<SaveOutcome, FileIoError> {
+pub fn save_missing_file(
+    worktree: &Path,
+    path: &Path,
+    text: &str,
+) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(path)?;
     let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
     let root = worktree_root(worktree)?;
     save_missing_file_at(&root, path, text)
 }
 
-pub(crate) fn save_missing_file_at(root: &Root, path: &Path, text: &str) -> Result<SaveOutcome, FileIoError> {
+pub(crate) fn save_missing_file_at(
+    root: &Root,
+    path: &Path,
+    text: &str,
+) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(path)?;
     let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
-    let (mut file, temporary) = fs_safety::create_temporary_in(&parent, 0o600).map_err(resolve_error)?;
+    let (mut file, temporary) =
+        fs_safety::create_temporary_in(&parent, 0o600).map_err(resolve_error)?;
     let result = (|| {
         file.write_all(text.as_bytes()).map_err(io_error)?;
         file.sync_all().map_err(io_error)?;
@@ -1137,77 +1239,13 @@ pub(crate) fn save_missing_file_at(root: &Root, path: &Path, text: &str) -> Resu
     }
     let durability = match fs_safety::sync_directory(&parent) {
         Ok(()) => SaveDurability::Durable,
-        Err(error) => SaveDurability::Unconfirmed { error: error.to_string() },
-    };
-    Ok(SaveOutcome::Saved { content_hash: blake3::hash(text.as_bytes()), durability })
-}
-
-/// Writes `bytes` into a temporary sibling that carries the destination's
-/// ownership, permissions, access ACL and content attributes, then renames it over the
-/// destination.
-///
-/// The replacement is a new inode, so every piece of metadata the old one
-/// carried has to be reproduced deliberately — `st_mode` alone leaves an
-/// ACL-bearing file readable by the wrong people and silently drops the user's
-/// extended attributes.
-fn publish_replacement(
-    parent: &Root,
-    name: &Path,
-    destination: &File,
-    bytes: &[u8],
-    permissions: Permissions,
-    before_publish: impl FnOnce() -> io::Result<()>,
-    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
-) -> Result<SaveDurability, FileIoError> {
-    let (mut temporary, temporary_name) =
-        fs_safety::create_temporary_in(parent, 0o600).map_err(resolve_error)?;
-    let result = (|| {
-        // Establish access rules before any sensitive bytes exist: otherwise
-        // the final chmod could briefly expose a mode-only view of an ACL.
-        fs_safety::copy_ownership(destination, &temporary).map_err(io_error)?;
-        fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
-        temporary.write_all(bytes).map_err(io_error)?;
-        // Set the mode after writing: writing can clear set-ID permission bits.
-        temporary.set_permissions(permissions).map_err(io_error)?;
-        // ...and reinstate the ACL after it, because the kernel rewrites the
-        // ACL's mask from the mode.
-        fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
-        let lost = fs_safety::copy_extended_attributes(destination, &temporary);
-        temporary.sync_all().map_err(io_error)?;
-        before_publish().map_err(io_error)?;
-        fs_safety::rename_within(parent, &temporary_name, name.as_os_str())
-            .map_err(resolve_error)?;
-        Ok(lost)
-    })();
-    let lost = match result {
-        Ok(lost) => lost,
-        Err(error) => {
-            if let Err(cleanup_error) = fs_safety::unlink_within(parent, &temporary_name) {
-                return Err(FileIoError::Io(format!(
-                    "{error}; could not remove partial save: {cleanup_error}"
-                )));
-            }
-            return Err(error);
-        }
-    };
-    // The bytes are published. Losing an optional attribute is not worth
-    // failing a save that already succeeded, but it must not be silent either.
-    for attribute in lost {
-        tracing::warn!(
-            path = %parent.path().join(name).display(),
-            %attribute,
-            "saved file did not receive one of its extended attributes"
-        );
-    }
-    // The rename has replaced the destination. From this point onward, an I/O
-    // failure must be reported as a successful replacement with unconfirmed
-    // durability; returning `Err` would falsely tell callers the old baseline
-    // is still on disk.
-    Ok(match sync_parent(parent) {
-        Ok(()) => SaveDurability::Durable,
         Err(error) => SaveDurability::Unconfirmed {
             error: error.to_string(),
         },
+    };
+    Ok(SaveOutcome::Saved {
+        content_hash: blake3::hash(text.as_bytes()),
+        durability,
     })
 }
 
@@ -1370,15 +1408,29 @@ mod tests {
         fs::write(&source, "pub fn example() { /* λ */ }\n").unwrap();
         let loaded = load_external_source(&source).unwrap();
         assert_eq!(loaded.source, source);
-        assert!(matches!(loaded.content, FileContent::Editable { text, markdown: false, .. } if text.contains("λ")));
+        assert!(
+            matches!(loaded.content, FileContent::Editable { text, markdown: false, .. } if text.contains("λ"))
+        );
         fs::write(&source, b"binary\0bytes").unwrap();
-        assert!(matches!(load_external_source(&source).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::Binary)));
+        assert!(matches!(
+            load_external_source(&source).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::Binary)
+        ));
         fs::write(&source, [0xff]).unwrap();
-        assert!(matches!(load_external_source(&source).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)));
+        assert!(matches!(
+            load_external_source(&source).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
+        ));
         let file = fs::File::create(&source).unwrap();
         file.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
-        assert!(matches!(load_external_source(&source).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })));
-        assert!(matches!(load_external_source(directory.path()).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)));
+        assert!(matches!(
+            load_external_source(&source).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })
+        ));
+        assert!(matches!(
+            load_external_source(directory.path()).unwrap().content,
+            FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)
+        ));
         assert!(load_external_source(Path::new("relative.rs")).is_err());
     }
 
@@ -1865,12 +1917,18 @@ mod tests {
             &foreign,
             b"after",
             source.permissions(),
+            &SaveBaseline::capture(&foreign, None).unwrap(),
+            &RecoveryContext::with_guard((), 0).unwrap(),
             || Ok(()),
             fs_safety::sync_directory,
         );
         match result {
             Err(error) => {
-                assert!(error.to_string().contains("file ownership"), "{error}");
+                assert!(
+                    error.to_string().contains("file ownership")
+                        || error.to_string().contains("identity"),
+                    "{error}"
+                );
                 assert_eq!(fs::read(&path).unwrap(), b"before");
                 let after = fs::metadata(&path).unwrap();
                 assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
@@ -1922,12 +1980,19 @@ mod tests {
 
     #[test]
     fn explicit_save_after_deletion_recreates_without_replacing_another_writer() {
-        let root = tempfile::tempdir().unwrap(); let path = Path::new("deleted.rs");
+        let root = tempfile::tempdir().unwrap();
+        let path = Path::new("deleted.rs");
         let outcome = save_missing_file(root.path(), path, "kept buffer").unwrap();
         assert!(matches!(outcome, SaveOutcome::Saved { .. }));
-        assert_eq!(std::fs::read_to_string(root.path().join(path)).unwrap(), "kept buffer");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(path)).unwrap(),
+            "kept buffer"
+        );
         assert!(save_missing_file(root.path(), path, "another writer").is_err());
-        assert_eq!(std::fs::read_to_string(root.path().join(path)).unwrap(), "kept buffer");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(path)).unwrap(),
+            "kept buffer"
+        );
     }
 
     #[test]
