@@ -1798,6 +1798,7 @@ mod search_tests {
         let app = super::super::tests::context_inspector_test_app(false);
         let invalid = HashMap::new();
         let context = SettingsContext {
+            terminal_font_size: app.settings.terminal_font_size,
             feedback: None,
             reload_error: None,
             can_undo: false,

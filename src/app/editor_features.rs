@@ -701,7 +701,7 @@ mod tests {
         let event = LspEvent::CodeActions {
             request: new,
             doc,
-            items: vec![LspCodeAction::local("Fix call", None, None)],
+            items: vec![LspCodeAction::local("Fix call".into(), None, None)],
         };
         drop(app.editor_feature_event(&event));
         assert_eq!(
@@ -716,7 +716,7 @@ mod tests {
         drop(app.editor_feature_event(&LspEvent::CodeActions {
             request: pending,
             doc,
-            items: vec![LspCodeAction::local("Dismissed fix", None, None)],
+            items: vec![LspCodeAction::local("Dismissed fix".into(), None, None)],
         }));
         assert!(!app.editor_features.code_actions.contains_key(&card));
         assert!(
@@ -741,7 +741,7 @@ mod tests {
         drop(app.editor_feature_event(&LspEvent::CodeActions {
             request,
             doc,
-            items: vec![LspCodeAction::local("Fix old range", None, None)],
+            items: vec![LspCodeAction::local("Fix old range".into(), None, None)],
         }));
         assert!(!app.editor_features.code_actions.contains_key(&card));
         assert!(!app.editor_features.choice_requests.contains_key(&card));
