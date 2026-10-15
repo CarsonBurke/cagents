@@ -3480,7 +3480,7 @@ impl Runtime {
             Action::Copy(self.target, item.id.clone(), CopyPart::Text),
         )];
         if let Some((at, stamp, full)) = self
-            .cache
+            .presentation_cache()
             .get(&item.id)
             .and_then(|cached| cached.stamp.as_ref())
             && item.at == Some(*at)
@@ -4778,7 +4778,7 @@ mod tests {
             id: "dated-prompt".into(),
             role: chat::Role::User,
             at: Some(at),
-            started_at: None,
+            started_at: Some(at - 120_000),
             content: ItemContent::Text {
                 text: "Recorded prompt".into(),
                 thinking: false,
@@ -4787,7 +4787,8 @@ mod tests {
         };
         let (mut runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&parent));
         let child = chat::Item {
-            id: "dated-child-answer".into(),
+            // Opaque message IDs can collide across transcripts.
+            id: parent.id.clone(),
             role: chat::Role::Assistant,
             at: Some(at + 120_000),
             content: ItemContent::Text {
@@ -4799,6 +4800,7 @@ mod tests {
         };
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
+        let child_id = native_child_fixture().id;
         snapshot.subagents.push(chat::Subagent {
             items: vec![Arc::new(child.clone())],
             ..native_child_fixture()
@@ -4810,9 +4812,14 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.cards
             .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
-        for item in [&parent, &child] {
+        for (selected, item) in [(None, &parent), (Some(child_id), &child)] {
+            let child_selected = selected.is_some();
+            let before_selection = app.chat_runtime_mut(target).unwrap().snapshot.clone();
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, selected)));
             let runtime = app.chat_runtime_mut(target).unwrap();
-            let expected = runtime.cache[&item.id]
+            assert!(Arc::ptr_eq(&before_selection, &runtime.snapshot));
+            assert_eq!(runtime.cache[&parent.id].stamp.as_ref().unwrap().0, at);
+            let expected = runtime.presentation_cache()[&item.id]
                 .stamp
                 .clone()
                 .expect("parent and child retain recorded time");
@@ -4823,7 +4830,10 @@ mod tests {
             drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert!(Arc::ptr_eq(&before, &runtime.snapshot));
-            assert_eq!(runtime.cache[&item.id].stamp.as_ref(), Some(&expected));
+            assert_eq!(
+                runtime.presentation_cache()[&item.id].stamp.as_ref(),
+                Some(&expected)
+            );
             let mut footer = runtime.message_copy(item);
             let mut tree = Tree::new(footer.as_widget());
             let node = footer.as_widget_mut().layout(
@@ -4884,6 +4894,58 @@ mod tests {
             assert!(
                 matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text)) if *target == runtime.target && id == &item.id)
             );
+            drop(footer);
+            if child_selected {
+                let revision = app.chat_runtime_mut(target).unwrap().child_cache[&item.id].revision;
+                let mut previous_label = expected.1;
+                for recorded in [Some(at + 180_000), None] {
+                    let mut snapshot = (*handle.snapshot()).clone();
+                    snapshot.generation += 1;
+                    Arc::make_mut(&mut snapshot.subagents[0].items[0]).at = recorded;
+                    handle.publish_snapshot_for_test(snapshot);
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    runtime.refresh();
+                    assert_eq!(
+                        runtime.child_cache[&item.id].revision, revision,
+                        "clock-only publication retains prepared child body"
+                    );
+                    assert_eq!(
+                        runtime.cache[&parent.id].stamp.as_ref().unwrap().0,
+                        at,
+                        "same child ID cannot replace the parent timestamp"
+                    );
+                    let current = &runtime.snapshot.subagents[0].items[0];
+                    let label = runtime.child_cache[&item.id]
+                        .stamp
+                        .as_ref()
+                        .map(|stamp| stamp.1.clone());
+                    let mut footer = runtime.message_copy(current);
+                    tree.diff(footer.as_widget_mut());
+                    let node = footer.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 100.0)),
+                    );
+                    let mut texts = Texts::default();
+                    footer.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut texts,
+                    );
+                    if let Some(label) = &label {
+                        assert!(
+                            texts.0.iter().any(|(text, _)| text == label),
+                            "same native footer Tree draws the changed child timestamp"
+                        );
+                    }
+                    assert!(
+                        !texts.0.iter().any(|(text, _)| text == &previous_label),
+                        "same native footer Tree withdraws the obsolete timestamp"
+                    );
+                    previous_label = label.unwrap_or_default();
+                }
+            }
         }
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
@@ -4894,7 +4956,7 @@ mod tests {
         runtime.refresh();
         assert!(runtime.cache[&parent.id].stamp.is_none());
         assert!(
-            runtime.cache[&child.id].stamp.is_none(),
+            runtime.child_cache[&child.id].stamp.is_none(),
             "missing recorded time never falls back to the current clock"
         );
     }

@@ -2321,11 +2321,11 @@ impl Runtime {
         let live: HashSet<_> = items.iter().map(|item| item.id.as_str()).collect();
         cache.retain(|id, _| live.contains(id.as_str()));
         let newest = items.len().wrapping_sub(1);
-        let items = items
+        let growing_items = items
             .iter()
             .enumerate()
             .map(|(index, item)| (item, busy && index == newest));
-        for (item, growing) in items {
+        for (item, growing) in growing_items {
             let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
             if let Some(cached) = cache.get_mut(&item.id) {
@@ -2376,6 +2376,19 @@ impl Runtime {
             }
             cached.item = Some(item.clone());
             cache.insert(item.id.clone(), cached);
+        }
+        // Stamp every admitted item after preparation, including the unchanged
+        // and append paths. Child selection can prepare from the current
+        // Snapshot without another provider wake.
+        let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
+        for item in items {
+            if let Some(cached) = cache.get_mut(&item.id)
+                && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
+            {
+                cached.stamp = item
+                    .at
+                    .and_then(|at| recorded_message_stamp(at, today.as_ref()));
+            }
         }
     }
     fn prepare_child_cache(&mut self, snapshot: &Snapshot) {
@@ -2517,20 +2530,6 @@ impl Runtime {
         self.prepare_child_cache(&snapshot);
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
-        let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
-        for item in snapshot
-            .items
-            .iter()
-            .chain(snapshot.subagents.iter().flat_map(|agent| &agent.items))
-        {
-            if let Some(cached) = self.cache.get_mut(&item.id)
-                && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
-            {
-                cached.stamp = item
-                    .at
-                    .and_then(|at| recorded_message_stamp(at, today.as_ref()));
-            }
-        }
         for request in &snapshot.requests {
             for field in &request.fields {
                 self.answers
