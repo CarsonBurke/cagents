@@ -230,7 +230,7 @@ impl Journal {
         if count>=128 {return Err("Retained actor restart receipt capacity reached".into());}
         self.db.execute("INSERT INTO restarts(id,hash,state) VALUES(?1,?2,?3)",params![id.to_string(),hash.as_slice(),serde_json::to_vec(&super::restart::RestartState::Accepted).map_err(|error|error.to_string())?]).map_err(|error|error.to_string())?;Ok(())
     }
-    pub fn finish_restart(&mut self,id:uuid::Uuid,result:Result<crate::daemon::holder_registry::Process,String>)->Result<super::restart::RestartState,String> {
+    pub fn finish_restart(&mut self,id:uuid::Uuid,result:Result<crate::daemon::holder_registry::Process,super::restart::RestartFailure>)->Result<super::restart::RestartState,String> {
         let state=super::restart::RestartState::Acknowledged(result);
         self.db.execute("UPDATE restarts SET state=?1 WHERE id=?2",params![serde_json::to_vec(&state).map_err(|error|error.to_string())?,id.to_string()]).map_err(|error|error.to_string())?;Ok(state)
     }

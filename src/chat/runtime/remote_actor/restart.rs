@@ -2,7 +2,11 @@
 //! A repeated request identity reads its receipt; it never resubmits a prompt.
 use super::*;
 #[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
-pub(crate) enum RestartState {Accepted,Acknowledged(Result<Process,String>)}
+pub(crate) enum RestartCleanup {TeardownProved,Uncertain}
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+pub(crate) struct RestartFailure {pub reason:String,pub cleanup:RestartCleanup}
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+pub(crate) enum RestartState {Accepted,Acknowledged(Result<Process,RestartFailure>)}
 #[derive(Clone,Debug,Serialize,Deserialize)]
 pub(crate) struct RestartReceipt {pub id:uuid::Uuid,pub state:RestartState}
 #[derive(Serialize,Deserialize)]
@@ -44,7 +48,14 @@ impl Server {
         if lineage.len()>1024 || serde_json::to_vec(&lineage).map_err(|error|error.to_string())?.len()>4*1024*1024 {return Err("Retained source lineage capacity reached".into());}
         self.journal.lock().unwrap_or_else(|p|p.into_inner()).admit_restart(id,&hash)?;
         self.lineage=lineage;
-        let result=self.replace_provider(request);
+        let previous=self.actor.clone();
+        let result=self.replace_provider(request).map_err(|reason|RestartFailure {
+            reason:reason.chars().take(4096).collect(),
+            // start_inner without an external launch owner returns Err only
+            // after proved cleanup (or before provider creation). An uncertain
+            // newly created actor is returned and remains resident instead.
+            cleanup:if self.actor.same_actor(&previous)||self.actor.is_completed() {RestartCleanup::TeardownProved}else {RestartCleanup::Uncertain},
+        });
         let state=self.journal.lock().unwrap_or_else(|p|p.into_inner()).finish_restart(id,result)?;
         self.changed.fetch_add(1,Ordering::Release);
         // Keep the original approved descriptor live throughout both phases.
