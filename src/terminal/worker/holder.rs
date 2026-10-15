@@ -92,6 +92,9 @@ enum Request {
         size: PtySize,
         #[serde(default)]
         recovery: Option<Recovery>,
+        /// Exactly one SCM_RIGHTS directory descriptor accompanies this spawn.
+        #[serde(default)]
+        anchored_directory: bool,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -177,12 +180,33 @@ pub(super) fn spawn(
     spawn_recoverable(command, size, exits, None)
 }
 
+fn validate_execution_directory(directory: &File) -> Result<(), String> {
+    let metadata = directory.metadata().map_err(|error| format!("inspect terminal working directory: {error}"))?;
+    if !metadata.is_dir() || metadata.nlink() == 0 {
+        return Err("The terminal's verified working directory is no longer available".into());
+    }
+    Ok(())
+}
+
 pub(super) fn spawn_recoverable(
     command: CommandBuilder,
     size: PtySize,
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Held, String> {
+    spawn_recoverable_at_directory(command, size, exits, recovery, None)
+}
+
+pub(super) fn spawn_recoverable_at_directory(
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    directory: Option<std::sync::Arc<File>>,
+) -> Result<Held, String> {
+    if let Some(directory) = &directory {
+        validate_execution_directory(directory)?;
+    }
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
     std::hint::black_box(&SERVE);
@@ -231,6 +255,7 @@ pub(super) fn spawn_recoverable(
     let command = postcard::to_stdvec(&command)
         .map(|command| STANDARD.encode(command))
         .map_err(|error| format!("encode terminal command: {error}"))?;
+    let directory_descriptors: Vec<RawFd> = directory.iter().map(|directory| directory.as_raw_fd()).collect();
     let started = holder
         .control
         .set_read_timeout(Some(START_TIMEOUT))
@@ -242,8 +267,9 @@ pub(super) fn spawn_recoverable(
                     command,
                     size,
                     recovery,
+                    anchored_directory: directory.is_some(),
                 },
-                &[],
+                &directory_descriptors,
             )
         })
         .and_then(|()| receive::<Report>(&holder.control))
@@ -1067,17 +1093,28 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size, mut recovery) = match receive::<Request>(&control) {
+    let (command, size, mut recovery, anchored_directory, mut descriptors) = match receive::<Request>(&control) {
         Ok(Some((
             Request::Spawn {
                 command,
                 size,
                 recovery,
+                anchored_directory,
             },
-            _,
-        ))) => (command, size, recovery),
+            descriptors,
+        ))) => (command, size, recovery, anchored_directory, descriptors),
         _ => return 1,
     };
+    let directory = match (anchored_directory, descriptors.len()) {
+        (true, 1) => Some(File::from(descriptors.pop().expect("checked directory descriptor"))),
+        (false, 0) => None,
+        _ => return fail("terminal spawn sent the wrong working-directory descriptors".into()),
+    };
+    if let Some(directory) = &directory {
+        if let Err(error) = validate_execution_directory(directory) {
+            return fail(error);
+        }
+    }
     if let Some(recovery) = &recovery {
         let authority = (|| {
             let boot = crate::daemon::read_boot_id()?;
@@ -1101,7 +1138,7 @@ fn serve(control: UnixStream) -> i32 {
             return fail(format!("authorize terminal holder: {error}"));
         }
     }
-    let command = match STANDARD
+    let mut command = match STANDARD
         .decode(command)
         .map_err(|error| error.to_string())
         .and_then(|command| {
@@ -1110,6 +1147,13 @@ fn serve(control: UnixStream) -> i32 {
         Ok(command) => command,
         Err(error) => return fail(format!("decode terminal command: {error}")),
     };
+    if let Some(directory) = &directory {
+        // portable-pty resolves relative executables before fork and closes
+        // extra child descriptors in pre_exec. Reference the holder's pinned
+        // descriptor so both cwd and relative executable resolution survive
+        // that close; spawn keeps this descriptor alive through exec success.
+        command.cwd(format!("/proc/{}/fd/{}", std::process::id(), directory.as_raw_fd()));
+    }
     let program = command
         .get_argv()
         .first()
@@ -1126,6 +1170,7 @@ fn serve(control: UnixStream) -> i32 {
         Ok(child) => child,
         Err(error) => return fail(format!("spawn {program}: {error:#}")),
     };
+    drop(directory);
     drop(pair.slave);
     let Some(pid) = child.process_id().map(|pid| pid as libc::pid_t) else {
         return fail(format!("spawn {program}: no process id"));
@@ -2024,6 +2069,52 @@ mod tests {
         assert!(descriptors.is_empty());
         drop(left);
         assert!(receive::<Report>(&right).unwrap().is_none());
+    }
+
+    #[test]
+    fn pinned_spawn_uses_renamed_directory_and_relative_program_not_reused_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let old = root.path().join("old");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("marker"), "ORIGINAL_DIRECTORY\n").unwrap();
+        std::fs::write(old.join("probe"), "#!/bin/sh\npwd -P\ncat marker\nprintf 'PINNED_DONE\\n'\n").unwrap();
+        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = std::sync::Arc::new(File::open(&old).unwrap());
+        std::fs::rename(&old, &moved).unwrap();
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("marker"), "WRONG_DIRECTORY\n").unwrap();
+        std::fs::write(old.join("probe"), "#!/bin/sh\nprintf 'WRONG_EXECUTABLE\\n'\nexit 43\n").unwrap();
+        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = CommandBuilder::new("./probe");
+        command.cwd(&old);
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held = spawn_recoverable_at_directory(command, size(), exits, None, Some(directory)).unwrap();
+        let output = read_until(&held.master, "PINNED_DONE");
+        assert!(output.contains(moved.to_str().unwrap()), "{output}");
+        assert!(output.contains("ORIGINAL_DIRECTORY"), "{output}");
+        assert!(!output.contains("WRONG_"), "{output}");
+        assert!(exited.recv_timeout(Duration::from_secs(5)).unwrap().unwrap().success());
+        drop(held);
+    }
+
+    #[test]
+    fn unavailable_directory_descriptor_is_refused_before_holder_spawn() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let removed = root.path().join("removed");
+        std::fs::create_dir(&removed).unwrap();
+        let directory = std::sync::Arc::new(File::open(&removed).unwrap());
+        std::fs::remove_dir(&removed).unwrap();
+        let marker = root.path().join("must-not-execute");
+        for directory in [directory, std::sync::Arc::new(tempfile::tempfile().unwrap())] {
+            let (exits, _) = crossbeam_channel::bounded(1);
+            let result = spawn_recoverable_at_directory(
+                command(&format!("touch '{}'", marker.display())), size(), exits, None, Some(directory),
+            );
+            assert!(result.is_err());
+            assert!(!marker.exists());
+        }
     }
 
     #[test]
