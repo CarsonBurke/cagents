@@ -7,29 +7,7 @@ const LIMIT: usize = 32 * 1024 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// One application-wide intent orders explicit chat copies across cards.
-/// Only weak slot headers are registered; withdrawing a queued request moves
-/// its actual source owner to the reclaimer without waiting for admission.
-#[derive(Default)]
-struct Hub { generation: AtomicU64, queued: Mutex<Vec<std::sync::Weak<InputSlot>>> }
-#[derive(Clone, Default)]
-pub(super) struct Intents(Arc<Hub>);
-#[derive(Clone)]
-pub(super) struct Intent { hub: Arc<Hub>, generation: u64 }
-impl Intents {
-    pub(super) fn next(&self)->Intent {
-        let generation=self.0.generation.fetch_add(1,Ordering::AcqRel).wrapping_add(1);
-        let previous=std::mem::take(&mut *self.0.queued.lock().unwrap_or_else(|error|error.into_inner()));
-        for slot in previous {if let Some(slot)=slot.upgrade() {slot.cancel();}}
-        Intent {hub:self.0.clone(),generation}
-    }
-}
-impl Intent {
-    pub(super) fn current(&self)->bool {self.hub.generation.load(Ordering::Acquire)==self.generation}
-    fn register(&self,input:&Arc<InputSlot>) {
-        self.hub.queued.lock().unwrap_or_else(|error|error.into_inner()).push(Arc::downgrade(input));
-    }
-}
+use super::clipboard_intent::Intent;
 
 #[derive(Clone)]
 struct Proof {
@@ -77,6 +55,7 @@ impl InputSlot {
         if let Some(source)=self.take() {retire(source);}
     }
 }
+impl clipboard_intent::Pending for InputSlot {fn withdraw(&self) {self.cancel();}}
 impl Drop for InputSlot {
     fn drop(&mut self) {
         if let Some(source) = self.source.get_mut().unwrap_or_else(|error| error.into_inner()).take() { retire(source); }

@@ -38,6 +38,7 @@ mod turn;
 mod turn_actions;
 mod originals;
 mod plain_copy;
+mod clipboard_intent;
 mod view;
 
 pub(super) fn prune_pasted_images() {
@@ -490,7 +491,7 @@ pub(super) struct State {
     drafts: HashMap<CardId, String>,
     recovery_drafts: HashMap<CardId, turn_actions::Prompt>,
     original_epoch: u64,
-    copy_intents: plain_copy::Intents,
+    copy_intents: clipboard_intent::Intents,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -520,7 +521,7 @@ impl Default for State {
             drafts: HashMap::new(),
             recovery_drafts: HashMap::new(),
             original_epoch: 0,
-            copy_intents: plain_copy::Intents::default(),
+            copy_intents: clipboard_intent::Intents::default(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
