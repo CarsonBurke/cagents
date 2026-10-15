@@ -55,7 +55,7 @@ pub(crate) fn get_or_init_messages() -> Sender<Message> {
                     let executor = Executor::new();
                     block_on(executor.run(async {
                         #[cfg(not(feature = "tokio"))]
-                        let mut messages = rx.fuse();
+                        let mut messages = std::pin::pin!(rx.fuse());
                         #[cfg(feature = "tokio")]
                         let mut messages = UnboundedReceiverStream::new(rx).fuse();
                         drive_context(
@@ -448,7 +448,7 @@ mod connection_tests {
             #[cfg(feature = "tokio")]
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
             #[cfg(not(feature = "tokio"))]
-            let mut messages = rx.fuse();
+            let mut messages = std::pin::pin!(rx.fuse());
             #[cfg(feature = "tokio")]
             let mut messages = UnboundedReceiverStream::new(rx).fuse();
             let mut sender = Some(tx);
