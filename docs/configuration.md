@@ -685,3 +685,5 @@ Keyboard → Editor. They appear only for the active editor's existing disk
 conflict or durability warning. Reload reads the selected file again; Overwrite
 is available only when that file has an explicit save conflict. Ordinary Save
 continues to preserve its disk-conflict checks.
+
+Editor refactoring commands are configurable: `editor_rename_symbol` (F2), `editor_format_document` (Shift+Alt+F), `editor_format_selection` (unbound), `editor_code_actions` (Ctrl+.) and `editor_signature_help` (Ctrl+Shift+Space). Availability uses the mounted source, current server capabilities, selection and writable/save guards. Code-buffer symbol rename takes precedence over pane rename; unsupported symbol rename retains the chord and reports the controller refusal.

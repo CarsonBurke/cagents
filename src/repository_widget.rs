@@ -2936,6 +2936,19 @@ impl RepositoryRuntime {
 
     /// Language actions belong to the mounted editable document, whose LSP
     /// registration and caret supply the existing request handlers' inputs.
+    pub fn registered_editor_feature_action(&self, card: CardId, command: crate::workspace_widget::GlobalShortcut) -> Option<RepositoryAction> {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let feature = match command {
+            Command::EditorRenameSymbol => EditorLanguageFeature::Rename,
+            Command::EditorFormatDocument => EditorLanguageFeature::FormatDocument,
+            Command::EditorFormatSelection => EditorLanguageFeature::FormatSelection,
+            Command::EditorCodeActions => EditorLanguageFeature::CodeActions,
+            Command::EditorSignatureHelp => EditorLanguageFeature::Signature,
+            _ => return None,
+        };
+        self.editor_language_feature_action(card, feature)
+    }
+
     pub fn editor_language_command_capabilities(&self) -> u8 {
         if self.editable_surface_visible()
             && self.lsp_document.is_some()
@@ -10231,6 +10244,7 @@ fn registered_editor_binding(
         return Some(
             runtime
                 .editor_language_command_action(card, command)
+                .or_else(|| runtime.registered_editor_feature_action(card, command))
                 .or_else(|| editor_command_action(card, command))
                 .map(text_editor::Binding::Custom),
         );
@@ -11546,8 +11560,6 @@ fn editable_document_view<'a>(
                     }
                 }
                 let action = match &press.key {
-                    Key::Named(Named::F2) if !runtime.standalone && press.modifiers.is_empty() => Some(EditorLspAction::Rename),
-                    Key::Character(character) if !runtime.standalone && character.as_str() == "." && press.modifiers.command() => Some(EditorLspAction::CodeActions),
                     Key::Named(Named::Escape)
                         if !runtime.language.completions.is_empty()
                             || !runtime.language.hover.is_empty()
@@ -20858,6 +20870,22 @@ mod tests {
         assert!(descriptor.available(&context));
         context.focused = crate::workspace_widget::FocusedPane::TextInput;
         assert!(!descriptor.available(&context));
+    }
+
+    #[test]
+    fn refactoring_bindings_retire_native_defaults_and_hold_unsupported_rename() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "source");
+        let press = |named, code| iced::widget::text_editor::KeyPress { key: iced::keyboard::Key::Named(named), modified_key: iced::keyboard::Key::Named(named), physical_key: iced::keyboard::key::Physical::Code(code), modifiers: iced::keyboard::Modifiers::empty(), text: None, status: iced::widget::text_editor::Status::Focused { is_hovered: false } };
+        let f2 = press(iced::keyboard::key::Named::F2, iced::keyboard::key::Code::F2);
+        assert!(matches!(registered_editor_binding(card, &runtime, &f2), Some(Some(text_editor::Binding::Custom(RepositoryAction::Language { action: EditorLspAction::Rename, .. })))));
+        runtime.set_lsp_document(None);
+        assert!(matches!(registered_editor_binding(card, &runtime, &f2), Some(None)), "an unsupported document cannot fall through to pane rename");
+        let mut shortcuts = crate::settings::KeyboardShortcuts::default();
+        shortcuts.editor_rename_symbol = vec!["F9".into()];
+        runtime.set_keyboard_shortcuts(Arc::new(shortcuts));
+        assert!(registered_editor_binding(card, &runtime, &f2).is_none());
+        assert!(matches!(registered_editor_binding(card, &runtime, &press(iced::keyboard::key::Named::F9, iced::keyboard::key::Code::F9)), Some(None)));
     }
 
     #[test]

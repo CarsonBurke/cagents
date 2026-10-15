@@ -221,6 +221,11 @@ pub enum GlobalShortcut {
     GitDiscardAllUntracked,
     EditorReload,
     EditorOverwrite,
+    EditorRenameSymbol,
+    EditorFormatDocument,
+    EditorFormatSelection,
+    EditorCodeActions,
+    EditorSignatureHelp,
 
     CommandPalette,
     NewThread,
@@ -543,6 +548,11 @@ impl GlobalShortcut {
             Self::GitDiscardAllUntracked => "git_discard_all_untracked",
             Self::EditorReload => "editor_reload",
             Self::EditorOverwrite => "editor_overwrite",
+            Self::EditorRenameSymbol => "editor_rename_symbol",
+            Self::EditorFormatDocument => "editor_format_document",
+            Self::EditorFormatSelection => "editor_format_selection",
+            Self::EditorCodeActions => "editor_code_actions",
+            Self::EditorSignatureHelp => "editor_signature_help",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -746,6 +756,7 @@ pub struct CommandContext {
     pub can_reopen: bool,
     pub has_unread: bool,
     pub editor_commands: u8,
+    pub editor_feature_commands: u8,
     pub diff_presentation_commands: u16,
     pub diff_selection_commands: u8,
     pub diff_hunk_commands: u8,
@@ -926,6 +937,7 @@ impl ShortcutDescriptor {
         if let Some(bit) = diff_hunk_command_bit(self.action) {
             return context.diff_hunk_commands & bit != 0;
         }
+        if let Some(bit) = editor_feature_command_bit(self.action) { return context.editor_feature_commands & bit != 0; }
         if let Some(bit) = editor_language_command_bit(self.action) {
             return context.editor_language_commands & bit != 0;
         }
@@ -2188,6 +2200,11 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Terminal,
     },
+    ShortcutDescriptor { action: GlobalShortcut::EditorRenameSymbol, label: "Rename symbol", repeatable: false, scope: ShortcutScope::Editor },
+    ShortcutDescriptor { action: GlobalShortcut::EditorFormatDocument, label: "Format document", repeatable: false, scope: ShortcutScope::Editor },
+    ShortcutDescriptor { action: GlobalShortcut::EditorFormatSelection, label: "Format selection", repeatable: false, scope: ShortcutScope::Editor },
+    ShortcutDescriptor { action: GlobalShortcut::EditorCodeActions, label: "Show code actions", repeatable: false, scope: ShortcutScope::Editor },
+    ShortcutDescriptor { action: GlobalShortcut::EditorSignatureHelp, label: "Show signature help", repeatable: false, scope: ShortcutScope::Editor },
 
 ];
 
@@ -2375,6 +2392,11 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::GitDiscardAllUntracked => &shortcuts.git_discard_all_untracked,
         GlobalShortcut::EditorReload => &shortcuts.editor_reload,
         GlobalShortcut::EditorOverwrite => &shortcuts.editor_overwrite,
+        GlobalShortcut::EditorRenameSymbol => &shortcuts.editor_rename_symbol,
+        GlobalShortcut::EditorFormatDocument => &shortcuts.editor_format_document,
+        GlobalShortcut::EditorFormatSelection => &shortcuts.editor_format_selection,
+        GlobalShortcut::EditorCodeActions => &shortcuts.editor_code_actions,
+        GlobalShortcut::EditorSignatureHelp => &shortcuts.editor_signature_help,
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
@@ -2897,7 +2919,7 @@ fn global_shortcut_descriptor(
     shortcuts: &KeyboardShortcuts,
     focused: FocusedPane,
 ) -> Option<&'static ShortcutDescriptor> {
-    GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| {
+    let matches = |descriptor: &ShortcutDescriptor| {
         shortcut_applies(descriptor, focused, shortcuts)
             && !(focused.is_text_editing()
                 && !descriptor.scope.owns_editing_chord(focused)
@@ -2909,7 +2931,14 @@ fn global_shortcut_descriptor(
                         shortcut_matches(binding, key, physical_key, modifiers)
                     })
                 })
-    })
+
+    };
+    // Actual native code-buffer commands take precedence over shared F2 pane
+    // rename, even if the language controller must report unsupported.
+    if focused == FocusedPane::Editor
+        && let Some(descriptor) = GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| descriptor.scope.is_native_editor() && matches(descriptor))
+    { return Some(descriptor); }
+    GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| matches(descriptor))
 }
 
 pub const fn review_command_bit(command: GlobalShortcut) -> Option<u8> {
@@ -3146,6 +3175,18 @@ pub const fn browser_command_bit(command: GlobalShortcut) -> Option<u8> {
         GlobalShortcut::BrowserAddress => Some(1 << 4),
         GlobalShortcut::BrowserOpenSystem => Some(1 << 5),
         GlobalShortcut::BrowserImportLogins => Some(1 << 6),
+        _ => None,
+    }
+}
+
+pub const EDITOR_FEATURE_COMMANDS: [GlobalShortcut; 5] = [GlobalShortcut::EditorRenameSymbol, GlobalShortcut::EditorFormatDocument, GlobalShortcut::EditorFormatSelection, GlobalShortcut::EditorCodeActions, GlobalShortcut::EditorSignatureHelp];
+pub const fn editor_feature_command_bit(command: GlobalShortcut) -> Option<u8> {
+    match command {
+        GlobalShortcut::EditorRenameSymbol => Some(1 << 0),
+        GlobalShortcut::EditorFormatDocument => Some(1 << 1),
+        GlobalShortcut::EditorFormatSelection => Some(1 << 2),
+        GlobalShortcut::EditorCodeActions => Some(1 << 3),
+        GlobalShortcut::EditorSignatureHelp => Some(1 << 4),
         _ => None,
     }
 }
@@ -7919,6 +7960,24 @@ mod tests {
                 crate::settings::text_editing_shortcut_conflict_for("browser_reload", binding)
                     .is_some()
             );
+        }
+    }
+
+    #[test]
+    fn symbol_rename_owns_its_configured_chord_only_in_actual_code_buffers() {
+        let mut shortcuts = KeyboardShortcuts::default();
+        assert!(shortcuts.fault().is_none());
+        let event = keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::F2), modified_key: keyboard::Key::Named(keyboard::key::Named::F2), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F2), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(), text: None, repeat: false };
+        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Editor), Some(GlobalShortcut::EditorRenameSymbol));
+        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::RepositoryPane), Some(GlobalShortcut::RenamePane));
+        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Review), Some(GlobalShortcut::RenamePane));
+        let context = CommandContext { focused: FocusedPane::Editor, ..Default::default() };
+        assert!(!shortcut_descriptor(GlobalShortcut::EditorRenameSymbol).available(&context), "missing server capability hides the command without giving its native chord to pane rename");
+        shortcuts.editor_rename_symbol.clear();
+        assert!(shortcuts.fault().is_none());
+        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Editor), Some(GlobalShortcut::RenamePane));
+        for focused in [FocusedPane::Terminal, FocusedPane::TextInput, FocusedPane::Chat, FocusedPane::SidebarRows] {
+            assert_ne!(global_shortcut(&event, &KeyboardShortcuts::default(), focused), Some(GlobalShortcut::EditorRenameSymbol));
         }
     }
 

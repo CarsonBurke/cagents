@@ -1249,30 +1249,6 @@ impl Cagents {
             .enumerate()
             .map(|(index, id)| (id, index))
             .collect();
-        if let Some(card) = self.workspace.focused() {
-            if let Some(doc) = self.lsp_document(card) {
-                let mut caps = self.lsp.capabilities(doc);
-                if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source()) {
-                    caps.rename = false; caps.format_document = false; caps.format_selection = false; caps.code_actions = false;
-                }
-                for (available, label, action) in [
-                    (caps.rename, "Rename symbol", repository_widget::EditorLspAction::Rename),
-                    (caps.format_document, "Format document", repository_widget::EditorLspAction::Format { selection: false }),
-                    (caps.format_selection, "Format selection", repository_widget::EditorLspAction::Format { selection: true }),
-                    (caps.code_actions, "Code actions", repository_widget::EditorLspAction::CodeActions),
-                    (caps.signature_help, "Show signature help", repository_widget::EditorLspAction::Signature),
-                ] {
-                    if available { entries.push((label.into(), String::new(), Message::Repository(RepositoryAction::Language { card, action }))); }
-                }
-            }
-        }
-        if let Some(card) = self.workspace.focused()
-            && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_focus_target(card).is_some())
-        {
-            for (label, chord, forward) in [("Next diagnostic", "F8", true), ("Previous diagnostic", "Shift+F8", false)] {
-                entries.push((label.into(), chord.into(), Message::Repository(RepositoryAction::Language {card,action:repository_widget::EditorLspAction::Diagnostic(forward)})));
-            }
-        }
         entries.push((
             "Open settings.toml".into(),
             "Edit application configuration".into(),
@@ -1282,11 +1258,6 @@ impl Cagents {
             "Reveal settings.toml".into(),
             "Show configuration in file manager".into(),
             Message::OpenSettingsFile { reveal: true },
-        ));
-        entries.push((
-            "Resume conversation".into(),
-            "Search saved native chats".into(),
-            Message::ResumeConversation(resume_ui::Action::Open),
         ));
         if category.is_none_or(|category| category == '@') {
             for card in self.durable.cards.iter().filter(|card| {
@@ -1936,6 +1907,7 @@ impl Cagents {
             diff_presentation_commands: card.map_or(0, |card| self.diff_presentation_command_capabilities(card)),
             diff_selection_commands: card.map_or(0, |card| self.diff_selection_command_capabilities(card)),
             diff_hunk_commands: card.map_or(0, |card| self.diff_hunk_command_capabilities(card)),
+            editor_feature_commands: card.map_or(0, |card| self.editor_feature_command_capabilities(card)),
             editor_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_command_capabilities(), _ => 0 }),
             editor_surface_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_surface_command_capabilities(id), Some(CardRuntime::PullRequests(pane)) => pane.runtime.editor_surface_command_capabilities(id), _ => 0 }),
             editor_language_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) if self.lsp_document(id) == runtime.lsp_document() && self.lsp_document(id).and_then(|doc| self.lsp.document_version(doc)).is_some() => runtime.editor_language_command_capabilities(), _ => 0 }),
@@ -2190,7 +2162,33 @@ impl Cagents {
             .fold(0, |mask, bit| mask | bit)
     }
 
+    fn editor_feature_command_capabilities(&self, card: CardId) -> u8 {
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return 0; };
+        let Some(doc) = self.lsp_document(card).filter(|doc| runtime.lsp_document() == Some(*doc)) else { return 0; };
+        let capabilities = self.lsp.capabilities(doc);
+        if !capabilities.ready { return 0; }
+        workspace_widget::EDITOR_FEATURE_COMMANDS.into_iter().filter_map(|command| {
+            let supported = match command {
+                Command::EditorRenameSymbol => capabilities.rename,
+                Command::EditorFormatDocument => capabilities.format_document,
+                Command::EditorFormatSelection => capabilities.format_selection,
+                Command::EditorCodeActions => capabilities.code_actions,
+                Command::EditorSignatureHelp => capabilities.signature_help,
+                _ => false,
+            };
+            if !supported || runtime.registered_editor_feature_action(card, command).is_none() { return None; }
+            workspace_widget::editor_feature_command_bit(command)
+        }).fold(0, |mask, bit| mask | bit)
+    }
+
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if workspace_widget::editor_feature_command_bit(command).is_some() {
+            let action = self.workspace.focused().filter(|card| self.editor_feature_command_capabilities(*card) & workspace_widget::editor_feature_command_bit(command).unwrap() != 0).and_then(|card| match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime.registered_editor_feature_action(card, command), _ => None,
+            });
+            return action.map_or_else(Task::none, |action| self.update(Message::Repository(action)));
+        }
+
         if workspace_widget::chat_user_command_bit(command).is_some() {
             return self
                 .workspace
@@ -2644,6 +2642,11 @@ impl Cagents {
             | Command::GitDiscardAllUntracked
             | Command::EditorReload
             | Command::EditorOverwrite
+            | Command::EditorRenameSymbol
+            | Command::EditorFormatDocument
+            | Command::EditorFormatSelection
+            | Command::EditorCodeActions
+            | Command::EditorSignatureHelp
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -2992,6 +2995,11 @@ impl SettingsField {
             Self::ShortcutGitDiscardAllUntracked => Some(Command::GitDiscardAllUntracked),
             Self::ShortcutEditorReload => Some(Command::EditorReload),
             Self::ShortcutEditorOverwrite => Some(Command::EditorOverwrite),
+            Self::ShortcutEditorRenameSymbol => Some(Command::EditorRenameSymbol),
+            Self::ShortcutEditorFormatDocument => Some(Command::EditorFormatDocument),
+            Self::ShortcutEditorFormatSelection => Some(Command::EditorFormatSelection),
+            Self::ShortcutEditorCodeActions => Some(Command::EditorCodeActions),
+            Self::ShortcutEditorSignatureHelp => Some(Command::EditorSignatureHelp),
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
@@ -3370,6 +3378,11 @@ impl ShortcutDraft {
             (Command::EditorReload, self.editor_reload.as_str()),
             (Command::EditorOverwrite, self.editor_overwrite.as_str()),
             (Command::TerminalReview, self.terminal_review.as_str()),
+            (Command::EditorRenameSymbol, self.editor_rename_symbol.as_str()),
+            (Command::EditorFormatDocument, self.editor_format_document.as_str()),
+            (Command::EditorFormatSelection, self.editor_format_selection.as_str()),
+            (Command::EditorCodeActions, self.editor_code_actions.as_str()),
+            (Command::EditorSignatureHelp, self.editor_signature_help.as_str()),
         ]
     }
 }

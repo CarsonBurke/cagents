@@ -448,6 +448,11 @@ pub struct KeyboardShortcuts {
     pub git_discard_all_untracked: Vec<String>,
     pub editor_reload: Vec<String>,
     pub editor_overwrite: Vec<String>,
+    pub editor_rename_symbol: Vec<String>,
+    pub editor_format_document: Vec<String>,
+    pub editor_format_selection: Vec<String>,
+    pub editor_code_actions: Vec<String>,
+    pub editor_signature_help: Vec<String>,
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -664,6 +669,11 @@ impl Default for KeyboardShortcuts {
             git_discard_all_untracked: Vec::new(),
             editor_reload: Vec::new(),
             editor_overwrite: Vec::new(),
+            editor_rename_symbol: vec!["F2".into()],
+            editor_format_document: vec!["Shift+Alt+F".into()],
+            editor_format_selection: Vec::new(),
+            editor_code_actions: vec!["Ctrl+.".into()],
+            editor_signature_help: vec!["Ctrl+Shift+Space".into()],
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -696,7 +706,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 202] {
+    pub fn actions(&self) -> [&Vec<String>; 207] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -900,12 +910,17 @@ impl KeyboardShortcuts {
             &self.editor_reload,
             &self.editor_overwrite,
             &self.terminal_review,
+            &self.editor_rename_symbol,
+            &self.editor_format_document,
+            &self.editor_format_selection,
+            &self.editor_code_actions,
+            &self.editor_signature_help,
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 202] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 207] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -1109,6 +1124,11 @@ impl KeyboardShortcuts {
             &mut self.editor_reload,
             &mut self.editor_overwrite,
             &mut self.terminal_review,
+            &mut self.editor_rename_symbol,
+            &mut self.editor_format_document,
+            &mut self.editor_format_selection,
+            &mut self.editor_code_actions,
+            &mut self.editor_signature_help,
         ]
     }
 
@@ -1170,7 +1190,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 202] = [
+const SHORTCUT_ACTIONS: [&str; 207] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1373,6 +1393,11 @@ const SHORTCUT_ACTIONS: [&str; 202] = [
     "editor_reload",
     "editor_overwrite",
     "terminal_review",
+    "editor_rename_symbol",
+    "editor_format_document",
+    "editor_format_selection",
+    "editor_code_actions",
+    "editor_signature_help",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1507,6 +1532,7 @@ pub fn text_editing_shortcut_conflict(binding: ShortcutBinding) -> Option<&'stat
 /// Native code-buffer actions have a narrower scope than workspace actions.
 /// Ordinary text controls and shells keep their own editing commands.
 pub fn is_editor_command(action: &str) -> bool {
+    if matches!(action, "editor_rename_symbol" | "editor_format_document" | "editor_format_selection" | "editor_code_actions" | "editor_signature_help") { return true; }
     matches!(
         action,
         "editor_undo"
@@ -1580,6 +1606,8 @@ pub fn is_review_command(action: &str) -> bool {
 }
 
 pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBinding) -> bool {
+    // Code buffers own their configured symbol rename before generic pane rename.
+    if matches!((left, right), ("editor_rename_symbol", "rename_pane") | ("rename_pane", "editor_rename_symbol")) { return false; }
     if (matches!(left, "editor_undo" | "editor_redo") && is_review_command(right))
         || (matches!(right, "editor_undo" | "editor_redo") && is_review_command(left))
     {
@@ -2759,7 +2787,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 197] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 202] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2957,6 +2985,11 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 197] = [
     "editor_reload",
     "editor_overwrite",
     "terminal_review",
+    "editor_rename_symbol",
+    "editor_format_document",
+    "editor_format_selection",
+    "editor_code_actions",
+    "editor_signature_help",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -7361,6 +7394,19 @@ new_thread = "Alt+Shift+G"
             "reopen_pane",
             parse_shortcut("Ctrl+Shift+Z").unwrap()
         ));
+    }
+
+    #[test]
+    fn symbol_rename_defaults_migrate_without_unbinding_pane_rename() {
+        let mut raw = toml::Table::new();
+        raw.insert("rename_pane".into(), vec!["F2"].into());
+        preserve_introduced_shortcuts(&mut raw);
+        let shortcuts: KeyboardShortcuts = toml::Value::Table(raw).try_into().unwrap();
+        assert_eq!(shortcuts.rename_pane, ["F2"]);
+        assert_eq!(shortcuts.editor_rename_symbol, ["F2"]);
+        assert!(shortcuts.fault().is_none());
+        assert!(!shortcut_binding_conflicts("editor_rename_symbol", "rename_pane", parse_shortcut("F2").unwrap()));
+        assert!(shortcut_binding_conflicts("editor_code_actions", "rename_pane", parse_shortcut("F2").unwrap()), "only the deliberate symbol/pane rename precedence is shared");
     }
 
     #[test]

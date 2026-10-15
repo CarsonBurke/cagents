@@ -3122,6 +3122,11 @@ pub enum SettingsField {
     ShortcutGitDiscardAllUntracked,
     ShortcutEditorReload,
     ShortcutEditorOverwrite,
+    ShortcutEditorRenameSymbol,
+    ShortcutEditorFormatDocument,
+    ShortcutEditorFormatSelection,
+    ShortcutEditorCodeActions,
+    ShortcutEditorSignatureHelp,
     ShortcutTerminalReview,
 }
 
@@ -3214,7 +3219,7 @@ impl SettingsField {
     }
 
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 202] = [
+    const SHORTCUTS: [Self; 207] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3417,6 +3422,11 @@ impl SettingsField {
         Self::ShortcutEditorReload,
         Self::ShortcutEditorOverwrite,
         Self::ShortcutTerminalReview,
+        Self::ShortcutEditorRenameSymbol,
+        Self::ShortcutEditorFormatDocument,
+        Self::ShortcutEditorFormatSelection,
+        Self::ShortcutEditorCodeActions,
+        Self::ShortcutEditorSignatureHelp,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3637,6 +3647,11 @@ impl SettingsField {
             Self::ShortcutGitDiscardAllUntracked => "Delete all untracked files…",
             Self::ShortcutEditorReload => "Reload file from disk",
             Self::ShortcutEditorOverwrite => "Overwrite conflicting file on disk",
+            Self::ShortcutEditorRenameSymbol => "Rename symbol",
+            Self::ShortcutEditorFormatDocument => "Format document",
+            Self::ShortcutEditorFormatSelection => "Format selection",
+            Self::ShortcutEditorCodeActions => "Show code actions",
+            Self::ShortcutEditorSignatureHelp => "Show signature help",
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3910,6 +3925,11 @@ impl SettingsField {
             | Self::ShortcutGitDiscardAllUntracked
             | Self::ShortcutEditorReload
             | Self::ShortcutEditorOverwrite
+            | Self::ShortcutEditorRenameSymbol
+            | Self::ShortcutEditorFormatDocument
+            | Self::ShortcutEditorFormatSelection
+            | Self::ShortcutEditorCodeActions
+            | Self::ShortcutEditorSignatureHelp
             | Self::ShortcutTerminalReview
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
@@ -4139,6 +4159,11 @@ struct ShortcutDraft {
     git_discard_all_untracked: String,
     editor_reload: String,
     editor_overwrite: String,
+    editor_rename_symbol: String,
+    editor_format_document: String,
+    editor_format_selection: String,
+    editor_code_actions: String,
+    editor_signature_help: String,
 
     terminal_review: String,
     command_palette: String,
@@ -4357,6 +4382,11 @@ impl ShortcutDraft {
             git_discard_all_untracked: settings::format_chords(&shortcuts.git_discard_all_untracked),
             editor_reload: settings::format_chords(&shortcuts.editor_reload),
             editor_overwrite: settings::format_chords(&shortcuts.editor_overwrite),
+            editor_rename_symbol: settings::format_chords(&shortcuts.editor_rename_symbol),
+            editor_format_document: settings::format_chords(&shortcuts.editor_format_document),
+            editor_format_selection: settings::format_chords(&shortcuts.editor_format_selection),
+            editor_code_actions: settings::format_chords(&shortcuts.editor_code_actions),
+            editor_signature_help: settings::format_chords(&shortcuts.editor_signature_help),
 
             terminal_review: settings::format_chords(&shortcuts.terminal_review),
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -4923,6 +4953,11 @@ impl SettingsDraft {
             SettingsField::ShortcutGitDiscardAllUntracked => { self.keyboard_shortcuts.git_discard_all_untracked = value }
             SettingsField::ShortcutEditorReload => { self.keyboard_shortcuts.editor_reload = value }
             SettingsField::ShortcutEditorOverwrite => { self.keyboard_shortcuts.editor_overwrite = value }
+            SettingsField::ShortcutEditorRenameSymbol => self.keyboard_shortcuts.editor_rename_symbol = value,
+            SettingsField::ShortcutEditorFormatDocument => self.keyboard_shortcuts.editor_format_document = value,
+            SettingsField::ShortcutEditorFormatSelection => self.keyboard_shortcuts.editor_format_selection = value,
+            SettingsField::ShortcutEditorCodeActions => self.keyboard_shortcuts.editor_code_actions = value,
+            SettingsField::ShortcutEditorSignatureHelp => self.keyboard_shortcuts.editor_signature_help = value,
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -5932,6 +5967,11 @@ fn settings_update(
         SettingsField::ShortcutGitDiscardAllUntracked => { next.keyboard_shortcuts.git_discard_all_untracked = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutEditorReload => { next.keyboard_shortcuts.editor_reload = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutEditorOverwrite => { next.keyboard_shortcuts.editor_overwrite = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorRenameSymbol => { next.keyboard_shortcuts.editor_rename_symbol = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorFormatDocument => { next.keyboard_shortcuts.editor_format_document = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorFormatSelection => { next.keyboard_shortcuts.editor_format_selection = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorCodeActions => { next.keyboard_shortcuts.editor_code_actions = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutEditorSignatureHelp => { next.keyboard_shortcuts.editor_signature_help = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
