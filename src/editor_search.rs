@@ -119,7 +119,9 @@ enum ReplacementCase {
 }
 
 fn matched_case(matched: &str) -> ReplacementCase {
-    let mut letters = matched.chars().filter(|character| character.is_alphabetic());
+    let mut letters = matched
+        .chars()
+        .filter(|character| character.is_alphabetic());
     let Some(first) = letters.next() else {
         return ReplacementCase::Unchanged;
     };
@@ -226,9 +228,18 @@ impl<'a> Replacement<'a> {
                 // allocating an intermediate String for every match.
                 let case = matched_case(matched);
                 let replacement = match case {
-                    ReplacementCase::Upper => self.uppercase.get_or_init(|| convert_case(self.text, case)).as_str(),
-                    ReplacementCase::Lower => self.lowercase.get_or_init(|| convert_case(self.text, case)).as_str(),
-                    ReplacementCase::Title => self.titlecase.get_or_init(|| convert_case(self.text, case)).as_str(),
+                    ReplacementCase::Upper => self
+                        .uppercase
+                        .get_or_init(|| convert_case(self.text, case))
+                        .as_str(),
+                    ReplacementCase::Lower => self
+                        .lowercase
+                        .get_or_init(|| convert_case(self.text, case))
+                        .as_str(),
+                    ReplacementCase::Title => self
+                        .titlecase
+                        .get_or_init(|| convert_case(self.text, case))
+                        .as_str(),
                     ReplacementCase::Unchanged => self.text,
                 };
                 result.push_str(replacement);
@@ -328,21 +339,21 @@ mod tests {
 
     #[test]
     fn preserved_lowercase_keeps_contextual_sigma_and_reuses_each_variant() {
-        for (text,expected) in [("ΟΣ","ος"),("ΟΣ\u{301}","ος\u{301}")] {
-            assert_eq!(preserve_case("foo",text),expected);
-            let replacement=Replacement::new("foo",text,FindOptions::default(),true).unwrap();
-            let mut output=String::new();
-            replacement.append("foo foo",0,3,&mut output).unwrap();
-            let allocation=replacement.lowercase.get().unwrap().as_ptr();
+        for (text, expected) in [("ΟΣ", "ος"), ("ΟΣ\u{301}", "ος\u{301}")] {
+            assert_eq!(preserve_case("foo", text), expected);
+            let replacement = Replacement::new("foo", text, FindOptions::default(), true).unwrap();
+            let mut output = String::new();
+            replacement.append("foo foo", 0, 3, &mut output).unwrap();
+            let allocation = replacement.lowercase.get().unwrap().as_ptr();
             output.push(' ');
-            replacement.append("foo foo",4,7,&mut output).unwrap();
-            assert_eq!(output,format!("{expected} {expected}"));
-            assert_eq!(replacement.lowercase.get().unwrap().as_ptr(),allocation);
+            replacement.append("foo foo", 4, 7, &mut output).unwrap();
+            assert_eq!(output, format!("{expected} {expected}"));
+            assert_eq!(replacement.lowercase.get().unwrap().as_ptr(), allocation);
             assert!(replacement.uppercase.get().is_none());
             assert!(replacement.titlecase.get().is_none());
         }
-        assert_eq!(preserve_case("FOO","ος"),"ΟΣ");
-        assert_eq!(preserve_case("fOo","ΟΣ"),"ΟΣ");
+        assert_eq!(preserve_case("FOO", "ος"), "ΟΣ");
+        assert_eq!(preserve_case("fOo", "ΟΣ"), "ΟΣ");
     }
 
     #[test]
