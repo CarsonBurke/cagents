@@ -93,7 +93,9 @@ pub(super) fn capture(actor: &mut Actor, candidate: &Path) -> Result<DirectoryPr
     let process = owned_process(actor)?;
     let approved = actor.launch_context.as_ref().map(|context| context.directory_identity()).transpose()?.flatten();
     let proof = prove(&process, candidate, approved)?;
-    if approved.is_none() {
+    if let Some(context) = &actor.launch_context {
+        context.pin_owned_directory(proof.directory.clone())?;
+    } else {
         // A legacy actor may acquire a pin only from its positively identified
         // live cwd. This changes no issued recipe or operational path.
         actor.launch_context = Some(Arc::new(super::super::protocol::ExecutionContext::new(Some(proof.directory.clone()))));
