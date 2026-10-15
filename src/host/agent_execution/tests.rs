@@ -1,3 +1,5 @@
+mod owned_late_decision;
+
 use super::*;
 use crate::{
     agent::Provider,
@@ -2039,10 +2041,10 @@ fn a_late_between_turn_interrupt_ack_cannot_cancel_the_next_owned_run() {
 
 #[test]
 fn a_request_arriving_after_result_cannot_lend_its_interrupt_ack_to_the_next_owned_run() {
-    if isolated("a_request_arriving_after_result_cannot_lend_its_interrupt_ack_to_the_next_owned_run").is_some() {
-        return;
-    }
-    between_turn_interrupt_ack_fixture(true);
+    owned_late_decision::run(
+        "a_request_arriving_after_result_cannot_lend_its_interrupt_ack_to_the_next_owned_run",
+        || between_turn_interrupt_ack_fixture(true),
+    );
 }
 
 fn between_turn_interrupt_ack_fixture(request_after_result: bool) {
