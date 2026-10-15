@@ -71,7 +71,7 @@ impl GitTarget {
         if command == Command::GitOutput && source.git_output().is_some() {
             return Some(SidebarAction::ToggleGitOutput { key });
         }
-        if command == Command::GitAmend && !source.busy() && source.head_oid.is_some() {
+        if command == Command::GitAmend && source.can_toggle_amend(state.commit_draft.amend) {
             return Some(SidebarAction::AmendChanged { key, amend: !state.commit_draft.amend });
         }
         if !source.mutations_available() || source.busy() {
@@ -123,7 +123,8 @@ impl GitTarget {
                 });
             }
             Command::GitCommit
-                if !state.commit_draft.subject.trim().is_empty()
+                if (!state.commit_draft.amend || source.operation.is_none())
+                    && !state.commit_draft.subject.trim().is_empty()
                     && (source.staged_count > 0
                         || (state.commit_draft.amend && source.head_oid.is_some())
                         || source.operation.as_ref().is_some_and(|operation| {
@@ -237,6 +238,30 @@ mod tests {
             assert!(target.stash_action(&model, &state, command, &entry).is_none());
         }
         assert_eq!(target.stashes(&model, &state), &[entry], "stash inspection remains readable");
+    }
+
+    #[test]
+    fn amend_palette_recovers_checked_drafts_and_refuses_amend_commit_during_operations() {
+        for head_present in [false, true] {
+            for kind in [None, Some(crate::repository::GitOperationKind::Merge), Some(crate::repository::GitOperationKind::Rebase), Some(crate::repository::GitOperationKind::CherryPick), Some(crate::repository::GitOperationKind::Revert)] {
+                for checked in [false, true] {
+                    let mut model = super::super::tests::panel_model();
+                    let mut state = super::super::tests::panel_state(&model);
+                    state.apply(&SidebarAction::CommitMessageChanged { key: state.active_worktree().unwrap().clone(), message: "Retained draft".into() });
+                    state.apply(&SidebarAction::AmendChanged { key: state.active_worktree().unwrap().clone(), amend: checked });
+                    let source = model.source_control.as_mut().unwrap();
+                    source.groups.retain(|group| group.area != ChangeArea::Conflict);
+                    if !head_present { source.head_oid = None; }
+                    source.operation = kind.map(|kind| crate::repository::GitOperationState { kind, incoming_ref: None, message: None });
+                    let target = GitTarget::capture(&model, &state).unwrap();
+                    assert_eq!(target.available(&model, &state, Command::GitAmend), checked || (head_present && kind.is_none()));
+                    if checked && kind.is_some() { assert!(!target.available(&model, &state, Command::GitCommit)); }
+                    model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(Arc::from("Read-only Git host")));
+                    assert_eq!(target.available(&model, &state, Command::GitAmend), checked || (head_present && kind.is_none()), "draft-only toggle survives write refusal");
+                    assert!(!target.available(&model, &state, Command::GitCommit));
+                }
+            }
+        }
     }
 
     #[test]

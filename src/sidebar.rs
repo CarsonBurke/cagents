@@ -2902,6 +2902,13 @@ impl SourceControlModel {
         self.mutation.is_some()
     }
 
+    /// Amend changes a draft until submission. Turning it off remains possible
+    /// if HEAD disappears or an operation begins after it was enabled.
+    pub fn can_toggle_amend(&self, current_amend: bool) -> bool {
+        !self.busy() && !self.is_reloading()
+            && (current_amend || (self.head_oid.is_some() && self.operation.is_none()))
+    }
+
     /// A retained snapshot cannot accept new host commands until its read finishes.
     pub fn is_reloading(&self) -> bool {
         self.reloading
@@ -10958,6 +10965,7 @@ fn changes_footer<'a>(
     let can_commit = source.mutations_available() && !modal_open
         && !source.busy()
         && state.commit_draft.ready()
+        && (!state.commit_draft.amend || source.operation.is_none())
         && !state.commit_draft.subject.trim().is_empty()
         && (source.staged_count > 0
             || (state.commit_draft.amend && source.head_oid.is_some())
@@ -11115,7 +11123,7 @@ fn changes_footer<'a>(
         .text_size(design::TEXT_CAPTION)
         .spacing(6)
         .on_toggle_maybe(
-            (!modal_open && !source.busy() && source.head_oid.is_some()).then(|| {
+            (!modal_open && source.can_toggle_amend(state.commit_draft.amend)).then(|| {
                 let key = key.clone();
                 move |amend| SidebarAction::AmendChanged {
                     key: key.clone(),
@@ -21012,6 +21020,49 @@ pub(crate) mod tests {
         assert!(other.mutations_available(), "one worktree never lends its capability to another");
     }
 
+    fn click_amend_checkbox(state: &SidebarState, source: &SourceControlModel, modal_open: bool) -> Vec<SidebarAction> {
+        let renderer = headless_renderer();
+        // Pinned native checkboxes activate through pointer/touch, not Enter.
+        let mut footer = changes_footer(state, source, modal_open);
+        let mut tree = Tree::new(footer.as_widget());
+        let viewport = cosmic::iced::Rectangle::with_size(Size::new(380., 1200.));
+        let node = footer.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()));
+        let nodes = footer.as_widget().a11y_nodes(Layout::new(&node), &tree, cosmic::iced::mouse::Cursor::Unavailable);
+        let bounds = nodes.root().iter().chain(nodes.children())
+            .find(|node| node.node().label() == Some("Amend")).unwrap().node().bounds().unwrap();
+        let point = cosmic::iced::Point::new(((bounds.x0 + bounds.x1) / 2.) as f32, ((bounds.y0 + bounds.y1) / 2.) as f32);
+        let mut toggles = Vec::new();
+        footer.as_widget_mut().update(&mut tree,
+            &cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonPressed(cosmic::iced::mouse::Button::Left)),
+            Layout::new(&node), cosmic::iced::mouse::Cursor::Available(point), &renderer,
+            &mut cosmic::iced::advanced::clipboard::Null, &mut cosmic::iced::advanced::Shell::new(&mut toggles), &viewport);
+        toggles
+    }
+
+    #[test]
+    fn mounted_amend_recovers_checked_draft_after_head_or_operation_changes() {
+        for head_present in [false, true] {
+            for kind in [None, Some(crate::repository::GitOperationKind::Merge), Some(crate::repository::GitOperationKind::Rebase), Some(crate::repository::GitOperationKind::CherryPick), Some(crate::repository::GitOperationKind::Revert)] {
+                for checked in [false, true] {
+                    let mut model = panel_model();
+                    let mut state = panel_state(&model);
+                    state.apply(&SidebarAction::AmendChanged { key: main_key(), amend: checked });
+                    let source = model.source_control.as_mut().unwrap();
+                    if !head_present { source.head_oid = None; }
+                    source.operation = kind.map(|kind| crate::repository::GitOperationState { kind, incoming_ref: None, message: None });
+                    source.set_mutation_unavailable_reason(Some(Arc::from("Git writes unavailable; drafts remain editable.")));
+                    let expected = checked || (head_present && kind.is_none());
+                    let actions = click_amend_checkbox(&state, source, false);
+                    assert_eq!(actions.iter().any(|action| matches!(action, SidebarAction::AmendChanged { amend, .. } if *amend == !checked)), expected);
+                    assert!(click_amend_checkbox(&state, source, true).is_empty(), "modal owns activation");
+                    source.set_mutation(Some(MutationKind::Other));
+                    assert!(click_amend_checkbox(&state, source, false).is_empty(), "a running operation owns its draft");
+                }
+            }
+        }
+    }
+
     #[test]
     fn read_only_git_disables_mounted_mutations_but_preserves_navigation() {
         use crate::workspace_widget::GlobalShortcut as Command;
@@ -21045,21 +21096,7 @@ pub(crate) mod tests {
         let disabled = frame_enter_presses(&renderer, git_panel(&model, &state, 380., false));
         assert!(!disabled.iter().any(mutates), "mounted native mutation controls must not emit actions");
         assert!(disabled.iter().any(|action| matches!(action, SidebarAction::OpenChange { .. } | SidebarAction::RefreshWorktree { .. })), "read navigation remains mounted and usable");
-        // Pinned native checkboxes activate through pointer/touch, not Enter.
-        let mut footer = changes_footer(&state, source, false);
-        let mut tree = Tree::new(footer.as_widget());
-        let viewport = cosmic::iced::Rectangle::with_size(Size::new(380., 1200.));
-        let node = footer.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(Size::ZERO, viewport.size()));
-        let nodes = footer.as_widget().a11y_nodes(Layout::new(&node), &tree, cosmic::iced::mouse::Cursor::Unavailable);
-        let bounds = nodes.root().iter().chain(nodes.children())
-            .find(|node| node.node().label() == Some("Amend")).unwrap().node().bounds().unwrap();
-        let point = cosmic::iced::Point::new(((bounds.x0 + bounds.x1) / 2.) as f32, ((bounds.y0 + bounds.y1) / 2.) as f32);
-        let mut toggles = Vec::new();
-        footer.as_widget_mut().update(&mut tree,
-            &cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonPressed(cosmic::iced::mouse::Button::Left)),
-            Layout::new(&node), cosmic::iced::mouse::Cursor::Available(point), &renderer,
-            &mut cosmic::iced::advanced::clipboard::Null, &mut cosmic::iced::advanced::Shell::new(&mut toggles), &viewport);
+        let toggles = click_amend_checkbox(&state, source, false);
         assert!(toggles.iter().any(|action| matches!(action, SidebarAction::AmendChanged { .. })), "Amend draft toggle/HEAD read remains usable; committing it does not");
         let mut retained = SourceControlModel::ready(main_key(), &snapshot());
         retained.upstream = None;
