@@ -317,8 +317,8 @@ mod tests {
 
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         for query in ["", "Font"] {
-            let mut setting = field::<()>("Font", "", widget::Space::new().width(1).height(1).into())
-                .view(query);
+            let mut setting =
+                field::<()>("Font", "", widget::Space::new().width(1).height(1).into()).view(query);
             let mut tree = Tree::new(&setting);
             let node = setting.as_widget_mut().layout(
                 &mut tree,
@@ -330,7 +330,11 @@ mod tests {
             let mut group = group(
                 "Font",
                 "",
-                vec![field::<()>("Font", "", widget::Space::new().width(1).height(1).into())],
+                vec![field::<()>(
+                    "Font",
+                    "",
+                    widget::Space::new().width(1).height(1).into(),
+                )],
             )
             .view("Editor", query)
             .unwrap();
