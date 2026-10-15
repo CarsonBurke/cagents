@@ -98,6 +98,7 @@ pub(super) struct State {
 struct Entry {
     revision:u64,
     copy_all:bool,
+    copy_error:Option<String>,
     part:chat::cache::changes::Part,
     pages:std::collections::BTreeMap<usize,Arc<Manifest>>,
     requested:HashMap<usize,u64>,
@@ -122,7 +123,7 @@ static NEXT:AtomicU64=AtomicU64::new(1);
 fn attempt()->u64 {NEXT.fetch_add(1,Ordering::Relaxed)}
 impl Entry {
     fn new(part:chat::cache::changes::Part)->Self {
-        Self {revision:attempt(),copy_all:false,part,pages:Default::default(),requested:Default::default(),page_errors:Default::default(),
+        Self {revision:attempt(),copy_all:false,copy_error:None,part,pages:Default::default(),requested:Default::default(),page_errors:Default::default(),
             wanted_pages:Default::default(),opened:Default::default(),patches:Default::default(),restored:Default::default(),
             patch_requests:Default::default(),patch_errors:Default::default()}
     }
@@ -163,6 +164,11 @@ impl State {
     pub(super) fn clear(&mut self) {
         self.entries.clear();self.aliases.clear();self.raw=None;self.projected=None;
         self.revision=self.revision.wrapping_add(1);self.context=self.context.wrapping_add(1);
+    }
+    pub(super) fn reconcile_demand(&mut self,expanded:&HashSet<String>,find:bool) {
+        let mut changed=false;
+        for (key,entry) in &mut self.entries {let old=entry.revision;entry.demand(expanded.contains(&key.source_id),find);changed|=entry.revision!=old;}
+        if changed {self.revision=self.revision.wrapping_add(1);}
     }
     pub(super) fn revision(&self)->u64 {self.revision}
     pub(super) fn item_revision(&self,item:&str)->u64 {self.aliases.get(item).and_then(|key|self.entries.get(key)).map_or(0,|entry|entry.revision)}
@@ -291,11 +297,12 @@ impl State {
         entry.requested.remove(&offset);
         match result {
             Ok(page) if page.source==*key && page.epoch==entry.part.epoch=>{
+                if page.omitted_files>0 && entry.copy_all {entry.copy_all=false;entry.copy_error=Some("The original file list is incomplete. No partial copy was made.".into());}
                 if page.metadata.total_files==1 {entry.opened.insert(0);}
                 entry.pages.insert(offset,page);
             }
-            Ok(_)=>{entry.page_errors.insert(offset,"The file list changed. Reload its current contents.".into());}
-            Err(error)=>{entry.copy_all=false;entry.page_errors.insert(offset,error);}
+            Ok(_)=>{entry.copy_all=false;entry.copy_error=Some("The original file list changed. No partial copy was made.".into());entry.page_errors.insert(offset,"The file list changed. Reload its current contents.".into());}
+            Err(error)=>{if entry.copy_all {entry.copy_error=Some(error.clone());}entry.copy_all=false;entry.page_errors.insert(offset,error);}
         }
         entry.revision=attempt();self.revision=self.revision.wrapping_add(1);true
     }
@@ -308,6 +315,7 @@ impl State {
                 && entry.file(index).is_some_and(|(_,file)|*file==patch.file)=>{
                 let record=chat::source_owners::ResidentPatch {source:key.clone(),epoch:patch.manifest.epoch,file:patch.file.clone()};
                 if chat::source_owners::resident_patch(&patch.text).as_ref()!=Some(&record) {
+                    entry.copy_all=false;entry.copy_error=Some("The complete patch no longer holds its source lease. No partial copy was made.".into());
                     entry.patch_errors.insert(index,"The patch no longer holds its source lease. Retry loading it.".into());
                 } else {
                     entry.restored.remove(&index);
@@ -315,15 +323,15 @@ impl State {
                     entry.patches.insert(index,LoadedPatch {text:patch.text,record,view});
                 }
             }
-            Ok(_)=>{entry.patch_errors.insert(index,"The patch changed before it could be displayed. Retry loading it.".into());}
-            Err(error)=>{entry.copy_all=false;entry.patch_errors.insert(index,error);}
+            Ok(_)=>{entry.copy_all=false;entry.copy_error=Some("The original patch changed. No partial copy was made.".into());entry.patch_errors.insert(index,"The patch changed before it could be displayed. Retry loading it.".into());}
+            Err(error)=>{if entry.copy_all {entry.copy_error=Some(error.clone());}entry.copy_all=false;entry.patch_errors.insert(index,error);}
         }
         entry.revision=attempt();self.revision=self.revision.wrapping_add(1);true
     }
     pub(super) fn request_copy_all(&mut self,item:&str)->bool {
         let Some(key)=self.aliases.get(item) else {return false;};let Some(entry)=self.entries.get_mut(key) else {return false;};
         if entry.part.metadata.unavailable.is_some() || entry.pages.values().any(|page|page.omitted_files>0) {return false;}
-        entry.copy_all=true;entry.demand(true,false);entry.revision=attempt();true
+        entry.copy_error=None;entry.copy_all=true;entry.demand(true,false);entry.revision=attempt();true
     }
     pub(super) fn take_copy_all(&mut self)->Option<(String,Vec<Arc<str>>)> {
         for (key,entry) in &mut self.entries {
@@ -362,6 +370,7 @@ pub(super) fn detail(runtime:&Runtime,item:&str)->Option<Element<'static,Message
     }
     rows.push(widget::button::text(if entry.copy_all {"Loading all patches for copy…"} else {"Copy all patches"})
         .on_press_maybe((!entry.copy_all && entry.part.metadata.unavailable.is_none() && entry.pages.values().all(|page|page.omitted_files==0)).then(||action(Action::CopyAllChangePatches(target,item.into())))).into());
+    if let Some(error)=&entry.copy_error {rows.push(design::caption(error.clone()).into());}
     if entry.pages.is_empty() && entry.page_errors.is_empty() {rows.push(design::caption("Loading original file list…").into());}
     for error in entry.page_errors.values() {
         rows.push(widget::row::with_children(vec![design::caption(error.clone()).width(Length::Fill).into(),
@@ -438,9 +447,7 @@ pub(super) fn complete_copy(runtime:&mut Runtime,item:&str,epoch:chat::cache::So
         Ok(ready)=>if let Some(output)=ready.0.lock().unwrap_or_else(|error|error.into_inner()).take() {
             runtime.copied=Some((item.into(),Instant::now()));
             let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());
-            for (key,entry) in &mut runtime.logical_changes.entries {
-                entry.demand(runtime.expanded.contains(&key.source_id),find);
-            }
+            runtime.logical_changes.reconcile_demand(&runtime.expanded,find);
             return iced::clipboard::write(output.text).map(cosmic::Action::App);
         },
         Err(error)=>if let Some(key)=runtime.logical_changes.aliases.get(item)
@@ -528,7 +535,10 @@ pub(super) fn manifest_ready(runtime:&mut Runtime,key:&chat::cache::SourceKey,of
     if runtime.visible.load(Ordering::Relaxed) && runtime.logical_changes.complete_manifest(key,offset,attempt,result) {runtime.refresh();runtime.refresh_find();}
 }
 pub(super) fn patch_ready(runtime:&mut Runtime,key:&chat::cache::SourceKey,index:usize,attempt:u64,result:Result<PatchReady,String>) {
-    if runtime.visible.load(Ordering::Relaxed) && runtime.logical_changes.complete_patch(key,index,attempt,result) {runtime.refresh_find();}
+    if runtime.visible.load(Ordering::Relaxed) && runtime.logical_changes.complete_patch(key,index,attempt,result) {
+        runtime.logical_changes.reconcile_demand(&runtime.expanded,runtime.find.as_ref().is_some_and(|query|!query.is_empty()));
+        runtime.refresh_find();
+    }
 }
 
 #[cfg(test)]
