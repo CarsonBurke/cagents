@@ -102,7 +102,7 @@ impl Prepared {
                 || !runtime
                     .git_read_source()
                     .is_some_and(|source| {
-                        source.authority().path() == self.descriptor.worktree.as_path()
+                        source.authority().path() == runtime.descriptor.worktree.as_path()
                             && receipt.matches_source(source)
                     })
             {
@@ -347,7 +347,10 @@ impl RepositoryRuntime {
         (buffer_revert
             || model.git_read_receipt().is_some_and(|receipt| {
                 self.git_read_source()
-                    .is_some_and(|source| receipt.matches_source(source))
+                    .is_some_and(|source| {
+                        source.authority().path() == self.descriptor.worktree.as_path()
+                            && receipt.matches_source(source)
+                    })
             }))
             && !model.is_empty()
             && (kind == git_patch::Kind::Unstage) == model.source_head.is_some()
