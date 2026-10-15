@@ -82,9 +82,12 @@ mod tests {
     }
     #[test]
     fn a_different_source_or_missing_actual_lease_refuses_before_any_effect() {
-        let (directory, _runtime, source, placement, protection) = fixture();
+        let (directory, runtime, source, placement, protection) = fixture();
         assert!(FilesystemRecoveryContext::new(&source, Arc::new(None), placement.clone()).is_err());
         let other = directory.path().join("other"); std::fs::create_dir(&other).unwrap(); let other = Root::open(&other).unwrap();
+        let foreign_lease = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), other.path(), false).unwrap()));
+        let error = FilesystemRecoveryContext::new(&source, foreign_lease, placement.clone()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "matching source placement must still reject a different source's actual cleanup lease");
         assert!(FilesystemRecoveryContext::new(&other, protection, placement).is_err());
         assert!(std::fs::read_dir(source.path()).unwrap().next().is_none());
         assert!(std::fs::read_dir(other.path()).unwrap().next().is_none());
