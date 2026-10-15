@@ -20,6 +20,7 @@ impl State {
 pub(in crate::app) enum Intent {
     Navigate,
     Terminal(TerminalSession),
+    TerminalWithLifecycle { session: TerminalSession, committed: Box<Message>, rejected: Box<Message> },
     NewTerminal(PathBuf),
     NewNativeThread,
     Chat { session: chat::Session, beside: Option<CardId>, ephemeral: bool },
@@ -130,8 +131,7 @@ impl Cagents {
         let Some((requested,epoch,roots,intent,result)) = receipt.0.lock().unwrap().take() else { return Task::none(); };
         if generation != self.worktree_selection.generation || !self.worktree_selection.pending {
             // Dropping an obsolete receipt releases its unexposed lease.
-            self.abandon_worktree_selection(intent);
-            return Task::none();
+            return self.abandon_worktree_selection(intent);
         }
         self.worktree_selection.pending = false;
         self.refresh_worktree_owners(Some(&requested));
@@ -141,14 +141,13 @@ impl Cagents {
         let prepared = match result {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.abandon_worktree_selection(intent);
+                let rejected = self.abandon_worktree_selection(intent);
                 self.status = Some(TransientNotice::warning(format!("Cannot open this worktree yet: {error}")));
-                return Task::none();
+                return rejected;
             }
         };
         if self.refuse_in_deleting_worktree(&prepared.path) {
-            self.abandon_worktree_selection(intent);
-            return Task::none();
+            return self.abandon_worktree_selection(intent);
         }
         self.worktree_protections.install_prepared(prepared.guard);
         self.worktree_protection_sync.invalidate();
@@ -166,14 +165,28 @@ impl Cagents {
         Task::batch([initialize,self.ensure_default_pane()])
     }
 
-    fn abandon_worktree_selection(&mut self, intent: Intent) {
-        if let Intent::Delete(target) = intent { self.cancel_prepared_worktree_deletion(target); }
+    fn abandon_worktree_selection(&mut self, intent: Intent) -> Task<Message> {
+        match intent {
+            Intent::Delete(target) => {self.cancel_prepared_worktree_deletion(target); Task::none()},
+            Intent::TerminalWithLifecycle {rejected,..} => self.update(*rejected),
+            _ => Task::none(),
+        }
     }
 
     fn finish_worktree_selection(&mut self, intent: Intent) -> Task<Message> {
         match intent {
             Intent::Navigate => Task::none(),
             Intent::Terminal(session) => self.insert_terminal_card(session,None),
+            Intent::TerminalWithLifecycle {session,committed,rejected} => {
+                if self.refuse_in_deleting_worktree(&session.launch.working_directory) {
+                    return self.update(*rejected);
+                }
+                let insert = self.insert_terminal_card(session,None);
+                // The scope lease and inserted card are installed before the
+                // caller can release its preparation path/guard or row.
+                let settled = self.update(*committed);
+                Task::batch([insert,settled])
+            }
             Intent::NewTerminal(path) => self.add_terminal(path),
             Intent::NewNativeThread => self.new_native_thread(),
             Intent::Chat {session,beside,ephemeral} => self.insert_chat_card_with_lifetime(session,beside,ephemeral,None),
@@ -296,6 +309,27 @@ mod tests {
     }
 
     #[test]
+    fn terminal_commit_callback_runs_after_card_insertion() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.worktree_selection.cancel();
+        app.worktree_selection.pending = true;
+        let generation = app.worktree_selection.generation;
+        let card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(session) = card.kind else {unreachable!()};
+        let intent = Intent::TerminalWithLifecycle {session,
+            committed:Box::new(Message::Sidebar(SidebarAction::OpenSettings)),
+            rejected:Box::new(Message::SettingsSearchChanged("rejected".into()))};
+        let task = app.prepare_worktree_selection(generation,"/repo".into(),false,intent,
+            app.worktree_owner_paths.watch.epoch(), |path|Ok((path,Vec::new(),None)));
+        let Message::WorktreeSelectionPrepared {generation,create,receipt} = crate::app::tests::task_app_message(task) else {panic!("unexpected selection reply")};
+        drop(app.worktree_selection_prepared(generation,create,receipt));
+        assert!(app.durable.cards.iter().any(|card|matches!(card.kind,CardKind::Terminal(_))));
+        assert!(matches!(app.workspace.focused().and_then(|id|app.card_state(id)).map(|card|&card.kind),Some(CardKind::Settings)),
+            "terminal insertion after the callback would steal its settings focus");
+        assert_ne!(app.settings_search,"rejected");
+    }
+
+    #[test]
     fn failed_preparation_performs_no_dependent_mutation() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.select_worktree("/old".into(),false));
@@ -305,9 +339,16 @@ mod tests {
         app.worktree_selection.pending = true;
         let card = crate::app::tests::terminal_card_state();
         let CardKind::Terminal(session) = card.kind else {unreachable!()};
-        let task = app.prepare_worktree_selection(generation,"/unavailable".into(),false,Intent::Terminal(session),app.worktree_owner_paths.watch.epoch(), |_| Err("lease unavailable".into()));
+        let intent = Intent::TerminalWithLifecycle {session,
+            committed:Box::new(Message::SettingsSearchChanged("committed".into())),
+            rejected:Box::new(Message::SettingsSearchChanged("rejected".into()))};
+        let task = app.prepare_worktree_selection(generation,"/unavailable".into(),false,intent,app.worktree_owner_paths.watch.epoch(), |_| Err("lease unavailable".into()));
         let Message::WorktreeSelectionPrepared {generation,create,receipt} = crate::app::tests::task_app_message(task) else {panic!("unexpected selection reply")};
+        drop(app.worktree_selection_prepared(generation,create,receipt.clone()));
+        assert_eq!(app.settings_search,"rejected");
+        app.settings_search = "already settled".into();
         drop(app.worktree_selection_prepared(generation,create,receipt));
+        assert_eq!(app.settings_search,"already settled","receipt replay repeated lifecycle callback");
         assert_eq!(app.active_workspace.as_deref(),Some(Path::new("/old")));
         assert_eq!(app.durable.cards.len(),before);
         assert!(app.status.as_ref().unwrap().message.contains("lease unavailable"));
