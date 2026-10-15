@@ -19,6 +19,10 @@ pub(super) struct Job {
 }
 impl Drop for Job { fn drop(&mut self) { self.cancellation.cancel(); } }
 impl RepositoryRuntime {
+    #[cfg(test)]
+    pub(super) fn disk_comparison_request_for_test(&self) -> Option<uuid::Uuid> {
+        self.disk_comparison_job.as_ref().map(|job| job.request)
+    }
     /// Exact current external observation, independent of button availability.
     /// Ordinary captured command targets include this value, so a queued Reload,
     /// Compare or Keep mine cannot silently adopt a newer disk observation.
@@ -107,10 +111,20 @@ impl RepositoryRuntime {
         if cancelled || current != completed { return self.compare_disk(identity.card); }
         self.disk_comparison_applied = model.is_some().then_some(current);
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
-        self.disk_comparison = Some(DiffState::ready(match model {
+        let mut state = DiffState::ready(match model {
             Some(model) => RenderedDiff::Text { model: Arc::new(model), old_label: "Disk".into(), new_label: "Unsaved buffer".into() },
             None => RenderedDiff::Error("Could not compare the buffer and disk. Your edits have been kept.".into()),
-        }));
+        });
+        if let DiffState::Ready(content, layout) = &mut state {
+            // Preserve the mounted disk-comparison surface's full context and
+            // native typography while the owned CPU job controls completion.
+            if let RenderedDiff::Text { model, .. } = content {
+                layout.set_folding(model, false);
+            }
+            let typography = self.diff_typography();
+            layout.set_row_heights(typography.line_height, typography.fold_height());
+        }
+        self.disk_comparison = Some(state);
         Task::none()
     }
 }

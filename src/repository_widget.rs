@@ -18487,6 +18487,7 @@ mod tests {
                 Some(DiffState::Loading { .. })
             ));
             drop(runtime.update(RepositoryAction::DiskComparisonLoaded {
+                request: runtime.disk_comparison_request_for_test().expect("actual owned comparison request"),
                 identity,
                 revision,
                 disk_hash,
@@ -18648,6 +18649,7 @@ mod tests {
         });
         drop(runtime.update(RepositoryAction::CompareDisk { card }));
         drop(runtime.update(RepositoryAction::DiskComparisonLoaded {
+                request: runtime.disk_comparison_request_for_test().expect("actual owned comparison request"),
             identity,
             revision,
             disk_hash,
