@@ -108,8 +108,10 @@ impl Content {
 
         #[cfg(test)]
         { self.parsed_bytes += input.len(); }
-        // Pop the last item
-        let _ = self.items.pop();
+        // Retain only enough prior parser state to prove a rendered styled
+        // prefix after reparsing. Raw-source append alone is insufficient.
+        let previous_index = self.items.len().saturating_sub(1);
+        let previous = self.items.pop();
 
         // Re-parse last item and new text
         for (item, source, broken_links) in parse_with(&mut self.state, input) {
@@ -169,6 +171,13 @@ impl Content {
 
                 !section.broken_links.is_empty()
             });
+        }
+        if let (Some(previous), Some(current)) = (previous.as_ref(), self.items.get_mut(previous_index)) {
+            match (previous, current) {
+                (Item::Paragraph(previous), Item::Paragraph(current)) => current.record_prefix(previous),
+                (Item::Heading(old_level, previous), Item::Heading(level, current)) if old_level == level => current.record_prefix(previous),
+                _ => {},
+            }
         }
     }
 
@@ -297,6 +306,11 @@ pub struct Text {
     plain: std::cell::OnceCell<Arc<str>>,
     last_style: Cell<Option<Style>>,
     last_styled_spans: RefCell<Arc<[text::Span<'static, Uri>]>>,
+    lineage: Arc<std::sync::Mutex<StyledLineage>>,
+}
+#[derive(Debug, Default)]
+struct StyledLineage {
+    edges: std::collections::VecDeque<(std::sync::Weak<Vec<Span>>, std::sync::Weak<Vec<Span>>)>,
 }
 
 impl Text {
@@ -310,6 +324,7 @@ impl Text {
             plain: std::cell::OnceCell::new(),
             last_style: Cell::default(),
             last_styled_spans: RefCell::default(),
+            lineage: Default::default(),
         }
     }
 
@@ -318,6 +333,7 @@ impl Text {
             link: None, strong: false, emphasis: false, code: false }] if text == source)
     }
     fn append_plain(&mut self, suffix: &str) {
+        let previous = Arc::downgrade(&self.spans);
         let [Span::Standard { text, .. }] = Arc::make_mut(&mut self.spans).as_mut_slice() else { unreachable!("plain append requires one plain span") };
         text.push_str(suffix);
         let length = self.starts.last().copied().unwrap_or_default() + suffix.len();
@@ -325,6 +341,37 @@ impl Text {
         self.plain.take();
         self.last_style.set(None);
         *self.last_styled_spans.get_mut() = Arc::from([]);
+        self.record_edge(previous);
+    }
+
+    fn record_edge(&mut self, previous: std::sync::Weak<Vec<Span>>) {
+        let mut lineage = self.lineage.lock().unwrap_or_else(|poison| poison.into_inner());
+        if lineage.edges.len() == 256 { lineage.edges.pop_front(); }
+        lineage.edges.push_back((previous, Arc::downgrade(&self.spans)));
+    }
+    fn record_prefix(&mut self, previous: &Text) {
+        if self.spans.len() < previous.spans.len() { return; }
+        if !previous.spans.iter().zip(self.spans.iter()).enumerate().all(|(index, (old, new))|
+            old.prefix_of(new, index + 1 == previous.spans.len())) { return; }
+        self.lineage = previous.lineage.clone();
+        self.record_edge(Arc::downgrade(&previous.spans));
+    }
+    /// Bounded, lineage-only proof for a previously rendered styled prefix.
+    /// This never scans text or materializes plain/styled spans. Reparsing
+    /// records exact conservative proofs before publication; rewrites and
+    /// Markdown reinterpretation establish a new lineage instead.
+    pub fn append_proven(&self, previous: &Text) -> bool {
+        if Arc::ptr_eq(&self.spans, &previous.spans) { return true; }
+        if !Arc::ptr_eq(&self.lineage, &previous.lineage) { return false; }
+        let mut cursor = Arc::downgrade(&previous.spans);
+        let target = Arc::downgrade(&self.spans);
+        let lineage = self.lineage.lock().unwrap_or_else(|poison| poison.into_inner());
+        for (old, next) in &lineage.edges {
+            if !old.ptr_eq(&cursor) { continue; }
+            if next.ptr_eq(&target) { return true; }
+            cursor = next.clone();
+        }
+        false
     }
 
     /// Logical text without constructing styled presentation spans. Shared by
@@ -375,6 +422,11 @@ enum Span {
 }
 
 impl Span {
+    fn prefix_of(&self, new: &Self, last: bool) -> bool {
+        let Self::Standard { text: old, strikethrough: a, link: b, strong: c, emphasis: d, code: e } = self;
+        let Self::Standard { text: new, strikethrough: f, link: g, strong: h, emphasis: i, code: j } = new;
+        (a,b,c,d,e) == (f,g,h,i,j) && if last { new.starts_with(old) } else { new == old }
+    }
     fn text(&self) -> &str { match self { Self::Standard { text, .. } => text } }
     fn view(&self, style: &Style) -> text::Span<'static, Uri> {
         self.view_part(style, 0..self.text().len())
@@ -983,6 +1035,48 @@ mod tests {
         let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
         text.spans(style).iter().map(|span| span.text.as_ref()).collect::<String>()
     });
+
+    fn paragraph_text(content: &Content) -> Text {
+        match content.items() { [Item::Paragraph(text)] => text.clone(), other => panic!("expected paragraph: {other:?}") }
+    }
+
+    #[test]
+    fn styled_append_lineage_accepts_coalesced_prefixes_and_releases_old_bodies() {
+        let mut content = Content::parse(&"words ".repeat(1000));
+        let first = paragraph_text(&content);
+        content.push_str("more words");
+        let middle = paragraph_text(&content);
+        let released = Arc::downgrade(&middle.spans);
+        content.push_str(" still more");
+        let latest = paragraph_text(&content);
+        assert!(latest.append_proven(&first));
+        assert!(latest.append_proven(&middle));
+        drop(middle);
+        assert!(released.upgrade().is_none(), "proof edges must not own source bodies");
+        let mut styled = Content::parse("word **bold** tail");
+        let previous = paragraph_text(&styled);
+        styled.push_str(" continuing");
+        assert!(paragraph_text(&styled).append_proven(&previous),
+            "unchanged emphasis/link/style prefix may complete progressively");
+    }
+
+    #[test]
+    fn styled_append_lineage_rejects_reinterpretation_rewrites_and_expired_proofs() {
+        let mut content = Content::parse("word **bold");
+        let previous = paragraph_text(&content);
+        content.push_str("**");
+        assert!(!paragraph_text(&content).append_proven(&previous),
+            "raw append that changes emphasis is not a rendered prefix");
+        let previous = paragraph_text(&Content::parse("[label](https://old.example) tail"));
+        let changed = paragraph_text(&Content::parse("[label](https://new.example) tail"));
+        assert!(!changed.append_proven(&previous));
+        let mut content = Content::parse("plain words");
+        let first = paragraph_text(&content);
+        for _ in 0..300 { content.push_str(" more"); }
+        let latest = paragraph_text(&content);
+        assert!(!latest.append_proven(&first), "expired proof requires worker-side exact fallback");
+        assert!(latest.lineage.lock().unwrap().edges.len() <= 256);
+    }
 
     const CASES: &[&str] = &[
         "# Heading\n\nA **bold** and *italic* [link](https://example.com), `inline code`, ~~strike~~.\n",
