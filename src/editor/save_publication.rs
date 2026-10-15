@@ -750,6 +750,36 @@ mod tests {
     }
 
     #[test]
+    fn refused_payload_enrollment_preserves_source_and_live_empty_holding() {
+        use std::sync::Arc;
+        let source_directory = tempfile::tempdir().unwrap();
+        let root = Root::open(source_directory.path()).unwrap();
+        fs::write(root.path().join("file"), b"original").unwrap();
+        let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
+        let fixture = fixture_context(&root);
+        let runtime = tempfile::tempdir().unwrap();
+        let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), root.path(), false).unwrap()));
+        let source_root = Arc::new(root.try_clone().unwrap());
+        let placement = fs_safety::RecoveryPlacement::acquire(
+            Arc::new(fixture.placement().directory().try_clone().unwrap()), source_root.clone(), Arc::from([source_root]),
+            fs_safety::RecoveryRegistryCheck::new(Arc::new(|| Ok(())), 0),
+        ).unwrap();
+        // Callback-only placement explicitly has no owned enrollment authority.
+        let context = FilesystemRecoveryContext::new(&root, protection, placement).unwrap();
+        let error = match Holding::create(&root, &source, &context) { Ok(_) => panic!("missing enrollment must refuse"), Err(error) => error };
+        assert!(error.to_string().contains("owned registration/adoption lease"));
+        let authority = error.recovery_authority().unwrap().clone();
+        let holding = fs::read_dir(context.placement().directory().path()).unwrap().next().unwrap().unwrap().path();
+        assert!(fs::read_dir(&holding).unwrap().next().is_none(), "no payload may precede enrollment");
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"original");
+        drop(error); drop(context);
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert!(!holding.exists());
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"original");
+    }
+
+    #[test]
     fn save_acquisition_before_publish_edit_preserves_external_bytes_even_on_forced_save() {
         for overwrite in [false, true] {
             let (dir, root) = fixture();
