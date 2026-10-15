@@ -47,7 +47,7 @@ pub(super) fn registry(host: &SharedHost) -> Result<SharedRegistry, String> {
 /// skip its retirement preflight or claim a managed provider was retired.
 pub(super) fn retirement_registry(host: &SharedHost) -> Result<Option<SharedRegistry>, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if state.model.is_some() && state.execution_registry.is_none() {
+    if state.has_installed_model() && state.execution_registry.is_none() {
         return Err("The managed execution registry is unavailable; recover its store before closing the original provider".into());
     }
     Ok(state.execution_registry.clone())

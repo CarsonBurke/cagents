@@ -454,6 +454,11 @@ impl HostState {
         self.model = Some(registry);
     }
 
+    /// Resident admission state only; this never opens or probes a store.
+    pub(super) fn has_installed_model(&self) -> bool {
+        self.model.is_some()
+    }
+
     /// In-memory publication of the exact durable observer registration. The
     /// caller installs this under the same HostLock as the matching Record.
     pub(super) fn publish_chat_observer(&mut self,id:TerminalId,instance:uuid::Uuid,stamp:uuid::Uuid) {
