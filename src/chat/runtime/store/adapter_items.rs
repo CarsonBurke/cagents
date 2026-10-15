@@ -40,8 +40,9 @@ impl Store {
         if key.agent_id.is_some() {
             return self.child_adapter_item(key);
         }
-        let record=self.db.query_row("SELECT CASE WHEN length(metadata)<=?2 THEN metadata ELSE NULL END,len0,len1,len2,CASE WHEN length(spans)<=?2 THEN spans ELSE NULL END FROM items WHERE id=?1",params![key.item_id,METADATA_LIMIT],|row|Ok((row.get::<_,Option<Vec<u8>>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Option<Vec<u8>>>(4)?))).optional().map_err(|error|error.to_string())?;
-        let Some((metadata,len0,len1,len2,spans))=record else {return Ok(None);};
+        let record=self.db.query_row("SELECT CASE WHEN length(metadata)<=?2 THEN metadata ELSE NULL END,len0,len1,len2,CASE WHEN length(spans)<=?2 THEN spans ELSE NULL END,source_shortened FROM items WHERE id=?1",params![key.item_id,METADATA_LIMIT],|row|Ok((row.get::<_,Option<Vec<u8>>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Option<Vec<u8>>>(4)?,row.get::<_,bool>(5)?))).optional().map_err(|error|error.to_string())?;
+        let Some((metadata,len0,len1,len2,spans,shortened))=record else {return Ok(None);};
+        if shortened {return Err("Original tool identity was shortened for presentation; refusing to promote it as complete source".into());}
         let metadata=metadata.ok_or("Original tool metadata exceeds its canonical limit")?;
         let spans=spans.ok_or("Original tool patch metadata exceeds its canonical limit")?;
         let lengths=[len0,len1,len2].map(usize::try_from);
@@ -189,6 +190,18 @@ mod tests {
             let item=reader(&store).read(&CanonicalItemKey::new(parent,"shared")).unwrap().unwrap();
             assert!(matches!(item.content,ItemContent::Changes {status:crate::chat::ToolStatus::Succeeded,changes} if changes.len()==1 && changes[0].path.ends_with(path) && changes[0].diff.len()>3*1024*1024));
         }
+    }
+
+    #[test]
+    fn presentation_shortening_is_not_promoted_to_complete_canonical_tool_identity() {
+        let store=Arc::new(Mutex::new(Store::new().unwrap()));
+        let item=Item {id:"shortened".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"n".repeat(METADATA_LIMIT+1),input:"original body".into(),output:String::new(),status:crate::chat::ToolStatus::Running}};
+        let warnings=store.lock().unwrap().apply(Event::Item(item)).unwrap();
+        assert!(warnings.iter().any(|event|matches!(event,Event::Error{fatal:false,..})));
+        assert!(reader(&store).read(&CanonicalItemKey::new(None,"shortened")).is_err());
+        // A later sparse result cannot silently clear the provenance fence.
+        store.lock().unwrap().apply(Event::Item(Item {id:"shortened".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:String::new(),input:String::new(),output:"done".into(),status:crate::chat::ToolStatus::Succeeded}})).unwrap();
+        assert!(reader(&store).read(&CanonicalItemKey::new(None,"shortened")).is_err());
     }
 
     #[test]
