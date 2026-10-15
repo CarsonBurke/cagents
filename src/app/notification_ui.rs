@@ -631,7 +631,7 @@ impl Cagents {
             crate::agent_execution::HostedSession::Chat(session) => session.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete),
             crate::agent_execution::HostedSession::Terminal(session) => session.continuity.live_proof().is_some_and(|proof| proof.is_complete()),
         };
-        if !proven || agent.spec.target.placement.as_ref().is_some_and(|placement| placement != &agent.placement) { return None; }
+        if !proven { return None; }
         match &agent.placement {
             Placement::Channel(id) => {
                 let shared = self.workspace_model.channel(*id)?;
@@ -1164,6 +1164,28 @@ mod tests {
         assert!(app.chat_start_pending(card), "existing native descriptor is attached, never synthesized");
         assert!(matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(actual) if actual == &session));
         assert_eq!(app.durable.cards.len(), 1);
+    }
+
+    #[test]
+    fn scheduled_attention_activation_uses_authenticated_current_placement_after_a_move() {
+        let (mut app, mut agent) = scheduled_attention_fixture();
+        let original = agent.spec.target.placement.clone();
+        let destination = ChannelId::new();
+        let mut local = app.durable.channels[0].clone();
+        local.id = destination;
+        local.title = "Moved destination".into();
+        Arc::make_mut(&mut app.durable).channels.push(local);
+        let mut shared = app.workspace_model.channels[0].clone();
+        shared.id = destination;
+        app.workspace_model.channels.push(shared);
+        agent.placement = crate::agent_execution::Placement::Channel(destination);
+        let session = activation_session(&agent).unwrap().id();
+        app.workspace_model.agents.push(agent.clone());
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert_eq!(agent.spec.target.placement, original, "accepted launch request remains immutable");
+        assert_eq!(app.durable.active_channel, Some(destination));
+        assert_eq!(app.workspace.focused(), Some(CardId::from_uuid(agent.id.as_uuid())));
+        assert!(app.durable.channels[0].cards.is_empty());
     }
 
     #[test]
