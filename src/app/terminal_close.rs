@@ -62,7 +62,7 @@ pub enum CompletedCloseOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct QueuedCardClose {
+pub struct QueuedCardClose {
     card: CardId,
     unasked: bool,
     kind: Option<CardKind>,
