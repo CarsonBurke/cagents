@@ -6624,6 +6624,23 @@ mod tests {
     }
 
     #[test]
+    fn working_agent_count_requires_matching_discovered_provider_identity() {
+        let published=Arc::new(PublishedState::new(false,Arc::new(|_|panic!("counting must not wake or inspect a process"))));
+        let handle=TerminalHandle {inner:Arc::new(HandleInner {commands:command_channel(1).0,events:crossbeam_channel::unbounded().1,published:published.clone(),worker:Arc::new(Mutex::new(None))})};
+        let activity=crate::agent::Activity {provider:crate::agent::Provider::Claude,state:crate::agent::ActivityState::Working};
+        *published.agent_activity.lock().unwrap()=Some(activity);
+        assert!(!handle.observed_working_agent(),"generic cached activity without a discovered agent cannot certify a working agent");
+        let launch=shell_session("unused fixture").launch;
+        *published.agent_process.lock().unwrap()=Some(AgentProcess {pid:123,start:456,provider:crate::agent::Provider::Claude,launch:launch.clone(),recovery:launch});
+        assert!(handle.observed_working_agent());
+        published.agent_activity.lock().unwrap().as_mut().unwrap().provider=crate::agent::Provider::Omp;
+        assert!(!handle.observed_working_agent(),"another provider's activity must not be attributed to this identity");
+        *published.agent_activity.lock().unwrap()=Some(activity);
+        published.completed.store(true,Ordering::Release);
+        assert!(!handle.observed_working_agent(),"completed actors never count as working");
+    }
+
+    #[test]
     fn stopping_terminal_remains_visible_for_explicit_cleanup_retry() {
         let published=PublishedState::new(false,Arc::new(|_|{}));
         published.input_order.lock().unwrap().closing=true;

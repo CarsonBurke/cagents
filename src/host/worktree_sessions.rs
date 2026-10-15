@@ -461,7 +461,7 @@ mod tests {
         root
     }
     #[test]
-    fn native_working_count_requires_positive_owned_work_and_deduplicates_the_roster() {
+    fn native_working_count_requires_positive_live_owned_work() {
         let root=repository_fixture();let host=host();let record=live_record(root.path().into());
         let id=record.session.id;let handle=record.handle.clone();host.lock().unwrap().chats.insert(id,record);
         let actors=census(&host,root.path()).unwrap();
