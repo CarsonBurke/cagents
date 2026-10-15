@@ -326,6 +326,17 @@ impl Handle {
             Owner::Remote(remote) => remote.account_switch_generation(),
         }
     }
+    /// Fresh actor-attested controls only; this is neither a send permit nor a
+    /// completed-session metadata fallback.
+    pub(crate) fn capture_continuation_options(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<Option<super::account_continuation::Options>, String> {
+        match &self.0 {
+            Owner::Local(local) => local.capture_continuation_options(deadline),
+            Owner::Remote(remote) => remote.capture_continuation_options(deadline),
+        }
+    }
     pub(crate) fn completed_account_options(
         &self,
     ) -> Result<Option<super::AccountSwitchOptions>, String> {

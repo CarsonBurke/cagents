@@ -1,6 +1,7 @@
 //! Exact retained Claude actor. Only bounded semantic publications cross this
 //! socket; provider stdout and mutable reducer state never leave the helper.
 mod journal;
+mod account_continuation;
 pub(crate) mod restart;
 pub(crate) use restart::{RestartCleanup, RestartFailure, RestartReceipt, RestartState};
 mod deadline_io;
@@ -1983,6 +1984,10 @@ impl Server {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
+            "capture_continuation_options" => {
+                let (deadline,) = decode!((account_continuation::Deadline,));
+                value!(self.capture_continuation_options(deadline)?)
+            }
             "account_switch_generation" => value!(self.actor.account_switch_generation()?),
             "completed_account_options" => value!(self.actor.completed_account_options()?),
             "account_switch_notice" => {
@@ -4230,4 +4235,132 @@ done"#;
         // Metadata alone does not call publish_retirement or reconstruct scope.
         assert!(actor.launch_account_scope().is_err());
     }
+    #[test]
+    fn continuation_capture_proxy_refuses_pending_uncertain_and_final_metadata_without_rpc() {
+        let actor = RemoteActor::fixture(); // No endpoint: these must refuse before connect.
+        let deadline = || Instant::now() + Duration::from_secs(1);
+        let identity = InputIdentity { sequence: 1, id: uuid::Uuid::new_v4(), hash: [0; 32] };
+        *actor.0.uncertain_input.lock().unwrap() = Some(identity.clone());
+        assert!(actor.capture_continuation_options(deadline()).unwrap_err().contains("unsettled"));
+        *actor.0.uncertain_input.lock().unwrap() = None;
+        actor.0.pending.lock().unwrap().push(Pending {
+            identity, payload: Value::Null, bytes: 0, reply: None,
+        });
+        assert!(actor.capture_continuation_options(deadline()).unwrap_err().contains("unsettled"));
+        actor.0.pending.lock().unwrap().clear();
+        actor.0.recovering_inputs.store(true, Ordering::Release);
+        assert!(actor.capture_continuation_options(deadline()).unwrap_err().contains("unsettled"));
+        actor.0.recovering_inputs.store(false, Ordering::Release);
+        actor.publish_closed(Snapshot { exited: true, ..Snapshot::default() });
+        assert!(actor.capture_continuation_options(deadline()).unwrap_err().contains("unsettled"));
+    }
+
+    #[test]
+    fn continuation_capture_proxy_checks_actual_authenticated_rpc_and_post_input_revision() {
+        for change in ["none", "input", "epoch"] {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let socket = root.path().join("capture.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let mut actor = RemoteActor::fixture();
+            Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+            let shared = actor.clone();
+            let peer = thread::spawn(move || {
+                let (control, _) = listener.accept().unwrap();
+                let request: Invocation = receive(&control, TIMEOUT).unwrap();
+                assert_eq!(request.method, "capture_continuation_options");
+                assert_eq!(request.proof, shared.0.proof);
+                assert_eq!(request.epoch, Some(shared.0.epoch));
+                let expiry: (account_continuation::Deadline,) = serde_json::from_value(request.args).unwrap();
+                assert!(serde_json::to_value(expiry).unwrap()[0].as_u64().unwrap() > 0);
+                if change == "input" {
+                    // A concurrent input may have already settled before the
+                    // reply; sequence still proves the capture was superseded.
+                    *shared.0.input_sequence.lock().unwrap() += 1;
+                }
+                let epoch = if change == "epoch" { uuid::Uuid::new_v4() } else { shared.0.epoch };
+                send(&control, &Ok::<_, String>(json!({"epoch":epoch, "options":null})), TIMEOUT).unwrap();
+            });
+            let result = actor.capture_continuation_options(Instant::now() + Duration::from_secs(2));
+            peer.join().unwrap();
+            if change == "none" { assert!(result.unwrap().is_none()); }
+            else { assert!(result.unwrap_err().contains("superseded")); }
+            assert!(actor.pending_inputs().is_empty());
+            assert!(!actor.state().completed);
+            assert!(!actor.0.stop.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn continuation_capture_helper_authenticates_epoch_and_refuses_durable_unknown_inputs() {
+        let mut fixture = resident_fixture();
+        let server = &mut fixture.server;
+        let request = |server: &Server, epoch| Invocation {
+            proof: server.proof.clone(), epoch: Some(epoch),
+            method: "capture_continuation_options".into(),
+            args: json!([account_continuation::Deadline::capture(Instant::now() + Duration::from_secs(2)).unwrap()]),
+        };
+        let error = server.invoke(request(server, uuid::Uuid::new_v4())).unwrap_err();
+        assert!(error.contains("superseded"));
+        let identity = InputIdentity { sequence: 1, id: uuid::Uuid::new_v4(), hash: [4; 32] };
+        {
+            let mut journal = server.journal.lock().unwrap();
+            journal.admit(&identity).unwrap();
+            journal.finish(&identity, InputState::Unknown("unconfirmed actual input".into())).unwrap();
+        }
+        // The in-memory pending list is empty after reattachment, but the
+        // durable unknown input still prohibits any read-only settings query.
+        assert!(server.pending.is_empty());
+        let epoch = server.epoch;
+        let error = server.invoke(request(server, epoch)).unwrap_err();
+        assert!(error.contains("unknown or unacknowledged"));
+        assert!(server.actor.provider_process().unwrap().is_current());
+        assert!(!server.actor.0.stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn continuation_capture_rpc_stalled_reply_keeps_original_deadline_and_never_retries() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("capture-deadline.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        let (release, wait) = crossbeam_channel::bounded(1);
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.method, "capture_continuation_options");
+            wait.recv_timeout(Duration::from_secs(3)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert!(listener.accept().is_err(), "capture must never retry a transport failure");
+        });
+        let started = Instant::now();
+        let error = actor.capture_continuation_options(started + Duration::from_millis(100)).unwrap_err();
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        peer.join().unwrap();
+        assert!(error.contains("deadline"));
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(actor.pending_inputs().is_empty());
+        assert!(!actor.0.stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn continuation_capture_helper_refuses_unsupported_policy_without_stopping_or_rebinding() {
+        let mut fixture = resident_fixture();
+        let server = &mut fixture.server;
+        let source = server.source.clone();
+        let process = server.actor.provider_process().unwrap();
+        let request = Invocation {
+            proof: server.proof.clone(), epoch: Some(server.epoch),
+            method: "capture_continuation_options".into(),
+            args: json!([account_continuation::Deadline::capture(Instant::now() + Duration::from_secs(2)).unwrap()]),
+        };
+        let error = server.invoke(request).unwrap_err();
+        assert!(error.contains("policy"), "{error}");
+        assert_eq!(server.source, source);
+        assert!(process.is_current());
+        assert!(server.closed_snapshot.is_none());
+        assert!(!server.actor.0.stop.load(Ordering::Acquire));
+    }
+
 }

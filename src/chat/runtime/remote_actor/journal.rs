@@ -466,6 +466,29 @@ impl Journal {
         }
         Ok(())
     }
+    /// Unknown/accepted inputs survive helper reattachment and prohibit a new
+    /// continuation capture even when no in-memory provider command remains.
+    pub(super) fn continuation_inputs_settled(&self) -> Result<bool, String> {
+        if self.continuity_loss()?.is_some() {
+            return Ok(false);
+        }
+        let mut statement = self.db.prepare("SELECT state FROM inputs")
+            .map_err(|error| error.to_string())?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| error.to_string())?;
+        for (index, row) in rows.enumerate() {
+            if index >= MAX_INPUTS {
+                return Err("Retained input census exceeds its bounded capacity".into());
+            }
+            let bytes = row.map_err(|error| error.to_string())?;
+            let state: InputState = serde_json::from_slice(&bytes)
+                .map_err(|error| error.to_string())?;
+            if !matches!(state, InputState::Acknowledged(_)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
     pub fn acknowledged_input_count(&self) -> usize {
         self.acknowledged_inputs.len()
     }
