@@ -266,6 +266,7 @@ pub struct WorkspaceManifest {
     pub conversation_drafts: HashMap<String, String>,
     pub conversation_models: HashMap<String, String>,
     pub conversation_channels: HashMap<String, ChannelId>,
+    pub terminal_handoff_receipts: HashMap<uuid::Uuid, crate::model::SavedTerminalHandoff>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
@@ -1754,6 +1755,7 @@ impl StateStore {
             conversation_drafts: manifest.conversation_drafts,
             conversation_models: manifest.conversation_models,
             conversation_channels: manifest.conversation_channels,
+            terminal_handoff_receipts: manifest.terminal_handoff_receipts,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
@@ -3332,6 +3334,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:terminal_handoff_receipts"),
+        &terminal_handoffs_json(&state.terminal_handoff_receipts)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
         &to_json(&state.repository_navigation)?,
     )?;
@@ -4749,6 +4756,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace conversation channels", &value))
         .transpose()?
         .unwrap_or_default(),
+        terminal_handoff_receipts: bounded_terminal_handoff_metadata(
+            connection,
+            &format!("workspace:{id}:navigation:terminal_handoff_receipts"),
+        )?
+        .map(|value| terminal_handoffs_from_json(&value))
+        .transpose()?
+        .unwrap_or_default(),
         local_only_cards: metadata(
             connection,
             &format!("workspace:{id}:navigation:local_only_cards"),
@@ -5224,6 +5238,19 @@ fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+/// A single read distinguishes a legacy missing key from a present oversized
+/// value without allocating the latter into a Rust String first.
+fn bounded_terminal_handoff_metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
+    let value: Option<Option<String>> = connection.prepare_cached(
+        "SELECT CASE WHEN length(CAST(value AS BLOB)) <= ?2 THEN value ELSE NULL END FROM metadata WHERE key = ?1"
+    )?.query_row(params![key, crate::model::MAX_TERMINAL_HANDOFF_BYTES as i64], |row| row.get(0)).optional()?;
+    match value {
+        None => Ok(None),
+        Some(Some(value)) => Ok(Some(value)),
+        Some(None) => Err(StoreError::corrupt_row("workspace terminal handoff receipts", "saved receipt metadata exceeds its byte budget")),
+    }
+}
+
 fn set_metadata(transaction: &Transaction<'_>, key: &str, value: &str) -> Result<()> {
     transaction
         .prepare_cached(
@@ -5236,6 +5263,20 @@ fn set_metadata(transaction: &Transaction<'_>, key: &str, value: &str) -> Result
 
 fn to_json(value: &impl Serialize) -> Result<String> {
     Ok(serde_json::to_string(value)?)
+}
+
+fn terminal_handoffs_json(value: &HashMap<uuid::Uuid, crate::model::SavedTerminalHandoff>) -> Result<String> {
+    crate::model::validate_terminal_handoffs(value).map_err(|error| StoreError::corrupt_row("workspace terminal handoff receipts", error))?;
+    to_json(value)
+}
+fn terminal_handoffs_from_json(value: &str) -> Result<HashMap<uuid::Uuid, crate::model::SavedTerminalHandoff>> {
+    // Reject before deserialization can allocate nested source/environment data.
+    if value.len() > crate::model::MAX_TERMINAL_HANDOFF_BYTES {
+        return Err(StoreError::corrupt_row("workspace terminal handoff receipts", "saved receipt metadata exceeds its byte budget"));
+    }
+    let receipts = from_json("workspace terminal handoff receipts", value)?;
+    crate::model::validate_terminal_handoffs(&receipts).map_err(|error| StoreError::corrupt_row("workspace terminal handoff receipts", error))?;
+    Ok(receipts)
 }
 
 fn from_json<T: DeserializeOwned>(kind: &str, value: &str) -> Result<T> {
@@ -5430,6 +5471,7 @@ mod tests {
             conversation_drafts: HashMap::new(),
             conversation_models: HashMap::new(),
             conversation_channels: HashMap::new(),
+            terminal_handoff_receipts: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
@@ -6391,6 +6433,78 @@ mod tests {
                 .agent_updates
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn oversized_saved_handoff_metadata_refuses_reload_without_rewriting_its_bytes() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("oversized-handoff.sqlite3");
+        let workspace = workspace_with_terminal(&boot("receipt-size"));
+        let store = StateStore::open(&database, boot("receipt-size")).unwrap();
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let key = format!("workspace:{}:navigation:terminal_handoff_receipts", workspace.id);
+        let oversized = crate::model::MAX_TERMINAL_HANDOFF_BYTES as i64 + 1;
+        let db = Connection::open(&database).unwrap();
+        // SQLite generates the corrupt payload; no equally large Rust String
+        // is constructed just to test the bounded production projection.
+        db.execute("UPDATE metadata SET value = CAST(zeroblob(?1) AS TEXT) WHERE key = ?2", params![oversized, key]).unwrap();
+        let store = StateStore::open(&database, boot("receipt-reload")).unwrap();
+        assert!(matches!(store.load_workspace(workspace.id, None), Err(StoreError::CorruptRow {field, ..}) if field == "workspace terminal handoff receipts"));
+        let retained: i64 = db.query_row("SELECT length(CAST(value AS BLOB)) FROM metadata WHERE key = ?1", [&key], |row| row.get(0)).unwrap();
+        assert_eq!(retained, oversized);
+        let prefix: String = db.query_row("SELECT hex(substr(CAST(value AS BLOB), 1, 4)) FROM metadata WHERE key = ?1", [&key], |row| row.get(0)).unwrap();
+        assert_eq!(prefix, "00000000");
+        // Missing legacy metadata remains distinct from oversized corruption.
+        db.execute("DELETE FROM metadata WHERE key = ?1", [&key]).unwrap();
+        assert!(store.load_workspace(workspace.id, None).unwrap().unwrap().terminal_handoff_receipts.is_empty());
+    }
+
+    #[test]
+    fn full_terminal_handoff_receipts_survive_conversion_restart_and_exact_ack() {
+        use crate::terminal::ipc::{ChatSourceBinding, TerminalDescriptor, TerminalHandoffReceipt};
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("handoff-receipts.sqlite3");
+        let boot_id = boot("handoff-receipts");
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let CardKind::Terminal(terminal) = workspace.cards[0].kind.clone() else { panic!("terminal"); };
+        let mut source = crate::chat::fresh_session(crate::agent::Provider::Claude, TerminalId::new(),
+            terminal.launch.working_directory.clone(), &crate::account::Account::system(crate::agent::Provider::Claude)).unwrap();
+        source.proof = terminal.continuity.live_proof();
+        let binding = ChatSourceBinding { source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4() };
+        let mut descriptor = TerminalDescriptor::relaunchable(terminal.id, terminal.launch.clone(), terminal.transcript_path.clone());
+        descriptor.session = terminal;
+        descriptor.execution_instance = uuid::Uuid::new_v4();
+        let mut learned = binding.clone();
+        learned.source.launch.session_id = Some("confirmed-return-thread".into());
+        let first = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source,
+            source_execution_instance: binding.execution_instance, source_binding: binding,
+            retained_binding: Some(learned), terminal_native_epoch: uuid::Uuid::new_v4(), terminal: descriptor };
+        let mut next = first.clone();
+        next.operation = uuid::Uuid::new_v4();
+        next.terminal.execution_instance = uuid::Uuid::new_v4();
+        let first_saved = crate::model::SavedTerminalHandoff { card: workspace.cards[0].id, receipt: first.clone(), converted: true };
+        let next_saved = crate::model::SavedTerminalHandoff { card: CardId::new(), receipt: next.clone(), converted: false };
+        workspace.terminal_handoff_receipts.insert(first.operation, first_saved.clone());
+        workspace.terminal_handoff_receipts.insert(next.operation, next_saved.clone());
+        let store = StateStore::open(&database, boot_id).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let store = StateStore::open(&database, boot("after-ui-crash")).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.terminal_handoff_receipts, workspace.terminal_handoff_receipts);
+        assert_eq!(restored.terminal_handoff_receipts[&first.operation], first_saved);
+        assert_eq!(restored.terminal_handoff_receipts[&next.operation], next_saved);
+        // Acknowledging one immutable operation cannot erase another return of
+        // the same terminal ID. No current inventory or recipe reconstructs it.
+        workspace.terminal_handoff_receipts.remove(&first.operation);
+        lane.save(&store, &workspace).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.terminal_handoff_receipts, HashMap::from([(next.operation, next_saved)]));
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        legacy.as_object_mut().unwrap().remove("terminal_handoff_receipts");
+        assert!(serde_json::from_value::<WorkspaceState>(legacy).unwrap().terminal_handoff_receipts.is_empty());
     }
 
     #[test]

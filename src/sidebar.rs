@@ -45,6 +45,9 @@ use row_interaction::RowInteraction;
 mod change_selection;
 pub mod commands;
 pub mod git_commands;
+pub mod conversation;
+pub use conversation::ConversationEndTarget;
+
 mod selection;
 pub use change_selection::Row as ChangeSelectionRow;
 pub use selection::{Intent as SelectionIntent, Row as SelectionRow};

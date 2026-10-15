@@ -252,6 +252,11 @@ impl Cagents {
         true
     }
 
+    #[cfg(test)]
+    pub(in crate::app) fn pending_shared_view_changes_for_test(&self) -> Vec<(Scope, Change)> {
+        self.shared_views.pending.iter().map(|(_, scope, change)| (scope.clone(), change.clone())).collect()
+    }
+
     pub(super) fn retain_local_pane(&mut self, id: CardId) {
         self.shared_views.retained.insert(id);
         Arc::make_mut(&mut self.durable).local_only_cards.insert(id);

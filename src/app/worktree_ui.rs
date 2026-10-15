@@ -201,6 +201,7 @@ fn scope_descriptor(
         conversation_drafts: HashMap::new(),
         conversation_models: HashMap::new(),
         conversation_channels: HashMap::new(),
+        terminal_handoff_receipts: HashMap::new(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
         // A projection carries no channels, so it has nothing to say about what
