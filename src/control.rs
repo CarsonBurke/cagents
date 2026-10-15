@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) mod created_journal;
+
 mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
