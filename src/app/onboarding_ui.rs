@@ -467,20 +467,17 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                let url = dialog.url.clone();
                 let destination = PathBuf::from(dialog.destination.trim());
-                let command = match clone_command(&dialog.url, &destination) {
-                    Ok(command) => command,
-                    Err(error) => {
-                        dialog.error = Some(error);
-                        return Task::none();
-                    }
-                };
                 let id = dialog.id;
                 let cancellation = dialog.cancellation.clone();
                 dialog.running = true;
                 dialog.error = None;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
+                        // Destination validation also touches the filesystem;
+                        // a network parent must never stall the UI thread.
+                        let command = clone_command(&url, &destination)?;
                         execute_clone(&command, &cancellation, destination)
                     })
                     .await
@@ -803,6 +800,47 @@ mod tests {
         assert!(clone_command("https://example.com/repo", Path::new("relative")).is_err());
         std::fs::create_dir(&destination).unwrap();
         assert!(clone_command("https://example.com/repo", &destination).is_err());
+    }
+
+    #[test]
+    fn clone_submit_defers_validation_and_reports_its_worker_result_inline() {
+        let fixture = tempfile::tempdir().unwrap();
+        let existing = fixture.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        for (url, destination, expected) in [
+            (
+                "https://example.invalid/repository.git",
+                existing,
+                "destination already exists",
+            ),
+            (
+                "--upload-pack=invalid",
+                fixture.path().join("new"),
+                "Enter a repository URL",
+            ),
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            drop(app.update_onboarding(Action::Clone));
+            let dialog = app.chrome_ui.clone_repository.as_mut().unwrap();
+            dialog.url = url.into();
+            dialog.destination = destination.to_string_lossy().into_owned();
+            let id = dialog.id;
+            let task = app.update_onboarding(Action::Submit);
+            let dialog = app.chrome_ui.clone_repository.as_ref().unwrap();
+            assert!(dialog.running, "Submit must schedule the worker before validation");
+            assert!(dialog.error.is_none(), "validation must not run during Submit dispatch");
+            let reply = super::super::tests::task_app_message(task);
+            let Message::Onboarding(Action::Finished { id: actual, result }) = reply else {
+                panic!("clone worker must return its owned result");
+            };
+            assert_eq!(actual, id);
+            assert!(result.as_ref().unwrap_err().contains(expected));
+            drop(app.update_onboarding(Action::Finished { id, result }));
+            let dialog = app.chrome_ui.clone_repository.as_ref().unwrap();
+            assert!(!dialog.running);
+            assert!(dialog.error.as_ref().unwrap().contains(expected));
+            assert!(app.sidebar_model.projects.is_empty());
+        }
     }
 
     #[test]
