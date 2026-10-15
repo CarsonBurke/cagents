@@ -26,7 +26,7 @@ pub(super) fn entry() -> Option<Result<(), String>> {
     {
         return None;
     }
-    Some((|| {
+    Some((|| -> Result<(),String> {
         crate::instance::validate_stage_guard()
             .map_err(|_| "Source inspection requires the active authenticated update fence")?;
         if arguments.len() != 2 {
@@ -47,7 +47,7 @@ pub(super) fn entry() -> Option<Result<(), String>> {
             .map_err(|_| "Cannot write source inspection receipt")?;
         stdout
             .write_all(b"\n")
-            .map_err(|_| "Cannot flush source inspection receipt")?;
+            .map_err(|_| "Cannot flush source inspection receipt".to_string())?;
         stdout
             .flush()
             .map_err(|_| "Cannot flush source inspection receipt")
