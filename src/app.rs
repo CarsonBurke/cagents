@@ -12606,22 +12606,18 @@ impl Cagents {
             }
         }
         let mut tasks = Vec::new();
-        if previous.diff_ignore_whitespace != self.settings.diff_ignore_whitespace {
-            tasks.push(self.synchronize_diff_whitespace(None));
-        }
-        if previous.editor_font_family() != self.settings.editor_font_family()
-            || previous.editor_font_size() != self.settings.editor_font_size()
-        {
+        let font_changed = previous.editor_font_family() != self.settings.editor_font_family()
+            || previous.editor_font_size() != self.settings.editor_font_size();
+        if font_changed {
             let font = crate::terminal::monospace_font(self.settings.editor_font_family());
             let size = self.settings.editor_font_size();
-            for (&card, runtime) in self.cards.iter_mut() {
+            for runtime in self.cards.values_mut() {
                 let runtime = match runtime {
                     CardRuntime::Repository(runtime) => runtime,
                     CardRuntime::PullRequests(pane) => &mut pane.runtime,
                     _ => continue,
                 };
                 runtime.set_editor_font(font, size);
-                tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
                 tasks.push(repository_task(runtime.restore_font_viewport()));
             }
         }
@@ -12691,6 +12687,16 @@ impl Cagents {
                     runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged),
                 ));
             }
+        }
+        // All setters above can invalidate a cached or in-flight model. Start
+        // workers only after the final presentation preferences are installed;
+        // a later theme setter would otherwise cancel the request just created
+        // by a font or whitespace change during Restore Defaults.
+        if font_changed
+            || previous.editor_syntax_theme != syntax_theme
+            || previous.diff_ignore_whitespace != self.settings.diff_ignore_whitespace
+        {
+            tasks.push(self.synchronize_diff_whitespace(None));
         }
         if previous.editor_auto_save != self.settings.editor_auto_save {
             let auto_save = self.settings.editor_auto_save;
@@ -21463,6 +21469,96 @@ mod tests {
             )));
             assert_eq!(app.settings.diff_ignore_whitespace, enabled);
             assert_eq!(preferences(&app), [enabled; 2]);
+        }
+    }
+
+    #[tokio::test]
+    async fn resetting_diff_preferences_rebuilds_visible_panes_with_final_theme() {
+        async fn settle(app: &mut Cagents, task: Task<Message>) {
+            let mut pending = VecDeque::from([task]);
+            while let Some(task) = pending.pop_front() {
+                let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                    continue;
+                };
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(
+                        message @ (Message::Repository(_) | Message::SettingsSaved { .. }),
+                    )) = action
+                    {
+                        pending.push_back(app.update(message));
+                    }
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .arg("-C").arg(directory.path()).args(args).output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        };
+        git(&["init", "-q"]);
+        let before = "fn main() {\n    let answer = 1;\n}\n";
+        let after = "fn main() {\n  let answer = 1;\n}\n";
+        std::fs::write(directory.path().join("source.rs"), before).unwrap();
+        git(&["add", "source.rs"]);
+        std::fs::write(directory.path().join("source.rs"), after).unwrap();
+
+        // Cover both a whitespace+theme reset and a font+theme reset with the
+        // whitespace preference unchanged: neither may start a worker before
+        // the subsequent theme invalidation has finished.
+        for ignore_whitespace in [true, false] {
+            let (mut app, project) = pull_request_test_app(&[7]);
+            app.settings_path = Some(directory.path().join("settings.toml"));
+            app.settings_write_blocked = false;
+            app.settings.diff_ignore_whitespace = ignore_whitespace;
+            app.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+            app.settings.editor_font_family = Some("serif".into());
+            app.settings.editor_font_size = Some(17.0);
+            drop(app.update(open_pull_request(project, 7)));
+            let pr = pull_request_cards(&app)[0].0;
+            let repository = CardId::new();
+            let mut state = app.card_state(pr).unwrap().clone();
+            state.id = repository;
+            Arc::make_mut(&mut app.durable).cards.push(state);
+            for card in [repository, pr] {
+                let (mut runtime, _) = RepositoryRuntime::diff_snapshot_fixture(card, "source.rs", before, after);
+                runtime.descriptor.repository = directory.path().join(".git");
+                runtime.descriptor.worktree = directory.path().to_path_buf();
+                runtime.set_diff_surface_visible(true);
+                runtime.set_diff_ignore_whitespace(ignore_whitespace);
+                runtime.set_syntax_theme(settings::EditorSyntaxTheme::Mocha);
+                runtime.set_editor_font(crate::terminal::monospace_font("serif"), 17.0);
+                app.card_state_mut(card).unwrap().exposure = Exposure::Visible;
+                let load = repository_task(runtime.refresh_diff_preferences(card));
+                if card == repository {
+                    app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+                    app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+                } else {
+                    let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else { panic!("PR fixture"); };
+                    pane.runtime = runtime;
+                }
+                settle(&mut app, load).await;
+            }
+            let model = |app: &Cagents, card| match app.cards.get(&card).unwrap() {
+                CardRuntime::Repository(runtime) => runtime.current_diff_model_snapshot(),
+                CardRuntime::PullRequests(pane) => pane.runtime.current_diff_model_snapshot(),
+                _ => unreachable!(),
+            }.expect("the returned task must install a ready model");
+            for card in [repository, pr] {
+                let ready = model(&app, card);
+                assert_eq!(ready.syntax_theme(), settings::EditorSyntaxTheme::Mocha);
+                assert_eq!(ready.additions, u32::from(!ignore_whitespace));
+            }
+            app.settings_reset_confirm = true;
+            let reset = app.update(Message::ConfirmResetSettings);
+            settle(&mut app, reset).await;
+            for card in [repository, pr] {
+                let ready = model(&app, card);
+                assert_eq!(ready.syntax_theme(), settings::EditorSyntaxTheme::Auto);
+                assert_eq!((ready.additions, ready.deletions), (1, 1));
+                assert_eq!((ready.before.as_ref(), ready.after.as_ref()), (before, after));
+            }
+            assert_eq!(settings::load(&directory.path().join("settings.toml")).unwrap(), AppSettings::default());
         }
     }
 
