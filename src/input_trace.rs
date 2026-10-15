@@ -411,7 +411,7 @@ impl KeyboardFocus {
             return None;
         }
         self.selected(regions)
-            .map(|(candidate, _)| RetainNativeFocus(candidate.clone()))
+            .map(|(candidate, _)| RetainNativeFocus { owner: candidate.clone(), cleared: false })
     }
 
     fn region_for(
@@ -452,7 +452,10 @@ impl KeyboardFocus {
 
 /// Clear contradictory native flags before children can admit ignored input.
 /// Do not refocus the owner: doing so can reset selection or IME state.
-struct RetainNativeFocus((Option<cosmic::iced::widget::Id>, Rectangle));
+struct RetainNativeFocus {
+    owner: (Option<cosmic::iced::widget::Id>, Rectangle),
+    cleared: bool,
+}
 
 impl Operation for RetainNativeFocus {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
@@ -465,8 +468,9 @@ impl Operation for RetainNativeFocus {
         bounds: Rectangle,
         state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
     ) {
-        if state.is_focused() && (id != self.0.0.as_ref() || bounds != self.0.1) {
+        if state.is_focused() && (id != self.owner.0.as_ref() || bounds != self.owner.1) {
             state.unfocus();
+            self.cleared = true;
         }
     }
 }
@@ -474,7 +478,10 @@ impl Operation for RetainNativeFocus {
 /// Some native widgets skip outside-click handling after a sibling captures
 /// the pointer. Complete only that missing unfocus step, after the chosen
 /// widget has processed its own press. Never grant focus from hit testing.
-struct UnfocusOutside(Point);
+struct UnfocusOutside {
+    point: Point,
+    cleared: bool,
+}
 
 impl Operation for UnfocusOutside {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
@@ -487,8 +494,9 @@ impl Operation for UnfocusOutside {
         bounds: Rectangle,
         state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
     ) {
-        if state.is_focused() && !bounds.contains(self.0) {
+        if state.is_focused() && !bounds.contains(self.point) {
             state.unfocus();
+            self.cleared = true;
         }
     }
 }
@@ -574,6 +582,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
                 self.content.as_widget_mut().operate(
                     &mut tree.children[0], layout, renderer, &mut reconcile,
                 );
+                if reconcile.cleared { shell.request_redraw(); }
             }
         } else if matches!(event, Event::Keyboard(_)) && self.focus_regions.is_some() {
             // Modifier updates without a focus sample must not reuse a
@@ -600,9 +609,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
         if self.focus_regions.is_some()
             && let Some(point) = pressed_position(event, cursor)
         {
+            let mut unfocus = UnfocusOutside { point, cleared: false };
             self.content.as_widget_mut().operate(
-                &mut tree.children[0], layout, renderer, &mut UnfocusOutside(point),
+                &mut tree.children[0], layout, renderer, &mut unfocus,
             );
+            if unfocus.cleared { shell.request_redraw(); }
         }
         if self.modal_keyboard && matches!(event, Event::InputMethod(_)) {
             shell.capture_event();
@@ -798,6 +809,7 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
             *self.trace.2.borrow_mut() = focus.widget_id(regions);
             if let Some(mut reconcile) = focus.reconcile(event, regions) {
                 self.content.as_overlay_mut().operate(layout, renderer, &mut reconcile);
+                if reconcile.cleared { shell.request_redraw(); }
             }
         }
         let region = self
@@ -812,7 +824,9 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
         if self.focus_regions.is_some()
             && let Some(point) = pressed_position(event, cursor)
         {
-            self.content.as_overlay_mut().operate(layout, renderer, &mut UnfocusOutside(point));
+            let mut unfocus = UnfocusOutside { point, cleared: false };
+            self.content.as_overlay_mut().operate(layout, renderer, &mut unfocus);
+            if unfocus.cleared { shell.request_redraw(); }
         }
         if self.modal_keyboard && matches!(event, Event::InputMethod(_)) {
             shell.capture_event();
@@ -1089,8 +1103,16 @@ mod tests {
                     Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit("ime".into())),
                 ] {
                     messages.clear();
-                    element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
-                        &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+                    let had_retained_raw = raw_focused.get();
+                    {
+                        let mut shell = Shell::new(&mut messages);
+                        element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
+                            &renderer, &mut clipboard::Null, &mut shell, &viewport);
+                        if had_retained_raw {
+                            assert_eq!(shell.redraw_request(), cosmic::iced::window::RedrawRequest::NextFrame,
+                                "clearing a native focus flag must refresh focus visuals");
+                        }
+                    }
                     assert!(!messages.contains(&FocusConflictMessage::RawInput), "{messages:?}");
                     assert!(!raw_focused.get(), "conflicting native flag must be cleared before child delivery");
                     assert_eq!(trace.keyboard_widget_id(), Some(control.clone()));
