@@ -746,13 +746,18 @@ pub(crate) mod handoff {
                     });
                 if paired_codex {
                     let original = chat.source.terminal.as_ref().expect("checked pair");
-                    let terminal = self.terminals.iter().find(|terminal| terminal.source.id == original.id)
+                    let terminal = self
+                        .terminals
+                        .iter()
+                        .find(|terminal| terminal.source.id == original.id)
                         .expect("checked paired terminal");
                     let mut replacement = terminal.source.clone();
                     replacement.launch = terminal.recipe.clone();
                     replacement.continuity = original.continuity.clone();
                     if &replacement != original {
-                        return Err("Paired Codex terminal descriptor would change during restart".into());
+                        return Err(
+                            "Paired Codex terminal descriptor would change during restart".into(),
+                        );
                     }
                 }
                 if !chat_ids.insert(chat.source.id)
@@ -878,7 +883,10 @@ pub(crate) mod handoff {
         // normalizing fresh/shell argv to resume argv would change it after
         // the source has stopped. Retained pairs keep their original worker.
         if source.launch.provider == crate::agent::Provider::Codex
-            && !matches!(source.native_continuity, chat::NativeContinuity::Durable { .. })
+            && !matches!(
+                source.native_continuity,
+                chat::NativeContinuity::Durable { .. }
+            )
             && let Some(terminal) = &source.terminal
             && Some(&terminal.launch) != launch.terminal_recipe().as_ref()
         {
@@ -1236,11 +1244,15 @@ pub(crate) mod handoff {
             // temporary file never becomes recovery or replay authority.
             let (mut file, temporary) = fs_safety::create_temporary_in(&self.root, 0o600)
                 .map_err(|error| error.to_string())?;
-            let result = file.write_all(&bytes).and_then(|()| file.sync_all())
+            let result = file
+                .write_all(&bytes)
+                .and_then(|()| file.sync_all())
                 .map_err(|error| error.to_string());
             let removed = fs_safety::unlink_within(&self.root, &temporary)
                 .map_err(|error| error.to_string())
-                .and_then(|()| fs_safety::sync_directory(&self.root).map_err(|error| error.to_string()));
+                .and_then(|()| {
+                    fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
+                });
             result.and(removed)
         }
 

@@ -365,9 +365,9 @@ mod tests {
         live.launch.recipe.program = "codex".into();
         let recipe = live.launch.terminal_recipe().unwrap();
         let proof = live.proof.clone().unwrap();
-        let mut paired = crate::terminal_ipc::TerminalDescriptor::relaunchable(
-            live.id, recipe.clone(), None,
-        ).session;
+        let mut paired =
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(live.id, recipe.clone(), None)
+                .session;
         paired.continuity = crate::model::TerminalContinuity::Live {
             host_session_id: proof.host_session_id.clone(),
             boot_id: proof.boot_id.clone(),
@@ -375,11 +375,22 @@ mod tests {
         };
         live.terminal = Some(paired);
         validate_live_chat(&live, true).unwrap();
-        qualify(&live, std::slice::from_ref(&live), &proof, |_| panic!("current pair")).unwrap();
-        for launch in [live.launch.recipe.clone(), LaunchRecipe::shell("/tmp".into()).unwrap()] {
+        qualify(&live, std::slice::from_ref(&live), &proof, |_| {
+            panic!("current pair")
+        })
+        .unwrap();
+        for launch in [
+            live.launch.recipe.clone(),
+            LaunchRecipe::shell("/tmp".into()).unwrap(),
+        ] {
             live.terminal.as_mut().unwrap().launch = launch;
             assert!(validate_live_chat(&live, true).is_err());
-            assert!(qualify(&live, std::slice::from_ref(&live), &proof, |_| panic!("current pair")).is_err());
+            assert!(
+                qualify(&live, std::slice::from_ref(&live), &proof, |_| panic!(
+                    "current pair"
+                ))
+                .is_err()
+            );
             validate_live_chat(&live, false).unwrap();
         }
     }

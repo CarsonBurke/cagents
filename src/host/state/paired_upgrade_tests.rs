@@ -22,35 +22,55 @@ fn isolated() -> bool {
     if std::env::var(CHILD).as_deref() == Ok(exact.as_str()) {
         return false;
     }
-    let root = tempfile::Builder::new().prefix("cagents-paired-upgrade-")
-        .tempdir_in("/var/tmp").unwrap().keep();
+    let root = tempfile::Builder::new()
+        .prefix("cagents-paired-upgrade-")
+        .tempdir_in("/var/tmp")
+        .unwrap()
+        .keep();
     for name in ["home", "run", "data", "config", "cache", "state"] {
         fs::create_dir(root.join(name)).unwrap();
         fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
     }
-    eprintln!("paired upgrade owning evidence retained at {}", root.display());
+    eprintln!(
+        "paired upgrade owning evidence retained at {}",
+        root.display()
+    );
     let command = CommandSpec::new(std::env::current_exe().unwrap())
         .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-        .env(CHILD, &exact).env("HOME", root.join("home"))
+        .env(CHILD, &exact)
+        .env("HOME", root.join("home"))
         .env("XDG_RUNTIME_DIR", root.join("run"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_STATE_HOME", root.join("state"))
         .env("PATH", "/usr/bin:/bin")
-        .env_remove("CODEX_HOME").env_remove("CLAUDE_CONFIG_DIR")
-        .env_remove("PI_CODING_AGENT_DIR").env_remove("OMP_PROFILE")
-        .env_remove("PI_PROFILE").env_remove("PI_CONFIG_DIR")
-        .timeout(Duration::from_secs(60)).output_limits(128 * 1024, 128 * 1024);
-    let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
+        .env_remove("CODEX_HOME")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("OMP_PROFILE")
+        .env_remove("PI_PROFILE")
+        .env_remove("PI_CONFIG_DIR")
+        .timeout(Duration::from_secs(60))
+        .output_limits(128 * 1024, 128 * 1024);
+    let output = SystemProcessExecutor
+        .execute(&command, &CancellationToken::new())
+        .unwrap();
     fs::write(root.join("stdout.log"), &output.stdout).unwrap();
     fs::write(root.join("stderr.log"), &output.stderr).unwrap();
     let output = output.require_success(&command.program).unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.lines().any(|line| line == "running 1 test")
-        && stdout.lines().any(|line| line == format!("test {exact} ... ok"))
-        && stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
-        "owning child did not execute its exact contract; evidence {}", root.display());
+    assert!(
+        stdout.lines().any(|line| line == "running 1 test")
+            && stdout
+                .lines()
+                .any(|line| line == format!("test {exact} ... ok"))
+            && stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+        "owning child did not execute its exact contract; evidence {}",
+        root.display()
+    );
     true
 }
 
@@ -80,11 +100,18 @@ impl Peer {
             let mut clients = Vec::new();
             let mut methods = Vec::new();
             while !stopping.load(Ordering::Acquire) {
-                assert!(Instant::now() < deadline, "paired Codex peer exceeded its deadline");
+                assert!(
+                    Instant::now() < deadline,
+                    "paired Codex peer exceeded its deadline"
+                );
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-                        stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
                         let client = tungstenite::accept(stream).unwrap();
                         client.get_ref().set_nonblocking(true).unwrap();
                         clients.push(client);
@@ -130,12 +157,19 @@ impl Peer {
             drop(clients);
             finished.send(methods).unwrap();
         });
-        Self { stop, complete, thread }
+        Self {
+            stop,
+            complete,
+            thread,
+        }
     }
 
     fn finish(self) -> Vec<String> {
         self.stop.store(true, Ordering::Release);
-        let methods = self.complete.recv_timeout(Duration::from_secs(3)).expect("peer did not stop");
+        let methods = self
+            .complete
+            .recv_timeout(Duration::from_secs(3))
+            .expect("peer did not stop");
         self.thread.join().unwrap();
         methods
     }
@@ -149,14 +183,22 @@ fn executable(root: &Path) -> PathBuf {
     fs::write(&source, "#include <unistd.h>\nint main(void) { char byte; while (read(0, &byte, 1) > 0) {} return 0; }\n").unwrap();
     let command = CommandSpec::new("cc")
         .args([source.to_str().unwrap(), "-o", executable.to_str().unwrap()])
-        .timeout(Duration::from_secs(10)).output_limits(16 * 1024, 16 * 1024);
-    SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap()
-        .require_success(&command.program).unwrap();
+        .timeout(Duration::from_secs(10))
+        .output_limits(16 * 1024, 16 * 1024);
+    SystemProcessExecutor
+        .execute(&command, &CancellationToken::new())
+        .unwrap()
+        .require_success(&command.program)
+        .unwrap();
     executable
 }
 
 fn run_pair(mode: &str) {
-    let root = tempfile::Builder::new().prefix("paired-source-").tempdir().unwrap().keep();
+    let root = tempfile::Builder::new()
+        .prefix("paired-source-")
+        .tempdir()
+        .unwrap()
+        .keep();
     let cwd = root.canonicalize().unwrap();
     let executable = executable(&cwd);
     let home = cwd.join("codex-home");
@@ -167,9 +209,19 @@ fn run_pair(mode: &str) {
     // terminal. Foreground observation includes these account/runtime fields;
     // an omitted inherited HOME or PATH would itself be a genuine recipe drift.
     let mut environment: BTreeMap<String, String> = [
-        "HOME", "PATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
-    ].into_iter().map(|name| (name.to_owned(), std::env::var(name).unwrap())).collect();
-    if let Some(path) = crate::agent_execution::bundled::matched_path(environment.get("PATH").map(String::as_str)) {
+        "HOME",
+        "PATH",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ]
+    .into_iter()
+    .map(|name| (name.to_owned(), std::env::var(name).unwrap()))
+    .collect();
+    if let Some(path) =
+        crate::agent_execution::bundled::matched_path(environment.get("PATH").map(String::as_str))
+    {
         environment.insert("PATH".into(), path);
     }
     environment.insert("CODEX_HOME".into(), home.display().to_string());
@@ -186,7 +238,14 @@ fn run_pair(mode: &str) {
         "fresh" => fresh.clone(),
         "shell" => LaunchRecipe {
             program: "/bin/bash".into(),
-            arguments: vec!["-c".into(), format!("exec '{}' --remote 'unix://{}'", executable.display(), socket.display())],
+            arguments: vec![
+                "-c".into(),
+                format!(
+                    "exec '{}' --remote 'unix://{}'",
+                    executable.display(),
+                    socket.display()
+                ),
+            ],
             ..fresh.clone()
         },
         _ => unreachable!(),
@@ -194,42 +253,110 @@ fn run_pair(mode: &str) {
     let original = host("original");
     let id = TerminalId::new();
     let terminal = TerminalSession {
-        id, launch: issued.clone(), transcript_path: None, resume_hint: None,
-        owned_codex_listener: None, recovery_origin: None, predecessor: None,
-        continuity: TerminalContinuity::RelaunchAvailable { recipe: issued, last_exit: None },
+        id,
+        launch: issued.clone(),
+        transcript_path: None,
+        resume_hint: None,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        continuity: TerminalContinuity::RelaunchAvailable {
+            recipe: issued,
+            last_exit: None,
+        },
     };
     spawn_terminal(&original, 1, terminal, TerminalSpawnOptions::default()).unwrap();
     let terminal = original.lock().unwrap().terminals[&id].handle.clone();
     let deadline = Instant::now() + Duration::from_secs(5);
     while terminal.observe_agent_process().is_none() {
-        assert!(Instant::now() < deadline, "Codex source did not become foreground");
+        assert!(
+            Instant::now() < deadline,
+            "Codex source did not become foreground"
+        );
         thread::sleep(Duration::from_millis(10));
     }
     let proof = original.lock().unwrap().proof().clone();
-    let request = Session { id, launch: Launch { provider: Provider::Codex, recipe: exact, session_id: Some(ID.into()) },
-        proof: Some(proof.clone()), terminal: None, owned_codex_listener: None, native_continuity: NativeContinuity::ReconnectOnly };
-    let preview = super::super::chat::process(&original, 1, ClientRequest::ChatPreview { session: request.clone(), source: proof.clone() }).unwrap();
-    let ServerResponse::ChatPreviewed { preview } = preview else { panic!("missing exact preview") };
-    let attached = super::super::chat::process(&original, 1, ClientRequest::ChatStartSelected { session: request, source: proof, token: preview.token }).unwrap();
-    let ServerResponse::ChatAttached { session: initial, .. } = attached else { panic!("missing paired attachment") };
-    assert_eq!(initial.terminal.as_ref().unwrap().launch, original.lock().unwrap().terminals[&id].session.launch);
+    let request = Session {
+        id,
+        launch: Launch {
+            provider: Provider::Codex,
+            recipe: exact,
+            session_id: Some(ID.into()),
+        },
+        proof: Some(proof.clone()),
+        terminal: None,
+        owned_codex_listener: None,
+        native_continuity: NativeContinuity::ReconnectOnly,
+    };
+    let preview = super::super::chat::process(
+        &original,
+        1,
+        ClientRequest::ChatPreview {
+            session: request.clone(),
+            source: proof.clone(),
+        },
+    )
+    .unwrap();
+    let ServerResponse::ChatPreviewed { preview } = preview else {
+        panic!("missing exact preview")
+    };
+    let attached = super::super::chat::process(
+        &original,
+        1,
+        ClientRequest::ChatStartSelected {
+            session: request,
+            source: proof,
+            token: preview.token,
+        },
+    )
+    .unwrap();
+    let ServerResponse::ChatAttached {
+        session: initial, ..
+    } = attached
+    else {
+        panic!("missing paired attachment")
+    };
+    assert_eq!(
+        initial.terminal.as_ref().unwrap().launch,
+        original.lock().unwrap().terminals[&id].session.launch
+    );
     let actor = original.lock().unwrap().chats[&id].handle.clone();
     let deadline = Instant::now() + Duration::from_secs(5);
     while actor.confirmed_session_id().as_deref() != Some(ID) {
-        assert!(Instant::now() < deadline, "paired actor did not confirm its thread");
+        assert!(
+            Instant::now() < deadline,
+            "paired actor did not confirm its thread"
+        );
         thread::sleep(Duration::from_millis(10));
     }
     // Observe the descriptor through the public attachment after the real
     // confirmation, rather than inventing a learned identity in the fixture.
-    let attached = super::super::chat::process(&original, 1, ClientRequest::ChatAttach { session: initial }).unwrap();
-    let ServerResponse::ChatAttached { session: saved, .. } = attached else { panic!("missing confirmed pair") };
+    let attached =
+        super::super::chat::process(&original, 1, ClientRequest::ChatAttach { session: initial })
+            .unwrap();
+    let ServerResponse::ChatAttached { session: saved, .. } = attached else {
+        panic!("missing confirmed pair")
+    };
     assert_eq!(saved.launch.session_id.as_deref(), Some(ID));
     let store_path = cwd.join("checkpoint");
-    let capability = original.lock().unwrap().shutdown_preflight(Instant::now()).unwrap().capability;
-    let prepared = prepare_upgrade_with_policy(&original, capability, false, None, || Store::open(&store_path));
+    let capability = original
+        .lock()
+        .unwrap()
+        .shutdown_preflight(Instant::now())
+        .unwrap()
+        .capability;
+    let prepared = prepare_upgrade_with_policy(&original, capability, false, None, || {
+        Store::open(&store_path)
+    });
     if mode != "exact" {
         let failure = prepared.unwrap_err();
-        assert!(failure.message.contains("Paired Codex terminal needs a different restart recipe"), "{}", failure.message);
+        assert!(
+            failure
+                .message
+                .contains("Paired Codex terminal needs a different restart recipe"),
+            "{}",
+            failure.message
+        );
         assert!(!original.lock().unwrap().shutting_down);
         assert!(!actor.is_completed());
         assert!(!terminal.is_completed());
@@ -240,14 +367,23 @@ fn run_pair(mode: &str) {
         assert_eq!(prepared.unwrap(), (1, 1));
         let prepared = Store::open(&store_path).unwrap().load().unwrap().unwrap();
         assert_eq!(prepared.chats[0].source, saved);
-        assert_eq!(prepared.terminals[0].recipe, saved.terminal.as_ref().unwrap().launch);
+        assert_eq!(
+            prepared.terminals[0].recipe,
+            saved.terminal.as_ref().unwrap().launch
+        );
         finish_upgrade(&original).unwrap();
         assert!(actor.is_completed());
         assert!(terminal.is_completed());
         let replacement = host("replacement");
         let proc_root = cwd.join("empty-proc");
         fs::create_dir(&proc_root).unwrap();
-        restore_upgrade_from(&replacement, Store::open(&store_path).unwrap(), &proc_root, None).unwrap();
+        restore_upgrade_from(
+            &replacement,
+            Store::open(&store_path).unwrap(),
+            &proc_root,
+            None,
+        )
+        .unwrap();
         let resolved = super::super::chat::resolve_upgrade(&replacement, &saved).unwrap();
         assert!(crate::chat::is_upgrade_recovery(&saved, &resolved));
         assert_eq!(resolved.launch.session_id.as_deref(), Some(ID));
@@ -256,8 +392,13 @@ fn run_pair(mode: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         let snapshot = loop {
             let snapshot = current_actor.snapshot(None).unwrap();
-            if snapshot.ready && !snapshot.history_loading { break snapshot; }
-            assert!(Instant::now() < deadline, "restored paired history did not load");
+            if snapshot.ready && !snapshot.history_loading {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restored paired history did not load"
+            );
             thread::sleep(Duration::from_millis(10));
         };
         assert!(snapshot.items.iter().any(|item| matches!(&item.content,
@@ -272,13 +413,17 @@ fn run_pair(mode: &str) {
 
 #[test]
 fn legacy_paired_fresh_and_shell_recipes_refuse_before_source_stop() {
-    if isolated() { return; }
+    if isolated() {
+        return;
+    }
     run_pair("fresh");
     run_pair("shell");
 }
 
 #[test]
 fn legacy_paired_exact_recipe_survives_checkpoint_restore_and_strict_client_identity() {
-    if isolated() { return; }
+    if isolated() {
+        return;
+    }
     run_pair("exact");
 }
