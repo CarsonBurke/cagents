@@ -108,7 +108,7 @@ impl Ledger {
         self.begin(credit_id, now_ms)
     }
 
-    pub(crate) fn begin(&mut self, credit_id: &str, now_ms: u64) -> Result<Admission, String> {
+    fn begin(&mut self, credit_id: &str, now_ms: u64) -> Result<Admission, String> {
         self.ensure_usable()?;
         identifier_str(credit_id)?;
         if let Some(index) = self.state.attempts.iter().position(|attempt| attempt.credit_id == credit_id) {

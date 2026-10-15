@@ -4328,6 +4328,19 @@ mod tests {
         }
     }
     #[test]
+    fn reconciled_monitor_attempt_still_refuses_consumption_after_another_session_reset_shared_usage() {
+        let mut adapter = adapter();
+        let (mut request, receiver) = reset_request();
+        request.reconcile = true;
+        request.condition = Some(crate::account::reset::request::Threshold {used_percent:90,max_age_ms:30_000});
+        let first = adapter.consume_reset_credit(request).unwrap();
+        let second = adapter.receive(json!({"id":first.writes[0]["id"],"result":allowance_account()})).unwrap();
+        let stopped = adapter.receive(json!({"id":second.writes[0]["id"],"result":reset_limits(0,1)})).unwrap();
+        assert!(stopped.events.is_empty() && stopped.writes.is_empty());
+        let error = receiver.recv_timeout(std::time::Duration::from_millis(100)).unwrap().err().unwrap();
+        assert!(error.contains("BelowThreshold") && error.contains("earlier uncertain attempt remains unresolved"));
+    }
+    #[test]
     fn uncertain_reset_reply_cannot_be_replaced_by_a_second_reset_or_inspection_request() {
         let mut adapter = adapter();
         let (request, receiver) = reset_request();
