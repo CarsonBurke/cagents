@@ -6369,7 +6369,7 @@ impl Cagents {
                         }
                         if let Some(prompt)=self.chat_ui.recovery_drafts.remove(&target.card)
                             && let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
-                            runtime.load_recovery_prompt(Arc::try_unwrap(prompt).unwrap_or_else(|shared|(*shared).clone()),"Editing this prompt continues the new branch.");
+                            runtime.load_recovery_prompt(prompt,"Editing this prompt continues the new branch.");
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
@@ -7566,7 +7566,7 @@ impl Cagents {
                 if let Some(runtime)=self.chat_runtime_mut(target)
                     && runtime.recovery_composer_empty()
                     && let Some(prompt)=runtime.recovery.prepared_prompt.take() {
-                    runtime.load_recovery_prompt(prompt,"Editing this prompt continues the new branch.");
+                    runtime.load_recovery_prompt(Arc::try_unwrap(prompt).unwrap_or_else(|shared|(*shared).clone()),"Editing this prompt continues the new branch.");
                     return iced::widget::operation::focus(card_control_id(target.card,"chat-composer")).map(cosmic::Action::App);
                 }
             }

@@ -258,8 +258,11 @@ impl Cagents {
                 // can be incomplete even when its siblings are off the page.
                 // Current snapshot settings never establish Retry eligibility.
                 if let Purpose::Edit {branch}=&query.purpose
-                    && let Some(prompt)=query.user.as_deref().and_then(|id|runtime.recovery.submitted.as_ref()
+                    && let Some(mut prompt)=query.user.as_deref().and_then(|id|runtime.recovery.submitted.as_ref()
                         .filter(|prompt|prompt.user_id.as_deref()==Some(id)).cloned()) {
+                    // Once restored from submitted history this is origin data,
+                    // even though the original send began as user intent.
+                    prompt.origin_backend=true;
                     return self.finish_original_edit(target,prompt,branch.clone(),context.session);
                 }
                 if !matches!(query.purpose,Purpose::Metadata) {
@@ -474,6 +477,38 @@ mod tests {
         assert!(runtime.composer.is_empty(),"absence of visible sibling fragments is not completeness proof");
         assert!(runtime.recovery.prepared_prompt.is_none());
         assert_eq!(runtime.recovery.notice.as_deref(),Some("The complete original prompt is unavailable for this turn."));
+    }
+
+    #[test]
+    fn unavailable_local_history_fallback_is_revoked_without_losing_a_concurrent_draft() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let mut runtime=runtime();let target=runtime.target;
+        runtime.recovery.submitting(&runtime.snapshot,&Command::Prompt {text:"accepted local history".into(),attachments:vec![],mode:PromptMode::Send});
+        let mut snapshot=(*runtime.snapshot).clone();snapshot.generation+=1;
+        snapshot.items=vec![Arc::new(chat::Item {id:"actual-local-user".into(),role:chat::Role::User,started_at:None,at:None,
+            content:ItemContent::Text {text:"accepted local history".into(),thinking:false,phase:chat::Phase::Final}})];
+        runtime.handle().unwrap().publish_snapshot_for_test(snapshot);runtime.refresh();
+        assert_eq!(runtime.recovery.submitted.as_ref().unwrap().user_id.as_deref(),Some("actual-local-user"));
+        assert!(!runtime.recovery.submitted.as_ref().unwrap().origin_backend);
+        let context=Context::current(&runtime).unwrap();
+        runtime.recovery.originals.begin(target,context,runtime.handle().cloned().unwrap(),
+            Some("actual-local-user".into()),Purpose::Edit {branch:None});
+        let id=runtime.recovery.originals.query_id_for_test();
+        runtime.replace_draft(text_editor::Content::with_text("typed while the original was loading"));
+        runtime.attachments=vec![Attachment {path:"/user/concurrent.png".into()}];
+        app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        drop(app.original_ready(target,id,None,0,Reply::fixture(Err(OriginalError::Unavailable("no accepted record".into())))));
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        let prepared=runtime.recovery.prepared_prompt.as_ref().unwrap();
+        assert!(prepared.origin_backend);
+        let weak=Arc::downgrade(prepared);
+        let alias=Account::managed(Provider::Claude,uuid::Uuid::new_v4(),"/same/home/through-another-alias".into()).id();
+        app.invalidate_originals_for_account(&alias);
+        assert!(weak.upgrade().is_none(),"historical local fallback is origin-derived after recovery");
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.recovery.prepared_prompt.is_none());
+        assert_eq!(runtime.composer.text(),"typed while the original was loading");
+        assert_eq!(runtime.attachments,vec![Attachment {path:"/user/concurrent.png".into()}]);
     }
 
     #[test]
