@@ -12,6 +12,7 @@ const META_BYTES: usize = 64 * 1024;
 pub(crate) struct Store {
     db: Connection,
     scope: LaunchAccountScope,
+    session:Option<String>,
     directory: PathBuf,
     pending_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -50,14 +51,11 @@ pub(crate) fn purge_account(scope: &LaunchAccountScope) -> Result<(), String> {
     purge_account_at(&installation_root()?,scope)
 }
 pub(crate) fn purge_session(scope:&LaunchAccountScope,confirmed_session:&str)->Result<(),String>{
+    let root=installation_root()?;
     scope.revalidate()?;
     if !valid_id(confirmed_session){return Err("Invalid confirmed conversation identity".into());}
-    let path=installation_root()?.join(account_key(scope)).join(format!("{:x}",Sha256::digest(confirmed_session.as_bytes())));
-    crate::secure_file::reject_symlink_components(&path).map_err(|e|e.to_string())?;
-    match fs::symlink_metadata(&path){Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(()),Err(e)=>Err(e.to_string()),Ok(_)=>{
-        crate::secure_file::validate_owned_directory(&path).map_err(|e|e.to_string())?;
-        fs::remove_dir_all(path).map_err(|e|e.to_string())
-    }}
+    if !root.join(account_key(scope)).exists(){return Ok(());}
+    Store::at(&root,scope,confirmed_session)?.purge_current_session()
 }
 fn purge_account_at(root: &Path, scope: &LaunchAccountScope) -> Result<(), String> {
     scope.revalidate()?;
@@ -111,16 +109,20 @@ impl Store {
     pub(crate) fn installation(scope: &LaunchAccountScope, session: &str) -> Result<Self,String> {
         Self::at(&installation_root()?,scope,session)
     }
+    /// Pending command bytes have physical account authority, but deliberately
+    /// have no native-session authority to accept or read original records.
+    pub(crate) fn pending_installation(scope:&LaunchAccountScope)->Result<Self,String>{Self::open(&installation_root()?,scope,None)}
     #[cfg(test)]
     pub(crate) fn for_test(root:&Path,scope:&LaunchAccountScope,session:&str)->Result<Self,String>{Self::at(root,scope,session)}
-    fn at(root:&Path,scope:&LaunchAccountScope,session:&str)->Result<Self,String> {
+    fn at(root:&Path,scope:&LaunchAccountScope,session:&str)->Result<Self,String>{Self::open(root,scope,Some(session))}
+    fn confirmed(&self)->Result<&str,String>{self.session.as_deref().ok_or_else(||"Pending command storage has no confirmed conversation authority".into())}
+    fn open(root:&Path,scope:&LaunchAccountScope,session:Option<&str>)->Result<Self,String> {
         scope.revalidate()?;
-        if !valid_id(session) {return Err("Invalid confirmed conversation identity".into());}
+        if session.is_some_and(|id|!valid_id(id)) {return Err("Invalid confirmed conversation identity".into());}
         associate_for_purge(root,scope)?;
         let account=root.join(account_key(scope));
         crate::secure_file::prepare_private_directory(&account).map_err(|e|e.to_string())?;
-        let directory=account.join(format!("{:x}",Sha256::digest(session.as_bytes())));
-        crate::secure_file::prepare_private_directory(&directory).map_err(|e|e.to_string())?;
+        let directory=account;
         let path=directory.join("annotations.sqlite");
         let file=fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
             .custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&path).map_err(|e|e.to_string())?;
@@ -129,19 +131,29 @@ impl Store {
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e|e.to_string())?;
         let version:u32=db.pragma_query_value(None,"user_version",|row|row.get(0)).map_err(|e|e.to_string())?;
         if version>1{return Err(format!("Conversation annotation schema {version} is newer than supported schema 1"));}
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-512; PRAGMA foreign_keys=ON;
-          CREATE TABLE IF NOT EXISTS prompts(user_id TEXT PRIMARY KEY, metadata BLOB NOT NULL, digest BLOB NOT NULL);
-          CREATE TABLE IF NOT EXISTS prompt_text(user_id TEXT NOT NULL REFERENCES prompts(user_id) ON DELETE CASCADE, position INTEGER NOT NULL, body BLOB NOT NULL, PRIMARY KEY(user_id,position));
-          CREATE TABLE IF NOT EXISTS aliases(alias TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES prompts(user_id));
-          CREATE TABLE IF NOT EXISTS approvals(agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,decision INTEGER NOT NULL,PRIMARY KEY(agent,item,request));
-          CREATE TABLE IF NOT EXISTS current_approval(agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,PRIMARY KEY(agent,item));
-          CREATE TABLE IF NOT EXISTS retained_attachments(path TEXT PRIMARY KEY,accepted INTEGER NOT NULL DEFAULT 0,bytes INTEGER NOT NULL);
+        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-512; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;
+          CREATE TABLE IF NOT EXISTS prompts(session TEXT NOT NULL,user_id TEXT NOT NULL,metadata BLOB NOT NULL,digest BLOB NOT NULL,PRIMARY KEY(session,user_id));
+          CREATE TABLE IF NOT EXISTS prompt_text(session TEXT NOT NULL,user_id TEXT NOT NULL,position INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(session,user_id,position),FOREIGN KEY(session,user_id) REFERENCES prompts(session,user_id) ON DELETE CASCADE);
+          CREATE TABLE IF NOT EXISTS aliases(session TEXT NOT NULL,alias TEXT NOT NULL,user_id TEXT NOT NULL,PRIMARY KEY(session,alias),FOREIGN KEY(session,user_id) REFERENCES prompts(session,user_id) ON DELETE CASCADE);
+          CREATE TABLE IF NOT EXISTS approvals(session TEXT NOT NULL,agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,decision INTEGER NOT NULL,PRIMARY KEY(session,agent,item,request));
+          CREATE TABLE IF NOT EXISTS current_approval(session TEXT NOT NULL,agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,PRIMARY KEY(session,agent,item));
+          CREATE TABLE IF NOT EXISTS retained_attachments(path TEXT PRIMARY KEY,accepted INTEGER NOT NULL DEFAULT 0,bytes INTEGER NOT NULL,session TEXT);
           CREATE INDEX IF NOT EXISTS pending_attachments ON retained_attachments(accepted) WHERE accepted=0;
-          CREATE TABLE IF NOT EXISTS latest(singleton INTEGER PRIMARY KEY CHECK(singleton=1),user_id TEXT NOT NULL); PRAGMA user_version=1;")
+          CREATE INDEX IF NOT EXISTS session_attachments ON retained_attachments(session) WHERE session IS NOT NULL;
+          CREATE TABLE IF NOT EXISTS latest(session TEXT PRIMARY KEY,user_id TEXT NOT NULL); PRAGMA user_version=1;")
             .map_err(|e|e.to_string())?;
-        let store=Self{db,scope:scope.clone(),directory,pending_bytes:Default::default()};
+        let store=Self{db,scope:scope.clone(),session:session.map(str::to_owned),directory,pending_bytes:Default::default()};
         store.recover_pending()?;
         Ok(store)
+    }
+    fn purge_current_session(&mut self)->Result<(),String>{
+        self.scope.revalidate()?;let session=self.confirmed()?.to_owned();
+        let transaction=self.db.transaction().map_err(|e|e.to_string())?;
+        transaction.execute("DELETE FROM prompts WHERE session=?1",[&session]).map_err(|e|e.to_string())?;
+        for table in ["approvals","current_approval","latest"]{transaction.execute(&format!("DELETE FROM {table} WHERE session=?1"),[&session]).map_err(|e|e.to_string())?;}
+        transaction.execute("UPDATE retained_attachments SET accepted=0,session=NULL WHERE session=?1",[&session]).map_err(|e|e.to_string())?;
+        transaction.commit().map_err(|e|e.to_string())?;
+        self.recover_pending()
     }
     /// Sweep only pending rows, never accepted originals or the transcript.
     /// Locks make recovery safe against another actor's active capture.
@@ -149,7 +161,7 @@ impl Store {
         use std::os::fd::AsRawFd;
         let _publication=crate::instance::owned_lock(&self.directory.join("capture-publication.lock"),libc::LOCK_EX).map_err(|e|e.to_string())?;
         let transaction=rusqlite::Transaction::new_unchecked(&self.db,rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
-        let mut statement=transaction.prepare("SELECT path FROM retained_attachments WHERE accepted=0 LIMIT 256").map_err(|e|e.to_string())?;
+        let mut statement=transaction.prepare("SELECT path FROM retained_attachments WHERE accepted=0 LIMIT 1024").map_err(|e|e.to_string())?;
         let paths=statement.query_map([],|row|row.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
         drop(statement);
         for name in paths {
@@ -189,7 +201,7 @@ impl Store {
             // exists and carries its own lifetime lease. Death at either cut
             // point leaves an indexed, recoverable pending capture.
             let publication=crate::instance::owned_lock(&self.directory.join("capture-publication.lock"),libc::LOCK_EX).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
-            if self.db.execute("INSERT INTO retained_attachments(path,bytes) SELECT ?1,?2 WHERE (SELECT count(*) FROM retained_attachments WHERE accepted=0)<32 AND (SELECT coalesce(sum(bytes),0) FROM retained_attachments WHERE accepted=0)+?2<=67108864",params![name,reserved_bytes]).map_err(storage_error)?!=1{return Err(OriginalError::TooLarge);}
+            if self.db.execute("INSERT INTO retained_attachments(path,bytes) SELECT ?1,?2 WHERE (SELECT count(*) FROM retained_attachments WHERE accepted=0)<1024 AND (SELECT coalesce(sum(bytes),0) FROM retained_attachments WHERE accepted=0)+?2<=268435456",params![name,reserved_bytes]).map_err(storage_error)?!=1{return Err(OriginalError::TooLarge);}
             let mut output=fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&retained).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
             created=true;
             // SAFETY: output owns this newly created regular file.
@@ -209,6 +221,7 @@ impl Store {
     /// command to its real user item. Conflicting rewrites are refused.
     pub(crate) fn accept(&mut self, original:&OriginalPrompt,text:&str,aliases:&[String],captures:&mut [PendingAttachment])->Result<(),OriginalError> {
         self.scope.revalidate().map_err(OriginalError::Unavailable)?;
+        let session=self.confirmed().map_err(OriginalError::Unavailable)?.to_owned();
         if !valid_id(&original.user_id)||!valid_id(&original.turn_id)||aliases.len()>128||aliases.iter().any(|id|!valid_id(id)) {return Err(OriginalError::TooLarge);}
         if !original.settings.is_exact() {return Err(OriginalError::Unavailable("The accepted provider settings are unknown".into()));}
         if text.len()!=original.text_bytes||text.len()>ORIGINAL_TEXT_BYTES||original.attachments.len()>32||original.attachments.iter().try_fold(0u64,|sum,file|sum.checked_add(file.bytes)).is_none_or(|bytes|bytes>64*1024*1024) {return Err(OriginalError::TooLarge);}
@@ -217,20 +230,20 @@ impl Store {
         if metadata.len()>META_BYTES{return Err(OriginalError::TooLarge);}
         let mut hash=Sha256::new();hash.update(&metadata);hash.update(text.as_bytes());let digest=hash.finalize();
         let transaction=self.db.transaction().map_err(storage_error)?;
-        let old:Option<Vec<u8>>=transaction.query_row("SELECT digest FROM prompts WHERE user_id=?1",[&original.user_id],|r|r.get(0)).optional().map_err(storage_error)?;
+        let old:Option<Vec<u8>>=transaction.query_row("SELECT digest FROM prompts WHERE session=?1 AND user_id=?2",params![session,original.user_id],|r|r.get(0)).optional().map_err(storage_error)?;
         if old.as_deref().is_some_and(|old|old!=digest.as_slice()){return Err(OriginalError::Changed);}
         if old.is_none(){
-            transaction.execute("INSERT INTO prompts VALUES(?1,?2,?3)",params![original.user_id,metadata,digest.as_slice()]).map_err(storage_error)?;
-            for (index,chunk) in text.as_bytes().chunks(CHUNK).enumerate(){transaction.execute("INSERT INTO prompt_text VALUES(?1,?2,?3)",params![original.user_id,index*CHUNK,chunk]).map_err(storage_error)?;}
+            transaction.execute("INSERT INTO prompts VALUES(?1,?2,?3,?4)",params![session,original.user_id,metadata,digest.as_slice()]).map_err(storage_error)?;
+            for (index,chunk) in text.as_bytes().chunks(CHUNK).enumerate(){transaction.execute("INSERT INTO prompt_text VALUES(?1,?2,?3,?4)",params![session,original.user_id,index*CHUNK,chunk]).map_err(storage_error)?;}
         }
         for alias in std::iter::once(&original.user_id).chain(aliases){
-            let existing:Option<String>=transaction.query_row("SELECT user_id FROM aliases WHERE alias=?1",[alias],|r|r.get(0)).optional().map_err(storage_error)?;
+            let existing:Option<String>=transaction.query_row("SELECT user_id FROM aliases WHERE session=?1 AND alias=?2",params![session,alias],|r|r.get(0)).optional().map_err(storage_error)?;
             if existing.as_deref().is_some_and(|id|id!=original.user_id){return Err(OriginalError::Changed);}
-            transaction.execute("INSERT OR IGNORE INTO aliases VALUES(?1,?2)",params![alias,original.user_id]).map_err(storage_error)?;
+            transaction.execute("INSERT OR IGNORE INTO aliases VALUES(?1,?2,?3)",params![session,alias,original.user_id]).map_err(storage_error)?;
         }
         for capture in captures.iter(){
             let name=capture.attachment.path.file_name().and_then(|name|name.to_str()).ok_or(OriginalError::Changed)?;
-            if transaction.execute("UPDATE retained_attachments SET accepted=1 WHERE path=?1",[name]).map_err(storage_error)?!=1{return Err(OriginalError::Changed);}
+            if transaction.execute("UPDATE retained_attachments SET accepted=1,session=?2 WHERE path=?1 AND (session IS NULL OR session=?2)",params![name,session]).map_err(storage_error)?!=1{return Err(OriginalError::Changed);}
         }
         transaction.commit().map_err(storage_error)?;
         for capture in captures{capture.accepted=true;}
@@ -239,21 +252,22 @@ impl Store {
     /// Called only for the newest live confirmed user, in conversation order.
     /// An unannotated newest user intentionally makes latest lookup unavailable.
     pub(crate) fn latest_user(&mut self,user_id:&str)->Result<(),String>{
-        self.scope.revalidate()?;if !valid_id(user_id){return Err("Invalid user identity".into());}
-        self.db.execute("INSERT INTO latest VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET user_id=excluded.user_id",[user_id]).map(|_|()).map_err(|e|e.to_string())
+        self.scope.revalidate()?;let session=self.confirmed()?;if !valid_id(user_id){return Err("Invalid user identity".into());}
+        self.db.execute("INSERT INTO latest VALUES(?1,?2) ON CONFLICT(session) DO UPDATE SET user_id=excluded.user_id",params![session,user_id]).map(|_|()).map_err(|e|e.to_string())
     }
     pub(crate) fn original(&self,user_id:Option<&str>,offset:usize,limit:usize)->Result<OriginalPage,OriginalError>{
         self.scope.revalidate().map_err(OriginalError::Unavailable)?;
+        let session=self.confirmed().map_err(OriginalError::Unavailable)?;
         if !(4..=ORIGINAL_PAGE_BYTES).contains(&limit){return Err(OriginalError::InvalidRange);}
-        let latest:Option<String>=if user_id.is_none(){self.db.query_row("SELECT user_id FROM latest WHERE singleton=1",[],|r|r.get(0)).optional().map_err(storage_error)?}else{None};
+        let latest:Option<String>=if user_id.is_none(){self.db.query_row("SELECT user_id FROM latest WHERE session=?1",[session],|r|r.get(0)).optional().map_err(storage_error)?}else{None};
         let id=user_id.or(latest.as_deref()).ok_or_else(||OriginalError::Unavailable("No confirmed latest user message".into()))?;
-        let found:Option<(String,Vec<u8>)>=self.db.query_row("SELECT prompts.user_id,metadata FROM prompts JOIN aliases ON aliases.user_id=prompts.user_id WHERE aliases.alias=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(storage_error)?;
+        let found:Option<(String,Vec<u8>)>=self.db.query_row("SELECT prompts.user_id,metadata FROM prompts JOIN aliases ON aliases.session=prompts.session AND aliases.user_id=prompts.user_id WHERE aliases.session=?1 AND aliases.alias=?2",params![session,id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(storage_error)?;
         let (id,metadata)=found.ok_or_else(||OriginalError::Unavailable("The exact original accepted command is unavailable".into()))?;
         let original:OriginalPrompt=postcard::from_bytes(&metadata).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
         if offset>original.text_bytes{return Err(OriginalError::InvalidRange);}
         let end=offset.saturating_add(limit).min(original.text_bytes);
-        let mut statement=self.db.prepare("SELECT position,body FROM prompt_text WHERE user_id=?1 AND position+length(body)>?2 AND position<?3 ORDER BY position").map_err(storage_error)?;
-        let rows=statement.query_map(params![id,offset,end],|r|Ok((r.get::<_,usize>(0)?,r.get::<_,Vec<u8>>(1)?))).map_err(storage_error)?;
+        let mut statement=self.db.prepare("SELECT position,body FROM prompt_text WHERE session=?1 AND user_id=?2 AND position+length(body)>?3 AND position<?4 ORDER BY position").map_err(storage_error)?;
+        let rows=statement.query_map(params![session,id,offset,end],|r|Ok((r.get::<_,usize>(0)?,r.get::<_,Vec<u8>>(1)?))).map_err(storage_error)?;
         let mut bytes=Vec::with_capacity(limit);for row in rows{let(position,body)=row.map_err(storage_error)?;let from=offset.saturating_sub(position);let to=(end-position).min(body.len());bytes.extend_from_slice(&body[from..to]);}
         if bytes.first().is_some_and(|byte|byte&0xc0==0x80){return Err(OriginalError::InvalidRange);}
         while std::str::from_utf8(&bytes).is_err(){if bytes.pop().is_none(){return Err(OriginalError::InvalidRange);}}
@@ -265,23 +279,24 @@ impl Store {
     /// Repeated delivery of an already seen Awaiting request is replay and
     /// cannot reopen a denied action. Only a distinct request starts a decision.
     pub(crate) fn approval(&mut self,key:&ApprovalKey,request:&str,decision:ApprovalDecision)->Result<(),String>{
-        self.scope.revalidate()?;let agent=key.agent_id.as_deref().unwrap_or("");
+        self.scope.revalidate()?;let session=self.confirmed()?.to_owned();let agent=key.agent_id.as_deref().unwrap_or("");
         if !valid_id(&key.item_id)||!valid_id(request)||agent.len()>ID_BYTES{return Err("Approval identity exceeds its limit".into());}
         let transaction=self.db.transaction().map_err(|e|e.to_string())?;
-        let known:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE agent=?1 AND item=?2 AND request=?3)",params![agent,key.item_id,request],|r|r.get(0)).map_err(|e|e.to_string())?;
+        let known:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE session=?1 AND agent=?2 AND item=?3 AND request=?4)",params![session,agent,key.item_id,request],|r|r.get(0)).map_err(|e|e.to_string())?;
         if decision==ApprovalDecision::Awaiting {
             if !known {
-                transaction.execute("INSERT INTO approvals VALUES(?1,?2,?3,0)",params![agent,key.item_id,request]).map_err(|e|e.to_string())?;
-                transaction.execute("INSERT INTO current_approval VALUES(?1,?2,?3) ON CONFLICT(agent,item) DO UPDATE SET request=excluded.request",params![agent,key.item_id,request]).map_err(|e|e.to_string())?;
+                transaction.execute("INSERT INTO approvals VALUES(?1,?2,?3,?4,0)",params![session,agent,key.item_id,request]).map_err(|e|e.to_string())?;
+                transaction.execute("INSERT INTO current_approval VALUES(?1,?2,?3,?4) ON CONFLICT(session,agent,item) DO UPDATE SET request=excluded.request",params![session,agent,key.item_id,request]).map_err(|e|e.to_string())?;
             }
         } else {
-            transaction.execute("UPDATE approvals SET decision=?4 WHERE agent=?1 AND item=?2 AND request=?3 AND decision=0 AND EXISTS(SELECT 1 FROM current_approval WHERE agent=?1 AND item=?2 AND request=?3)",params![agent,key.item_id,request,if decision==ApprovalDecision::Denied{2}else{1}]).map_err(|e|e.to_string())?;
+            transaction.execute("UPDATE approvals SET decision=?5 WHERE session=?1 AND agent=?2 AND item=?3 AND request=?4 AND decision=0 AND EXISTS(SELECT 1 FROM current_approval WHERE session=?1 AND agent=?2 AND item=?3 AND request=?4)",params![session,agent,key.item_id,request,if decision==ApprovalDecision::Denied{2}else{1}]).map_err(|e|e.to_string())?;
         }
         transaction.commit().map_err(|e|e.to_string())
     }
     pub(crate) fn denied(&self,key:&ApprovalKey)->Result<bool,String>{
         self.scope.revalidate()?;
-        self.db.query_row("SELECT EXISTS(SELECT 1 FROM current_approval c JOIN approvals a USING(agent,item,request) WHERE c.agent=?1 AND c.item=?2 AND a.decision=2)",params![key.agent_id.as_deref().unwrap_or(""),key.item_id],|r|r.get(0)).map_err(|e|e.to_string())
+        let session=self.confirmed()?;
+        self.db.query_row("SELECT EXISTS(SELECT 1 FROM current_approval c JOIN approvals a USING(session,agent,item,request) WHERE c.session=?1 AND c.agent=?2 AND c.item=?3 AND a.decision=2)",params![session,key.agent_id.as_deref().unwrap_or(""),key.item_id],|r|r.get(0)).map_err(|e|e.to_string())
     }
 }
 fn storage_error(error:rusqlite::Error)->OriginalError{OriginalError::Unavailable(error.to_string())}
@@ -417,12 +432,25 @@ mod tests {
         let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");
         let store=Store::at(&annotations,&account,"session").unwrap();
         // Durable row committed, process died before file creation.
-        store.db.execute("INSERT INTO retained_attachments VALUES('capture-before-file',0,4)",[]).unwrap();
+        store.db.execute("INSERT INTO retained_attachments VALUES('capture-before-file',0,4,NULL)",[]).unwrap();
         // Durable row committed and file created, process died before lease.
-        store.db.execute("INSERT INTO retained_attachments VALUES('capture-before-lease',0,4)",[]).unwrap();
+        store.db.execute("INSERT INTO retained_attachments VALUES('capture-before-lease',0,4,NULL)",[]).unwrap();
         let orphan=store.directory.join("capture-before-lease");fs::write(&orphan,b"data").unwrap();fs::set_permissions(&orphan,fs::Permissions::from_mode(0o600)).unwrap();
         drop(store);let restored=Store::at(&annotations,&account,"session").unwrap();
         assert!(!orphan.exists());let pending:usize=restored.db.query_row("SELECT count(*) FROM retained_attachments WHERE accepted=0",[],|row|row.get(0)).unwrap();assert_eq!(pending,0);
+    }
+
+    #[test]
+    fn unconfirmed_capture_binds_atomically_without_changing_the_provider_visible_path(){
+        let root=test_directory();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");
+        let mut pending=Store::open(&annotations,&account,None).unwrap();let image=root.path().join("image.png");fs::write(&image,b"immutable actual dispatch").unwrap();let mut captures=vec![pending.retain_attachment(&image).unwrap()];let sent_path=captures[0].attachment.path.clone();
+        let mut original=prompt("actual-provider-user","text");original.attachments=vec![captures[0].attachment.clone()];
+        assert!(matches!(pending.accept(&original,"text",&[],&mut captures),Err(OriginalError::Unavailable(_))),"a dispatch selector is not session authority");
+        assert!(matches!(pending.original(Some(&original.user_id),0,4),Err(OriginalError::Unavailable(_))));
+        let mut confirmed=Store::at(&annotations,&account,"actual-confirmed-session").unwrap();confirmed.accept(&original,"text",&[],&mut captures).unwrap();drop(captures);drop(pending);drop(confirmed);
+        let mut restored=Store::at(&annotations,&account,"actual-confirmed-session").unwrap();assert_eq!(fs::read(&sent_path).unwrap(),b"immutable actual dispatch");assert_eq!(restored.original(Some(&original.user_id),0,4).unwrap().original.attachments[0].path,sent_path);
+        let mut other=Store::at(&annotations,&account,"another-session").unwrap();let other_original=prompt("actual-provider-user","else");other.accept(&other_original,"else",&[],&mut []).unwrap();
+        restored.purge_current_session().unwrap();assert!(!sent_path.exists());assert!(matches!(restored.original(Some(&original.user_id),0,4),Err(OriginalError::Unavailable(_))));assert_eq!(other.original(Some(&original.user_id),0,4).unwrap().text,"else");
     }
 
 }
