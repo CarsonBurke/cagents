@@ -861,6 +861,9 @@ impl Handle {
         &self,
         command: &Command,
     ) -> Result<Option<super::FileChangeReply>, String> {
+        if !matches!(command,Command::LoadFileChanges {..}|Command::LoadFileChangePatches {..}) {
+            return Ok(None);
+        }
         self.0
             .store
             .lock()

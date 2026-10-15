@@ -563,6 +563,11 @@ impl Store {
         &self,
         command: &Command,
     ) -> Result<Option<crate::chat::FileChangeReply>, String> {
+        // The ordinary ChatCommand dispatcher probes this API for every
+        // command. Cache unavailability must not consume safe control routes.
+        if !matches!(command,Command::LoadFileChanges {..}|Command::LoadFileChangePatches {..}) {
+            return Ok(None);
+        }
         self.with_source_read(|error|error, |store| {
         store.source_guard()?;
         let requested_key = match command {

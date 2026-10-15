@@ -133,6 +133,9 @@ mod tests {
         assert!(store.raw_source_page(RawSourceQuery {source:SourceKey {agent_id:None,source_id:"tool".into()},field:RawSourceField::ToolInput,offset:0,limit:64,expected_epoch:None,until:None}).is_err());
         assert!(store.source_page(SourceQuery {source:SourceKey {agent_id:None,source_id:"prose".into()},offset:0,limit:64,expected_epoch:None,until:None}).is_err());
         assert!(store.file_query(&Command::LoadFileChanges {request_id:1,after:None}).is_err());
+        for command in [Command::Interrupt,Command::Refresh,Command::Answer {request_id:"safe-denial".into(),action:"deny".into(),answers:Vec::new()}] {
+            assert!(matches!(store.file_query(&command),Ok(None)),"unrelated control probes do not require a source read lease");
+        }
         assert!(store.window().is_err());
         let mut state=crate::chat::Snapshot::default();
         state.items.push(std::sync::Arc::new(item("old-view",ItemContent::Text {text:"private retained view".into(),thinking:false,phase:Phase::Final})));
@@ -203,4 +206,37 @@ mod tests {
         store.db.execute_batch("ROLLBACK").unwrap();
         assert_all_reads_and_retry_refuse(&mut store);
     }
+    #[test]
+    fn actual_runtime_safe_denial_routes_remain_usable_when_cache_reads_are_poisoned() {
+        use crate::chat::protocol::{Adapter,ProcessSpec,Step,TransportSpec};
+        struct Controls(crossbeam_channel::Sender<String>);
+        impl Adapter for Controls {
+            fn initialize(&mut self)->Result<Step,String>{Ok(Step::default())}
+            fn receive(&mut self,_:serde_json::Value)->Result<Step,String>{Ok(Step::default())}
+            fn command(&mut self,command:Command)->Result<Step,String>{
+                let Command::Answer {action,..}=command else {return Err("fixture expects actual denial".into())};
+                self.0.send(action).unwrap();Ok(Step::default())
+            }
+        }
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:std::env::temp_dir(),environment:Default::default()};
+        let (observed,received)=crossbeam_channel::bounded(1);
+        let mut initial=Step {events:vec![Event::Ready(true)],..Step::default()};
+        let store=super::super::preflight(&spec,&mut initial).unwrap();
+        let handle=super::super::Handle::start(spec,Box::new(Controls(observed)),initial,store,None,|_|{}).unwrap();
+        {
+            let store=handle.0.store.lock().unwrap();
+            let hook=RollbackFault::install(&store);
+            assert!(store.with_source_read(|e|e,|_|Ok::<_,String>(())).is_err());
+            drop(hook);
+            store.db.execute_batch("ROLLBACK").unwrap();
+            assert!(store.source_guard().is_err());
+        }
+        let denial=Command::Answer {request_id:"pending-approval".into(),action:"deny".into(),answers:Vec::new()};
+        assert!(matches!(handle.file_query(&denial),Ok(None)),"host ordinary dispatch probes cache before provider command");
+        assert!(handle.file_query(&Command::LoadFileChanges {request_id:1,after:None}).is_err());
+        handle.command(denial).unwrap();
+        assert_eq!(received.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),"deny");
+        handle.close().unwrap();
+    }
+
 }
