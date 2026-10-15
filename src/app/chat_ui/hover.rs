@@ -29,6 +29,7 @@ use iced::{Element, Length, window};
 pub(super) fn view<'a, Message, Theme, Renderer>(
     base: impl Into<Element<'a, Message, Theme, Renderer>>,
     top: impl Into<Element<'a, Message, Theme, Renderer>>,
+    spacing: f32,
 ) -> Element<'a, Message, Theme, Renderer>
 where
     Message: 'a,
@@ -45,6 +46,7 @@ where
     struct Hover<'a, Message, Theme, Renderer> {
         base: Element<'a, Message, Theme, Renderer>,
         top: Element<'a, Message, Theme, Renderer>,
+        spacing: f32,
     }
 
     fn child_layouts<'b>(
@@ -97,18 +99,49 @@ where
             renderer: &Renderer,
             limits: &layout::Limits,
         ) -> layout::Node {
-            let base = self
-                .base
-                .as_widget_mut()
-                .layout(&mut tree.children[0], renderer, limits);
-
-            let top = self.top.as_widget_mut().layout(
-                &mut tree.children[1],
-                renderer,
-                &layout::Limits::new(Size::ZERO, base.size()),
-            );
-
-            layout::Node::with_children(base.size(), vec![base, top])
+            // The hidden actions reserve exactly the space they will paint.
+            // A long date moves below the header in narrow panes, leaving at
+            // least half the row for the command rather than covering it.
+            let top =
+                self.top
+                    .as_widget_mut()
+                    .layout(&mut tree.children[1], renderer, &limits.loose());
+            let stacked = top.size().width + self.spacing > limits.max().width / 2.0;
+            let base_limits = if stacked {
+                limits.shrink(Size::new(0.0, top.size().height + self.spacing))
+            } else {
+                limits.shrink(Size::new(top.size().width + self.spacing, 0.0))
+            };
+            let base =
+                self.base
+                    .as_widget_mut()
+                    .layout(&mut tree.children[0], renderer, &base_limits);
+            let natural = if stacked {
+                Size::new(
+                    base.size().width.max(top.size().width),
+                    base.size().height + self.spacing + top.size().height,
+                )
+            } else {
+                Size::new(
+                    base.size().width + self.spacing + top.size().width,
+                    base.size().height.max(top.size().height),
+                )
+            };
+            let size = limits.resolve(Length::Fill, Length::Shrink, natural);
+            let (base, top) = if stacked {
+                let y = base.size().height + self.spacing;
+                let x = (size.width - top.size().width).max(0.0);
+                (base, top.move_to(iced::Point::new(x, y)))
+            } else {
+                let base_y = (size.height - base.size().height) / 2.0;
+                let top_y = (size.height - top.size().height) / 2.0;
+                let x = (size.width - top.size().width).max(0.0);
+                (
+                    base.move_to(iced::Point::new(0.0, base_y)),
+                    top.move_to(iced::Point::new(x, top_y)),
+                )
+            };
+            layout::Node::with_children(size, vec![base, top])
         }
 
         fn draw(
@@ -405,5 +438,6 @@ where
     Element::new(Hover {
         base: base.into(),
         top: top.into(),
+        spacing,
     })
 }
