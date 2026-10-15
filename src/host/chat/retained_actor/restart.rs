@@ -139,11 +139,12 @@ pub(in crate::host) fn restart_completed(
             recovery_environment: handle.restart_environment().0,
         };
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down
-            || state.chats.get(&source.id).is_none_or(|record| {
-                !record.handle.same_actor(&handle) || !record.handle.is_completed()
-            })
-        {
+        let completed_same_owner = match state.chats.get(&source.id) {
+            Some(record) if record.handle.same_actor(&handle) =>
+                record.handle.try_close_identity().map_err(unavailable)?.completed,
+            _ => false,
+        };
+        if state.shutting_down || !completed_same_owner {
             return Err(unavailable(
                 "The retained owner changed during restart preparation; no provider was started",
             ));
