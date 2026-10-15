@@ -182,6 +182,12 @@ pub(crate) fn resident_raw(text:&Arc<str>)->Option<ResidentRaw> {
     let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());state.prune();emit(pool,&mut state);
     state.raw_provenance.get(&Owner::Raw(text).id()).cloned()
 }
+/// Exact live Item lookup for result acceptance, without scanning/pruning the
+/// global pool or borrowing other source bodies. Its weak header prevents ID
+/// reuse while provenance remains indexed; the caller supplies a live Arc.
+pub(crate) fn resident_source(item:&Arc<Item>)->Option<ResidentSource> {
+    owners().lock().unwrap_or_else(|error|error.into_inner()).provenance.get(&Owner::Item(item).id()).cloned()
+}
 pub(crate) fn resident_sources(snapshot:&Snapshot)->Vec<ResidentSource> {
     let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());state.prune();emit(pool,&mut state);resident_sources_in(&state,snapshot)
 }
