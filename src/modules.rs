@@ -36,6 +36,10 @@ pub mod diagnostics;
 #[cfg(feature = "ui")]
 pub mod diff_view;
 #[cfg(feature = "ui")]
+pub mod diff_interaction;
+#[cfg(feature = "ui")]
+pub mod diff_patch;
+#[cfg(feature = "ui")]
 pub mod document_link;
 #[cfg(feature = "ui")]
 pub mod document_render;
