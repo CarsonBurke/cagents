@@ -2741,7 +2741,7 @@ impl Actor {
                 continue;
             }
             #[cfg(test)]
-            if matches!(&command,ActorCommand::CloseIfRevision{..}) {self.adapter.after_close_input_drained();}
+            if matches!(&command,ActorCommand::CloseIfRevision{..}|ActorCommand::CloseIfIdle{..}) {self.adapter.after_close_input_drained();}
             let (run, command) = match command {
                 ActorCommand::CaptureExecutionDirectory { directory, proof } => {
                     let result = directory::capture(self, &directory);
@@ -5590,17 +5590,20 @@ mod tests {
                 }
             }
         }
+        for idle_close in [false,true] {
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
         let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sh".into(),arguments:vec!["-c".into(),"while [ ! -e \"$1/release\" ]; do sleep 0.01; done; printf '{\"turn\":true}\\n'; : > \"$1/emitted\"; exec cat".into(),"fixture".into(),directory.path().to_string_lossy().into_owned()],working_directory:directory.path().into(),environment:BTreeMap::new()};
         let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
         let handle=LocalHandle::start(spec,Box::new(AfterPoll {directory:directory.path().into()}),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
         let consent=handle.close_observation();
-        let refusal=handle.close_if_revision(consent.close_revision).unwrap_err();
+        let generation=handle.0.state.lock().unwrap().generation;
+        let refusal=if idle_close {handle.close_if_idle(generation)} else {handle.close_if_revision(consent.close_revision)}.unwrap_err();
         assert!(directory.path().join("emitted").exists(),"the provider crossed the exact post-poll gap");
-        assert!(refusal.contains("work is unchanged"));
+        assert!(refusal.contains(if idle_close {"quiescent ownership"} else {"work is unchanged"}));
         assert!(!handle.is_completed());assert!(!handle.close_observation().closing);
         until(&handle,|state|state.turn_generation>consent.turn_generation);
         handle.close().unwrap();
+        }
     }
 
 
