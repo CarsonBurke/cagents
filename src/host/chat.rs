@@ -1433,7 +1433,7 @@ fn start_with_execution(
 
 /// Attach a CLI view without stopping the server-owned thread or its native
 /// connection. Both descriptors retain the same daemon-owned session ID.
-fn codex_terminal_view(
+pub(super) fn codex_terminal_view(
     host: &SharedHost,
     client: ClientId,
     chat_id: TerminalId,

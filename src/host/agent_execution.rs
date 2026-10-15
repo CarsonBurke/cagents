@@ -21,6 +21,8 @@ mod account_info;
 mod directory;
 pub(super) mod mailbox;
 mod ownership;
+mod restart;
+pub(super) use restart::{prepare_restart_pair, restore_restart_pair};
 pub(super) mod terminals;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
@@ -1100,6 +1102,17 @@ fn create_console(
     session: &chat::Session,
     handle: &chat::runtime::Handle,
 ) -> Result<(), ConsoleError> {
+    create_console_with_restart(host, registry, agent, session, handle, None).map(|_| ())
+}
+
+fn create_console_with_restart(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: AgentId,
+    session: &chat::Session,
+    handle: &chat::runtime::Handle,
+    restart: Option<(&Agent, &chat::Session)>,
+) -> Result<Option<chat::RestartReceipt>, ConsoleError> {
     let program = crate::companion::Product::Cli
         .beside_current()
         .map_err(|e| e.to_string())?;
@@ -1198,15 +1211,30 @@ fn create_console(
             record.session.terminal = Some(descriptor.session.clone());
             record.paired_terminal = Some(console_handle.clone());
         }
-        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        let expected = registry
-            .agent(agent)?
-            .session
-            .ok_or("Provider binding disappeared")?;
-        registry.bind_agent_console(agent, &expected, descriptor.session.clone())?;
-        Ok::<_, String>(())
+        let receipt = if let Some((_, source)) = restart {
+            let current = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let record = state.chats.get(&session.id)
+                    .filter(|record| record.handle.same_actor(handle))
+                    .ok_or("The restarted provider changed before its pair was saved")?;
+                let mut current = record.session.clone();
+                current.launch.session_id = handle.confirmed_session_id();
+                current.native_continuity = handle.native_continuity();
+                current
+            };
+            Some(chat::RestartReceipt::confirm(source.clone(), current)?)
+        } else { None };
+        let mut registry = registry.lock().unwrap_or_else(|p|p.into_inner());
+        if let Some((previous,_)) = restart {
+            registry.rebind_restarted_agent(previous, receipt.as_ref().ok_or("The restart receipt disappeared")?)?;
+        } else {
+            let expected = registry.agent(agent)?.session.ok_or("Provider binding disappeared")?;
+            registry.bind_agent_console(agent, &expected, descriptor.session.clone())?;
+        }
+        Ok::<_, String>(receipt)
     })();
-    if let Err(error) = publish {
+    if let Err(error) = &publish {
+        let error = error.clone();
         // The holder must retain its exact pair until terminal teardown is
         // proved. Clearing the pair first loses the cleanup owner if the daemon
         // crashes between that acknowledgment and terminal shutdown.
@@ -1258,8 +1286,9 @@ fn create_console(
         }
         return Err(ConsoleError::Known(error));
     }
+    let receipt = publish.map_err(ConsoleError::Known)?;
     announce(host, registry);
-    Ok(())
+    Ok(receipt)
 }
 
 fn console(

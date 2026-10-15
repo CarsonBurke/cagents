@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub mod coordination;
 pub mod presentation;
 pub mod pricing;
+mod restart;
+pub use restart::RestartReceipt;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
