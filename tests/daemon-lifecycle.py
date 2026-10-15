@@ -46,8 +46,15 @@ class Instance:
         self.root.mkdir(mode=0o700)
         runtime = self.root / "runtime"
         runtime.mkdir(mode=0o700)
-        self.env = os.environ.copy()
-        self.env.update({
+        home = self.root / "home"
+        home.mkdir(mode=0o700)
+        # No production provider/account state or credential environment belongs
+        # in these shell-only fixtures, even though no provider is launched.
+        self.env = {
+            "HOME": str(home),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "TERM": "xterm-256color",
             "XDG_RUNTIME_DIR": str(runtime),
             "XDG_DATA_HOME": str(self.root / "data"),
             "XDG_CONFIG_HOME": str(self.root / "config"),
@@ -57,10 +64,7 @@ class Instance:
             "CAGENTS_EXITED_TERMINAL_RETENTION_SECS": str(retention),
             "CAGENTS_LOCAL_DEBUG": "1",
             "RUST_LOG": "cagents=debug,cagentsd=debug,warn",
-        })
-        for key in ("CAGENTS_DEVICE", "CAGENTS_DEVICE_SOCKET", "CAGENTS_DAEMON_FENCE",
-                    "CAGENTS_INSTALL_GUARD", "DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET"):
-            self.env.pop(key, None)
+        }
         help_result = subprocess.run([str(binaries / "cagents"), "terminal", "list", "--help"],
                                      env=self.env, capture_output=True, text=True, timeout=10)
         self.list_all = "--all" in help_result.stdout
