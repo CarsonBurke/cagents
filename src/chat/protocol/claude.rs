@@ -8174,14 +8174,16 @@ mod tests {
 
     #[test]
     fn notification_questions_use_real_claude_prompts_across_pending_requests() {
-        let question = |id: &str, text: &str| json!({
-            "type":"control_request", "request_id":id,
-            "request":{"subtype":"can_use_tool", "tool_name":"AskUserQuestion",
-                "input":{"questions":[{"question":text,"header":"Migration",
-                    "options":[{"label":"Keep","description":"Keep existing"},
-                        {"label":"Replace","description":"Use replacement"}],
-                    "multiSelect":false}]}}
-        });
+        let question = |id: &str, text: &str| {
+            json!({
+                "type":"control_request", "request_id":id,
+                "request":{"subtype":"can_use_tool", "tool_name":"AskUserQuestion",
+                    "input":{"questions":[{"question":text,"header":"Migration",
+                        "options":[{"label":"Keep","description":"Keep existing"},
+                            {"label":"Replace","description":"Use replacement"}],
+                        "multiSelect":false}]}}
+            })
+        };
         let frames = vec![
             question("question-a", "Which config_file.rs strategy should A use?"),
             question("question-b", "Which migration should B use?"),
@@ -8191,17 +8193,35 @@ mod tests {
             question("question-b", "Unsupported duplicate wording"),
         ];
         let receipts = crate::chat::runtime::notification_frames_for_test(
-            Box::new(Claude { busy: true, ready: true, ..Default::default() }),
-            frames, false,
+            Box::new(Claude {
+                busy: true,
+                ready: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
         );
         assert_eq!(receipts.len(), 2);
-        assert!(receipts[0].1.preview.contains("Which config_file.rs strategy should A use?"));
-        assert!(receipts[1].1.preview.contains("Which migration should B use?"));
+        assert!(
+            receipts[0]
+                .1
+                .preview
+                .contains("Which config_file.rs strategy should A use?")
+        );
+        assert!(
+            receipts[1]
+                .1
+                .preview
+                .contains("Which migration should B use?")
+        );
         assert!(!receipts[1].1.preview.contains("Unsupported duplicate"));
         assert_ne!(receipts[0].0.key, receipts[1].0.key);
         for (evidence, content) in receipts {
             assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
-            assert_eq!(content.request, Some(crate::notifications::RequestType::Question));
+            assert_eq!(
+                content.request,
+                Some(crate::notifications::RequestType::Question)
+            );
             assert!(!content.preview.contains("waiting for your answers"));
         }
     }

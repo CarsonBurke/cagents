@@ -3886,13 +3886,15 @@ mod tests {
 
     #[test]
     fn notification_questions_use_real_codex_prompts_and_same_id_revisions() {
-        let question = |id: u64, text: &str| json!({
-            "id":id, "method":"item/tool/requestUserInput",
-            "params":{"threadId":"thread-exact", "turnId":"notification-turn",
-                "questions":[{"id":"migration", "header":"Migration", "question":text,
-                    "options":[{"label":"Keep","description":"Keep existing"},
-                        {"label":"Replace","description":"Use replacement"}]}]}
-        });
+        let question = |id: u64, text: &str| {
+            json!({
+                "id":id, "method":"item/tool/requestUserInput",
+                "params":{"threadId":"thread-exact", "turnId":"notification-turn",
+                    "questions":[{"id":"migration", "header":"Migration", "question":text,
+                        "options":[{"label":"Keep","description":"Keep existing"},
+                            {"label":"Replace","description":"Use replacement"}]}]}
+            })
+        };
         let frames = vec![
             question(71, "Which config_file.rs strategy should A use?"),
             question(72, "Which migration should B use?"),
@@ -3901,17 +3903,27 @@ mod tests {
             question(72, "Updated B: preserve config_file.rs?"),
             question(72, "Updated B: preserve config_file.rs?"),
         ];
-        let receipts = crate::chat::runtime::notification_frames_for_test(
-            Box::new(adapter()), frames, false,
+        let receipts =
+            crate::chat::runtime::notification_frames_for_test(Box::new(adapter()), frames, false);
+        assert_eq!(
+            receipts.len(),
+            3,
+            "identical repeated metadata must not notify again"
         );
-        assert_eq!(receipts.len(), 3, "identical repeated metadata must not notify again");
         for (index, expected) in [
             "Which config_file.rs strategy should A use?",
-            "Which migration should B use?", "Updated B: preserve config_file.rs?",
-        ].into_iter().enumerate() {
+            "Which migration should B use?",
+            "Updated B: preserve config_file.rs?",
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (evidence, content) = &receipts[index];
             assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
-            assert_eq!(content.request, Some(crate::notifications::RequestType::Question));
+            assert_eq!(
+                content.request,
+                Some(crate::notifications::RequestType::Question)
+            );
             assert!(content.preview.contains(expected), "{}", content.preview);
             assert!(!content.preview.contains("waiting for your answer"));
         }
@@ -3921,23 +3933,35 @@ mod tests {
 
     #[test]
     fn notification_secret_question_revisions_notify_without_exposing_prompts() {
-        let question = |wording: &str| json!({
-            "id":73, "method":"item/tool/requestUserInput",
-            "params":{"threadId":"thread-exact", "turnId":"notification-turn",
-                "questions":[{"id":"secret", "header":"PRIVATE_HEADER", "question":wording,
-                    "isSecret":true, "options":[]}]}
-        });
+        let question = |wording: &str| {
+            json!({
+                "id":73, "method":"item/tool/requestUserInput",
+                "params":{"threadId":"thread-exact", "turnId":"notification-turn",
+                    "questions":[{"id":"secret", "header":"PRIVATE_HEADER", "question":wording,
+                        "isSecret":true, "options":[]}]}
+            })
+        };
         let receipts = crate::chat::runtime::notification_frames_for_test(
-            Box::new(adapter()), vec![
-                question("PRIVATE_FIRST_QUESTION"), question("PRIVATE_CHANGED_QUESTION"),
+            Box::new(adapter()),
+            vec![
+                question("PRIVATE_FIRST_QUESTION"),
                 question("PRIVATE_CHANGED_QUESTION"),
-            ], false,
+                question("PRIVATE_CHANGED_QUESTION"),
+            ],
+            false,
         );
-        assert_eq!(receipts.len(), 2, "changed secret prompts still need fresh attention");
+        assert_eq!(
+            receipts.len(),
+            2,
+            "changed secret prompts still need fresh attention"
+        );
         assert_ne!(receipts[0].0.key, receipts[1].0.key);
         for (evidence, content) in receipts {
             assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
-            assert_eq!(content.request, Some(crate::notifications::RequestType::Question));
+            assert_eq!(
+                content.request,
+                Some(crate::notifications::RequestType::Question)
+            );
             assert_eq!(content.preview, "Codex is waiting for your answer.");
             assert!(!content.preview.contains("PRIVATE"));
         }

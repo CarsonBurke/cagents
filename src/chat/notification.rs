@@ -185,7 +185,10 @@ fn public_question_preview(request: &super::Request) -> Option<String> {
     // heading as the field label (OMP); those fields contain input help, not
     // a replacement for that message. Keep the existing meaningful message
     // first in that shape. Claude/Codex have distinct public question labels.
-    let message_first = request.fields.iter().filter(|field| !field.secret)
+    let message_first = request
+        .fields
+        .iter()
+        .filter(|field| !field.secret)
         .all(|field| field.label.is_empty() || field.label == request.title);
     let mut text = if message_first {
         bounded(&request.description, RETAINED_BYTES)
@@ -238,14 +241,22 @@ impl Snapshot {
         // values never define a new notice or enter this digest.
         for field in &request.fields {
             digest.update([0]);
-            for text in [field.id.as_str(), field.label.as_str(), field.description.as_str()] {
+            for text in [
+                field.id.as_str(),
+                field.label.as_str(),
+                field.description.as_str(),
+            ] {
                 digest.update(text.len().to_le_bytes());
                 digest.update(text.as_bytes());
             }
             digest.update([u8::from(field.multiple), u8::from(field.secret)]);
             digest.update(field.choices.len().to_le_bytes());
             for choice in &field.choices {
-                for text in [choice.id.as_str(), choice.label.as_str(), choice.description.as_str()] {
+                for text in [
+                    choice.id.as_str(),
+                    choice.label.as_str(),
+                    choice.description.as_str(),
+                ] {
                     digest.update(text.len().to_le_bytes());
                     digest.update(text.as_bytes());
                 }
@@ -295,16 +306,37 @@ mod tests {
         use crate::chat::{Choice, Field, Request, RequestKind};
         let mut snapshot = Snapshot {
             requests: vec![Request {
-                kind: RequestKind::Question, id: "question".into(), title: "Provider questions".into(),
+                kind: RequestKind::Question,
+                id: "question".into(),
+                title: "Provider questions".into(),
                 description: "Provider is waiting for your answers.".into(),
-                fields: vec![Field { id: "public".into(),
-                    label: "Which `config_file.rs` strategy?".into(), description: "Migration".into(),
-                    choices: vec![Choice { id: "keep".into(), label: "Keep".into(), description: "Keep existing".into() }],
-                    multiple: false, secret: false, initial: "PRIVATE_ANSWER".into(),
-                }, Field { id: "secret".into(), label: "PRIVATE_LABEL".into(),
-                    description: "PRIVATE_DESCRIPTION".into(), choices: vec![],
-                    multiple: false, secret: true, initial: "PRIVATE_SECRET".into() }], actions: vec![],
-            }], ..Default::default()
+                fields: vec![
+                    Field {
+                        id: "public".into(),
+                        label: "Which `config_file.rs` strategy?".into(),
+                        description: "Migration".into(),
+                        choices: vec![Choice {
+                            id: "keep".into(),
+                            label: "Keep".into(),
+                            description: "Keep existing".into(),
+                        }],
+                        multiple: false,
+                        secret: false,
+                        initial: "PRIVATE_ANSWER".into(),
+                    },
+                    Field {
+                        id: "secret".into(),
+                        label: "PRIVATE_LABEL".into(),
+                        description: "PRIVATE_DESCRIPTION".into(),
+                        choices: vec![],
+                        multiple: false,
+                        secret: true,
+                        initial: "PRIVATE_SECRET".into(),
+                    },
+                ],
+                actions: vec![],
+            }],
+            ..Default::default()
         };
         let content = snapshot.notification_content(Kind::Waiting);
         assert!(content.preview.contains("Which config_file.rs strategy?"));
@@ -316,7 +348,12 @@ mod tests {
         snapshot.requests[0].fields[1].label = "EDITED_SECRET_LABEL".into();
         let changed_secret_prompt = snapshot.waiting_fingerprint();
         assert_ne!(changed_secret_prompt, original);
-        assert!(!snapshot.notification_content(Kind::Waiting).preview.contains("SECRET_LABEL"));
+        assert!(
+            !snapshot
+                .notification_content(Kind::Waiting)
+                .preview
+                .contains("SECRET_LABEL")
+        );
         snapshot.requests[0].fields[0].choices[0].label = "Keep revised option".into();
         assert_ne!(snapshot.waiting_fingerprint(), changed_secret_prompt);
         snapshot.requests[0].fields[0].label = "λ".repeat(RETAINED_BYTES * 2);

@@ -3104,7 +3104,10 @@ pub(crate) fn notification_frames_for_test(
     adapter: Box<dyn Adapter>,
     frames: Vec<serde_json::Value>,
     fail_store: bool,
-) -> Vec<(crate::notifications::Evidence, crate::notifications::Content)> {
+) -> Vec<(
+    crate::notifications::Evidence,
+    crate::notifications::Content,
+)> {
     assert!(!frames.is_empty() && frames.len() <= 32);
     let count = frames.len();
     struct Frame {
