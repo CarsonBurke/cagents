@@ -116,3 +116,18 @@ fn a_genuine_ssh_failure_is_not_an_already_stopped_remote_daemon() {
     assert_eq!(error["error"]["kind"],"device");
     assert!(!fixture.root.path().join("spawned").exists());
 }
+
+#[test]
+fn unresolved_runtime_is_an_error_rather_than_an_already_stopped_daemon() {
+    let fixture=Fixture::new();
+    for runtime in [None,Some("relative-runtime")] {
+        let mut command=fixture.command(&["daemon","stop"]).env_remove("XDG_RUNTIME_DIR");
+        if let Some(runtime)=runtime {command=command.env("XDG_RUNTIME_DIR",runtime);}
+        let output=fixture.run(command);
+        assert_eq!(output.exit_code,Some(1),"{output:?}");
+        assert!(output.stdout.is_empty());
+        let error:Value=serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"],"socket_path","{error}");
+        assert!(!fixture.root.path().join("spawned").exists());
+    }
+}
