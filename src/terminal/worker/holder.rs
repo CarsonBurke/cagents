@@ -2937,6 +2937,25 @@ while not (root/'exit-root').exists(): time.sleep(.005)
     }
 
     #[test]
+    fn cleanup_report_uses_its_dedicated_channel_on_the_shared_reactor() {
+        let (control, peer) = UnixStream::pair().unwrap();
+        let root = open_pidfd(std::process::id() as i32).unwrap();
+        let (released, _release) = std::io::pipe().unwrap();
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let (acknowledge, acknowledged) = crossbeam_channel::bounded(1);
+        let (cleanup, cleaned) = crossbeam_channel::bounded(1);
+        let runtime = crate::terminal::reactor::runtime().unwrap();
+        let watcher = runtime.spawn(watch_shared(control, root, released, exits, acknowledge, cleanup, false));
+        send(&peer, &Report::ScreenCached, &[]).unwrap();
+        assert!(acknowledged.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+        assert!(matches!(cleaned.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+        send(&peer, &Report::CleanupProved, &[]).unwrap();
+        cleaned.recv_timeout(Duration::from_secs(2)).unwrap();
+        runtime.block_on(async { tokio::time::timeout(Duration::from_secs(2), watcher).await.unwrap().unwrap(); });
+        assert!(acknowledged.try_recv().is_err(), "cleanup must never reuse the generic screen/adoption ACK");
+    }
+
+    #[test]
     fn stale_screen_ack_and_holder_exit_do_not_prove_descendant_cleanup() {
         struct Kill(File);
         impl Drop for Kill {fn drop(&mut self){let _=signal(&self.0,libc::SIGKILL);}}
