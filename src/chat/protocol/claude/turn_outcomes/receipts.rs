@@ -237,6 +237,9 @@ mod tests {
             ("Bash", json!({"interrupted":false,"backgroundTaskId":"background-job","backgroundedByTurnAbort":true}), false),
             ("Bash", json!({"interrupted":true,"backgroundTaskId":"background-job"}), false),
             ("Bash", json!({"interrupted":true,"detachedToolCall":true}), false),
+            ("Bash", json!({"interrupted":true,"backgroundedByUser":true}), false),
+            ("Bash", json!({"interrupted":true,"backgroundedToDeliverMessage":true}), false),
+            ("Bash", json!({"interrupted":true,"timedOutAfterMs":1000}), false),
             ("Bash", json!({"interrupted":"true"}), false),
         ] {
             let mut adapter = adapter(); let input = submit(&mut adapter); accept(&mut adapter, &input);

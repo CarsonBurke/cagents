@@ -45,7 +45,9 @@ pub(super) fn interrupted_shell(content: &ItemContent, result: &Value) -> bool {
     let absent_or_false = |field: &str| result.get(field).is_none_or(|value| value.is_null() || value.as_bool() == Some(false));
     let no_background = result.get("backgroundTaskId").is_none_or(|value| value.is_null() || value.as_str() == Some(""));
     known && result["interrupted"].as_bool() == Some(true) && absent_or_false("detachedToolCall")
-        && absent_or_false("backgroundedByTurnAbort") && no_background
+        && absent_or_false("backgroundedByTurnAbort") && absent_or_false("backgroundedByUser")
+        && absent_or_false("backgroundedToDeliverMessage") && no_background
+        && result.get("timedOutAfterMs").is_none_or(Value::is_null)
 }
 
 impl Inputs {
