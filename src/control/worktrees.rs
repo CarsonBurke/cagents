@@ -115,6 +115,7 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
         Reply::BranchDeleted {..}|Reply::BranchDeleteRefused {..}=>return Err(AppError::new("protocol","Unexpected branch-deletion response")),
         Reply::StaleLock {..}=>return Err(AppError::new("protocol","Unexpected stale-lock response")),
         Reply::ResolvedProject {..}=>return Err(AppError::new("protocol","Unexpected project-ID response")),
+        Reply::SetupIntent {..}|Reply::SetupPrepared {..}=>return Err(AppError::new("protocol","Unexpected setup recovery response")),
         Reply::DisposableIgnoredDirectories {..}=>return Err(AppError::new("protocol","Unexpected policy response")),
         Reply::Inspected {..}=>return Err(AppError::new("protocol","Unexpected worktree inspection response")),
         Reply::Removed {path,branch_deleted,warnings,branch_error}=> {
