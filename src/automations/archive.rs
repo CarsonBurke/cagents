@@ -273,7 +273,7 @@ pub fn inspect_completed_automation_pane(
         .map_err(|_| "The source automation registry is unavailable")?;
     let registry_version: u32 = model.pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| "The source automation registry version is unreadable")?;
-    if registry_version > crate::host::model::SCHEMA_VERSION {
+    if registry_version > crate::host::WORKSPACE_REGISTRY_SCHEMA_VERSION {
         return Err("The source automation registry requires a newer archive inspector".into());
     }
     let schema:bool=model.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='automation_snapshots')",[],|row|row.get(0)).map_err(|_|"The source automation registry is unreadable")?;
@@ -609,7 +609,7 @@ mod tests {
             "no migration or source writes"
         );
         let versioned = Connection::open(&registry).unwrap();
-        for version in [ARCHIVE_REGISTRY_SCHEMA_FLOOR - 1, crate::host::model::SCHEMA_VERSION + 1] {
+        for version in [ARCHIVE_REGISTRY_SCHEMA_FLOOR - 1, crate::host::WORKSPACE_REGISTRY_SCHEMA_VERSION + 1] {
             versioned.pragma_update(None,"user_version",version).unwrap();
             let before_version = std::fs::read(&registry).unwrap();
             assert!(inspect_archived_pane(&window,&registry,card,&session).is_err(),"unsupported archive authority version {version}");
