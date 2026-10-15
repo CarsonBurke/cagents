@@ -2271,7 +2271,7 @@ impl Actor {
         if let Some(message)=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).originals(originals){tracing::warn!(%message,"original command metadata unavailable");}
         let original_revision=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).revision();
         let mut state=self.state.lock().unwrap_or_else(|p|p.into_inner());
-        if state.original_revision!=original_revision{state.original_revision=original_revision;self.dirty=true;}
+        if state.original_revision!=original_revision{state.original_revision=original_revision;state.generation=state.generation.saturating_add(1);self.dirty=true;}
         drop(state);
         for value in step.writes {
             let mut frame = BoundedFrame(Vec::new());
