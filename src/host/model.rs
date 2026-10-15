@@ -97,6 +97,9 @@ impl Registry {
 
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
+        // Writers commit independently of HostState. One read transaction
+        // keeps metadata, views and agents on the same WAL snapshot.
+        let transaction = self.db.unchecked_transaction().map_err(|error| error.to_string())?;
         let (identity, sequence) = self
             .db
             .query_row(
@@ -193,7 +196,7 @@ impl Registry {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(WorkspaceModel {
+        let model = WorkspaceModel {
             navigation_orders,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
@@ -203,7 +206,9 @@ impl Registry {
             projects,
             channels,
             closed_projects,
-        })
+        };
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(model)
     }
 
     /// Applies one edit as a single transaction, bumping `sequence` when it
