@@ -357,7 +357,7 @@ mod settings_typography_tests {
         );
         let small_toggle = text_height(
             crate::ui_controls::field::toggle(false)
-                .label("Choice")
+                .label("Choice".to_owned())
                 .into(),
         );
         let small_button = text_height(crate::ui_controls::button::secondary("Action").into());
@@ -421,7 +421,7 @@ mod settings_typography_tests {
         assert!(
             text_height(
                 crate::ui_controls::field::toggle(false)
-                    .label("Choice")
+                    .label("Choice".to_owned())
                     .into()
             ) > small_toggle
         );
