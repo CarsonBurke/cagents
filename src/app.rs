@@ -21162,12 +21162,25 @@ mod tests {
         log.dismiss(newest);
         assert_eq!(log.len(), 1);
 
-        // Distinct messages past capacity drop the oldest, never grow.
+        // Lower-severity traffic stays bounded without hiding an unresolved error.
         for index in 0..NOTICE_LOG_CAPACITY * 2 {
             log.record(TransientNotice::warning(format!("failure {index}")));
         }
         assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
-        // The surviving error was evicted, so the header must stop claiming one.
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+        let error = log
+            .recent()
+            .find(|entry| entry.notice.message == "first failure")
+            .expect("warning traffic must preserve the unresolved error")
+            .id;
+        assert!(
+            !log.recent()
+                .any(|entry| entry.notice.message == "failure 0")
+        );
+        assert!(log.recent().any(
+            |entry| entry.notice.message == format!("failure {}", NOTICE_LOG_CAPACITY * 2 - 1)
+        ));
+        log.dismiss(error);
         assert_eq!(log.severity(), Some(NoticeSeverity::Warning));
 
         log.clear();
