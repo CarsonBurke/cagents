@@ -15,6 +15,7 @@ struct Deletion {
 #[derive(Default)]
 pub(super) struct State {
     pending: HashMap<AccountId, Deletion>,
+    provider_epochs: BTreeMap<Provider,u64>,
     /// Only starts already in flight at intent are fenced. A subsequently
     /// authenticated new handle gets its own local cache and provenance.
     inflight: HashMap<Target, Vec<Deletion>>,
@@ -68,6 +69,8 @@ impl Cagents {
         if targets.iter().any(|target| fences.get(target).is_some_and(|entries| entries.len()>=MAX_PENDING_DELETIONS && !entries.contains(&deletion))) {
             return Err("A previous conversation is still reconnecting. Let it finish or close it before deleting more account files.".into());
         }
+        let epoch=self.chat_ui.history_deletions.provider_epochs.entry(provider).or_default();
+        *epoch=epoch.checked_add(1).ok_or("Account history revocation generation is exhausted; reopen this window before deleting more files")?;
         for target in targets {
             let entries = fences.entry(target).or_default();
             if !entries.contains(&deletion) { entries.push(deletion.clone()); }
@@ -75,6 +78,12 @@ impl Cagents {
         self.revoke_account_history(&deletion);
         self.chat_ui.history_deletions.pending.insert(id.clone(),deletion);
         Ok(())
+    }
+
+    /// Archived readers without backend home association fence only their old
+    /// body/query lineage against this intent; this never grants read authority.
+    pub(in crate::app) fn account_history_revocation_epoch(&self,provider:Provider)->u64 {
+        self.chat_ui.history_deletions.provider_epochs.get(&provider).copied().unwrap_or(0)
     }
 
     fn revoke_account_history(&mut self, deletion: &Deletion) {

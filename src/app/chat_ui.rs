@@ -17763,4 +17763,21 @@ mod tests {
         assert!(chat_runtime(&app,card).snapshot.items.is_empty());
     }
 
+
+    #[test]
+    fn account_history_archive_epoch_advances_only_for_successful_deletion_preflight() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let id=app.account_ui.add_managed_fixture(Provider::Codex,99206);
+        assert_eq!(app.account_history_revocation_epoch(Provider::Codex),0);
+        let card=live_chat(&mut app,Some(KNOWN_THREAD)); // Unknown live identity refuses preflight.
+        assert!(app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).is_err());
+        assert_eq!(app.account_history_revocation_epoch(Provider::Codex),0);
+        close_chat(&mut app,card);
+        app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
+        assert_eq!(app.account_history_revocation_epoch(Provider::Codex),1);
+        assert_eq!(app.account_history_revocation_epoch(Provider::Claude),0);
+        complete_account_privacy_intent(&mut app,&id);
+        assert_eq!(app.account_history_revocation_epoch(Provider::Codex),1,"completion does not advance or reset intent lineage");
+    }
+
 }
