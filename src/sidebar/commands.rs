@@ -18,6 +18,45 @@ pub enum CommandTarget {
     },
 }
 
+/// Whole-area intent is independent of the focused row, and refuses a later
+/// explicit selection before the existing fresh-status backend is entered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupTarget {
+    pub key: ActiveWorktreeKey,
+    pub selection_revision: u64,
+}
+impl GroupTarget {
+    pub fn capture(model: &SidebarModel, state: &SidebarState) -> Option<Self> {
+        let source = model.source_control.as_ref()?;
+        (state.active_worktree() == Some(&source.key) && model.contains_worktree(&source.key))
+            .then(|| Self { key: source.key.clone(), selection_revision: state.change_selection_revision() })
+    }
+    pub fn available(&self, model: &SidebarModel, state: &SidebarState, command: Command, modal_open: bool) -> bool {
+        let Some((area, command)) = crate::workspace_widget::git_group_command_target(command) else { return false; };
+        state.active_worktree() == Some(&self.key)
+            && model.source_control.as_ref().is_some_and(|source| source.key == self.key)
+            && state.change_selection_revision() == self.selection_revision
+            && whole_change_group_available(model, state, area, command, modal_open)
+    }
+    pub fn action(&self, model: &SidebarModel, state: &SidebarState, command: Command, modal_open: bool) -> Option<SidebarAction> {
+        let (area, command) = crate::workspace_widget::git_group_command_target(command)?;
+        resolve_captured_change_group(model, state, &self.key, area, command, self.selection_revision, modal_open)?;
+        Some(SidebarAction::RunChangeGroup { key: self.key.clone(), area, command, selection_revision: self.selection_revision })
+    }
+}
+
+pub const fn whole_group_command_id(area: ChangeArea, command: ChangeGroupCommand) -> Option<Command> {
+    Some(match (area, command) {
+        (ChangeArea::Unstaged, ChangeGroupCommand::Stage) => Command::GitStageAllUnstaged,
+        (ChangeArea::Untracked, ChangeGroupCommand::Stage) => Command::GitStageAllUntracked,
+        (ChangeArea::Conflict, ChangeGroupCommand::Stage) => Command::GitStageAllConflicts,
+        (ChangeArea::Staged, ChangeGroupCommand::Unstage) => Command::GitUnstageAllStaged,
+        (ChangeArea::Unstaged, ChangeGroupCommand::Discard) => Command::GitDiscardAllUnstaged,
+        (ChangeArea::Untracked, ChangeGroupCommand::Discard) => Command::GitDiscardAllUntracked,
+        _ => return None,
+    })
+}
+
 /// Menu parameters remain in their ordinary self-contained sidebar action.
 /// Only the template identity is shared with palette/shortcut registration.
 pub fn command_id(action: &SidebarAction) -> Option<Command> {
@@ -386,7 +425,9 @@ impl CommandTarget {
             }
             _ => {}
         }
-        if source.busy() {
+        // Header Stage/Unstage already queue work behind the active mutation.
+        // Preserve that behavior for the same registered selection commands.
+        if source.busy() && !matches!(command, Command::StageSelectedChanges | Command::UnstageSelectedChanges) {
             return None;
         }
         let operation = match command {

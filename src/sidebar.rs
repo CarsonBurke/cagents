@@ -9683,24 +9683,25 @@ fn changes_section<'a>(
                 group_commands(source, group, modal_open)
                     .into_iter()
                     .map(|mut control| {
-                        if selected_change_group_anchor(source, state, group.area).is_some() {
-                            control.name = match control.action.as_ref() {
-                                Some(SidebarAction::ChangeGroup {
-                                    command: ChangeGroupCommand::Stage,
-                                    ..
-                                }) => "Stage selection",
-                                Some(SidebarAction::ChangeGroup {
-                                    command: ChangeGroupCommand::Unstage,
-                                    ..
-                                }) => "Unstage selection",
-                                Some(SidebarAction::ChangeGroup {
-                                    command: ChangeGroupCommand::Discard,
-                                    ..
-                                }) => "Discard selection…",
-                                _ => control.name,
+                        let mut label = Cow::Borrowed(control.name);
+                        if let Some(SidebarAction::ChangeGroup { key, area, command }) = control.action.take() {
+                            let registered = if let Some(row) = selected_change_group_anchor(source, state, area) {
+                                let id = commands::change_command_id(command);
+                                control.action = Some(SidebarAction::RunChangeCommand { command: id, key, row, selection_revision: state.change_selection_revision() });
+                                id
+                            } else {
+                                let id = commands::whole_group_command_id(area, command).expect("existing group control has a template");
+                                if whole_change_group_available_for(source, state, area, command, modal_open) {
+                                    control.action = Some(SidebarAction::RunChangeGroup { key, area, command, selection_revision: state.change_selection_revision() });
+                                }
+                                id
                             };
+                            let descriptor = crate::workspace_widget::shortcut_descriptor(registered);
+                            label = Cow::Borrowed(descriptor.label);
+                            let chords = crate::workspace_widget::shortcut_chords(registered, shortcuts);
+                            if !chords.is_empty() { label = Cow::Owned(format!("{} · {}", descriptor.label, chords)); }
                         }
-                        control.into_element()
+                        panel_icon_action(control.icon, label, control.action, control.id)
                     }),
             ))
             .align_right(Length::Fill)
@@ -10376,9 +10377,10 @@ pub fn whole_change_group_available(
     command: ChangeGroupCommand,
     modal_open: bool,
 ) -> bool {
-    let Some(source) = model.source_control.as_ref() else { return false; };
+    model.source_control.as_ref().is_some_and(|source| model.contains_worktree(&source.key) && whole_change_group_available_for(source, state, area, command, modal_open))
+}
+fn whole_change_group_available_for(source: &SourceControlModel, state: &SidebarState, area: ChangeArea, command: ChangeGroupCommand, modal_open: bool) -> bool {
     if modal_open || state.active_worktree() != Some(&source.key)
-        || !model.contains_worktree(&source.key)
         || !matches!(source.data_state, SidebarDataState::Ready)
         || state.change_rows.first_in_area(area).is_some()
         || source.group(area).is_none_or(ChangeGroup::is_empty)
@@ -17649,6 +17651,40 @@ pub(crate) mod tests {
                     .contains(&"Toggle Projects sidebar — Alt+B".to_owned())
             );
         }
+    }
+
+    #[test]
+    fn registered_whole_group_controls_keep_selection_revision_and_current_chords() {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        let renderer = headless_renderer();
+        let mut model = panel_model();
+        let mut state = panel_state(&model);
+        let mut shortcuts = crate::settings::KeyboardShortcuts::default();
+        shortcuts.git_stage_all_unstaged = vec!["F9".into()];
+        let source = model.source_control.as_ref().unwrap();
+        let target = commands::GroupTarget::capture(&model, &state).unwrap();
+        let names = accessible_names(&renderer, changes_section(&state, source, false, &shortcuts));
+        assert!(names.iter().any(|name| name == "Stage all unstaged changes · F9"), "{names:?}");
+        let actions = frame_enter_presses(&renderer, changes_section(&state, source, false, &shortcuts));
+        let groups: Vec<_> = actions.into_iter().filter(|action| matches!(action, SidebarAction::RunChangeGroup { .. })).collect();
+        assert_eq!(groups.len(), 6);
+        for command in crate::workspace_widget::GIT_GROUP_COMMANDS {
+            let (area, mutation) = crate::workspace_widget::git_group_command_target(command).unwrap();
+            assert_eq!(commands::whole_group_command_id(area, mutation), Some(command));
+            assert!(target.available(&model, &state, command, false));
+            assert!(groups.iter().any(|action| matches!(action, SidebarAction::RunChangeGroup { key, area: actual, command: kind, selection_revision } if key == &target.key && *actual == area && *kind == mutation && *selection_revision == target.selection_revision)));
+            assert!(!target.available(&model, &state, command, true));
+        }
+        let row = ChangeSelectionRow { area: ChangeArea::Unstaged, path: repo_path("assets/logo.png") };
+        state.select_change_rows(row.clone(), SelectionIntent::Toggle, &[row]);
+        assert!(!target.available(&model, &state, Command::GitStageAllUnstaged, false));
+        state.apply(&SidebarAction::ClearChangeSelection { key: target.key.clone() });
+        assert!(!target.available(&model, &state, Command::GitStageAllUnstaged, false), "clearing a newer selection never revives the old payload");
+        let fresh = commands::GroupTarget::capture(&model, &state).unwrap();
+        model.source_control.as_mut().unwrap().set_mutation(Some(MutationKind::Stage));
+        assert!(fresh.available(&model, &state, Command::GitStageAllUnstaged, false));
+        assert!(fresh.available(&model, &state, Command::GitUnstageAllStaged, false));
+        assert!(!fresh.available(&model, &state, Command::GitDiscardAllUnstaged, false));
     }
 
     /// The accessible names an element publishes, in tree order.

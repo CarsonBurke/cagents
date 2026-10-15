@@ -213,6 +213,12 @@ pub enum GlobalShortcut {
     ChatCancelQueued,
     ChatToggleSteering,
     ChatToggleFastMode,
+    GitStageAllUnstaged,
+    GitStageAllUntracked,
+    GitStageAllConflicts,
+    GitUnstageAllStaged,
+    GitDiscardAllUnstaged,
+    GitDiscardAllUntracked,
 
     CommandPalette,
     NewThread,
@@ -525,6 +531,12 @@ impl GlobalShortcut {
             Self::ChatCancelQueued => "chat_cancel_queued",
             Self::ChatToggleSteering => "chat_toggle_steering",
             Self::ChatToggleFastMode => "chat_toggle_fast_mode",
+            Self::GitStageAllUnstaged => "git_stage_all_unstaged",
+            Self::GitStageAllUntracked => "git_stage_all_untracked",
+            Self::GitStageAllConflicts => "git_stage_all_conflicts",
+            Self::GitUnstageAllStaged => "git_unstage_all_staged",
+            Self::GitDiscardAllUnstaged => "git_discard_all_unstaged",
+            Self::GitDiscardAllUntracked => "git_discard_all_untracked",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -699,6 +711,7 @@ pub struct CommandContext {
     /// Some mask records an originating sidebar target, including a stale target with no actions.
     pub sidebar_commands: Option<u64>,
     pub git_commands: u32,
+    pub git_group_commands: u8,
     pub save_in_flight: bool,
     pub focused: FocusedPane,
     pub pane_index: Option<usize>,
@@ -737,6 +750,25 @@ pub struct CommandContext {
     pub can_search_project: bool,
     pub has_attention: bool,
     pub can_cycle_workspace: bool,
+}
+
+/// Whole-area Git templates, distinct from explicit selected-row operations.
+pub const GIT_GROUP_COMMANDS: [GlobalShortcut; 6] = [GlobalShortcut::GitStageAllUnstaged, GlobalShortcut::GitStageAllUntracked, GlobalShortcut::GitStageAllConflicts, GlobalShortcut::GitUnstageAllStaged, GlobalShortcut::GitDiscardAllUnstaged, GlobalShortcut::GitDiscardAllUntracked];
+pub fn git_group_command_bit(command: GlobalShortcut) -> Option<u8> {
+    GIT_GROUP_COMMANDS.iter().position(|candidate| *candidate == command).map(|index| 1 << index)
+}
+pub const fn git_group_command_target(command: GlobalShortcut) -> Option<(crate::repository::ChangeArea, crate::sidebar::ChangeGroupCommand)> {
+    use crate::repository::ChangeArea;
+    use crate::sidebar::ChangeGroupCommand;
+    Some(match command {
+        GlobalShortcut::GitStageAllUnstaged => (ChangeArea::Unstaged, ChangeGroupCommand::Stage),
+        GlobalShortcut::GitStageAllUntracked => (ChangeArea::Untracked, ChangeGroupCommand::Stage),
+        GlobalShortcut::GitStageAllConflicts => (ChangeArea::Conflict, ChangeGroupCommand::Stage),
+        GlobalShortcut::GitUnstageAllStaged => (ChangeArea::Staged, ChangeGroupCommand::Unstage),
+        GlobalShortcut::GitDiscardAllUnstaged => (ChangeArea::Unstaged, ChangeGroupCommand::Discard),
+        GlobalShortcut::GitDiscardAllUntracked => (ChangeArea::Untracked, ChangeGroupCommand::Discard),
+        _ => return None,
+    })
 }
 
 /// Display order shared by the Keyboard table and its registry coverage checks.
@@ -828,6 +860,7 @@ impl ShortcutDescriptor {
     /// must not silently substitute Device files for a different user action.
     pub fn available_on_device(self, remote: bool) -> bool {
         if !remote { return true; }
+        if git_group_command_bit(self.action).is_some() { return false; }
         if matches!(self.scope, ShortcutScope::Editor | ShortcutScope::EditorHistory | ShortcutScope::Repository | ShortcutScope::Review) { return false; }
         !matches!(self.action,
             GlobalShortcut::ResumeConversation | GlobalShortcut::NewWorktree
@@ -842,6 +875,7 @@ impl ShortcutDescriptor {
         if context.save_in_flight && self.action.blocked_during_save() {
             return false;
         }
+        if let Some(bit) = git_group_command_bit(self.action) { return context.git_group_commands & bit != 0; }
         if let Some(bit) = git_command_bit(self.action) {
             return context.git_commands & bit != 0;
         }
@@ -2127,6 +2161,13 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Chat,
     },
+    ShortcutDescriptor { action: GlobalShortcut::GitStageAllUnstaged, label: "Stage all unstaged changes", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitStageAllUntracked, label: "Stage all untracked files", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitStageAllConflicts, label: "Stage all conflicts", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitUnstageAllStaged, label: "Unstage all staged changes", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitDiscardAllUnstaged, label: "Discard all unstaged changes…", repeatable: false, scope: ShortcutScope::Workspace },
+    ShortcutDescriptor { action: GlobalShortcut::GitDiscardAllUntracked, label: "Delete all untracked files…", repeatable: false, scope: ShortcutScope::Workspace },
+
 ];
 
 static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
@@ -2305,6 +2346,12 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::ChatCancelQueued => &shortcuts.chat_cancel_queued,
         GlobalShortcut::ChatToggleSteering => &shortcuts.chat_toggle_steering,
         GlobalShortcut::ChatToggleFastMode => &shortcuts.chat_toggle_fast_mode,
+        GlobalShortcut::GitStageAllUnstaged => &shortcuts.git_stage_all_unstaged,
+        GlobalShortcut::GitStageAllUntracked => &shortcuts.git_stage_all_untracked,
+        GlobalShortcut::GitStageAllConflicts => &shortcuts.git_stage_all_conflicts,
+        GlobalShortcut::GitUnstageAllStaged => &shortcuts.git_unstage_all_staged,
+        GlobalShortcut::GitDiscardAllUnstaged => &shortcuts.git_discard_all_unstaged,
+        GlobalShortcut::GitDiscardAllUntracked => &shortcuts.git_discard_all_untracked,
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,

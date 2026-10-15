@@ -440,6 +440,12 @@ pub struct KeyboardShortcuts {
     pub chat_cancel_queued: Vec<String>,
     pub chat_toggle_steering: Vec<String>,
     pub chat_toggle_fast_mode: Vec<String>,
+    pub git_stage_all_unstaged: Vec<String>,
+    pub git_stage_all_untracked: Vec<String>,
+    pub git_stage_all_conflicts: Vec<String>,
+    pub git_unstage_all_staged: Vec<String>,
+    pub git_discard_all_unstaged: Vec<String>,
+    pub git_discard_all_untracked: Vec<String>,
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -646,6 +652,12 @@ impl Default for KeyboardShortcuts {
             chat_cancel_queued: Vec::new(),
             chat_toggle_steering: Vec::new(),
             chat_toggle_fast_mode: Vec::new(),
+            git_stage_all_unstaged: Vec::new(),
+            git_stage_all_untracked: Vec::new(),
+            git_stage_all_conflicts: Vec::new(),
+            git_unstage_all_staged: Vec::new(),
+            git_discard_all_unstaged: Vec::new(),
+            git_discard_all_untracked: Vec::new(),
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -678,7 +690,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 193] {
+    pub fn actions(&self) -> [&Vec<String>; 199] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -873,12 +885,18 @@ impl KeyboardShortcuts {
             &self.chat_cancel_queued,
             &self.chat_toggle_steering,
             &self.chat_toggle_fast_mode,
+            &self.git_stage_all_unstaged,
+            &self.git_stage_all_untracked,
+            &self.git_stage_all_conflicts,
+            &self.git_unstage_all_staged,
+            &self.git_discard_all_unstaged,
+            &self.git_discard_all_untracked,
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 193] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 199] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -1073,6 +1091,12 @@ impl KeyboardShortcuts {
             &mut self.chat_cancel_queued,
             &mut self.chat_toggle_steering,
             &mut self.chat_toggle_fast_mode,
+            &mut self.git_stage_all_unstaged,
+            &mut self.git_stage_all_untracked,
+            &mut self.git_stage_all_conflicts,
+            &mut self.git_unstage_all_staged,
+            &mut self.git_discard_all_unstaged,
+            &mut self.git_discard_all_untracked,
         ]
     }
 
@@ -1134,7 +1158,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 193] = [
+const SHORTCUT_ACTIONS: [&str; 199] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1328,6 +1352,12 @@ const SHORTCUT_ACTIONS: [&str; 193] = [
     "chat_cancel_queued",
     "chat_toggle_steering",
     "chat_toggle_fast_mode",
+    "git_stage_all_unstaged",
+    "git_stage_all_untracked",
+    "git_stage_all_conflicts",
+    "git_unstage_all_staged",
+    "git_discard_all_unstaged",
+    "git_discard_all_untracked",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -2610,7 +2640,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 188] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 194] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2799,6 +2829,12 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 188] = [
     "chat_cancel_queued",
     "chat_toggle_steering",
     "chat_toggle_fast_mode",
+    "git_stage_all_unstaged",
+    "git_stage_all_untracked",
+    "git_stage_all_conflicts",
+    "git_unstage_all_staged",
+    "git_discard_all_unstaged",
+    "git_discard_all_untracked",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
