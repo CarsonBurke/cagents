@@ -3184,6 +3184,7 @@ struct AgentDraft {
     configuration: settings::AgentLaunchSettings,
     environment: Vec<(String, String)>,
     launch_error: Option<String>,
+    executable_revision: uuid::Uuid,
     argument_owner: uuid::Uuid,
     argument_rows: Vec<uuid::Uuid>,
     environment_owner: uuid::Uuid,
@@ -3221,6 +3222,7 @@ impl AgentDraft {
             configuration,
             environment,
             launch_error,
+            executable_revision: uuid::Uuid::new_v4(),
             argument_owner: uuid::Uuid::new_v4(),
             environment_owner: uuid::Uuid::new_v4(),
         }
@@ -3496,6 +3498,9 @@ impl SettingsDraft {
                             draft.set_environment(environment);
                         }
                     }
+                }
+                if matches!(field, AgentSetting::Executable | AgentSetting::Environment) {
+                    draft.executable_revision = uuid::Uuid::new_v4();
                 }
                 draft.launch_error = draft.configuration.validate(provider).err();
             }
@@ -4608,6 +4613,7 @@ pub enum Message {
     DetectAgentExecutable(crate::agent::Provider),
     AgentExecutableDetected {
         provider: crate::agent::Provider,
+        revision: uuid::Uuid,
         previous_executable: Option<String>,
         previous_path: Option<String>,
         result: Result<String, String>,
@@ -16403,12 +16409,12 @@ impl Application for Cagents {
                 crate::settings_widgets::reveal_content_start()
             }
             Message::DetectAgentExecutable(provider) => {
-                let mut configuration = self
-                    .settings_draft
-                    .agents
-                    .get(&provider)
-                    .map(|draft| draft.configuration.clone())
-                    .unwrap_or_default();
+                let draft = self.settings_draft.agents.entry(provider).or_default();
+                // A new request, edited execution input, or replaced draft
+                // invalidates old discovery even when its text later matches.
+                draft.executable_revision = uuid::Uuid::new_v4();
+                let revision = draft.executable_revision;
+                let mut configuration = draft.configuration.clone();
                 let previous_executable = configuration.executable.take();
                 let previous_path = configuration.environment.get("PATH").cloned();
                 cosmic::task::future(async move {
@@ -16426,6 +16432,7 @@ impl Application for Cagents {
                     .unwrap_or_else(|_| Err("Could not detect the executable. Try again.".into()));
                     Message::AgentExecutableDetected {
                         provider,
+                        revision,
                         previous_executable,
                         previous_path,
                         result,
@@ -16434,10 +16441,13 @@ impl Application for Cagents {
             }
             Message::AgentExecutableDetected {
                 provider,
+                revision,
                 previous_executable,
                 previous_path,
                 ..
-            } if self
+            } if self.settings_draft.agents.get(&provider)
+                .is_none_or(|draft| draft.executable_revision != revision)
+                || self
                 .settings_draft
                 .agents
                 .get(&provider)
@@ -19876,6 +19886,58 @@ mod tests {
             app.settings_invalid[&SettingsField::Agent(provider, AgentSetting::Executable)]
                 .contains("absolute")
         );
+    }
+
+    #[test]
+    fn settings_detect_rejects_reset_edit_clear_and_superseded_request_callbacks() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("claude");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let provider = crate::agent::Provider::Claude;
+        let field = SettingsField::Agent(provider, AgentSetting::Executable);
+        let environment = vec![("PATH".to_owned(), directory.path().to_str().unwrap().to_owned())];
+        for replaced in ["edit_clear", "reset_restore_path", "new_request"] {
+            let mut app = context_inspector_test_app(false);
+            app.settings_path = Some(directory.path().join("settings.toml"));
+            app.settings.agents.insert("claude".into(), settings::AgentLaunchSettings {
+                environment: environment.iter().cloned().collect(), ..Default::default()
+            });
+            app.settings_draft = SettingsDraft::from_settings(&app.settings);
+            let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
+            assert!(matches!(&message, Message::AgentExecutableDetected { result: Ok(path), .. } if path == executable.to_str().unwrap()));
+            match replaced {
+                "edit_clear" => {
+                    drop(app.update(Message::SettingsDraftChanged { field, value: "/manual/choice".into() }));
+                    drop(app.update(Message::SettingsDraftChanged { field, value: String::new() }));
+                }
+                "reset_restore_path" => {
+                    drop(app.update(Message::ResetSettings));
+                    drop(app.update(Message::ConfirmResetSettings));
+                    // Return to the same text after an actual reset. Equality
+                    // alone must not restore the old request's ownership.
+                    drop(app.update(Message::SettingsDraftChanged {
+                        field: SettingsField::Agent(provider, AgentSetting::Environment),
+                        value: serde_json::to_string(&environment).unwrap(),
+                    }));
+                }
+                "new_request" => { drop(app.update(Message::DetectAgentExecutable(provider))); }
+                _ => unreachable!(),
+            }
+            let before = app.settings.clone();
+            let draft = app.settings_draft.clone();
+            let pending = app.settings_pending.clone();
+            let generation = app.settings_save_generation;
+            let revision = draft.agents[&provider].executable_revision;
+            drop(app.update(message));
+            assert_eq!(app.settings, before, "{replaced}");
+            assert_eq!(app.settings_draft, draft, "{replaced}");
+            assert_eq!(app.settings_draft.agents[&provider].executable_revision, revision);
+            assert_eq!(app.settings_pending, pending);
+            assert_eq!(app.settings_save_generation, generation);
+            assert!(app.settings_invalid.is_empty());
+        }
     }
 
     #[test]
