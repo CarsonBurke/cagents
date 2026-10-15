@@ -3115,6 +3115,27 @@ pub(super) fn close_terminal_actor(
     handle: &Handle,
 ) -> Result<(), ProtocolError> {
     handle.close().map_err(unavailable)?;
+    retire_terminal_actor(host, terminal_id, handle)
+}
+
+/// A source-checked terminal close must release control admission even when
+/// provider cleanup is stuck. Deadline failure keeps this exact actor record
+/// available for an explicit retry; it never grants replacement authority.
+pub(super) fn close_terminal_actor_until(
+    host: &SharedHost,
+    terminal_id: TerminalId,
+    handle: &Handle,
+    deadline: Instant,
+) -> Result<(), ProtocolError> {
+    handle.close_until(deadline).map_err(unavailable)?;
+    retire_terminal_actor(host, terminal_id, handle)
+}
+
+fn retire_terminal_actor(
+    host: &SharedHost,
+    terminal_id: TerminalId,
+    handle: &Handle,
+) -> Result<(), ProtocolError> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let removed = if state
         .chats

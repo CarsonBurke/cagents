@@ -1280,6 +1280,9 @@ fn close_terminal_source_checked(
     execution_instance: uuid::Uuid,
     allow_active: bool,
 ) -> Result<RequestOutcome, ProtocolError> {
+    // One paired-teardown budget, independent of how long provider code might
+    // take to return. The retained source survives an unconfirmed timeout.
+    let deadline = Instant::now() + Duration::from_secs(10);
     let changed = || ProtocolError::new(
         ProtocolErrorCode::InvalidRequest,
         "The selected terminal source changed; refresh its inventory before closing it",
@@ -1320,7 +1323,7 @@ fn close_terminal_source_checked(
     };
     if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
         if let Some(paired) = paired {
-            super::chat::close_terminal_actor(host, source.id, &paired)?;
+            super::chat::close_terminal_actor_until(host, source.id, &paired, deadline)?;
         }
         let retired = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
