@@ -10616,6 +10616,13 @@ pub fn capture_worktree_creation_retirements(
     Ok(WorktreeCreationRetirements { store, planned: planned.clone(), candidates })
 }
 impl WorktreeCreationRetirements {
+    /// Descriptive pre-effect tuple, not a removal receipt or filesystem
+    /// authority. A path-only successful reply must still match this path
+    /// before the caller can finish its already captured bookkeeping.
+    pub fn planned(&self) -> &RemovedWorktree {
+        &self.planned
+    }
+
     /// Known removal is preserved even if this bookkeeping CAS refuses.
     pub fn finish(self, removed: &RemovedWorktree) -> Result<(), Vec<StoreError>> {
         if self.planned != *removed {
