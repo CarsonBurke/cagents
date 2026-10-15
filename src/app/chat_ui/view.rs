@@ -398,6 +398,14 @@ fn queue_key(press: &text_editor::KeyPress, empty: bool) -> bool {
 
 /// A failure, as an entry of the transcript: what went wrong, set apart the
 /// way a system notice is and read in sequence with what it interrupted.
+fn visible_notice_body(body: &str, expanded: bool) -> String {
+    if !expanded && body.lines().count() > NOTICE_LINES {
+        body.lines().take(NOTICE_LINES).collect::<Vec<_>>().join("\n")
+    } else {
+        body.to_owned()
+    }
+}
+
 fn notice_identity(anchor: Option<&str>, message: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hash = std::hash::DefaultHasher::new();
@@ -1227,7 +1235,7 @@ impl Runtime {
         }
         if matches!(item.content, ItemContent::Text { .. } | ItemContent::Delivery { .. }) {
             if let ItemContent::Delivery { kind: chat::DeliveryKind::Notice, body, .. } = &item.content {
-                let body = if !self.expanded.contains(&item.id) { body.lines().take(NOTICE_LINES).collect::<Vec<_>>().join("\n") } else { body.clone() };
+                let body = visible_notice_body(body, self.expanded.contains(&item.id));
                 if !body.is_empty() { builder.plain(&item.id, &[2], body.into()); }
             } else { builder.markdown(&item.id, &[0], cached.markdown.items()); }
         }
@@ -3822,14 +3830,7 @@ impl Runtime {
             ];
             if !body.is_empty() {
                 let long = body.lines().count() > NOTICE_LINES;
-                let text = if long && !expanded {
-                    body.lines()
-                        .take(NOTICE_LINES)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    body.clone()
-                };
+                let text = visible_notice_body(body, expanded);
                 rows.push(
                     widget::container(selectable_prose::logical_text(
                         vec![iced::widget::text::Span::new(text)].into(), design::TEXT_CAPTION.into(),
@@ -6170,6 +6171,17 @@ mod tests {
             clipboard.0,
             format!("{expected}\n\nQueued message\n\nProvider warning\n\ntool output\n")
         );
+    }
+
+    #[test]
+    fn notice_projection_keeps_exact_visible_newlines() {
+        for body in ["short", "short\n", "short\n\n"] {
+            assert_eq!(visible_notice_body(body, false), body);
+            assert_eq!(visible_notice_body(body, true), body);
+        }
+        let long = "line\n".repeat(NOTICE_LINES + 1);
+        assert_eq!(visible_notice_body(&long, false), vec!["line"; NOTICE_LINES].join("\n"));
+        assert_eq!(visible_notice_body(&long, true), long);
     }
 
     #[test]
