@@ -257,15 +257,24 @@ impl History {
         now: Instant,
         presence: Option<(bool, bool)>,
     ) {
-        self.record_group_with_presence_identities(changes, before, after, now,
-            presence.map(|(before, after)| ((before, 0), (after, 0))));
+        self.record_group_with_presence_identities(
+            changes,
+            before,
+            after,
+            now,
+            presence.map(|(before, after)| ((before, 0), (after, 0))),
+        );
     }
 
     /// Existence history also owns the immutable restoration lineage. Text and
     /// metadata intentions can change independently, including empty files.
     pub fn record_group_with_presence_identities(
-        &mut self, changes: Vec<TextChange>, before: Cursor, after: Cursor,
-        now: Instant, presence: Option<((bool, u64), (bool, u64))>,
+        &mut self,
+        changes: Vec<TextChange>,
+        before: Cursor,
+        after: Cursor,
+        now: Instant,
+        presence: Option<((bool, u64), (bool, u64))>,
     ) {
         let presence = presence.filter(|(before, after)| before != after);
         if changes.is_empty() && presence.is_none() {
@@ -301,16 +310,29 @@ impl History {
     /// Expected and resulting existence for the next replay. Install only
     /// after replay answers Applied.
     pub fn replay_presence(&self, redo: bool) -> Option<(bool, bool)> {
-        self.replay_presence_identity(redo).map(|(before, after)| (before.0, after.0))
+        self.replay_presence_identity(redo)
+            .map(|(before, after)| (before.0, after.0))
     }
 
     pub fn replay_presence_identity(&self, redo: bool) -> Option<((bool, u64), (bool, u64))> {
-        let presence = if redo { self.redo.last() } else { self.undo.back() }?.presence?;
-        Some(if redo { presence } else { (presence.1, presence.0) })
+        let presence = if redo {
+            self.redo.last()
+        } else {
+            self.undo.back()
+        }?
+        .presence?;
+        Some(if redo {
+            presence
+        } else {
+            (presence.1, presence.0)
+        })
     }
 
     pub fn retained_presence_ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.undo.iter().chain(self.redo.iter()).filter_map(|transaction| transaction.presence)
+        self.undo
+            .iter()
+            .chain(self.redo.iter())
+            .filter_map(|transaction| transaction.presence)
             .flat_map(|(before, after)| [before.1, after.1])
     }
 

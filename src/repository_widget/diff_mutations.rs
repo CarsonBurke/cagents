@@ -84,7 +84,11 @@ impl RepositoryRuntime {
         })
     }
 
-    fn diff_mutation_control_action(&self, card: CardId, kind: git_patch::Kind) -> Option<RepositoryAction> {
+    fn diff_mutation_control_action(
+        &self,
+        card: CardId,
+        kind: git_patch::Kind,
+    ) -> Option<RepositoryAction> {
         if self.has_diff_selection() {
             return self.diff_selection_mutation_action(card, kind);
         }
@@ -96,18 +100,31 @@ impl RepositoryRuntime {
         self.current_hunk_mutation_rows(kind).is_some()
     }
 
-    pub fn diff_hunk_mutation_action(&self, card: CardId, kind: git_patch::Kind) -> Option<RepositoryAction> {
+    pub fn diff_hunk_mutation_action(
+        &self,
+        card: CardId,
+        kind: git_patch::Kind,
+    ) -> Option<RepositoryAction> {
         let rows = self.current_hunk_mutation_rows(kind)?;
         let request = self.diff_mutation_request(card, rows)?;
-        Some(RepositoryAction::ApplyDiffHunk { card, kind, request })
+        Some(RepositoryAction::ApplyDiffHunk {
+            card,
+            kind,
+            request,
+        })
     }
 
     fn current_hunk_mutation_rows(&self, kind: git_patch::Kind) -> Option<Range<usize>> {
-        if self.has_diff_selection() || !self.can_mutate_diff(kind) { return None; }
+        if self.has_diff_selection() || !self.can_mutate_diff(kind) {
+            return None;
+        }
         let model = self.current_diff_model_snapshot()?;
         let starts = model.change_starts(self.diff_mode);
         let start = *starts.get(self.diff_change)?;
-        let end = starts.get(self.diff_change + 1).copied().unwrap_or_else(|| model.row_count(self.diff_mode));
+        let end = starts
+            .get(self.diff_change + 1)
+            .copied()
+            .unwrap_or_else(|| model.row_count(self.diff_mode));
         (start < end).then_some(start..end)
     }
 
@@ -117,8 +134,10 @@ impl RepositoryRuntime {
         }
         let rows = self.selected_diff_range()?;
         let model = self.current_diff_model_snapshot()?;
-        (!rows.is_empty() && rows.end <= model.row_count(self.diff_mode)
-            && self.diff_interaction.selection?.has_changes(&model)).then_some(rows)
+        (!rows.is_empty()
+            && rows.end <= model.row_count(self.diff_mode)
+            && self.diff_interaction.selection?.has_changes(&model))
+        .then_some(rows)
     }
 
     fn can_mutate_diff(&self, kind: git_patch::Kind) -> bool {
@@ -265,10 +284,15 @@ impl RepositoryRuntime {
             }
         }
         let presence_id = if !present {
-            let id = document.next_presence_id.checked_add(1).ok_or("The file's Undo identity is exhausted. Reload before reverting.")?;
+            let id = document
+                .next_presence_id
+                .checked_add(1)
+                .ok_or("The file's Undo identity is exhausted. Reload before reverting.")?;
             document.next_presence_id = id;
             id
-        } else { document.presence_id };
+        } else {
+            document.presence_id
+        };
         let cursor = document.content.cursor();
         let scroll = document.content.scroll_position();
         let mut buffer = ProtocolTracked {
@@ -535,30 +559,69 @@ mod tests {
         let mut model = crate::diff_view::build_diff("", &text);
         model.present = [false, true];
         model.modes = [None, Some(mode)];
-        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(RenderedDiff::Text {
-            model: Arc::new(model), old_label: "Index".into(), new_label: "Working tree".into(),
-        }));
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Text {
+                model: Arc::new(model),
+                old_label: "Index".into(),
+                new_label: "Working tree".into(),
+            }),
+        );
         runtime.working_diff.applied = runtime.wanted_working_diff();
         runtime.working_diff.desired = runtime.wanted_working_diff();
         runtime.working_diff.applied_rich = true;
         runtime.working_diff.desired_rich = true;
         let model = runtime.current_diff_model_snapshot().unwrap();
-        let request = runtime.diff_mutation_request(card, 0..model.row_count(runtime.diff_mode)).unwrap();
-        let (identity, revision, mut patch) = runtime.capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request)).unwrap().build().unwrap();
-        runtime.apply_diff_buffer_revert_with_presence(&identity, revision.unwrap(), patch.buffer_change.take(), patch.working_present.unwrap(), patch.working_mode).unwrap();
+        let request = runtime
+            .diff_mutation_request(card, 0..model.row_count(runtime.diff_mode))
+            .unwrap();
+        let (identity, revision, mut patch) = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request))
+            .unwrap()
+            .build()
+            .unwrap();
+        runtime
+            .apply_diff_buffer_revert_with_presence(
+                &identity,
+                revision.unwrap(),
+                patch.buffer_change.take(),
+                patch.working_present.unwrap(),
+                patch.working_mode,
+            )
+            .unwrap();
     }
 
     fn initialize_presence_fixture(root: &Path) {
-    let initialized = std::process::Command::new("git")
-        .args(["-c", "core.fsmonitor=false", "init", "--template=", "-b", "main"])
-        .arg(&root).env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR").env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_CONFIG").env_remove("GIT_CONFIG_PARAMETERS").env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_OBJECT_DIRECTORY").env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .output().unwrap();
-    assert!(initialized.status.success(), "{}", String::from_utf8_lossy(&initialized.stderr));
+        let initialized = std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "init",
+                "--template=",
+                "-b",
+                "main",
+            ])
+            .arg(&root)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .output()
+            .unwrap();
+        assert!(
+            initialized.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
     }
 
     async fn finish_lineage_save(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
@@ -566,7 +629,9 @@ mod tests {
         let mut pending = std::collections::VecDeque::from([task]);
         let mut completions = 0;
         while let Some(task) = pending.pop_front() {
-            let Some(mut stream) = iced::runtime::task::into_stream(task) else { continue; };
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                continue;
+            };
             while let Some(action) = stream.next().await {
                 if let iced::runtime::Action::Output(action) = action {
                     completions += 1;
@@ -582,23 +647,30 @@ mod tests {
     #[tokio::test]
     async fn partial_change_multiple_presence_undos_restore_their_own_access_metadata() {
         use std::os::unix::fs::PermissionsExt;
-        for (save_between_undos, late_completion) in [(true, false), (false, false), (false, true)] {
+        for (save_between_undos, late_completion) in [(true, false), (false, false), (false, true)]
+        {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().canonicalize().unwrap();
             initialize_presence_fixture(&root);
             std::fs::write(root.join("new.sh"), "synthetic alpha\n").unwrap();
-            std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
             let card = CardId::new();
             let (mut runtime, _) = added_file_runtime(card, &root, "synthetic alpha\n");
             revert_complete_added_buffer(&mut runtime, card, 0o100644);
             let task = runtime.request_save_inner(card, false, false);
             finish_lineage_save(&mut runtime, task).await;
             assert!(!root.join("new.sh").exists());
-            let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
-            document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("synthetic beta\n".into()))));
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!()
+            };
+            document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+                Arc::new("synthetic beta\n".into()),
+            )));
             let task = runtime.request_save_inner(card, false, false);
             finish_lineage_save(&mut runtime, task).await;
-            std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
             revert_complete_added_buffer(&mut runtime, card, 0o100644);
             let task = runtime.request_save_inner(card, false, false);
             if late_completion {
@@ -607,7 +679,9 @@ mod tests {
                 drop(runtime.update(RepositoryAction::Undo { card }));
                 drop(runtime.update(RepositoryAction::Undo { card }));
                 finish_lineage_save(&mut runtime, task).await;
-                let DocumentState::Editable(document) = &runtime.document else { unreachable!() };
+                let DocumentState::Editable(document) = &runtime.document else {
+                    unreachable!()
+                };
                 assert_eq!(document.restorations.len(), 2);
                 assert_ne!(document.presence_id, document.saved_presence_id);
                 assert!(runtime.is_dirty());
@@ -616,8 +690,18 @@ mod tests {
                 drop(runtime.update(RepositoryAction::Undo { card }));
                 let task = runtime.request_save_inner(card, false, false);
                 finish_lineage_save(&mut runtime, task).await;
-                assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), "synthetic beta\n");
-                assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().permissions().mode() & 0o777, 0o644);
+                assert_eq!(
+                    std::fs::read_to_string(root.join("new.sh")).unwrap(),
+                    "synthetic beta\n"
+                );
+                assert_eq!(
+                    std::fs::metadata(root.join("new.sh"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o644
+                );
                 drop(runtime.update(RepositoryAction::Undo { card }));
             }
             assert!(!runtime.desired_file_present());
@@ -630,9 +714,19 @@ mod tests {
             assert_eq!(runtime.editor_text().unwrap(), "synthetic alpha\n");
             let task = runtime.request_save_inner(card, false, false);
             finish_lineage_save(&mut runtime, task).await;
-            assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), "synthetic alpha\n");
-            assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().permissions().mode() & 0o777, 0o600,
-                "older synthetic contents must not acquire the later broader permissions");
+            assert_eq!(
+                std::fs::read_to_string(root.join("new.sh")).unwrap(),
+                "synthetic alpha\n"
+            );
+            assert_eq!(
+                std::fs::metadata(root.join("new.sh"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "older synthetic contents must not acquire the later broader permissions"
+            );
             assert!(!runtime.is_dirty());
         }
         eprintln!("PRESENCE_LINEAGE_VERIFIED");
@@ -645,7 +739,8 @@ mod tests {
         let root = directory.path().canonicalize().unwrap();
         initialize_presence_fixture(&root);
         std::fs::write(root.join("new.sh"), "synthetic initial\n").unwrap();
-        std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
         let card = CardId::new();
         let (mut runtime, _) = added_file_runtime(card, &root, "synthetic initial\n");
         let mut latest = String::new();
@@ -655,27 +750,59 @@ mod tests {
             finish_lineage_save(&mut runtime, task).await;
             assert!(!root.join("new.sh").exists());
             latest = format!("synthetic cycle {index}\n");
-            let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
-            document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(latest.clone()))));
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!()
+            };
+            document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+                Arc::new(latest.clone()),
+            )));
             let task = runtime.request_save_inner(card, false, false);
             finish_lineage_save(&mut runtime, task).await;
-            assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), latest);
+            assert_eq!(
+                std::fs::read_to_string(root.join("new.sh")).unwrap(),
+                latest
+            );
         }
         revert_complete_added_buffer(&mut runtime, card, 0o100644);
         let refused = runtime.request_save_inner(card, false, false);
         assert!(iced::runtime::task::into_stream(refused).is_none());
-        assert!(runtime.save_error().unwrap().contains("retained deletion snapshots"));
-        assert_eq!(runtime.source_surface, SourceSurface::Editor, "the recovery message must be visible");
-        assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), latest);
-        assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(
+            runtime
+                .save_error()
+                .unwrap()
+                .contains("retained deletion snapshots")
+        );
+        assert_eq!(
+            runtime.source_surface,
+            SourceSurface::Editor,
+            "the recovery message must be visible"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.sh")).unwrap(),
+            latest
+        );
+        assert_eq!(
+            std::fs::metadata(root.join("new.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(runtime.editor_text().unwrap(), latest);
         assert!(!runtime.is_dirty());
-        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
         assert_eq!(document.restorations.len(), 64);
         document.history.clear();
         document.prune_restorations();
-        assert_eq!(document.restorations.len(), 1, "only the current/saved lineage remains after history is dropped");
+        assert_eq!(
+            document.restorations.len(),
+            1,
+            "only the current/saved lineage remains after history is dropped"
+        );
     }
 
     #[tokio::test]
@@ -951,9 +1078,15 @@ mod tests {
     fn selection_mutation_commands_disable_unchanged_context_only_ranges() {
         let card = CardId::new();
         let mut runtime = selected_mutation_fixture(card);
-        let context_row = runtime.current_diff_model_snapshot().unwrap().row_count(runtime.diff_mode) - 1;
+        let context_row = runtime
+            .current_diff_model_snapshot()
+            .unwrap()
+            .row_count(runtime.diff_mode)
+            - 1;
         runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(
-            runtime.diff_mode, crate::diff_interaction::Side::New, context_row,
+            runtime.diff_mode,
+            crate::diff_interaction::Side::New,
+            context_row,
         ));
         for kind in [git_patch::Kind::Stage, git_patch::Kind::Revert] {
             assert!(!runtime.can_apply_diff_selection(kind));
@@ -970,20 +1103,48 @@ mod tests {
         let mut runtime = selected_mutation_fixture(card);
         assert!(runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
         assert!(!runtime.can_apply_diff_selection(git_patch::Kind::Stage));
-        let RepositoryAction::ApplyDiffHunk { request, .. } = runtime.diff_mutation_control_action(card, git_patch::Kind::Stage).unwrap()
-            else { panic!("toolbar must capture its rendered hunk"); };
+        let RepositoryAction::ApplyDiffHunk { request, .. } = runtime
+            .diff_mutation_control_action(card, git_patch::Kind::Stage)
+            .unwrap()
+        else {
+            panic!("toolbar must capture its rendered hunk");
+        };
         let rows = request.rows.clone();
         runtime.diff_change = usize::MAX;
         assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
-        assert!(runtime.diff_hunk_mutation_action(card, git_patch::Kind::Stage).is_none());
+        assert!(
+            runtime
+                .diff_hunk_mutation_action(card, git_patch::Kind::Stage)
+                .is_none()
+        );
         assert_eq!(request.rows, rows);
         runtime.diff_change = 0;
-        let context_row = runtime.current_diff_model_snapshot().unwrap().row_count(runtime.diff_mode) - 1;
-        runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(runtime.diff_mode, crate::diff_interaction::Side::New, context_row));
-        assert!(runtime.diff_mutation_control_action(card, git_patch::Kind::Stage).is_none());
-        assert!(runtime.diff_mutation_control_action(card, git_patch::Kind::Revert).is_none());
+        let context_row = runtime
+            .current_diff_model_snapshot()
+            .unwrap()
+            .row_count(runtime.diff_mode)
+            - 1;
+        runtime.diff_interaction.selection = Some(crate::diff_interaction::Selection::new(
+            runtime.diff_mode,
+            crate::diff_interaction::Side::New,
+            context_row,
+        ));
+        assert!(
+            runtime
+                .diff_mutation_control_action(card, git_patch::Kind::Stage)
+                .is_none()
+        );
+        assert!(
+            runtime
+                .diff_mutation_control_action(card, git_patch::Kind::Revert)
+                .is_none()
+        );
         assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
-        assert!(runtime.diff_hunk_mutation_action(card, git_patch::Kind::Stage).is_none());
+        assert!(
+            runtime
+                .diff_hunk_mutation_action(card, git_patch::Kind::Stage)
+                .is_none()
+        );
         runtime.diff_interaction.selection.as_mut().unwrap().anchor = 0;
         assert!(runtime.can_apply_diff_selection(git_patch::Kind::Stage));
         assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));

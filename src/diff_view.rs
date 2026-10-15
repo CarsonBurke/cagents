@@ -1497,11 +1497,16 @@ struct NormalizedDiffLines {
 
 impl NormalizedDiffLines {
     fn new(source: &str, cancellation: &CancellationToken) -> Result<Self, Cancelled> {
-        let mut result = Self { text: String::with_capacity(source.len()), lines: Vec::new() };
+        let mut result = Self {
+            text: String::with_capacity(source.len()),
+            lines: Vec::new(),
+        };
         for line in source.split_inclusive('\n') {
             check_cancelled(cancellation)?;
             let start = result.text.len();
-            result.text.extend(line.chars().filter(|ch| *ch == '\n' || !ch.is_whitespace()));
+            result
+                .text
+                .extend(line.chars().filter(|ch| *ch == '\n' || !ch.is_whitespace()));
             result.lines.push(start..result.text.len());
         }
         Ok(result)
@@ -1528,9 +1533,13 @@ pub fn build_line_changes(
         return Some(Vec::new());
     }
     let normalized = if ignore_whitespace {
-        Some((NormalizedDiffLines::new(before, cancellation).ok()?,
-            NormalizedDiffLines::new(after, cancellation).ok()?))
-    } else { None };
+        Some((
+            NormalizedDiffLines::new(before, cancellation).ok()?,
+            NormalizedDiffLines::new(after, cancellation).ok()?,
+        ))
+    } else {
+        None
+    };
     let input = match &normalized {
         Some((before, after)) => before.input(after),
         None => InternedInput::new(before, after),
@@ -1638,9 +1647,13 @@ fn build_diff_rows_from_sources(
         return Ok(model);
     }
     let normalized = if ignore_whitespace {
-        Some((NormalizedDiffLines::new(before, cancellation)?,
-            NormalizedDiffLines::new(after, cancellation)?))
-    } else { None };
+        Some((
+            NormalizedDiffLines::new(before, cancellation)?,
+            NormalizedDiffLines::new(after, cancellation)?,
+        ))
+    } else {
+        None
+    };
     let input = match &normalized {
         Some((before, after)) => before.input(after),
         None => InternedInput::new(before.as_ref(), after),
@@ -2367,18 +2380,56 @@ mod tests {
         ] {
             let baseline = Arc::<str>::from(before);
             let model = build_diff_rows_with_options(&baseline, after, true, &cancel).unwrap();
-            assert_eq!(model.line_counts, [before.split_inclusive('\n').count(), after.split_inclusive('\n').count()]);
-            assert_eq!(build_line_changes(before, after, true, &cancel).unwrap(), expected_changes, "{before:?} → {after:?}");
+            assert_eq!(
+                model.line_counts,
+                [
+                    before.split_inclusive('\n').count(),
+                    after.split_inclusive('\n').count()
+                ]
+            );
+            assert_eq!(
+                build_line_changes(before, after, true, &cancel).unwrap(),
+                expected_changes,
+                "{before:?} → {after:?}"
+            );
             for (side, source) in [before, after].into_iter().enumerate() {
                 let line_count = source.split_inclusive('\n').count();
-                let coordinates = model.inline_rows.iter().filter_map(|row| if side == 0 {row.old_line} else {row.new_line}).collect::<Vec<_>>();
-                assert_eq!(coordinates, (1..=line_count as u32).collect::<Vec<_>>(), "{before:?} → {after:?}, side{side}");
+                let coordinates = model
+                    .inline_rows
+                    .iter()
+                    .filter_map(|row| {
+                        if side == 0 {
+                            row.old_line
+                        } else {
+                            row.new_line
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    coordinates,
+                    (1..=line_count as u32).collect::<Vec<_>>(),
+                    "{before:?} → {after:?}, side{side}"
+                );
             }
             for mode in [DiffMode::Inline, DiffMode::Split] {
                 let range = 0..model.row_count(mode);
                 if !model.is_empty() {
-                    assert_eq!(crate::diff_patch::selected_content(&model, after, mode, range.clone(), false).as_deref(), Some(after));
-                    assert_eq!(crate::diff_patch::selected_content(&model, after, mode, range, true).as_deref(), Some(before));
+                    assert_eq!(
+                        crate::diff_patch::selected_content(
+                            &model,
+                            after,
+                            mode,
+                            range.clone(),
+                            false
+                        )
+                        .as_deref(),
+                        Some(after)
+                    );
+                    assert_eq!(
+                        crate::diff_patch::selected_content(&model, after, mode, range, true)
+                            .as_deref(),
+                        Some(before)
+                    );
                 }
             }
         }
