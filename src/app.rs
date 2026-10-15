@@ -9934,6 +9934,7 @@ impl Cagents {
         } else {
             RepositoryRuntime::new(view)
         };
+        self.configure_repository_recovery_endpoint(&mut runtime);
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_editor_font(
             crate::terminal::monospace_font(self.settings.editor_font_family()),

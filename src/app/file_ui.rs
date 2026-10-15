@@ -208,6 +208,7 @@ impl Cagents {
         self.retire_lsp_card(card);
         if candidate.is_none() {
             let mut runtime = RepositoryRuntime::new_directory(view.clone());
+            self.configure_repository_recovery_endpoint(&mut runtime);
             runtime.set_auto_save(self.settings.editor_auto_save);
             runtime.set_wrap_lines(self.settings.editor_wrap_lines);
             runtime.set_editor_tab_width(self.settings.editor_tab_width);

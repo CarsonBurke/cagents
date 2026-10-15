@@ -81,6 +81,25 @@ pub(super) struct ResolvedWindowRoots {
 }
 
 impl Cagents {
+    /// Configure only new editable-file runtimes, before their first worker.
+    /// Runtime captures this SAME endpoint with its worker-opened original Root;
+    /// changing device/window selection later cannot reroute that admission.
+    /// An absent endpoint MUST remain read-only in the shared runtime. The
+    /// endpoint is not an Active lease; only the actual enrolled worker receipt
+    /// permits Editable publication. Historical/preview runtimes do not call it.
+    fn configure_repository_recovery_endpoint(&mut self, runtime: &mut RepositoryRuntime) {
+        let expected = (self.workspace_model.identity != crate::workspace_model::NO_REGISTRY)
+            .then_some(self.workspace_model.identity);
+        match LocalRecoveryEndpoint::capture(expected) {
+            Ok(endpoint) => runtime.set_recovery_endpoint(endpoint),
+            Err(error) => {
+                self.status = Some(TransientNotice::warning(format!(
+                    "File recovery is unavailable; files remain read-only: {error}"
+                )));
+            }
+        }
+    }
+
     /// Pure ingress capture: no metadata, directory opens or Git commands. The
     /// runtime getter returns its original admitted worker-opened file root,
     /// including a paused Locate source; descriptor.worktree is not authority.
