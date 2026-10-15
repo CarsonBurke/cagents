@@ -4237,6 +4237,34 @@ done"#;
         // Metadata alone does not call publish_retirement or reconstruct scope.
         assert!(actor.launch_account_scope().is_err());
     }
+    /// Every private continuation peer must finish even if the real caller
+    /// refuses/expires before it opens a socket. Never join a blocking accept.
+    fn continuation_peer_accept(
+        listener: &UnixListener,
+        finished: &crossbeam_channel::Receiver<()>,
+        deadline: Instant,
+    ) -> Result<UnixStream, String> {
+        listener.set_nonblocking(true).map_err(|error| error.to_string())?;
+        loop {
+            match finished.try_recv() {
+                Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    return Err("Continuation caller finished before connecting".into());
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err("Continuation fixture accept deadline expired".into());
+            }
+            match listener.accept() {
+                Ok((control, _)) => return Ok(control),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
     #[test]
     fn continuation_capture_proxy_refuses_pending_uncertain_and_final_metadata_without_rpc() {
         let actor = RemoteActor::fixture(); // No endpoint: these must refuse before connect.
@@ -4266,8 +4294,10 @@ done"#;
             let mut actor = RemoteActor::fixture();
             Arc::get_mut(&mut actor.0).unwrap().socket = socket;
             let shared = actor.clone();
+            let (finished, wait) = crossbeam_channel::bounded(1);
+            let accept_deadline = Instant::now() + Duration::from_secs(3);
             let peer = thread::spawn(move || {
-                let (control, _) = listener.accept().unwrap();
+                let control = continuation_peer_accept(&listener, &wait, accept_deadline).unwrap();
                 let request: Invocation = receive(&control, TIMEOUT).unwrap();
                 assert_eq!(request.method, "capture_continuation_options");
                 assert_eq!(request.proof, shared.0.proof);
@@ -4283,6 +4313,7 @@ done"#;
                 send(&control, &Ok::<_, String>(json!({"epoch":epoch, "options":null})), TIMEOUT).unwrap();
             });
             let result = actor.capture_continuation_options(Instant::now() + Duration::from_secs(2));
+            let _ = finished.send(());
             peer.join().unwrap();
             if change == "none" { assert!(result.unwrap().is_none()); }
             else { assert!(result.unwrap_err().contains("superseded")); }
@@ -4327,8 +4358,9 @@ done"#;
         let mut actor = RemoteActor::fixture();
         Arc::get_mut(&mut actor.0).unwrap().socket = socket;
         let (release, wait) = crossbeam_channel::bounded(1);
+        let accept_deadline = Instant::now() + Duration::from_secs(3);
         let peer = thread::spawn(move || {
-            let (control, _) = listener.accept().unwrap();
+            let control = continuation_peer_accept(&listener, &wait, accept_deadline).unwrap();
             let request: Invocation = receive(&control, TIMEOUT).unwrap();
             assert_eq!(request.method, "capture_continuation_options");
             wait.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -4470,6 +4502,26 @@ done"#;
         assert_eq!(server.source, issued);
         assert!(server.closed_snapshot.is_none());
         assert!(!server.actor.0.stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn continuation_capture_peer_settles_after_actual_proxy_refuses_before_connect() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("capture-refused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        actor.0.recovering_inputs.store(true, Ordering::Release);
+        let (finished, wait) = crossbeam_channel::bounded(1);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let peer = thread::spawn(move || continuation_peer_accept(&listener, &wait, deadline));
+        let result = actor.capture_continuation_options(Instant::now() + Duration::from_secs(2));
+        let _ = finished.send(());
+        let accepted = peer.join().unwrap();
+        assert!(result.unwrap_err().contains("unsettled"));
+        assert!(accepted.unwrap_err().contains("caller finished before connecting"));
+        assert!(actor.pending_inputs().is_empty());
+        assert!(!actor.0.stop.load(Ordering::Acquire));
     }
 
 }
