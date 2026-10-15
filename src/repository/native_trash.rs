@@ -196,10 +196,22 @@ fn ensure_directory(
         }
     }
 }
+fn verify_native_spelling(root: &fs_safety::Root) -> Result<(), String> {
+    let named = fs_safety::Root::open(root.path()).map_err(error)?;
+    if identity(&named)? != identity(root)? {
+        return Err(
+            "The native Trash directory or an ancestor was replaced; no replacement was changed"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn check_native(
     root: &fs_safety::Root,
     context: &FilesystemRecoveryContext,
 ) -> Result<fs::Metadata, String> {
+    verify_native_spelling(root)?;
     context.validate_payload_root(root).map_err(error)?;
     let metadata = root.metadata().map_err(error)?;
     if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o700 {
@@ -479,6 +491,8 @@ impl Owner {
         self.publication.directory()
     }
     fn validate_native(&self) -> Result<(), String> {
+        verify_native_spelling(&self.files)?;
+        verify_native_spelling(&self.info)?;
         fs_safety::verify_recovery_directory_private(&self.files, &self.files_metadata)
             .map_err(error)?;
         fs_safety::verify_recovery_directory_private(&self.info, &self.info_metadata)
@@ -488,7 +502,9 @@ impl Owner {
             .map_err(error)?;
         self.context
             .validate_payload_root(&self.info)
-            .map_err(error)
+            .map_err(error)?;
+        verify_native_spelling(&self.files)?;
+        verify_native_spelling(&self.info)
     }
     fn validate_holding(&self) -> Result<(), String> {
         fs_safety::verify_recovery_directory_private(self.holding(), &self.private_metadata)
