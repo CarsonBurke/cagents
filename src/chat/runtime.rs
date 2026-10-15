@@ -3092,9 +3092,24 @@ pub(crate) fn notification_frame_for_test(
     crate::notifications::Evidence,
     crate::notifications::Content,
 ) {
+    let mut receipts = notification_frames_for_test(adapter, vec![frame], fail_store);
+    assert!(!receipts.is_empty(), "one authoritative outcome expected");
+    receipts.remove(0)
+}
+
+/// A real provider adapter keeps its pending request map across frames, while
+/// the actual actor/store publishes semantic waiting-context revisions.
+#[cfg(test)]
+pub(crate) fn notification_frames_for_test(
+    adapter: Box<dyn Adapter>,
+    frames: Vec<serde_json::Value>,
+    fail_store: bool,
+) -> Vec<(crate::notifications::Evidence, crate::notifications::Content)> {
+    assert!(!frames.is_empty() && frames.len() <= 32);
+    let count = frames.len();
     struct Frame {
         adapter: Box<dyn Adapter>,
-        frame: Option<serde_json::Value>,
+        frames: std::collections::VecDeque<serde_json::Value>,
     }
     impl Adapter for Frame {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -3105,7 +3120,7 @@ pub(crate) fn notification_frame_for_test(
         }
         fn command(&mut self, _: Command) -> Result<Step, String> {
             self.adapter
-                .receive(self.frame.take().ok_or("fixture frame consumed")?)
+                .receive(self.frames.pop_front().ok_or("fixture frames consumed")?)
         }
         fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
             Ok(Step::default())
@@ -3124,11 +3139,11 @@ pub(crate) fn notification_frame_for_test(
     };
     let mut adapter: Box<dyn Adapter> = Box::new(Frame {
         adapter,
-        frame: Some(frame),
+        frames: frames.into(),
     });
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
-    let (send, receive) = crossbeam_channel::bounded(4);
+    let (send, receive) = crossbeam_channel::bounded(64);
     let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
         if let Update::AttentionContext { evidence, content } = update {
             let _ = send.try_send((
@@ -3142,24 +3157,33 @@ pub(crate) fn notification_frame_for_test(
     if fail_store {
         handle.0.store.lock().unwrap().read_only_for_test().unwrap();
     }
-    let command = handle.command(Command::Refresh);
-    let receipt = receive.recv_timeout(Duration::from_secs(2));
+    let commands: Vec<_> = (0..count)
+        .map(|_| handle.command(Command::Refresh))
+        .collect();
+    let first = receive.recv_timeout(Duration::from_secs(2));
+    let later: Vec<_> = receive.try_iter().collect();
+    // Retire the actual process before asserting any result, including the
+    // missing-callback/error paths, just as the one-frame fixture did.
     let closed = handle.close();
-    if fail_store {
-        let error = command.expect_err("readonly SQLite must reject the final item");
-        assert!(
-            error.contains("readonly") || error.contains("read-only"),
-            "unexpected injected store failure: {error}"
-        );
-    } else {
-        command.unwrap();
+    for command in commands {
+        if fail_store {
+            let error = command.expect_err("readonly SQLite must reject the final item");
+            assert!(
+                error.contains("readonly") || error.contains("read-only"),
+                "unexpected injected store failure: {error}"
+            );
+        } else {
+            command.unwrap();
+        }
     }
     closed.unwrap();
     assert!(
         handle.is_completed(),
         "real fixture process teardown must still be proved"
     );
-    receipt.expect("real adapter must publish an outcome through the actor")
+    let mut receipts = vec![first.expect("real adapter must publish an outcome through the actor")];
+    receipts.extend(later);
+    receipts
 }
 
 #[cfg(test)]

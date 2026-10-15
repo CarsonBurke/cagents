@@ -3885,6 +3885,41 @@ mod tests {
     }
 
     #[test]
+    fn notification_questions_use_real_codex_prompts_and_same_id_revisions() {
+        let question = |id: u64, text: &str| json!({
+            "id":id, "method":"item/tool/requestUserInput",
+            "params":{"threadId":"thread-exact", "turnId":"notification-turn",
+                "questions":[{"id":"migration", "header":"Migration", "question":text,
+                    "options":[{"label":"Keep","description":"Keep existing"},
+                        {"label":"Replace","description":"Use replacement"}]}]}
+        });
+        let frames = vec![
+            question(71, "Which config_file.rs strategy should A use?"),
+            question(72, "Which migration should B use?"),
+            json!({"method":"serverRequest/resolved",
+                "params":{"threadId":"thread-exact", "requestId":71}}),
+            question(72, "Updated B: preserve config_file.rs?"),
+            question(72, "Updated B: preserve config_file.rs?"),
+        ];
+        let receipts = crate::chat::runtime::notification_frames_for_test(
+            Box::new(adapter()), frames, false,
+        );
+        assert_eq!(receipts.len(), 3, "identical repeated metadata must not notify again");
+        for (index, expected) in [
+            "Which config_file.rs strategy should A use?",
+            "Which migration should B use?", "Updated B: preserve config_file.rs?",
+        ].into_iter().enumerate() {
+            let (evidence, content) = &receipts[index];
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(content.request, Some(crate::notifications::RequestType::Question));
+            assert!(content.preview.contains(expected), "{}", content.preview);
+            assert!(!content.preview.contains("waiting for your answer"));
+        }
+        assert_ne!(receipts[0].0.key, receipts[1].0.key);
+        assert_ne!(receipts[1].0.key, receipts[2].0.key);
+    }
+
+    #[test]
     fn notification_callback_sees_completed_frame_text_and_failed_frame_diagnosis() {
         for (status, expected_kind, error, expected) in [
             (

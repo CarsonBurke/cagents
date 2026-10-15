@@ -174,6 +174,33 @@ fn response_preview(preview: &Preview, error: Option<&str>, kind: Kind) -> Strin
     }
 }
 
+/// Public prompts are provider-neutral here: Claude puts its question in the
+/// field label and Codex puts it in the description. Retain both, without
+/// copying field defaults or answers, under the same bounded Markdown scan.
+fn public_question_preview(request: &super::Request) -> Option<String> {
+    if request.kind != super::RequestKind::Question {
+        return None;
+    }
+    let mut text = String::new();
+    for field in request.fields.iter().filter(|field| !field.secret) {
+        for part in [field.label.as_str(), field.description.as_str()] {
+            if part.is_empty() || text.len() == RETAINED_BYTES {
+                continue;
+            }
+            if !text.is_empty() {
+                let separator = bounded(" · ", RETAINED_BYTES - text.len());
+                text.push_str(&separator);
+            }
+            text.push_str(&bounded(part, RETAINED_BYTES - text.len()));
+        }
+        if text.len() == RETAINED_BYTES {
+            break;
+        }
+    }
+    let preview = presentation::preview(&text);
+    (!preview.is_empty()).then_some(preview)
+}
+
 impl Snapshot {
     /// Stream the actionable request metadata into a fixed-size fingerprint.
     /// Do not truncate identity, clone its payload, or include secret answers
@@ -195,6 +222,23 @@ impl Snapshot {
             super::RequestKind::Question => 1,
             super::RequestKind::Consent => 2,
         }]);
+        // A provider can replace the public question/options while keeping its
+        // RPC request ID. Answer/default values never define a new notice.
+        for field in request.fields.iter().filter(|field| !field.secret) {
+            digest.update([0]);
+            for text in [field.id.as_str(), field.label.as_str(), field.description.as_str()] {
+                digest.update(text.len().to_le_bytes());
+                digest.update(text.as_bytes());
+            }
+            digest.update([u8::from(field.multiple)]);
+            digest.update(field.choices.len().to_le_bytes());
+            for choice in &field.choices {
+                for text in [choice.id.as_str(), choice.label.as_str(), choice.description.as_str()] {
+                    digest.update(text.len().to_le_bytes());
+                    digest.update(text.as_bytes());
+                }
+            }
+        }
         Some(format!("{:x}", digest.finalize()))
     }
 
@@ -211,8 +255,10 @@ impl Snapshot {
                     super::RequestKind::Question => RequestType::Question,
                     super::RequestKind::Consent => RequestType::Consent,
                 });
-                // Never include secret field values or command arguments.
-                content.preview = presentation::preview(&request.description);
+                // Public question prompts are useful; field initial/answer
+                // values and all secret fields stay out of the excerpt.
+                content.preview = public_question_preview(request)
+                    .unwrap_or_else(|| presentation::preview(&request.description));
                 if content.preview.is_empty() {
                     content.preview = presentation::preview(&request.title);
                 }
@@ -231,6 +277,38 @@ impl Snapshot {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn notification_question_context_uses_public_metadata_without_answer_values() {
+        use crate::chat::{Choice, Field, Request, RequestKind};
+        let mut snapshot = Snapshot {
+            requests: vec![Request {
+                kind: RequestKind::Question, id: "question".into(), title: "Provider questions".into(),
+                description: "Provider is waiting for your answers.".into(),
+                fields: vec![Field { id: "public".into(),
+                    label: "Which `config_file.rs` strategy?".into(), description: "Migration".into(),
+                    choices: vec![Choice { id: "keep".into(), label: "Keep".into(), description: "Keep existing".into() }],
+                    multiple: false, secret: false, initial: "PRIVATE_ANSWER".into(),
+                }, Field { id: "secret".into(), label: "PRIVATE_LABEL".into(),
+                    description: "PRIVATE_DESCRIPTION".into(), choices: vec![],
+                    multiple: false, secret: true, initial: "PRIVATE_SECRET".into() }], actions: vec![],
+            }], ..Default::default()
+        };
+        let content = snapshot.notification_content(Kind::Waiting);
+        assert!(content.preview.contains("Which config_file.rs strategy?"));
+        assert!(!content.preview.contains("PRIVATE"));
+        let original = snapshot.waiting_fingerprint();
+        snapshot.requests[0].fields[0].initial = "EDITED_ANSWER".into();
+        snapshot.requests[0].fields[1].label = "EDITED_SECRET_LABEL".into();
+        snapshot.requests[0].fields[1].initial = "EDITED_SECRET".into();
+        assert_eq!(snapshot.waiting_fingerprint(), original);
+        snapshot.requests[0].fields[0].choices[0].label = "Keep revised option".into();
+        assert_ne!(snapshot.waiting_fingerprint(), original);
+        snapshot.requests[0].fields[0].label = "λ".repeat(RETAINED_BYTES * 2);
+        let content = snapshot.notification_content(Kind::Waiting);
+        assert!(content.preview.chars().count() <= 240);
+        assert!(!content.preview.chars().any(char::is_control));
+    }
 
     #[test]
     fn live_preview_survives_history_paging_and_turn_reset_clears_it() {
