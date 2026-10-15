@@ -55,6 +55,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "editor_widget/snapshot.rs"]
 mod snapshot;
 pub use snapshot::TextSnapshot;
 
