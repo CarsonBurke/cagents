@@ -66,7 +66,8 @@ fn save(value: &Attestation) -> Result<(), String> {
 
 /// Called only with recovery received over the authenticated holder endpoint.
 /// The None-ID presentation was issued verbatim; only its confirmed ID and
-/// capability may have become visible before an old helper rewrote its recipe.
+/// capability may have become visible independently during confirmation. The
+/// launch recipe and complete paired terminal remain exact.
 pub(crate) fn recognized_source(record: &Record, recovery: &Recovery, requested: &Session) -> Result<Session, String> {
     let sources = || recovery.previous_sources.iter().chain(std::iter::once(&recovery.source));
     if let Some(source) = sources().find(|source| *source == requested) { return Ok(source.clone()); }

@@ -1705,6 +1705,58 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_presentation_alias_rebinds_exact_durable_agent_without_replaying_accepted_work() {
+        use crate::{chat::{NativeContinuity, OwnedCodexListener, native_holder}, daemon::holder_registry::{Kind, Process, Record}};
+        let (mut registry, directory, mut request) = fixture();
+        let Destination::New(spec) = &mut request.destination else { unreachable!() };
+        spec.provider = Provider::Codex;
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let HostedSession::Chat(mut initial) = source() else { unreachable!() };
+        initial.launch.provider = Provider::Codex;
+        initial.launch.session_id = None;
+        initial.launch.recipe.program = "codex".into();
+        initial.launch.recipe.working_directory = directory.path().into();
+        let socket = directory.path().join("owned/control.sock");
+        initial.launch.recipe.arguments = vec!["--remote".into(), format!("unix://{}", socket.display())];
+        initial.owned_codex_listener = Some(OwnedCodexListener { socket, allocator: initial.proof.clone().unwrap() });
+        initial.native_continuity = NativeContinuity::ReconnectOnly;
+        let mut confirmed = initial.clone();
+        confirmed.launch.session_id = Some("confirmed-original-thread".into());
+        confirmed.native_continuity = NativeContinuity::Durable { provider_version: "0.157.1".into() };
+        let mut published = confirmed.clone();
+        published.native_continuity = NativeContinuity::ReconnectOnly;
+        let published = HostedSession::Chat(published);
+        registry.reserve_agent_launch(accepted.agent.id, &published).unwrap();
+        registry.bind_agent(accepted.agent.id, None, published.clone()).unwrap();
+        let token = registry.register_agent_authority(&published).unwrap();
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(&std::fs::metadata(directory.path()).unwrap());
+        registry.pin_agent_directory(accepted.agent.id, identity).unwrap();
+        let recovery = native_holder::Recovery {
+            source: confirmed.clone(), previous_sources: vec![initial.clone()], execution_console: None, paired_holder: None,
+            confirmed_thread: confirmed.launch.session_id.clone(), server_version: Some("0.157.1".into()),
+            server_identity: Some(crate::chat::protocol::ServerIdentity { user_agent: "cagents/0.157.1 (Linux)".into(),
+                canonical_home: directory.path().join("account"), reported_home: directory.path().join("account").to_string_lossy().into() }),
+            server_process: Some(Process { pid: 42, start: 1 }), execution_environment: Default::default(),
+        };
+        let record = Record { version: 3, build: None, kind: Kind::Native, application: crate::instance::APPLICATION_ID.into(),
+            boot: confirmed.proof.as_ref().unwrap().boot_id.clone(), terminal: confirmed.id,
+            holder: Process { pid: 43, start: 2 }, root: Process { pid: 42, start: 1 } };
+        let mut retained = vec![HostedSession::Chat(initial), HostedSession::Chat(confirmed.clone())];
+        let mut successor = confirmed;
+        successor.proof.as_mut().unwrap().host_incarnation = crate::model::HostIncarnation::new("adopted-original-server");
+        let successor = HostedSession::Chat(successor);
+        assert!(registry.retained_agent_directory(&retained).is_err(), "canonical aliases alone do not authenticate the issued early presentation");
+        assert!(registry.adopt_authenticated_agent_session(&retained, &successor).is_err());
+        retained.extend(native_holder::presentation_sources(&record, &recovery).unwrap().into_iter().map(HostedSession::Chat));
+        assert!(retained.contains(&published), "only an exact holder-confirmed projection may fill this gap");
+        assert_eq!(registry.retained_agent_directory(&retained).unwrap(), Some(identity));
+        assert!(registry.adopt_authenticated_agent_session(&retained, &successor).unwrap());
+        assert_eq!(registry.agent(accepted.agent.id).unwrap().session, Some(successor.clone()));
+        assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(successor));
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run, "reattachment never reauthorizes or settles the accepted prompt");
+    }
+
+    #[test]
     fn approved_directory_identity_survives_reopen_and_refuses_replacement() {
         let (mut registry, directory, request) = fixture();
         let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
