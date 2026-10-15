@@ -329,7 +329,9 @@ impl<'a, Message> BrowserWidget<'a, Message> {
 
     fn native_owner(&self, state: &WidgetState) -> bool {
         self.model_focused
-            || (state.activation_observed && self.native_activation_allowed && self.on_focus.is_some())
+            || (state.activation_observed
+                && self.native_activation_allowed
+                && self.on_focus.is_some())
     }
     fn owns_keyboard(&self, state: &WidgetState) -> bool {
         self.native_owner(state)
@@ -421,7 +423,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         // a window event while absent from native traversal.
         state.window_focus_observed = None;
         state.activation_observed = false;
-        if !self.model_focused { operation::Focusable::unfocus(state); }
+        if !self.model_focused {
+            operation::Focusable::unfocus(state);
+        }
         self.attach_keyboard(state);
         let _ = self.synchronize_presentation(state);
         let _ = self.synchronize_focus(state);
@@ -1528,8 +1532,8 @@ mod tests {
         use crate::workspace_widget::FocusedPane;
         use cosmic::iced::advanced::clipboard;
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
-        use std::{cell::RefCell, rc::Rc};
         use keyboard::key::Code;
+        use std::{cell::RefCell, rc::Rc};
         let handle = BrowserHandle::fixture();
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let trace = InputTrace::default();
@@ -1538,29 +1542,103 @@ mod tests {
         let samples = Rc::new(RefCell::new(Vec::new()));
         let make_view = || {
             let samples = samples.clone();
-            observe_keyboard_events(BrowserWidget::<()>::new(&handle).id(id.clone()).model_focused(false).native_activation_allowed(true).on_focus(()), &trace, vec![(id.clone(), KeyboardRegion { pane: FocusedPane::Browser, card: Some(card) })], move |event, _, region, widget| {
-                if matches!(event, keyboard::Event::KeyPressed { .. }) { samples.borrow_mut().push((region, widget)); }
+            observe_keyboard_events(
+                BrowserWidget::<()>::new(&handle)
+                    .id(id.clone())
+                    .model_focused(false)
+                    .native_activation_allowed(true)
+                    .on_focus(()),
+                &trace,
+                vec![(
+                    id.clone(),
+                    KeyboardRegion {
+                        pane: FocusedPane::Browser,
+                        card: Some(card),
+                    },
+                )],
+                move |event, _, region, widget| {
+                    if matches!(event, keyboard::Event::KeyPressed { .. }) {
+                        samples.borrow_mut().push((region, widget));
+                    }
+                },
+            )
+        };
+        let mut ui = UserInterface::build(
+            make_view(),
+            Size::new(400.0, 240.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let release = |code, letter: &str| {
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key: keyboard::Key::Character(letter.to_owned().into()),
+                modified_key: keyboard::Key::Character(letter.to_owned().into()),
+                physical_key: keyboard::key::Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
             })
         };
-        let mut ui = UserInterface::build(make_view(), Size::new(400.0, 240.0), Cache::new(), &mut renderer);
-        let release = |code, letter: &str| Event::Keyboard(keyboard::Event::KeyReleased { key: keyboard::Key::Character(letter.to_owned().into()), modified_key: keyboard::Key::Character(letter.to_owned().into()), physical_key: keyboard::key::Physical::Code(code), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty() });
-        let _ = ui.update(&[
-            Event::Mouse(mouse::Event::ButtonPressed(Button::Left)),
-            Event::Mouse(mouse::Event::ButtonReleased(Button::Left)),
-            press("a", Code::KeyA, keyboard::Modifiers::empty()), release(Code::KeyA, "a"),
-            Event::InputMethod(input_method::Event::Commit("native-ime".into())),
-        ], mouse::Cursor::Available(Point::new(80.0, 80.0)), &mut renderer, &mut clipboard::Null, &mut Vec::new());
-        assert_eq!(samples.borrow().as_slice(), &[(KeyboardRegion { pane: FocusedPane::Browser, card: Some(card) }, Some(id.clone()))]);
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::ButtonPressed(Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(Button::Left)),
+                press("a", Code::KeyA, keyboard::Modifiers::empty()),
+                release(Code::KeyA, "a"),
+                Event::InputMethod(input_method::Event::Commit("native-ime".into())),
+            ],
+            mouse::Cursor::Available(Point::new(80.0, 80.0)),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            samples.borrow().as_slice(),
+            &[(
+                KeyboardRegion {
+                    pane: FocusedPane::Browser,
+                    card: Some(card)
+                },
+                Some(id.clone())
+            )]
+        );
         let input = queued_input(&handle);
-        let keys: Vec<_> = input.iter().filter_map(|input| match input { BrowserInput::Key { state, code, .. } => Some((*state, code.as_str())), _ => None }).collect();
-        assert_eq!(keys, [(ButtonState::Pressed, "KeyA"), (ButtonState::Released, "KeyA")], "inspect before TreeDrop: {input:?}");
+        let keys: Vec<_> = input
+            .iter()
+            .filter_map(|input| match input {
+                BrowserInput::Key { state, code, .. } => Some((*state, code.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (ButtonState::Pressed, "KeyA"),
+                (ButtonState::Released, "KeyA")
+            ],
+            "inspect before TreeDrop: {input:?}"
+        );
         assert!(input.iter().any(|input| matches!(input, BrowserInput::Ime(ImeInput::Commit(text)) if text == "native-ime")), "{input:?}");
         let cache = ui.into_cache();
         samples.borrow_mut().clear();
-        let mut ui = UserInterface::build(make_view(), Size::new(400.0, 240.0), cache, &mut renderer);
-        let _ = ui.update(&[press("b", Code::KeyB, keyboard::Modifiers::empty()), Event::InputMethod(input_method::Event::Commit("must-not-send".into()))], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+        let mut ui =
+            UserInterface::build(make_view(), Size::new(400.0, 240.0), cache, &mut renderer);
+        let _ = ui.update(
+            &[
+                press("b", Code::KeyB, keyboard::Modifiers::empty()),
+                Event::InputMethod(input_method::Event::Commit("must-not-send".into())),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut Vec::new(),
+        );
         let input = queued_input(&handle);
-        assert!(!input.iter().any(|input| matches!(input, BrowserInput::Key { .. } | BrowserInput::Ime(_))), "stale click authority survived a fresh inactive diff: {input:?}");
+        assert!(
+            !input
+                .iter()
+                .any(|input| matches!(input, BrowserInput::Key { .. } | BrowserInput::Ime(_))),
+            "stale click authority survived a fresh inactive diff: {input:?}"
+        );
         assert_eq!(samples.borrow()[0].0.card, None);
     }
 

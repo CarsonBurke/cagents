@@ -1713,7 +1713,6 @@ fn fresh_owned_input_waits_for_all_prior_cleanup_responses_and_refuses_after_unk
     }
 }
 
-
 #[test]
 fn inactive_native_terminal_click_admits_the_first_key_and_ime_before_app_selection_diff() {
     use crate::input_trace::{InputTrace, KeyboardRegion, observe_keyboard_events};
@@ -1733,37 +1732,115 @@ fn inactive_native_terminal_click_admits_the_first_key_and_ime_before_app_select
         terminal.id = Some(id.clone());
         terminal.on_shortcut = None;
         let samples = samples.clone();
-        observe_keyboard_events(terminal, &trace, vec![(id.clone(), KeyboardRegion { pane: FocusedPane::Terminal, card: Some(card) })], move |event, _, region, widget| {
-            if matches!(event, keyboard::Event::KeyPressed { .. }) { samples.borrow_mut().push((region, widget)); }
-            Message::Shortcut
-        })
+        observe_keyboard_events(
+            terminal,
+            &trace,
+            vec![(
+                id.clone(),
+                KeyboardRegion {
+                    pane: FocusedPane::Terminal,
+                    card: Some(card),
+                },
+            )],
+            move |event, _, region, widget| {
+                if matches!(event, keyboard::Event::KeyPressed { .. }) {
+                    samples.borrow_mut().push((region, widget));
+                }
+                Message::Shortcut
+            },
+        )
     };
-    let mut ui = UserInterface::build(make_view(), Size::new(640.0, 320.0), Cache::new(), &mut renderer);
+    let mut ui = UserInterface::build(
+        make_view(),
+        Size::new(640.0, 320.0),
+        Cache::new(),
+        &mut renderer,
+    );
     let mut messages = Vec::new();
-    let _ = ui.update(&[
-        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-        raw_letter(keyboard::key::Code::KeyA, "a", true, keyboard::Modifiers::empty()),
-        raw_letter(keyboard::key::Code::KeyA, "a", false, keyboard::Modifiers::empty()),
-        Event::InputMethod(input_method::Event::Commit("native-ime".into())),
-    ], mouse::Cursor::Available(Point::new(80.0, 80.0)), &mut renderer, &mut clipboard::Null, &mut messages);
-    assert!(messages.contains(&Message::Focus), "the real click queued the App focus message, which remains deliberately unapplied");
-    assert_eq!(samples.borrow().as_slice(), &[(KeyboardRegion { pane: FocusedPane::Terminal, card: Some(card) }, Some(id.clone()))]);
+    let _ = ui.update(
+        &[
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                true,
+                keyboard::Modifiers::empty(),
+            ),
+            raw_letter(
+                keyboard::key::Code::KeyA,
+                "a",
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+            Event::InputMethod(input_method::Event::Commit("native-ime".into())),
+        ],
+        mouse::Cursor::Available(Point::new(80.0, 80.0)),
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert!(
+        messages.contains(&Message::Focus),
+        "the real click queued the App focus message, which remains deliberately unapplied"
+    );
+    assert_eq!(
+        samples.borrow().as_slice(),
+        &[(
+            KeyboardRegion {
+                pane: FocusedPane::Terminal,
+                card: Some(card)
+            },
+            Some(id.clone())
+        )]
+    );
     let requests = peer.fence();
-    let keys: Vec<_> = requests.iter().filter_map(|request| match request { ClientRequest::Key { input, .. } => Some((input.key, input.action)), _ => None }).collect();
-    assert_eq!(keys, [(TerminalKey::Character('a'), KeyAction::Press), (TerminalKey::Character('a'), KeyAction::Release)], "{requests:?}");
+    let keys: Vec<_> = requests
+        .iter()
+        .filter_map(|request| match request {
+            ClientRequest::Key { input, .. } => Some((input.key, input.action)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            (TerminalKey::Character('a'), KeyAction::Press),
+            (TerminalKey::Character('a'), KeyAction::Release)
+        ],
+        "{requests:?}"
+    );
     assert!(requests.iter().any(|request| matches!(request, ClientRequest::Input { bytes, .. } if bytes == b"native-ime")), "{requests:?}");
     let cache = ui.into_cache();
     samples.borrow_mut().clear();
     // A subsequent diff saying this pane is still inactive supersedes the
     // observation, including a parked tree remount after another pane won.
     let mut ui = UserInterface::build(make_view(), Size::new(640.0, 320.0), cache, &mut renderer);
-    let _ = ui.update(&[raw_letter(keyboard::key::Code::KeyB, "b", true, keyboard::Modifiers::empty()), Event::InputMethod(input_method::Event::Commit("must-not-send".into()))], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut Vec::new());
+    let _ = ui.update(
+        &[
+            raw_letter(
+                keyboard::key::Code::KeyB,
+                "b",
+                true,
+                keyboard::Modifiers::empty(),
+            ),
+            Event::InputMethod(input_method::Event::Commit("must-not-send".into())),
+        ],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut Vec::new(),
+    );
     let requests = peer.fence();
-    assert!(!requests.iter().any(|request| matches!(request, ClientRequest::Key { .. } | ClientRequest::Input { .. })), "stale click authority survived a fresh inactive diff: {requests:?}");
+    assert!(
+        !requests.iter().any(|request| matches!(
+            request,
+            ClientRequest::Key { .. } | ClientRequest::Input { .. }
+        )),
+        "stale click authority survived a fresh inactive diff: {requests:?}"
+    );
     assert_eq!(samples.borrow()[0].0.card, None);
 }
-
 
 #[test]
 fn inactive_native_terminal_review_survives_a11y_publication_before_the_app_focus_diff() {
@@ -1792,43 +1869,85 @@ fn inactive_native_terminal_review_survives_a11y_publication_before_the_app_focu
     native_focus(&mut terminal, &mut tree, &renderer);
     assert!(tree.state.downcast_ref::<WidgetState>().input_focused);
     assert!(!terminal.model_focused);
-    let published = terminal.a11y_nodes(
-        Layout::new(&layout), &tree, mouse::Cursor::Unavailable,
-    );
+    let published = terminal.a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
     let id = published.root()[0].id().clone();
-    assert_eq!(dispatch(
-        &mut terminal, &mut tree, &renderer,
-        action(id, Action::Focus, None),
-    ), vec![Message::Review(true)]);
-    dispatch(
-        &mut terminal, &mut tree, &renderer,
-        key(keyboard::key::Named::ArrowRight, keyboard::key::Code::ArrowRight, true),
+    assert_eq!(
+        dispatch(
+            &mut terminal,
+            &mut tree,
+            &renderer,
+            action(id, Action::Focus, None),
+        ),
+        vec![Message::Review(true)]
     );
-    let selection = tree.state.downcast_ref::<WidgetState>()
-        .a11y.borrow().selection.clone().expect("native Review selection");
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        key(
+            keyboard::key::Named::ArrowRight,
+            keyboard::key::Code::ArrowRight,
+            true,
+        ),
+    );
+    let selection = tree
+        .state
+        .downcast_ref::<WidgetState>()
+        .a11y
+        .borrow()
+        .selection
+        .clone()
+        .expect("native Review selection");
     assert!(reviewing(&tree));
     peer.fence();
 
     // Native accessibility publication can occur before the queued App update.
     // It must use the same observed owner as update(), preserving Review state.
-    let published = terminal.a11y_nodes(
-        Layout::new(&layout), &tree, mouse::Cursor::Unavailable,
-    );
+    let published = terminal.a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
     assert!(reviewing(&tree));
-    assert_eq!(tree.state.downcast_ref::<WidgetState>().a11y.borrow().selection,
-        Some(selection));
-    assert!(published.root()[0].node().description().unwrap().contains("Review mode"));
-    assert!(!published.root()[0].node().label().unwrap().contains("not focused"));
+    assert_eq!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .selection,
+        Some(selection)
+    );
+    assert!(
+        published.root()[0]
+            .node()
+            .description()
+            .unwrap()
+            .contains("Review mode")
+    );
+    assert!(
+        !published.root()[0]
+            .node()
+            .label()
+            .unwrap()
+            .contains("not focused")
+    );
     assert_no_pty_input(&peer.fence());
 
     // An actual subsequent inactive App diff supersedes the native observation.
     terminal = widget(&peer, "inactive-review", barrier, false, false);
     tree.diff(&mut terminal as &mut dyn Widget<Message, Theme, Renderer>);
-    let published = terminal.a11y_nodes(
-        Layout::new(&layout), &tree, mouse::Cursor::Unavailable,
-    );
+    let published = terminal.a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
     assert!(!reviewing(&tree));
-    assert!(tree.state.downcast_ref::<WidgetState>().a11y.borrow().selection.is_none());
-    assert!(published.root()[0].node().description().unwrap().contains("Terminal input"));
+    assert!(
+        tree.state
+            .downcast_ref::<WidgetState>()
+            .a11y
+            .borrow()
+            .selection
+            .is_none()
+    );
+    assert!(
+        published.root()[0]
+            .node()
+            .description()
+            .unwrap()
+            .contains("Terminal input")
+    );
     assert_no_pty_input(&peer.fence());
 }

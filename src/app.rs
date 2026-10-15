@@ -9113,8 +9113,7 @@ impl Cagents {
         // what it is given. An overlay inspector additionally hides the workspace, so
         // that shell would not even be on screen.
         let raw_input_blocked = self.workspace_inputs_blocked() || self.update_prepared;
-        let native_activation_allowed =
-            !raw_input_blocked && !self.focused_repository_is_saving();
+        let native_activation_allowed = !raw_input_blocked && !self.focused_repository_is_saving();
         let card_focused = focused && self.refresh_ui.focused && !raw_input_blocked;
         #[cfg(not(feature = "integrated-browser"))]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|_| {

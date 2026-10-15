@@ -1718,7 +1718,9 @@ impl<Message> TerminalWidget<Message> {
     }
     fn native_owner(&self, state: &WidgetState) -> bool {
         self.model_focused
-            || (state.activation_observed && self.native_activation_allowed && self.on_focus.is_some())
+            || (state.activation_observed
+                && self.native_activation_allowed
+                && self.on_focus.is_some())
     }
     fn keyboard_focused(&self, state: &WidgetState) -> bool {
         self.native_owner(state)
@@ -2045,8 +2047,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.padding,
         );
         let state = tree.state.downcast_ref::<WidgetState>();
-        let focused = self.native_owner(state)
-            && state.native_window_focused.unwrap_or(self.window_focused);
+        let focused =
+            self.native_owner(state) && state.native_window_focused.unwrap_or(self.window_focused);
         let mut a11y = state.a11y.borrow_mut();
         a11y.barrier = self.review_input_barrier.clone();
         a11y.bind(id, self.terminal_identity);

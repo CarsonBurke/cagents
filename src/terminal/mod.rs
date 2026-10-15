@@ -37,10 +37,10 @@ pub use types::{
     TerminalConfig, TerminalEvent, TerminalKey, TerminalSendError, TerminalSize,
     TerminalStartError, TerminalWake,
 };
-#[cfg(all(test, feature = "ui"))]
-pub(crate) use widget::accessibility_tests::Peer as WidgetTestPeer;
 #[cfg(feature = "ui")]
 pub(crate) use widget::ReviewInputBarrier;
+#[cfg(all(test, feature = "ui"))]
+pub(crate) use widget::accessibility_tests::Peer as WidgetTestPeer;
 #[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};
 #[cfg(feature = "host")]
