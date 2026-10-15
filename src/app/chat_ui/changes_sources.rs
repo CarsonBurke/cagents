@@ -392,6 +392,13 @@ impl State {
 }
 
 
+fn current_item<'a>(runtime:&'a Runtime,item:&str)->Option<&'a chat::Item> {
+    let items=match runtime.selected_subagent.as_deref() {
+        Some(id)=>runtime.snapshot.subagents.iter().find(|agent|agent.id==id).map(|agent|agent.items.as_slice()),
+        None=>Some(runtime.snapshot.items.as_slice()),
+    }?;
+    items.iter().find(|current|current.id==item).map(Arc::as_ref)
+}
 pub(super) fn detail(runtime:&Runtime,item:&str)->Option<Element<'static,Message>> {
     let key=runtime.logical_changes.aliases.get(item)?;
     let entry=runtime.logical_changes.entries.get(key)?;
@@ -413,8 +420,7 @@ pub(super) fn detail(runtime:&Runtime,item:&str)->Option<Element<'static,Message
             let index=file.file_index;let open=entry.opened.contains(&index) || runtime.find.as_ref().is_some_and(|query|!query.is_empty());
             let label=step::path_label(&file.path,&runtime.session.launch.recipe.working_directory);
             let Ok(logical_index)=u32::try_from(index) else {rows.push(design::caption("The file index exceeds the selectable document range.").into());continue;};
-            let painted=runtime.snapshot.items.iter().chain(runtime.snapshot.subagents.iter().flat_map(|agent|agent.items.iter()))
-                .find(|current|current.id==item).and_then(|item|runtime.find_paint_for(item));
+            let painted=current_item(runtime,item).and_then(|item|runtime.find_paint_for(item));
             let logical=|path:&[u32]|selectable_prose::Logical {identity:selection::logical_identity(item,path),start:0,paint:painted.clone()};
             let title=widget::row::with_children(vec![
                 widget::button::custom(widget::icon(Icon::handle(if open {Icon::PanDown}else {Icon::PanEnd})).size(design::COMPACT_ICON_SIZE))
@@ -797,6 +803,32 @@ mod tests {
         let mut element=detail(&runtime,&page.source.source_id).unwrap();
         assert!(!labels(&mut element,&mut tree).iter().any(|label|label=="Copy patch"));
         assert!(runtime.logical_changes.copy_patch(&page.source.source_id,0).is_none());
+    }
+
+    #[test]
+    fn selected_child_reused_root_identity_uses_its_exact_item_for_patch_highlights() {
+        let id="same-opaque-root";
+        let item=|status|Arc::new(chat::Item {id:id.into(),role:chat::Role::Assistant,at:None,started_at:None,
+            content:ItemContent::Changes {status,changes:vec![]}});
+        let parent=item(ToolStatus::Failed);let child=item(ToolStatus::Succeeded);
+        let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
+        let snapshot=Snapshot {ready:true,items:vec![parent.clone()],subagents:vec![chat::Subagent {
+            id:"selected-child".into(),kind:String::new(),description:String::new(),status:ToolStatus::Succeeded,
+            model:None,waiting:false,detail:String::new(),background:false,items:vec![child.clone()]}],..Default::default()};
+        let handle=Arc::new(ClientHandle::fixture(session.clone(),snapshot));
+        let mut runtime=Runtime::new(Target {card:CardId::new(),generation:1},session,Connection::Live(handle),true,crate::settings::EditorSyntaxTheme::default());
+        runtime.selected_subagent=Some("selected-child".into());
+        let identity=selection::logical_identity(id,&[6,0]);let body:Arc<str>=Arc::from("+CHILD_ONLY_MATCH");
+        let external=Arc::new(find::External {item:Arc::from(id),revision:777,blocks:vec![find::Block {identity,text:body}].into()});
+        runtime.find_external.insert(id.into(),external.clone());
+        let mut paint=find::Paint::new(1,&[find::Match {turn:Arc::from(id),item:Arc::from(id),identity,range:1..17}],None);
+        paint.sources=Arc::new(HashMap::from([(id.into(),find::SourceProof {item:Arc::downgrade(&child),growing:false,external:Some(Arc::downgrade(&external))})]));
+        paint.signatures=Arc::new(HashMap::from([(Arc::<str>::from(id),1)]));runtime.find_paint=Some(Arc::new(paint));
+        assert!(std::ptr::eq(current_item(&runtime,id).unwrap(),child.as_ref()));
+        assert!(runtime.find_paint_for(current_item(&runtime,id).unwrap()).is_some(),"actual detail lookup preserves accepted child paint");
+        assert!(runtime.find_paint_for(parent.as_ref()).is_none(),"same spelling is not the child source proof");
+        runtime.selected_subagent=Some("vanished-child".into());assert!(current_item(&runtime,id).is_none(),"no fallback to another transcript");
+        runtime.selected_subagent=None;assert!(std::ptr::eq(current_item(&runtime,id).unwrap(),parent.as_ref()));
     }
 
 }
