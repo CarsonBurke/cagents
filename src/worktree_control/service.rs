@@ -48,7 +48,6 @@ pub(crate) fn execute(
 ) -> Result<Execution, String> {
     let cancellation = CancellationToken::new();
     let service = RepositoryService::system("git");
-    let store = journal_store()?;
     let reply = match operation {
         Operation::List { repository } => {
             let records = service
@@ -66,20 +65,19 @@ pub(crate) fn execute(
                 .collect::<Result<Vec<_>, String>>()?;
             Ok(Reply::Listed { worktrees })
         }
-        operation @ Operation::Remove { .. } => remove_with_executor(
-            operation,
-            &service,
-            &SystemProcessExecutor,
-            &store,
-            &mut live_sessions,
-            |_| Ok(()),
-            || {},
-        ),
+        operation @ Operation::Remove { .. } => {
+            let store = journal_store()?;
+            remove_with_executor(
+                operation, &service, &SystemProcessExecutor, &store,
+                &mut live_sessions, |_| Ok(()), || {},
+            )
+        }
         Operation::StaleLock {
             repository,
             path,
             unlock,
         } => {
+            let store = journal_store()?;
             same_repository(&service, &repository, &path, &cancellation)?;
             if unlock {
                 service.unlock_stale_worktree(&store, &repository, &path, &cancellation)?;
