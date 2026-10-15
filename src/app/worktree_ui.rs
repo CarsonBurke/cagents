@@ -2261,10 +2261,9 @@ mod tests {
             Vec::new(),
         )];
         let _ = app.restore_worktree_scope();
-        let _ = app.update(Message::WorktreeCreated {
-            project_id: project,
-            repository: root.path().into(),
-            result: Ok(WorktreeCreationOutcome::Created {
+        // Exercise presentation after the guarded operation ingress. The
+        // actual consent/worker/publication boundary has separate Task tests.
+        let _ = app.apply_worktree_created(project, root.path().into(), Ok(WorktreeCreationOutcome::Created {
                 worktree: WorktreeRecord {
                     id: crate::model::WorktreeId::new(),
                     path: nested.clone(),
@@ -2278,7 +2277,7 @@ mod tests {
                 },
                 warnings: Vec::new(),
             }),
-        });
+        );
         assert_eq!(app.terminal_directory(), Some(nested.clone()));
         assert_eq!(
             app.sidebar_state.active_worktree().unwrap().canonical_path,
@@ -2412,13 +2411,12 @@ mod tests {
             Vec::new(),
         )];
         let _ = app.restore_worktree_scope();
-        let _ = app.update(Message::WorktreeCreated {
-            project_id: project,
-            repository: repository.clone(),
-            result: Ok(report
+        // Exercise presentation after the guarded operation ingress. The
+        // actual consent/worker/publication boundary has separate Task tests.
+        let _ = app.apply_worktree_created(project, repository.clone(), Ok(report
                 .outcome
                 .expect("a created operation reports its outcome")),
-        });
+        );
 
         let entry = &app.sidebar_model.projects[0];
         assert_eq!(

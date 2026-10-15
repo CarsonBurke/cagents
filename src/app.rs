@@ -2835,9 +2835,6 @@ fn completion_navigates(message: &Message) -> bool {
         } | Message::ProjectWorktreeCreated {
             result: Ok(WorktreeCreationOutcome::Created { .. }),
             ..
-        } | Message::WorktreeCreated {
-            result: Ok(WorktreeCreationOutcome::Created { .. }),
-            ..
         } | Message::PullRequestCreated {
             result: Ok(PullRequestCreationOutcome::Created { .. }),
             ..
@@ -7152,11 +7149,6 @@ pub enum Message {
         source_id: OperationId,
         operation: OperationId,
         project_generation: u64,
-        repository: PathBuf,
-        result: Result<WorktreeCreationOutcome, String>,
-    },
-    WorktreeCreated {
-        project_id: ProjectId,
         repository: PathBuf,
         result: Result<WorktreeCreationOutcome, String>,
     },
@@ -20468,8 +20460,6 @@ impl Application for Cagents {
                 }
                 self.apply_worktree_created(project_id, repository, result)
             }
-            Message::WorktreeCreated { project_id, repository, result } =>
-                self.apply_worktree_created(project_id, repository, result),
             Message::PullRequestBaseChanged(value) => {
                 if let Some(dialog) = &mut self.pull_request_dialog {
                     dialog.base = value;
