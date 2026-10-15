@@ -205,6 +205,9 @@ impl Cagents {
         else if intent.copy_done { WorktreeSetupStatus::Succeeded }
         else { WorktreeSetupStatus::Interrupted("Creation finished before setup completion was confirmed. Review files and terminal output before resuming.".into()) };
         self.setup_ui.recovered.insert(path.clone(), (creation, intent));
+        // An inventory pass may have seen an older run before the journal
+        // was restored. Re-arbitrate using this durable run identity.
+        self.setup_ui.terminals.remove(&path);
         self.setup_ui.statuses.insert(path, status);
         self.refresh_worktree_setup_rows();
     }
@@ -352,6 +355,32 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.push(next);
         app.refresh_worktree_setup_rows();
         assert!(matches!(app.sidebar_model.projects[0].worktrees[0].setup_status, Some(WorktreeSetupStatus::Interrupted(_))));
+    }
+
+    #[test]
+    fn durable_run_identity_wins_over_an_old_run_with_a_later_clock_timestamp() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let path = PathBuf::from("/repo/setup");
+        let current = OperationId::new();
+        let mut old = fresh_terminal_session(LaunchRecipe::shell(path.clone()).unwrap());
+        old.launch.environment.insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
+        old.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), OperationId::new().to_string());
+        old.launch.environment.insert("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), "100".into());
+        old.continuity = TerminalContinuity::Exited { last_exit: crate::model::TerminalExit { code: Some(9), signal: None, occurred_at_unix_ms: 100 } };
+        Arc::make_mut(&mut app.durable).cards[0].kind = CardKind::Terminal(old);
+        let mut next = app.durable.cards[0].clone(); next.id = CardId::new();
+        let mut session = fresh_terminal_session(LaunchRecipe::shell(path.clone()).unwrap());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), current.to_string());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), "10".into());
+        session.continuity = TerminalContinuity::Exited { last_exit: crate::model::TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 10 } };
+        let expected = session.id;
+        next.kind = CardKind::Terminal(session);
+        Arc::make_mut(&mut app.durable).cards.push(next);
+        app.refresh_worktree_setup_rows();
+        app.recover_worktree_setup(current, path.clone(), SetupIntent { run_id: Some(current), ..Default::default() });
+        assert_eq!(app.setup_ui.statuses[&path], WorktreeSetupStatus::Succeeded);
+        assert_eq!(app.setup_ui.terminals[&path].1, expected);
     }
 
     #[test]
