@@ -14,6 +14,12 @@ impl Cagents {
     pub(super) fn publication_recovery_pending(&self) -> bool {
         self.editor_features.recovery.as_ref().is_some_and(|state| !state.authority.is_resolved())
     }
+    /// Exact unresolved window fallback snapshot for a refusal-only logical
+    /// project marker. It grants no root, retry, or new file-operation proof.
+    pub(super) fn publication_recovery_authority(&self, worktree: &Path) -> Option<crate::editor::RecoveryAuthority> {
+        self.editor_features.recovery.as_ref().filter(|state| !state.authority.is_resolved()
+            && (state.unknown_scope || state.scopes.contains(worktree))).map(|state| state.authority.clone())
+    }
     /// Cheap reducer-side scope guard. Concrete effects still use their held
     /// original roots; this predicate never resolves diagnostic paths.
     pub(super) fn publication_recovery_blocks(&self, worktree: &Path) -> bool {
@@ -149,6 +155,9 @@ mod tests {
         drop(app.update(Message::EditorFeatures(Action::Published { ticket: 999, result: Err(failure) })));
         assert!(app.publication_recovery_pending()); assert!(app.publication_recovery_blocks(root.path()));
         assert!(!app.publication_recovery_blocks(other.path()));
+        let original_marker = app.publication_recovery_authority(root.path()).expect("capture this exact unresolved window object");
+        assert_eq!(original_marker, authority);
+        assert!(app.publication_recovery_authority(other.path()).is_none());
         assert!(app.publication_recovery_view().is_some());
         drop(app.exit_after_language_servers()); assert!(app.exit.is_none());
         for final_attempt in [false, true] {
@@ -164,6 +173,8 @@ mod tests {
             assert!(completed); assert_eq!(app.publication_recovery_pending(), !final_attempt);
         }
         assert!(authority.is_resolved()); assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert!(original_marker.is_resolved());
+        assert!(app.publication_recovery_authority(root.path()).is_none());
         assert!(app.publication_recovery_view().is_none());
     }
 }
