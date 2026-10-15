@@ -10,7 +10,7 @@ const MAX_RECOVERY_ROOTS: usize = 256;
 /// producer must pass the resolved original roots into the authenticated daemon
 /// reservation issuer. Its current catalog/lease also covers registered sibling
 /// worktrees which this window has never opened.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct WindowRecoveryRoots {
     projects: Vec<worktree_dialog::WorktreeCreationSource>,
     edited: Vec<Arc<Root>>,
@@ -50,10 +50,15 @@ impl WindowRecoveryRoots {
     /// temporary actor clones are dropped after reservation intake, so pending
     /// cleanup retains only exact roots plus its independent daemon lease and
     /// survives origin close or an unrelated project generation change.
-    pub(super) fn resolve(self) -> io::Result<ResolvedWindowRoots> {
+    pub(super) fn resolve(self, cancellation: &CancellationToken) -> io::Result<ResolvedWindowRoots> {
+        let check_cancelled = || if cancellation.is_cancelled() {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "Recovery intake was cancelled before any file effect."))
+        } else { Ok(()) };
+        check_cancelled()?;
         let mut roots = self.edited;
         let mut common = Vec::new();
         for project in self.projects {
+            check_cancelled()?;
             let (source, candidate) = project.recovery_roots().map_err(|error| io::Error::other(error.to_string()))?;
             roots.push(source);
             common.push(candidate);
@@ -61,12 +66,14 @@ impl WindowRecoveryRoots {
         let mut known = HashSet::new();
         let mut unique = Vec::new();
         for root in roots {
+            check_cancelled()?;
             let metadata = root.metadata()?;
             if known.insert((metadata.dev(), metadata.ino())) { unique.push(root); }
         }
         if unique.len() > MAX_RECOVERY_ROOTS {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Recovery exceeds the bounded current-window root census; no file was changed."));
         }
+        check_cancelled()?;
         Ok(ResolvedWindowRoots { edited_and_project_roots: unique, common_directory_candidates: common })
     }
 }
