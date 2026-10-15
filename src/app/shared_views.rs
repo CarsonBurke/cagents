@@ -1053,6 +1053,7 @@ impl Cagents {
                             (a, b) => a == b,
                         };
                         if !same_session {
+                            self.forget_terminal_close_binding(pane.id);
                             self.cards.remove(&pane.id);
                             self.lifecycle.remove(pane.id);
                         }
@@ -1193,6 +1194,7 @@ impl Cagents {
 
     /// Passive removal detaches surfaces; it never calls a host close request.
     fn detach_shared_pane(&mut self, id: CardId) {
+        self.forget_terminal_close_binding(id);
         self.shared_views.defaults.remove(&id);
         Arc::make_mut(&mut self.durable)
             .pending_terminal_creations

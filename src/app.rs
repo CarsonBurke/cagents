@@ -4942,6 +4942,7 @@ pub struct Cagents {
     terminal_close: Option<terminal_close::CloseIntent>,
     queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
     terminal_close_attempts: HashSet<TerminalId>,
+    terminal_close_bindings: terminal_close::Bindings,
     terminal_close_generation: u64,
     closed_terminal_cards: HashSet<CardId>,
     uncertain_terminal_proofs: HashMap<CardId, HostSessionProof>,
@@ -5649,6 +5650,7 @@ impl Cagents {
                 // commands, which could otherwise mask a permanent failure
                 // as a closed visibility channel.
                 self.cards.insert(card, CardRuntime::Terminal(handle));
+                self.capture_terminal_close_binding(card, started.spawned);
                 tasks.push(self.drain_terminal(card, 0));
                 if ended_terminal(self.card_state(card)).is_some() {
                     // The daemon can report a session that already
@@ -8506,6 +8508,7 @@ impl Cagents {
             let events = handle.events();
             (handle.host_proof(), events.try_iter().collect::<Vec<_>>())
         };
+        self.capture_terminal_close_binding(card, false);
         let mut durable_changed = false;
         let mut recovery = None;
         let mut clipboard_task = Task::none();
@@ -13001,6 +13004,7 @@ impl Application for Cagents {
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
             terminal_close_attempts: HashSet::new(),
+            terminal_close_bindings: terminal_close::Bindings::default(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
             uncertain_terminal_proofs: HashMap::new(),
@@ -25302,6 +25306,7 @@ mod tests {
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
             terminal_close_attempts: HashSet::new(),
+            terminal_close_bindings: terminal_close::Bindings::default(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
             worktree_operations: HashMap::new(),

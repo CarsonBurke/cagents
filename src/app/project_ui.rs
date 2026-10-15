@@ -791,6 +791,7 @@ impl Cagents {
             self.sidebar_state.acknowledge_agent_update(card);
             self.chat_discard(card);
             self.cards.remove(&card);
+            self.forget_terminal_close_binding(card);
             self.lifecycle.remove(card);
             if let Some(state) = self.card_state_mut(card) {
                 state.existence = removed_existence("project removed by user");
@@ -1477,6 +1478,7 @@ impl Cagents {
                         self.sidebar_state.acknowledge_agent_update(id);
                         self.chat_discard(id);
                         self.cards.remove(&id);
+                        self.forget_terminal_close_binding(id);
                         self.lifecycle.remove(id);
                         if let Some(card) = self.card_state_mut(id) {
                             card.existence = removed_existence("worktree removed");

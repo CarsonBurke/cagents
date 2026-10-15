@@ -103,6 +103,7 @@ impl Cagents {
     ) -> Task<Message> {
         let mut reconnect = Vec::new();
         for terminal in &terminals {
+            self.corroborate_terminal_close_adoption(terminal);
             // Existing handles intentionally refuse proof changes. Replace one
             // only after a fresh inventory proves its complete issued lineage;
             // the start path checks the replacement daemon's lease again.
