@@ -1,7 +1,7 @@
 //! Bounded, cancellable worktree content search. The blocking worker publishes
 //! small batches; neither traversal nor matching runs on the UI thread.
 use std::{
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -171,50 +171,54 @@ pub fn search(
             continue;
         }
         let path = path.to_path_buf();
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::with_capacity(SEARCH_BLOCK_BYTES, file);
         let mut line = 0;
         let mut finished = false;
         while !finished {
-            bytes.clear();
-            let mut block_lines = 0;
-            // Read complete lines into bounded blocks. Literal queries can
-            // reject a whole block with one regex search instead of creating
-            // a separate regex iterator/cache for every nonmatching line.
-            // Regex mode keeps its exact per-line anchor semantics.
-            while bytes.len() < SEARCH_BLOCK_BYTES {
-                if cancellation.is_cancelled() {
-                    return;
-                }
-                let start = bytes.len();
-                let read = std::io::Read::take(&mut reader, (MAX_LINE_BYTES + 1) as u64)
-                    .read_until(b'\n', &mut bytes);
-                match read {
-                    Ok(0) => {
-                        finished = true;
-                        break;
-                    }
+            // Read the common case in one bulk operation instead of wrapping
+            // Read::take, validating UTF-8 and extending the buffer per line.
+            // Complete the final line only, with the same strict line bound.
+            bytes.resize(SEARCH_BLOCK_BYTES, 0);
+            let read = match reader.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => { skipped += 1; break; },
+            };
+            bytes.truncate(read);
+            let mut invalid_file = false;
+            let tail_start = memchr::memrchr(b'\n', &bytes).map_or(0, |index| index + 1);
+            if tail_start != bytes.len() {
+                let remaining = MAX_LINE_BYTES + 1 - (bytes.len() - tail_start);
+                match Read::take(&mut reader, remaining as u64).read_until(b'\n', &mut bytes) {
+                    Ok(0) => finished = true,
+                    Ok(_) => {},
                     Err(_) => {
-                        bytes.truncate(start);
-                        skipped += 1;
+                        bytes.truncate(tail_start);
+                        invalid_file = true;
                         finished = true;
-                        break;
-                    }
-                    _ => {}
+                    },
                 }
-                let next = &bytes[start..];
-                if next.len() > MAX_LINE_BYTES
-                    || next.contains(&0)
-                    || std::str::from_utf8(next).is_err()
-                {
-                    // Earlier complete text lines remain searchable, while
-                    // the invalid/oversized line and rest of this file skip.
-                    bytes.truncate(start);
-                    skipped += 1;
+                if bytes.len() - tail_start > MAX_LINE_BYTES {
+                    bytes.truncate(tail_start);
+                    invalid_file = true;
                     finished = true;
-                    break;
                 }
-                block_lines += 1;
             }
+            // Invalid data skips its line and the suffix, retaining all valid
+            // complete lines before it just as the per-line reader did.
+            let invalid = memchr::memchr(0, &bytes).into_iter()
+                .chain(std::str::from_utf8(&bytes).err().map(|error| error.valid_up_to()))
+                .min();
+            if let Some(invalid) = invalid {
+                let valid = memchr::memrchr(b'\n', &bytes[..invalid]).map_or(0, |index| index + 1);
+                bytes.truncate(valid);
+                invalid_file = true;
+                finished = true;
+            }
+            if invalid_file { skipped += 1; }
+            if cancellation.is_cancelled() { return; }
+            let block_lines = memchr::memchr_iter(b'\n', &bytes).count()
+                + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
             let text =
                 std::str::from_utf8(&bytes).expect("only validated complete lines enter the block");
             if options.regex || regex.is_match(text) {
@@ -490,6 +494,25 @@ mod tests {
             events.last(),
             Some(Progress::Finished { skipped: 1, .. })
         ));
+    }
+
+    #[test]
+    fn bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix() {
+        let fixture=tempfile::tempdir().unwrap();
+        let mut text=vec![b'x';SEARCH_BLOCK_BYTES-2];
+        text.extend_from_slice("é needle\r\n".as_bytes());
+        text.extend_from_slice(b"valid needle\n");
+        text.extend(std::iter::repeat_n(b'x',MAX_LINE_BYTES+1));
+        text.extend_from_slice(b"needle\n");
+        std::fs::write(fixture.path().join("cross-block"),text).unwrap();
+        let events=run(fixture.path(),options("needle"));
+        let found=matches(events.clone());
+        assert_eq!(found.iter().map(|found| (found.line,found.column)).collect::<Vec<_>>(),vec![(0,SEARCH_BLOCK_BYTES+1),(1,6)]);
+        assert!(matches!(events.last(),Some(Progress::Finished {skipped:1,..})));
+        std::fs::write(fixture.path().join("cross-block"),b"needle\nvalid\ninvalid\xffneedle\nneedle\n").unwrap();
+        let events=run(fixture.path(),options("needle"));
+        assert_eq!(matches(events.clone()).len(),1);
+        assert!(matches!(events.last(),Some(Progress::Finished {skipped:1,..})));
     }
 
     #[test]

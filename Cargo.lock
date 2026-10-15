@@ -1212,6 +1212,7 @@ dependencies = [
  "libcosmic",
  "libghostty-vt",
  "lsp-types",
+ "memchr",
  "mermaid-rs-renderer",
  "notify",
  "portable-pty",
