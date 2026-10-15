@@ -2565,4 +2565,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn absent_completed_handler_does_not_offer_an_unavailable_control_for_stale_or_unbound_identity() {
+        for registry_missing in [false,true] {
+            let (mut app,card,target)=local_dismissal_fixture();
+            let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
+            if registry_missing {app.workspace_model.identity=crate::workspace_model::NO_REGISTRY;}else{app.workspace_model.views[0].revision+=1;}
+            drop(app.completed_terminal_closed(card,source,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})));
+            assert!(app.local_terminal_unavailable_notice(card).is_none());
+            assert!(!app.status.as_ref().unwrap().message.contains("Dismiss locally"));
+            assert!(app.status.as_ref().unwrap().message.contains("Reconnect"));
+            assert!(app.workspace.card(card).is_some());
+        }
+    }
+    #[test]
+    fn old_absence_cannot_offer_or_hide_a_fresh_start_without_confirmed_worker_metadata() {
+        let (mut app,card,target)=local_dismissal_fixture();
+        let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
+        // A new successful startup may publish the same ended descriptor before
+        // optional worker metadata arrives; its presentation generation differs.
+        drop(app.terminal_local_presentation_started(card));
+        drop(app.completed_terminal_closed(card,source,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
+        assert!(app.local_terminal_unavailable_notice(card).is_none());
+        drop(app.dismiss_terminal_locally(target));
+        assert!(app.workspace.card(card).is_some());assert!(!app.locally_dismissed_terminal(card));
+    }
+
+    #[test]
+    fn repeated_empty_inventory_and_unrelated_view_edits_preserve_explicit_local_hide() {
+        let (mut app,card,target)=local_dismissal_fixture();
+        app.offer_local_terminal_dismissal(Some(target.clone()));drop(app.dismiss_terminal_locally(target));
+        let before=app.workspace_model.clone();
+        for _ in 0..4 {drop(app.observe_local_terminal_residents(&[]));assert!(app.locally_dismissed_terminal(card));assert!(app.workspace.card(card).is_none());}
+        assert_eq!(app.workspace_model,before);
+        let other=app.durable.channels[1].id;
+        let mut view=View::empty(Scope::Channel(other));view.revision=123;
+        app.workspace_model.views.push(view);app.workspace_model.sequence+=1;
+        let model=app.workspace_model.clone();drop(app.reconcile_shared_views());
+        assert!(app.locally_dismissed_terminal(card));assert!(app.workspace.card(card).is_none());
+        assert_eq!(app.workspace_model,model);assert!(app.shared_views.pending.is_empty());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+    }
+
 }

@@ -7,7 +7,7 @@ use crate::workspace_model::views::{Pane,Scope};
 pub struct Target {
     card:CardId, source:TerminalSession, registry:uuid::Uuid,
     scope:Scope,revision:u64,pane:Pane,token:uuid::Uuid,
-    captured:Option<CapturedTerminal>,inventory:u64,
+    captured:Option<CapturedTerminal>,inventory:u64,presentation_generation:uuid::Uuid,
 }
 impl std::fmt::Debug for Target {
     fn fmt(&self,formatter:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
@@ -17,10 +17,10 @@ impl std::fmt::Debug for Target {
 #[derive(Default)]
 pub(super) struct State {
     unavailable:HashMap<CardId,Target>,hidden:HashMap<CardId,Target>,
-    inventory:u64,last_seen:HashMap<TerminalId,u64>,
+    inventory:u64,last_seen:HashMap<TerminalId,u64>,generations:HashMap<CardId,uuid::Uuid>,
 }
 impl State {
-    pub(super) fn forget(&mut self,card:CardId){self.unavailable.remove(&card);self.hidden.remove(&card);}
+    pub(super) fn forget(&mut self,card:CardId){self.unavailable.remove(&card);self.hidden.remove(&card);self.generations.insert(card,uuid::Uuid::new_v4());}
 }
 impl Cagents {
     pub(in crate::app) fn local_terminal_dismissal_target(&self,card:CardId)->Option<Target> {
@@ -30,13 +30,14 @@ impl Cagents {
         let mut panes=self.workspace_model.views.iter().flat_map(|view|view.panes.iter().filter(move|pane|pane.id==card).map(move|pane|(view,pane)));
         let (view,pane)=panes.next()?;
         if panes.next().is_some() || pane.pending_terminal_start || pane.kind!=CardKind::Terminal(source.clone()){return None;}
-        Some(Target{card,source,registry:self.workspace_model.identity,scope:view.scope.clone(),revision:view.revision,pane:pane.clone(),token:uuid::Uuid::new_v4(),captured:self.terminal_close_bindings.bound.get(&card).cloned(),inventory:self.terminal_close_bindings.local.inventory})
+        Some(Target{card,source,registry:self.workspace_model.identity,scope:view.scope.clone(),revision:view.revision,pane:pane.clone(),token:uuid::Uuid::new_v4(),captured:self.terminal_close_bindings.bound.get(&card).cloned(),inventory:self.terminal_close_bindings.local.inventory,presentation_generation:self.terminal_close_bindings.local.generations.get(&card).copied().unwrap_or_else(uuid::Uuid::nil)})
     }
     fn local_terminal_dismissal_current(&self,target:&Target)->bool {
         if !self.card_state(target.card).is_some_and(|state|state.existence.is_open()){return false;}
         if self.workspace_model.identity!=target.registry || self.terminal_start_in_flight(target.card) || self.chat_start_pending(target.card) || ended_terminal(self.card_state(target.card))!=Some(&target.source) {return false;}
         if !same_captured(target.captured.as_ref(),self.terminal_close_bindings.bound.get(&target.card)){return false;}
         let state=&self.terminal_close_bindings.local;
+        if state.generations.get(&target.card).copied().unwrap_or_else(uuid::Uuid::nil)!=target.presentation_generation {return false;}
         if state.last_seen.get(&target.source.id).is_some_and(|seen|*seen>target.inventory){return false;}
         if let Some(CardRuntime::Terminal(surface))=self.cards.get(&target.card) {
             if let Some(binding)=surface.worker_binding(){
@@ -46,10 +47,11 @@ impl Cagents {
         let mut owned=self.workspace_model.views.iter().flat_map(|view|view.panes.iter().filter(move|pane|pane.id==target.card).map(move|pane|(view,pane)));
         owned.next().is_some_and(|(view,pane)|view.scope==target.scope&&view.revision==target.revision&&pane==&target.pane) && owned.next().is_none()
     }
-    pub(in crate::app) fn offer_local_terminal_dismissal(&mut self,target:Option<Target>) {
+    pub(in crate::app) fn offer_local_terminal_dismissal(&mut self,target:Option<Target>)->bool {
         if let Some(target)=target.filter(|target|self.local_terminal_dismissal_current(target)) {
             self.terminal_close_bindings.local.unavailable.insert(target.card,target);
-        }
+            true
+        } else {false}
     }
     pub(in crate::app) fn locally_dismissed_terminal(&self,card:CardId)->bool {
         self.terminal_close_bindings.local.hidden.get(&card).is_some_and(|target|self.local_terminal_dismissal_current(target))
@@ -60,15 +62,18 @@ impl Cagents {
         state.hidden.retain(|_,target|valid.contains(&target.token));state.unavailable.retain(|_,target|valid.contains(&target.token));
         let ids=self.durable.cards.iter().filter(|card|card.existence.is_open()).filter_map(|card|match &card.kind{CardKind::Terminal(source)=>Some(source.id),_=>None}).collect::<HashSet<_>>();
         state.last_seen.retain(|id,_|ids.contains(id));
+        let cards=self.durable.cards.iter().filter(|card|card.existence.is_open()).map(|card|card.id).collect::<HashSet<_>>();
+        state.generations.retain(|card,_|cards.contains(card));
     }
     pub(in crate::app) fn observe_local_terminal_residents(&mut self,terminals:&[crate::terminal::ipc::TerminalDescriptor])->Task<Message> {
         let state=&mut self.terminal_close_bindings.local;
         state.inventory=state.inventory.saturating_add(1);
         let present=terminals.iter().map(|terminal|terminal.session.id).collect::<HashSet<_>>();
+        let hidden_before=state.hidden.len();
         let reveal=state.hidden.values().any(|target|present.contains(&target.source.id));
         for id in present {state.last_seen.insert(id,state.inventory);}
         self.prune_local_terminal_dismissals();
-        if reveal {self.reconcile_shared_views()} else {Task::none()}
+        if reveal || self.terminal_close_bindings.local.hidden.len()<hidden_before {self.reconcile_shared_views()} else {Task::none()}
     }
     pub(in crate::app) fn dismiss_terminal_locally(&mut self,target:Target)->Task<Message> {
         if self.modal_is_open() || !self.local_terminal_dismissal_current(&target) || self.terminal_close_bindings.local.unavailable.get(&target.card).is_none_or(|current|current.token!=target.token){return Task::none();}

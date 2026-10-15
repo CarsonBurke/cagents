@@ -564,10 +564,12 @@ impl Cagents {
                 }
                 // Absence grants only an explicit, revision-bound local
                 // presentation option. Shared membership/history remain intact.
-                self.offer_local_terminal_dismissal(presentation);
-                self.status = Some(TransientNotice::warning(
-                    "The saved pane is unavailable. Use Dismiss locally to hide it in this window, or refresh its connection. Shared sessions and history are preserved.",
-                ));
+                let offered=self.offer_local_terminal_dismissal(presentation);
+                self.status = Some(TransientNotice::warning(if offered {
+                    "The saved pane is unavailable. Use Dismiss locally to hide it in this window, or refresh its connection. Shared sessions and history are preserved."
+                } else {
+                    "The saved pane is unavailable and was kept because its current local identity could not be verified. Reconnect or refresh this pane before trying again."
+                }));
                 Task::none()
             }
             Ok(CompletedCloseOutcome::Closed) => {
