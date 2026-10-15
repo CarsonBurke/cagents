@@ -300,6 +300,10 @@ impl LocalHandle {
         launch_account_scope:Result<crate::account::scope::LaunchAccountScope,String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
+        // Only the caller's retained startup context may own a strong cleanup
+        // Handle. A scope pin synthesized below has no external installer to
+        // clear it and must never create Actor→Context→Handle self-retention.
+        let external_launch_owner=manage_launch_ownership&&spec.execution.is_some();
         spec.remove_unset_environment();
         // A live actor's close authority follows the physical directory it
         // entered, never a launch alias that can be retargeted afterwards.
@@ -700,7 +704,7 @@ impl LocalHandle {
             .map_err(|e| e.to_string())?;
         *inner.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         let handle = Self(inner);
-        if manage_launch_ownership && !adopted_native && let Some(context) = &launch_context {
+        if external_launch_owner && !adopted_native && let Some(context) = &launch_context {
             context.claim_owner(Arc::new(handle.clone()));
         }
         // No child can exist before its exact actor cleanup capability and
@@ -711,13 +715,13 @@ impl LocalHandle {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 use super::protocol::LaunchCleanup;
-                if handle.cleanup().is_ok() || (manage_launch_ownership&&launch_context.is_some()) {
+                if handle.cleanup().is_ok() || (external_launch_owner&&launch_context.is_some()) {
                     return Err(error);
                 }
                 // Interactive launches have no execution journal. Preserve
                 // their exact actor for host publication if cleanup is unknown.
             }
-            Err(error) if manage_launch_ownership&&launch_context.is_some() => {
+            Err(error) if external_launch_owner&&launch_context.is_some() => {
                 return Err(format!(
                     "Provider startup did not finish: {error}; its exact cleanup owner is retained"
                 ));
@@ -3637,6 +3641,18 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropping_live_ordinary_actor_reaps_its_child_with_a_synthesized_scope_pin() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut adapter:Box<dyn Adapter>=Box::new(Echo);let mut initial=adapter.initialize().unwrap();let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,adapter,initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
+        let process=handle.provider_process().unwrap();assert!(process.is_current());let alive=handle.resource_lifetime();
+        drop(handle);
+        assert!(!alive(),"an internal directory pin must not own its own Handle cleanup capability");
+        let deadline=Instant::now()+Duration::from_secs(2);while process.is_current() {assert!(Instant::now()<deadline,"dropping the last live ordinary handle must join its exact child");thread::yield_now();}
+    }
+
     #[test]
     fn completed_actor_retains_only_the_original_directory_pin_after_a_move() {
         let root=tempfile::tempdir_in("/var/tmp").unwrap();let original=root.path().join("original");std::fs::create_dir(&original).unwrap();
