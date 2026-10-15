@@ -323,6 +323,10 @@ pub enum LspIntent {
     Close,
 }
 
+/// File-surface commands share availability with their mounted toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorSurfaceCommand { Save, DiscardEdits, Edit, Preview, Diff }
+
 #[derive(Debug, Clone)]
 pub enum EditorLspAction {
     Complete,
@@ -4873,6 +4877,25 @@ impl RepositoryRuntime {
         matches!(&self.document, DocumentState::Editable(document) if document.dirty)
     }
 
+    /// Returns the exact toolbar action when its current document can accept
+    /// it. Palette and remapped shortcuts use this same activation-time guard.
+    pub fn editor_surface_command_action(&self, card: CardId, command: EditorSurfaceCommand) -> Option<RepositoryAction> {
+        self.selected.as_ref()?;
+        Some(match command {
+            EditorSurfaceCommand::Save if self.can_save() => RepositoryAction::Save { card, overwrite: false },
+            EditorSurfaceCommand::DiscardEdits if self.can_discard_edits() => RepositoryAction::DiscardEdits { card },
+            EditorSurfaceCommand::Edit if self.can_apply_markdown_mode(false) => RepositoryAction::ApplyMarkdownMode { card, preview: false },
+            EditorSurfaceCommand::Preview => {
+                let file_information = !matches!(&self.document, DocumentState::Editable(_) | DocumentState::Image { .. });
+                if file_information && !self.is_saving() { RepositoryAction::ApplySourceSurface { card, diff: false } }
+                else if !file_information && self.can_apply_markdown_mode(true) { RepositoryAction::ApplyMarkdownMode { card, preview: true } }
+                else { return None; }
+            }
+            EditorSurfaceCommand::Diff if self.can_show_diff() => RepositoryAction::ApplySourceSurface { card, diff: true },
+            _ => return None,
+        })
+    }
+
     pub fn can_save(&self) -> bool {
         matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none())
     }
@@ -8671,23 +8694,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             && (!editable || !editing)
             && (file_information || runtime.can_apply_markdown_mode(true)),
     )
-    .on_press_maybe(
-        (if file_information {
-            !runtime.is_saving()
-        } else {
-            runtime.can_apply_markdown_mode(true)
-        })
-        .then(|| {
-            if file_information {
-                RepositoryAction::ApplySourceSurface { card, diff: false }
-            } else {
-                RepositoryAction::ApplyMarkdownMode {
-                    card,
-                    preview: true,
-                }
-            }
-        }),
-    );
+    .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Preview));
     let preview = if editable {
         preview
     } else {
@@ -8695,12 +8702,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     };
     let edit = icon_button(Icon::Edit, "Edit file")
         .selected(editable && editing && runtime.can_apply_markdown_mode(false))
-        .on_press_maybe(runtime.can_apply_markdown_mode(false).then(|| {
-            RepositoryAction::ApplyMarkdownMode {
-                card,
-                preview: false,
-            }
-        }));
+        .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Edit));
     let edit = if editable {
         edit.id(focus_restore_id(card))
     } else {
@@ -8712,11 +8714,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             edit.into(),
             icon_button(Icon::Diff, "View diff")
                 .selected(runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff())
-                .on_press_maybe(
-                    runtime
-                        .can_show_diff()
-                        .then(|| RepositoryAction::ApplySourceSurface { card, diff: true }),
-                )
+                .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Diff))
                 .into(),
         ])];
     // File actions stay mounted whether or not they can run: an inactive
@@ -8729,11 +8727,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 Icon::RevertFile,
                 "Discard unsaved edits (Ctrl+Z restores them)",
             )
-            .on_press_maybe(
-                runtime
-                    .can_discard_edits()
-                    .then(|| RepositoryAction::DiscardEdits { card }),
-            )
+            .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::DiscardEdits))
             .into(),
         );
         controls.push(
@@ -8748,10 +8742,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 },
             )
             .selected(runtime.is_dirty())
-            .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
-                card,
-                overwrite: false,
-            }))
+            .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Save))
             .into(),
         );
     }
