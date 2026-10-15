@@ -2045,6 +2045,10 @@ impl Actor {
                 let _=reply.send(Err("Provider input is still arriving; refresh close confirmation or stop the agent before closing".into()));
                 continue;
             }
+            #[cfg(test)]
+            if matches!(&command,ActorCommand::CloseIfRevision{..}) {
+                self.adapter.after_close_input_drained();
+            }
             let (run, command) = match command {
                 ActorCommand::Provider { run, command } => (run, command),
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
@@ -2113,8 +2117,16 @@ impl Actor {
                     let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
                     let close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
                     let unchanged=close.revision==revision && close.directory_identity.is_some();
-                    if unchanged {self.stop.store(true,Ordering::Release);}
-                    let _=reply.send(if unchanged {Ok(())} else {Err("Provider work changed before conditional close".into())});
+                    // Empty input and the actor's FIFO cannot fence work that
+                    // the provider starts immediately after the final poll.
+                    // No supported adapter currently supplies an authoritative
+                    // backend conditional-close barrier, so preserve this live
+                    // owner instead of treating its observed revision as one.
+                    let _=reply.send(Err(if unchanged {
+                        "The provider cannot atomically fence backend turns for guarded close; stop it explicitly, then refresh the worktree census".into()
+                    } else {
+                        "Provider work changed before conditional close".into()
+                    }));
                     continue;
                 }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
@@ -3240,7 +3252,7 @@ mod tests {
     }
 
     #[test]
-    fn conditional_close_refuses_new_admitted_or_autonomous_work_but_allows_streaming() {
+    fn conditional_close_tracks_work_without_assuming_a_backend_fence() {
         struct Consent;
         impl Adapter for Consent {
             fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
@@ -3291,8 +3303,9 @@ mod tests {
         assert!(autonomous.turn_generation>admitted.turn_generation);
         assert!(handle.close_if_revision(admitted.close_revision).is_err());
         assert!(!handle.close_observation().closing);
-        handle.close_if_revision(autonomous.close_revision).unwrap();
-        assert!(handle.is_completed());
+        assert!(handle.close_if_revision(autonomous.close_revision).unwrap_err().contains("atomically fence backend turns"));
+        assert!(!handle.close_observation().closing);
+        handle.close().unwrap();
     }
 
     #[test]
@@ -3332,7 +3345,8 @@ mod tests {
         handle.command(Command::SetPermissionMode {mode:"manual".into()}).unwrap();
         let completed=handle.close_observation();
         assert_eq!(completed.activity,ActivityState::Idle);
-        handle.close_if_revision(completed.close_revision).unwrap();
+        assert!(handle.close_if_revision(completed.close_revision).unwrap_err().contains("atomically fence backend turns"));
+        handle.close().unwrap();
     }
 
     #[test]
@@ -3383,7 +3397,42 @@ mod tests {
         assert!(!handle.close_observation().closing);
         until(&handle,|state|state.turn_generation>consent.turn_generation);
         assert!(handle.close_if_revision(consent.close_revision).is_err());
-        handle.close_if_revision(handle.close_observation().close_revision).unwrap();
+        assert!(handle.close_if_revision(handle.close_observation().close_revision).unwrap_err().contains("atomically fence backend turns"));
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn conditional_close_refuses_work_started_after_the_final_empty_input_poll() {
+        struct AfterPoll { directory:std::path::PathBuf }
+        impl Adapter for AfterPoll {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Default::default())}
+            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Default::default())}
+            fn receive(&mut self,value:Value)->Result<Step,String> {
+                Ok(Step {events:if value["turn"]==true {vec![Event::TurnStarted]} else {Vec::new()},..Default::default()})
+            }
+            fn after_close_input_drained(&mut self) {
+                // This callback runs after the successful poll and before the
+                // actor compares consent. The provider then starts new work
+                // without any corresponding local command admission.
+                std::fs::write(self.directory.join("release"),b"").unwrap();
+                let deadline=Instant::now()+Duration::from_secs(5);
+                while !self.directory.join("emitted").exists() {
+                    assert!(Instant::now()<deadline,"provider did not emit its post-poll turn");
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sh".into(),arguments:vec!["-c".into(),"while [ ! -e \"$1/release\" ]; do sleep 0.01; done; printf '{\"turn\":true}\\n'; : > \"$1/emitted\"; exec cat".into(),"fixture".into(),directory.path().to_string_lossy().into_owned()],working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(AfterPoll {directory:directory.path().into()}),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
+        let consent=handle.close_observation();
+        let refusal=handle.close_if_revision(consent.close_revision).unwrap_err();
+        assert!(directory.path().join("emitted").exists(),"the provider crossed the exact post-poll gap");
+        assert!(refusal.contains("atomically fence backend turns"));
+        assert!(!handle.is_completed());assert!(!handle.close_observation().closing);
+        until(&handle,|state|state.turn_generation>consent.turn_generation);
+        handle.close().unwrap();
     }
 
     #[test]
@@ -3405,6 +3454,7 @@ mod tests {
         assert!(!observation.ready && !observation.exited && !observation.closing);
         assert!(handle.close_if_revision(observation.close_revision).unwrap_err().contains("reattach"));
         handle.0.close_state.lock().unwrap().unobserved_native=false;
+        handle.close_if_revision(observation.close_revision).unwrap();
     }
 
     #[test]

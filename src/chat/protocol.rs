@@ -303,6 +303,10 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Force the otherwise rare backend-after-poll interleaving in runtime
+    /// regression tests. No test hook is present in production adapters.
+    #[cfg(test)]
+    fn after_close_input_drained(&mut self) {}
     /// Update cached operational paths before initialization, after the caller
     /// pinned and verified the private execution directory.
     fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> { Ok(()) }
