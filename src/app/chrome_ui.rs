@@ -2180,9 +2180,10 @@ impl Cagents {
             widget::Id::new(TOOLBAR_FOCUS_ID),
             enabled.then_some(Message::ChromeUi(Action::ToggleNewTab)),
         );
-        let context = self.chrome_command_context();
-        let content = (self.chrome_ui.popup == Some(Popup::NewTab) && enabled)
-            .then(|| self.new_tab_popup(&context));
+        let content = (self.chrome_ui.popup == Some(Popup::NewTab) && enabled).then(|| {
+            let context = self.chrome_command_context();
+            self.new_tab_popup(&context)
+        });
         let close = self.chrome_ui.new_tab_target.as_ref().map_or(Action::Close, |target| Action::CloseNewTab(target.request));
         crate::ui_controls::popover(
             control,
