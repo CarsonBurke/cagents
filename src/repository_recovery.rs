@@ -623,7 +623,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             "Undo requires the original protected outside-checkout recovery context; no path was undone.".into()
         ))?;
         let root = self.captured_worktree_root(&recovery.worktree)?;
-        context.validate_for_source(&root).map_err(|error| ValidationError::Io(error.to_string()))?;
         let directory = root
             .metadata()
             .map_err(|error| ValidationError::Io(error.to_string()))?;
@@ -634,6 +633,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 },
             });
         }
+        context.validate_for_source(&root).map_err(|error| ValidationError::Io(error.to_string()))?;
         let mut paths = Vec::new();
         let mut failures = Vec::new();
         let mut created_directories =
