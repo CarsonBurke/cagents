@@ -750,14 +750,12 @@ impl Cagents {
                 tasks.push(task);
             }
         }
-        tasks.push(
-            self.sync_automation_proposal_page(
-                model.identity,
-                model.automation_proposal_sequence,
-                model.pending_automation_proposal_count,
-                model.pending_automation_proposals.clone(),
-            ),
-        );
+        tasks.push(self.sync_automation_proposal_page(
+            model.identity,
+            model.automation_proposal_sequence,
+            model.pending_automation_proposal_count,
+            model.pending_automation_proposals.clone(),
+        ));
         self.workspace_model = model;
         // Fence inconsistent canonical evidence before persisting can publish
         // any restored local projection into the incoming authoritative model.
@@ -2144,8 +2142,8 @@ mod tests {
             headless_automation_agents: Vec::new(),
             archived_automation_agents: Vec::new(),
             pending_automation_proposals: Vec::new(),
-                pending_automation_proposal_count: 0,
-                automation_proposal_sequence: 0,
+            pending_automation_proposal_count: 0,
+            automation_proposal_sequence: 0,
         }
     }
 

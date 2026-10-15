@@ -34,9 +34,22 @@ pub enum Action {
         generation: u64,
     },
     Updated(Vec<ProposalSummary>),
-    Page { generation: u64, after: Option<uuid::Uuid>, offset: u64 },
-    PageLoaded { generation: u64, after: Option<uuid::Uuid>, offset: u64, result: Arc<Result<Vec<ProposalSummary>, String>> },
-    ReviewRefreshed { generation: u64, pushed: Option<(uuid::Uuid, u64, u64)>, result: Arc<Result<Proposal, String>> },
+    Page {
+        generation: u64,
+        after: Option<uuid::Uuid>,
+        offset: u64,
+    },
+    PageLoaded {
+        generation: u64,
+        after: Option<uuid::Uuid>,
+        offset: u64,
+        result: Arc<Result<Vec<ProposalSummary>, String>>,
+    },
+    ReviewRefreshed {
+        generation: u64,
+        pushed: Option<(uuid::Uuid, u64, u64)>,
+        result: Arc<Result<Proposal, String>>,
+    },
     Loaded {
         id: uuid::Uuid,
         revision: u64,
@@ -121,12 +134,54 @@ impl Cagents {
                 .max_height(160)
                 .into(),
                 widget::row::with_children(vec![
-                    design::body(format!("Showing {}–{}", if pending.is_empty() { 0 } else { self.automation_approval.page_offset + 1 }, self.automation_approval.page_offset.saturating_add(pending.len() as u64))).into(),
+                    design::body(format!(
+                        "Showing {}–{}",
+                        if pending.is_empty() {
+                            0
+                        } else {
+                            self.automation_approval.page_offset + 1
+                        },
+                        self.automation_approval
+                            .page_offset
+                            .saturating_add(pending.len() as u64)
+                    ))
+                    .into(),
                     crate::ui_controls::button::secondary("First requests")
-                        .on_press_maybe((!self.modal_is_open() && !self.automation_approval.page_loading && self.automation_approval.total > 0).then_some(Message::AutomationApproval(Action::Page { generation: self.automation_approval.page_generation, after: None, offset: 0 }))).into(),
+                        .on_press_maybe(
+                            (!self.modal_is_open()
+                                && !self.automation_approval.page_loading
+                                && self.automation_approval.total > 0)
+                                .then_some(Message::AutomationApproval(Action::Page {
+                                    generation: self.automation_approval.page_generation,
+                                    after: None,
+                                    offset: 0,
+                                })),
+                        )
+                        .into(),
                     crate::ui_controls::button::secondary("Next requests")
-                        .on_press_maybe((!self.modal_is_open() && !self.automation_approval.page_loading && pending.len() == crate::automations::PROPOSAL_PAGE_SIZE && self.automation_approval.page_offset.saturating_add(pending.len() as u64) < self.automation_approval.total).then_some(Message::AutomationApproval(Action::Page { generation: self.automation_approval.page_generation, after: pending.last().map(|proposal| proposal.id), offset: self.automation_approval.page_offset.saturating_add(pending.len() as u64) }))).into(),
-                ]).spacing(space::S).align_y(Alignment::Center).into(),
+                        .on_press_maybe(
+                            (!self.modal_is_open()
+                                && !self.automation_approval.page_loading
+                                && pending.len() == crate::automations::PROPOSAL_PAGE_SIZE
+                                && self
+                                    .automation_approval
+                                    .page_offset
+                                    .saturating_add(pending.len() as u64)
+                                    < self.automation_approval.total)
+                                .then_some(Message::AutomationApproval(Action::Page {
+                                    generation: self.automation_approval.page_generation,
+                                    after: pending.last().map(|proposal| proposal.id),
+                                    offset: self
+                                        .automation_approval
+                                        .page_offset
+                                        .saturating_add(pending.len() as u64),
+                                })),
+                        )
+                        .into(),
+                ])
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into(),
             ])
             .spacing(space::S),
         )
@@ -152,10 +207,22 @@ impl Cagents {
         state.page_loading = false;
     }
 
-    pub(super) fn sync_automation_proposal_page(&mut self, identity: uuid::Uuid, sequence: u64, total: u64, pending: Vec<ProposalSummary>) -> Task<Message> {
+    pub(super) fn sync_automation_proposal_page(
+        &mut self,
+        identity: uuid::Uuid,
+        sequence: u64,
+        total: u64,
+        pending: Vec<ProposalSummary>,
+    ) -> Task<Message> {
         let key = (identity, sequence, self.automation_approval.watch_epoch);
-        if self.automation_approval.pushed == Some(key) { return Task::none(); }
-        if self.automation_approval.pushed.is_some_and(|previous| previous.0 != identity) {
+        if self.automation_approval.pushed == Some(key) {
+            return Task::none();
+        }
+        if self
+            .automation_approval
+            .pushed
+            .is_some_and(|previous| previous.0 != identity)
+        {
             let state = &mut self.automation_approval;
             state.available = None;
             state.reading = None;
@@ -168,29 +235,57 @@ impl Cagents {
         }
         self.automation_approval.pushed = Some(key);
         self.automation_approval.total = total;
-        self.automation_approval.page_generation = self.automation_approval.page_generation.wrapping_add(1);
+        self.automation_approval.page_generation =
+            self.automation_approval.page_generation.wrapping_add(1);
         self.automation_approval.page_loading = false;
         self.automation_approval.page_offset = 0;
         self.automation_approval.review_refresh = None;
-        self.update_automation_approval(Action::Updated(pending.into_iter().take(crate::automations::PROPOSAL_PAGE_SIZE).collect()))
+        self.update_automation_approval(Action::Updated(
+            pending
+                .into_iter()
+                .take(crate::automations::PROPOSAL_PAGE_SIZE)
+                .collect(),
+        ))
     }
 
     fn refresh_automation_approval_review(&mut self) -> Task<Message> {
-        let Some(proposal) = self.automation_approval.proposal.as_ref() else { return Task::none(); };
-        let key = (self.automation_approval.generation, self.automation_approval.pushed);
-        if self.automation_approval.review_refresh == Some(key) { return Task::none(); }
+        let Some(proposal) = self.automation_approval.proposal.as_ref() else {
+            return Task::none();
+        };
+        let key = (
+            self.automation_approval.generation,
+            self.automation_approval.pushed,
+        );
+        if self.automation_approval.review_refresh == Some(key) {
+            return Task::none();
+        }
         let id = proposal.id;
         self.automation_approval.review_refresh = Some(key);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-                let mut client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-                match client.automation(crate::agent_execution::Authority::default(), Request::Proposal { id }).map_err(|error| error.to_string())? {
+                let socket = crate::terminal::ipc::daemon_socket_path()
+                    .map_err(|error| error.to_string())?;
+                let mut client = crate::control::ControlClient::connect(&socket)
+                    .map_err(|error| error.to_string())?;
+                match client
+                    .automation(
+                        crate::agent_execution::Authority::default(),
+                        Request::Proposal { id },
+                    )
+                    .map_err(|error| error.to_string())?
+                {
                     Response::Proposal(proposal) => Ok(*proposal),
                     _ => Err("No exact request receipt was returned".into()),
                 }
-            }).await.map_err(|error| error.to_string()).and_then(|result| result);
-            Message::AutomationApproval(Action::ReviewRefreshed { generation: key.0, pushed: key.1, result: Arc::new(result) })
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::AutomationApproval(Action::ReviewRefreshed {
+                generation: key.0,
+                pushed: key.1,
+                result: Arc::new(result),
+            })
         })
     }
 
@@ -272,7 +367,10 @@ impl Cagents {
     pub(super) fn update_automation_approval(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Updated(pending) => {
-                self.automation_approval.pending = pending.into_iter().take(crate::automations::PROPOSAL_PAGE_SIZE).collect();
+                self.automation_approval.pending = pending
+                    .into_iter()
+                    .take(crate::automations::PROPOSAL_PAGE_SIZE)
+                    .collect();
                 if self
                     .automation_approval
                     .available
@@ -286,15 +384,17 @@ impl Cagents {
                     self.automation_approval.available = None;
                 }
                 if !self.automation_approval.deciding
-                    && (self.automation_approval.review_stale || self
-                        .automation_approval
-                        .proposal
-                        .as_ref()
-                        .is_some_and(|proposal| {
-                            !self.automation_approval.pending.iter().any(|summary| {
-                                summary.id == proposal.id && summary.revision == proposal.revision
-                            })
-                        }))
+                    && (self.automation_approval.review_stale
+                        || self
+                            .automation_approval
+                            .proposal
+                            .as_ref()
+                            .is_some_and(|proposal| {
+                                !self.automation_approval.pending.iter().any(|summary| {
+                                    summary.id == proposal.id
+                                        && summary.revision == proposal.revision
+                                })
+                            }))
                 {
                     // A bounded/queued watch packet is discovery, not a private
                     // decision receipt. An exact read also fences a packet that
@@ -303,48 +403,101 @@ impl Cagents {
                 }
                 Task::none()
             }
-            Action::Page { generation, after, offset } => {
-                if generation != self.automation_approval.page_generation || self.automation_approval.page_loading || self.modal_is_open() || self.update_prepared {
+            Action::Page {
+                generation,
+                after,
+                offset,
+            } => {
+                if generation != self.automation_approval.page_generation
+                    || self.automation_approval.page_loading
+                    || self.modal_is_open()
+                    || self.update_prepared
+                {
                     return Task::none();
                 }
-                self.automation_approval.page_generation = self.automation_approval.page_generation.wrapping_add(1);
+                self.automation_approval.page_generation =
+                    self.automation_approval.page_generation.wrapping_add(1);
                 let generation = self.automation_approval.page_generation;
                 self.automation_approval.page_loading = true;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-                        let mut client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-                        match client.automation(crate::agent_execution::Authority::default(), Request::AllPendingProposals { after, limit: crate::automations::PROPOSAL_PAGE_SIZE }).map_err(|error| error.to_string())? {
+                        let socket = crate::terminal::ipc::daemon_socket_path()
+                            .map_err(|error| error.to_string())?;
+                        let mut client = crate::control::ControlClient::connect(&socket)
+                            .map_err(|error| error.to_string())?;
+                        match client
+                            .automation(
+                                crate::agent_execution::Authority::default(),
+                                Request::AllPendingProposals {
+                                    after,
+                                    limit: crate::automations::PROPOSAL_PAGE_SIZE,
+                                },
+                            )
+                            .map_err(|error| error.to_string())?
+                        {
                             Response::Proposals(page) => Ok(page),
                             _ => Err("No pending request page was returned".into()),
                         }
-                    }).await.map_err(|error| error.to_string()).and_then(|result| result);
-                    Message::AutomationApproval(Action::PageLoaded { generation, after, offset, result: Arc::new(result) })
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::AutomationApproval(Action::PageLoaded {
+                        generation,
+                        after,
+                        offset,
+                        result: Arc::new(result),
+                    })
                 })
             }
-            Action::PageLoaded { generation, after, offset, result } => {
-                if !self.automation_approval.page_loading || generation != self.automation_approval.page_generation {
+            Action::PageLoaded {
+                generation,
+                after,
+                offset,
+                result,
+            } => {
+                if !self.automation_approval.page_loading
+                    || generation != self.automation_approval.page_generation
+                {
                     return Task::none();
                 }
                 self.automation_approval.page_loading = false;
                 match result.as_ref() {
-                    Ok(page) if page.len() <= crate::automations::PROPOSAL_PAGE_SIZE && page.windows(2).all(|pair| pair[0].id < pair[1].id) && page.first().is_none_or(|proposal| after.is_none_or(|after| proposal.id > after)) => {
+                    Ok(page)
+                        if page.len() <= crate::automations::PROPOSAL_PAGE_SIZE
+                            && page.windows(2).all(|pair| pair[0].id < pair[1].id)
+                            && page.first().is_none_or(|proposal| {
+                                after.is_none_or(|after| proposal.id > after)
+                            }) =>
+                    {
                         self.automation_approval.pending = page.clone();
                         self.automation_approval.page_offset = offset;
                     }
-                    _ => self.status = Some(TransientNotice::error("Pending requests could not be loaded. Retry from the first page.")),
+                    _ => {
+                        self.status = Some(TransientNotice::error(
+                            "Pending requests could not be loaded. Retry from the first page.",
+                        ))
+                    }
                 }
                 Task::none()
             }
-            Action::ReviewRefreshed { generation, pushed, result } => {
+            Action::ReviewRefreshed {
+                generation,
+                pushed,
+                result,
+            } => {
                 if self.automation_approval.review_refresh != Some((generation, pushed)) {
                     return Task::none();
                 }
                 self.automation_approval.review_refresh = None;
-                if self.automation_approval.generation != generation || self.automation_approval.deciding {
+                if self.automation_approval.generation != generation
+                    || self.automation_approval.deciding
+                {
                     return Task::none();
                 }
-                let Some(expected) = self.automation_approval.proposal.as_ref() else { return Task::none(); };
+                let Some(expected) = self.automation_approval.proposal.as_ref() else {
+                    return Task::none();
+                };
                 match result.as_ref() {
                     Ok(receipt) => {
                         let mut expected = expected.clone();
@@ -356,10 +509,16 @@ impl Cagents {
                             self.automation_approval.review_stale = false;
                         } else {
                             self.automation_approval.review_stale = true;
-                            self.status = Some(TransientNotice::warning("The request changed; dismiss this review and reopen it before deciding."));
+                            self.status = Some(TransientNotice::warning(
+                                "The request changed; dismiss this review and reopen it before deciding.",
+                            ));
                         }
                     }
-                    Err(_) => self.status = Some(TransientNotice::warning("The request could not be refreshed; its decision remains unresolved.")),
+                    Err(_) => {
+                        self.status = Some(TransientNotice::warning(
+                            "The request could not be refreshed; its decision remains unresolved.",
+                        ))
+                    }
                 }
                 Task::none()
             }
@@ -370,8 +529,10 @@ impl Cagents {
                 watch_epoch,
                 result,
             } => {
-                if self.automation_approval.reading != Some((id, revision, read_generation, watch_epoch))
-                    || self.automation_approval.watch_epoch != watch_epoch {
+                if self.automation_approval.reading
+                    != Some((id, revision, read_generation, watch_epoch))
+                    || self.automation_approval.watch_epoch != watch_epoch
+                {
                     return Task::none();
                 }
                 self.automation_approval.reading = None;
@@ -392,11 +553,12 @@ impl Cagents {
                 // An explicit notification activation can precede its model
                 // push. The exact user-authorized Pending reply is sufficient
                 // to review it; this never approves or enables any schedule.
-                if self.automation_approval.pending.len() < crate::automations::PROPOSAL_PAGE_SIZE && !self
-                    .automation_approval
-                    .pending
-                    .iter()
-                    .any(|summary| summary.id == id)
+                if self.automation_approval.pending.len() < crate::automations::PROPOSAL_PAGE_SIZE
+                    && !self
+                        .automation_approval
+                        .pending
+                        .iter()
+                        .any(|summary| summary.id == id)
                 {
                     self.automation_approval
                         .pending
@@ -426,10 +588,12 @@ impl Cagents {
                     .filter(|proposal| proposal.id == id && proposal.revision == revision)
                     .cloned();
                 let Some(proposal) = proposal else {
-                    self.automation_approval.read_generation = self.automation_approval.read_generation.wrapping_add(1);
+                    self.automation_approval.read_generation =
+                        self.automation_approval.read_generation.wrapping_add(1);
                     let read_generation = self.automation_approval.read_generation;
                     let watch_epoch = self.automation_approval.watch_epoch;
-                    self.automation_approval.reading = Some((id, revision, read_generation, watch_epoch));
+                    self.automation_approval.reading =
+                        Some((id, revision, read_generation, watch_epoch));
                     return cosmic::task::future(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             let socket = crate::terminal::ensure_daemon_ready()
@@ -475,7 +639,9 @@ impl Cagents {
                 generation,
                 approved,
             } => {
-                if self.automation_approval.review_stale || !self.approval_user_action_matches(id, revision, generation) {
+                if self.automation_approval.review_stale
+                    || !self.approval_user_action_matches(id, revision, generation)
+                {
                     return Task::none();
                 }
                 let state = &mut self.automation_approval;
@@ -1110,7 +1276,13 @@ mod tests {
     }
 
     fn request_page(proposal: &Proposal, first: u128, last: u128) -> Vec<ProposalSummary> {
-        (first..=last).map(|index| { let mut summary = ProposalSummary::from(proposal); summary.id = uuid::Uuid::from_u128(index); summary }).collect()
+        (first..=last)
+            .map(|index| {
+                let mut summary = ProposalSummary::from(proposal);
+                summary.id = uuid::Uuid::from_u128(index);
+                summary
+            })
+            .collect()
     }
 
     #[test]
@@ -1118,25 +1290,58 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let identity = uuid::Uuid::new_v4();
         let proposal = proposal();
-        drop(app.sync_automation_proposal_page(identity, 1, 10_000, request_page(&proposal, 1, 10_000)));
+        drop(app.sync_automation_proposal_page(
+            identity,
+            1,
+            10_000,
+            request_page(&proposal, 1, 10_000),
+        ));
         assert_eq!(app.automation_approval.total, 10_000);
         assert_eq!(app.automation_approval.pending.len(), 64);
         let generation = app.automation_approval.page_generation;
-        drop(app.update_automation_approval(Action::Page { generation, after: Some(uuid::Uuid::from_u128(64)), offset: 64 }));
+        drop(app.update_automation_approval(Action::Page {
+            generation,
+            after: Some(uuid::Uuid::from_u128(64)),
+            offset: 64,
+        }));
         let request = app.automation_approval.page_generation;
-        drop(app.update_automation_approval(Action::PageLoaded { generation: request, after: Some(uuid::Uuid::from_u128(64)), offset: 64, result: Arc::new(Ok(request_page(&proposal,65,128))) }));
-        assert_eq!(app.automation_approval.page_offset,64);
-        assert_eq!(app.automation_approval.pending[0].id,uuid::Uuid::from_u128(65));
-        assert_eq!(app.automation_approval.pending.last().unwrap().id,uuid::Uuid::from_u128(128));
+        drop(app.update_automation_approval(Action::PageLoaded {
+            generation: request,
+            after: Some(uuid::Uuid::from_u128(64)),
+            offset: 64,
+            result: Arc::new(Ok(request_page(&proposal, 65, 128))),
+        }));
+        assert_eq!(app.automation_approval.page_offset, 64);
+        assert_eq!(
+            app.automation_approval.pending[0].id,
+            uuid::Uuid::from_u128(65)
+        );
+        assert_eq!(
+            app.automation_approval.pending.last().unwrap().id,
+            uuid::Uuid::from_u128(128)
+        );
         // An unrelated execution/model edit must not reset explicit navigation.
-        drop(app.sync_automation_proposal_page(identity,1,10_000,request_page(&proposal,1,64)));
-        assert_eq!(app.automation_approval.page_offset,64);
+        drop(app.sync_automation_proposal_page(
+            identity,
+            1,
+            10_000,
+            request_page(&proposal, 1, 64),
+        ));
+        assert_eq!(app.automation_approval.page_offset, 64);
         // A new consent edge resets the page and fences its old completion.
-        drop(app.sync_automation_proposal_page(identity,2,9_999,request_page(&proposal,1,64)));
-        drop(app.update_automation_approval(Action::PageLoaded { generation: request, after: Some(uuid::Uuid::from_u128(64)), offset:64, result:Arc::new(Ok(request_page(&proposal,65,128))) }));
-        assert_eq!(app.automation_approval.page_offset,0);
-        assert_eq!(app.automation_approval.pending[0].id,uuid::Uuid::from_u128(1));
-        assert_eq!(app.automation_approval.total,9_999);
+        drop(app.sync_automation_proposal_page(identity, 2, 9_999, request_page(&proposal, 1, 64)));
+        drop(app.update_automation_approval(Action::PageLoaded {
+            generation: request,
+            after: Some(uuid::Uuid::from_u128(64)),
+            offset: 64,
+            result: Arc::new(Ok(request_page(&proposal, 65, 128))),
+        }));
+        assert_eq!(app.automation_approval.page_offset, 0);
+        assert_eq!(
+            app.automation_approval.pending[0].id,
+            uuid::Uuid::from_u128(1)
+        );
+        assert_eq!(app.automation_approval.total, 9_999);
     }
 
     #[test]
@@ -1145,45 +1350,105 @@ mod tests {
         let mut proposal = proposal();
         proposal.id = uuid::Uuid::from_u128(999);
         app.automation_approval.available = Some(proposal.clone());
-        drop(app.update_automation_approval(Action::Open { id:proposal.id, revision:proposal.revision }));
+        drop(app.update_automation_approval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        }));
         let generation = app.automation_approval.generation;
         let identity = uuid::Uuid::new_v4();
-        drop(app.sync_automation_proposal_page(identity,1,1_000,request_page(&proposal,1,64)));
+        drop(app.sync_automation_proposal_page(identity, 1, 1_000, request_page(&proposal, 1, 64)));
         assert!(app.automation_approval_open());
-        assert_eq!(app.automation_approval.proposal.as_ref().unwrap().state,ProposalState::Pending);
+        assert_eq!(
+            app.automation_approval.proposal.as_ref().unwrap().state,
+            ProposalState::Pending
+        );
         assert!(app.automation_approval.review_refresh.is_some());
         let pushed = app.automation_approval.pushed;
-        drop(app.update_automation_approval(Action::ReviewRefreshed { generation, pushed, result:Arc::new(Ok(proposal.clone())) }));
+        drop(app.update_automation_approval(Action::ReviewRefreshed {
+            generation,
+            pushed,
+            result: Arc::new(Ok(proposal.clone())),
+        }));
         assert!(app.automation_approval_open());
-        drop(app.sync_automation_proposal_page(identity,2,999,request_page(&proposal,1,64)));
+        drop(app.sync_automation_proposal_page(identity, 2, 999, request_page(&proposal, 1, 64)));
         let pushed = app.automation_approval.pushed;
-        let mut resolved = proposal.clone(); resolved.state = ProposalState::Declined;
-        drop(app.update_automation_approval(Action::ReviewRefreshed { generation, pushed, result:Arc::new(Ok(resolved)) }));
-        assert!(!app.automation_approval_open(),"only the exact private receipt can retire an omitted review");
-        assert_eq!(app.automation_approval.total,999);
+        let mut resolved = proposal.clone();
+        resolved.state = ProposalState::Declined;
+        drop(app.update_automation_approval(Action::ReviewRefreshed {
+            generation,
+            pushed,
+            result: Arc::new(Ok(resolved)),
+        }));
+        assert!(
+            !app.automation_approval_open(),
+            "only the exact private receipt can retire an omitted review"
+        );
+        assert_eq!(app.automation_approval.total, 999);
     }
     #[test]
     fn global_request_banner_builds_only_one_page_of_real_widgets() {
-        use cosmic::iced::{Rectangle, Size, advanced::{Layout, layout, renderer::Headless, widget::{Operation,Tree}}};
+        use cosmic::iced::{
+            Rectangle, Size,
+            advanced::{
+                Layout, layout,
+                renderer::Headless,
+                widget::{Operation, Tree},
+            },
+        };
         #[derive(Default)]
         struct Labels(Vec<String>);
         impl Operation for Labels {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
-            fn text(&mut self, _:Option<&widget::Id>, _:Rectangle, text:&str) { self.0.push(text.to_owned()); }
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let proposal = proposal();
-        drop(app.sync_automation_proposal_page(uuid::Uuid::new_v4(),1,10_000,request_page(&proposal,1,10_000)));
-        let renderer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-            .block_on(cosmic::Renderer::new(cosmic::iced::Font::default(),cosmic::iced::Pixels(14.0),Some("tiny-skia"))).unwrap();
+        drop(app.sync_automation_proposal_page(
+            uuid::Uuid::new_v4(),
+            1,
+            10_000,
+            request_page(&proposal, 1, 10_000),
+        ));
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
         let mut element = app.automation_approval_banner();
         let mut tree = Tree::new(element.as_widget_mut());
-        let node = element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(Size::ZERO,Size::new(900.0,1000.0)));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(900.0, 1000.0)),
+        );
         let mut labels = Labels::default();
-        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut labels);
-        assert_eq!(labels.0.iter().filter(|text| text.starts_with("Scheduled work requested:")).count(),64);
-        assert!(labels.0.iter().any(|text| text=="10000 pending scheduled-work request(s)"));
-        assert!(labels.0.iter().any(|text| text=="Next requests"));
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut labels);
+        assert_eq!(
+            labels
+                .0
+                .iter()
+                .filter(|text| text.starts_with("Scheduled work requested:"))
+                .count(),
+            64
+        );
+        assert!(
+            labels
+                .0
+                .iter()
+                .any(|text| text == "10000 pending scheduled-work request(s)")
+        );
+        assert!(labels.0.iter().any(|text| text == "Next requests"));
     }
     #[test]
     fn reconnect_fences_pages_and_private_review_receipts_even_at_the_same_clock() {
@@ -1191,31 +1456,58 @@ mod tests {
         let identity = uuid::Uuid::new_v4();
         let mut proposal = proposal();
         proposal.id = uuid::Uuid::from_u128(999);
-        drop(app.sync_automation_proposal_page(identity,1,1_000,request_page(&proposal,1,64)));
+        drop(app.sync_automation_proposal_page(identity, 1, 1_000, request_page(&proposal, 1, 64)));
         let generation = app.automation_approval.page_generation;
-        drop(app.update_automation_approval(Action::Page { generation, after:Some(uuid::Uuid::from_u128(64)),offset:64 }));
+        drop(app.update_automation_approval(Action::Page {
+            generation,
+            after: Some(uuid::Uuid::from_u128(64)),
+            offset: 64,
+        }));
         let old_page = app.automation_approval.page_generation;
         app.automation_proposals_reconnected();
-        drop(app.sync_automation_proposal_page(identity,1,1_000,request_page(&proposal,1,64)));
-        drop(app.update_automation_approval(Action::PageLoaded {generation:old_page,after:Some(uuid::Uuid::from_u128(64)),offset:64,result:Arc::new(Ok(request_page(&proposal,65,128)))}));
-        assert_eq!(app.automation_approval.page_offset,0);
-        assert_eq!(app.automation_approval.pending[0].id,uuid::Uuid::from_u128(1));
+        drop(app.sync_automation_proposal_page(identity, 1, 1_000, request_page(&proposal, 1, 64)));
+        drop(app.update_automation_approval(Action::PageLoaded {
+            generation: old_page,
+            after: Some(uuid::Uuid::from_u128(64)),
+            offset: 64,
+            result: Arc::new(Ok(request_page(&proposal, 65, 128))),
+        }));
+        assert_eq!(app.automation_approval.page_offset, 0);
+        assert_eq!(
+            app.automation_approval.pending[0].id,
+            uuid::Uuid::from_u128(1)
+        );
         app.automation_approval.available = Some(proposal.clone());
-        drop(app.update_automation_approval(Action::Open { id:proposal.id,revision:proposal.revision }));
-        drop(app.sync_automation_proposal_page(identity,2,1_000,request_page(&proposal,1,64)));
+        drop(app.update_automation_approval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        }));
+        drop(app.sync_automation_proposal_page(identity, 2, 1_000, request_page(&proposal, 1, 64)));
         let old_push = app.automation_approval.pushed;
         let review = app.automation_approval.generation;
         assert!(app.automation_approval.review_refresh.is_some());
         app.automation_proposals_reconnected();
-        drop(app.sync_automation_proposal_page(identity,2,1_000,request_page(&proposal,1,64)));
+        drop(app.sync_automation_proposal_page(identity, 2, 1_000, request_page(&proposal, 1, 64)));
         let new_push = app.automation_approval.pushed;
-        assert_ne!(old_push,new_push);
+        assert_ne!(old_push, new_push);
         assert!(app.automation_approval.review_refresh.is_some());
-        let mut stale = proposal.clone(); stale.state=ProposalState::Declined;
-        drop(app.update_automation_approval(Action::ReviewRefreshed {generation:review,pushed:old_push,result:Arc::new(Ok(stale))}));
-        assert!(app.automation_approval_open(),"old daemon receipt cannot retire the current review");
+        let mut stale = proposal.clone();
+        stale.state = ProposalState::Declined;
+        drop(app.update_automation_approval(Action::ReviewRefreshed {
+            generation: review,
+            pushed: old_push,
+            result: Arc::new(Ok(stale)),
+        }));
+        assert!(
+            app.automation_approval_open(),
+            "old daemon receipt cannot retire the current review"
+        );
         let current_review = app.automation_approval.generation;
-        drop(app.update_automation_approval(Action::ReviewRefreshed {generation:current_review,pushed:new_push,result:Arc::new(Ok(proposal))}));
+        drop(app.update_automation_approval(Action::ReviewRefreshed {
+            generation: current_review,
+            pushed: new_push,
+            result: Arc::new(Ok(proposal)),
+        }));
         assert!(app.automation_approval_open());
         assert!(app.automation_approval.review_refresh.is_none());
     }
@@ -1224,14 +1516,19 @@ mod tests {
     fn ordinary_proposal_loads_are_fenced_across_reconnect_and_repeated_open() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let proposal = proposal();
-        let open = Action::Open { id: proposal.id, revision: proposal.revision };
+        let open = Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        };
         drop(app.update(Message::AutomationApproval(open.clone())));
         let old_read = app.automation_approval.read_generation;
         let old_epoch = app.automation_approval.watch_epoch;
         app.automation_proposals_reconnected();
         drop(app.update(Message::AutomationApproval(Action::Loaded {
-            id: proposal.id, revision: proposal.revision,
-            read_generation: old_read, watch_epoch: old_epoch,
+            id: proposal.id,
+            revision: proposal.revision,
+            read_generation: old_read,
+            watch_epoch: old_epoch,
             result: Arc::new(Ok(proposal.clone())),
         })));
         assert!(!app.automation_approval_open());
@@ -1243,22 +1540,29 @@ mod tests {
         let current_read = app.automation_approval.read_generation;
         assert_ne!(first_read, current_read);
         drop(app.update(Message::AutomationApproval(Action::Loaded {
-            id: proposal.id, revision: proposal.revision,
-            read_generation: first_read, watch_epoch: epoch,
+            id: proposal.id,
+            revision: proposal.revision,
+            read_generation: first_read,
+            watch_epoch: epoch,
             result: Arc::new(Ok(proposal.clone())),
         })));
         assert!(!app.automation_approval_open());
         assert!(app.automation_approval.reading.is_some());
         drop(app.update(Message::AutomationApproval(Action::Loaded {
-            id: proposal.id, revision: proposal.revision,
-            read_generation: current_read, watch_epoch: epoch,
+            id: proposal.id,
+            revision: proposal.revision,
+            read_generation: current_read,
+            watch_epoch: epoch,
             result: Arc::new(Ok(proposal.clone())),
         })));
         assert!(app.automation_approval_open());
         drop(app.cancel_automation_approval());
         assert!(app.automation_approval.available.is_some());
         app.automation_proposals_reconnected();
-        assert!(app.automation_approval.available.is_none(), "cached consent cannot cross a reconnect");
+        assert!(
+            app.automation_approval.available.is_none(),
+            "cached consent cannot cross a reconnect"
+        );
     }
 
     #[test]
@@ -1266,26 +1570,68 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let proposal = proposal();
         let identity = uuid::Uuid::new_v4();
-        drop(app.sync_automation_proposal_page(identity, 1, 1, vec![ProposalSummary::from(&proposal)]));
+        drop(app.sync_automation_proposal_page(
+            identity,
+            1,
+            1,
+            vec![ProposalSummary::from(&proposal)],
+        ));
         app.automation_approval.available = Some(proposal.clone());
-        drop(app.update(Message::AutomationApproval(Action::Open { id: proposal.id, revision: proposal.revision })));
+        drop(app.update(Message::AutomationApproval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        })));
         let previous_generation = app.automation_approval.generation;
-        drop(app.sync_automation_proposal_page(uuid::Uuid::new_v4(), 1, 1, vec![ProposalSummary::from(&proposal)]));
+        drop(app.sync_automation_proposal_page(
+            uuid::Uuid::new_v4(),
+            1,
+            1,
+            vec![ProposalSummary::from(&proposal)],
+        ));
         assert!(app.automation_approval.review_stale);
-        assert!(app.automation_approval.review_refresh.is_some(), "same summary cannot qualify the new registry");
+        assert!(
+            app.automation_approval.review_refresh.is_some(),
+            "same summary cannot qualify the new registry"
+        );
         let generation = app.automation_approval.generation;
         assert_ne!(previous_generation, generation);
-        drop(app.update(Message::AutomationApproval(Action::Decide { id: proposal.id, revision: proposal.revision, generation, approved: true })));
+        drop(app.update(Message::AutomationApproval(Action::Decide {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation,
+            approved: true,
+        })));
         assert!(!app.automation_approval.deciding);
-        drop(app.update(Message::AutomationApproval(Action::ReviewRefreshed { generation, pushed: app.automation_approval.pushed, result: Arc::new(Err("unavailable".into())) })));
+        drop(
+            app.update(Message::AutomationApproval(Action::ReviewRefreshed {
+                generation,
+                pushed: app.automation_approval.pushed,
+                result: Arc::new(Err("unavailable".into())),
+            })),
+        );
         assert!(app.automation_approval.review_stale);
         drop(app.refresh_automation_approval_review());
-        drop(app.update(Message::AutomationApproval(Action::ReviewRefreshed { generation, pushed: app.automation_approval.pushed, result: Arc::new(Ok(proposal.clone())) })));
+        drop(
+            app.update(Message::AutomationApproval(Action::ReviewRefreshed {
+                generation,
+                pushed: app.automation_approval.pushed,
+                result: Arc::new(Ok(proposal.clone())),
+            })),
+        );
         assert!(!app.automation_approval.review_stale);
-        drop(app.update(Message::AutomationApproval(Action::Decide { id: proposal.id, revision: proposal.revision, generation: previous_generation, approved: true })));
+        drop(app.update(Message::AutomationApproval(Action::Decide {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation: previous_generation,
+            approved: true,
+        })));
         assert!(!app.automation_approval.deciding);
-        drop(app.update(Message::AutomationApproval(Action::Decide { id: proposal.id, revision: proposal.revision, generation, approved: true })));
+        drop(app.update(Message::AutomationApproval(Action::Decide {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation,
+            approved: true,
+        })));
         assert!(app.automation_approval.deciding);
     }
-
 }

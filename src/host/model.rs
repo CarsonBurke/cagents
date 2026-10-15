@@ -194,7 +194,8 @@ impl Registry {
             navigation_orders,
             headless_automation_agents: self.headless_automation_agents()?,
             archived_automation_agents: self.archived_automation_agents()?,
-            pending_automation_proposals: self.pending_automation_proposals_page(None, crate::automations::PROPOSAL_PAGE_SIZE)?,
+            pending_automation_proposals: self
+                .pending_automation_proposals_page(None, crate::automations::PROPOSAL_PAGE_SIZE)?,
             pending_automation_proposal_count: self.pending_automation_proposal_count()?,
             automation_proposal_sequence: self.automation_proposal_sequence()?,
             views: views::all(&self.db)?,
@@ -631,16 +632,16 @@ fn migrate(db: &Connection) -> Result<(), String> {
     // Version this complete automation extension atomically. Old binaries must
     // refuse this schema rather than silently lose proof or notification intent.
     if version < 13 {
-    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
-    let clock_exists: bool = tx.query_row(
+        let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let clock_exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name='automation_proposal_sequence')",
         [], |row| row.get(0)).map_err(|error| error.to_string())?;
-    if !clock_exists {
-        tx.execute_batch("ALTER TABLE metadata ADD COLUMN automation_proposal_sequence INTEGER NOT NULL DEFAULT 0 CHECK(automation_proposal_sequence>=0);")
+        if !clock_exists {
+            tx.execute_batch("ALTER TABLE metadata ADD COLUMN automation_proposal_sequence INTEGER NOT NULL DEFAULT 0 CHECK(automation_proposal_sequence>=0);")
             .map_err(|error| error.to_string())?;
-    }
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS automation_notifications (key TEXT PRIMARY KEY, event TEXT NOT NULL) STRICT;
+        }
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS automation_notifications (key TEXT PRIMARY KEY, event TEXT NOT NULL) STRICT;
         CREATE TABLE IF NOT EXISTS automation_retired_manual_requests (
             automation TEXT NOT NULL, request TEXT NOT NULL, revision INTEGER NOT NULL,
             PRIMARY KEY(automation,request)
@@ -659,9 +660,9 @@ fn migrate(db: &Connection) -> Result<(), String> {
             JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision
             WHERE json_type(r.definition,'$.precheck')='object';")
         .map_err(|error| error.to_string())?;
-    tx.execute_batch("CREATE INDEX IF NOT EXISTS global_pending_automation_proposals ON automation_proposals(id) WHERE pending=1; PRAGMA user_version=13;")
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS global_pending_automation_proposals ON automation_proposals(id) WHERE pending=1; PRAGMA user_version=13;")
         .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
     }
     Ok(())
 }

@@ -271,7 +271,8 @@ pub fn inspect_completed_automation_pane(
     model
         .busy_timeout(std::time::Duration::from_millis(100))
         .map_err(|_| "The source automation registry is unavailable")?;
-    let registry_version: u32 = model.pragma_query_value(None, "user_version", |row| row.get(0))
+    let registry_version: u32 = model
+        .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|_| "The source automation registry version is unreadable")?;
     if registry_version > crate::host::WORKSPACE_REGISTRY_SCHEMA_VERSION {
         return Err("The source automation registry requires a newer archive inspector".into());
@@ -570,7 +571,9 @@ mod tests {
         );
         let model = Connection::open(&registry).unwrap();
         model.execute_batch("CREATE TABLE agents(id TEXT,closed INTEGER,record TEXT);CREATE TABLE automation_snapshots(agent TEXT,snapshot TEXT);").unwrap();
-        model.pragma_update(None, "user_version", ARCHIVE_REGISTRY_SCHEMA_FLOOR).unwrap();
+        model
+            .pragma_update(None, "user_version", ARCHIVE_REGISTRY_SCHEMA_FLOOR)
+            .unwrap();
         model
             .execute(
                 "INSERT INTO agents VALUES(?1,1,?2)",
@@ -609,13 +612,27 @@ mod tests {
             "no migration or source writes"
         );
         let versioned = Connection::open(&registry).unwrap();
-        for version in [ARCHIVE_REGISTRY_SCHEMA_FLOOR - 1, crate::host::WORKSPACE_REGISTRY_SCHEMA_VERSION + 1] {
-            versioned.pragma_update(None,"user_version",version).unwrap();
+        for version in [
+            ARCHIVE_REGISTRY_SCHEMA_FLOOR - 1,
+            crate::host::WORKSPACE_REGISTRY_SCHEMA_VERSION + 1,
+        ] {
+            versioned
+                .pragma_update(None, "user_version", version)
+                .unwrap();
             let before_version = std::fs::read(&registry).unwrap();
-            assert!(inspect_archived_pane(&window,&registry,card,&session).is_err(),"unsupported archive authority version {version}");
-            assert_eq!(std::fs::read(&registry).unwrap(),before_version,"inspection must not rewrite unsupported schemas");
+            assert!(
+                inspect_archived_pane(&window, &registry, card, &session).is_err(),
+                "unsupported archive authority version {version}"
+            );
+            assert_eq!(
+                std::fs::read(&registry).unwrap(),
+                before_version,
+                "inspection must not rewrite unsupported schemas"
+            );
         }
-        versioned.pragma_update(None,"user_version",ARCHIVE_REGISTRY_SCHEMA_FLOOR).unwrap();
+        versioned
+            .pragma_update(None, "user_version", ARCHIVE_REGISTRY_SCHEMA_FLOOR)
+            .unwrap();
         drop(versioned);
         #[cfg(unix)]
         {
