@@ -13,7 +13,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[derive(Clone)]
 pub(crate) struct ReservedProject {
     project: ProjectInstance,
     roots: Vec<PathBuf>,
@@ -24,7 +23,7 @@ pub(crate) struct ReservedProject {
     protected_sessions: HashSet<TerminalId>,
     infer_directory: bool,
 }
-pub(crate) type Reservations = Arc<Mutex<BTreeMap<uuid::Uuid, ReservedProject>>>;
+pub(crate) type Reservations = Arc<Mutex<BTreeMap<uuid::Uuid, Arc<ReservedProject>>>>;
 pub(crate) struct Reservation {
     entries: Reservations,
     token: uuid::Uuid,
@@ -151,7 +150,7 @@ fn entries(host: &SharedHost) -> Reservations {
         .project_removals
         .clone()
 }
-fn scopes(host: &SharedHost) -> Vec<ReservedProject> {
+fn scopes(host: &SharedHost) -> Vec<Arc<ReservedProject>> {
     entries(host)
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -307,7 +306,7 @@ pub(crate) fn reserve(
         if entries.values().any(|active| active.project == *project) {
             return Err(busy());
         }
-        entries.insert(token, reserved);
+        entries.insert(token, Arc::new(reserved));
     }
     Ok(Reservation { entries, token })
 }
