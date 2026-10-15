@@ -11,7 +11,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
@@ -2827,6 +2827,27 @@ pub enum AttentionState {
     Waiting,
 }
 
+/// A worktree's attention derived once from the pane maps, then reused by
+/// every row and project badge in that render.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorktreeAttention<'a> {
+    pub state: Option<AttentionState>,
+    pub outcome: Option<&'a crate::agent::ActivityOutcome>,
+    pub unread: bool,
+}
+
+impl<'a> WorktreeAttention<'a> {
+    fn observe(&mut self, activity: Option<crate::agent::ActivityState>, unread: bool, outcome: Option<&'a crate::agent::ActivityOutcome>) {
+        self.state = self.state.max(attention_state(activity, unread, outcome));
+        self.unread |= unread;
+        if let Some(outcome) = outcome
+            && self.outcome.is_none_or(|previous| outcome_priority(outcome) > outcome_priority(previous))
+        {
+            self.outcome = Some(outcome);
+        }
+    }
+}
+
 pub fn cycle_attention(
     cards: &[CardId],
     current: Option<CardId>,
@@ -3148,6 +3169,29 @@ impl SidebarState {
             self.has_card_update(card),
             self.card_outcome(card),
         )
+    }
+
+    /// One pass over activity and persisted unread ownership. Avoid scanning
+    /// every pane separately for each worktree in a collapsed project hint.
+    pub fn worktree_attention_summaries(&self, project: ProjectId) -> HashMap<WorktreeId, WorktreeAttention<'_>> {
+        let mut summaries = HashMap::<WorktreeId, WorktreeAttention<'_>>::new();
+        for (card, entry) in &self.agent_activity {
+            let Some((owner, worktree)) = entry.owner else { continue; };
+            if owner == project {
+                summaries.entry(worktree).or_default().observe(
+                    Some(entry.activity.state), self.has_card_update(*card), self.card_outcome(*card));
+            }
+        }
+        // Unread ownership survives a restart before the live activity map is
+        // restored, and must still put a badge on that project's compact chip.
+        for (card, owner) in &self.agent_updates {
+            if let Some((owner, worktree)) = owner
+                && *owner == project
+            {
+                summaries.entry(*worktree).or_default().observe(None, true, self.card_outcome(*card));
+            }
+        }
+        summaries
     }
 
     pub fn worktree_outcome(
@@ -11997,6 +12041,29 @@ pub(crate) mod tests {
         status.dirty.unstaged = 1;
         row.apply_status(&status);
         assert!(matches!(worktree_change_icon(&row), Icon::Changes));
+    }
+
+    #[test]
+    fn attention_summaries_match_owned_priority_and_restore_unread_without_activity() {
+        let project = ProjectId::new();
+        let worktree = WorktreeId::new();
+        let restored = WorktreeId::new();
+        let mut state = SidebarState::default();
+        let working = CardId::new();
+        let failed = CardId::new();
+        let waiting = CardId::new();
+        for (card, activity) in [(working, crate::agent::ActivityState::Working), (failed, crate::agent::ActivityState::Idle), (waiting, crate::agent::ActivityState::Waiting)] {
+            state.set_agent_activity(card, project, worktree, crate::agent::Activity { provider: crate::agent::Provider::Codex, state: activity });
+        }
+        state.set_card_outcome(failed, Some(crate::agent::ActivityOutcome::Failed { reason: "fixture failure".into() }));
+        state.observe_agent_update(CardId::new(), project, restored);
+        let summaries = state.worktree_attention_summaries(project);
+        assert_eq!(summaries[&worktree].state, state.worktree_attention(project, worktree));
+        assert_eq!(summaries[&worktree].outcome, state.worktree_outcome(project, worktree));
+        assert_eq!(summaries[&worktree].state, Some(AttentionState::Waiting));
+        assert_eq!(summaries[&restored].state, Some(AttentionState::Unread));
+        assert!(summaries[&restored].unread);
+        assert!(state.worktree_attention_summaries(ProjectId::new()).is_empty());
     }
 
     #[test]
