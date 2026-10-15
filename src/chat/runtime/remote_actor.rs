@@ -1598,6 +1598,8 @@ impl Server {
         let provider = actor
             .provider_process()
             .ok_or("Retained actor did not retain its exact provider process")?;
+        #[cfg(test)]
+        hold_failed_startup_for_test(&actor, control, &startup.source, &provider)?;
         let directory_path = registry::directory(Kind::Native)?;
         crate::secure_file::prepare_private_directory(&directory_path)
             .map_err(|error| error.to_string())?;
@@ -2500,6 +2502,49 @@ extern "C" fn serve_if_requested() {
         thread::sleep(Duration::from_millis(100));
     }
     std::process::exit(73);
+}
+
+/// Exercise the actual pre-discovery cleanup owner without widening any
+/// production launch API. Only an isolated libtest subprocess sets this path.
+/// The real provider/actor exists, but no Record, JSON, or Attached exists yet.
+#[cfg(test)]
+fn hold_failed_startup_for_test(
+    actor: &LocalHandle,
+    control: &UnixStream,
+    source: &chat::Session,
+    provider: &Process,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let Some(directory) = std::env::var_os("CAGENTS_STARTUP_OWNER_HOLD") else {
+        return Ok(());
+    };
+    let directory = PathBuf::from(directory);
+    let metadata = std::fs::symlink_metadata(&directory).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.uid() != crate::daemon::current_uid()
+        || metadata.permissions().mode() & 0o077 != 0 {
+        return Err("Startup owner fixture requires its own private directory".into());
+    }
+    let helper = Process::read(std::process::id() as i32).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "source": source,
+        "helper": helper,
+        "provider": provider,
+    })).map_err(|error| error.to_string())?;
+    let mut marker = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join("failed-startup.json")).map_err(|error| error.to_string())?;
+    marker.write_all(&bytes).and_then(|()| marker.sync_all()).map_err(|error| error.to_string())?;
+    let failure = "Fixture refuses Attached before publishing retained actor discovery".to_owned();
+    send(control, &Err::<Attached, _>(failure.clone()), Duration::from_secs(2))?;
+    // The StartupAttempt cancellation is real, but cannot claim this retained
+    // LocalHandle was cleaned while the test explicitly holds its owner.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !directory.join("release").exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    actor.close()?;
+    reap_orphans()?;
+    Err(failure)
 }
 
 fn confirm_installed_snapshot(state: &mut Snapshot) {

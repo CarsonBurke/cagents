@@ -1017,3 +1017,125 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     assert!(!identity.record.root.is_current() && !identity.record.holder.is_current());
     drop(lease);
 }
+
+
+/// Real helper/provider startup fails before discovery. A private test latch
+/// holds the actual LocalHandle while the public start has already returned Err.
+#[test]
+fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
+    const EXACT: &str = "host::chat::retained_actor_tests::failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup";
+    const CHILD: &str = "CAGENTS_STARTUP_OWNER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        use std::os::fd::FromRawFd;
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = directory.path();
+        for path in ["home/.claude", "run", "data", "config", "cache", "bin", "project", "hold"] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        fs::set_permissions(root.join("hold"),fs::Permissions::from_mode(0o700)).unwrap();
+        let reservation = crate::daemon::child_reaper::reserve().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", EXACT, "--nocapture"])
+            .env_clear().env(CHILD,"1").env("CAGENTS_RETAINED_ACTOR_FIXTURE","1")
+            .env("CAGENTS_HOLDER_ROOT",root).env("CAGENTS_STARTUP_OWNER_HOLD",root.join("hold"))
+            .env("HOME",root.join("home")).env("CLAUDE_CONFIG_DIR",root.join("home/.claude"))
+            .env("XDG_RUNTIME_DIR",root.join("run")).env("XDG_DATA_HOME",root.join("data"))
+            .env("XDG_CONFIG_HOME",root.join("config")).env("XDG_CACHE_HOME",root.join("cache"))
+            .env("PATH",format!("{}:/usr/bin:/bin",root.join("bin").display()))
+            .spawn().unwrap();
+        reservation.quarantine();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open,child.id(),0) };
+        if raw < 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = child.kill();
+            reservation.preserve_suspended(child,None,"startup fixture pidfd capture failed");
+            let _ = directory.keep(); // Preserve private evidence for uncertain fixture descendants.
+            panic!("Cannot pin exact fixture child: {error}");
+        }
+        let pidfd = unsafe { std::fs::File::from_raw_fd(raw as i32) };
+        let deadline = Instant::now()+Duration::from_secs(60);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        let _ = directory.keep();
+                        panic!("isolated startup fixture failed: {status}");
+                    }
+                    return;
+                }
+                Ok(None) if Instant::now()<deadline => thread::sleep(Duration::from_millis(20)),
+                result => {
+                    let _ = child.kill();
+                    if let Err((error,child,pidfd,reservation)) = reservation.retain(child,pidfd) {
+                        reservation.preserve_suspended(child,Some(pidfd),&error.to_string());
+                    }
+                    let _ = directory.keep();
+                    panic!("Exact startup fixture did not settle before its deadline: {result:?}");
+                }
+            }
+        }
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    install_provider(&root.join("bin/claude"));
+    let proof = HostSessionProof {host_session_id:HostSessionId::new("startup-owner-fixture"),
+        boot_id:crate::daemon::read_boot_id().unwrap(),host_incarnation:HostIncarnation::new("first")};
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let lease = crate::daemon::HostLease::acquire(&paths,&proof).unwrap();
+    let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
+    let capability = host.lock().unwrap().shutdown_preflight(Instant::now()).unwrap().capability;
+    let source = chat::fresh_session(Provider::Claude,TerminalId::new(),root.join("project"),
+        &crate::account::Account::system(Provider::Claude)).unwrap();
+    let context = Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap());
+    struct Release {path:std::path::PathBuf,context:Arc<chat::protocol::ExecutionContext>}
+    impl Drop for Release {
+        fn drop(&mut self) {let _=fs::write(&self.path,b"release");let _=self.context.reconcile_cleanup();}
+    }
+    let release = Release {path:root.join("hold/release"),context:context.clone()};
+    let error = start_execution(&host,0,source.clone(),context.clone()).unwrap_err();
+    assert!(error.message.contains("Fixture refuses Attached"),"{error:?}");
+    #[derive(serde::Deserialize)]
+    struct Evidence {source:Session,helper:crate::daemon::holder_registry::Process,provider:crate::daemon::holder_registry::Process}
+    let evidence: Evidence = serde_json::from_slice(&fs::read(root.join("hold/failed-startup.json")).unwrap()).unwrap();
+    assert_eq!(evidence.source.id,source.id);
+    assert!(evidence.helper.is_current() && evidence.provider.is_current());
+    assert_eq!(context.outcome(),chat::protocol::LaunchOutcome::Uncertain);
+    let native = crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
+    let socket = crate::daemon::holder_registry::socket(&native,source.id);
+    assert!(!socket.exists() && !socket.with_extension("json").exists());
+    {
+        let state = host.lock().unwrap();
+        assert!(!state.chats.contains_key(&source.id) && !state.chat_spawning.contains_key(&source.id));
+        let pending = state.native_actor_startups.get(&source.id).unwrap();
+        assert!(Arc::ptr_eq(&pending.context,&context));
+        assert_eq!(pending.source,evidence.source);
+    }
+    let started = Instant::now();
+    {
+        use crate::terminal_ipc::{ShutdownOperation,ShutdownOutcome};
+        let mut state = host.lock().unwrap();
+        assert_eq!(state.inventory_count(),0,"no published record masks the startup-only guard");
+        assert_eq!(state.shutdown_preflight(Instant::now()),Err(ShutdownOutcome::OwnershipUncertain));
+        assert_eq!(state.shutdown(ShutdownOperation::Stop {require_empty:true,expected_generation:None},Instant::now()),ShutdownOutcome::OwnershipUncertain);
+        assert_eq!(state.shutdown(ShutdownOperation::Confirm {capability:capability.clone()},Instant::now()),ShutdownOutcome::OwnershipUncertain);
+        assert!(state.allow_automatic_worktree_cleanup(0,&[]).unwrap_err().contains("native helper startup"));
+        assert!(!state.shutting_down);
+    }
+    assert!(super::super::state::prepare_upgrade(&host,capability,false).is_err());
+    assert!(super::super::finish_chat_shutdown(&host).unwrap_err().contains("native helper startup"));
+    assert!(started.elapsed()<Duration::from_secs(2),"pending-owner admission must not invoke its held cleanup RPC");
+    assert!(start_execution(&host,0,source.clone(),context.clone()).is_err(),"uncertain startup cannot spawn a second provider");
+    let mut unrelated = evidence.source.clone();
+    unrelated.launch.recipe.arguments.push("--not-the-owned-startup".into());
+    assert!(retained_actor::reconcile_startup(&host,&unrelated).is_err());
+    assert!(Arc::ptr_eq(&host.lock().unwrap().native_actor_startups[&source.id].context,&context));
+    assert!(evidence.helper.is_current() && evidence.provider.is_current());
+    fs::write(&release.path,b"release").unwrap();
+    assert!(retained_actor::reconcile_startup(&host,&evidence.source).unwrap());
+    assert_eq!(context.outcome(),chat::protocol::LaunchOutcome::TeardownProved);
+    assert!(!evidence.helper.is_current() && !evidence.provider.is_current());
+    assert!(!host.lock().unwrap().native_actor_startups.contains_key(&source.id));
+    host.lock().unwrap().shutdown_preflight(Instant::now()).unwrap();
+    assert!(!socket.exists() && !socket.with_extension("json").exists());
+    drop(release);
+    drop(lease);
+}
