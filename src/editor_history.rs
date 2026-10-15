@@ -610,6 +610,16 @@ impl Excerpt {
             .collect()
     }
 
+    /// Prepare one replacement with its exact inserted and removed native
+    /// line boundaries. Both positions must lie in this excerpt.
+    pub fn range_change(&self, start: Position, end: Position, replacement: &str) -> Option<TextChange> {
+        let (from, to) = (self.offset(start)?, self.offset(end)?);
+        let removed = self.text.get(from..to)?;
+        let inserted = Self::document(replacement);
+        Some(TextChange { start, removed: removed.to_owned(), inserted: replacement.to_owned(),
+            removed_breaks: self.slice_breaks(from, to), inserted_breaks: inserted.slice_breaks(0, replacement.len()) })
+    }
+
     /// The line an offset falls on, by index into `lines`.
     fn line_of(&self, offset: usize) -> usize {
         self.lines

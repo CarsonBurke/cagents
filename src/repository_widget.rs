@@ -857,6 +857,27 @@ struct EditorDocument {
     history_time: Option<Instant>,
 }
 
+/// Native ranges staged for a synchronous controller turn. This is a buffer
+/// transition only; it carries no disk publication or save authority.
+pub(crate) struct PreparedWorkspaceEdit {
+    generation: u64,
+    source: PathBuf,
+    revision: u64,
+    version: i32,
+    before: Arc<str>,
+    changes: Vec<TextChange>,
+}
+
+/// The controller must commit or roll back this exact native transition before
+/// returning from its reducer. History and LSP publication wait until every
+/// participating buffer has replayed successfully.
+#[must_use]
+pub(crate) struct AppliedWorkspaceEdit {
+    prepared: PreparedWorkspaceEdit,
+    cursor: text_editor::Cursor,
+    scroll: text_editor::ScrollPosition,
+}
+
 /// What one editor action did to the buffer's text.
 #[derive(Debug, Clone, PartialEq)]
 enum Applied {
@@ -4330,6 +4351,142 @@ impl RepositoryRuntime {
             DocumentState::Editable(document) => Some(document.content.text()),
             _ => None,
         }
+    }
+
+    pub(crate) fn workspace_edit_candidate_source(&self) -> Option<PathBuf> {
+        match &self.document {
+            DocumentState::Editable(document) => Some(self.descriptor.worktree.join(&document.source)),
+            _ => self.selected.as_ref().map(|file| self.descriptor.worktree.join(&file.path)),
+        }
+    }
+
+    pub(crate) fn workspace_edit_snapshot_size(&self) -> usize {
+        match &self.document {
+            DocumentState::Editable(document) => document.content.text_len(),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn workspace_edit_snapshot(&self) -> Option<(PathBuf, crate::editor_workspace_edit::OpenSnapshot)> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        Some((self.descriptor.worktree.join(&document.source), crate::editor_workspace_edit::OpenSnapshot {
+            text: document.content.text().into(),
+            version: document.lsp_version,
+            protocol_version: None,
+            protocol_incarnation: None,
+            writable: document.active_save.is_none() && document.lsp_version < i32::MAX,
+        }))
+    }
+
+    /// Stage every target before applying any of them. The controller consumes
+    /// all staged transitions in the same update turn, without an await.
+    pub(crate) fn prepare_workspace_edit(&mut self, plan: &crate::editor_workspace_edit::DocumentPlan) -> Result<PreparedWorkspaceEdit, String> {
+        self.flush_lsp_change();
+        let DocumentState::Editable(document) = &self.document else { return Err("An edited buffer was closed".into()); };
+        let source = self.descriptor.worktree.join(&document.source);
+        if !plan.open || !plan.open_paths.contains(&source) || document.active_save.is_some() || document.lsp_version == i32::MAX
+            || Some(document.lsp_version) != plan.version || !content_matches(&document.content, &plan.before) {
+            return Err("An edited buffer changed after the preview was prepared".into());
+        }
+        if plan.edits.is_empty() && plan.before != plan.after {
+            return Err("The preview does not contain the native edits it claims".into());
+        }
+        let offsets = plan.edits.iter().flat_map(|edit| [edit.range.start, edit.range.end]).collect::<Vec<_>>();
+        let positions = document.content.positions_for_offsets(&offsets).ok_or("The server edit names an invalid native boundary")?;
+        let mut changes = Vec::new();
+        for (index, edit) in plan.edits.iter().enumerate().rev() {
+            if plan.before.get(edit.range.clone()) == Some(edit.new_text.as_str()) { continue; }
+            let (start, end) = (positions[index * 2], positions[index * 2 + 1]);
+            let expected = plan.before.get(edit.range.clone()).ok_or("The server edit has an invalid range")?;
+            if document.content.range_end(start, expected) != Some(end) { return Err("The server edit does not address the native buffer".into()); }
+            changes.push(document.content.range_change(start, end, &edit.new_text).ok_or("The server edit cannot be represented by the native editor")?);
+        }
+        Ok(PreparedWorkspaceEdit {
+            generation: self.generation,
+            source,
+            revision: document.revision,
+            version: document.lsp_version,
+            before: Arc::clone(&plan.before),
+            changes,
+        })
+    }
+
+    pub(crate) fn apply_workspace_edit(&mut self, prepared: PreparedWorkspaceEdit) -> Result<AppliedWorkspaceEdit, String> {
+        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
+        if self.generation != prepared.generation || self.descriptor.worktree.join(&document.source) != prepared.source
+            || document.revision != prepared.revision || document.lsp_version != prepared.version
+            || document.active_save.is_some() || !content_matches(&document.content, &prepared.before) {
+            return Err("The prepared buffer edit is stale".into());
+        }
+        let cursor = document.content.cursor();
+        let scroll = document.content.scroll_position();
+        let mut buffer = ProtocolTracked { content: &mut document.content, edits: Vec::new() };
+        for (index, change) in prepared.changes.iter().enumerate() {
+            if !buffer.replace(change.start, &change.removed, &change.inserted, &change.inserted_breaks) {
+                let mut restored = true;
+                for previous in prepared.changes[..index].iter().rev() {
+                    restored &= buffer.replace(previous.start, &previous.inserted, &previous.removed, &previous.removed_breaks);
+                }
+                buffer.content.set_cursor(cursor);
+                buffer.content.restore_scroll_position(scroll);
+                if !restored {
+                    document.history.clear();
+                    document.text_changed();
+                    document.dirty = true;
+                    document.conflict = true;
+                    document.error = Some("A workspace edit could not restore this buffer".into());
+                    self.push_lsp_change(None);
+                }
+                return Err(if restored { "The prepared edit could not be applied; the buffer was preserved" } else { "The prepared edit failed and its buffer rollback could not complete" }.into());
+            }
+        }
+        document.content.set_cursor(cursor);
+        document.content.restore_scroll_position(scroll);
+        Ok(AppliedWorkspaceEdit { prepared, cursor, scroll })
+    }
+
+    pub(crate) fn commit_workspace_edit(&mut self, applied: AppliedWorkspaceEdit) -> Result<(), String> {
+        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
+        if self.generation != applied.prepared.generation
+            || self.descriptor.worktree.join(&document.source) != applied.prepared.source
+            || document.revision != applied.prepared.revision || document.lsp_version != applied.prepared.version {
+            return Err("The native edit did not finish in its original update turn".into());
+        }
+        if applied.prepared.changes.is_empty() { return Ok(()); }
+        document.history.record_group(applied.prepared.changes, applied.cursor, document.content.cursor(), Instant::now());
+        document.text_changed();
+        self.push_lsp_change(None);
+        Ok(())
+    }
+
+    pub(crate) fn rollback_workspace_edit(&mut self, applied: AppliedWorkspaceEdit) -> Result<(), String> {
+        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
+        if self.generation != applied.prepared.generation
+            || self.descriptor.worktree.join(&document.source) != applied.prepared.source
+            || document.revision != applied.prepared.revision || document.lsp_version != applied.prepared.version {
+            return Err("The native rollback is no longer current".into());
+        }
+        let mut buffer = ProtocolTracked { content: &mut document.content, edits: Vec::new() };
+        for change in applied.prepared.changes.iter().rev() {
+            if !buffer.replace(change.start, &change.inserted, &change.removed, &change.removed_breaks) {
+                // Preserve the actual remaining bytes as dirty, visible work
+                // instead of treating a failed rollback as a clean document.
+                document.history.clear();
+                document.text_changed();
+                document.dirty = true;
+                document.conflict = true;
+                document.error = Some("A workspace edit could not restore this buffer".into());
+                self.push_lsp_change(None);
+                return Err("A workspace edit could not restore this buffer".into());
+            }
+        }
+        buffer.content.set_cursor(applied.cursor);
+        buffer.content.restore_scroll_position(applied.scroll);
+        Ok(())
+    }
+
+    pub(crate) fn programmatic_edit_task(&mut self, card: CardId) -> Task<RepositoryAction> {
+        Task::batch([self.find_task(card), self.markdown_task(card)])
     }
 
     pub fn selected_staging_selection(
@@ -11182,6 +11339,95 @@ fn information_state_height<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_workspace_edits_are_sparse_and_one_native_undo_group() {
+        let card = CardId::new();
+        let before = format!("old();\n{}old();\n", "unchanged source line\n".repeat(16_000));
+        let after = before.replace("old()", "new_name()");
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, &before);
+        let path = runtime.workspace_edit_candidate_source().unwrap();
+        let last = before.rfind("old()").unwrap();
+        let plan = crate::editor_workspace_edit::DocumentPlan {
+            path: path.clone(), relative: "main.rs".into(),
+            before: before.clone().into(), after: after.clone().into(),
+            before_hash: blake3::hash(before.as_bytes()), version: Some(1),
+            protocol_version: Some(1), protocol_incarnation: None,
+            open: true, open_paths: vec![path],
+            edits: [0, last].into_iter().map(|offset| crate::editor_workspace_edit::ResolvedEdit {
+                range: offset..offset + 3, new_text: "new_name".into(),
+            }).collect(),
+        };
+        let prepared = runtime.prepare_workspace_edit(&plan).unwrap();
+        assert_eq!(runtime.editor_text().unwrap(), before, "preflight cannot edit the buffer");
+        assert_eq!(prepared.changes.len(), 2);
+        assert!(prepared.changes.iter().map(|change| change.removed.len() + change.inserted.len()).sum::<usize>() < 32);
+        let applied = runtime.apply_workspace_edit(prepared).unwrap();
+        runtime.commit_workspace_edit(applied).unwrap();
+        assert_eq!(runtime.editor_text().unwrap(), after);
+        assert!(runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), before);
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), after);
+    }
+
+    #[test]
+    fn a_native_edit_after_preparation_refuses_the_staged_transition() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "old");
+        let path = runtime.workspace_edit_candidate_source().unwrap();
+        let plan = crate::editor_workspace_edit::DocumentPlan {
+            path: path.clone(), relative: "main.rs".into(),
+            before: "old".into(), after: "new".into(), before_hash: blake3::hash(b"old"),
+            version: Some(1), protocol_version: Some(1), protocol_incarnation: None,
+            open: true, open_paths: vec![path],
+            edits: vec![crate::editor_workspace_edit::ResolvedEdit { range: 0..3, new_text: "new".into() }],
+        };
+        let prepared = runtime.prepare_workspace_edit(&plan).unwrap();
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        let actual = runtime.editor_text().unwrap();
+        assert_ne!(actual, "old");
+        assert!(runtime.apply_workspace_edit(prepared).is_err());
+        assert_eq!(runtime.editor_text().unwrap(), actual);
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), "old");
+    }
+
+    #[test]
+    fn later_replay_refusal_restores_prior_buffers_without_changing_their_history() {
+        let a = CardId::new();
+        let b = CardId::new();
+        let (mut first, _) = RepositoryRuntime::lsp_open_fixture(a, "old");
+        let (mut later, _) = RepositoryRuntime::lsp_open_fixture(b, "old");
+        drop(first.update(RepositoryAction::EditorAction { card: a, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        let original = first.editor_text().unwrap();
+        let plan = |runtime: &RepositoryRuntime| {
+            let (path, snapshot) = runtime.workspace_edit_snapshot().unwrap();
+            let offset = snapshot.text.find("old").unwrap();
+            crate::editor_workspace_edit::DocumentPlan {
+                path: path.clone(), relative: "main.rs".into(),
+                before: Arc::clone(&snapshot.text), after: snapshot.text.replace("old", "new").into(),
+                before_hash: blake3::hash(snapshot.text.as_bytes()), version: Some(snapshot.version),
+                protocol_version: None, protocol_incarnation: None, open: true, open_paths: vec![path],
+                edits: vec![crate::editor_workspace_edit::ResolvedEdit { range: offset..offset + 3, new_text: "new".into() }],
+            }
+        };
+        let first_prepared = first.prepare_workspace_edit(&plan(&first)).unwrap();
+        let mut later_prepared = later.prepare_workspace_edit(&plan(&later)).unwrap();
+        // Exercise the actual replay safeguard after all native preflights.
+        later_prepared.changes[0].removed = "unavailable".into();
+        let applied = first.apply_workspace_edit(first_prepared).unwrap();
+        assert_ne!(first.editor_text().unwrap(), original);
+        assert!(later.apply_workspace_edit(later_prepared).is_err());
+        first.rollback_workspace_edit(applied).unwrap();
+        assert_eq!(first.editor_text().unwrap(), original);
+        assert_eq!(later.editor_text().unwrap(), "old");
+        drop(first.update(RepositoryAction::Undo { card: a }));
+        assert_eq!(first.editor_text().unwrap(), "old");
+        drop(first.update(RepositoryAction::Redo { card: a }));
+        assert_eq!(first.editor_text().unwrap(), original, "a refused workspace edit must not become Redo history");
+    }
+
     async fn finish_navigation_task(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
         use cosmic::iced::futures::StreamExt;
         if let Some(mut stream) = iced::runtime::task::into_stream(task) {
