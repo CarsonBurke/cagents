@@ -13,7 +13,7 @@ if functions --query fish_right_prompt
     function fish_right_prompt
         set -l rendered (__cagents_original_right_prompt | string collect --allow-empty --no-trim-newlines)
         set -l prompt_status $pipestatus[1]
-        printf '\e]133;A;k=s\a%s\e]133;B\a' "$rendered"
+        printf '\e]133;P;k=r\a%s\e]133;B\a' "$rendered"
         return $prompt_status
     end
 end

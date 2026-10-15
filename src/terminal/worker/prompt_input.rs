@@ -88,7 +88,23 @@ printf 'right-return=%s\n' $status
             Err(error) => panic!("Run fish prompt fixture: {error}"),
         };
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
-        assert_eq!(result.stdout, b"\x1b]133;A\x07status=0,pipeline=1 0\n\n\x1b]133;B\x07left-return=7,state=yes\n\x1b]133;A;k=s\x07right=0,pipeline=1 0\x1b]133;B\x07right-return=9\n");
+        assert_eq!(result.stdout, b"\x1b]133;A\x07status=0,pipeline=1 0\n\n\x1b]133;B\x07left-return=7,state=yes\n\x1b]133;P;k=r\x07right=0,pipeline=1 0\x1b]133;B\x07right-return=9\n");
+    }
+
+    #[test]
+    fn right_prompt_markers_keep_the_cursor_on_the_prompt_row() {
+        let mut terminal = Terminal::new(TerminalOptions { cols: 40, rows: 6, max_scrollback: 100 }).unwrap();
+        terminal.vt_write(b"\x1b]133;A\x07> \x1b]133;B\x07");
+        let prompt_row = terminal.cursor_y().unwrap();
+        terminal.vt_write(b"\x1b[30G\x1b]133;P;k=r\x07right\x1b]133;B\x07");
+        assert_eq!(terminal.cursor_y().unwrap(), prompt_row);
+        assert_eq!(terminal.cursor_x().unwrap(), 34);
+        assert_eq!(has_prompt_input(&terminal).unwrap(), Some(false));
+        terminal.vt_write(b"\x1b[3Gunfinished");
+        assert_eq!(has_prompt_input(&terminal).unwrap(), Some(true));
+        terminal.vt_write(b"\r\x1b[2K\x1b]133;A\x07> \x1b]133;B\x07\x1b[30G\x1b]133;P;k=r\x07right\x1b]133;B\x07\x1b[3G");
+        assert_eq!(terminal.cursor_y().unwrap(), prompt_row);
+        assert_eq!(has_prompt_input(&terminal).unwrap(), Some(false));
     }
 
     #[test]
