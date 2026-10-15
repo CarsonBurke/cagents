@@ -67,15 +67,21 @@ pub(super) fn report(service:&Service,store:&crate::persistence::StateStore,repo
     let primary=records.first().filter(|record|!record.bare).map(|record|record.path.clone()).ok_or("Setup needs a primary checkout")?;
     let common=service.common_dir(repository,cancel).map_err(|error|error.to_string())?;
     let mut matches=Vec::new();
+    let mut failures=Vec::new();
     for row in store.journaled_worktree_operations().map_err(|error|error.to_string())? {
         if row.status!=PendingOperationStatus::Applied||row.action!="create"||row.entity_kind!="worktree_creation" {continue;}
         let destination=serde_json::from_value::<PathBuf>(row.payload["request"]["destination"].clone()).ok();
         if destination.as_ref()!=Some(&path) {continue;}
-        let report=verified_report(service,&row,&common,record,cancel)?;
-        let request=report.request.as_ref().ok_or("The setup receipt has no request")?;
-        if request.setup_intent.is_some() {matches.push(report);}
+        match verified_report(service,&row,&common,record,cancel) {
+            Ok(report)=>if report.request.as_ref().is_some_and(|request|request.setup_intent.is_some()) {matches.push(report);},
+            Err(error)=>failures.push(error),
+        }
     }
-    if matches.len()!=1 {return Err("No unique daemon-owned setup intent is available for this checkout; review its original creation client".into());}
+    if matches.len()!=1 {
+        let mut detail="No unique daemon-owned setup intent is available for this checkout; review its original creation client".to_owned();
+        if !failures.is_empty() {detail.push_str(": ");detail.push_str(&failures.join("; "));}
+        return Err(detail);
+    }
     Ok((matches.pop().expect("one receipt"),primary))
 }
 

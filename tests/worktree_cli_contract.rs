@@ -377,3 +377,28 @@ fn daemon_setup_recovery_refuses_a_direct_same_path_and_branch_replacement() {
     assert_eq!(fixture.setup_intent(&path),retained,"replacement must not adopt or rewrite the original intent");
     assert!(path.join("tracked").is_file());assert!(client.list().unwrap().is_empty());
 }
+
+
+#[test]
+fn daemon_setup_review_selects_only_the_current_generation_after_service_recreation() {
+    use cagents::{device_service,repository::WorktreeSetupIntent,worktree_control::{Operation,Reply}};
+    let fixture=Fixture::new();let project=fixture.root.path().join("project");
+    let path=fixture.create("recreated-setup");
+    let old:WorktreeSetupIntent=serde_json::from_value(fixture.setup_intent(&path)).unwrap();
+    let admin=fixture.git(&path,&["rev-parse","--absolute-git-dir"]);
+    fixture.git(&project,&["worktree","remove",path.to_str().unwrap()]);
+    assert_eq!(fixture.create("recreated-setup"),path);
+    assert_eq!(fixture.git(&path,&["rev-parse","--absolute-git-dir"]),admin);
+    let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client=cagents::control::ControlClient::connect(&socket).unwrap();let repository=project.join(".git");
+    let device_service::Reply::Worktree(Reply::SetupIntent {intent,..})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntent {repository:repository.clone(),path:path.clone()}}).unwrap() else {panic!("wrong setup metadata")};
+    let current:WorktreeSetupIntent=serde_json::from_str(&intent).unwrap();assert_ne!(current.run_id,old.run_id);
+    let resume=|run|device_service::Operation::Worktree {operation:Operation::ResumeSetup {repository:repository.clone(),path:path.clone(),expected_run_id:run,expected_plan_fingerprint:None,trust:false,skip:true}};
+    assert!(client.device_operation(resume(old.run_id)).is_err(),"old approval must not authorize the new creation");
+    let device_service::Reply::Worktree(Reply::SetupPrepared {run_id,..})=client.device_operation(resume(current.run_id)).unwrap() else {panic!("wrong resumed metadata")};
+    assert_ne!(Some(run_id),current.run_id);assert_ne!(Some(run_id),old.run_id);
+    let device_service::Reply::Worktree(Reply::SetupIntents {intents,warnings})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntents {repository}}).unwrap() else {panic!("wrong setup inventory")};
+    assert_eq!(intents.len(),1);assert_eq!(intents[0].run_id,Some(run_id));
+    assert!(!warnings.is_empty(),"the stale old receipt remains diagnostic evidence");
+    assert!(client.list().unwrap().is_empty(),"skip must not start a terminal");
+}
