@@ -512,6 +512,7 @@ mod tests {
     }
 
     fn revert_complete_added_buffer(runtime: &mut RepositoryRuntime, card: CardId, mode: u32) {
+        runtime.source_surface = SourceSurface::Diff;
         let text = runtime.editor_text().unwrap();
         let mut model = crate::diff_view::build_diff("", &text);
         model.present = [false, true];
@@ -529,24 +530,46 @@ mod tests {
         runtime.apply_diff_buffer_revert_with_presence(&identity, revision.unwrap(), patch.buffer_change.take(), patch.working_present.unwrap(), patch.working_mode).unwrap();
     }
 
+    async fn finish_lineage_save(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
+        use cosmic::iced::futures::StreamExt;
+        let mut pending = std::collections::VecDeque::from([task]);
+        let mut completions = 0;
+        while let Some(task) = pending.pop_front() {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else { continue; };
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action) = action {
+                    completions += 1;
+                    assert!(completions < 100, "fixture refresh must settle");
+                    // Settle the real file-list/Git refresh produced by the
+                    // save. Autosave timing belongs to its separate contract.
+                    pending.push_back(runtime.update_inner(action));
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn partial_change_multiple_presence_undos_restore_their_own_access_metadata() {
         use std::os::unix::fs::PermissionsExt;
         for (save_between_undos, late_completion) in [(true, false), (false, false), (false, true)] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().canonicalize().unwrap();
+            let initialized = std::process::Command::new("git").args(["init", "-b", "main"])
+                .arg(&root).env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output().unwrap();
+            assert!(initialized.status.success(), "{}", String::from_utf8_lossy(&initialized.stderr));
             std::fs::write(root.join("new.sh"), "synthetic alpha\n").unwrap();
             std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600)).unwrap();
             let card = CardId::new();
             let (mut runtime, _) = added_file_runtime(card, &root, "synthetic alpha\n");
             revert_complete_added_buffer(&mut runtime, card, 0o100644);
             let task = runtime.request_save_inner(card, false, false);
-            finish_presence_save(&mut runtime, task).await;
+            finish_lineage_save(&mut runtime, task).await;
             assert!(!root.join("new.sh").exists());
             let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
             document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("synthetic beta\n".into()))));
             let task = runtime.request_save_inner(card, false, false);
-            finish_presence_save(&mut runtime, task).await;
+            finish_lineage_save(&mut runtime, task).await;
             std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o644)).unwrap();
             revert_complete_added_buffer(&mut runtime, card, 0o100644);
             let task = runtime.request_save_inner(card, false, false);
@@ -555,16 +578,16 @@ mod tests {
                 // moved the current history back to A's absence identity.
                 drop(runtime.update(RepositoryAction::Undo { card }));
                 drop(runtime.update(RepositoryAction::Undo { card }));
-                finish_presence_save(&mut runtime, task).await;
+                finish_lineage_save(&mut runtime, task).await;
                 let DocumentState::Editable(document) = &runtime.document else { unreachable!() };
                 assert_eq!(document.restorations.len(), 2);
                 assert_ne!(document.presence_id, document.saved_presence_id);
                 assert!(runtime.is_dirty());
             } else {
-                finish_presence_save(&mut runtime, task).await;
+                finish_lineage_save(&mut runtime, task).await;
                 drop(runtime.update(RepositoryAction::Undo { card }));
                 let task = runtime.request_save_inner(card, false, false);
-                finish_presence_save(&mut runtime, task).await;
+                finish_lineage_save(&mut runtime, task).await;
                 assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), "synthetic beta\n");
                 assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().permissions().mode() & 0o777, 0o644);
                 drop(runtime.update(RepositoryAction::Undo { card }));
@@ -572,13 +595,13 @@ mod tests {
             assert!(!runtime.desired_file_present());
             if save_between_undos {
                 let task = runtime.request_save_inner(card, false, false);
-                finish_presence_save(&mut runtime, task).await;
+                finish_lineage_save(&mut runtime, task).await;
                 assert!(!root.join("new.sh").exists());
             }
             drop(runtime.update(RepositoryAction::Undo { card }));
             assert_eq!(runtime.editor_text().unwrap(), "synthetic alpha\n");
             let task = runtime.request_save_inner(card, false, false);
-            finish_presence_save(&mut runtime, task).await;
+            finish_lineage_save(&mut runtime, task).await;
             assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), "synthetic alpha\n");
             assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().permissions().mode() & 0o777, 0o600,
                 "older synthetic contents must not acquire the later broader permissions");
