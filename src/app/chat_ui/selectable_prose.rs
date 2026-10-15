@@ -125,6 +125,7 @@ impl State {
 pub(super) struct Logical {
     pub identity: u64,
     pub start: usize,
+    pub paint: Option<Arc<find::Paint>>,
 }
 
 pub(super) fn logical_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
@@ -148,8 +149,13 @@ fn build_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
         .map(|span| span.text.as_ref())
         .collect::<String>()
         .into();
-    let highlights = super::find::highlights(&plain, find.unwrap_or_default());
-    let truncated = highlights.truncated;
+    let (matches,current,truncated) = if let Some(logical) = &logical {
+        let (matches,current) = logical.paint.as_ref().map(|paint| paint.fragment(logical.identity,logical.start,plain.len())).unwrap_or_default();
+        (matches,current,false)
+    } else {
+        let highlights = super::find::highlights(&plain,find.unwrap_or_default());
+        (highlights.ranges,None,highlights.truncated)
+    };
     let body = Element::new(Selectable {
         spans,
         plain,
@@ -157,7 +163,8 @@ fn build_text(spans: Arc<[Span<'static, String>]>, size: iced::Pixels,
         font,
         target,
         logical,
-        matches: highlights.ranges,
+        matches,
+        current,
     });
     if truncated {
         widget::column::with_children(vec![
@@ -190,6 +197,7 @@ pub(super) fn plain(
 struct Selectable {
     logical: Option<Logical>,
     matches: Vec<std::ops::Range<usize>>,
+    current: Option<std::ops::Range<usize>>,
     spans: Arc<[Span<'static, String>]>,
     plain: Arc<str>,
     size: iced::Pixels,
@@ -212,6 +220,10 @@ impl Selectable {
             let lo = start.clamp(offset, next) - offset;
             let hi = end.clamp(offset, next) - offset;
             let mut boundaries = vec![0, lo, hi, span.text.len()];
+            if let Some(current) = &self.current {
+                boundaries.push(current.start.clamp(offset,next)-offset);
+                boundaries.push(current.end.clamp(offset,next)-offset);
+            }
             let first = self.matches.partition_point(|found| found.end <= offset);
             let last = self.matches.partition_point(|found| found.start < next);
             let matching = &self.matches[first..last];
@@ -236,7 +248,7 @@ impl Selectable {
                 part.text = span.text[range].to_owned().into();
                 if selected || found {
                     part.highlight = Some(iced::advanced::text::Highlight {
-                        background: if selected {
+                        background: if selected || self.current.as_ref().is_some_and(|current| current.contains(&position)) {
                             design::accent_color(&cosmic::theme::active())
                         } else {
                             design::accent_wash(&cosmic::theme::active())
@@ -448,6 +460,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             }
         }
         paint_ranges(renderer, paragraph, &self.matches, translation, design::accent_wash(theme));
+        if let Some(current) = &self.current {
+            paint_ranges(renderer,paragraph,std::slice::from_ref(current),translation,design::accent_color(theme));
+        }
         let selection = state.anchor.min(state.end)..state.anchor.max(state.end);
         if !selection.is_empty() {
             paint_ranges(renderer, paragraph, &[selection], translation, design::accent_color(theme));
@@ -615,6 +630,7 @@ mod tests {
             logical: None,
             plain: "α first\nβ second".into(),
             spans: spans.clone(),
+            current: None,
             matches: vec![],
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),
@@ -697,6 +713,7 @@ mod tests {
             logical: None,
             plain: "before αβ linked".into(),
             spans,
+            current: None,
             matches: vec![],
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),
@@ -765,6 +782,7 @@ mod tests {
             logical: None,
             plain: "one needle two".into(),
             spans: vec![Span::new("one needle two")].into(),
+            current: None,
             matches: vec![4..10],
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),

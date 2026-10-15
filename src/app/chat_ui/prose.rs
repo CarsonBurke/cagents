@@ -247,6 +247,7 @@ pub(super) fn view(
         path: vec![0],
         dark: cosmic::theme::is_dark(),
         find: find.map(Arc::from),
+        paint: cached.find_paint.clone(),
     }
     .items(cached.markdown.items(), settings)
 }
@@ -269,6 +270,7 @@ pub(super) fn content_view(
         path: vec![1, cached.coordination.as_ref().and_then(|coordinated| coordinated.contents().position(|candidate| std::ptr::eq(candidate, content))).unwrap_or_default() as u32],
         dark: cosmic::theme::is_dark(),
         find: find.map(Arc::from),
+        paint: cached.find_paint.clone(),
     }
     .items(content.items(), settings)
 }
@@ -287,6 +289,7 @@ pub(super) fn items_for_test(
         path: vec![0],
         dark: true,
         find: None,
+        paint: None,
     }
     .items(
         items,
@@ -298,6 +301,7 @@ pub(super) fn items_for_test(
 struct Renderer {
     item: Arc<str>,
     path: Vec<u32>,
+    paint: Option<Arc<find::Paint>>,
     find: Option<Arc<str>>,
     target: Target,
     blocks: Arc<HashMap<u64, Arc<[Span<'static, String>]>>>,
@@ -308,11 +312,11 @@ struct Renderer {
 impl Renderer {
     fn child(&self, index: u32) -> Self {
         let mut path = self.path.clone(); path.push(index);
-        Self { item: self.item.clone(), path, find: self.find.clone(), target: self.target,
+        Self { item: self.item.clone(), path, paint: self.paint.clone(), find: self.find.clone(), target: self.target,
             blocks: self.blocks.clone(), revision: self.revision, dark: self.dark }
     }
     fn logical(&self, _text: Arc<str>, start: usize) -> selectable_prose::Logical {
-        selectable_prose::Logical { identity: selection::logical_identity(&self.item, &self.path), start }
+        selectable_prose::Logical { identity: selection::logical_identity(&self.item, &self.path), start, paint: self.paint.clone() }
     }
     fn items(
         &self,
@@ -329,7 +333,7 @@ impl Renderer {
             let renderer = self.child(index as u32);
             let key = selection::logical_identity(&renderer.item, &renderer.path);
             let mut revision = std::hash::DefaultHasher::new();
-            (self.revision, settings.text_size.0.to_bits(), settings.style.font, &self.find, self.dark).hash(&mut revision);
+            (self.revision, settings.text_size.0.to_bits(), settings.style.font, &self.find, self.paint.as_ref().map(|paint| (paint.generation, paint.current.as_ref().map(|found| (found.identity,found.range.start)))), self.dark).hash(&mut revision);
             let revision = revision.finish();
             let estimate = match item {
                 markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) =>
@@ -651,7 +655,7 @@ pub(super) fn code_text(
         (logical.as_ref().map(|logical| logical.identity), range.start).hash(&mut key);
         let key = key.finish();
         let mut revision = std::hash::DefaultHasher::new();
-        (&text[range.clone()], &find, font, size.0.to_bits(), cosmic::theme::is_dark()).hash(&mut revision);
+        (&text[range.clone()], &find, logical.as_ref().and_then(|logical| logical.paint.as_ref()).map(|paint| (paint.generation, paint.current.as_ref().map(|found| (found.identity,found.range.start)))), font, size.0.to_bits(), cosmic::theme::is_dark()).hash(&mut revision);
         let revision = revision.finish();
         let estimate = ((range.len() as f32 * size.0 * 0.6 / design::READABLE_MEASURE).ceil().max(1.0)
             + text[range.clone()].matches('\n').count() as f32) * size.0 * 1.3;
@@ -722,7 +726,7 @@ fn paragraph(
         (logical.as_ref().map(|logical| logical.identity), range.start).hash(&mut key);
         let key = key.finish();
         let mut revision = std::hash::DefaultHasher::new();
-        (&plain[range.clone()], &find, settings.style.font, settings.text_size.0.to_bits(), cosmic::theme::is_dark()).hash(&mut revision);
+        (&plain[range.clone()], &find, logical.as_ref().and_then(|logical| logical.paint.as_ref()).map(|paint| (paint.generation, paint.current.as_ref().map(|found| (found.identity,found.range.start)))), settings.style.font, settings.text_size.0.to_bits(), cosmic::theme::is_dark()).hash(&mut revision);
         let revision = revision.finish();
         let estimate = ((range.len() as f32 * settings.text_size.0 * 0.5 / design::READABLE_MEASURE).ceil().max(1.0)
             + plain[range.clone()].matches('\n').count() as f32) * settings.text_size.0 * 1.3;

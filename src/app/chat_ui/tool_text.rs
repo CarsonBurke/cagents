@@ -242,6 +242,7 @@ impl ToolText {
         }
         let spans = syntax.as_ref().map(|(_, block)| block.spans(cosmic::theme::is_dark()).clone())
             .unwrap_or_else(|| Arc::from([]));
+        let matching = logical.as_ref().is_some_and(|logical| logical.paint.as_ref().is_some_and(|paint| paint.blocks.contains_key(&logical.identity)));
         let body: Element<'static, Message> = widget::container(prose::code_text(
             self.text.clone(), spans, design::TEXT_BODY.into(), iced::Font::MONOSPACE,
             target, find, logical,
@@ -253,7 +254,7 @@ impl ToolText {
         .into();
         // Find reveals the matching source in the outer transcript. A nested
         // viewport would otherwise keep a deep match hidden at its old offset.
-        let limit = limit.filter(|_| !find.is_some_and(|query| find::contains(&self.text, query)));
+        let limit = limit.filter(|_| !matching);
         let Some((height, follows)) = limit else {
             return body;
         };

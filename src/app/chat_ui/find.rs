@@ -6,7 +6,7 @@ use std::{
 use unicode_casefold::UnicodeCaseFold;
 
 mod index;
-pub(super) use index::{Block, Document, Index, Match};
+pub(super) use index::{Input, Match, Paint, Worker};
 
 pub(super) const HIGHLIGHT_LIMIT: usize = 4096;
 pub(super) struct Highlights {

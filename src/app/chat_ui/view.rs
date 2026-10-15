@@ -708,6 +708,8 @@ impl Scroll {
 
     /// The height of the loaded transcript, which is what tells the page the
     /// reader has already asked for from the one they are asking for now.
+    pub(super) fn bottom_offset(self) -> f32 { (self.travel() - self.from_top).max(0.0) }
+
     pub(super) fn content(self) -> f32 {
         self.content
     }
@@ -1341,7 +1343,7 @@ impl Runtime {
                 let mut key = std::hash::DefaultHasher::new();
                 ("selected-child-item", &item.id).hash(&mut key);
                 let mut revision = std::hash::DefaultHasher::new();
-                (cached.revision, self.expanded.contains(&item.id), &self.find, dark).hash(&mut revision);
+                (cached.revision, self.expanded.contains(&item.id), &self.find, self.find_paint.as_ref().and_then(|paint| paint.current.as_ref()).map(|found| (found.identity,found.range.start)), dark).hash(&mut revision);
                 let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
                     (body.len() as f32 / (content_width / 8.0).max(20.0)).ceil().max(1.0) * 22.0 + footer
                 });
@@ -1511,7 +1513,7 @@ impl Runtime {
                         "0 matches".to_owned()
                     } else {
                         format!(
-                            "{} of {} turns",
+                            "{} of {} matches",
                             self.find_index + 1,
                             self.find_matches.len()
                         )
@@ -3108,7 +3110,7 @@ impl Runtime {
     /// It reads the items' change tokens rather than their bodies, so it
     /// costs the same for a one-line answer as for a long one.
     pub(super) fn find_turn_matches(&self, key: &str) -> bool {
-        self.find_matches.iter().any(|candidate| candidate == key)
+        self.find_matches.iter().any(|candidate| candidate.turn == key)
     }
 
     fn turn_fingerprint(&self, turn: &turn::Turn, dark: bool) -> u64 {
@@ -3128,6 +3130,7 @@ impl Runtime {
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
         self.find.as_ref().filter(|_| self.find_turn_matches(&turn.key)).hash(&mut hasher);
+        self.find_paint.as_ref().and_then(|paint| paint.current.as_ref()).filter(|found| found.turn == turn.key).map(|found| (found.identity,found.range.start)).hash(&mut hasher);
         // Only reasoning uses the transcript's busy state to decide whether
         // its disclosure has finished. Other rows derive activity from their
         // own items and the group's status and duration.
@@ -3680,7 +3683,7 @@ impl Runtime {
     fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
         let (text, attachment, long) = self.prompt_text(item);
         let expanded = self.expanded.contains(&item.id);
-        let logical = selectable_prose::Logical { identity: selection::logical_identity(&item.id, &[2]), start: 0 };
+        let logical = selectable_prose::Logical { identity: selection::logical_identity(&item.id, &[2]), start: 0, paint: self.find_paint.clone() };
         let body: Element<'static, Message> = if attachment {
             widget::row::with_children(vec![
                 widget::icon(Icon::Attachment.handle()).size(12).into(),

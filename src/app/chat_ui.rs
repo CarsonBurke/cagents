@@ -250,6 +250,7 @@ pub enum Action {
     Files(Target, PathBuf, Arc<Vec<String>>),
     Find(Target, String),
     FindNext(Target, bool),
+    FindIndexed(Target, u64, Option<Arc<Vec<find::Match>>>),
     CloseFind(Target),
     FindFocused(Target, bool),
     Tick,
@@ -963,6 +964,7 @@ struct CachedItem {
     patches: Vec<tool_text::ToolText>,
     token: ChangeToken,
     item: Option<Arc<chat::Item>>,
+    find_paint: Option<Arc<find::Paint>>,
     /// Unique presentation identity for retained turns, including tail collisions.
     revision: u64,
     /// The body as the Markdown parser is given it, resumed on each append.
@@ -1088,6 +1090,7 @@ impl CachedItem {
             patches,
             token: ChangeToken::of(content),
             item,
+            find_paint: None,
             revision: Self::next_revision(),
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
@@ -1466,7 +1469,14 @@ enum QueuedStep {
 pub(super) struct Runtime {
     find: Option<String>,
     find_focused: bool,
-    find_matches: Vec<String>,
+    find_matches: Vec<find::Match>,
+    find_generation: Arc<AtomicU64>,
+    find_waiting: Option<u64>,
+    find_dirty: bool,
+    find_worker: Arc<Mutex<find::Worker>>,
+    find_paint: Option<Arc<find::Paint>>,
+    find_origin: Option<view::Scroll>,
+    find_navigated: bool,
     find_disclosure: find::Disclosure,
     find_index: usize,
     copied: Option<(String, Instant)>,
@@ -2089,6 +2099,13 @@ impl Runtime {
             find: None,
             find_focused: false,
             find_matches: Vec::new(),
+            find_generation: Arc::new(AtomicU64::new(0)),
+            find_waiting: None,
+            find_dirty: false,
+            find_worker: Default::default(),
+            find_paint: None,
+            find_origin: None,
+            find_navigated: false,
             find_disclosure: find::Disclosure::default(),
             find_index: 0,
             copied: None,
@@ -2560,52 +2577,43 @@ impl Runtime {
     }
 
     fn refresh_find(&mut self) {
-        let previous = self.find_matches.get(self.find_index).cloned();
-        let query = self.find.as_deref().unwrap_or_default();
-        self.find_matches = self
-            .turns
-            .iter()
-            .filter(|turn| {
-                !query.is_empty()
-                    && turn
-                        .prompt
-                        .iter()
-                        .copied()
-                        .chain(
-                            turn.steps
-                                .iter()
-                                .chain(&turn.prose)
-                                .map(|placed| placed.index),
-                        )
-                        .filter_map(|index| self.snapshot.items.get(index))
-                        .any(|item| {
-                            contains_text(&item.content, query)
-                                // A card shows its words unquoted, as no
-                                // command line or tool input writes them.
-                                || self
-                                    .cache
-                                    .get(&item.id)
-                                    .and_then(|cached| cached.coordination.as_deref())
-                                    .is_some_and(|coordinated| {
-                                        coordinated
-                                            .parts()
-                                            .iter()
-                                            .any(|(_, text)| find::contains(text, query))
-                                    })
-                        })
-            })
-            .map(|turn| turn.key.clone())
-            .collect();
-        self.find_index = previous
-            .and_then(|key| {
-                self.find_matches
-                    .iter()
-                    .position(|candidate| candidate == &key)
-            })
-            .unwrap_or_else(|| {
-                self.find_index
-                    .min(self.find_matches.len().saturating_sub(1))
-            });
+        self.find_dirty |= self.find.as_ref().is_some_and(|query| !query.is_empty());
+    }
+
+    fn find_search_task(&mut self) -> Option<Task<Message>> {
+        let query = self.find.as_ref().filter(|query| !query.is_empty())?.clone();
+        if !self.find_dirty || self.find_waiting.is_some() { return None; }
+        self.find_dirty = false;
+        let generation = self.find_generation.load(Ordering::Relaxed);
+        self.find_waiting = Some(generation);
+        let target = self.target;
+        let current = self.find_generation.clone();
+        let worker = self.find_worker.clone();
+        let provider = self.session.launch.provider;
+        let inputs = self.turns.iter().flat_map(|turn| {
+            turn.prompt.iter().copied().chain(turn.steps.iter().chain(&turn.prose).map(|placed| placed.index))
+                .filter_map(|index| {
+                    let item = self.snapshot.items.get(index)?.clone();
+                    let revision = self.cache.get(&item.id).map_or(0, |cached| cached.revision);
+                    Some(find::Input { item,revision,turn:turn.key.clone(),growing:self.snapshot.busy })
+                })
+        }).collect::<Vec<_>>();
+        Some(cosmic::task::future(async move {
+            tokio::time::sleep(Duration::from_millis(125)).await;
+            let matches = if current.load(Ordering::Relaxed) != generation { None } else {
+                tokio::task::spawn_blocking(move || {
+                    worker.lock().ok()?.search(&inputs,provider,&query,generation,&current)
+                }).await.ok().flatten()
+            };
+            Message::ChatUi(Action::FindIndexed(target,generation,matches.map(Arc::new)))
+        }))
+    }
+
+    fn update_find_paint(&mut self) {
+        self.find_paint = self.find.as_ref().map(|_| Arc::new(find::Paint::new(
+            self.find_generation.load(Ordering::Relaxed), &self.find_matches,
+            self.find_matches.get(self.find_index).cloned())));
+        for cached in self.cache.values_mut() { cached.find_paint = self.find_paint.clone(); }
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
@@ -3457,7 +3465,11 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return None;
         };
-        runtime.find.get_or_insert_with(String::new);
+        if runtime.find.is_none() {
+            runtime.find_origin = Some(runtime.scroll);
+            runtime.find_navigated = false;
+            runtime.find = Some(String::new());
+        }
         Some(
             iced::widget::operation::focus(card_control_id(card, "chat-find"))
                 .map(cosmic::Action::App),
@@ -3476,75 +3488,32 @@ impl Cagents {
         } else {
             (runtime.find_index + runtime.find_matches.len() - 1) % runtime.find_matches.len()
         };
-        let key = runtime.find_matches[runtime.find_index].clone();
-        if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
-            runtime.find_disclosure.turn(&key, &mut runtime.opened);
-            let query = runtime.find.as_deref().unwrap_or_default();
-            for placed in turn.steps.iter().chain(&turn.prose) {
-                let Some(item) = runtime.snapshot.items.get(placed.index) else {
-                    continue;
-                };
-                // A card's message or prompt, or a message a step read, may
-                // be folded to its opening.
-                let coordinated = runtime
-                    .cache
-                    .get(&item.id)
-                    .and_then(|cached| cached.coordination.as_deref());
-                let mut unfolded = false;
-                for (part, text) in coordinated
-                    .map(coordination::Coordinated::parts)
-                    .unwrap_or_default()
-                {
-                    if find::contains(text, query) {
-                        unfolded = true;
-                        runtime
-                            .find_disclosure
-                            .part(&format!("{}#{part}", item.id), &mut runtime.unfolded);
-                    }
-                }
-                // A collapsed step hides its match, and so does a card whose
-                // match is only in the command or output it was read from.
-                let raw = match coordinated {
-                    Some(coordinated) if coordinated.is_card() => !unfolded,
-                    _ => turn.steps.contains(placed) || placed.slot == turn::Slot::Thinking,
-                };
-                if raw
-                    && contains_text(&item.content, query)
-                    && runtime
-                        .find_disclosure
-                        .item(&item.id, &mut runtime.expanded)
-                {
-                    let previous = runtime.cache.remove(&item.id);
-                    runtime.cache.insert(
-                        item.id.clone(),
-                        CachedItem::updated(
-                            &item.content,
-                            runtime.syntax_theme,
-                            previous,
-                            true,
-                            false,
-                            chat::coordination::recognize(item, runtime.session.launch.provider),
-                        ),
-                    );
-                }
+        runtime.find_navigated = true;
+        self.reveal_chat_find(target)
+    }
+
+    fn reveal_chat_find(&mut self, target: Target) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
+        let Some(found) = runtime.find_matches.get(runtime.find_index).cloned() else { return Task::none(); };
+        runtime.find_disclosure.turn(&found.turn,&mut runtime.opened);
+        if let Some(item) = runtime.snapshot.items.iter().find(|item| item.id == found.item) {
+            if runtime.find_disclosure.item(&item.id,&mut runtime.expanded) {
+                let previous = runtime.cache.remove(&item.id);
+                let mut cached = CachedItem::updated(&item.content,runtime.syntax_theme,previous,true,false,
+                    chat::coordination::recognize(item,runtime.session.launch.provider));
+                cached.item = Some(item.clone());
+                runtime.cache.insert(item.id.clone(),cached);
             }
-            // A delivery folded to its opening would hide a match in its body;
-            // its heading is always shown.
-            for index in &turn.prompt {
-                if let Some(item) = runtime.snapshot.items.get(*index)
-                    && matches!(&item.content, ItemContent::Delivery { body, .. } if find::contains(body, query))
-                {
-                    runtime
-                        .find_disclosure
-                        .item(&item.id, &mut runtime.expanded);
+            if let Some(coordinated) = runtime.cache.get(&item.id).and_then(|cached| cached.coordination.as_deref()) {
+                for (part,_) in coordinated.parts() {
+                    runtime.find_disclosure.part(&format!("{}#{part}",item.id),&mut runtime.unfolded);
                 }
             }
         }
+        runtime.update_find_paint();
         crate::document_link::scroll_to_heading_anchored(
-            card_control_id(target.card, "chat-transcript"),
-            iced::advanced::widget::Id::new(format!("chat-turn-{}-{key}", target.card)),
-            true,
-        )
+            card_control_id(target.card,"chat-transcript"),
+            iced::advanced::widget::Id::new(format!("virtual-chunk-{:x}",found.identity)),true)
     }
     fn load_chat_files(&mut self, target: Target, directory: PathBuf) -> Task<Message> {
         if crate::device::is_remote() {
@@ -5764,6 +5733,10 @@ impl Cagents {
             _ => None,
         };
         let task = self.handle_chat_ui_inner(action);
+        let searches = self.cards.values_mut().filter_map(|card| match card {
+            CardRuntime::Chat(runtime) => runtime.find_search_task(), _ => None,
+        }).collect::<Vec<_>>();
+        let task = Task::batch(std::iter::once(task).chain(searches));
         if let Some(target) = restore
             && let Some(runtime) = self.chat_runtime_mut(target)
             && !runtime.account_picker
@@ -7233,34 +7206,49 @@ impl Cagents {
             }
             Action::Find(target, query) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_disclosure.restore(
-                        &mut runtime.expanded,
-                        &mut runtime.unfolded,
-                        &mut runtime.opened,
-                    );
+                    if runtime.find.is_none() { runtime.find_origin = Some(runtime.scroll); runtime.find_navigated = false; }
+                    runtime.find_disclosure.restore(&mut runtime.expanded,&mut runtime.unfolded,&mut runtime.opened);
+                    runtime.find_generation.fetch_add(1,Ordering::Relaxed);
                     runtime.find = Some(query);
-                    runtime.refresh_find();
-                    runtime.find_index = runtime.find_matches.len().saturating_sub(1);
+                    runtime.find_waiting = None;
+                    runtime.find_matches.clear();
+                    runtime.find_index = 0;
+                    runtime.find_dirty = true;
+                    runtime.update_find_paint();
                 }
-                return self.chat_find_next(target, true);
+            }
+            Action::FindIndexed(target,generation,matches) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else { return Task::none(); };
+                if runtime.find.is_none() || runtime.find_generation.load(Ordering::Relaxed) != generation { return Task::none(); }
+                runtime.find_waiting = None;
+                if let Some(matches) = matches {
+                    let previous = runtime.find_matches.get(runtime.find_index).cloned();
+                    runtime.find_matches = matches.as_ref().clone();
+                    runtime.find_index = previous.and_then(|previous| runtime.find_matches.iter().position(|found| found == &previous)).unwrap_or(0);
+                    runtime.update_find_paint();
+                    return self.reveal_chat_find(target);
+                }
             }
             Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
             Action::CloseFind(target) => {
+                let mut restore = None;
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_disclosure.restore(
-                        &mut runtime.expanded,
-                        &mut runtime.unfolded,
-                        &mut runtime.opened,
-                    );
+                    runtime.find_generation.fetch_add(1,Ordering::Relaxed);
+                    runtime.find_waiting = None;
+                    runtime.find_dirty = false;
+                    runtime.find_disclosure.restore(&mut runtime.expanded,&mut runtime.unfolded,&mut runtime.opened);
                     runtime.find = None;
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
+                    runtime.update_find_paint();
+                    if !runtime.find_navigated { restore = runtime.find_origin.take(); }
+                    runtime.find_origin = None;
                 }
-                return iced::widget::operation::focus(card_control_id(
-                    target.card,
-                    "chat-composer",
-                ))
-                .map(cosmic::Action::App);
+                let focus = iced::widget::operation::focus(card_control_id(target.card,"chat-composer")).map(cosmic::Action::App);
+                return Task::batch([focus, restore.map_or_else(Task::none,|scroll| {
+                    iced::widget::scrollable::scroll_to(card_control_id(target.card,"chat-transcript"),
+                        iced::widget::scrollable::AbsoluteOffset {x:0.0,y:scroll.bottom_offset()}).map(cosmic::Action::App)
+                })]);
             }
             Action::FindFocused(target, focused) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -8325,6 +8313,7 @@ impl Cagents {
                     runtime.subagent_scroll.insert(id, scroll);
                     return Task::none();
                 }
+                if user_input && runtime.find.is_some() { runtime.find_navigated = true; }
                 runtime.scroll = scroll;
                 let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
                 if at_bottom && !runtime.snapshot.has_later {

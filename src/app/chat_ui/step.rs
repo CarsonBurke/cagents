@@ -307,7 +307,7 @@ impl Runtime {
                 self.find.as_deref(), selectable_prose::Logical {
                     identity: selection::logical_identity(&item.id, &match part {
                         CopyPart::Input => vec![4], CopyPart::Change(index) => vec![6, index as u32], _ => vec![5],
-                    }), start: 0,
+                    }), start: 0, paint: self.find_paint.clone(),
                 }),
             Some(caption.to_owned()),
             Some(copy),

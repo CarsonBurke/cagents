@@ -114,3 +114,99 @@ mod tests {
         assert_eq!(matched_ranges(&text,"x",4096).ranges.len(),4096);
     }
 }
+
+/// One accepted search result, shared by mounted fragments. Ranges refer to
+/// whole logical blocks; a fragment intersects them without rescanning text.
+#[derive(Clone, Default, Debug)]
+pub(in crate::app::chat_ui) struct Paint {
+    pub generation: u64,
+    pub blocks: HashMap<u64, Arc<[Range<usize>]>>,
+    pub current: Option<Match>,
+}
+impl Paint {
+    pub fn new(generation: u64, matches: &[Match], current: Option<Match>) -> Self {
+        let mut blocks: HashMap<u64, Vec<Range<usize>>> = HashMap::new();
+        for found in matches { blocks.entry(found.identity).or_default().push(found.range.clone()); }
+        Self { generation, blocks: blocks.into_iter().map(|(key,ranges)| (key,ranges.into())).collect(), current }
+    }
+    pub fn fragment(&self, identity: u64, start: usize, length: usize) -> (Vec<Range<usize>>, Option<Range<usize>>) {
+        let end = start.saturating_add(length);
+        let clip = |range: &Range<usize>| (range.start < end && range.end > start)
+            .then(|| range.start.max(start)-start..range.end.min(end)-start);
+        let ranges = self.blocks.get(&identity).map(|ranges| {
+            let first = ranges.partition_point(|range| range.end <= start);
+            ranges[first..].iter().take_while(|range| range.start < end).filter_map(clip).collect()
+        }).unwrap_or_default();
+        let current = self.current.as_ref().filter(|found| found.identity == identity).and_then(|found| clip(&found.range));
+        (ranges,current)
+    }
+}
+
+pub(in crate::app::chat_ui) struct Input {
+    pub item: Arc<crate::chat::Item>,
+    pub revision: u64,
+    pub turn: String,
+    pub growing: bool,
+}
+#[derive(Default)]
+pub(in crate::app::chat_ui) struct Worker {
+    index: Index,
+    documents: HashMap<String, Document>,
+}
+impl Worker {
+    pub fn search(&mut self, inputs: &[Input], provider: crate::agent::Provider,
+        query: &str, generation: u64, current: &AtomicU64) -> Option<Vec<Match>> {
+        let present: HashSet<_> = inputs.iter().map(|input| input.item.id.as_str()).collect();
+        self.documents.retain(|id,_| present.contains(id.as_str()));
+        let mut documents = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if current.load(Ordering::Relaxed) != generation { return None; }
+            if self.documents.get(&input.item.id).is_none_or(|document| document.revision != input.revision) {
+                self.documents.insert(input.item.id.clone(), document(input,provider));
+            }
+            let mut document = self.documents[&input.item.id].clone();
+            document.turn.clone_from(&input.turn);
+            documents.push(document);
+        }
+        self.index.search(&documents,query,generation,current)
+    }
+}
+fn document(input: &Input, provider: crate::agent::Provider) -> Document {
+    use crate::app::chat_ui::{coordination, markdown, markdown_source, selection};
+    use crate::chat::{ItemContent, Role, DeliveryKind};
+    let item = &input.item;
+    let mut builder = selection::Catalog::builder();
+    let mut parse = |body: &str| {
+        let source = match markdown_source::Source::default().advance(body,input.growing) {
+            markdown_source::Step::Append(text) | markdown_source::Step::Restart(text) => text,
+        };
+        let parsed = markdown::Content::parse(&source);
+        builder.markdown(&item.id,&[0],parsed.items());
+    };
+    match &item.content {
+        ItemContent::Text {text,..} if item.role == Role::User => builder.plain(&item.id,&[2],Arc::from(text.as_str())),
+        ItemContent::Text {text,..} => parse(text),
+        ItemContent::Delivery {kind,body,..} if *kind != DeliveryKind::Notice => parse(body),
+        ItemContent::Delivery {body,..} => builder.plain(&item.id,&[2],Arc::from(body.as_str())),
+        ItemContent::Command {command,output,..} => {
+            builder.plain(&item.id,&[4],Arc::from(command.as_str()));
+            builder.plain(&item.id,&[5],Arc::from(output.as_str()));
+        }
+        ItemContent::Tool {input,output,..} => {
+            builder.plain(&item.id,&[4],Arc::from(input.as_str()));
+            builder.plain(&item.id,&[5],Arc::from(output.as_str()));
+        }
+        ItemContent::Changes {changes,..} => for (index,change) in changes.iter().enumerate() {
+            builder.plain(&item.id,&[6,index as u32],Arc::from(change.diff.as_str()));
+        },
+        _ => {}
+    }
+    if let Some(reading) = crate::chat::coordination::recognize(item,provider) {
+        let coordinated = coordination::Coordinated::new(reading);
+        for (index,content) in coordinated.contents().enumerate() {
+            builder.markdown(&item.id,&[1,index as u32],content.items());
+        }
+    }
+    let blocks = builder.finish().search_blocks().into_iter().map(|(identity,text)| Block {identity,text}).collect();
+    Document {item:item.id.clone(),revision:input.revision,turn:input.turn.clone(),blocks}
+}
