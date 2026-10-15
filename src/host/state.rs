@@ -1,4 +1,5 @@
 mod presentation;
+mod terminal_instances;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -240,6 +241,7 @@ pub(crate) struct HostState {
     /// made per-frame allocation scale with the number of attached views.
     proof: Arc<HostSessionProof>,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
+    published_terminal_workers: terminal_instances::PublishedWorkers,
     spawning: BTreeSet<TerminalId>,
     /// Covers the interval before a login's live TerminalRecord exists.
     browser_logins_spawning: BTreeSet<TerminalId>,
@@ -345,6 +347,7 @@ impl HostState {
             recover_holders: false,
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
+            published_terminal_workers: Default::default(),
             spawning: BTreeSet::new(),
             browser_logins_spawning: BTreeSet::new(),
             clients: BTreeMap::new(),
@@ -1244,6 +1247,7 @@ impl HostState {
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
         self.inventory_generation += 1;
         self.notification_closed.remove(&terminal_id);
+        self.published_terminal_workers.observe(terminal_id, handle.execution_instance());
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
