@@ -77,6 +77,59 @@ impl AccountSwitchOptions {
     }
 }
 
+/// Transfer only the session-owned flag overlay. Inherited policy remains owned
+/// by its source and must already agree before the handoff can be accepted.
+fn next_account_permission_update(
+    current: &super::PermissionSettings,
+    desired: &super::PermissionSettings,
+) -> Result<Option<super::PermissionSettingsUpdate>, String> {
+    use super::PermissionSettingsUpdate as Update;
+    const FLAGS: &str = "flagSettings";
+    let inherited_rules = |settings: &super::PermissionSettings| {
+        settings.rules.iter().filter(|rule| rule.source != FLAGS).cloned().collect::<Vec<_>>()
+    };
+    let inherited_environment = |settings: &super::PermissionSettings| {
+        settings.environment.iter().filter(|entry| entry.source != FLAGS).cloned().collect::<Vec<_>>()
+    };
+    fn same<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+        a.len() == b.len() && a.iter().all(|entry| b.contains(entry))
+    }
+    if !same(&inherited_rules(current), &inherited_rules(desired))
+        || !same(&inherited_environment(current), &inherited_environment(desired))
+    {
+        return Err("The alternate account has different inherited permission rules or Auto mode context; continue separately with an explicit permission choice".into());
+    }
+    for rule in current.rules.iter().filter(|rule| rule.source == FLAGS) {
+        if !desired.rules.contains(rule) {
+            return Ok(Some(Update::RemoveRule { behavior: rule.behavior, rule: rule.rule.clone() }));
+        }
+    }
+    for entry in current.environment.iter().filter(|entry| entry.source == FLAGS) {
+        if !desired.environment.contains(entry) {
+            return Ok(Some(Update::RemoveEnvironment { text: entry.text.clone() }));
+        }
+    }
+    for rule in desired.rules.iter().filter(|rule| rule.source == FLAGS) {
+        if !current.rules.contains(rule) {
+            return Ok(Some(Update::AddRule { behavior: rule.behavior, rule: rule.rule.clone() }));
+        }
+    }
+    for entry in desired.environment.iter().filter(|entry| entry.source == FLAGS) {
+        if !current.environment.contains(entry) {
+            return Ok(Some(Update::AddEnvironment { text: entry.text.clone() }));
+        }
+    }
+    Ok(None)
+}
+
+fn account_permissions_match(current: Option<&super::PermissionSettings>, desired: Option<&super::PermissionSettings>) -> bool {
+    match (current, desired) {
+        (_, None) => true,
+        (Some(current), Some(desired)) => matches!(next_account_permission_update(current, desired), Ok(None)),
+        (None, Some(_)) => false,
+    }
+}
+
 enum ActorCommand {
     AccountNotice(String),
     AccountSwitchGeneration(crossbeam_channel::Sender<Option<u64>>),
@@ -1221,15 +1274,16 @@ impl LocalHandle {
             if let Some(failure) = self.failure() {
                 return Err(failure);
             }
-            let (ready,model_matches,permission_matches,fast_matches,permissions_match,fast_enabled,model_available)={
+            let (ready,model_matches,permission_matches,fast_matches,permissions_match,fast_enabled,model_available,permission_settings)={
                 let snapshot=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
                 (snapshot.ready,
                     options.model.is_none() || (snapshot.selected_model==options.model && snapshot.reasoning==options.reasoning),
                     options.permission_mode.is_none() || snapshot.permission_mode==options.permission_mode,
                     options.fast_mode.is_none() || snapshot.fast_mode.as_ref().map(super::FastMode::enabled)==options.fast_mode,
-                    options.permissions.is_none() || snapshot.permissions==options.permissions,
+                    account_permissions_match(snapshot.permissions.as_ref(), options.permissions.as_ref()),
                     snapshot.fast_mode.as_ref().is_some_and(super::FastMode::enabled),
-                    snapshot.models.iter().any(|model|Some(&model.id)==options.model.as_ref()))
+                    snapshot.models.iter().any(|model|Some(&model.id)==options.model.as_ref()),
+                    snapshot.permissions.clone())
             };
             // Inspect only current controls. Restoring settings must never page
             // or clone a transcript merely because the source pane is hidden.
@@ -1270,10 +1324,19 @@ impl LocalHandle {
                 } else if model_matches
                     && permission_matches
                     && !permissions_match
-                    && !permissions_requested
                 {
-                    self.command(Command::RefreshPermissions)?;
-                    permissions_requested = true;
+                    if !permissions_requested {
+                        // This acknowledged read supplies a fresh source-aware
+                        // baseline before any session-only overlay mutation.
+                        self.command(Command::RefreshPermissions)?;
+                        permissions_requested = true;
+                    } else if let (Some(current), Some(desired)) = (permission_settings.as_ref(), options.permissions.as_ref()) {
+                        if let Some(update) = next_account_permission_update(current, desired)? {
+                            // Claude acknowledges only after read-back confirms
+                            // the flagSettings edit. Never write inherited files.
+                            self.command(Command::UpdatePermissionSettings { update })?;
+                        }
+                    }
                 }
             }
             if Instant::now() >= deadline {

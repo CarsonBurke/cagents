@@ -10178,4 +10178,101 @@ mod tests {
         assert_eq!(page.len(), 2);
         assert_eq!(page[1].tool_calls[&0]["input"]["new_string"], "new-2");
     }
+    #[test]
+    fn account_switch_restores_current_session_permission_edits_without_writing_inherited_policy() {
+        use chat::PermissionSettingsUpdate as Update;
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let inherited = json!({"source":"projectSettings","settings":{"permissions":{"deny":["Bash(rm *)"]}}});
+        let initial_flags = json!({
+            "permissions":{"allow":["Bash(legacy)"],"additionalDirectories":["/retained-directory"]},
+            "autoMode":{"environment":["legacy context"],"unrelated":"retained-value"},
+            "hooks":{"unrelated":"must-never-be-transferred"}
+        });
+        let start = |label: &str, inherited: Value| {
+            let flags = initial_flags.clone();
+            let parsed = super::super::claude_permissions::Snapshot::parse(&json!({
+                "effective":{"autoMode":{"environment":["legacy context"]}},
+                "sources":[inherited.clone(),{"source":"flagSettings","settings":flags.clone()}]
+            })).unwrap();
+            let log = directory.path().join(format!("{label}.jsonl"));
+            let recipe = crate::model::LaunchRecipe {
+                program: "/usr/bin/python3".into(),
+                arguments: vec!["-u".into(),"-c".into(),r#"import json,sys
+flags=json.loads(sys.argv[1]); inherited=json.loads(sys.argv[2])
+for line in sys.stdin:
+    frame=json.loads(line)
+    with open(sys.argv[3],'a') as log: log.write(json.dumps(frame)+'\n')
+    assert frame['type']=='control_request', 'restoration must never send a prompt'
+    request=frame['request']
+    if request['subtype']=='apply_flag_settings':
+        flags.update(request['settings']); response={}
+    elif request['subtype']=='get_settings':
+        response={'effective':{'autoMode':{'environment':[]}},'sources':[inherited,{'source':'flagSettings','settings':flags}]}
+    else: raise AssertionError(request)
+    print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':response}}),flush=True)
+"#.into(),flags.to_string(),inherited.to_string(),log.to_string_lossy().into_owned()],
+                working_directory: directory.path().to_path_buf(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            };
+            let adapter = Claude {
+                ready: true,
+                session_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+                permissions: Some(parsed.clone()),
+                ..Default::default()
+            };
+            let spec = ProcessSpec::from(&recipe);
+            let mut initial = Step {
+                events: vec![Event::Ready(true), Event::PermissionSettings(parsed.settings),
+                    Event::Session { id:"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),title:None }],
+                ..Step::default()
+            };
+            let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+            let handle = chat::runtime::Handle::start(spec,Box::new(adapter),initial,store,
+                Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()), |_| {}).unwrap();
+            (handle,recipe,log)
+        };
+        let (source, issued, _) = start("source",inherited.clone());
+        for update in [
+            Update::RemoveRule { behavior:chat::PermissionBehavior::Allow,rule:"Bash(legacy)".into() },
+            Update::AddRule { behavior:chat::PermissionBehavior::Allow,rule:"Bash(cargo test *)".into() },
+            Update::RemoveEnvironment { text:"legacy context".into() },
+            Update::AddEnvironment { text:"This is a disposable checkout.".into() },
+        ] {
+            source.command(Command::UpdatePermissionSettings { update }).unwrap();
+        }
+        source.close().unwrap(); // Explicit whole-session completion, not a selector side effect.
+        let options = source.completed_account_options().unwrap().unwrap();
+        let (successor, successor_issued, log) = start("successor",inherited);
+        assert_eq!(issued.arguments[..5], successor_issued.arguments[..5]);
+        successor.restore_account_options(&options,Instant::now()+Duration::from_secs(5),||false).unwrap();
+        let restored = successor.snapshot(None).unwrap();
+        assert_eq!(restored.permissions,options.permissions);
+        let writes = std::fs::read_to_string(log).unwrap();
+        let frames:Vec<Value> = writes.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        let patches:Vec<_> = frames.iter().filter(|frame|frame["request"]["subtype"]=="apply_flag_settings").collect();
+        assert_eq!(patches.len(),4,"remove stale session entries and restore both current edits");
+        for patch in patches {
+            let settings=&patch["request"]["settings"];
+            assert!(settings.get("hooks").is_none());
+            if let Some(permissions)=settings.get("permissions") {
+                assert_eq!(permissions["additionalDirectories"],json!(["/retained-directory"]));
+                assert!(permissions.get("deny").is_none(),"inherited deny policy is never copied into the editable source");
+            }
+            if let Some(auto)=settings.get("autoMode") {
+                assert_eq!(auto["unrelated"],"retained-value");
+            }
+        }
+        successor.close().unwrap();
+
+        let (different, _, log) = start("different-policy",json!({"source":"projectSettings","settings":{"permissions":{"deny":["Bash(curl *)"]}}}));
+        let refusal = different.restore_account_options(&options,Instant::now()+Duration::from_secs(5),||false).unwrap_err();
+        assert!(refusal.contains("different inherited permission"));
+        let writes=std::fs::read_to_string(log).unwrap();
+        assert!(writes.lines().all(|line|serde_json::from_str::<Value>(line).unwrap()["request"]["subtype"]=="get_settings"));
+        assert!(!different.is_completed(),"a permission mismatch does not authorize stopping the actor");
+        different.close().unwrap();
+    }
+
 }
