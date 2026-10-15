@@ -822,6 +822,34 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
         .map_err(unavailable)
 }
 
+fn ensure_native_account_admission(
+    host: &SharedHost,
+    spec: &chat::protocol::ProcessSpec,
+    execution: Option<&chat::protocol::ExecutionContext>,
+) -> Result<(), ProtocolError> {
+    if matches!(spec.transport, chat::protocol::TransportSpec::History) {
+        return Ok(());
+    }
+    if let Some(context) = execution {
+        context.verify_directory(&spec.working_directory).map_err(unavailable)?;
+    }
+    let directory = execution.and_then(|context| context.directory_descriptor());
+    super::account_lifecycle::ensure_launch_at_directory(
+        host,
+        &spec.working_directory,
+        &spec.environment,
+        &spec.unset_environment,
+        false,
+        directory.as_deref(),
+    )?;
+    // Refuse a replaced operational spelling rather than authorizing the new
+    // inode while the child still owns the original directory descriptor.
+    if let Some(context) = execution {
+        context.verify_directory(&spec.working_directory).map_err(unavailable)?;
+    }
+    Ok(())
+}
+
 fn start_with_execution(
     host: &SharedHost,
     client: ClientId,
@@ -1190,15 +1218,6 @@ fn start_with_execution(
         spec.environment = environment.clone();
     }
     spec.remove_unset_environment();
-    if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
-        super::account_lifecycle::ensure_launch(
-            host,
-            &spec.working_directory,
-            &spec.environment,
-            &spec.unset_environment,
-            false,
-        )?;
-    }
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1245,6 +1264,11 @@ fn start_with_execution(
             }
         }
     }
+    // Admission must use the verified operational directory, not the issued
+    // recipe spelling. In particular a relative credential home cannot be
+    // classified against that spelling when the child will fchdir to a pin.
+    // Do this before initialize: an adapter may perform provider I/O there.
+    ensure_native_account_admission(host, &spec, execution.as_deref())?;
     let mut initial = adapter.initialize().map_err(error)?;
     let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
     if terminate_source && source.is_none() {
@@ -1445,6 +1469,7 @@ fn start_with_execution(
                 .map_err(unavailable)?;
         }
         spec.remove_unset_environment();
+        ensure_native_account_admission(host, &spec, spec.execution.as_deref())?;
         let recovery_environment = spec.environment.clone();
         // Capability is transient process context, never a public launch
         // recipe. A fresh provider may delegate only as its real session.
@@ -3513,6 +3538,101 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn native_account_admission_uses_the_pinned_operational_directory_before_provider_start() {
+        const CHILD: &str = "CAGENTS_NATIVE_ACCOUNT_ADMISSION_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::Builder::new().prefix("cagents-native-account-")
+                .tempdir_in("/var/tmp").unwrap();
+            for name in ["home", "config", "data", "cache", "runtime"] {
+                std::fs::create_dir(root.path().join(name)).unwrap();
+            }
+            let log = root.path().join("test.log");
+            let output = std::fs::File::create(&log).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::chat::tests::native_account_admission_uses_the_pinned_operational_directory_before_provider_start", "--nocapture"])
+                .env_clear().env(CHILD, root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+                .env("PATH", "/usr/bin:/bin").env("SHELL", "/bin/sh")
+                .stdout(output.try_clone().unwrap()).stderr(output).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() { break status; }
+                if Instant::now() >= deadline {
+                    let _ = child.kill(); let _ = child.wait();
+                    panic!("native admission fixture timed out: {}", root.keep().display());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let evidence = std::fs::read_to_string(&log).unwrap();
+            if !status.success() {
+                panic!("native admission fixture failed: {}\n{evidence}", root.keep().display());
+            }
+            assert!(evidence.contains("1 passed; 0 failed"), "{evidence}");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let issued = root.join("issued");
+        let operational = root.join("operational");
+        std::fs::create_dir_all(&issued).unwrap();
+        let context = Arc::new(chat::protocol::ExecutionContext::capture(&issued).unwrap());
+        std::fs::rename(&issued, &operational).unwrap();
+        std::fs::create_dir(&issued).unwrap();
+        let profile = operational.join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let marker = root.join("provider-started");
+        let executable = root.join("provider-wrapper");
+        std::fs::write(&executable, format!("#!/bin/sh\nprintf started > '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("native-account-admission"),
+            boot_id: BootId::new("fixture"), host_incarnation: HostIncarnation::new("fixture"),
+        })));
+        host.lock().unwrap().register_client(1);
+        let account = crate::account::Account::linked(Provider::Codex, uuid::Uuid::new_v4(), profile.clone());
+        let _reservation = super::super::account_lifecycle::Reservation::install(&host, &[account]).unwrap();
+        for relative in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "HOME", "absolute-reserved"] {
+            let mut environment = BTreeMap::from([
+                ("HOME".into(), root.join("home").display().to_string()),
+                ("CLAUDE_CONFIG_DIR".into(), root.join("home").display().to_string()),
+                ("CODEX_HOME".into(), root.join("home").display().to_string()),
+            ]);
+            if relative == "absolute-reserved" {
+                environment.insert("CODEX_HOME".into(), profile.display().to_string());
+            } else {
+                environment.insert(relative.into(), "profile".into());
+                if relative == "HOME" { environment.remove("CODEX_HOME"); }
+                // The obsolete cwd would admit this recipe and miss operational/profile.
+                super::super::account_lifecycle::ensure_launch(&host, &issued, &environment, &Default::default(), false).unwrap();
+            }
+            let session = Session {
+                id: TerminalId::new(), terminal: None, proof: None,
+                owned_codex_listener: None, native_continuity: Default::default(),
+                launch: chat::Launch { provider: Provider::Claude, session_id: None,
+                    recipe: LaunchRecipe { program: executable.display().to_string(), arguments: Vec::new(),
+                        working_directory: issued.clone(), environment, unset_environment: Default::default() } },
+            };
+            let original = session.clone();
+            let refusal = start_at_execution_directory(&host, 1, session, Default::default(), context.clone(), &operational).unwrap_err();
+            assert!(refusal.message.contains(if relative == "absolute-reserved" { "being changed" } else { relative }), "{refusal:?}");
+            assert!(!marker.exists(), "refusal must precede provider creation/input");
+            let state = host.lock().unwrap();
+            assert!(!state.chats.contains_key(&original.id));
+            assert!(!state.chat_spawning.contains_key(&original.id));
+            assert!(!state.issued_chat_ids.contains(&original.id));
+            assert_eq!(original.launch.recipe.working_directory, issued);
+        }
+        // A reused original spelling cannot replace the approved inode.
+        let spec = ProcessSpec::from(&LaunchRecipe { program: "/bin/false".into(), arguments: Vec::new(),
+            working_directory: issued, environment: Default::default(), unset_environment: Default::default() });
+        assert!(ensure_native_account_admission(&host, &spec, Some(&context)).is_err());
+    }
 
     #[test]
     fn removed_claude_account_is_reported_before_missing_resume_history() {
