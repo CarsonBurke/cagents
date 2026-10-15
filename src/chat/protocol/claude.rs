@@ -4066,9 +4066,10 @@ impl Claude {
             "task_started" | "task_progress" | "task_notification" | "task_updated" => {
                 let task = required(frame, "task_id")?;
                 let id = format!("claude-task:{task}");
+                let mut presentation_known=true;
                 let previous=match self.cached_tool(None,&id) {
                     Ok(previous)=>previous,
-                    Err(message)=> {step.events.push(Event::Error {message,fatal:false});return Ok(());}
+                    Err(message)=> {step.events.push(Event::Error {message,fatal:false});presentation_known=false;None}
                 };
                 let mut item = previous.unwrap_or(Item {
                     id,
@@ -4158,13 +4159,14 @@ impl Claude {
                     let owner=owners.next().cloned();
                     if owners.next().is_some() {
                         step.events.push(Event::Error {message:"Original task tool scope is ambiguous; preserving its existing source".into(),fatal:false});
-                        return Ok(());
-                    }
-                    let scope=owner.as_ref().and_then(|key|key.agent_id.as_deref());
-                    match self.cached_tool(scope,tool) {
-                        Ok(Some(item))=>matches!(&item.content,ItemContent::Tool {name,..} if name=="Agent"),
-                        Ok(None)=>false,
-                        Err(message)=> {step.events.push(Event::Error {message,fatal:false});return Ok(());}
+                        presentation_known=false;false
+                    } else {
+                        let scope=owner.as_ref().and_then(|key|key.agent_id.as_deref());
+                        match self.cached_tool(scope,tool) {
+                            Ok(Some(item))=>matches!(&item.content,ItemContent::Tool {name,..} if name=="Agent"),
+                            Ok(None)=>false,
+                            Err(message)=> {step.events.push(Event::Error {message,fatal:false});presentation_known=false;false}
+                        }
                     }
                 } else {false};
                 if let Some(tool) = &known_tool {
@@ -4211,6 +4213,10 @@ impl Claude {
                         background: None,
                     });
                 }
+                // Presentation loss cannot suppress independent provider task
+                // lifecycle proof. Preserve the old source rather than emit a
+                // newly fabricated task row, and keep processing completion.
+                if presentation_known {
                 self.tool(None,item.clone());
                 if represented {
                     if self.visible_task_rows.remove(&item.id) {
@@ -4221,6 +4227,7 @@ impl Claude {
                 } else {
                     self.visible_task_rows.insert(item.id.clone());
                     step.events.push(Event::Item(item.clone()));
+                }
                 }
                 if string(frame, "subtype") == "task_started"
                     && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")

@@ -139,6 +139,20 @@ mod tests {
     }
 
     #[test]
+    fn source_loss_cannot_suppress_independent_task_completion_or_invent_a_tool_row() {
+        use serde_json::json;
+        let store=Arc::new(Mutex::new(Store::new().unwrap()));
+        let mut adapter=crate::chat::protocol::claude::fixture_adapter();adapter.bind_item_reader(reader(&store));
+        let step=adapter.receive(json!({"type":"assistant","uuid":"lost-agent","message":{"content":[{"type":"tool_use","id":"lost-agent","name":"Agent","input":{"description":"x".repeat(3*1024*1024),"run_in_background":true}}]}})).unwrap();
+        commit(&store,adapter.as_mut(),step);
+        store.lock().unwrap().db.execute("DELETE FROM chunks WHERE id='lost-agent' AND field=0 AND position=0",[]).unwrap();
+        let done=adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task-lost","tool_use_id":"lost-agent","status":"completed","summary":"Finished work","ambient":true})).unwrap();
+        assert!(done.events.iter().any(|event|matches!(event,Event::Error {fatal:false,..})));
+        assert!(done.events.iter().any(|event|matches!(event,Event::Subagent {id,status:Some(crate::chat::ToolStatus::Succeeded),..} if id=="lost-agent")),"cache/source availability cannot veto actual provider lifecycle proof");
+        assert!(!done.events.iter().any(|event|matches!(event,Event::Item(item) if item.id=="claude-task:task-lost")),"unavailable original source cannot become a fabricated synthetic task");
+    }
+
+    #[test]
     fn oversized_same_frame_call_and_result_are_available_until_store_commit() {
         use crate::chat::ToolStatus;
         use serde_json::json;
