@@ -29,9 +29,12 @@ impl CanonicalItemReader for Reader {
         if store.canonical_generation != self.generation {
             return Err("Original tool source was revoked by reset".into());
         }
+        let _read = store.db.unchecked_transaction().map_err(|error| error.to_string())?;
         store.raw_guard()?;
-        if key.agent_id.is_none()
-            && store.raw_revoked(&crate::chat::cache::SourceKey {
+        if key.agent_id.is_some() {
+            return store.validate_child_adapter_key(key);
+        }
+        if store.raw_revoked(&crate::chat::cache::SourceKey {
                 agent_id: None,
                 source_id: key.item_id.clone(),
             })?
@@ -115,16 +118,19 @@ impl Store {
         self.flush_text()?;
         self.raw_guard()?;
         if key.agent_id.is_some() {
-            return self.child_adapter_item(key);
+            self.flush_child_adapter_read(key)?;
         }
-        // Keep owner/revocation and every canonical field read in one SQLite
-        // snapshot; a reopened handle cannot replace rows between the proof
-        // check and body hydration.
+        // Flush before admission to the read snapshot. Owner/revocation and
+        // every parent or child metadata/body/patch field must then use that
+        // same SQLite view, including optional cache-hit authorization.
         let _read = self
             .db
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
         self.raw_guard()?;
+        if key.agent_id.is_some() {
+            return self.child_adapter_item(key);
+        }
         if self.raw_revoked(&crate::chat::cache::SourceKey {
             agent_id: None,
             source_id: key.item_id.clone(),
@@ -711,6 +717,82 @@ mod tests {
         assert!(
             matches!(reader(&store).read(&key).unwrap().unwrap().content,ItemContent::Tool {input,..} if input=="new source")
         );
+    }
+
+    #[test]
+    fn resident_child_cache_hits_cannot_bypass_exact_child_revocation() {
+        use serde_json::json;
+        let store = Arc::new(Mutex::new(Store::new().unwrap()));
+        let source = reader(&store);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut adapter = crate::chat::protocol::claude::fixture_adapter();
+        adapter.bind_item_reader(Arc::new(CountReader { inner: source.clone(), reads: reads.clone() }));
+        for parent in [None, Some("one"), Some("two")] {
+            let carrier = parent.unwrap_or("parent");
+            let mut frame = json!({"type":"assistant","uuid":carrier,"message":{"id":carrier,"content":[{"type":"tool_use","id":"same-tool","name":"Opaque","input":{"private_owner":carrier}}]}});
+            if let Some(parent) = parent { frame["parent_tool_use_id"] = json!(parent); }
+            let step = adapter.receive(frame).unwrap();
+            commit(&store, adapter.as_mut(), step);
+        }
+        store.lock().unwrap().apply(Event::SubagentItemsRemoved { id: "one".into(), ids: vec!["same-tool".into()] }).unwrap();
+        assert!(source.validate_key(&CanonicalItemKey::new(Some("one"), "same-tool")).is_err());
+        assert!(source.validate_key(&CanonicalItemKey::new(None, "same-tool")).is_ok());
+        assert!(source.validate_key(&CanonicalItemKey::new(Some("two"), "same-tool")).is_ok());
+        reads.store(0, std::sync::atomic::Ordering::Relaxed);
+        let late = adapter.receive(json!({"type":"user","uuid":"late-child-result","parent_tool_use_id":"one","message":{"content":[{"type":"tool_result","tool_use_id":"same-tool","content":"late private result","is_error":false}]}})).unwrap();
+        assert!(late.events.iter().any(|event| matches!(event, Event::Error { message, fatal:false } if message.contains("removed"))));
+        assert!(!late.events.iter().any(|event| matches!(event, Event::Item(_) | Event::SubagentItem { .. })),
+            "a still-resident optional copy must not emit revoked private child content");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0,
+            "the scalar tombstone fence must reject before any body hydration");
+        let late_parent = adapter.receive(json!({"type":"user","uuid":"late-parent-result","message":{"content":[{"type":"tool_result","tool_use_id":"same-tool","content":"parent still valid","is_error":false}]}})).unwrap();
+        commit(&store, adapter.as_mut(), late_parent);
+        assert_eq!(source.read(&CanonicalItemKey::new(None,"same-tool")).unwrap().unwrap().content.status(), Some(crate::chat::ToolStatus::Succeeded));
+        assert_eq!(source.read(&CanonicalItemKey::new(Some("two"),"same-tool")).unwrap().unwrap().content.status(), Some(crate::chat::ToolStatus::Running));
+    }
+
+    #[test]
+    fn delegated_owner_and_body_reads_share_one_snapshot_during_exact_owner_replacement() {
+        struct Swap { path: PathBuf, fired: bool, error: Option<String> }
+        unsafe extern "C" fn trace(_: u32, context: *mut std::ffi::c_void, _: *mut std::ffi::c_void, sql: *mut std::ffi::c_void) -> i32 {
+            if context.is_null() || sql.is_null() { return 0; }
+            let state = unsafe { &mut *context.cast::<Swap>() };
+            let sql = unsafe { std::ffi::CStr::from_ptr(sql.cast()) }.to_string_lossy();
+            if state.fired || !sql.contains("FROM child_tools WHERE agent=") { return 0; }
+            state.fired = true;
+            // SQLite invokes this immediately before the child metadata query.
+            // A second WAL writer replaces ownership and same-length bytes at
+            // this deterministic boundary, without touching the read handle.
+            state.error = (|| -> Result<(), String> {
+                let mut replacement = Connection::open(&state.path).map_err(|error| error.to_string())?;
+                super::super::raw::initialize(&mut replacement)?;
+                replacement.execute("UPDATE child_tool_chunks SET data=?1 WHERE agent='one' AND id='tool' AND field=0 AND position=0", [b"new-body".as_slice()]).map_err(|error| error.to_string())?;
+                Ok(())
+            })().err();
+            0
+        }
+        struct Hook(*mut rusqlite::ffi::sqlite3);
+        impl Drop for Hook {
+            fn drop(&mut self) {
+                unsafe { rusqlite::ffi::sqlite3_trace_v2(self.0, 0, None, std::ptr::null_mut()); }
+            }
+        }
+        let mut store = Store::new().unwrap();
+        let item = Item { id:"tool".into(), role:Role::Assistant, started_at:None, at:None,
+            content:ItemContent::Tool {name:"Opaque".into(),input:"old-body".into(),output:String::new(),status:crate::chat::ToolStatus::Running}};
+        store.apply(Event::SubagentItem {id:"one".into(),item:item.clone()}).unwrap();
+        let mut state = Box::new(Swap {path:store.directory.join("transcript.sqlite"),fired:false,error:None});
+        let db = unsafe { store.db.handle() };
+        let hook = Hook(db);
+        assert_eq!(unsafe { rusqlite::ffi::sqlite3_trace_v2(db, rusqlite::ffi::SQLITE_TRACE_STMT as u32, Some(trace), (&mut *state as *mut Swap).cast()) }, rusqlite::ffi::SQLITE_OK);
+        let restored = store.adapter_item(&CanonicalItemKey::new(Some("one"),"tool"));
+        drop(hook);
+        assert!(state.fired, "the actual compound child read must cross the tested boundary");
+        assert!(state.error.is_none(), "replacement failed: {:?}", state.error);
+        assert_eq!(restored.unwrap().unwrap().content,item.content,
+            "a read admitted under the original owner returns its coherent old bytes, not a replacement owner's body");
+        assert!(store.adapter_item(&CanonicalItemKey::new(Some("one"),"tool")).is_err(),
+            "a later read cannot reuse the revoked owner handle");
     }
 
     #[test]
