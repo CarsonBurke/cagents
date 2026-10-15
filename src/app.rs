@@ -3993,6 +3993,21 @@ pub struct SourceControlRead {
     read: u64,
 }
 
+/// A panel failure only changes sidebar status authority when the worker
+/// specifically observed its status command/parser fail. Later Files/metadata
+/// failures retain their own panel error without asserting status was unreadable.
+#[derive(Debug, Clone)]
+pub struct SourceControlReadFailure {
+    message: String,
+    status_read: Option<u64>,
+}
+impl From<String> for SourceControlReadFailure {
+    fn from(message: String) -> Self { Self { message, status_read: None } }
+}
+impl From<&str> for SourceControlReadFailure {
+    fn from(message: &str) -> Self { message.to_owned().into() }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Device(device_ui::Action),
@@ -4018,7 +4033,7 @@ pub enum Message {
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<SourceControlRead, String>,
+        result: Result<SourceControlRead, SourceControlReadFailure>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -11283,10 +11298,13 @@ impl Cagents {
                 let status_read = git_ui::next_status_read();
                 let snapshot = service
                     .snapshot_cached(&worktree, options, &cancellation, &mut cache)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| SourceControlReadFailure {
+                        message: error.to_string(),
+                        status_read: cache.status_attempt_failed().then_some(status_read),
+                    })?;
                 if cancellation.is_cancelled() {
                     cache.invalidate(false);
-                    return Err("source-control read cancelled".to_owned());
+                    return Err("source-control read cancelled".into());
                 }
                 let (status, operation) = cache.row_status().ok_or_else(|| {
                     "successful source-control read did not expose display status".to_owned()
@@ -11330,13 +11348,13 @@ impl Cagents {
                 let model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
                 if cancellation.is_cancelled() {
                     cache.invalidate(false);
-                    return Err("source-control read cancelled".to_owned());
+                    return Err("source-control read cancelled".into());
                 }
                 read.prepared = Some(Box::new((snapshot, model)));
                 Ok(read)
             })
             .await
-            .map_err(|error| format!("source-control reader join failed: {error}"))
+            .map_err(|error| SourceControlReadFailure::from(format!("source-control reader join failed: {error}")))
             .and_then(|result| result);
             Message::SourceControlLoaded {
                 key,
@@ -16825,6 +16843,16 @@ impl Application for Cagents {
                         worktree.apply_operation(read.operation);
                     }
                 }
+                if let Err(failure) = &result && let Some(read) = failure.status_read {
+                    let display_error: String = failure.message.chars().take(512).collect();
+                    if self.refresh_ui.git.accept_bound_status_error(&key, &display_error, read)
+                        && let Some(worktree) = self.sidebar_model.projects.iter_mut()
+                            .find(|project| project.id == key.project_id)
+                            .and_then(|project| project.worktrees.iter_mut().find(|row| row.id == key.worktree_id && row.path == key.canonical_path))
+                    {
+                        worktree.apply_status_error(Some(&display_error));
+                    }
+                }
                 if matches!(&result, Ok(read) if read.prepared.is_none()) {
                     if let Some(source) = self.sidebar_model.source_control.as_mut() {
                         source.set_reloading(false);
@@ -16837,7 +16865,7 @@ impl Application for Cagents {
                             *read.prepared.expect("unchanged reads returned above");
                         (Some(snapshot), model)
                     }
-                    Err(error) => (None, SourceControlModel::failed(key, error)),
+                    Err(error) => (None, SourceControlModel::failed(key, error.message)),
                 };
                 // The reload replaces the rows and nothing else: an in-flight
                 // mutation, its last failure, and the history already walked

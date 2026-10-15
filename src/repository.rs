@@ -659,6 +659,7 @@ impl Default for SnapshotOptions {
 /// file lists and untracked measurements rather than keeping every visited tree.
 #[derive(Debug, Default)]
 pub struct SnapshotCache {
+    status_attempt_failed: bool,
     last_status: Option<StatusSnapshot>,
     digest: Option<[u8; 32]>,
     dirty: bool,
@@ -878,6 +879,11 @@ fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileI
 }
 
 impl SnapshotCache {
+    /// Classification for the CURRENT snapshot_cached attempt only. A metadata,
+    /// config or Files failure must not be presented as a failed status read.
+    /// Display recovery only; this flag never authorizes a mutation.
+    pub fn status_attempt_failed(&self) -> bool { self.status_attempt_failed }
+
     /// Tiny display facts proven by the last successful cached read, including
     /// an unchanged read. Never use this projection as mutation authority.
     pub fn row_status(&self) -> Option<(&StatusSnapshot, Option<GitOperationKind>)> {
@@ -4486,6 +4492,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         cache: &mut SnapshotCache,
     ) -> Result<Option<RepositorySnapshot>, RepositoryError> {
+        cache.status_attempt_failed = false;
         if cache
             .publication_dependencies
             .as_ref()
@@ -4548,7 +4555,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 cache.fsmonitor.as_deref(),
             ),
             cancellation,
-        )?;
+        ).inspect_err(|_| cache.status_attempt_failed = true)?;
         use sha2::Digest;
         let digest: [u8; 32] = sha2::Sha256::digest(&output.stdout).into();
         if !cache.dirty && cache.digest == Some(digest) && cache.metadata.is_some() {
@@ -4569,7 +4576,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return Ok(None);
             }
         }
-        let mut status = invalid_output(parse_status(&output.stdout), output)?;
+        let mut status = invalid_output(parse_status(&output.stdout), output)
+            .inspect_err(|_| cache.status_attempt_failed = true)?;
         status.untracked_omitted = !options.untracked_changes;
         for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
             let output = self.run_checked(
@@ -8555,6 +8563,27 @@ mod tests {
             unknown.reconciliation_due(),
             "unsupported path discovery must retain bounded reconciliation"
         );
+    }
+
+    #[test]
+    fn snapshot_cache_distinguishes_status_failures_from_later_or_prepass_errors() {
+        let options = SnapshotOptions { untracked_changes: true, untracked_files: false };
+        let failure = || Ok(ProcessOutput { exit_code: Some(128), signal: None, success: false,
+            stdout: Vec::new(), stderr: b"fixture failure".to_vec() });
+        let valid = b"# branch.oid (initial)\0# branch.head main\0";
+        for (checked, outputs, expected) in [
+            (false, vec![failure()], false), // config prepass, before status
+            (true, vec![failure()], true), // actual status command
+            (true, vec![success(b"invalid status\0")], true), // status parser
+            (true, vec![success(valid), failure()], false), // numstat, after status
+        ] {
+            let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+            let git = RepositoryService::new("git", executor);
+            let mut cache = SnapshotCache { options: Some(options), fsmonitor_checked: checked,
+                status_attempt_failed: true, ..Default::default() };
+            assert!(git.snapshot_cached(Path::new("/snapshot-status-failure"), options, &CancellationToken::new(), &mut cache).is_err());
+            assert_eq!(cache.status_attempt_failed(), expected, "classification must reset before every attempt, not leak an older failure");
+        }
     }
 
     #[test]

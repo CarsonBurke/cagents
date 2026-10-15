@@ -281,6 +281,20 @@ impl State {
         true
     }
 
+    /// Actual failed status attempts share the same row order as successful
+    /// bound/watch proofs. A later successful sibling/read must not be undone.
+    pub(super) fn accept_bound_status_error(&mut self, key: &ActiveWorktreeKey, error: &str, read: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(&key.project_id) else { return true; };
+        if entry.snapshot.status_reads.get(&key.worktree_id).is_some_and(|current| *current > read)
+            || !entry.snapshot.worktrees.iter().any(|(record, _)| record.id == key.worktree_id && record.path == key.canonical_path) {
+            return false;
+        }
+        entry.snapshot.status_reads.insert(key.worktree_id, read);
+        entry.snapshot.status_errors.insert(key.worktree_id, error.to_owned());
+        entry.failed_status_attempts.insert(key.worktree_id, Instant::now());
+        true
+    }
+
     pub fn forget(&mut self, project: ProjectId) {
         if let Some(entry) = self.entries.remove(&project)
             && let Some(cancel) = entry.cancellation
@@ -3436,6 +3450,62 @@ mod tests {
         assert!(!app.refresh_ui.git.entries.contains_key(&project));
         assert!(app.sidebar_model.project(project).is_none());
     }
+    #[test]
+    fn bound_status_failure_marks_last_known_and_retries_without_a_watch_event() {
+        const TEST: &str = "app::git_ui::tests::bound_status_failure_marks_last_known_and_retries_without_a_watch_event";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        for delayed in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("repository");
+            let baseline = fixture(&root);
+            let key = ActiveWorktreeKey { project_id: ProjectId::new(), worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+            let mut app = app_with_status_snapshot(baseline, &key);
+            let first = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+            assert!(matches!(&first, Message::SourceControlLoaded { result: Ok(_), .. }));
+            drop(app.update(first));
+            drop(app.update(Message::SourceControlLoaded { key: key.clone(), request: app.refresh_ui.source_generation,
+                result: Err("file enrichment failed after a successful status".into()),
+            }));
+            assert!(app.sidebar_model.projects[0].worktrees[0].status_error.is_none(), "generic panel errors are not status failures");
+            let index = root.join(".git/index"); let original = fs::read(&index).unwrap();
+            fs::write(&index, "broken index").unwrap();
+            // Deliberately do not inject a watcher event: the bound fallback
+            // must make this actual failed status attempt visible itself.
+            let failed = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+            assert!(matches!(&failed, Message::SourceControlLoaded { result: Err(failure), .. } if failure.status_read.is_some()));
+            fs::write(&index, original).unwrap(); fs::write(root.join("new.txt"), "new\n").unwrap();
+            if delayed {
+                let previous = app.refresh_ui.git.entries[&key.project_id].snapshot.clone();
+                let recovered = read_local(key.project_id, previous, git_watch::Change { worktrees: [key.worktree_id].into(), untracked: true, ..Default::default() }, CancellationToken::new()).unwrap();
+                drop(app.update(Message::GitUi(Action::Read { project: key.project_id, generation: 9, result: Ok(recovered) })));
+                drop(app.update(failed));
+            } else {
+                drop(app.update(failed.clone()));
+                let row = &app.sidebar_model.projects[0].worktrees[0];
+                assert!(row.status_error.is_some());
+                assert!(row.chrome.tooltip.contains("Last known:"));
+                let entry = app.refresh_ui.git.entries.get_mut(&key.project_id).unwrap();
+                assert!(entry.snapshot.status_errors.contains_key(&key.worktree_id));
+                assert!(entry.failed_status_attempts.contains_key(&key.worktree_id));
+                entry.cancellation = None;
+                entry.failed_status_attempts.insert(key.worktree_id, Instant::now() - FALLBACK_INTERVAL);
+                app.refresh_ui.source_last_refresh = Instant::now();
+                let retry = super::super::tests::task_app_message(app.git_fallback_tick());
+                assert!(matches!(&retry, Message::GitUi(Action::Read { result: Ok((snapshot, _)), .. }) if snapshot.status_updates == HashSet::from([key.worktree_id])));
+                drop(app.update(retry));
+                // An older duplicate failure cannot make the successful retry
+                // unavailable again or reset its per-row recovery deadline.
+                drop(app.update(failed));
+            }
+            let row = &app.sidebar_model.projects[0].worktrees[0];
+            assert!(row.status_error.is_none());
+            assert_eq!(row.dirty.as_ref().unwrap().untracked, 1);
+            let entry = &app.refresh_ui.git.entries[&key.project_id];
+            assert!(!entry.snapshot.status_errors.contains_key(&key.worktree_id));
+            assert!(!entry.failed_status_attempts.contains_key(&key.worktree_id));
+        }
+    }
+
     #[test]
     fn failed_row_recovery_is_paced_per_row_and_not_postponed_by_failed_siblings() {
         fn run(task: Task<Message>) -> Message {
