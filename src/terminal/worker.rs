@@ -2754,7 +2754,7 @@ impl Worker {
         if self
             .terminal
             .title()
-            .is_some_and(|title| !title.trim().is_empty())
+            .is_ok_and(|title| !title.trim().is_empty())
         {
             return;
         }
