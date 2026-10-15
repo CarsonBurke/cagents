@@ -401,6 +401,7 @@ pub(super) fn process_request(
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
+            | ClientRequest::CloseTerminalSourceChecked { .. }
             | ClientRequest::ChatRecoverAccount {
                 idle_generation: Some(_),
                 ..
@@ -1168,6 +1169,11 @@ pub(super) fn process_request(
                 false,
             ))
         }
+        ClientRequest::CloseTerminalSourceChecked {
+            source,
+            execution_instance,
+            allow_active,
+        } => close_terminal_source_checked(host, client_id, source, execution_instance, allow_active),
         ClientRequest::CloseTerminalChecked {
             terminal_id,
             allow_active,
@@ -1242,6 +1248,66 @@ pub(super) fn process_request(
             ))
         }
     }
+}
+
+/// process_request holds exclusive control admission. Retain both exact owners
+/// under HostState, perform bounded teardown outside it, then retire only the
+/// retained worker. Even an identical recipe under a reused ID is insufficient.
+fn close_terminal_source_checked(
+    host: &SharedHost,
+    client_id: ClientId,
+    source: crate::model::TerminalSession,
+    execution_instance: uuid::Uuid,
+    allow_active: bool,
+) -> Result<RequestOutcome, ProtocolError> {
+    let changed = || ProtocolError::new(
+        ProtocolErrorCode::InvalidRequest,
+        "The selected terminal source changed; refresh its inventory before closing it",
+        false,
+    );
+    let (handle, paired) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let current = state.descriptor(client_id, source.id)?;
+        if execution_instance.is_nil() || current.execution_instance != execution_instance
+            || current.session != source || source.continuity.live_proof().is_none() {
+            return Err(changed());
+        }
+        let record = state.terminals.get(&source.id).ok_or_else(changed)?;
+        let handle = record.handle.clone();
+        let paired = state.chats.get(&source.id).map(|record| {
+            if !record.paired_terminal.as_ref().is_some_and(|expected| expected.same_worker(&handle))
+                || !record.session.terminal.as_ref().is_some_and(|terminal|
+                    terminal.id == source.id && terminal.launch == source.launch)
+                || !(record.session.launch.provider == crate::agent::Provider::Codex
+                    || record.owns_execution_console()) {
+                return Err(changed());
+            }
+            Ok(record.handle.clone())
+        }).transpose()?;
+        (handle, paired)
+    };
+    let outcome = if !allow_active && paired.as_ref().is_some_and(|actor| actor.owns_work()) {
+        crate::terminal_ipc::TerminalCloseResult::Active
+    } else {
+        handle.close_checked(allow_active)
+    };
+    if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
+        if let Some(paired) = paired {
+            super::chat::close_terminal_actor(host, source.id, &paired)?;
+        }
+        let retired = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.terminals.get(&source.id).is_some_and(|record| record.handle.same_worker(&handle)) {
+                state.retire_terminal(source.id)
+            } else {
+                None
+            }
+        };
+        drop(retired);
+    }
+    Ok((ServerResponse::TerminalCloseChecked {
+        terminal_id: source.id, outcome,
+    }, Vec::new(), false))
 }
 
 fn prepare_resume(
@@ -1396,6 +1462,62 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn source_checked_close_refuses_same_id_successor_and_preserves_force_consent() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalContinuity, TerminalSession};
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("source-checked-close"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(super::super::state::HostLock::new(super::super::state::HostState::new(proof)));
+        let mut recipe = LaunchRecipe::shell("/".into()).unwrap();
+        recipe.program = "/bin/cat".into();
+        recipe.arguments.clear();
+        let session = TerminalSession {
+            id: TerminalId::new(), launch: recipe.clone(),
+            owned_codex_listener: None, recovery_origin: None, predecessor: None,
+            transcript_path: None, resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None },
+        };
+        let old = crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {}).unwrap();
+        let observed = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.reserve_spawn(session.id).unwrap();
+            state.finish_spawn(1, session.clone(), old.clone(), true).unwrap()
+        };
+        old.shutdown().unwrap();
+        let replacement = crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {}).unwrap();
+        let current = {
+            let mut state = host.lock().unwrap();
+            state.reserve_spawn(session.id).unwrap();
+            state.finish_spawn(1, session.clone(), replacement.clone(), true).unwrap()
+        };
+        assert_eq!(observed.session, current.session,
+            "the daemon proof and full launch recipe alone cannot distinguish this successor");
+        assert_ne!(observed.execution_instance, current.execution_instance);
+        let request = |source, execution_instance, allow_active| ClientRequest::CloseTerminalSourceChecked {
+            source, execution_instance, allow_active,
+        };
+        assert!(process_request(&host, 1, request(observed.session, observed.execution_instance, true)).is_err());
+        assert!(!replacement.is_completed());
+        let mut changed = current.session.clone();
+        changed.launch.working_directory = "/another-project".into();
+        assert!(process_request(&host, 1, request(changed, current.execution_instance, true)).is_err());
+        assert!(process_request(&host, 1, request(current.session.clone(), uuid::Uuid::nil(), true)).is_err());
+        assert!(!replacement.is_completed());
+        assert!(matches!(process_request(&host, 1,
+            request(current.session.clone(), current.execution_instance, false)).unwrap().0,
+            ServerResponse::TerminalCloseChecked { outcome: crate::terminal_ipc::TerminalCloseResult::Active, .. }));
+        assert!(!replacement.is_completed(), "active work needs explicit consent");
+        assert!(matches!(process_request(&host, 1,
+            request(current.session, current.execution_instance, true)).unwrap().0,
+            ServerResponse::TerminalCloseChecked { outcome: crate::terminal_ipc::TerminalCloseResult::Closed, .. }));
+        assert!(replacement.is_completed());
+        assert!(!host.lock().unwrap().terminals.contains_key(&session.id));
+    }
 
     #[test]
     fn completed_release_refuses_live_or_changed_sessions() {

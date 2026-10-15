@@ -1011,6 +1011,25 @@ impl ControlClient {
         }
     }
 
+    /// Close the exact source and worker returned by inventory. This does not
+    /// attach by ID first: attachment could resolve a replacement before the
+    /// source check and needlessly change its presentation state.
+    pub fn close_terminal_source_checked(
+        &mut self,
+        source: crate::model::TerminalSession,
+        execution_instance: uuid::Uuid,
+        allow_active: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        let id = source.id;
+        match self.request_with_deadline(
+            ClientRequest::CloseTerminalSourceChecked { source, execution_instance, allow_active },
+            Instant::now() + CHAT_CLOSE_TIMEOUT,
+        )? {
+            ServerResponse::TerminalCloseChecked { terminal_id, outcome } if terminal_id == id => Ok(outcome),
+            response => Err(unexpected_response("a source-checked terminal close", &response)),
+        }
+    }
+
     pub fn close_terminal_checked(
         &mut self,
         terminal_id: TerminalId,
