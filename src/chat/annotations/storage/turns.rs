@@ -397,6 +397,20 @@ impl Store {
         Ok(TurnWriteReceipt { revision: next, changed })
     }
 
+    /// Cheap invalidation probe for an unchanged current transcript window.
+    /// The same snapshot guards version and revocation before exposing a revision.
+    pub(crate) fn turn_outcome_revision(&self) -> Result<u64,String> {
+        self.revalidate()?;
+        let session=self.confirmed()?;
+        let transaction=rusqlite::Transaction::new_unchecked(&self.db,TransactionBehavior::Deferred).map_err(|error|error.to_string())?;
+        require_schema(&transaction)?;
+        reject_revoked_session(&transaction,session)?;
+        let revision=revision(&transaction,session)?;
+        transaction.commit().map_err(|error|error.to_string())?;
+        self.revalidate()?;
+        Ok(revision)
+    }
+
     /// One indexed batched join against a bounded visible transcript window.
     /// No full-history outcomes or per-item request fan-out enters memory.
     pub(crate) fn project_turn_outcomes(&self, origins: &[VisibleItemOrigin]) -> Result<TurnOutcomeProjection, String> {
