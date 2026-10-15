@@ -26,6 +26,14 @@ pub(super) struct CloseProcess {
     pub start: u64,
 }
 
+pub(super) struct AdmittedDirectory {
+    pub(super) path: std::path::PathBuf,
+    pub(super) identity: crate::agent_execution::DirectoryIdentity,
+    // Pin the inode until the worker's retained source is retired; a numeric
+    // identity alone could match an unrelated recycled inode after completion.
+    _directory: Arc<File>,
+}
+
 pub(super) struct RootIdentity {
     pub process: CloseProcess,
     pidfd: File,
@@ -46,6 +54,17 @@ impl RootIdentity {
             executable,
             kill_receipt: Arc::new(Mutex::new(false)),
         })
+    }
+
+    /// Read the kernel's physical cwd while the exact root identity is pinned.
+    /// This is captured at installation, never reinterpreted through launch aliases.
+    pub(super) fn current_directory(&self) -> io::Result<AdmittedDirectory> {
+        if !same_identity(&self.process, &read_process(self.process.pid)?) { return Err(changed()); }
+        let directory = Arc::new(fs::OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC).open(format!("/proc/{}/cwd", self.process.pid))?);
+        let path = fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))?;
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(&directory.metadata()?);
+        if !path.is_absolute() || !same_identity(&self.process, &read_process(self.process.pid)?) { return Err(changed()); }
+        Ok(AdmittedDirectory { path, identity, _directory: directory })
     }
 
     pub(super) fn original_executable(&self) -> bool {

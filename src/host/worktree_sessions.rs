@@ -34,7 +34,7 @@ struct Actor {
     starting: bool,
 }
 struct Candidates {
-    terminals: Vec<(uuid::Uuid, TerminalSession, TerminalHandle, PathBuf)>,
+    terminals: Vec<(uuid::Uuid, TerminalSession, TerminalHandle, Option<(PathBuf, crate::agent_execution::DirectoryIdentity)>)>,
     natives: Vec<(uuid::Uuid, chat::Session, chat::runtime::Handle, bool)>,
     starting: Vec<(TerminalId, uuid::Uuid, PathBuf)>,
 }
@@ -105,7 +105,7 @@ fn candidates(host: &SharedHost) -> Result<Candidates, String> {
         return Err("A daemon transition has not established an attributable working directory; refresh after it settles".into());
     }
     let terminals = state.terminals.values().map(|record| (
-        record.instance, record.session.clone(), record.handle.clone(), record.current_directory().to_owned(),
+        record.handle.execution_instance(), record.session.clone(), record.handle.clone(), record.handle.admitted_directory().map(|(path, identity)| (path.to_owned(), identity)),
     )).collect();
     let natives = state.chats.values().map(|record| {
         let pair_valid = match (record.paired_terminal.as_ref(), state.terminals.get(&record.session.id)) {
@@ -133,7 +133,14 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
     let candidates = candidates(host)?;
     let mut actors = BTreeMap::new();
     for (instance, session, handle, directory) in candidates.terminals {
-        if !inside(&session.launch.working_directory, path)? && !inside(&directory, path)? { continue; }
+        let (directory, identity) = directory.ok_or_else(|| format!("Terminal {} has no authoritative admitted physical directory; close it explicitly before worktree removal", session.id))?;
+        // Operational/launch aliases may expand removal protection, but cannot
+        // newly authorize closing an actor admitted in another physical scope.
+        let metadata = std::fs::symlink_metadata(&directory).map_err(|error| format!("Terminal {} admitted directory moved or disappeared: {error}", session.id))?;
+        if !metadata.is_dir() || crate::agent_execution::DirectoryIdentity::from_metadata(&metadata) != identity {
+            return Err(format!("Terminal {} admitted directory changed identity; its actor was preserved", session.id));
+        }
+        if !directory.starts_with(path) { continue; }
         let (revision, busy) = handle.close_observation()?;
         let token = BusyAgent { session: session.id, instance, close_revision: Some(revision), turn_generation: None };
         actors.insert(session.id, Actor { token, busy, terminal: Some(Terminal { instance, session, handle, revision }), native: None, starting: false });
@@ -217,7 +224,7 @@ pub(super) fn close(host: &SharedHost, repository: &Path, path: &Path, agents: &
         if let Some(terminal) = &actor.terminal {
             {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                if state.terminals.get(&actor.token.session).is_none_or(|record| record.instance != terminal.instance || !record.handle.same_worker(&terminal.handle)) {
+                if state.terminals.get(&actor.token.session).is_none_or(|record| record.handle.execution_instance() != terminal.instance || !record.handle.same_worker(&terminal.handle)) {
                     return Err("The terminal actor changed before close; refresh the worktree census".into());
                 }
             }
@@ -236,7 +243,7 @@ pub(super) fn close(host: &SharedHost, repository: &Path, path: &Path, agents: &
             state.inventory_generation += 1;
         }
         if let Some(terminal) = &actor.terminal {
-            if state.terminals.get(&actor.token.session).is_none_or(|record| record.instance != terminal.instance || !record.handle.same_worker(&terminal.handle)) {
+            if state.terminals.get(&actor.token.session).is_none_or(|record| record.handle.execution_instance() != terminal.instance || !record.handle.same_worker(&terminal.handle)) {
                 return Err("The terminal changed during close; its replacement was preserved".into());
             }
             state.retire_terminal(actor.token.session);

@@ -5,7 +5,7 @@ mod close_processes;
 mod close_tests;
 pub(crate) mod holder;
 
-use close_processes::{FrozenFamily, RootIdentity};
+use close_processes::{AdmittedDirectory, FrozenFamily, RootIdentity};
 
 use std::{
     cell::{Cell, RefCell},
@@ -375,6 +375,7 @@ struct InputOrder {
 
 struct PublishedState {
     execution_instance: uuid::Uuid,
+    admitted_directory: OnceLock<AdmittedDirectory>,
     snapshot: ArcSwap<RenderSnapshot>,
     published_generation: AtomicU64,
     acknowledged_generation: AtomicU64,
@@ -424,6 +425,7 @@ impl PublishedState {
         let (capture_tx, capture_rx) = crossbeam_channel::bounded(1);
         Self {
             execution_instance: uuid::Uuid::new_v4(),
+            admitted_directory: OnceLock::new(),
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
             published_generation: AtomicU64::new(0),
             acknowledged_generation: AtomicU64::new(0),
@@ -992,6 +994,10 @@ impl TerminalHandle {
     /// terminal ID or a daemon-wide ownership proof.
     pub(crate) fn execution_instance(&self) -> uuid::Uuid {
         self.inner.published.execution_instance
+    }
+    /// Physical scope captured from the exact root process when installed.
+    pub(crate) fn admitted_directory(&self) -> Option<(&std::path::Path, crate::agent_execution::DirectoryIdentity)> {
+        self.inner.published.admitted_directory.get().map(|directory| (directory.path.as_path(), directory.identity))
     }
     pub(crate) fn same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -1900,6 +1906,9 @@ impl Worker {
         let child_identity = RootIdentity::capture(held.child.pid(), executable)
             .ok()
             .filter(|_| held.child.unreaped());
+        if let Some(directory) = child_identity.as_ref().and_then(|root| root.current_directory().ok()) {
+            let _ = published.admitted_directory.set(directory);
+        }
         let duplicate = |purpose: &str| {
             held.master
                 .duplicate()
@@ -6378,6 +6387,23 @@ mod tests {
         assert!(!active(&worker));
         drop(commands);
         worker.run();
+    }
+
+    #[test]
+    fn worktree_scope_does_not_follow_a_retargeted_launch_alias() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let outside = root.path().join("outside"); let selected = root.path().join("selected");
+        std::fs::create_dir(&outside).unwrap(); std::fs::create_dir(&selected).unwrap();
+        let alias = root.path().join("alias"); std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        let mut session = shell_session("echo PHYSICAL_READY; sleep 600");
+        session.launch.working_directory = alias.clone();
+        let handle = TerminalHandle::spawn(session, TerminalConfig::default(), |_| {}).unwrap();
+        wait_for_text(&handle, "PHYSICAL_READY");
+        assert_eq!(handle.admitted_directory().map(|(path, _)| path), Some(outside.as_path()));
+        std::fs::remove_file(&alias).unwrap(); std::os::unix::fs::symlink(&selected, &alias).unwrap();
+        assert_eq!(alias.canonicalize().unwrap(), selected);
+        assert_eq!(handle.admitted_directory().map(|(path, _)| path), Some(outside.as_path()), "changing a recipe alias must never grant close authority over another worktree");
+        handle.shutdown().unwrap();
     }
 
     #[test]

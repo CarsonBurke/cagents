@@ -57,7 +57,6 @@ pub(crate) type HostLock = super::lock::HostMutex<HostState>;
 pub(crate) type SharedHost = Arc<HostLock>;
 
 pub(crate) struct TerminalRecord {
-    pub(super) instance: uuid::Uuid,
     screen_lost_after_crash: bool,
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
@@ -1191,7 +1190,6 @@ impl HostState {
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
-                instance: uuid::Uuid::new_v4(),
                 screen_lost_after_crash: false,
                 session,
                 handle,
