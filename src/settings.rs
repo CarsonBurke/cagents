@@ -518,6 +518,9 @@ pub struct FixedShortcut {
     pub chords: &'static [&'static str],
     pub scope: &'static str,
     pub refusal: &'static str,
+    /// Native font zoom also accepts logical keypad keys. Its filter uses the
+    /// same handler instead of the configurable number-row binding policy.
+    pub font_zoom_delta: Option<i8>,
 }
 
 pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
@@ -526,48 +529,56 @@ pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
         chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"],
         scope: "Navigation",
         refusal: "This chord is reserved for Cycle recent panes",
+        font_zoom_delta: None,
     },
     FixedShortcut {
         label: "Increase font size",
         chords: &["Ctrl+=", "Ctrl+Plus", "Ctrl+Shift+=", "Ctrl+Shift+Plus"],
         scope: "Editor",
         refusal: "This chord is reserved for Increase font size",
+        font_zoom_delta: Some(1),
     },
     FixedShortcut {
         label: "Decrease font size",
         chords: &["Ctrl+-"],
         scope: "Editor",
         refusal: "This chord is reserved for Decrease font size",
+        font_zoom_delta: Some(-1),
     },
     FixedShortcut {
         label: "Reset font size",
         chords: &["Ctrl+0"],
         scope: "Editor",
         refusal: "This chord is reserved for Reset font size",
+        font_zoom_delta: Some(0),
     },
     FixedShortcut {
         label: "Save file",
         chords: &["Ctrl+S"],
         scope: "Editor",
         refusal: "This chord is reserved for Save file",
+        font_zoom_delta: None,
     },
     FixedShortcut {
         label: "Stage / unstage selected lines",
         chords: &["Ctrl+Shift+S"],
         scope: "Editor",
         refusal: "This chord is reserved for Stage / unstage selected lines",
+        font_zoom_delta: None,
     },
     FixedShortcut {
         label: "Copy terminal selection",
         chords: &["Ctrl+Shift+C"],
         scope: "Panes",
         refusal: "This chord is reserved for Copy terminal selection",
+        font_zoom_delta: None,
     },
     FixedShortcut {
         label: "Paste into terminal",
         chords: &["Ctrl+Shift+V"],
         scope: "Panes",
         refusal: "This chord is reserved for Paste into terminal",
+        font_zoom_delta: None,
     },
 ];
 
