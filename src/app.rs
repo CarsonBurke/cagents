@@ -11849,6 +11849,7 @@ impl Cagents {
     #[cfg(feature = "integrated-browser")]
     fn release_browser_parent(&mut self) {
         let release_started = Instant::now();
+        tracing::debug!(target: "cagents::lifecycle", stage = "browser_parent_release_started");
         let cards = self
             .cards
             .iter()
@@ -14799,7 +14800,8 @@ impl Application for Cagents {
             }
             Message::UpdateUi(action) => self.update_update_ui(action),
             Message::StartupWindowOpened(window) => {
-                tracing::debug!(target: "cagents::startup", stage = "window_opened");
+                tracing::debug!(target: "cagents::startup", stage = "window_opened",
+                    main_window = self.core.main_window_id() == Some(window));
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();
                 }
@@ -15021,7 +15023,8 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WindowCloseRequested(window) => {
-                tracing::debug!(target: "cagents::lifecycle", stage = "close_requested");
+                tracing::debug!(target: "cagents::lifecycle", stage = "close_requested",
+                    main_window = self.core.main_window_id() == Some(window));
                 // libcosmic reports the closed window through this same
                 // request, and a second close must not reopen the exit.
                 if self.exit.is_some() || self.dirty_repository_close.is_some() {
@@ -17504,6 +17507,7 @@ impl Drop for Cagents {
             });
             tracing::error!(%error, "failed to persist settings");
         }
+        tracing::debug!(target: "cagents::lifecycle", stage = "final_persistence_shutdown_started");
         if let Some(session) = &mut self.session {
             session.shutdown();
         }

@@ -286,6 +286,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
         let started = std::time::Instant::now();
+        tracing::debug!(target: "cagents::startup", stage = "lease_acquire_started");
         let lease = cagents::instance::WindowLease::acquire(new_window, slot).map_err(|error| {
             let category = if matches!(error.get_ref().and_then(|inner|
                 inner.downcast_ref::<cagents::instance::ApplicationLeaseError>()),
@@ -304,23 +305,36 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
             cagents::device::window_slot(source)?
         };
         let stage = std::time::Instant::now();
+        tracing::debug!(target: "cagents::startup", stage = "persistence_initialize_started");
         cagents::session::SessionRuntime::initialize_window(
             device_source
                 .as_deref()
                 .unwrap_or(cagents::instance::PRIMARY_WINDOW),
-        )?;
+        ).inspect_err(|_| {
+            tracing::debug!(target: "cagents::startup", stage = "persistence_initialize_failed");
+        })?;
         tracing::debug!(target: "cagents::startup", stage = "persistence_initialized",
             elapsed_ms = stage.elapsed().as_millis() as u64);
         let (activation_tx, activation_rx) = async_channel::unbounded();
-        let listener = cagents::instance::UiActivationListener::bind(activation_tx)?;
+        tracing::debug!(target: "cagents::startup", stage = "activation_listener_started");
+        let listener = cagents::instance::UiActivationListener::bind(activation_tx).inspect_err(|_| {
+            tracing::debug!(target: "cagents::startup", stage = "activation_listener_failed");
+        })?;
+        tracing::debug!(target: "cagents::startup", stage = "activation_listener_ready");
         let stage = std::time::Instant::now();
+        tracing::debug!(target: "cagents::startup", stage = "daemon_wait_started");
         if !fixture {
-            cagents::terminal::ensure_daemon_ready()?;
+            cagents::terminal::ensure_daemon_ready().inspect_err(|_| {
+                tracing::debug!(target: "cagents::startup", stage = "daemon_wait_failed");
+            })?;
         }
         tracing::debug!(target: "cagents::startup", stage = "daemon_ready",
             elapsed_ms = stage.elapsed().as_millis() as u64);
         let stage = std::time::Instant::now();
-        let restored = cagents::app::Cagents::load_startup()?;
+        tracing::debug!(target: "cagents::startup", stage = "state_restore_started");
+        let restored = cagents::app::Cagents::load_startup().inspect_err(|_| {
+            tracing::debug!(target: "cagents::startup", stage = "state_restore_failed");
+        })?;
         tracing::debug!(target: "cagents::startup", stage = "state_restored",
             elapsed_ms = stage.elapsed().as_millis() as u64,
             total_ms = started.elapsed().as_millis() as u64);
