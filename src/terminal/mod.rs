@@ -24,7 +24,8 @@ pub(crate) const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration:
 pub use ipc::TerminalSpawnOptions;
 
 pub use hosted::{
-    HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for,
+    HostedTerminalBinding, HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready,
+    ensure_daemon_ready_for,
 };
 pub use snapshot::{
     CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, RenderSnapshot, Rgb,
@@ -49,3 +50,5 @@ pub(crate) use worker::UpgradeSnapshot;
 pub(crate) use worker::flush_archived_notices;
 #[cfg(feature = "host")]
 pub(crate) use worker::holder::inspect as inspect_holder;
+#[cfg(feature = "host")]
+pub(crate) use worker::holder::inspect_until as inspect_holder_until;

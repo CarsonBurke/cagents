@@ -172,6 +172,11 @@ pub(crate) struct Holder {
 }
 
 impl Holder {
+    /// Exact private discovery identity; observing it grants no release authority.
+    pub(crate) fn record(&self) -> &Record {
+        &self.identity.record
+    }
+
     pub fn is_durable(&self) -> bool {
         self.durable
     }
@@ -312,7 +317,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
     let execution = spec.execution.clone();
     let directory = execution
         .as_ref()
-        .and_then(|context| context.directory.clone());
+        .and_then(|context| context.directory_descriptor());
     let directory_fd = directory.as_ref().map(|file| file.as_raw_fd());
     let request = Spawn {
         directory_fd,
@@ -458,6 +463,10 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
 }
 
 fn connect(record: &Record) -> Result<UnixStream, String> {
+    connect_before(record, Instant::now() + TIMEOUT)
+}
+
+fn connect_before(record: &Record, deadline: Instant) -> Result<UnixStream, String> {
     let directory = registry::directory(Kind::Native)?;
     let socket = registry::socket(&directory, record.terminal);
     if registry::evidence(&socket, Kind::Native)?.as_ref() != Some(record)
@@ -465,8 +474,7 @@ fn connect(record: &Record) -> Result<UnixStream, String> {
     {
         return Err("Native holder discovery evidence changed".into());
     }
-    let control =
-        crate::daemon::holder_registry::connect(&socket).map_err(|error| error.to_string())?;
+    let control = registry::connect_until(&socket, deadline).map_err(|error| error.to_string())?;
     let credentials = peer(&control)?;
     if credentials.uid != crate::daemon::current_uid()
         || credentials.pid != record.holder.pid
@@ -481,15 +489,28 @@ pub(crate) fn inspect(
     record: &Record,
     proof: &HostSessionProof,
 ) -> Result<(Recovery, bool), String> {
-    let control = connect(record)?;
+    inspect_until(record, proof, Instant::now() + TIMEOUT * 2)
+}
+
+pub(crate) fn inspect_until(
+    record: &Record,
+    proof: &HostSessionProof,
+    deadline: Instant,
+) -> Result<(Recovery, bool), String> {
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("Native holder census deadline expired")
+    };
+    let control = connect_before(record, deadline)?;
     send(
         &control,
         &Request::Inspect {
             proof: proof.clone(),
         },
-        TIMEOUT,
+        remaining()?,
     )?;
-    match receive(&control, TIMEOUT)? {
+    match receive(&control, remaining()?)? {
         Some(Report::Inspected {
             protocol,
             record: actual,

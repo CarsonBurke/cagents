@@ -2056,6 +2056,83 @@ impl RepositoryRuntime {
         Ok(())
     }
 
+    /// Retain the mounted buffer/undo state while fencing reads of the old
+    /// project location. Relative editor paths keep naming the same files.
+    pub(crate) fn relocate_project(
+        &mut self,
+        card: CardId,
+        relocation: &crate::project_recovery::Relocation,
+    ) -> Task<RepositoryAction> {
+        let previous = self.descriptor.worktree.clone();
+        relocation.path(&mut self.descriptor.repository);
+        relocation.path(&mut self.descriptor.worktree);
+        if previous == self.descriptor.worktree {
+            return Task::none();
+        }
+        let reload_document = matches!(
+            &self.document,
+            DocumentState::Loading | DocumentState::Failed { .. }
+        );
+        self.push_lsp_close();
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.file_list_generation = self.file_list_generation.wrapping_add(1).max(1);
+        self.file_list_loading = false;
+        self.file_list_started = None;
+        self.file_list_digest = None;
+        self.cancel_file_search();
+        self.diffs.clear();
+        self.basis_resolution = None;
+        let mut pdf = None;
+        match &mut self.document {
+            DocumentState::Editable(document) => {
+                document.diagram_cancel = None;
+                document.diagram_pending = None;
+            }
+            DocumentState::Pdf {
+                path,
+                page,
+                tone,
+                zoom,
+                rendering,
+                ..
+            } => {
+                relocation.path(path);
+                if let Some(active) = rendering.take() {
+                    pdf = Some(active.pending.unwrap_or(active.requested));
+                    (*page, *tone, *zoom) =
+                        (active.drawn.page, active.drawn.tone, active.drawn.zoom);
+                    self.pdf_request = self.pdf_request.wrapping_add(1);
+                }
+            }
+            _ => {}
+        }
+        if let Some(navigation) = &mut self.restored_navigation {
+            relocation.path(&mut navigation.worktree);
+        }
+        if let Err(error) = self.protect_editor_worktree(&self.descriptor.worktree.clone()) {
+            self.files =
+                FileListState::Failed(format!("Could not protect located worktree: {error}"));
+        }
+        self.push_lsp_open(&self.descriptor.worktree.clone());
+        let listing = self.refresh_visible(card);
+        let diagrams = self.diagram_task(card);
+        let page = pdf.map_or_else(Task::none, |wanted| {
+            self.update(RepositoryAction::PdfPage {
+                card,
+                page: wanted.page,
+                tone: wanted.tone,
+                zoom: wanted.zoom,
+            })
+        });
+        if reload_document && let Some(file) = self.selected.clone() {
+            let pending = self.pending_editor_navigation.take();
+            let document = self.open_file_entry(card, file);
+            self.pending_editor_navigation = pending;
+            return Task::batch([listing, diagrams, page, document]);
+        }
+        Task::batch([listing, diagrams, page])
+    }
+
     pub fn new(descriptor: RepositoryView) -> Self {
         let identity = descriptor.worktree.display().to_string();
         Self {
@@ -6068,6 +6145,76 @@ impl RepositoryRuntime {
         );
         let identity = self.next_identity(card, path);
         self.request_diff(identity, basis, old_path)
+    }
+
+    /// Open a repository-relative location, even before the directory listing
+    /// arrives. Coordinates are zero-based native line/UTF-8 byte positions.
+    /// The requested range is clamped when the asynchronous file read finishes.
+    pub fn open_file_location(
+        &mut self,
+        card: CardId,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        selection_bytes: usize,
+    ) -> Task<RepositoryAction> {
+        if crate::repository::RepoPath::parse(&path).is_err() {
+            return Task::none();
+        }
+        let caret = text_editor::Position { line, column };
+        let selection = (selection_bytes > 0).then_some(text_editor::Position {
+            line,
+            column: column.saturating_add(selection_bytes),
+        });
+        if self.selected_path() == Some(path.as_path())
+            && let DocumentState::Editable(document) = &mut self.document
+        {
+            document.content.set_cursor(text_editor::Cursor {
+                position: caret,
+                selection,
+            });
+            document
+                .content
+                .restore_scroll_position(text_editor::ScrollPosition {
+                    line: line.saturating_sub(10),
+                    vertical: 0.0,
+                    horizontal: 0.0,
+                });
+            self.source_surface = SourceSurface::Editor;
+            self.markdown_mode = MarkdownMode::Edit;
+            return self.focus_editor(card);
+        }
+        if self.blocks_navigation() {
+            return Task::none();
+        }
+        let loading_same = self.selected_path() == Some(path.as_path())
+            && matches!(self.document, DocumentState::Loading);
+        let task = if loading_same {
+            Task::none()
+        } else {
+            let file = self.file(&path).cloned().unwrap_or(RepositoryFile {
+                path: path.clone(),
+                ..RepositoryFile::default()
+            });
+            if file.directory {
+                return Task::none();
+            }
+            self.open_file_entry(card, file)
+        };
+        self.pending_editor_navigation = Some((
+            path,
+            crate::model::EditorNavigation {
+                caret: crate::model::EditorPosition { line, column },
+                selection: selection.map(|position| crate::model::EditorPosition {
+                    line: position.line,
+                    column: position.column,
+                }),
+                scroll_line: line.saturating_sub(10),
+                scroll_vertical: 0.0,
+                scroll_horizontal: 0.0,
+            },
+        ));
+        task
     }
 
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {

@@ -4,7 +4,7 @@
 mod cleanup;
 mod transport;
 pub(crate) use cleanup::{Detached, closed_pair_holder, closed_source, confirm_pair_closed};
-pub(crate) use transport::{Holder, adopt, inspect, spawn};
+pub(crate) use transport::{Holder, adopt, inspect, inspect_until, spawn};
 
 use crate::{
     agent::Provider,
@@ -260,6 +260,11 @@ pub(crate) fn codex_version(user_agent: &str) -> Option<&str> {
 /// The server's version, when it is one whose continuity was verified.
 pub(crate) fn verified_codex_version(user_agent: &str) -> Option<&str> {
     codex_version(user_agent).filter(|version| VERIFIED_CODEX_VERSIONS.contains(version))
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_source() -> super::Session {
+    tests::recovery().source
 }
 
 #[cfg(test)]

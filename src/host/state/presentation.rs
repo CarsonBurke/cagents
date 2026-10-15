@@ -255,10 +255,11 @@ pub(in crate::host) fn snapshot(
             ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
         })?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !state.subscriptions.attached(client, id) {
+        let current = state.attached_terminal(client, id)?;
+        if !current.handle.same_worker(&handle) {
             return Err(ProtocolError::new(
-                ProtocolErrorCode::PermissionDenied,
-                "client detached during capture",
+                ProtocolErrorCode::ProofMismatch,
+                "The terminal worker changed during capture; rediscover its attachment",
                 false,
             ));
         }

@@ -195,6 +195,7 @@ fn scope_descriptor(
         // A projection carries no channels, so it has nothing to say about what
         // was shared with which registry.
         workspace_model_identity: None,
+        shared_project_bindings: Default::default(),
         local_only_cards: HashSet::new(),
         pending_terminal_creations: HashSet::new(),
     }
@@ -233,6 +234,7 @@ impl Cagents {
                         .order()
                         .filter(|card| members.contains(card))
                         .collect::<Vec<_>>();
+                    order = self.preserve_locally_dismissed_order(&channel.cards, order);
                     let mounted = order.iter().copied().collect::<HashSet<_>>();
                     order.extend(
                         channel
@@ -728,7 +730,7 @@ impl Cagents {
 
     fn install_workspace_scope(
         &mut self,
-        scoped: WorkspaceState,
+        mut scoped: WorkspaceState,
         path: PathBuf,
         offset: Option<f32>,
     ) -> Task<Message> {
@@ -744,6 +746,9 @@ impl Cagents {
             "workspace-strip-{}",
             self.workspace_view_generation
         ));
+        scoped
+            .cards
+            .retain(|card| !self.locally_dismissed_terminal(card.id));
         self.workspace = Self::rebuild_workspace(&scoped);
         self.workspace.resize_viewport(width);
         // Focus selects the initial position only on the first visit. Returning
@@ -1192,7 +1197,7 @@ mod tests {
             )
             .unwrap();
         let _ = app.update(Message::CloseCard(id));
-        let _ = app.update(Message::CommitClose(id));
+        let _ = app.update(app.commit_close_message(id));
         assert!(
             !app.durable
                 .cards
@@ -1291,7 +1296,7 @@ mod tests {
         let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
         assert_eq!(order(&app), [pane]);
         let _ = app.request_card_removal(pane);
-        let _ = app.update(Message::CommitClose(pane));
+        let _ = app.update(app.commit_close_message(pane));
         assert!(app.utility_card(&CardKind::Settings).is_none());
         assert!(
             app.durable
@@ -1910,7 +1915,7 @@ mod tests {
         assert_eq!(app.workspace.pending_close().unwrap().unmounting, cloned);
         // The native focus handoff publishes CommitClose after the reserved
         // pane yields focus. Drive that acknowledgement before reopening.
-        let _ = app.update(Message::CommitClose(cloned));
+        let _ = app.update(app.commit_close_message(cloned));
         assert!(!app.card_state(cloned).unwrap().existence.is_open());
         assert!(!app.durable.card_scopes.contains_key(&cloned));
         let _ = app.run_workspace_command(

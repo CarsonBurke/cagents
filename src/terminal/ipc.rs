@@ -143,7 +143,8 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+/// Version 82 binds source-checked close to the exact resident worker.
+pub const PROTOCOL_VERSION: u16 = 83;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -472,6 +473,22 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Close only the exact inventory source and resident worker the user
+    /// selected. A successor with the same durable ID has no such authority.
+    CloseTerminalSourceChecked {
+        source: TerminalSession,
+        execution_instance: uuid::Uuid,
+        allow_active: bool,
+    },
+    /// Exact actor/worker identities for a guarded project removal census.
+    ProjectCloseInventory {
+        project: crate::project_recovery::ProjectInstance,
+    },
+    /// Explicit project removal, fenced before teardown and final deletion.
+    CloseProjectGuarded {
+        project: crate::project_recovery::ProjectInstance,
+        sessions: Vec<crate::project_recovery::SessionClose>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -779,6 +796,9 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
     },
+    ProjectCloseInventory {
+        sessions: Vec<crate::project_recovery::SessionClose>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -903,6 +923,10 @@ pub struct TerminalDescriptor {
     pub upgrade_sources: Vec<TerminalSession>,
     #[serde(default)]
     pub upgrade_relaunches: Vec<UpgradeRelaunch>,
+    /// Exact resident worker observed by this inventory result. Nil means no
+    /// resident worker exists and cannot authorize a source-checked close.
+    #[serde(default)]
+    pub execution_instance: uuid::Uuid,
 }
 
 /// Explicitly accepted resume-picker or fresh agent launches, bound to the
@@ -920,6 +944,7 @@ impl TerminalDescriptor {
         transcript_path: Option<PathBuf>,
     ) -> Self {
         Self {
+            execution_instance: uuid::Uuid::nil(),
             session: TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,

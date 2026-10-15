@@ -101,8 +101,10 @@ impl Cagents {
         &mut self,
         terminals: Vec<crate::terminal::ipc::TerminalDescriptor>,
     ) -> Task<Message> {
+        let presentation = self.observe_local_terminal_residents(&terminals);
         let mut reconnect = Vec::new();
         for terminal in &terminals {
+            self.corroborate_terminal_close_adoption(terminal);
             // Existing handles intentionally refuse proof changes. Replace one
             // only after a fresh inventory proves its complete issued lineage;
             // the start path checks the replacement daemon's lease again.
@@ -133,7 +135,7 @@ impl Cagents {
                 self.relaunched_terminals.remove(&terminal.session.id);
             }
         }
-        let mut tasks = Vec::new();
+        let mut tasks = vec![presentation];
         for (card, session, visible) in reconnect {
             let visible = visible && self.workspace_surfaces_visible();
             self.terminal_recovery_attempts.remove(&session.id);

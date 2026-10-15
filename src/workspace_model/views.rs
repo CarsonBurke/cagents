@@ -105,6 +105,14 @@ pub enum Change {
     InsertIfEmpty {
         pane: Pane,
     },
+    /// UI removal consent is tied to this registry and original pane source.
+    /// This additive wire variant requires a newly allocated matched protocol.
+    RemoveSource {
+        registry: uuid::Uuid,
+        repository: PathBuf,
+        before: Pane,
+        execution_instance: Option<uuid::Uuid>,
+    },
 }
 
 impl View {
@@ -167,6 +175,23 @@ impl View {
             Change::Transfer { .. } => {
                 return Err("a transfer must be applied to both views atomically".into());
             }
+            Change::RemoveSource { before, .. } => {
+                let matches = self
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.id == before.id)
+                    .collect::<Vec<_>>();
+                if matches.is_empty() {
+                    return Ok(false);
+                }
+                if matches.len() != 1 || !same_pane_source(before, matches[0]) {
+                    return Err("workspace view removal source conflict".into());
+                }
+                self.panes.retain(|pane| pane.id != before.id);
+                if !self.retired.contains(&before.id) {
+                    self.retired.push(before.id);
+                }
+            }
             Change::Remove { id } => {
                 self.panes.retain(|pane| pane.id != *id);
                 if !self.retired.contains(id) {
@@ -190,6 +215,38 @@ impl View {
         before
             .and_then(|id| self.panes.iter().position(|pane| pane.id == id))
             .unwrap_or(self.panes.len())
+    }
+}
+
+/// Display edits can be independent; execution source, startup and placement
+/// must remain exactly the source that the removal request captured.
+pub fn same_pane_source(expected: &Pane, current: &Pane) -> bool {
+    expected.id == current.id
+        && same_card_source(&expected.kind, &current.kind)
+        && expected.pending_terminal_start == current.pending_terminal_start
+        && expected.scope == current.scope
+}
+
+/// Logical source equality permits the same execution to finish and the same
+/// conversation to retain/adopt its native backend. Per-worker teardown still
+/// requires the separate authenticated execution-instance receipt.
+pub fn same_card_source(expected: &CardKind, current: &CardKind) -> bool {
+    match (expected, current) {
+        (CardKind::Terminal(expected), CardKind::Terminal(current)) => {
+            let mut source = current.clone();
+            source.continuity = expected.continuity.clone();
+            source == *expected
+                && current
+                    .continuity
+                    .live_proof()
+                    .is_none_or(|proof| expected.continuity.live_proof() == Some(proof))
+        }
+        (CardKind::Chat(expected), CardKind::Chat(current)) => {
+            let mut source = current.clone();
+            source.native_continuity = expected.native_continuity.clone();
+            source == *expected
+        }
+        _ => shared_kind(expected) == shared_kind(current),
     }
 }
 
@@ -475,5 +532,55 @@ pub fn same_resource(left: &CardKind, right: &CardKind) -> bool {
         (CardKind::Chat(a), CardKind::Chat(b)) => a.id == b.id,
         (CardKind::Browser(a), CardKind::Browser(b)) => a.id == b.id,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod removal_source_tests {
+    use super::*;
+    #[test]
+    fn logical_chat_removal_preserves_thread_pair_proof_and_configuration() {
+        let launch = crate::model::LaunchRecipe {
+            program: "fixture".into(),
+            arguments: vec![],
+            working_directory: "/repo".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let session = crate::chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: launch,
+                session_id: Some("original-thread".into()),
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let before = CardKind::Chat(session.clone());
+        let mut retained = session.clone();
+        retained.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "restarted".into(),
+        };
+        assert!(same_card_source(&before, &CardKind::Chat(retained.clone())));
+        retained.launch.session_id = Some("replacement-thread".into());
+        assert!(!same_card_source(&before, &CardKind::Chat(retained)));
+        let mut paired = session.clone();
+        paired.terminal = Some(crate::model::TerminalSession {
+            id: crate::model::TerminalId::new(),
+            launch: session.launch.recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe: session.launch.recipe.clone(),
+                last_exit: None,
+            },
+        });
+        assert!(!same_card_source(&before, &CardKind::Chat(paired)));
     }
 }
