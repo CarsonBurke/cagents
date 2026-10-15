@@ -2095,6 +2095,13 @@ pub enum RepositoryRuntimeStatus {
     Unavailable,
 }
 
+/// Parse a compiler-style path:line[:column] using one-based scalar columns.
+/// Frontends should search by the returned path and defer the coordinates
+/// with the exact file-open request instead of including them in the query.
+pub fn parse_file_location(input: &str) -> Option<(String, usize, usize)> {
+    crate::editor_navigation::parse_location(input)
+}
+
 impl RepositoryRuntime {
     fn protect_editor_worktree(&mut self, directory: &Path) -> std::io::Result<()> {
         if self
