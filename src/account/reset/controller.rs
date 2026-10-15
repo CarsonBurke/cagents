@@ -12,7 +12,7 @@ pub(crate) fn execute(handle: &Handle, request: Request, root: &Path, expires: I
     current()?;
     let mut outcome = None;
     let mut reconciled = false;
-    if let Action::Redeem {expected, credit_id, authorized:_} = request.action {
+    if let Action::Redeem {expected, credit_id, authorized:_, condition} = request.action {
         if allowance.account.as_ref() != Some(&expected) {
             return Err("The target's actual provider account differs from the requested reset account; no credit was consumed".into());
         }
@@ -30,7 +30,7 @@ pub(crate) fn execute(handle: &Handle, request: Request, root: &Path, expires: I
                 // error below, including missing RPC support and timeout.
                 current()?;
                 let (reply, response) = crossbeam_channel::bounded(1);
-                handle.consume_reset_credit(transport::Consume::prepared(expires, expected, credit_id.clone(), idempotency_key, reconcile_first, reply))?;
+                handle.consume_reset_credit(transport::Consume::prepared(expires, expected, credit_id.clone(), idempotency_key, reconcile_first, condition, reply))?;
                 let consumed = response.recv_deadline(expires)
                     .map_err(|_| "Provider reset outcome is uncertain; preserve and reconcile the original attempt before retrying".to_string())??;
                 current()?;

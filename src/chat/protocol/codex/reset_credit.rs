@@ -61,6 +61,12 @@ pub(super) fn receive(adapter: &mut Codex, mut redemption: Redemption, frame: &V
                     return Ok(Some(transport::Consumed {outcome, allowance}));
                 }
                 if !redemption.request.reconcile {
+                    if let Some(condition) = redemption.request.condition {
+                        let decision = crate::account::reset::decision(&allowance, now, condition.max_age_ms, condition.used_percent, true)?;
+                        if !matches!(decision, crate::account::reset::Decision::Eligible {..}) {
+                            return Err(format!("Shared allowance no longer meets the authorized monitor threshold ({decision:?}); no credit was consumed"));
+                        }
+                    }
                     if allowance.reset_credits.as_ref().is_none_or(|credits| credits.available_count == 0) { return Err("Provider reports no available reset credits; no credit was consumed".into()); }
                     let credit = allowance.reset_credits.as_ref().and_then(|credits| credits.details.as_ref())
                         .and_then(|rows| rows.iter().find(|credit| credit.id == redemption.request.credit_id));

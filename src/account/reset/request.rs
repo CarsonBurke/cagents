@@ -20,7 +20,14 @@ pub(crate) enum Action {
         credit_id: String,
         /// Explicit user intent only. No implied consent from a threshold.
         authorized: bool,
+        condition: Option<Threshold>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Threshold {
+    pub used_percent: u8,
+    pub max_age_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,10 +45,13 @@ pub(crate) struct Report {
 
 impl Request {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if let Action::Redeem {expected, credit_id, authorized} = &self.action {
+        if let Action::Redeem {expected, credit_id, authorized, condition} = &self.action {
             identifier_str(&expected.account_id)?;
             identifier_str(&expected.backend_origin)?;
             identifier_str(credit_id)?;
+            if condition.is_some_and(|condition| condition.used_percent == 0 || condition.used_percent > 100 || condition.max_age_ms == 0 || condition.max_age_ms > 60_000) {
+                return Err("Monitor threshold must be1..100 percent with freshness1..60000 milliseconds".into());
+            }
             if !authorized { return Err("Redeeming a provider reset credit requires explicit --authorize authorization".into()); }
         }
         Ok(())
@@ -81,7 +91,7 @@ mod tests {
     fn requested_identity_is_bounded_intent_and_requires_explicit_authorization() {
         let request = Request {session:TerminalId::new(), action:Action::Redeem {
             expected:ProviderAccount {account_id:"actual-account".into(),backend_origin:"https://chatgpt.com".into()},
-            credit_id:"opaque-credit".into(), authorized:false}};
+            credit_id:"opaque-credit".into(), authorized:false, condition:None}};
         assert!(request.validate().unwrap_err().contains("explicit"));
         let mut authorized = request;
         let Action::Redeem {authorized: consent, credit_id, ..} = &mut authorized.action else {panic!()};
