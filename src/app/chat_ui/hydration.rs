@@ -6,8 +6,7 @@ use std::ops::Range;
 
 #[cfg(test)]
 const PART_BYTES: usize = 128 * 1024;
-const SOURCE_BYTES: usize = 32 * 1024 * 1024;
-const RESIDENT_BYTES: usize = 72 * 1024 * 1024;
+use chat::source_owners::{Admission,SOURCE_BYTES};
 
 pub(super) use chat::cache::SourceKey as Key;
 
@@ -192,46 +191,8 @@ impl State {
     }
 }
 
-/// A lease follows the actual immutable item through snapshots, parser caches
-/// and retained trees: weak owners disappear only when the last item owner is
-/// gone. Clearing a State cannot release a still-retained item's accounting.
-#[derive(Default)]
-struct Owners {
-    entries:Vec<(std::sync::Weak<chat::Item>,usize)>,
-    /// One global replacement can temporarily overlap the old Item owners.
-    turnover:Option<(std::sync::Weak<chat::Item>,std::sync::Weak<chat::Item>)>,
-}
-fn owners()->&'static Mutex<Owners> {
-    static OWNERS:std::sync::OnceLock<Mutex<Owners>>=std::sync::OnceLock::new();
-    OWNERS.get_or_init(Mutex::default)
-}
-impl Owners {
-    fn prune(&mut self) {
-        self.entries.retain(|(owner,_)|owner.strong_count()>0);
-        if self.turnover.as_ref().is_some_and(|(old,new)|old.strong_count()==0 || new.strong_count()==0) {self.turnover=None;}
-    }
-    fn bytes(&self)->usize {self.entries.iter().map(|(_,bytes)|*bytes).sum()}
-    fn admit(&mut self,item:&Arc<chat::Item>,bytes:usize,replaced:Option<&Arc<chat::Item>>)->Admission {
-        self.prune();
-        if bytes>SOURCE_BYTES {return Admission::Capacity;}
-        let total=self.bytes();
-        if total.saturating_add(bytes)<=RESIDENT_BYTES {
-            self.entries.push((Arc::downgrade(item),bytes));return Admission::Ready;
-        }
-        if self.turnover.is_some() {return Admission::Turnover;}
-        let old=replaced.and_then(|replaced|self.entries.iter().find(|(owner,_)|owner.as_ptr()==Arc::as_ptr(replaced)));
-        let Some((old,old_bytes))=old else {return Admission::Capacity;};
-        if total.saturating_sub(*old_bytes).saturating_add(bytes)>RESIDENT_BYTES
-            || total.saturating_add(bytes)>RESIDENT_BYTES+SOURCE_BYTES {return Admission::Capacity;}
-        self.turnover=Some((old.clone(),Arc::downgrade(item)));
-        self.entries.push((Arc::downgrade(item),bytes));Admission::Ready
-    }
-}
-#[derive(Clone,Copy,Debug,PartialEq,Eq)]
-enum Admission {Ready,Turnover,Capacity}
-pub(super) fn live_source_bytes()->usize {
-    let mut owners=owners().lock().unwrap_or_else(|error|error.into_inner());owners.prune();owners.bytes()
-}
+pub(super) fn live_source_bytes()->usize {chat::source_owners::usage().admitted_bytes}
+
 static READER_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Allocated String capacity in the two readers, including a completed body
 /// awaiting admission. Shared `known` items remain counted only by Owners.
@@ -248,8 +209,8 @@ impl Drop for ReaderCapacity {
     fn drop(&mut self) { self.set(0); }
 }
 pub(super) fn reader_source_capacity()->usize { READER_CAPACITY.load(Ordering::Relaxed) }
-fn admit(item:&Arc<chat::Item>,bytes:usize,replaced:Option<&Arc<chat::Item>>)->Admission {
-    owners().lock().unwrap_or_else(|error|error.into_inner()).admit(item,bytes,replaced)
+fn admit(item:&Arc<chat::Item>,_bytes:usize,replaced:Option<&Arc<chat::Item>>)->Admission {
+    chat::source_owners::admit(item,replaced)
 }
 
 #[derive(Clone)]
@@ -530,26 +491,6 @@ mod tests {
         state.project(source_snapshot(Snapshot {generation:3,source_revision:2,detail:"Account usage changed".into(),
             items,..Snapshot::default()}),None);
         assert!(state.requests().is_empty(),"metadata alone must not probe source epochs");
-    }
-    #[test]
-    fn one_global_turnover_replaces_sources_without_exceeding_transient_cap() {
-        const MIB:usize=1024*1024;
-        let mut owners=Owners::default();
-        let mut old=vec![text("a","a"),text("b","b"),text("c","c")];
-        for item in &old {assert_eq!(owners.admit(item,20*MIB,None),Admission::Ready);}
-        let cache_owner=old[0].clone();let pending_known=old[0].clone();
-        let new_a=text("a","new a");
-        assert_eq!(owners.admit(&new_a,20*MIB,Some(&old[0])),Admission::Ready);
-        assert_eq!(owners.bytes(),80*MIB);assert!(owners.bytes()<=RESIDENT_BYTES+SOURCE_BYTES);
-        let new_b=text("b","new b");
-        assert_eq!(owners.admit(&new_b,20*MIB,Some(&old[1])),Admission::Turnover);
-        old.remove(0);drop(cache_owner);
-        assert_eq!(owners.admit(&new_b,20*MIB,Some(&old[0])),Admission::Turnover);
-        drop(pending_known);
-        assert_eq!(owners.admit(&new_b,20*MIB,Some(&old[0])),Admission::Ready);
-        assert_eq!(owners.bytes(),80*MIB);assert!(owners.bytes()<=RESIDENT_BYTES+SOURCE_BYTES);
-        old.remove(0);owners.prune();assert_eq!(owners.bytes(),60*MIB);
-        assert!(owners.turnover.is_none());
     }
 
     #[test]
