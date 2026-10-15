@@ -1031,6 +1031,7 @@ mod tests {
 
     #[test]
     fn a_failed_return_cannot_capture_a_new_shared_removal_basis_for_the_held_end() {
+        for local_error in [None, Some(false), Some(true)] {
         for retained_owner in [false, true] {
         let (mut app, card, directory) = fixture();
         if retained_owner { attach_durable_owner(&mut app, card); }
@@ -1039,7 +1040,9 @@ mod tests {
         shared_scope(&mut app, card, directory.path());
         let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("original chat"); };
         let target = runtime.target;
-        app.chat_ui.phases.insert(card, Phase::Returning { target, local: None, close_requested: false });
+        let source = app.chat_return_session(card).unwrap();
+        let local = local_error.map(|_| LocalReturn { session: source.clone(), launch: source.launch.recipe.clone(), resumes: true });
+        app.chat_ui.phases.insert(card, Phase::Returning { target, local, close_requested: false });
         let _original_delivery = queued(app.close_cards_in_order(vec![card]));
         let batch = app.pane_close_batch_for(card);
         assert!(batch.is_some());
@@ -1048,7 +1051,12 @@ mod tests {
         app.workspace_model.views[0].scope = crate::workspace_model::views::Scope::Worktree {
             repository: directory.path().into(), path: directory.path().join("new-owner"),
         };
-        drop(app.update(Message::ChatUi(super::super::Action::HandoffFinished(target, Err("original return failed".into())))));
+        let completion = match local_error {
+            None => super::super::Action::HandoffFinished(target, Err("original return failed".into())),
+            Some(false) => super::super::Action::ReturnedLocally(target, Err(ReturnRefused::SourceLive)),
+            Some(true) => super::super::Action::ReturnedLocally(target, Err(ReturnRefused::Unconfirmed("original return failed".into()))),
+        };
+        drop(app.update(Message::ChatUi(completion)));
         assert!(app.chat_ui.end_requests.is_empty());
         assert!(!app.pane_close_batch_current(batch), "failed old intent must not leave a dormant selection");
         assert!(app.chat_ui.phases.is_empty());
@@ -1057,6 +1065,7 @@ mod tests {
         assert!(app.recently_closed.is_empty());
         let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("original runtime kept"); };
         assert_eq!(runtime.unsent_text(), "keep original failed-return draft");
+        }
         }
     }
 

@@ -6572,6 +6572,7 @@ impl Cagents {
                 }
                 let batch = request.as_ref().and_then(|request| request.batch);
                 let close = close && request.as_ref().is_some_and(|request| request.current(self, target.card));
+                if !close { self.stop_pane_close_batch(batch); }
                 let card = target.card;
                 // The original Return remains authorized when its secondary
                 // selected End was revoked. Never attach a newer batch here.
@@ -6599,7 +6600,7 @@ impl Cagents {
                     self.status = Some(TransientNotice::error(error));
                     self.reread_chat_activity(target);
                     return if close {
-                        self.begin_chat_close_for(card, batch)
+                        request.map_or_else(Task::none, |request| self.begin_chat_close_request(card, request))
                     } else {
                         Task::none()
                     };
