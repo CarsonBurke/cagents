@@ -8,7 +8,7 @@
 //! taken out where the output enters it.
 //!
 //! All three adapters use this: [`display`] for output a provider reports
-//! whole, and [`Stream`] for output it reports in deltas, where a sequence may
+//! whole, and `Stream` for output it reports in deltas, where a sequence may
 //! be cut anywhere.
 
 /// Output reported whole, without its escape sequences and with each line as
@@ -55,6 +55,7 @@ pub(super) fn display(raw: String) -> String {
 /// the provider reports whole at the end goes through [`display`], which
 /// keeps only the last.
 #[derive(Debug)]
+#[cfg(any(feature = "host", test))]
 pub(super) struct Stream {
     escape: Escape,
     returned: bool,
@@ -67,6 +68,7 @@ pub(super) struct Stream {
 /// No sequence payload is needed to identify its terminator. In particular,
 /// an arbitrarily long unterminated OSC/DCS/APC string costs one enum value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg(any(feature = "host", test))]
 enum Escape {
     #[default]
     Ground,
@@ -78,6 +80,7 @@ enum Escape {
     StringEscape,
 }
 
+#[cfg(any(feature = "host", test))]
 impl Default for Stream {
     fn default() -> Self {
         Self {
@@ -90,6 +93,7 @@ impl Default for Stream {
     }
 }
 
+#[cfg(any(feature = "host", test))]
 impl Stream {
     /// What `delta` adds to the output shown so far.
     pub(super) fn push(&mut self, delta: &str) -> String {
