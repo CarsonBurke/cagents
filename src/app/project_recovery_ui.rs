@@ -384,7 +384,15 @@ impl Cagents {
                             known_root.as_deref().unwrap_or(&path).display()
                         )
                     });
-                    project.location_repair=(!missing).then(||detail.clone()).flatten();
+                    let repair=(!missing).then(||detail.clone()).flatten();
+                    if repair.is_some() && project.location_repair!=repair {
+                        // A read against the vanished primary may have failed
+                        // before this probe found its usable linked checkout.
+                        // Let normal refresh retry via the verified fallback;
+                        // do not repeatedly erase a later fallback read failure.
+                        project.unreachable=None;
+                    }
+                    project.location_repair=repair;
                     if project.missing == missing {
                         if missing {
                             project.unreachable = detail;
@@ -1420,6 +1428,7 @@ mod tests {
         let (mut app,id)=app(&metadata);
         let project=app.sidebar_model.projects.iter_mut().find(|project|project.id==id).unwrap();
         project.kind=ProjectKind::Git;
+        project.unreachable=Some("primary checkout disappeared during its previous Git read".into());
         app.project_ui.checkout_roots.insert(metadata.clone(),linked.clone());
         app.project_ui.primary_checkout_roots.insert(metadata.clone(),primary.clone());
         Arc::make_mut(&mut app.durable).shared_project_bindings.insert(id,crate::model::SharedProjectBinding {ordinal:7,root:Some(primary.clone())});
