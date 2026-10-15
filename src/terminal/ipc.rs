@@ -903,6 +903,10 @@ pub struct TerminalDescriptor {
     pub upgrade_sources: Vec<TerminalSession>,
     #[serde(default)]
     pub upgrade_relaunches: Vec<UpgradeRelaunch>,
+    /// Exact resident worker observed by this inventory result. Nil means no
+    /// live worker exists and cannot authorize a source-checked live close.
+    #[serde(default)]
+    pub execution_instance: uuid::Uuid,
 }
 
 /// Explicitly accepted resume-picker or fresh agent launches, bound to the
@@ -920,6 +924,7 @@ impl TerminalDescriptor {
         transcript_path: Option<PathBuf>,
     ) -> Self {
         Self {
+            execution_instance: uuid::Uuid::nil(),
             session: TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
