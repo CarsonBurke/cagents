@@ -98,6 +98,40 @@ fn local_chat_close_retains_positive_owner_across_actual_sql_failure_and_retry()
     let refused=super::super::process(&f.host,1,ClientRequest::ChatClose{chat_id:f.source.id}).unwrap_err();
     assert!(refused.message.contains("local retirement write denied"),"{refused:?}");f.assert_retained();
     assert!(require_open(&f.host.lock().unwrap(),f.source.id).is_err());
+    {
+        use crate::project_recovery::{ProjectInstance,SessionClose};
+        use crate::model::{TerminalSession,TerminalContinuity};
+        let own=f._directory.path().to_owned();let other=own.join("unrelated-project");std::fs::create_dir(&other).unwrap();
+        let model=f.registry.lock().unwrap().apply(&ModelEdit::OpenProject{repository:other.clone(),checkout:None,primary_checkout:None,name:"Independent".into(),kind:ProjectKind::Folder}).unwrap().model;
+        let project=ProjectInstance{registry:model.identity,repository:own.clone(),ordinal:model.project(&own).unwrap().ordinal};
+        let foreign=ProjectInstance{registry:model.identity,repository:other.clone(),ordinal:model.project(&other).unwrap().ordinal};
+        struct Terminals(Vec<crate::terminal::TerminalHandle>);
+        impl Drop for Terminals{fn drop(&mut self){for terminal in &self.0{let _=terminal.shutdown();}}}
+        let mut terminals=Terminals(Vec::new());
+        let mut spawn=|path:&std::path::Path| {
+            let mut recipe=LaunchRecipe::shell(path.to_owned()).unwrap();recipe.program="/bin/cat".into();recipe.arguments.clear();
+            let session=TerminalSession{id:TerminalId::new(),launch:recipe.clone(),owned_codex_listener:None,recovery_origin:None,predecessor:None,transcript_path:None,resume_hint:None,continuity:TerminalContinuity::RelaunchAvailable{recipe,last_exit:None}};
+            let worker=crate::terminal::TerminalHandle::spawn(session.clone(),Default::default(),|_|{}).unwrap();
+            let descriptor={let mut state=f.host.lock().unwrap();state.reserve_spawn(session.id).unwrap();state.finish_spawn(1,session,worker.clone(),true).unwrap()};
+            terminals.0.push(worker);SessionClose{source:HostedSession::Terminal(descriptor.session),execution_instance:Some(descriptor.execution_instance),provider:None}
+        };
+        let healthy=spawn(&own);let independent=spawn(&other);let pending=f.pending();
+        let inventory=crate::host::client::process_request(&f.host,1,ClientRequest::ProjectCloseInventory{project:project.clone()}).unwrap_err();
+        assert!(inventory.message.contains("retirement"),"{inventory:?}");
+        let remove=crate::host::client::process_request(&f.host,1,ClientRequest::CloseProjectGuarded{project,sessions:vec![healthy.clone()]}).unwrap_err();
+        assert!(remove.message.contains("retirement"),"{remove:?}");
+        assert_eq!(f.host.lock().unwrap().read_model().unwrap(),model);
+        assert!(!terminals.0[0].is_completed()&&!terminals.0[1].is_completed());
+        assert!(Arc::ptr_eq(&f.pending(),&pending));assert!(!f.registry.lock().unwrap().agent(f.agent).unwrap().closed);
+        assert!(f.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+        assert!(crate::host::client::process_request(&f.host,1,ClientRequest::Input{terminal_id:independent.source.id(),bytes:b"independent of SQL retry\n".to_vec()}).is_ok());
+        let result=crate::host::client::process_request(&f.host,1,ClientRequest::CloseProjectGuarded{project:foreign,sessions:vec![independent]}).unwrap();
+        assert!(matches!(result.0,ServerResponse::WorkspaceModel{..}));assert!(!terminals.0[0].is_completed()&&terminals.0[1].is_completed());
+        assert!(Arc::ptr_eq(&f.pending(),&pending));assert!(!f.registry.lock().unwrap().agent(f.agent).unwrap().closed);
+        let HostedSession::Terminal(source)=healthy.source else{unreachable!()};
+        let result=crate::host::client::process_request(&f.host,1,ClientRequest::CloseTerminalSourceChecked{source,execution_instance:healthy.execution_instance.unwrap(),allow_active:true}).unwrap();
+        assert!(matches!(result.0,ServerResponse::TerminalCloseChecked{outcome:crate::terminal_ipc::TerminalCloseResult::Closed,..}));
+    }
     let before=f.pending().snapshot().unwrap();f.allow_commit();
     let ServerResponse::ChatClosed{snapshot,..}=super::super::process(&f.host,1,ClientRequest::ChatClose{chat_id:f.source.id}).unwrap() else{panic!("exact close retry must publish ChatClosed")};
     assert_eq!(snapshot.generation,before.generation);assert_eq!(snapshot.session_id,before.session_id);f.assert_retired();

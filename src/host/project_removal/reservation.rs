@@ -356,10 +356,7 @@ fn require_no_startups(host:&SharedHost,reserved:&ReservedProject)->Result<(),Pr
     let registry=super::super::agent_execution::registry(host).map_err(error)?;
     for (id,(source,_context)) in &pending {
         let hosted=HostedSession::Chat(source.clone());
-        let explicit_own=reserved.sessions.contains(id)||reserved.panes.contains(&CardId::from_uuid(id.as_uuid()));
-        let repository=registry.lock().unwrap_or_else(|p|p.into_inner()).retained_session_repository(std::slice::from_ref(&hosted)).map_err(error)?;
-        let foreign=!explicit_own && (repository.as_ref().is_some_and(|repository|*repository!=reserved.project.repository)
-            || (repository.is_none()&&reserved.protected_sources.iter().any(|saved|saved==&hosted)));
+        let foreign=positively_foreign(&registry,reserved,*id,&hosted)?;
         if !foreign {
             return Err(error(format!("Native startup {id} retains unresolved provider ownership in this project or an uncertain scope. Resolve that exact startup before removing the project; no project sessions were closed.")));
         }
@@ -376,8 +373,35 @@ fn require_no_startups(host:&SharedHost,reserved:&ReservedProject)->Result<(),Pr
     Ok(())
 }
 
+fn positively_foreign(registry:&super::super::agent_execution::SharedRegistry,reserved:&ReservedProject,id:TerminalId,source:&HostedSession)->Result<bool,ProtocolError> {
+    let explicit_own=reserved.sessions.contains(&id)||reserved.panes.contains(&CardId::from_uuid(id.as_uuid()));
+    let repository=registry.lock().unwrap_or_else(|p|p.into_inner()).retained_session_repository(std::slice::from_ref(source)).map_err(error)?;
+    Ok(!explicit_own && (repository.as_ref().is_some_and(|repository|*repository!=reserved.project.repository)
+        ||(repository.is_none()&&reserved.protected_sources.iter().any(|saved|saved==source))))
+}
+fn require_no_local_retirements(host:&SharedHost,reserved:&ReservedProject)->Result<(),ProtocolError> {
+    let pending={let state=host.lock().unwrap_or_else(|p|p.into_inner());
+        if state.local_chat_retirements.len()>super::MAX_SESSIONS {return Err(error("Pending provider retirement inventory exceeds its bound; no project sessions were closed"));}
+        state.local_chat_retirements.iter().map(|(id,pending)|(*id,pending.clone())).collect::<Vec<_>>()};
+    if pending.is_empty(){return Ok(());}
+    let registry=super::super::agent_execution::registry(host).map_err(error)?;
+    for (id,pending) in &pending {
+        let source=HostedSession::Chat(pending.source().clone());
+        if !positively_foreign(&registry,reserved,*id,&source)? {
+            return Err(error(format!("Session {id} retains its original provider retirement after a storage or cleanup failure. Retry that exact close before removing this project; no project sessions were closed.")));
+        }
+    }
+    let state=host.lock().unwrap_or_else(|p|p.into_inner());
+    if state.local_chat_retirements.len()!=pending.len()||pending.iter().any(|(id,pending)|state.local_chat_retirements.get(id).is_none_or(|current|!Arc::ptr_eq(current,pending))) {
+        return Err(error("Provider retirement custody changed during project inventory. Retry after it settles; no project sessions were closed."));
+    }
+    Ok(())
+}
+fn require_no_pending_owners(host:&SharedHost,reserved:&ReservedProject)->Result<(),ProtocolError> {
+    require_no_startups(host,reserved)?;require_no_local_retirements(host,reserved)
+}
 pub(super) fn require_no_startup_owners(host:&SharedHost,project:&ProjectInstance)->Result<(),ProtocolError> {
-    require_no_startups(host,&prepare(host,project)?)
+    require_no_pending_owners(host,&prepare(host,project)?)
 }
 
 /// Caller holds short exclusive control admission. No slow teardown occurs here.
@@ -397,7 +421,7 @@ pub(crate) fn reserve(host:&SharedHost,project:&ProjectInstance,selected:&[Sessi
     reserved
         .sessions
         .extend(selected.iter().map(|selected| selected.source.id()));
-    require_no_startups(host,&reserved)?;
+    require_no_pending_owners(host,&reserved)?;
     // A missing installed actor is not proof that its retained provider died.
     // Fail the entire roster before the first close; leave its saved pane and
     // project reachable for explicit recovery/cleanup. Foreign pending owners
