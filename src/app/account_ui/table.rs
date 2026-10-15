@@ -642,13 +642,17 @@ fn line<'a>(
 ) -> Element<'a, Message> {
     let mut items: Vec<Element<'a, Message>> = vec![
         widget::container(
-            widget::row::with_children(vec![
+            // with_children drops a zero-width Space as void. Keep this
+            // measurement-only child, then declare the sizing explicitly.
+            widget::Row::from_vec(vec![
                 account,
                 iced::widget::Space::new()
                     .width(0)
                     .height((height - 2.0 * space::XS).max(0.0))
                     .into(),
             ])
+            .width(Length::Fill)
+            .height(Length::Shrink)
             .spacing(0),
         )
         .width(Length::Fill)
@@ -1380,6 +1384,53 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_lines_keep_their_minimum_height_and_grow_for_wrapped_captions() {
+        use iced::advanced::{Layout as WidgetLayout, layout::Limits, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        for minimum in [design::ROW_HEIGHT, ROW_HEIGHT] {
+            let mut element = line(
+                design::caption("Short account caption").into(),
+                Vec::new(),
+                iced::widget::Space::new().into(),
+                minimum,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 4000.0)),
+            );
+            assert!(node.size().height >= minimum, "minimum={minimum}, actual={:?}", node.size());
+        }
+        let reason = "A visible account failure reason must wrap without clipping. ".repeat(12);
+        let mut element = line(
+            design::caption(reason.clone())
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+            Vec::new(),
+            iced::widget::Space::new().into(),
+            ROW_HEIGHT,
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 4000.0)),
+        );
+        assert!(node.size().height > ROW_HEIGHT);
+        let mut rendered = super::super::acceptance_support::Rendered::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            WidgetLayout::new(&node),
+            &renderer,
+            &mut rendered,
+        );
+        assert!(rendered.0.iter().any(|(text, bounds)| {
+            text == &reason && bounds.width > 0.0 && bounds.height > ROW_HEIGHT
+        }));
+    }
 
     #[test]
     fn a_sign_in_waiting_to_be_asked_again_no_longer_points_at_its_terminal() {
