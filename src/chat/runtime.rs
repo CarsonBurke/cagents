@@ -228,6 +228,7 @@ struct Inner {
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     recovery_environment: BTreeMap<String, String>,
+    ownership_admission: Arc<Mutex<()>>,
     preserve_native: Arc<AtomicBool>,
     release_native: Arc<AtomicBool>,
     retain_cleanup_receipt: Arc<AtomicBool>,
@@ -526,6 +527,7 @@ impl LocalHandle {
         let store = retained_store.unwrap_or_else(|| Arc::new(Mutex::new(store)));
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let ownership_admission=Arc::new(Mutex::new(()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -565,6 +567,7 @@ impl LocalHandle {
             ),
             launch_account_scope,
             recovery_environment,
+            ownership_admission:ownership_admission.clone(),
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
@@ -592,6 +595,8 @@ impl LocalHandle {
                     reconnect_only_reported: false,
                     expected_native_peer,
                     native_peer: None,
+                    ownership_admission,
+                    release_native:release_native.clone(),
                     preserve_native: preserve_native.clone(),
                     native_installed: native_installed.clone(),
                     adapter,
@@ -1061,10 +1066,21 @@ impl LocalHandle {
         if observed_id != actor_id {
             return Err("The provider actor was replaced; its replacement was preserved".into());
         }
+        if self.0.preserve_native.load(Ordering::Acquire) {
+            return Err("Provider ownership is being preserved for a successor; refresh before stopping it".into());
+        }
         if self.is_completed() || self.0.stop.load(Ordering::Acquire) {
-            return if unobserved {
+            let _admission=match self.0.ownership_admission.try_lock() {
+                Ok(admission)=>admission,
+                Err(std::sync::TryLockError::Poisoned(p))=>p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock)=>return Err("Provider ownership admission is busy; retain its owner and retry".into()),
+            };
+            return if self.0.preserve_native.load(Ordering::Acquire) {
+                Err("Provider ownership is being preserved for a successor; its owner was preserved".into())
+            } else if unobserved {
                 Err("Retained provider ownership must be reattached before session stop".into())
             } else {
+                self.0.release_native.store(true,Ordering::Release);
                 Ok(())
             };
         }
@@ -1640,11 +1656,17 @@ impl LocalHandle {
         ) {
             return Err("This native provider has no verified durable owner".into());
         }
-        if self.0.release_native.load(Ordering::Acquire) {
-            return Err("Native provider has already been explicitly closed".into());
-        }
-        self.0.preserve_native.store(true, Ordering::Release);
+        self.claim_native_preservation()?;
         self.close_inner(true, None)
+    }
+
+    fn claim_native_preservation(&self)->Result<(),String> {
+        let _admission=self.0.ownership_admission.lock().unwrap_or_else(|p|p.into_inner());
+        if self.0.release_native.load(Ordering::Acquire) {
+            return Err("Native provider session stop already owns cleanup".into());
+        }
+        self.0.preserve_native.store(true,Ordering::Release);
+        Ok(())
     }
 
     pub(crate) fn close_for_resume(&self) -> Result<(), String> {
@@ -2283,6 +2305,8 @@ struct Actor {
     reconnect_only_reported: bool,
     expected_native_peer: Option<crate::daemon::holder_registry::Process>,
     native_peer: Option<crate::daemon::holder_registry::Process>,
+    ownership_admission: Arc<Mutex<()>>,
+    release_native: Arc<AtomicBool>,
     preserve_native: Arc<AtomicBool>,
     native_installed: Arc<AtomicBool>,
     adapter: Box<dyn Adapter>,
@@ -2985,11 +3009,15 @@ impl Actor {
                     }));
                     continue;
                 }
-                ActorCommand::StopSession { actor_id } => {
-                    let close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
-                    let result = if close.actor_id != actor_id {
+                ActorCommand::StopSession {actor_id} => {
+                    let _admission=self.ownership_admission.lock().unwrap_or_else(|p|p.into_inner());
+                    let close = self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+                    let result = if self.preserve_native.load(Ordering::Acquire) {
+                        Err("Provider ownership is being preserved for a successor; its owner was preserved".into())
+                    } else if close.actor_id != actor_id {
                         Err("The provider actor was replaced; its replacement was preserved".into())
                     } else {
+                        self.release_native.store(true,Ordering::Release);
                         self.stop.store(true, Ordering::Release);
                         Ok(())
                     };
@@ -5337,6 +5365,27 @@ mod tests {
             ToolStatus::Failed,
             "confirmed provider teardown settles all owned children"
         );
+    }
+
+    #[test]
+    fn native_stop_and_preservation_have_one_admission_winner() {
+        for preserve_first in [false,true] {
+            let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+            let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+            let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
+            let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
+            let actor=handle.close_observation().actor_id;
+            if preserve_first {
+                handle.claim_native_preservation().unwrap();
+                assert!(handle.fence_session_stop_until(actor,Instant::now()+Duration::from_secs(2)).is_err());
+                assert!(!handle.0.stop.load(Ordering::Acquire));
+            } else {
+                handle.fence_session_stop_until(actor,Instant::now()+Duration::from_secs(2)).unwrap();
+                assert!(handle.0.release_native.load(Ordering::Acquire),"release ownership must be fenced before stop ACK and gate release");
+                assert!(handle.claim_native_preservation().is_err());
+            }
+            handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        }
     }
 
     #[test]
