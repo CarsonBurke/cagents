@@ -342,9 +342,12 @@ impl HostedPublishedState {
                 accepted = false;
             }
         }
-        self.complete_key(ticket, if accepted { result } else {
-            Err("terminal key admission was not confirmed before its deadline".into())
-        });
+        let result = match result {
+            Ok(binding) if accepted => Ok(binding),
+            Ok(_) => Err("terminal key admission was not confirmed before its deadline".into()),
+            Err(error) => Err(error),
+        };
+        self.complete_key(ticket, result);
         accepted
     }
 
