@@ -6098,9 +6098,15 @@ fn undo_discard_refuses_a_same_size_substituted_unpack_file_and_preserves_it() {
     assert!(executor.changed.load(std::sync::atomic::Ordering::Acquire));
     assert!(!matches!(result, MutationOutcome::Applied { .. }), "{result:?}");
     assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"base");
-    assert!(fs::read_dir(fixture.work()).unwrap().filter_map(Result::ok).any(|entry| {
-        entry.file_type().is_ok_and(|kind| kind.is_file()) && fs::read(entry.path()).is_ok_and(|bytes| bytes == b"EVIL")
-    }), "the unexpected generated entry must be retained rather than blindly unlinked");
+    fn preserved_artifact(directory: &Path, depth: usize) -> bool {
+        if depth > 4 { return false; }
+        fs::read_dir(directory).unwrap().filter_map(Result::ok).any(|entry| {
+            let kind = entry.file_type().unwrap();
+            (kind.is_file() && fs::read(entry.path()).is_ok_and(|bytes| bytes == b"EVIL"))
+                || (kind.is_dir() && entry.file_name() != ".git" && preserved_artifact(&entry.path(), depth + 1))
+        })
+    }
+    assert!(preserved_artifact(&fixture.work(), 0), "the unexpected generated entry must be retained rather than blindly unlinked");
     let before = receipt.entries.iter().find(|entry| entry.path == path("tracked.txt")).unwrap();
     let cagents::repository::SavedEntry::Blob { oid, .. } = &before.before else { panic!("tracked backup required") };
     assert_eq!(fixture.git_in_work(&["cat-file", "blob", oid.as_str()]), b"work");
