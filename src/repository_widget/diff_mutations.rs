@@ -101,7 +101,10 @@ impl Prepared {
             if !receipt.is_current()
                 || !runtime
                     .git_read_source()
-                    .is_some_and(|source| receipt.matches_source(source))
+                    .is_some_and(|source| {
+                        source.authority().path() == runtime.descriptor.worktree.as_path()
+                            && receipt.matches_source(source)
+                    })
             {
                 return Err(
                     "The original Git reader changed; reload this source before applying changes"
@@ -303,11 +306,18 @@ impl RepositoryRuntime {
         .then_some(rows)
     }
 
+    /// Classify native buffer-only Revert without capturing text or consulting
+    /// whichever Git panel is currently focused. Availability is checked by
+    /// the ordinary hunk/selection predicates separately.
+    pub fn diff_mutation_applies_to_buffer(&self, kind: git_patch::Kind) -> bool {
+        kind == git_patch::Kind::Revert && self.editable_working_diff()
+    }
+
     fn can_mutate_diff(&self, kind: git_patch::Kind) -> bool {
         // A hunk edit keeps the current document open. Unsaved working
         // text is a valid source while its annotations match that revision;
         // saving and unresolved durability still fence the operation.
-        let buffer_revert = kind == git_patch::Kind::Revert && self.editable_working_diff();
+        let buffer_revert = self.diff_mutation_applies_to_buffer(kind);
         if self.git_mutation_unavailable_reason.is_some() && !buffer_revert
             || !self.shows_diff()
             // Compare with disk owns visible row coordinates. Its overlay may
@@ -337,7 +347,10 @@ impl RepositoryRuntime {
         (buffer_revert
             || model.git_read_receipt().is_some_and(|receipt| {
                 self.git_read_source()
-                    .is_some_and(|source| receipt.matches_source(source))
+                    .is_some_and(|source| {
+                        source.authority().path() == self.descriptor.worktree.as_path()
+                            && receipt.matches_source(source)
+                    })
             }))
             && !model.is_empty()
             && (kind == git_patch::Kind::Unstage) == model.source_head.is_some()
@@ -1452,6 +1465,25 @@ mod tests {
         source.invalidate();
         assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
         assert!(runtime.can_apply_diff_hunk(git_patch::Kind::Revert));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn original_git_reader_refuses_descriptor_only_path_rebinding() {
+        let card = CardId::new();
+        let mut runtime = selected_mutation_fixture(card);
+        assert!(runtime.diff_mutation_applies_to_buffer(git_patch::Kind::Revert));
+        assert!(!runtime.diff_mutation_applies_to_buffer(git_patch::Kind::Stage));
+        assert!(runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
+        let prepared = runtime
+            .capture_diff_mutation(card, git_patch::Kind::Stage, None)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        runtime.descriptor.worktree = runtime.descriptor.worktree.with_extension("different");
+        assert!(!runtime.can_apply_diff_hunk(git_patch::Kind::Stage));
+        assert!(runtime.capture_diff_mutation(card, git_patch::Kind::Stage, None).is_none());
+        assert!(prepared.apply(&mut runtime).is_err());
     }
 
     #[test]
