@@ -1453,6 +1453,10 @@ impl Editor {
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_line_height(self.settings.terminal_line_height);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+        runtime.set_find_preferences(
+            self.settings.editor_find_options,
+            self.settings.editor_replace_preserve_case,
+        );
         let mut sidebar = SidebarModel::ready(
             SidebarMode::Expanded,
             vec![SidebarProject::new(
@@ -3521,6 +3525,11 @@ impl Application for Editor {
                         };
                         return Self::open_external_link(uri);
                     }
+                    let find_preferences_changed = matches!(
+                        &action,
+                        RepositoryAction::FindOptionsChanged { .. }
+                            | RepositoryAction::PreserveCaseChanged { .. }
+                    );
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
@@ -3589,6 +3598,17 @@ impl Application for Editor {
                     }
                     if focus_loaded {
                         tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
+                    }
+                    if find_preferences_changed {
+                        let (options, preserve) = self.tab(id).unwrap().runtime.find_preferences();
+                        self.settings.editor_find_options = options;
+                        self.settings.editor_replace_preserve_case = preserve;
+                        for tab in &mut self.tabs {
+                            tasks.push(repository_task(tab.runtime.update_find_preferences(
+                                tab.id, options, preserve,
+                            )));
+                        }
+                        tasks.push(self.save_settings());
                     }
                     tasks.push(self.drain(id));
                     if loaded || saved {
@@ -4080,6 +4100,11 @@ impl Application for Editor {
                         tab.runtime
                             .set_syntax_theme(self.settings.editor_syntax_theme);
                     }
+                    let options = self.settings.editor_find_options;
+                    let preserve = self.settings.editor_replace_preserve_case;
+                    let find_tasks = self.tabs.iter_mut().map(|tab| {
+                        repository_task(tab.runtime.update_find_preferences(tab.id, options, preserve))
+                    }).collect::<Vec<_>>();
                     let shortcuts =
                         self.capture_preference(PreferenceWrite::Shortcuts(self.shortcuts.clone()));
                     Task::batch([
@@ -4087,6 +4112,7 @@ impl Application for Editor {
                         self.appearance(),
                         self.save_settings(),
                         preference_task(shortcuts),
+                        Task::batch(find_tasks),
                     ])
                 }
                 Message::ShortcutChanged(action, value) => {
@@ -6662,6 +6688,66 @@ mod tests {
             app.notice.as_deref(),
             Some("these diagnostics describe an earlier version of the file"),
         );
+    }
+
+    #[test]
+    fn find_preferences_load_share_persist_and_reset_across_standalone_tabs() {
+        use cagents::ui_controls::FindOption;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            std::fs::write(root.join(name), "foo FOO\n").unwrap();
+        }
+        let mut app = configured(&directory);
+        app.settings_writable = true;
+        app.settings.editor_find_options.case_sensitive = true;
+        app.settings.editor_replace_preserve_case = true;
+        let first = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        load_selected(&mut app, first);
+        let second = add(&mut app, root.to_str().unwrap(), Some("b.rs"));
+        load_selected(&mut app, second);
+        for id in [first, second] {
+            assert_eq!(app.tab(id).unwrap().runtime.find_preferences(),
+                (app.settings.editor_find_options, true));
+        }
+        let task = app.update(Message::Repository(RepositoryAction::FindOptionsChanged {
+            card: first, option: FindOption::Regex, enabled: true,
+        }));
+        run_tasks(&mut app, task);
+        let task = app.update(Message::Repository(RepositoryAction::PreserveCaseChanged {
+            card: first, enabled: false,
+        }));
+        run_tasks(&mut app, task);
+        let persisted = settings::load(&app.settings_path).unwrap();
+        assert!(persisted.editor_find_options.case_sensitive);
+        assert!(persisted.editor_find_options.regex);
+        assert!(!persisted.editor_replace_preserve_case);
+        let third = add(&mut app, root.to_str().unwrap(), Some("c.rs"));
+        load_selected(&mut app, third);
+        for id in [first, second, third] {
+            assert_eq!(app.tab(id).unwrap().runtime.find_preferences(),
+                (persisted.editor_find_options, false));
+        }
+        let mut reopened = configured(&directory);
+        reopened.settings_writable = true;
+        reopened.settings = persisted;
+        let fourth = add(&mut reopened, root.to_str().unwrap(), Some("d.rs"));
+        load_selected(&mut reopened, fourth);
+        assert_eq!(reopened.tab(fourth).unwrap().runtime.find_preferences(),
+            (app.settings.editor_find_options, false));
+        app.settings_open = true;
+        drop(app.update(Message::ResetSettings));
+        let task = app.update(Message::ResetSettings);
+        run_tasks(&mut app, task);
+        let defaults = AppSettings::default();
+        for id in [first, second, third] {
+            assert_eq!(app.tab(id).unwrap().runtime.find_preferences(),
+                (defaults.editor_find_options, defaults.editor_replace_preserve_case));
+        }
+        let reset = settings::load(&app.settings_path).unwrap();
+        assert_eq!(reset.editor_find_options, defaults.editor_find_options);
+        assert_eq!(reset.editor_replace_preserve_case, defaults.editor_replace_preserve_case);
     }
 
     #[test]

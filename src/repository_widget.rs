@@ -3214,6 +3214,22 @@ impl RepositoryRuntime {
             self.find_options = options;
             self.refresh_find_matches();
         }
+        if let Some(active) = &self.find_replacement
+            && !self.replacement_is_current(active)
+        {
+            active.cancellation.cancel();
+        }
+    }
+
+    /// Apply shared preferences and dispatch any refreshed asynchronous search.
+    pub fn update_find_preferences(
+        &mut self,
+        card: CardId,
+        options: crate::editor_search::FindOptions,
+        preserve_case: bool,
+    ) -> Task<RepositoryAction> {
+        self.set_find_preferences(options, preserve_case);
+        self.find_task(card)
     }
 
     pub fn find_preferences(&self) -> (crate::editor_search::FindOptions, bool) {
@@ -19139,6 +19155,25 @@ mod tests {
             },
         );
         assert_eq!(runtime.find_total, 4);
+    }
+
+    #[test]
+    fn shared_find_preferences_dispatch_refreshed_regex_results() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "a1 a.");
+        update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
+        update_find_settled(&mut runtime, RepositoryAction::FindQueryChanged {
+            card, query: "a.".into(),
+        });
+        assert_eq!(runtime.find_total, 1);
+        let mut options = runtime.find_preferences().0;
+        options.regex = true;
+        let task = runtime.update_find_preferences(card, options, true);
+        assert_eq!(runtime.find_total, 0);
+        assert!(runtime.find_active.is_some());
+        settle_find_tasks(&mut runtime, task);
+        assert_eq!(runtime.find_total, 2);
+        assert_eq!(runtime.find_preferences(), (options, true));
     }
 
     #[test]

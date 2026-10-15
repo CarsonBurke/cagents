@@ -12575,18 +12575,19 @@ impl Cagents {
         if previous.editor_find_options != self.settings.editor_find_options
             || previous.editor_replace_preserve_case != self.settings.editor_replace_preserve_case
         {
-            for runtime in self.cards.values_mut() {
-                match runtime {
-                    CardRuntime::Repository(runtime) => runtime.set_find_preferences(
-                        self.settings.editor_find_options,
+            for (card, runtime) in &mut self.cards {
+                let task = match runtime {
+                    CardRuntime::Repository(runtime) => runtime.update_find_preferences(
+                        *card, self.settings.editor_find_options,
                         self.settings.editor_replace_preserve_case,
                     ),
-                    CardRuntime::PullRequests(pane) => pane.runtime.set_find_preferences(
-                        self.settings.editor_find_options,
+                    CardRuntime::PullRequests(pane) => pane.runtime.update_find_preferences(
+                        *card, self.settings.editor_find_options,
                         self.settings.editor_replace_preserve_case,
                     ),
-                    _ => {}
-                }
+                    _ => Task::none(),
+                };
+                tasks.push(repository_task(task));
             }
         }
         if previous.keyboard_shortcuts != self.settings.keyboard_shortcuts {
@@ -14089,16 +14090,17 @@ impl Application for Cagents {
                     if let Some((options, preserve)) = preferences {
                         self.settings.editor_find_options = options;
                         self.settings.editor_replace_preserve_case = preserve;
-                        for runtime in self.cards.values_mut() {
-                            match runtime {
+                        for (target, runtime) in &mut self.cards {
+                            let task = match runtime {
                                 CardRuntime::Repository(runtime) => {
-                                    runtime.set_find_preferences(options, preserve)
+                                    runtime.update_find_preferences(*target, options, preserve)
                                 }
                                 CardRuntime::PullRequests(pane) => {
-                                    pane.runtime.set_find_preferences(options, preserve)
+                                    pane.runtime.update_find_preferences(*target, options, preserve)
                                 }
-                                _ => {}
-                            }
+                                _ => Task::none(),
+                            };
+                            tasks.push(repository_task(task));
                         }
                         tasks.push(self.save_settings_task(false));
                     }
