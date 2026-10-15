@@ -117,6 +117,8 @@ pub struct TextSnapshot {
     root: Option<Arc<Node>>,
     serialized: Arc<OnceLock<Arc<str>>>,
 }
+impl PartialEq for TextSnapshot { fn eq(&self, other: &Self) -> bool { self.same_text(other) } }
+impl Eq for TextSnapshot {}
 impl fmt::Debug for TextSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TextSnapshot").field("lines",&self.line_count()).field("bytes",&self.len()).finish()
@@ -130,6 +132,30 @@ impl TextSnapshot {
             SavedLine { text: Arc::from(text), ending, terminator, hash, power }
         }).collect();
         Self { root: build(&lines), serialized: Arc::new(OnceLock::new()) }
+    }
+    /// A functional replacement for protocol-compatible native lines. Only
+    /// the boundary lines, inserted text and AVL ancestors are copied.
+    pub fn replaced(&self, start: Position, end: Position, inserted: &str) -> Option<Self> {
+        if !self.protocol_compatible_lines()
+            || (start.line,start.column) > (end.line,end.column)
+            || inserted.as_bytes().iter().enumerate().any(|(index,byte)| *byte == b'\r' && inserted.as_bytes().get(index+1) != Some(&b'\n'))
+        { return None; }
+        let first = self.root.as_ref()?.line(start.line)?;
+        let last = self.root.as_ref()?.line(end.line)?;
+        let prefix = first.text.get(..start.column)?;
+        let suffix = last.text.get(end.column..)?;
+        let mut boundary = String::with_capacity(prefix.len()+inserted.len()+suffix.len());
+        boundary.push_str(prefix); boundary.push_str(inserted); boundary.push_str(suffix);
+        let mut lines = Vec::new();
+        let mut parts = boundary.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() { lines.push((part,last.ending,last.terminator)); }
+            else if let Some(text) = part.strip_suffix('\r') { lines.push((text,LineEnding::CrLf,"\r\n")); }
+            else { lines.push((part,LineEnding::Lf,"\n")); }
+        }
+        let mut result = self.clone();
+        result.replace_lines(start.line,end.line+1,lines);
+        Some(result)
     }
     pub fn len(&self) -> usize { self.root.as_ref().map_or(0,|root| root.bytes()) }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
@@ -184,6 +210,23 @@ mod tests {
             assert_balanced(left); assert_balanced(right);
         }
     }
+    #[test]
+    fn functional_replacements_preserve_native_lines_without_serializing() {
+        let original = TextSnapshot::from_lines([("α",LineEnding::CrLf,"\r\n"),("middle",LineEnding::Lf,"\n"),("last",LineEnding::None,"")]);
+        let changed = original.replaced(Position {line:0,column:2}, Position {line:1,column:3}, "insert\nnew").unwrap();
+        assert!(!original.is_materialized());
+        assert!(!changed.is_materialized());
+        assert_eq!(changed.text().as_ref(),"αinsert\nnewdle\nlast");
+        assert_eq!(original.text().as_ref(),"α\r\nmiddle\nlast");
+        assert!(original.replaced(Position {line:0,column:1},Position {line:0,column:2},"x").is_none());
+        assert!(original.replaced(Position {line:1,column:0},Position {line:0,column:0},"x").is_none());
+        assert!(original.replaced(Position {line:0,column:0},Position {line:0,column:0},"\r").is_none());
+        let at_end = original.replaced(Position {line:2,column:4},Position {line:2,column:4},"\r\n").unwrap();
+        assert_eq!(at_end.text().as_ref(),"α\r\nmiddle\nlast\r\n");
+        assert_eq!(at_end.line_count(),4);
+        if let Some(root) = &at_end.root { assert_balanced(root); }
+    }
+
     #[test]
     fn persistent_line_edits_keep_old_snapshots_and_balanced_aggregates() {
         let mut values: Vec<_> = (0..1024).map(|n| format!("line{n}\n")).collect();
