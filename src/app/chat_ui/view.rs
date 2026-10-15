@@ -1391,8 +1391,10 @@ impl Runtime {
                 widget::container(design::caption(snapshot.original_retry_diagnostic.clone().unwrap_or_else(||
                     "Restoring the original prompt settings…".into())))
                     .width(Length::Fill).into(),
-                icon(Icon::Refresh, "Refresh original restoration status", available,
-                    Action::Command(target, Command::Refresh)),
+                if snapshot.original_retry_pending {
+                    icon(Icon::Refresh, "Refresh original restoration status", available,
+                        Action::Command(target, Command::Refresh))
+                } else {iced::widget::Space::new().into()},
             ]).spacing(step::GAP_S).align_y(Alignment::Center).into());
         }
         content.extend(self.plan_view());

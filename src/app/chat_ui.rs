@@ -1368,6 +1368,9 @@ enum HistoryNavigation {
 }
 
 struct PendingCommand {
+    /// A non-authorizing cleanup/status command during exact restoration.
+    /// Its refusal is scoped feedback, not a replacement provider failure.
+    original_restoration: bool,
     followup: bool,
     /// The provider's queued message this command asks back, which stops
     /// being waited for if the request never reaches the provider.
@@ -5783,11 +5786,12 @@ impl Cagents {
         {
             return Task::none();
         }
+        let original_restoration=runtime.snapshot.original_retry_pending;
         runtime.next_command = runtime.next_command.wrapping_add(1);
         let id = runtime.next_command;
         let page = match &command {
             Command::LoadEarlier => Some(view::Page::Earlier),
-            Command::Refresh => Some(view::Page::Latest),
+            Command::Refresh if !original_restoration => Some(view::Page::Latest),
             Command::LoadLater => Some(view::Page::Newer),
             _ => None,
         };
@@ -5816,6 +5820,7 @@ impl Cagents {
         runtime.recovery.submitting(&handle.snapshot(), &command);
         runtime.recovery.notice = None;
         runtime.pending = Some(PendingCommand {
+            original_restoration,
             followup: false,
             take_back: None,
             id,
@@ -5827,7 +5832,7 @@ impl Cagents {
             sent,
             queued: step,
         });
-        runtime.error = None;
+        if !original_restoration {runtime.error = None;}
         let command=runtime.prompt_attachment_names(command);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || handle.send(command))
@@ -7650,6 +7655,10 @@ impl Cagents {
                             ]);
                         }
                         pending.first_prompt
+                    }
+                    Err(error) if pending.original_restoration => {
+                        runtime.recovery.notice=Some(format!("Original restoration: {error}"));
+                        return Task::none();
                     }
                     Err(error) => {
                         if pending.page.is_some() {
@@ -17104,6 +17113,56 @@ mod tests {
         let page=chat::annotations::OriginalPage {session_id:session,original,offset:0,next_offset:end,text:text[..end].into(),complete:end==text.len()};
         original_result(app,card,originals::Value::Metadata(page));
     }
+    #[test]
+    fn held_restoration_keeps_denials_and_cleanup_available_without_authorizing_work() {
+        for decision in ["deny","decline","reject","cancel","abort"] {
+            let mut app=crate::app::tests::context_inspector_test_app(false);
+            let card=live_chat(&mut app,Some(KNOWN_THREAD));let target=chat_runtime(&app,card).target;
+            let runtime=app.chat_runtime_mut(target).unwrap();
+            runtime.replace_draft(text_editor::Content::with_text("keep my unrelated draft"));
+            runtime.attachments=vec![Attachment {path:"/user/next.png".into()}];
+            let snapshot=Arc::make_mut(&mut runtime.snapshot);snapshot.original_retry_pending=true;
+            snapshot.requests=vec![chat::Request {id:"native-approval".into(),kind:chat::RequestKind::Approval,title:"Allow tool?".into(),description:String::new(),fields:vec![],
+                actions:["allow",decision].into_iter().map(|id|chat::Choice {id:id.into(),label:id.into(),description:String::new()}).collect()}];
+            let current=(*runtime.snapshot).clone();runtime.handle().unwrap().publish_snapshot_for_test(current);
+            drop(app.handle_chat_ui(Action::Answer(target,"native-approval".into(),"allow".into())));
+            assert!(chat_runtime(&app,card).pending.is_none());
+            drop(app.handle_chat_ui(Action::Answer(target,"native-approval".into(),decision.into())));
+            assert_eq!(chat_runtime(&app,card).pending.as_ref().unwrap().request.as_deref(),Some("native-approval"));
+            assert!(chat_runtime(&app,card).pending.as_ref().unwrap().original_restoration);
+            settle(&mut app,card,Ok(()));
+            let runtime=chat_runtime(&app,card);
+            assert_eq!(runtime.composer.text(),"keep my unrelated draft");
+            assert_eq!(runtime.attachments,vec![Attachment {path:"/user/next.png".into()}]);
+            assert!(runtime.snapshot.original_retry_pending,"denial ACK does not prove settings reconciled");
+        }
+    }
+
+    #[test]
+    fn restoration_refresh_ack_preserves_scroll_and_provider_failure_instead_of_paging_history() {
+        for result in [Ok(()),Err("Wait for effective settings readback".to_owned())] {
+            let mut app=crate::app::tests::context_inspector_test_app(false);
+            let card=live_chat(&mut app,Some(KNOWN_THREAD));let target=chat_runtime(&app,card).target;
+            let runtime=app.chat_runtime_mut(target).unwrap();
+            runtime.scroll=view::Scroll::new(480.0,1600.0,600.0);
+            runtime.error=Some("existing provider transport failure".into());
+            let snapshot=Arc::make_mut(&mut runtime.snapshot);snapshot.original_retry_pending=true;
+            snapshot.original_retry_diagnostic=Some("Readback pending".into());snapshot.error=Some("API Error: 529 Overloaded".into());
+            let current=(*runtime.snapshot).clone();runtime.handle().unwrap().publish_snapshot_for_test(current);
+            let scroll=runtime.scroll;let failures=runtime.failures.clone();
+            drop(app.chat_send(target,Command::Refresh,false));
+            let runtime=chat_runtime(&app,card);let pending=runtime.pending.as_ref().unwrap();
+            assert!(pending.original_restoration && pending.page.is_none());
+            assert!(runtime.page_request.is_none());
+            settle(&mut app,card,result.clone());
+            let runtime=chat_runtime(&app,card);
+            assert_eq!(runtime.scroll,scroll);assert_eq!(runtime.failures,failures);
+            assert_eq!(runtime.error.as_deref(),Some("existing provider transport failure"));
+            assert_eq!(runtime.snapshot.error.as_deref(),Some("API Error: 529 Overloaded"));
+            assert_eq!(runtime.recovery.notice.as_deref(),result.err().as_deref().map(|_|"Original restoration: Wait for effective settings readback"));
+        }
+    }
+
     #[test]
     fn pending_original_restore_refuses_new_intent_before_local_queue_or_account_routing() {
         let mut app=crate::app::tests::context_inspector_test_app(false);

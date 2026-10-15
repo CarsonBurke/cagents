@@ -146,7 +146,9 @@ impl Runtime {
     /// Navigation and cancellation remain available even when native busy is false.
     pub(super) fn original_restore_allows(&self, command: &Command) -> bool {
         !self.snapshot.original_retry_pending
-            || matches!(command, Command::Interrupt | Command::Refresh | Command::LoadEarlier | Command::LoadLater)
+            || matches!(command, Command::Interrupt | Command::Refresh | Command::LoadEarlier | Command::LoadLater
+                | Command::StopSubagent {..} | Command::RemoveQueued {..} | Command::DismissPermissionDenial {..})
+            || matches!(command, Command::Answer {action,..} if matches!(action.as_str(),"deny"|"decline"|"reject"|"cancel"|"abort"))
     }
     fn revoke_originals(&mut self) {
         self.recovery.originals.clear();
