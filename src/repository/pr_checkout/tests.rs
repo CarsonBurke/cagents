@@ -13,8 +13,14 @@ fn isolated_fixture_case(qualified: &str) -> bool {
     let prefix = concat!(env!("CARGO_CRATE_NAME"), "::");
     let case = qualified.strip_prefix(prefix).unwrap_or(qualified);
     if std::env::var("CAGENTS_PR_FIXTURE_CASE").as_deref() == Ok(case) {
-        assert!(std::env::vars_os().all(|(name, _)| !name.as_encoded_bytes().starts_with(b"GIT_")), "owning child must start before any ambient Git configuration is captured");
-        for (marker, setting) in [("CAGENTS_PR_FIXTURE_RUNTIME", "XDG_RUNTIME_DIR"), ("CAGENTS_PR_FIXTURE_DATA", "XDG_DATA_HOME")] {
+        assert!(
+            std::env::vars_os().all(|(name, _)| !name.as_encoded_bytes().starts_with(b"GIT_")),
+            "owning child must start before any ambient Git configuration is captured"
+        );
+        for (marker, setting) in [
+            ("CAGENTS_PR_FIXTURE_RUNTIME", "XDG_RUNTIME_DIR"),
+            ("CAGENTS_PR_FIXTURE_DATA", "XDG_DATA_HOME"),
+        ] {
             let path = std::env::var_os(marker).expect("owned isolated fixture directory");
             assert_eq!(std::env::var_os(setting), Some(path.clone()));
             let metadata = fs::metadata(path).unwrap();
@@ -24,35 +30,77 @@ fn isolated_fixture_case(qualified: &str) -> bool {
         }
         return false;
     }
-    let private = |prefix: &str| tempfile::Builder::new().prefix(prefix)
-        .permissions(fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+    let private = |prefix: &str| {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    };
     let runtime = private("cagents-pr-runtime-");
     let data = private("cagents-pr-data-");
     let mut command = CommandSpec::new(std::env::current_exe().unwrap())
-        .args([case, "--exact", "--nocapture", "--test-threads=1", "--color=never"])
+        .args([
+            case,
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--color=never",
+        ])
         .env("CAGENTS_PR_FIXTURE_CASE", case)
         .env("CAGENTS_PR_FIXTURE_RUNTIME", runtime.path())
         .env("CAGENTS_PR_FIXTURE_DATA", data.path())
-        .env("XDG_RUNTIME_DIR", runtime.path()).env("XDG_DATA_HOME", data.path())
-        .timeout(Duration::from_secs(90)).output_limits(1024 * 1024, 1024 * 1024);
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_DATA_HOME", data.path())
+        .timeout(Duration::from_secs(90))
+        .output_limits(1024 * 1024, 1024 * 1024);
     for (name, _) in std::env::vars_os() {
-        if name.as_encoded_bytes().starts_with(b"GIT_") { command = command.env_remove(name); }
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            command = command.env_remove(name);
+        }
     }
     // Reuse the existing bounded executor instead of writing an unbounded
     // child stream to disk. Private files contain only the bounded result.
-    let (success, stdout, stderr, status) = match SystemProcessExecutor.execute(&command, &CancellationToken::default()) {
-        Ok(output) => (output.success, output.stdout, output.stderr, format!("exit {:?}, signal {:?}", output.exit_code, output.signal)),
-        Err(failure) => (false, failure.stdout, failure.stderr, format!("{:?}: {}", failure.kind, failure.message)),
-    };
+    let (success, stdout, stderr, status) =
+        match SystemProcessExecutor.execute(&command, &CancellationToken::default()) {
+            Ok(output) => (
+                output.success,
+                output.stdout,
+                output.stderr,
+                format!("exit {:?}, signal {:?}", output.exit_code, output.signal),
+            ),
+            Err(failure) => (
+                false,
+                failure.stdout,
+                failure.stderr,
+                format!("{:?}: {}", failure.kind, failure.message),
+            ),
+        };
     for (name, bytes) in [("case.stdout", &stdout), ("case.stderr", &stderr)] {
-        fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .open(runtime.path().join(name)).unwrap().write_all(bytes).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(runtime.path().join(name))
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
     }
     let stdout = String::from_utf8_lossy(&stdout);
     let stderr = String::from_utf8_lossy(&stderr);
     assert!(success, "owning case {case}: {status}\n{stdout}\n{stderr}");
-    assert!(stdout.lines().any(|line| line.contains(&format!("test {case} ... ok"))), "actual named owning test did not pass: {stdout}\n{stderr}");
-    assert!(stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")), "exact selector must run one owning case: {stdout}\n{stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains(&format!("test {case} ... ok"))),
+        "actual named owning test did not pass: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+        "exact selector must run one owning case: {stdout}\n{stderr}"
+    );
     print!("{stdout}");
     eprint!("{stderr}");
     true
@@ -113,7 +161,16 @@ fn run_git(directory: &Path, args: &[&str]) -> Output {
         }
     }
     let output = command
-        .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "init.templateDir=", "-c", "commit.gpgsign=false"])
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "init.templateDir=",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .arg("-C")
         .arg(directory)
         .args(args)
@@ -266,7 +323,13 @@ fn is_effect(command: &CommandSpec) -> bool {
 
 #[test]
 fn missing_tracking_is_confirmed_atomically_and_bare_push_updates_pr() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(missing_tracking_is_confirmed_atomically_and_bare_push_updates_pr))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(missing_tracking_is_confirmed_atomically_and_bare_push_updates_pr)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(false);
     run_git(&fixture.root, &["config", "example.unrelated", "preserved"]);
     let path = fixture.root.join(".git/config");
@@ -305,7 +368,15 @@ fn missing_tracking_is_confirmed_atomically_and_bare_push_updates_pr() {
 
 #[test]
 fn advanced_pr_fast_forwards_existing_worktree_and_preserves_unrelated_ignored_tree() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(advanced_pr_fast_forwards_existing_worktree_and_preserves_unrelated_ignored_tree))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(
+            advanced_pr_fast_forwards_existing_worktree_and_preserves_unrelated_ignored_tree
+        )
+    )) {
+        return;
+    }
     for tracked in [false, true] {
         let fixture = Fixture::new(tracked);
         fs::create_dir(fixture.root.join("secret")).unwrap();
@@ -342,7 +413,13 @@ fn advanced_pr_fast_forwards_existing_worktree_and_preserves_unrelated_ignored_t
 
 #[test]
 fn repeated_current_checkout_is_verified_without_fetch_or_losing_local_edits() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(repeated_current_checkout_is_verified_without_fetch_or_losing_local_edits))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(repeated_current_checkout_is_verified_without_fetch_or_losing_local_edits)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     fs::write(fixture.root.join("other"), "local edit\n").unwrap();
     let plan = fixture.prepare(&fixture.request(fixture.original.clone()));
@@ -359,7 +436,13 @@ fn repeated_current_checkout_is_verified_without_fetch_or_losing_local_edits() {
 
 #[test]
 fn readonly_pr_branch_updates_exact_head_without_configuring_upstream() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(readonly_pr_branch_updates_exact_head_without_configuring_upstream))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(readonly_pr_branch_updates_exact_head_without_configuring_upstream)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(false);
     run_git(&fixture.root, &["branch", "-m", "pr/7"]);
     let new = fixture.advance(|root| fs::write(root.join("file"), "readonly new\n").unwrap());
@@ -380,7 +463,13 @@ fn readonly_pr_branch_updates_exact_head_without_configuring_upstream() {
 
 #[test]
 fn alias_branch_requires_explicit_upstream_push_mode_and_never_rewrites_policy() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(alias_branch_requires_explicit_upstream_push_mode_and_never_rewrites_policy))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(alias_branch_requires_explicit_upstream_push_mode_and_never_rewrites_policy)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     run_git(&fixture.root, &["branch", "-m", "alias"]);
     let mut request = fixture.request(fixture.original.clone());
@@ -412,7 +501,13 @@ fn alias_branch_requires_explicit_upstream_push_mode_and_never_rewrites_policy()
 
 #[test]
 fn partial_conflicting_and_push_override_configuration_refuses_without_mutation() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(partial_conflicting_and_push_override_configuration_refuses_without_mutation))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(partial_conflicting_and_push_override_configuration_refuses_without_mutation)
+    )) {
+        return;
+    }
     for (key, value) in [
         ("branch.feature.remote", "origin"),
         ("branch.feature.merge", "refs/heads/feature"),
@@ -444,7 +539,13 @@ fn partial_conflicting_and_push_override_configuration_refuses_without_mutation(
 
 #[test]
 fn dirty_or_locally_ahead_checkout_refuses_and_preserves_every_edit() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(dirty_or_locally_ahead_checkout_refuses_and_preserves_every_edit))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(dirty_or_locally_ahead_checkout_refuses_and_preserves_every_edit)
+    )) {
+        return;
+    }
     for staged in [false, true] {
         let fixture = Fixture::new(true);
         let new = fixture.advance(|root| fs::write(root.join("file"), "PR\n").unwrap());
@@ -482,7 +583,13 @@ fn dirty_or_locally_ahead_checkout_refuses_and_preserves_every_edit() {
 
 #[test]
 fn same_oid_branch_switch_at_effect_is_refused_under_native_ref_locks() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(same_oid_branch_switch_at_effect_is_refused_under_native_ref_locks))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(same_oid_branch_switch_at_effect_is_refused_under_native_ref_locks)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     run_git(&fixture.root, &["branch", "other-branch"]);
     let new = fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap());
@@ -510,7 +617,13 @@ fn same_oid_branch_switch_at_effect_is_refused_under_native_ref_locks() {
 
 #[test]
 fn concurrent_config_edit_and_dirty_write_at_effect_are_preserved() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(concurrent_config_edit_and_dirty_write_at_effect_are_preserved))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(concurrent_config_edit_and_dirty_write_at_effect_are_preserved)
+    )) {
+        return;
+    }
     for config in [false, true] {
         let fixture = Fixture::new(true);
         let new = fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap());
@@ -549,7 +662,13 @@ fn concurrent_config_edit_and_dirty_write_at_effect_are_preserved() {
 
 #[test]
 fn ignored_collision_created_after_census_is_preserved_at_checkout_effect() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(ignored_collision_created_after_census_is_preserved_at_checkout_effect))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(ignored_collision_created_after_census_is_preserved_at_checkout_effect)
+    )) {
+        return;
+    }
     let mut fixture = Fixture::new(true);
     let new = fixture.advance(|root| {
         fs::write(root.join("secret"), "PR secret\n").unwrap();
@@ -611,7 +730,13 @@ exec /usr/bin/git "$@"
 
 #[test]
 fn native_preserving_checkout_keeps_original_head_and_index_policy() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(native_preserving_checkout_keeps_original_head_and_index_policy))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(native_preserving_checkout_keeps_original_head_and_index_policy)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     let new = fixture.advance(|root| fs::write(root.join("file"), "native new\n").unwrap());
     let policy = fixture.root.join(".git/index policy");
@@ -667,7 +792,13 @@ fn native_preserving_checkout_keeps_original_head_and_index_policy() {
 
 #[test]
 fn preserving_checkout_can_advance_to_a_new_commit_with_the_same_tree() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(preserving_checkout_can_advance_to_a_new_commit_with_the_same_tree))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(preserving_checkout_can_advance_to_a_new_commit_with_the_same_tree)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     let new = fixture.advance(|root| {
         fs::write(root.join("file"), "intermediate\n").unwrap();
@@ -695,7 +826,13 @@ fn preserving_checkout_can_advance_to_a_new_commit_with_the_same_tree() {
 
 #[test]
 fn unexpected_head_lock_probe_success_is_uncertain_and_never_runs_checkout() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(unexpected_head_lock_probe_success_is_uncertain_and_never_runs_checkout))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(unexpected_head_lock_probe_success_is_uncertain_and_never_runs_checkout)
+    )) {
+        return;
+    }
     let mut fixture = Fixture::new(true);
     let new = fixture.advance(|root| fs::write(root.join("file"), "native new\n").unwrap());
     let wrapper = fixture.temporary.path().join("unexpected-probe-git");
@@ -742,7 +879,13 @@ exec /usr/bin/git "$@"
 
 #[test]
 fn a_different_checkout_failure_cannot_publish_the_parent_reference() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(a_different_checkout_failure_cannot_publish_the_parent_reference))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(a_different_checkout_failure_cannot_publish_the_parent_reference)
+    )) {
+        return;
+    }
     let mut fixture = Fixture::new(true);
     let new = fixture.advance(|root| fs::write(root.join("file"), "native new\n").unwrap());
     let wrapper = fixture.temporary.path().join("failed-after-checkout-git");
@@ -796,7 +939,13 @@ exec /usr/bin/git "$@"
 
 #[test]
 fn cancellation_after_native_index_publication_retains_partial_state() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(cancellation_after_native_index_publication_retains_partial_state))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(cancellation_after_native_index_publication_retains_partial_state)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     let new = fixture.advance(|root| fs::write(root.join("file"), "native new\n").unwrap());
     let hooks = fixture.root.join(".git/hooks");
@@ -850,7 +999,13 @@ printf paused > "$CAGENTS_PR_GITDIR_FD/checkout-paused"
 
 #[test]
 fn ignored_collision_refuses_and_preserves_original_secret() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(ignored_collision_refuses_and_preserves_original_secret))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(ignored_collision_refuses_and_preserves_original_secret)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     let new = fixture.advance(|root| {
         fs::write(root.join("secret"), "PR secret\n").unwrap();
@@ -873,7 +1028,13 @@ fn ignored_collision_refuses_and_preserves_original_secret() {
 
 #[test]
 fn ignored_symlink_ancestor_refuses_without_touching_its_external_target() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(ignored_symlink_ancestor_refuses_without_touching_its_external_target))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(ignored_symlink_ancestor_refuses_without_touching_its_external_target)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     let new = fixture.advance(|root| {
         fs::create_dir(root.join("secret")).unwrap();
@@ -901,7 +1062,13 @@ fn ignored_symlink_ancestor_refuses_without_touching_its_external_target() {
 
 #[test]
 fn plan_debug_never_formats_configuration_bytes_or_credential_urls() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(plan_debug_never_formats_configuration_bytes_or_credential_urls))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(plan_debug_never_formats_configuration_bytes_or_credential_urls)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     let secret = "fixture-authorization-sentinel";
     let token = "fixture-url-token-sentinel";
@@ -926,7 +1093,13 @@ fn plan_debug_never_formats_configuration_bytes_or_credential_urls() {
 
 #[test]
 fn replacing_worktree_path_at_effect_never_updates_replacement_or_wrong_inode() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(replacing_worktree_path_at_effect_never_updates_replacement_or_wrong_inode))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(replacing_worktree_path_at_effect_never_updates_replacement_or_wrong_inode)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     let new = fixture.advance(|root| fs::write(root.join("file"), "PR\n").unwrap());
     let plan = fixture.prepare(&fixture.request(new));
@@ -962,7 +1135,13 @@ fn replacing_worktree_path_at_effect_never_updates_replacement_or_wrong_inode() 
 
 #[test]
 fn direct_config_edit_during_staging_is_preserved_and_pair_is_not_published() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(direct_config_edit_during_staging_is_preserved_and_pair_is_not_published))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(direct_config_edit_during_staging_is_preserved_and_pair_is_not_published)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(false);
     let plan = fixture.prepare(&fixture.request(fixture.original.clone()));
     let config = fixture.root.join(".git/config");
@@ -993,7 +1172,15 @@ fn direct_config_edit_during_staging_is_preserved_and_pair_is_not_published() {
 
 #[test]
 fn concurrent_private_config_snapshot_never_widens_the_named_lock_or_exposes_new_bytes() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(concurrent_private_config_snapshot_never_widens_the_named_lock_or_exposes_new_bytes))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(
+            concurrent_private_config_snapshot_never_widens_the_named_lock_or_exposes_new_bytes
+        )
+    )) {
+        return;
+    }
     let fixture = Fixture::new(false);
     let config = fixture.root.join(".git/config");
     fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
@@ -1040,7 +1227,13 @@ fn concurrent_private_config_snapshot_never_widens_the_named_lock_or_exposes_new
 
 #[test]
 fn foreign_index_lock_is_preserved_without_publishing_tracking() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(foreign_index_lock_is_preserved_without_publishing_tracking))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(foreign_index_lock_is_preserved_without_publishing_tracking)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(false);
     let plan = fixture.prepare(&fixture.request(fixture.original.clone()));
     fs::write(
@@ -1063,7 +1256,15 @@ fn foreign_index_lock_is_preserved_without_publishing_tracking() {
 
 #[test]
 fn original_policy_is_chained_with_its_hook_configuration_and_aborted_effects_are_honest() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(original_policy_is_chained_with_its_hook_configuration_and_aborted_effects_are_honest))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(
+            original_policy_is_chained_with_its_hook_configuration_and_aborted_effects_are_honest
+        )
+    )) {
+        return;
+    }
     for reject in ["none", "prepared", "committed"] {
         let fixture = Fixture::new(true);
         let new = fixture.advance(|root| fs::write(root.join("file"), "policy PR\n").unwrap());
@@ -1114,7 +1315,15 @@ fn original_policy_is_chained_with_its_hook_configuration_and_aborted_effects_ar
 
 #[test]
 fn native_addition_guard_preserves_non_utf8_ignored_data_and_refuses_file_to_directory() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(native_addition_guard_preserves_non_utf8_ignored_data_and_refuses_file_to_directory))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(
+            native_addition_guard_preserves_non_utf8_ignored_data_and_refuses_file_to_directory
+        )
+    )) {
+        return;
+    }
     use std::os::unix::ffi::OsStringExt;
     let fixture = Fixture::new(true);
     let odd = OsString::from_vec(b"odd\xff\n[] -entry".to_vec());
@@ -1153,7 +1362,13 @@ fn native_addition_guard_preserves_non_utf8_ignored_data_and_refuses_file_to_dir
 
 #[test]
 fn new_paths_with_newlines_and_globs_are_checked_and_installed_literally() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(new_paths_with_newlines_and_globs_are_checked_and_installed_literally))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(new_paths_with_newlines_and_globs_are_checked_and_installed_literally)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     let path = "new []\n -entry";
     let new = fixture.advance(|root| fs::write(root.join(path), "literal\n").unwrap());
@@ -1165,7 +1380,13 @@ fn new_paths_with_newlines_and_globs_are_checked_and_installed_literally() {
 
 #[test]
 fn truncated_or_over_limit_addition_census_refuses_before_checkout() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(truncated_or_over_limit_addition_census_refuses_before_checkout))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(truncated_or_over_limit_addition_census_refuses_before_checkout)
+    )) {
+        return;
+    }
     for payload in ["printf x", "/usr/bin/head -c 16777217 /dev/zero"] {
         let mut fixture = Fixture::new(true);
         let new = fixture.advance(|root| fs::write(root.join("new-path"), "new\n").unwrap());
@@ -1187,7 +1408,13 @@ fn truncated_or_over_limit_addition_census_refuses_before_checkout() {
 
 #[test]
 fn unsupported_native_transaction_refuses_before_any_checkout_effect() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(unsupported_native_transaction_refuses_before_any_checkout_effect))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(unsupported_native_transaction_refuses_before_any_checkout_effect)
+    )) {
+        return;
+    }
     let mut fixture = Fixture::new(true);
     let new = fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap());
     let wrapper = fixture.temporary.path().join("unsupported-git-wrapper");
@@ -1208,7 +1435,15 @@ fn unsupported_native_transaction_refuses_before_any_checkout_effect() {
 
 #[test]
 fn detached_policy_descendant_keeps_operation_running_and_protected_through_cancellation() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(detached_policy_descendant_keeps_operation_running_and_protected_through_cancellation))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(
+            detached_policy_descendant_keeps_operation_running_and_protected_through_cancellation
+        )
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     let new = fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap());
     let policy = fixture.root.join(".git/descendant-policy");
@@ -1283,7 +1518,15 @@ fn detached_policy_descendant_keeps_operation_running_and_protected_through_canc
 
 #[test]
 fn policy_child_finishing_before_first_lease_probe_cannot_authorize_a_stale_receipt() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(policy_child_finishing_before_first_lease_probe_cannot_authorize_a_stale_receipt))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(
+            policy_child_finishing_before_first_lease_probe_cannot_authorize_a_stale_receipt
+        )
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     let new = fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap());
     let policy = fixture.root.join(".git/late-policy");
@@ -1364,7 +1607,13 @@ fi
 
 #[test]
 fn packed_nested_branches_repair_absent_tracking_and_can_fast_forward() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(packed_nested_branches_repair_absent_tracking_and_can_fast_forward))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(packed_nested_branches_repair_absent_tracking_and_can_fast_forward)
+    )) {
+        return;
+    }
     for advance in [false, true] {
         let fixture = Fixture::new(false);
         run_git(&fixture.root, &["branch", "-m", "nested/feature"]);
@@ -1398,7 +1647,13 @@ fn packed_nested_branches_repair_absent_tracking_and_can_fast_forward() {
 
 #[test]
 fn missing_ref_namespace_never_follows_a_foreign_symlink_parent() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(missing_ref_namespace_never_follows_a_foreign_symlink_parent))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(missing_ref_namespace_never_follows_a_foreign_symlink_parent)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(false);
     let external = fixture.temporary.path().join("external-ref-storage");
     fs::create_dir(&external).unwrap();
@@ -1410,7 +1665,15 @@ fn missing_ref_namespace_never_follows_a_foreign_symlink_parent() {
 
 #[test]
 fn explicit_preserve_local_keeps_ahead_commits_and_all_dirty_bytes_without_fetch_or_repair() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(explicit_preserve_local_keeps_ahead_commits_and_all_dirty_bytes_without_fetch_or_repair))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(
+            explicit_preserve_local_keeps_ahead_commits_and_all_dirty_bytes_without_fetch_or_repair
+        )
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     fs::write(fixture.root.join("file"), "local commit\n").unwrap();
     run_git(&fixture.root, &["commit", "-qam", "local work"]);
@@ -1480,7 +1743,15 @@ fn explicit_preserve_local_keeps_ahead_commits_and_all_dirty_bytes_without_fetch
 
 #[test]
 fn explicit_preserve_local_admits_diverged_commits_while_strict_writer_still_refuses() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(explicit_preserve_local_admits_diverged_commits_while_strict_writer_still_refuses))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(
+            explicit_preserve_local_admits_diverged_commits_while_strict_writer_still_refuses
+        )
+    )) {
+        return;
+    }
     let fixture = Fixture::new(true);
     fs::write(fixture.root.join("file"), "local divergent commit\n").unwrap();
     run_git(&fixture.root, &["commit", "-qam", "local divergence"]);
@@ -1516,7 +1787,13 @@ fn explicit_preserve_local_admits_diverged_commits_while_strict_writer_still_ref
 
 #[test]
 fn preserve_local_never_repairs_missing_tracking_or_accepts_changed_confirmation() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(preserve_local_never_repairs_missing_tracking_or_accepts_changed_confirmation))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(preserve_local_never_repairs_missing_tracking_or_accepts_changed_confirmation)
+    )) {
+        return;
+    }
     let missing = Fixture::new(false);
     let request = missing.request(missing.original.clone());
     let config = fs::read(missing.root.join(".git/config")).unwrap();
@@ -1565,7 +1842,13 @@ impl std::io::Write for PrivateFetchLogSink {
 
 #[test]
 fn private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr)
+    )) {
+        return;
+    }
     const CHILD: &str = "CAGENTS_PRIVATE_FETCH_LOG_TEST";
     if std::env::var_os(CHILD).is_none() {
         let output = Command::new(std::env::current_exe().unwrap()).args(["--exact", "repository::pr_checkout::tests::private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr", "--nocapture"]).env(CHILD, "1").output().unwrap();
@@ -1693,7 +1976,13 @@ fn private_fetch_failure_never_logs_or_displays_credentials_in_argv_or_stderr() 
 
 #[test]
 fn captured_raw_fetch_endpoint_applies_git_url_rewrites_exactly_once() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(captured_raw_fetch_endpoint_applies_git_url_rewrites_exactly_once))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(captured_raw_fetch_endpoint_applies_git_url_rewrites_exactly_once)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(false);
     let missing = fixture.temporary.path().join("must-not-be-used");
     run_git(
@@ -1714,7 +2003,13 @@ fn captured_raw_fetch_endpoint_applies_git_url_rewrites_exactly_once() {
 
 #[test]
 fn explicit_tracking_repair_preserves_local_ahead_dirty_work_and_all_refs() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(explicit_tracking_repair_preserves_local_ahead_dirty_work_and_all_refs))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(explicit_tracking_repair_preserves_local_ahead_dirty_work_and_all_refs)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(false);
     fs::write(fixture.root.join("file"), "local commit\n").unwrap();
     run_git(&fixture.root, &["commit", "-qam", "local work"]);
@@ -1823,7 +2118,15 @@ fn explicit_tracking_repair_preserves_local_ahead_dirty_work_and_all_refs() {
 
 #[test]
 fn tracking_repair_preserves_diverged_head_and_refuses_missing_or_stale_tracking_refs() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(tracking_repair_preserves_diverged_head_and_refuses_missing_or_stale_tracking_refs))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(
+            tracking_repair_preserves_diverged_head_and_refuses_missing_or_stale_tracking_refs
+        )
+    )) {
+        return;
+    }
     let fixture = Fixture::new(false);
     fs::write(fixture.root.join("file"), "local divergent\n").unwrap();
     run_git(&fixture.root, &["commit", "-qam", "local divergence"]);
@@ -1885,7 +2188,13 @@ fn tracking_repair_preserves_diverged_head_and_refuses_missing_or_stale_tracking
 
 #[test]
 fn tracking_only_preserve_requires_absent_pair_and_fresh_confirmation() {
-    if isolated_fixture_case(concat!(module_path!(), "::", stringify!(tracking_only_preserve_requires_absent_pair_and_fresh_confirmation))) { return; }
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(tracking_only_preserve_requires_absent_pair_and_fresh_confirmation)
+    )) {
+        return;
+    }
     let fixture = Fixture::new(false);
     let request = fixture.request(fixture.original.clone());
     let plan = fixture
