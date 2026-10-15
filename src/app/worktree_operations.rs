@@ -102,10 +102,11 @@ impl ActiveWorktreeOperation {
                     worktrees.iter().any(|worktree| worktree.path == *path)
                 });
                 (!self.restored && !listed).then(|| {
-                    (
-                        WorktreeOperationPhase::Working,
-                        "Created; waiting for the checkout to list it".to_owned(),
-                    )
+                    if self.source.is_none() || self.project_generation.is_none() {
+                        (WorktreeOperationPhase::Failed, "Created; publication withheld because the original source receipt is unavailable. Reload the original project to inspect it.".to_owned())
+                    } else {
+                        (WorktreeOperationPhase::Working, "Created; waiting for the checkout to list it".to_owned())
+                    }
                 })
             }
             Some(WorktreeOperationState::NotCreated) if self.restored => None,
@@ -175,6 +176,7 @@ impl Cagents {
             .any(|operation| !operation.finished)
     }
 
+    #[cfg(test)]
     pub(super) fn start_worktree_operation(
         &mut self,
         project: ProjectId,
@@ -184,6 +186,7 @@ impl Cagents {
         self.start_worktree_operation_with_source(project, request, draft, None)
     }
 
+    #[cfg(test)]
     pub(super) fn start_worktree_operation_with_source(
         &mut self,
         project: ProjectId,
@@ -253,6 +256,9 @@ impl Cagents {
                     detail: format!("The original creation source is unavailable; no creation was started: {detail}"),
                     created_at_unix_ms: unix_millis(),
                 };
+                if project_generation.is_none() {
+                    return refused("the original logical project generation is unavailable; reload the project".to_owned());
+                }
                 match source {
                     Some(source) => {
                         if source.repository() != request.repository {
@@ -267,8 +273,7 @@ impl Cagents {
                             Err(error) => refused(error.to_string()),
                         }
                     }
-                    None => RepositoryService::system("git")
-                        .create_worktree_journaled(&store, &request, generation, &token, &sender),
+                    None => refused("the original displayed physical source is unavailable; reload the project".to_owned()),
                 }
             })
             .await
@@ -400,11 +405,12 @@ impl Cagents {
         if let (Some(repository), Some(outcome @ WorktreeCreationOutcome::Created { .. })) =
             (repository, outcome)
         {
-            return cosmic::task::message(match (source_id, project_generation) {
-                (Some(source_id), Some(project_generation)) => Message::ProjectWorktreeCreated {
-                    project_id, source_id, project_generation, operation: id, repository, result: Ok(outcome),
-                },
-                _ => Message::WorktreeCreated { project_id, repository, result: Ok(outcome) },
+            let (Some(source_id), Some(project_generation)) = (source_id, project_generation) else {
+                self.status = Some(TransientNotice::warning("Creation settled without its original source receipt. Its result was retained; reload the original project to inspect it."));
+                return Task::none();
+            };
+            return cosmic::task::message(Message::ProjectWorktreeCreated {
+                project_id, source_id, project_generation, operation: id, repository, result: Ok(outcome),
             });
         }
         Task::none()

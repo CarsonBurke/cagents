@@ -526,9 +526,8 @@ impl Cagents {
                             .resolve_worktree_request(&input, &token)
                             .map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
                     },
-                    None => RepositoryService::system("git")
-                        .resolve_worktree_request(&input, &token)
-                        .map_err(|error| WorktreeInputError::from_resolution(&error, &draft)),
+                    None => Err(WorktreeInputError::general(
+                        "The displayed creation source is unavailable. Reload the project before creating a worktree.")),
                 }
             })
             .await
@@ -1547,7 +1546,6 @@ mod tests {
         parked
     }
 
-    #[cfg(target_os = "linux")]
     async fn first_creation_message(task: Task<Message>) -> Message {
         use cosmic::iced::futures::StreamExt;
         let mut stream = iced::runtime::task::into_stream(task).expect("production worker task exists");
@@ -1567,6 +1565,88 @@ mod tests {
         let source = opened.source.clone().expect("ordinary generic dialog consumes published source");
         assert_eq!(opened.project_creation_id, Some(source.id()));
         source
+    }
+
+    #[tokio::test]
+    async fn unbound_form_resolution_refuses_without_starting_a_creation() {
+        let Fixture { mut app, .. } = fixture();
+        drop(app.update(Message::WorktreeBranchChanged("topic".into())));
+        let resolved = first_creation_message(app.submit_worktree_dialog()).await;
+        let Message::WorktreeInputResolved { result: Err(error), .. } = &resolved else {
+            panic!("a form without physical consent must refuse before discovery");
+        };
+        assert!(error.message.contains("Reload the project"));
+        drop(app.update(resolved));
+        assert!(app.worktree_operations.is_empty());
+        assert!(dialog(&app).resolving.is_none());
+        assert!(dialog(&app).error.as_ref().unwrap().message.contains("Reload the project"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unbound_creation_worker_refuses_even_a_valid_resolved_request() {
+        const TEST: &str = "app::worktree_dialog::tests::unbound_creation_worker_refuses_even_a_valid_resolved_request";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        for missing_source in [true, false] {
+            let (mut fixture, _files, root, _oid) = real_history_source();
+            let source = dialog(&fixture.app).source.clone().unwrap();
+            let (project, operation, request) = resolve_history_input(fixture.app.submit_worktree_dialog()).await;
+            let destination = request.destination.clone();
+            let generation = fixture.app.project_creation_generation(project).unwrap();
+            let task = fixture.app.start_worktree_operation_with_project_source(project, request, None,
+                (!missing_source).then_some(source), None, missing_source.then_some(generation));
+            let finished = first_creation_message(task).await;
+            let Message::WorktreeOperationFinished { result: Ok(report), .. } = &finished else {
+                panic!("the refusing worker must settle explicitly");
+            };
+            assert_eq!(report.operation_id, operation);
+            assert_eq!(report.state, WorktreeOperationState::NotCreated);
+            assert!(report.outcome.is_none());
+            assert!(report.detail.contains("unavailable"));
+            assert!(!destination.exists());
+            assert!(!root.join(".worktrees").exists());
+            assert!(isolated_git(&root, &["for-each-ref", "--format=%(refname)", "refs/heads/history-topic"]).is_empty());
+            drop(fixture.app.update(finished));
+            assert!(!fixture.app.has_active_worktree_operations());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_created_report_without_original_source_proof_is_retained_without_publication() {
+        const TEST: &str = "app::worktree_dialog::tests::a_created_report_without_original_source_proof_is_retained_without_publication";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        for missing_source in [true, false] {
+            let (mut fixture, _files, _root, _oid) = real_history_source();
+            let source = dialog(&fixture.app).source.clone().unwrap();
+            let (project, operation, request) = resolve_history_input(fixture.app.submit_worktree_dialog()).await;
+            let generation = fixture.app.project_creation_generation(project).unwrap();
+            let created = crate::model::WorktreeId::new();
+            let record = crate::repository::WorktreeRecord {
+                id: created, path: request.destination.clone(), created_at_unix_ms: None,
+                head_oid: None, branch: Some("refs/heads/history-topic".into()),
+                detached: false, bare: false, lock: crate::repository::WorktreeLock::default(),
+                prunable_reason: None,
+            };
+            // A synthetic worker answer exercises the final reducer only.
+            // The unbound task is never driven and no worktree is created.
+            drop(fixture.app.start_worktree_operation_with_project_source(project, request.clone(), None,
+                (!missing_source).then_some(source), None, missing_source.then_some(generation)));
+            let next = fixture.app.finish_worktree_operation(operation, 1, Ok(crate::repository::WorktreeOperationReport {
+                operation_id: operation, generation: 1, request: Some(request),
+                state: WorktreeOperationState::Created,
+                outcome: Some(WorktreeCreationOutcome::Created { worktree: record, warnings: vec![] }),
+                detail: "Created fixture answer".into(), created_at_unix_ms: 1,
+            }));
+            assert!(iced::runtime::task::into_stream(next).is_none(), "no raw or guarded publication may escape missing consent");
+            assert!(fixture.app.worktree_operations.contains_key(&operation));
+            assert!(!fixture.app.has_active_worktree_operations());
+            let row = fixture.app.sidebar_model.project(project).unwrap().operations.iter().find(|row| row.id == operation).unwrap();
+            assert!(row.detail.contains("publication withheld"));
+            assert!(!fixture.app.sidebar_model.project(project).unwrap().worktrees.iter().any(|row| row.id == created));
+            fixture.app.session.as_ref().unwrap().flush(Duration::from_secs(5)).unwrap();
+            assert!(fixture.app.session.as_ref().unwrap().operation_store().load_worktree(created).unwrap().is_none());
+        }
     }
 
     #[cfg(target_os = "linux")]
