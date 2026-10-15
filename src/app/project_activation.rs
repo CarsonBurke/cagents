@@ -89,6 +89,8 @@ pub(super) fn supersedes_project_activation(message: &Message) -> bool {
         | Message::ActivateSession { .. } | Message::NewTerminal | Message::NewBrowser
         | Message::OpenBrowser(_) | Message::OpenLink(..) | Message::OpenDocumentLink(..)
         | Message::ChromeUi(chrome_ui::Action::Launch(_))
+        | Message::RunCommand(_)
+        | Message::Palette(palette_ui::Action::Run(_) | palette_ui::Action::Submit)
         | Message::ProjectUi(project_ui::Action::Command { .. } | project_ui::Action::ConfirmDelete
             | project_ui::Action::ConfirmRemove | project_ui::Action::RetryDelete(_))
         | Message::Viewport { event: WorkspaceViewportEvent::PointerFocused(_), .. }
@@ -97,6 +99,8 @@ pub(super) fn supersedes_project_activation(message: &Message) -> bool {
             | SidebarAction::BrowsePullRequests { .. } | SidebarAction::NewChannel { .. }
             | SidebarAction::NewWorktree { .. } | SidebarAction::OpenSettings | SidebarAction::OpenAutomations)
     ) || matches!(message, Message::ChannelUi(action) if !action.answers_own_dialog())
+        || matches!(message, Message::Repository(action) if !repository_action_allowed_while_modal(action))
+        || matches!(message, Message::ChatUi(action) if !action.allowed_while_modal())
 }
 
 #[cfg(test)]

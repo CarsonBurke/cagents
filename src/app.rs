@@ -13225,7 +13225,7 @@ impl Application for Cagents {
         // Camera-only events cannot change labels, selected worktrees, or
         // repository bindings. Keep per-frame work proportional to visible
         // columns rather than rebuilding every card's chrome.
-        let camera_only = matches!(
+        let mut camera_only = matches!(
             &message,
             Message::Frame(_)
                 | Message::Viewport {
@@ -13233,7 +13233,7 @@ impl Application for Cagents {
                     ..
                 }
         );
-        let reconcile_row_selection = !matches!(
+        let mut reconcile_row_selection = !matches!(
             &message,
             Message::Sidebar(SidebarAction::ScrollProjects(_) | SidebarAction::NavigateRow { .. })
         ) && matches!(
@@ -16464,7 +16464,13 @@ impl Application for Cagents {
         // and it is the one place that can bound the history.
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
+        let activation_was_pending = self.project_ui.activation.is_some();
         let task = Task::batch([task, self.resume_project_activation()]);
+        if activation_was_pending && self.project_ui.activation.is_none() {
+            // A resumed selection can change scope even on a camera frame.
+            camera_only = false;
+            reconcile_row_selection = true;
+        }
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
         self.sync_notification_presence();
