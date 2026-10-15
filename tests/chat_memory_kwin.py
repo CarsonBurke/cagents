@@ -64,14 +64,17 @@ class ControllerProof(unittest.TestCase):
         actions = []
         def action(command, *arguments):
             actions.append(command)
-            if command == 'screenshot':
-                Path(arguments[0]).write_bytes(b'private screenshot fixture')
+            if command == 'observe':
+                image = self.case / 'observation.png'
+                image.write_bytes(b'private screenshot fixture')
+                return {**self.value, 'ocr': {'text': 'Exact actor memory-other;', 'image': str(image),
+                                            'image_sha256': hashlib.sha256(image.read_bytes()).hexdigest()}}
             return self.value
         adapter.action = action
-        response = SimpleNamespace(stdout='Exact actor memory-other;', check_returncode=lambda: None)
-        with patch.object(self.namespace['subprocess'], 'run', return_value=response), self.assertRaisesRegex(SystemExit, 'footer'):
+        with patch.object(self.namespace['subprocess'], 'run') as run, self.assertRaisesRegex(SystemExit, 'footer'):
             adapter.focused_ui('memory-minted')
-        self.assertEqual(actions, ['window', 'screenshot'])
+        run.assert_not_called()
+        self.assertEqual(actions, ['observe'])
         self.assertFalse(json.loads(adapter.output.read_text())['matched'])
 
     def test_matching_footer_revalidates_native_window_after_ocr(self):
@@ -79,13 +82,17 @@ class ControllerProof(unittest.TestCase):
         actions = []
         def action(command, *arguments):
             actions.append(command)
-            if command == 'screenshot':
-                Path(arguments[0]).write_bytes(b'private screenshot fixture')
+            if command == 'observe':
+                image = self.case / 'observation.png'
+                image.write_bytes(b'private screenshot fixture')
+                return {**self.value, 'ocr': {'text': 'Exact actor\nmemory-minted;', 'image': str(image),
+                                            'image_sha256': hashlib.sha256(image.read_bytes()).hexdigest()}}
+            return self.value
         adapter.action = action
-        response = SimpleNamespace(stdout='Exact actor\nmemory-minted;', check_returncode=lambda: None)
-        with patch.object(self.namespace['subprocess'], 'run', return_value=response):
+        with patch.object(self.namespace['subprocess'], 'run') as run:
             adapter.focused_ui('memory-minted')
-        self.assertEqual(actions, ['window', 'screenshot', 'window'])
+        run.assert_not_called()
+        self.assertEqual(actions, ['observe', 'window'])
 
 
 if __name__ == '__main__':

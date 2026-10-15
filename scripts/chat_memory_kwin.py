@@ -1,8 +1,8 @@
 """Read-only proof and request/reply adapter for an admitted private desktop.
 
-The controller performs window PID verification, input and capture inside its
-existing lock-owning holder. This module never dispatches XTest or desktop
-commands itself. OCR reads only the screenshot returned by that holder.
+The controller performs window PID verification, input, capture, OCR and actor
+closure inside its existing lock-owning holder. This module launches only the
+bounded request/reply client; no native tool or CLI child can outlive admission.
 """
 import hashlib
 import json
@@ -62,7 +62,7 @@ class Adapter:
     def action(self, command, *arguments):
         if command == 'key':
             command, arguments = 'chord', ({'ctrl+w': 'Control_L+w', 'ctrl+PageDown': 'Control_L+Page_Down'}[arguments[0]],)
-        if command not in ('window', 'screenshot', 'chord'):
+        if command not in ('window', 'observe', 'chord', 'close-agent'):
             raise SystemExit('unsupported pane-close controller request')
         if not current(self.owner) or hashlib.sha256(self.control.read_bytes()).hexdigest() != self.control_hash:
             raise SystemExit('private desktop/controller changed during pane closure')
@@ -81,22 +81,24 @@ class Adapter:
         return value
 
     def focused_ui(self, expected_actor=None):
-        self.action('window')
         if expected_actor is None:
+            self.action('window')
             return
-        directory = self.case / 'pane-close-screenshots'
-        directory.mkdir(mode=0o700, exist_ok=True)
-        image = directory / (str(time.monotonic_ns()) + '.png')
-        self.action('screenshot', str(image))
-        if not image.is_file() or image.is_symlink():
-            raise SystemExit('admitted holder did not produce its private screenshot')
-        result = subprocess.run(['/usr/bin/tesseract', str(image), 'stdout'],
-                                capture_output=True, text=True, timeout=30)
-        result.check_returncode()
-        compact = ''.join(result.stdout.split())
+        observation = self.action('observe')
+        ocr = observation.get('ocr', {})
+        text = ocr.get('text')
+        if not isinstance(text, str) or len(text.encode()) > 262144 or not isinstance(ocr.get('image'), str):
+            raise SystemExit('admitted holder returned no bounded OCR observation')
+        image = Path(ocr['image'])
+        if not image.is_absolute() or image.is_symlink() or not image.resolve(strict=True).is_relative_to(self.case):
+            raise SystemExit('admitted holder screenshot escaped its private case')
+        digest = hashlib.sha256(image.read_bytes()).hexdigest()
+        if digest != ocr.get('image_sha256'):
+            raise SystemExit('admitted holder screenshot changed after observation')
+        compact = ''.join(text.split())
         matched = ('Exactactor' + expected_actor + ';') in compact
         with self.output.open('a') as receipt:
-            receipt.write(json.dumps({'native_ocr': str(image), 'image_sha256': hashlib.sha256(image.read_bytes()).hexdigest(),
+            receipt.write(json.dumps({'native_ocr': str(image), 'image_sha256': digest,
                                       'exact_actor_marker': expected_actor, 'matched': matched,
                                       'monotonic_ns': time.monotonic_ns()}) + '\n')
         if not matched:

@@ -251,7 +251,10 @@ def main():
         output.write(json.dumps(proof) + "\n")
     for actor in actors:
         if actor["agent"]["id"] in pending:
-            FIXTURE["cli_call"](args.cli, env, ["agent", "close", actor["agent"]["id"]], root)
+            if kwin:
+                action("close-agent", actor["agent"]["id"])
+            else:
+                FIXTURE["cli_call"](args.cli, env, ["agent", "close", actor["agent"]["id"]], root)
     for _ in range(3 * len(targets) + 3):
         state = census()
         remaining = {card for card in targets if not closed(card, state)}
