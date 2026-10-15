@@ -807,6 +807,7 @@ fn start_with_execution(
     }
     let reservation_id = session.id;
     let mut source_process = None;
+    let mut resolved_restart_recipe = None;
     let mut source_fresh = None;
     let mut source_environment = BTreeMap::new();
     let mut source_transient = None;
@@ -876,6 +877,7 @@ fn start_with_execution(
                     "Restored source differs from its exact confirmed restart recipe",
                 ));
             }
+            resolved_restart_recipe = Some(recipe);
         } else {
             session.launch.recipe = recipe;
             session.launch.session_id = fresh.is_none().then_some(id);
@@ -1192,7 +1194,7 @@ fn start_with_execution(
                     source_transient.as_ref().map(|environment| &environment.0),
                 )?;
             if source_process.as_ref() != Some(&current_process)
-                || current_recipe != session.launch.recipe
+                || &current_recipe != resolved_restart_recipe.as_ref().unwrap_or(&session.launch.recipe)
                 || current_fresh != source_fresh
                 || current_execution != source_execution
             {
