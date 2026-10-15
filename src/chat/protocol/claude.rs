@@ -299,6 +299,7 @@ enum ReportTask {
 
 #[derive(Default)]
 struct Claude {
+    attachment_names: Vec<Option<PathBuf>>,
     originals: original::Originals,
     annotation_updates: Vec<chat::annotations::ApprovalUpdate>,
     session_id: Option<String>,
@@ -556,6 +557,7 @@ impl Claude {
         attachments: Vec<Attachment>,
         mode: PromptMode,
     ) -> Result<Step, String> {
+        let attachment_names=std::mem::take(&mut self.attachment_names);
         if !self.ready {
             return Err("Claude is still initializing".into());
         }
@@ -586,8 +588,8 @@ impl Claude {
         }
         let mut content = vec![json!({"type":"text", "text":text})];
         let mut payload_size = encoded_len(&content)?;
-        for attachment in &attachments {
-            let block = attachment_block(&self.cwd, &attachment.path)?;
+        for (index,attachment) in attachments.iter().enumerate() {
+            let block = attachment_block_named(&self.cwd, &attachment.path,attachment_names.get(index).and_then(Option::as_deref))?;
             payload_size = payload_size.saturating_add(encoded_len(&block)? + 1);
             if payload_size >= MAX_PAYLOAD {
                 return Err(
@@ -1640,6 +1642,7 @@ impl Adapter for Claude {
                 }
             )
     }
+    fn prompt_attachment_names(&mut self,names:Vec<Option<PathBuf>>) { self.attachment_names=names; }
     fn original_command(&mut self, id: Option<String>) {
         self.originals.staged = id;
     }
@@ -3630,6 +3633,9 @@ fn question_fields(input: &Value) -> Result<Vec<Field>, String> {
     Ok(fields)
 }
 fn attachment_block(cwd: &Path, path: &Path) -> Result<Value, String> {
+    attachment_block_named(cwd,path,None)
+}
+fn attachment_block_named(cwd: &Path, path: &Path, display_path:Option<&Path>) -> Result<Value, String> {
     let path = if path.is_absolute() {
         path.to_owned()
     } else {
@@ -3682,7 +3688,7 @@ fn attachment_block(cwd: &Path, path: &Path) -> Result<Value, String> {
             "Unsupported Claude attachment; use PNG, JPEG, GIF, WebP, PDF, or UTF-8 text".to_owned()
         })?;
         Ok(
-            json!({"type":"document", "title":path.file_name().unwrap_or_default().to_string_lossy(), "source":{"type":"text", "media_type":"text/plain", "data":text}}),
+            json!({"type":"document", "title":display_path.unwrap_or(&path).file_name().unwrap_or_default().to_string_lossy(), "source":{"type":"text", "media_type":"text/plain", "data":text}}),
         )
     }
 }

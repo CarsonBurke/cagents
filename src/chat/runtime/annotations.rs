@@ -1369,6 +1369,29 @@ while True:
     }
 
     #[test]
+    fn actual_actor_preserves_document_titles_while_dispatching_private_captured_bytes() {
+        use super::super::Handle;
+        fn wait(mut condition:impl FnMut()->bool){let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);while !condition(){assert!(std::time::Instant::now()<deadline);std::thread::sleep(std::time::Duration::from_millis(5));}}
+        let root=annotations::storage::test_directory();let home=root.path().join("claude-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Claude,root.path(),|key|(key=="CLAUDE_CONFIG_DIR").then(||home.as_os_str().to_owned())).unwrap();let script=root.path().join("documents.py");
+        std::fs::write(&script,r#"import sys,json,pathlib
+root=pathlib.Path(sys.argv[1]); session='00000000-0000-4000-8000-000000000001'
+def emit(frame): print(json.dumps(frame),flush=True)
+for line in sys.stdin:
+ frame=json.loads(line)
+ if frame.get('type')=='control_request':
+  subtype=frame['request']['subtype']; response={'current_permission_mode':'default','fast_mode_state':'off'} if subtype=='initialize' else {'applied':{'model':'reported-model','effort':'low'}}
+  emit({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':response}})
+ elif frame.get('type')=='user':
+  with (root/'documents.jsonl').open('a') as out: out.write(json.dumps(frame)+'\n')
+  emit({'type':'result','subtype':'success','uuid':'result-'+frame['uuid'],'session_id':session,'is_error':False,'result':'done'})
+"#).unwrap();
+        let spec=protocol::ProcessSpec{execution:None,messages:None,unset_environment:Default::default(),transport:protocol::TransportSpec::JsonLines,program:"python3".into(),arguments:vec![script.to_string_lossy().into_owned(),root.path().to_string_lossy().into_owned()],working_directory:root.path().to_owned(),environment:Default::default()};let mut adapter=protocol::claude::annotation_test_async_adapter();let mut initial=adapter.initialize().unwrap();let cache=super::super::preflight(&spec,&mut initial).unwrap();let handle=Handle::start_inner(spec,adapter,initial,cache,None,None,Ok(scope),|_|{}).unwrap();handle.0.annotations.lock().unwrap().root=Some(root.path().join("annotations"));wait(||handle.snapshot(None).unwrap().ready);
+        let picker=root.path().join("config.toml");std::fs::write(&picker,b"mode=1").unwrap();handle.command(Command::Prompt{text:"read config".into(),attachments:vec![crate::chat::Attachment{path:picker}],mode:crate::chat::PromptMode::Send}).unwrap();wait(||root.path().join("documents.jsonl").exists() && !handle.snapshot(None).unwrap().busy);
+        let edited=root.path().join("edited-private-uuid.toml");std::fs::write(&edited,b"mode=2").unwrap();let label=root.path().join("original-name.toml");assert!(!label.exists());handle.command(Command::PromptNamed{text:"edited new intent".into(),attachments:vec![crate::chat::NamedAttachment{path:edited,display_path:Some(label)}],mode:crate::chat::PromptMode::Send}).unwrap();
+        let frames=||std::fs::read_to_string(root.path().join("documents.jsonl")).ok().and_then(|text|text.lines().map(serde_json::from_str::<Value>).collect::<Result<Vec<_>,_>>().ok());wait(||frames().is_some_and(|frames|frames.len()==2));let frames=frames().unwrap();let first=&frames[0]["message"]["content"][1];let second=&frames[1]["message"]["content"][1];assert_eq!(first["type"],"document");assert_eq!(first["title"],"config.toml");assert_eq!(first["source"]["data"],"mode=1");assert_eq!(second["title"],"original-name.toml");assert_eq!(second["source"]["data"],"mode=2");handle.close().unwrap();
+    }
+
+    #[test]
     fn named_edit_attachments_capture_only_dispatch_bytes_and_retain_display_hint() {
         let root = annotations::storage::test_directory();
         let home = root.path().join("codex-home");

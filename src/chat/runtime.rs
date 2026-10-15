@@ -2169,6 +2169,13 @@ impl Actor {
             } else {
                 Vec::new()
             };
+            // Preserve document titles before immutable capture changes byte
+            // paths. These labels never select which file an adapter opens.
+            let provider_names=match &command {
+                Command::Prompt{attachments,..}=>attachments.iter().enumerate().map(|(index,attachment)|names.get(index).cloned().flatten().or_else(||Some(attachment.path.clone()))).collect(),
+                Command::PromptOriginal{original,..}=>original.attachments.iter().map(|attachment|Some(attachment.original_path.clone())).collect(),
+                _=>Vec::new(),
+            };
             let retry = if let Command::PromptOriginal {
                 session_id,
                 original,
@@ -2238,6 +2245,7 @@ impl Actor {
             } else {
                 None
             };
+            self.adapter.prompt_attachment_names(provider_names);
             self.adapter.original_command(original.clone());
             let prepared = if let Some((_, settings)) = &retry {
                 self.adapter.retry_original(settings, command)
