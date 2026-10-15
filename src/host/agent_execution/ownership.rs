@@ -176,6 +176,11 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
         if !retire {
             return Ok(Reconciliation::Idle);
         }
+        #[cfg(test)]
+        {
+            let hook = AFTER_RECONCILIATION_ELIGIBILITY.lock().unwrap().take();
+            if let Some(hook) = hook { hook(); }
+        }
         if let Some(generation) = idle_generation {
             handle.close_if_idle(generation)?;
         }
@@ -259,4 +264,13 @@ static BEFORE_RECONCILIATION_TRANSITION: std::sync::Mutex<Option<Box<dyn FnOnce(
 #[cfg(test)]
 pub(in crate::host) fn before_reconciliation_transition(hook: impl FnOnce() + Send + 'static) {
     *BEFORE_RECONCILIATION_TRANSITION.lock().unwrap() = Some(Box::new(hook));
+}
+
+// Exact old race boundary: eligibility has been observed, but close has not
+// begun. The real lifecycle claim must already exclude supported restarts.
+#[cfg(test)]
+static AFTER_RECONCILIATION_ELIGIBILITY: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(in crate::host) fn after_reconciliation_eligibility(hook: impl FnOnce() + Send + 'static) {
+    *AFTER_RECONCILIATION_ELIGIBILITY.lock().unwrap() = Some(Box::new(hook));
 }
