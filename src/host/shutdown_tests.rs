@@ -338,6 +338,11 @@ fn provider_shutdown_failure_is_reported_while_healthy_owners_are_reaped() {
     assert!(healthy_chat.is_completed(), "later healthy provider was skipped after the first failure");
     assert_eq!(finish_terminal_shutdown(&handles), vec![Ok(())]);
     assert!(healthy_terminal.is_completed());
+    match start_time(pid) {
+        Ok(current) => assert_ne!(current, original_start, "the exact healthy PTY root remains unreaped"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) => {}
+        Err(error) => panic!("inspect the healthy PTY root after shutdown: {error}"),
+    }
     assert!(started.elapsed() < Duration::from_secs(12));
     assert!(record.root.is_current(), "unrelated healthy cleanup must not terminate the retained provider");
     // The same owned capability can make progress after its exact transient
