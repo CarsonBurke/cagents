@@ -492,6 +492,8 @@ impl Cagents {
                 self.palette.git_target = None;
                 self.palette.group_target = None;
                 self.palette.git_captured = false;
+                self.palette.project_creation_captured = false;
+                self.palette.project_creation_targets = [None, None];
                 self.palette.stash_picker = None;
                 self.palette.stash_entries.clear();
                 self.palette.reassign = None;
@@ -768,6 +770,8 @@ impl Cagents {
                 self.palette.git_target = None;
                 self.palette.group_target = None;
                 self.palette.git_captured = false;
+                self.palette.project_creation_captured = false;
+                self.palette.project_creation_targets = [None, None];
                 self.palette.stash_picker = None;
                 self.palette.stash_entries.clear();
                 self.palette.recording = None;
@@ -899,6 +903,8 @@ impl Cagents {
             self.palette.stash_entries.clear();
             self.palette.git_target = None;
             self.palette.git_captured = false;
+            self.palette.project_creation_captured = false;
+            self.palette.project_creation_targets = [None, None];
         }
         let save = if self.settings_path.is_some() {
             self.save_settings_task(false)
@@ -3969,6 +3975,43 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn palette_creation_refuses_replaced_project_and_new_open_uses_new_actor() {
+        const TEST: &str = "app::palette_ui::tests::palette_creation_refuses_replaced_project_and_new_open_uses_new_actor";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let files = tempfile::tempdir().unwrap();
+        let parent = files.path().canonicalize().unwrap();
+        let root = parent.join("repository");
+        super::super::git_binding::tests::init(&root, "original\n");
+        let (mut app, key) = super::super::git_binding::tests::app_for(&root);
+        let publish = |app: &mut Cagents, generation| {
+            let loaded = super::super::load_repository(&root, Some(key.project_id), CancellationToken::new()).unwrap();
+            app.repository_generations.insert(key.project_id, generation);
+            drop(app.update(Message::RepositoryLoaded { project_id: key.project_id, generation, open_cards: false, result: Ok(loaded) }));
+        };
+        publish(&mut app, 1);
+        drop(app.update_palette(Action::Open));
+        let old = app.palette_entries().into_iter().find(|entry| entry_command(&entry.2) == Some(Command::NewWorktree)).unwrap().2;
+        let old_binding = app.project_creation_command_target(Command::NewWorktree).unwrap().binding;
+        std::fs::rename(&root, parent.join("original")).unwrap();
+        super::super::git_binding::tests::init(&root, "replacement\n");
+        publish(&mut app, 2);
+        assert_ne!(app.project_creation_source(key.project_id).unwrap().id(), old_binding);
+        let generation = app.palette.generation;
+        drop(app.update_palette(Action::Run(generation, MessageBox(Box::new(old)))));
+        assert!(app.worktree_dialog.is_none());
+        assert!(app.palette.query.is_some(), "stale pointer activation preserves the result surface");
+        assert!(app.project_creation_command_target(Command::NewWorktree).is_none(), "an old opening never remints its project intent");
+        drop(app.update_palette(Action::Close));
+        drop(app.update_palette(Action::Open));
+        let fresh = app.palette_entries().into_iter().find(|entry| entry_command(&entry.2) == Some(Command::NewWorktree)).unwrap().2;
+        app.palette.selected_message = Some(fresh);
+        drop(app.update_palette(Action::Submit));
+        assert!(app.worktree_dialog.is_some(), "a fresh palette opening admits the replacement's current capability");
+    }
+
 
     /// Run a real scroll operation against the retained native widget tree.
     fn scroll_fixture_step(
