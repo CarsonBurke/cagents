@@ -8190,6 +8190,33 @@ mod tests {
     }
 
     #[test]
+    fn standalone_cancel_after_group_read_success_fences_stage_unstage_and_discard_handoff() {
+        use cagents::repository::ChangeArea;
+        use sidebar::ChangeGroupCommand as Group;
+        for command in [Group::Stage, Group::Unstage, Group::Discard] {
+            let directory = git_fixture();
+            let root = directory.path();
+            std::fs::write(root.join("new.txt"), "original work\n").unwrap();
+            if command == Group::Unstage { git(root, &["add", "new.txt"]); }
+            let before_index = git(root, &["diff", "--cached", "--binary"]);
+            let mut app = editor();
+            let id = open_real_git(&mut app, root, None);
+            let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+            let area = if command == Group::Unstage { ChangeArea::Staged } else { ChangeArea::Untracked };
+            let read = app.update(Message::Sidebar(SidebarAction::ChangeGroup { key: key.clone(), area, command }));
+            let completed = task_messages(read).into_iter().find(|message| matches!(message, Message::ChangeGroupResolved { result: Ok(_), .. })).expect("status really completed successfully before cancellation");
+            sidebar_action(&mut app, SidebarAction::CancelGitMutation { key });
+            let task = app.update(completed);
+            run_tasks(&mut app, task);
+            assert_eq!(git(root, &["diff", "--cached", "--binary"]), before_index);
+            assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "original work\n");
+            assert!(app.pending_discard().is_none());
+            assert!(app.git_groups.is_empty());
+            assert!(app.tabs.iter().all(|tab| tab.mutation.is_none()));
+        }
+    }
+
+    #[test]
     fn standalone_cancel_preparation_releases_reservation_and_late_completion_cannot_mutate() {
         let directory = git_fixture();
         let root = directory.path();
@@ -8257,10 +8284,14 @@ mod tests {
             app.settings.editor_auto_save = false;
             let id = open_real_git(&mut app, root, None);
             open_real_change(&mut app, id, "tracked.txt", ChangeArea::Unstaged);
+            let edit_surface = app.update(Message::Repository(RepositoryAction::ApplySourceSurface { card: id, diff: false }));
+            run_tasks(&mut app, edit_surface);
             let select = app.update(Message::Repository(RepositoryAction::EditorAction { card: id, action: EditorAction::SelectAll }));
             run_tasks(&mut app, select);
             let edit = app.update(Message::Repository(RepositoryAction::EditorAction { card: id, action: EditorAction::Edit(EditorEdit::Paste(Arc::new("dirty live text\n".into()))) }));
             run_tasks(&mut app, edit);
+            let diff_surface = app.update(Message::Repository(RepositoryAction::ApplySourceSurface { card: id, diff: true }));
+            run_tasks(&mut app, diff_surface);
             assert!(app.tab(id).unwrap().runtime.is_dirty());
             if selected {
                 let request = app.tab(id).unwrap().runtime.diff_mutation_request(id, 0..2).unwrap();

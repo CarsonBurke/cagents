@@ -213,6 +213,12 @@ impl Editor {
         let Some(queue) = self.git_groups.get_mut(&root).filter(|queue| queue.active == Some(request.origin.operation)) else {
             return Task::none();
         };
+        // A successful read may already be queued for delivery when Cancel
+        // is clicked. Cancellation owns the read-to-effect handoff too.
+        if self.mutation_cancellation(request.origin.card).is_some_and(|cancellation| cancellation.is_cancelled()) {
+            let notice = match result { Err(error) => error, Ok(_) => "Git action cancelled before applying the resolved selection.".into() };
+            return self.finish_mutation_root(root, Some(notice));
+        }
         if self.modal_open() || !self.group_origin_current(&request) {
             return self.finish_mutation_root(root.clone(), Some("The original change group or selection changed before the action could run.".into()));
         }
