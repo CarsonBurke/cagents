@@ -96,6 +96,8 @@ pub(super) struct State {
     installed: BTreeMap<Provider, bool>,
     /// Only acknowledged execution changes advance these callback fences.
     metadata_revisions: BTreeMap<Provider, u64>,
+    locating: Option<BTreeMap<Provider, u64>>,
+    locate_pending: bool,
     registry: Registry,
     store: Option<Store>,
     homes: Option<Homes>,
@@ -242,6 +244,8 @@ impl State {
             accounts: Vec::new(),
             installed: BTreeMap::new(),
             metadata_revisions: BTreeMap::new(),
+            locating: None,
+            locate_pending: false,
             registry,
             store,
             homes,
@@ -1753,7 +1757,12 @@ impl Cagents {
 
     /// Judges again, on the shell's `PATH`, which accounts have a CLI to ask,
     /// restoring what the cache has for any found only there.
-    fn locate_accounts(&self) -> Task<Message> {
+    fn locate_accounts(&mut self) -> Task<Message> {
+        if let Some(revisions) = &self.account_ui.locating {
+            self.account_ui.locate_pending |= revisions != &self.account_ui.metadata_revisions;
+            return Task::none();
+        }
+        self.account_ui.locating = Some(self.account_ui.metadata_revisions.clone());
         let accounts: Vec<Account> = self
             .account_ui
             .accounts
@@ -2343,11 +2352,13 @@ impl Cagents {
                 self.update_account_ui(Action::Loaded(loaded))
             }
             Action::PolicyLocated { revisions, mut restored, mut installed } => {
+                if self.account_ui.locating.as_ref() != Some(&revisions) { return Task::none(); }
+                self.account_ui.locating = None;
                 restored.retain(|entry| self.account_ui.account(&entry.id).is_some_and(|state| self.account_ui.metadata_revision_matches(state.account.provider, &revisions)));
                 installed.retain(|provider, _| self.account_ui.metadata_revision_matches(*provider, &revisions));
                 self.account_ui.installed.extend(installed);
                 self.account_ui.restore(restored);
-                Task::none()
+                if std::mem::take(&mut self.account_ui.locate_pending) { self.locate_accounts() } else { Task::none() }
             }
             Action::Loaded(loaded) => {
                 self.account_ui.installed = loaded.installed;
@@ -5319,6 +5330,14 @@ mod tests {
         }
         assert!(app.account_ui.catalog(Provider::Claude).is_none());
         assert!(!app.account_ui.installed.contains_key(&Provider::Claude));
+        let first_locator = BTreeMap::from([(Provider::Claude, 1)]);
+        assert_eq!(app.account_ui.locating.as_ref(), Some(&first_locator));
+        assert!(app.account_ui.locate_pending, "new policy waits for actual first discovery");
+        drop(app.update(Message::AccountUi(Action::PolicyLocated { revisions: first_locator.clone(), restored: Vec::new(), installed: BTreeMap::from([(Provider::Claude, false)]) })));
+        assert_eq!(app.account_ui.locating.as_ref(), Some(&BTreeMap::from([(Provider::Claude, 2)])));
+        assert!(!app.account_ui.locate_pending);
+        drop(app.update(Message::AccountUi(Action::PolicyLocated { revisions: first_locator, restored: Vec::new(), installed: BTreeMap::from([(Provider::Claude, false)]) })));
+        assert_eq!(app.account_ui.locating.as_ref(), Some(&BTreeMap::from([(Provider::Claude, 2)])), "late duplicate does not release the new locator");
         drop(app.update(Message::AccountUi(old_load)));
         assert!(!app.account_ui.installed.contains_key(&Provider::Claude));
         let answer = |revision, installed, name: &str| Message::AccountUi(Action::Probed {
