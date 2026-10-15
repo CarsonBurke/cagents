@@ -1961,6 +1961,36 @@ mod tests {
         assert!(app.project_ui.select_on_load.is_none());
     }
 
+    #[test]
+    fn explicit_project_activation_uses_checkout_provenance_instead_of_bare_metadata() {
+        let (mut app, project_id, _) = app_with_project();
+        let repository = PathBuf::from("/fixture/metadata.git");
+        let linked = PathBuf::from("/fixture/linked");
+        let primary = PathBuf::from("/fixture/primary");
+        let row = |path: &Path| SidebarWorktree::from_durable(
+            crate::model::WorktreeId::new(), path.to_path_buf(), Some("topic".into()),
+        );
+        let mut project = SidebarProject::new(
+            project_id, RepositoryId::new(), "fixture".into(), repository.clone(),
+            vec![row(&repository), row(&linked)], Vec::new(),
+        );
+        app.project_ui.checkout_roots.insert(repository.clone(), linked.clone());
+        assert_eq!(app.project_activation_worktree(&project), Some(linked.clone()),
+            "Git's first bare metadata record must not displace the actual checkout");
+        app.project_ui.primary_checkout_roots.insert(repository.clone(), primary.clone());
+        assert_eq!(app.project_activation_worktree(&project), Some(linked.clone()),
+            "a retained primary absent from current rows must not fence a usable linked checkout");
+        project.worktrees.push(row(&primary));
+        assert_eq!(app.project_activation_worktree(&project), Some(primary),
+            "a verified separate-directory primary wins over a linked checkout regardless of row order");
+        app.project_ui.primary_checkout_roots.clear();
+        app.project_ui.checkout_roots.clear();
+        assert_eq!(app.project_activation_worktree(&project), Some(linked),
+            "legacy fallback also skips the non-checkout metadata row");
+        project.worktrees.truncate(1);
+        assert_eq!(app.project_activation_worktree(&project), None);
+    }
+
     /// A channel another window created arrives as a scope, not as a
     /// conversation: N windows adopting one channel must not start N chats in
     /// it, and the cards inside a channel are each window's own business.

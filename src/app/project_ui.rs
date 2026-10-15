@@ -231,12 +231,7 @@ impl Cagents {
             .iter()
             .find(|project| project.repository == repository);
         if let Some(project) = project {
-            let primary = project
-                .worktrees
-                .iter()
-                .find(|worktree| crate::sidebar::is_primary_worktree(&repository, &worktree.path))
-                .or_else(|| project.worktrees.first())
-                .map(|worktree| worktree.path.clone());
+            let primary = self.project_activation_worktree(project);
             if let Some(path) = primary {
                 self.project_ui.select_on_load = None;
                 return self.select_worktree(path, false);
@@ -249,6 +244,38 @@ impl Cagents {
             return Task::none();
         }
         self.project_load_task(repository, id, false, kind)
+    }
+
+    /// Discovery records the primary separately from the last opened checkout.
+    /// Prefer those known roots while they are in the current row inventory;
+    /// a bare common directory is metadata, never a navigable checkout.
+    pub(super) fn project_activation_worktree(&self, project: &SidebarProject) -> Option<PathBuf> {
+        let checkout = |path: &Path| {
+            project.kind != ProjectKind::Git || path != project.repository.as_path()
+        };
+        let listed = |path: &Path| {
+            project.worktrees.iter().any(|row| row.path.as_path() == path)
+        };
+        self.project_ui
+            .primary_checkout_roots
+            .get(&project.repository)
+            .filter(|path| listed(path))
+            .or_else(|| {
+                self.project_ui
+                    .checkout_roots
+                    .get(&project.repository)
+                    .filter(|path| listed(path))
+            })
+            .cloned()
+            .or_else(|| {
+                project
+                    .worktrees
+                    .iter()
+                    .filter(|row| checkout(&row.path))
+                    .find(|row| sidebar::is_primary_worktree(&project.repository, &row.path))
+                    .or_else(|| project.worktrees.iter().find(|row| checkout(&row.path)))
+                    .map(|row| row.path.clone())
+            })
     }
 
     pub(super) fn known_project_checkout(
