@@ -247,6 +247,28 @@ mod tests {
     }
 
     #[test]
+    fn camera_update_drives_the_protection_preparation_it_schedules() {
+        use cosmic::Application as _;
+        let mut app = empty_window();
+        let width = app.workspace.viewport_width();
+        let task = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(width),
+        });
+        assert!(app.worktree_protection_sync.inflight.is_some());
+        let Message::WorktreeProtectionsPrepared {
+            generation,
+            receipt,
+        } = crate::app::tests::task_app_message(task)
+        else {
+            panic!("camera update did not return its protection task")
+        };
+        drop(app.window_protections_prepared(generation, receipt));
+        assert!(app.worktree_protection_sync.inflight.is_none());
+        assert_eq!(app.worktree_protection_sync.applied, Some(Vec::new()));
+    }
+
+    #[test]
     fn release_continuation_waits_for_real_lease_retirement_and_selection_receipts() {
         let runtime = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();

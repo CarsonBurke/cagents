@@ -16660,7 +16660,11 @@ impl Application for Cagents {
             self.latency.abandon_pending();
         }
         if camera_only {
-            return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
+            return Task::batch([
+                task,
+                protections,
+                self.release_deferred_navigation_if_unblocked(),
+            ]);
         }
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
