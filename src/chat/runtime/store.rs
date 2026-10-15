@@ -58,6 +58,7 @@ pub(super) struct Window {
     pub has_later: bool,
 }
 pub(crate) struct Store {
+    pub(super) account_source_binding: super::account_source::StoreAccountBinding,
     db: Connection,
     /// A reset revokes every previously issued canonical source reader.
     canonical_generation: uuid::Uuid,
@@ -175,6 +176,7 @@ impl Store {
             let source_revocation = crate::transcript_cache::export::SourceRevocationEpoch::new(source_incarnation)
                 .map_err(|error| error.to_string())?;
             Ok(Self {
+                account_source_binding: Default::default(),
                 raw_sources,
                 canonical_generation: uuid::Uuid::new_v4(),
                 reset_pending: false,

@@ -27,6 +27,8 @@ mod websocket;
 mod worker_join;
 use store::Store;
 pub(crate) use store::StoreExportSeed;
+mod account_source;
+pub(crate) use account_source::CapturedAccountSource;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
@@ -291,6 +293,8 @@ struct Inner {
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
+    account_source_session: Option<crate::model::TerminalId>,
     recovery_environment: BTreeMap<String, String>,
     preserve_native: Arc<AtomicBool>,
     release_native: Arc<AtomicBool>,
@@ -373,12 +377,28 @@ impl Handle {
         mut spec: ProcessSpec,
         mut adapter: Box<dyn Adapter>,
         initial: Step,
-        store: Store,
+        mut store: Store,
         session_id: Option<String>,
         ownership: Option<NativeOwnership>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
+        // Capture only a fresh typed actual backend, after explicit removals.
+        // Neither a requested resume selector nor an adopted/legacy recipe
+        // establishes the original credential-home provenance.
+        let account_source_session = match &ownership {
+            Some(NativeOwnership::New(source, _)) => Some(source.id),
+            _ => None,
+        };
+        let launch_account_scope = match &ownership {
+            Some(NativeOwnership::New(source, _)) if !matches!(spec.transport, TransportSpec::History) =>
+                crate::account::scope::LaunchAccountScope::resolve(
+                    source.launch.provider, &spec.working_directory,
+                    |name| spec.environment.get(name).map(std::ffi::OsString::from),
+                ),
+            _ => Err("This backend has no original typed account-source provenance".into()),
+        };
+
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
@@ -392,6 +412,9 @@ impl Handle {
         {
             context.verify_directory(&spec.working_directory)?;
         }
+        account_source::bind_store(
+            &mut store, launch_account_scope.as_ref().map_err(String::as_str), account_source_session,
+        )?;
         let mut owned_socket = None;
         if let TransportSpec::OwnedUnixWebSocket { socket } = &spec.transport {
             use std::os::unix::fs::DirBuilderExt;
@@ -495,6 +518,8 @@ impl Handle {
                 spec.environment.clone(),
             ),
             recovery_environment,
+            launch_account_scope,
+            account_source_session,
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
