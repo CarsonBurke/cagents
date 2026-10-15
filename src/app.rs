@@ -14081,6 +14081,7 @@ impl Application for Cagents {
             Message::Repository(RepositoryAction::NavigateLocation { card, forward }) => {
                 if self.modal_is_open() { return Task::none(); }
                 if let Some(task) = self.navigate_cross_card_location(card, forward) { return task; }
+                if self.editor_features.location_history.has_entries() { return Task::none(); }
                 match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => repository_task(runtime.update(RepositoryAction::NavigateLocation { card, forward })),
                     _ => Task::none(),
@@ -24215,6 +24216,24 @@ mod tests {
         assert_ne!(reopened, origin);
         assert_ne!(reopened, target);
         assert!(matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.editor_text().as_deref() == Some("keep this buffer")));
+    }
+
+    #[test]
+    fn window_history_exhaustion_never_reenters_the_runtime_stack() {
+        let (mut app, card) = editing_repository_app();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "zero\none\ntwo\n");
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        for line in ["2", "3"] {
+            drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card })));
+            drop(app.update(Message::Repository(RepositoryAction::GoToLineChanged { card, value: line.into() })));
+            drop(app.update(Message::Repository(RepositoryAction::SubmitGoToLine { card })));
+        }
+        for (forward, lines) in [(false, [1, 0, 0]), (true, [1, 2, 2])] {
+            for line in lines {
+                drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card, forward })));
+                assert_eq!(app.capture_editor_location(card).unwrap().anchor.caret.line, line);
+            }
+        }
     }
 
     #[test]

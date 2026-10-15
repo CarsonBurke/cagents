@@ -3486,6 +3486,7 @@ impl Application for Editor {
                 Message::Repository(RepositoryAction::NavigateLocation { card, forward }) => {
                     if self.modal_open() { return Task::none(); }
                     if let Some(task) = self.navigate_cross_card_location(card, forward) { return task; }
+                    if self.lsp_navigation.history.has_entries() { return Task::none(); }
                     self.tab_mut(card).map_or_else(Task::none, |tab| repository_task(tab.runtime.update(RepositoryAction::NavigateLocation { card, forward })))
                 }
                 Message::Navigation(action) => self.update_navigation(action),

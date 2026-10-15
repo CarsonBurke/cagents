@@ -20,6 +20,8 @@ pub struct History {
 pub struct Target { pub location: Location, revision: u64, index: usize }
 
 impl History {
+    pub fn has_entries(&self) -> bool { !self.entries.is_empty() }
+
     pub fn record_jump(&mut self, from: Location, to: Location) {
         if from.card == to.card && from.source == to.source
             && from.anchor.caret == to.anchor.caret && from.anchor.selection == to.anchor.selection { return; }

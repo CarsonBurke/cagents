@@ -53,7 +53,7 @@ pub(super) struct State {
     jumps: HashMap<CardId, PendingJump>,
     pub(super) resolving: HashMap<CardId, (LspRequestId, u64)>,
     next_resolution: u64,
-    history: cagents::editor_locations::History,
+    pub(super) history: cagents::editor_locations::History,
     history_origins: HashMap<CardId, cagents::editor_locations::Location>,
     history_restores: HashMap<CardId, (cagents::editor_locations::Location, cagents::editor_locations::Target)>,
 }
@@ -226,6 +226,7 @@ impl Editor {
 
     pub(super) fn navigate_cross_card_location(&mut self, card: CardId, forward: bool) -> Option<Task<Message>> {
         if self.modal_open() || self.exiting || self.active != Some(card) { return None; }
+        self.collect_location_jump(card);
         let from = self.capture_editor_location(card)?;
         self.lsp_navigation.history.observe_origin(&from);
         let target = self.lsp_navigation.history.peek(forward, |entry| {
@@ -451,6 +452,25 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path).unwrap(), "a😀éX\n");
         app.remove_tab(origin);
         assert!(app.navigate_cross_card_location(target, false).is_none());
+    }
+
+    #[test]
+    fn window_history_exhaustion_never_reenters_the_runtime_stack() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "zero\none\ntwo\n").unwrap();
+        let mut app = editor();
+        let card = open_file(&mut app, root.path(), "a.rs");
+        for line in ["2", "3"] {
+            for action in [RepositoryAction::OpenGoToLine { card }, RepositoryAction::GoToLineChanged { card, value: line.into() }, RepositoryAction::SubmitGoToLine { card }] {
+                let task = app.update(Message::Repository(action)); run_tasks(&mut app, task);
+            }
+        }
+        for (forward, lines) in [(false, [1, 0, 0]), (true, [1, 2, 2])] {
+            for line in lines {
+                let task = app.update(Message::Repository(RepositoryAction::NavigateLocation { card, forward })); run_tasks(&mut app, task);
+                assert_eq!(app.capture_editor_location(card).unwrap().anchor.caret.line, line);
+            }
+        }
     }
 
     #[test]
