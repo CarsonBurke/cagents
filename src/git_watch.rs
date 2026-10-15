@@ -752,7 +752,10 @@ impl Monitor {
         Self {
             commands,
             configuration: Arc::new(Mutex::new(Configuration::default())),
-            pending: Arc::new(Mutex::new(Pending { changes, ..Default::default() })),
+            pending: Arc::new(Mutex::new(Pending {
+                changes,
+                ..Default::default()
+            })),
             receiver,
             thread: None,
         }
@@ -1013,35 +1016,55 @@ pub(crate) mod tests {
     /// Fixture commands must not inherit a caller's repository, injected
     /// configuration, template or hooks. Production policy tests use their own
     /// commands and are deliberately unaffected by this test-only isolation.
-    pub(crate) fn isolated_fixture_command(mut command: crate::repository::CommandSpec) -> crate::repository::CommandSpec {
-        let names = std::env::vars_os().map(|(name, _)| name)
-            .chain(command.environment.keys().cloned()).collect::<BTreeSet<_>>();
+    pub(crate) fn isolated_fixture_command(
+        mut command: crate::repository::CommandSpec,
+    ) -> crate::repository::CommandSpec {
+        let names = std::env::vars_os()
+            .map(|(name, _)| name)
+            .chain(command.environment.keys().cloned())
+            .collect::<BTreeSet<_>>();
         for name in names {
             if name.as_encoded_bytes().starts_with(b"GIT_") {
                 command.environment.remove(&name);
                 command = command.env_remove(name);
             }
         }
-        command.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .timeout(Duration::from_secs(30))
     }
 
-    pub(crate) fn run_fixture_command(mut command: crate::repository::CommandSpec) -> crate::repository::ProcessOutput {
+    pub(crate) fn run_fixture_command(
+        mut command: crate::repository::CommandSpec,
+    ) -> crate::repository::ProcessOutput {
         use crate::repository::ProcessExecutor;
         command.stdout_limit = 64 * 1024;
         command.stderr_limit = 64 * 1024;
-        let output = crate::repository::SystemProcessExecutor.execute(&command, &CancellationToken::default())
+        let output = crate::repository::SystemProcessExecutor
+            .execute(&command, &CancellationToken::default())
             .expect("bounded isolated fixture command runs");
-        assert!(output.success, "fixture command failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.success,
+            "fixture command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         output
     }
 
     fn fixture_init_command(root: &Path) -> crate::repository::CommandSpec {
         crate::repository::CommandSpec::new("git")
-            .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                "init", "--template=", "-b", "main"])
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "init",
+                "--template=",
+                "-b",
+                "main",
+            ])
             .arg(root.as_os_str())
     }
 
@@ -1055,7 +1078,9 @@ pub(crate) mod tests {
     pub(crate) fn fixture_isolated(test: &str) -> bool {
         const CHILD: &str = "CAGENTS_TEST_GIT_WATCH_FIXTURE";
         if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(test)) {
-            for (name, value) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) {
+            for (name, value) in
+                std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_"))
+            {
                 let expected = match name.to_str() {
                     Some("GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM") => "/dev/null",
                     Some("GIT_CONFIG_NOSYSTEM") => "1",
@@ -1066,10 +1091,13 @@ pub(crate) mod tests {
             return true;
         }
         let command = crate::repository::CommandSpec::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"]).env(CHILD, test);
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, test);
         let output = run_fixture_command(isolated_fixture_command(command));
-        assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
-            "the owned child must run exactly its fixture test");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+            "the owned child must run exactly its fixture test"
+        );
         false
     }
 
@@ -1093,7 +1121,12 @@ pub(crate) mod tests {
             .env("GIT_CONFIG_KEY_0", "core.worktree")
             .env("GIT_CONFIG_VALUE_0", directory.path().as_os_str());
         let command = isolated_fixture_command(command);
-        assert!(!command.environment.keys().any(|name| name == "GIT_DIR" || name == "GIT_CONFIG_KEY_0"));
+        assert!(
+            !command
+                .environment
+                .keys()
+                .any(|name| name == "GIT_DIR" || name == "GIT_CONFIG_KEY_0")
+        );
         run_fixture_command(command);
         assert!(root.join(".git/HEAD").is_file());
         assert!(!elsewhere.exists());
@@ -1478,7 +1511,11 @@ pub(crate) mod tests {
 
     #[test]
     fn capped_inventory_keeps_native_directory_and_admin_coverage() {
-        if !fixture_isolated("git_watch::tests::capped_inventory_keeps_native_directory_and_admin_coverage") { return; }
+        if !fixture_isolated(
+            "git_watch::tests::capped_inventory_keeps_native_directory_and_admin_coverage",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         init_fixture(root);
@@ -1545,7 +1582,11 @@ pub(crate) mod tests {
 
     #[test]
     fn incomplete_ignored_inventory_does_not_descend_build_trees() {
-        if !fixture_isolated("git_watch::tests::incomplete_ignored_inventory_does_not_descend_build_trees") { return; }
+        if !fixture_isolated(
+            "git_watch::tests::incomplete_ignored_inventory_does_not_descend_build_trees",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         init_fixture(root);
@@ -1581,7 +1622,11 @@ pub(crate) mod tests {
 
     #[test]
     fn unreadable_index_keeps_initial_root_and_admin_watches() {
-        if !fixture_isolated("git_watch::tests::unreadable_index_keeps_initial_root_and_admin_watches") { return; }
+        if !fixture_isolated(
+            "git_watch::tests::unreadable_index_keeps_initial_root_and_admin_watches",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         init_fixture(root);
@@ -1608,7 +1653,11 @@ pub(crate) mod tests {
 
     #[test]
     fn native_watcher_observes_first_file_in_initial_and_later_empty_directories() {
-        if !fixture_isolated("git_watch::tests::native_watcher_observes_first_file_in_initial_and_later_empty_directories") { return; }
+        if !fixture_isolated(
+            "git_watch::tests::native_watcher_observes_first_file_in_initial_and_later_empty_directories",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let git = RepositoryService::system("git");
