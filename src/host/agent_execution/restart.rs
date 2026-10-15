@@ -24,7 +24,18 @@ pub(in crate::host) struct CompletedPair {
 impl PairPlan {
     pub(in crate::host) fn source(&self) -> &chat::Session { &self.source }
     pub(in crate::host) fn execution_directory(&self) -> Result<(std::path::PathBuf, Arc<chat::protocol::ExecutionContext>), String> {
-        self.execution.clone().ok_or_else(|| "The completed restart no longer owns a pending directory handoff".into())
+        let (directory, execution) = self.execution.clone().ok_or_else(|| "The completed restart no longer owns a pending directory handoff".to_owned())?;
+        execution.verify_directory(&directory)?;
+        if let (Some(registry), Some(agent)) = (&self.registry, &self.agent) {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            if registry.agent_execution_directory(agent.id)? != directory
+                || registry.agent_directory(agent.id)? != execution.directory_identity()?
+                || execution.directory_identity()?.is_none()
+            {
+                return Err("The accepted provider's approved operational directory changed during restart".into());
+            }
+        }
+        Ok((directory, execution))
     }
     pub(in crate::host) fn release_completed(&mut self) -> CompletedPair {
         CompletedPair {
@@ -119,6 +130,9 @@ fn current(host: &SharedHost, id: TerminalId) -> Result<(chat::Session, chat::ru
 }
 
 pub(in crate::host) fn restore_restart_pair(host: &SharedHost, client: super::super::state::ClientId, plan: &PairPlan) -> Result<chat::RestartReceipt, String> {
+    // Applies to a reused live console as well as a recreated view. A pending
+    // handoff cannot publish readiness after its approved mapping was changed.
+    plan.execution_directory()?;
     let (mut session, handle) = current(host, plan.source.id)?;
     if session.proof != plan.source.proof || session.launch.provider != plan.source.launch.provider
         || session.launch.recipe != plan.source.launch.recipe
@@ -184,6 +198,7 @@ pub(in crate::host) fn restore_restart_pair(host: &SharedHost, client: super::su
     let (replacement, actual) = current(host, session.id)?;
     if !actual.same_actor(&handle) { return Err("The provider changed before its pair receipt was published".into()); }
     let receipt = chat::RestartReceipt::confirm(plan.source.clone(), replacement)?;
+    plan.execution_directory()?;
     if let (Some(registry),Some(agent)) = (&plan.registry,&plan.agent) {
         registry.lock().unwrap_or_else(|p|p.into_inner()).rebind_restarted_agent(agent,&receipt)?;
         announce(host,registry);
