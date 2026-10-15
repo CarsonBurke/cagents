@@ -400,7 +400,15 @@ pub fn load_file(
 
 /// Filesystem identity of the root used by an asynchronous document read.
 #[derive(Debug, Clone)]
-pub struct FileRootIdentity { path: PathBuf, device: u64, inode: u64, _root: std::sync::Arc<Root> }
+pub struct FileRootIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    _root: std::sync::Arc<Root>,
+    // The whole pair keeps this actual Doc/Undo/worker owner visible to the
+    // window's original custody. Diagnostic ticket clones alone are not owners.
+    admission: Option<crate::edited_root_admission::AdmittedRoot>,
+}
 impl PartialEq for FileRootIdentity {
     fn eq(&self, other: &Self) -> bool { self.path == other.path && self.device == other.device && self.inode == other.inode }
 }
@@ -409,6 +417,18 @@ impl FileRootIdentity {
     /// Pure clone of the original worker-opened descriptor. A stale spelling
     /// does not turn this into authority over a newly located/replaced root.
     pub fn retained_root(&self) -> std::sync::Arc<Root> { std::sync::Arc::clone(&self._root) }
+    /// Pure clone of an already admitted original owner. This does not enroll,
+    /// validate or authorize a different directory from its diagnostic path.
+    pub fn retained_admission(&self) -> Option<crate::edited_root_admission::AdmittedRoot> {
+        self.admission.clone()
+    }
+    /// Worker-only attachment before Editable publication. A successful ticket
+    /// from another Root cannot be rebound merely by storing it in the model.
+    pub(crate) fn with_admission(mut self, admission: crate::edited_root_admission::AdmittedRoot, deadline: std::time::Instant) -> Result<Self, FileIoError> {
+        admission.validate_for_root(&self._root, deadline).map_err(io_error)?;
+        self.admission = Some(admission);
+        Ok(self)
+    }
     /// Called on the publication worker. A stale read receipt may still name
     /// this held root, but its old pathname cannot authorize a new checkout.
     pub(crate) fn validate_named(&self, worktree: &Path) -> Result<&Root, FileIoError> {
@@ -425,13 +445,16 @@ impl FileRootIdentity {
         if self.device != relocated.device || self.inode != relocated.inode {
             return Err(FileIoError::Io("The located checkout is a different directory. The original buffer was kept; reopen a file in the new checkout before saving there.".into()));
         }
-        Ok(relocated)
+        match &self.admission {
+            Some(admission) => relocated.with_admission(admission.clone(), std::time::Instant::now() + std::time::Duration::from_secs(5)),
+            None => Ok(relocated),
+        }
     }
 
     pub(crate) fn of(root: std::sync::Arc<Root>) -> Result<Self, FileIoError> {
         use std::os::unix::fs::MetadataExt;
         let metadata = root.metadata().map_err(io_error)?;
-        Ok(Self { path: root.path().to_path_buf(), device: metadata.dev(), inode: metadata.ino(), _root: root })
+        Ok(Self { path: root.path().to_path_buf(), device: metadata.dev(), inode: metadata.ino(), _root: root, admission: None })
     }
 }
 
