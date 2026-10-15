@@ -1494,6 +1494,24 @@ impl TerminalHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn while_archive_preparing_for_test<R>(&self, operation: impl FnOnce() -> R) -> R {
+        struct Reopen(Arc<PublishedState>);
+        impl Drop for Reopen {
+            fn drop(&mut self) {
+                let mut phase = self.0.archive.lock().unwrap_or_else(|p| p.into_inner());
+                if matches!(*phase, ArchivePhase::Preparing) { *phase = ArchivePhase::Live; }
+                self.0.archive_ready.notify_all();
+            }
+        }
+        let mut phase = self.inner.published.archive.lock().unwrap();
+        assert!(matches!(*phase, ArchivePhase::Live));
+        *phase = ArchivePhase::Preparing;
+        drop(phase);
+        let _reopen = Reopen(Arc::clone(&self.inner.published));
+        operation()
+    }
+
     fn try_command(&self, command: Command) -> Result<(), TerminalSendError> {
         // Enqueue and archive preparation share this lock. No accepted query
         // can land between the final drain and worker teardown.

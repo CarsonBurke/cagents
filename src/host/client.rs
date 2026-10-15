@@ -1720,6 +1720,66 @@ mod tests {
     }
 
     #[test]
+    fn archiving_terminals_cannot_occupy_all_input_dispatch_workers() {
+        static ENTERED: std::sync::OnceLock<crossbeam_channel::Sender<TerminalId>> = std::sync::OnceLock::new();
+        fn handler(host: &SharedHost, client: ClientId, request: ClientRequest) -> Result<RequestOutcome, ProtocolError> {
+            if let ClientRequest::Input { terminal_id, .. } = &request { ENTERED.get().unwrap().send(*terminal_id).unwrap(); }
+            process_request(host, client, request)
+        }
+        fn reply(codec: &mut FrameCodec, peer: &mut UnixStream, request: u64) -> ServerMessage {
+            loop {
+                let envelope: ServerEnvelope = codec.read(peer).unwrap().unwrap();
+                if envelope.request_id == Some(request) { return envelope.message; }
+            }
+        }
+        crate::terminal::transport::initialize_host().unwrap();
+        let runtime = crate::terminal::transport::runtime().unwrap();
+        let (entered, observed) = crossbeam_channel::bounded(3);
+        ENTERED.set(entered).unwrap();
+        let (proof, host) = panic_test_host("archive-input-isolation");
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let marker = directory.path().join("live-input");
+        let mut peers = Vec::new(); let mut tasks = Vec::new(); let mut handles = Vec::new(); let mut ids = Vec::new();
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        for client in 1..=3 {
+            let (mut peer, server) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_millis(750))).unwrap();
+            tasks.push(runtime.spawn(serve_async(server, client, Arc::clone(&host), handler, None)));
+            codec.write(&mut peer, &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 1, proof: None, request: ClientRequest::Connect { expected_host: Some(proof.clone()), resume: Vec::new() } }).unwrap();
+            assert!(matches!(reply(&mut codec, &mut peer, 1), ServerMessage::Response { response: ServerResponse::Connected { .. } }));
+            let mut recipe = crate::model::LaunchRecipe::shell(directory.path().into()).unwrap();
+            recipe.program = "/bin/cat".into(); recipe.arguments.clear();
+            if client == 3 {
+                recipe.program = "/bin/sh".into();
+                recipe.arguments = vec!["-c".into(), "IFS= read -r line; printf '%s' \"$line\" > \"$1\"; exec /bin/cat".into(), "fixture".into(), marker.to_string_lossy().into_owned()];
+            }
+            let source = crate::model::TerminalSession { id: TerminalId::new(), launch: recipe.clone(), owned_codex_listener: None, recovery_origin: None, predecessor: None, transcript_path: None, resume_hint: None, continuity: crate::model::TerminalContinuity::RelaunchAvailable { recipe, last_exit: None } };
+            let handle = crate::terminal::TerminalHandle::spawn(source.clone(), Default::default(), |_| {}).unwrap();
+            let mut state = host.lock().unwrap(); state.reserve_spawn(source.id).unwrap(); state.finish_spawn(client, source.clone(), handle.clone(), true).unwrap(); drop(state);
+            ids.push(source.id); handles.push(handle); peers.push(peer);
+        }
+        handles[0].while_archive_preparing_for_test(|| handles[1].while_archive_preparing_for_test(|| {
+            for index in 0..2 { codec.write(&mut peers[index], &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 2, proof: Some(proof.clone()), request: ClientRequest::Input { terminal_id: ids[index], bytes: b"not-admitted".to_vec() } }).unwrap(); }
+            let first = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+            let second = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_ne!(first, second); assert!(ids[..2].contains(&first) && ids[..2].contains(&second));
+            let started = Instant::now();
+            codec.write(&mut peers[2], &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 2, proof: Some(proof.clone()), request: ClientRequest::Input { terminal_id: ids[2], bytes: b"live-pty\n".to_vec() } }).unwrap();
+            assert!(matches!(reply(&mut codec, &mut peers[2], 2), ServerMessage::Response { response: ServerResponse::Accepted }));
+            loop {
+                if std::fs::read_to_string(&marker).is_ok_and(|text| text == "live-pty") { break; }
+                assert!(started.elapsed() < Duration::from_millis(750), "unrelated actual PTY input waited for archive preparation");
+                thread::yield_now();
+            }
+            assert!(started.elapsed() < Duration::from_millis(750));
+            for peer in &mut peers[..2] { let ServerMessage::Error(error) = reply(&mut codec, peer, 2) else { panic!("archiving input was incorrectly accepted") }; assert_eq!(error.code, ProtocolErrorCode::QueueFull); assert!(error.retryable); }
+        }));
+        for handle in &handles { handle.shutdown().unwrap(); }
+        drop(peers);
+        runtime.block_on(async { tokio::time::timeout(Duration::from_secs(5), async { for task in tasks { task.await.unwrap(); } crate::terminal::transport::flush_retired().await; }).await.unwrap(); });
+    }
+
+    #[test]
     fn thirty_client_connections_add_no_os_threads() {
         const FIXTURE: &str = "CAGENTS_TRANSPORT_THREAD_CENSUS";
         if std::env::var_os(FIXTURE).is_none() {
