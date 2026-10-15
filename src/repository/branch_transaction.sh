@@ -12,20 +12,7 @@ repo_git() (
         --git-dir="$CAGENTS_BRANCH_FD_1" --work-tree="$CAGENTS_BRANCH_FD_0" "$@"
 )
 verify() {
-    # Original source/private/common followed by the created parent/root/admin.
-    for index in 0 1 2 3 4 5; do
-        case "$index" in
-            0) named=$CAGENTS_BRANCH_NAMED_0; fd=$CAGENTS_BRANCH_FD_0; identity=$CAGENTS_BRANCH_ID_0;;
-            1) named=$CAGENTS_BRANCH_NAMED_1; fd=$CAGENTS_BRANCH_FD_1; identity=$CAGENTS_BRANCH_ID_1;;
-            2) named=$CAGENTS_BRANCH_NAMED_2; fd=$CAGENTS_BRANCH_FD_2; identity=$CAGENTS_BRANCH_ID_2;;
-            3) named=$CAGENTS_BRANCH_NAMED_3; fd=$CAGENTS_BRANCH_FD_3; identity=$CAGENTS_BRANCH_ID_3;;
-            4) named=$CAGENTS_BRANCH_NAMED_4; fd=$CAGENTS_BRANCH_FD_4; identity=$CAGENTS_BRANCH_ID_4;;
-            5) named=$CAGENTS_BRANCH_NAMED_5; fd=$CAGENTS_BRANCH_FD_5; identity=$CAGENTS_BRANCH_ID_5;;
-        esac
-        [ ! -L "$named" ]
-        [ "$(/usr/bin/stat -Lc '%d:%i' -- "$named")" = "$identity" ]
-        [ "$(/usr/bin/stat -Lc '%d:%i' -- "$fd")" = "$identity" ]
-    done
+    . "$CAGENTS_BRANCH_PRIVATE/check-identities"
     count=0
     while IFS=' ' read -r old new ref extra; do
         [ -z "$extra" ]

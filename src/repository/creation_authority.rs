@@ -119,6 +119,9 @@ struct Publication {
     result: Result<OwnedDestination, RepositoryError>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RegistrationExpectation { RequestedBranch, Detached }
+
 pub(super) struct CreationSession {
     source: WorktreeAuthority,
     source_roots: [fs_safety::Root; 3],
@@ -261,12 +264,17 @@ impl CreationSession {
     }
 
     pub(super) fn bind_created(self: &Arc<Self>, evidence: &mut CreationEvidence,
-        request: &CreateWorktreeRequest, registered: &WorktreeRecord, expected_oid: &str)
+        request: &CreateWorktreeRequest, registered: &WorktreeRecord, expected_oid: &str,
+        expectation: RegistrationExpectation)
         -> Result<Arc<VerifiedCreatedRoot>, RepositoryError>
     {
         self.validate()?;
+        let expected_branch = match expectation {
+            RegistrationExpectation::RequestedBranch => Some(request.branch.full_ref()),
+            RegistrationExpectation::Detached => None,
+        };
         if evidence.operation != request.operation_id || registered.path != request.destination
-            || registered.branch.as_deref() != Some(request.branch.full_ref().as_str())
+            || registered.branch != expected_branch
             || registered.head_oid.as_deref() != Some(expected_oid)
             || registered.lock.reason.as_deref() != Some(format!("cagents:{}", request.operation_id).as_str())
             || registered.bare || registered.prunable_reason.is_some()
@@ -295,14 +303,14 @@ impl CreationSession {
             common.try_clone().map_err(filesystem)?)?;
         let created = Arc::new(VerifiedCreatedRoot { source: self.clone(), owned,
             authority, admin: admin_witness.clone(), operation: request.operation_id,
-            branch: request.branch.full_ref() });
+            branch: expected_branch });
         created.validate()?;
         evidence.admin = Some(admin_witness);
         Ok(created)
     }
 }
 
-fn regular_locator(root: &fs_safety::Root, leaf: &str) -> Result<Vec<u8>, RepositoryError> {
+pub(super) fn regular_locator(root: &fs_safety::Root, leaf: &str) -> Result<Vec<u8>, RepositoryError> {
     let file = fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(anchor(root).join(leaf))
         .map_err(filesystem)?;
@@ -325,7 +333,7 @@ pub(super) struct VerifiedCreatedRoot {
     authority: WorktreeAuthority,
     admin: DirectoryWitness,
     operation: OperationId,
-    branch: String,
+    branch: Option<String>,
 }
 
 impl fmt::Debug for VerifiedCreatedRoot {

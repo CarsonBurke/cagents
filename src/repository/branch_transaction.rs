@@ -40,7 +40,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .ok_or_else(|| invalid("Branch advancement needs the verified provisional checkout"))?;
         let mut held = vec![source, private, common];
         held.extend(created.transaction_roots()?);
-        let common = &held[2];
+        let common = held[2].try_clone().map_err(|error| invalid(error.to_string()))?;
         let old = journal.existing_branch_oid.as_deref()
             .ok_or_else(|| invalid("No existing branch consent was recorded"))?;
         let new = journal.base_oid.as_deref()
@@ -60,19 +60,49 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if records.iter().any(|record| record.branch.as_deref() == Some(full_ref.as_str())) {
             return Err(invalid("The existing branch became checked out elsewhere; it was retained"));
         }
-        let common_metadata = common.metadata().map_err(|error| invalid(error.to_string()))?;
-        let mut roots = Vec::new();
-        for record in records.iter().filter(|record| !record.bare) {
-            let captured = WorktreeAuthority::capture(&record.path)?;
-            let (_, admin, other_common) = captured.retained_roots()?;
-            let metadata = other_common.metadata().map_err(|error| invalid(error.to_string()))?;
-            if (metadata.dev(), metadata.ino()) != (common_metadata.dev(), common_metadata.ino()) {
-                return Err(invalid("A registered checkout changed its common metadata"));
+        // Native Git resolves registered HEADs from its common metadata, not
+        // from mutable <checkout>/.git aliases. Lock those exact admin roots.
+        let mut roots = vec![common.try_clone().map_err(|error| invalid(error.to_string()))?];
+        let mut linked_paths = HashSet::new();
+        let registry = match fs_safety::open_directory_beneath(&common, Path::new("worktrees")) {
+            Ok(root) => Some(root),
+            Err(error) if error.is_not_found() => None,
+            Err(error) => return Err(invalid(error.to_string())),
+        };
+        if let Some(registry) = registry {
+            for (index, entry) in registry.read_dir().map_err(|error| invalid(error.to_string()))?.enumerate() {
+                if index >= 4096 { return Err(invalid("The registered checkout inventory exceeds its safe bound")); }
+                let entry = entry.map_err(|error| invalid(error.to_string()))?;
+                let admin = fs_safety::open_directory_beneath(&registry, Path::new(&entry.file_name()))
+                    .map_err(|error| invalid(error.to_string()))?;
+                let backlink = creation_authority::regular_locator(&admin, "gitdir")?;
+                let marker = bytes_to_path(trim_one_line_ending(&backlink));
+                let record = records.iter().find(|record| !record.bare && record.path.join(".git") == marker)
+                    .ok_or_else(|| invalid("A registered admin has no matching native checkout record; repair or prune it first"))?;
+                if !linked_paths.insert(record.path.clone()) {
+                    return Err(invalid("Multiple registered admins claim the same checkout path"));
+                }
+                if !fs_safety::metadata_beneath(&admin, Path::new("HEAD"))
+                    .map_err(|error| invalid(error.to_string()))?.is_file() {
+                    return Err(invalid("A registered checkout has no regular files-backend HEAD"));
+                }
+                roots.push(admin);
             }
-            roots.push(admin);
         }
-        roots.sort_by(|left, right| left.path().cmp(right.path()));
-        roots.dedup_by(|left, right| left.path() == right.path());
+        let primary = records.iter().filter(|record| !record.bare && !linked_paths.contains(&record.path))
+            .collect::<Vec<_>>();
+        if primary.len() > 1 { return Err(invalid("The primary checkout registration is ambiguous")); }
+        for record in primary {
+            let captured = WorktreeAuthority::capture(&record.path)?;
+            let (_, admin, _) = captured.retained_roots()?;
+            let actual = admin.metadata().map_err(|error| invalid(error.to_string()))?;
+            let expected = common.metadata().map_err(|error| invalid(error.to_string()))?;
+            if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
+                return Err(invalid("The primary checkout locator no longer names its registered admin"));
+            }
+        }
+        held.extend(roots.iter().map(|root| root.try_clone().map_err(|error| invalid(error.to_string())))
+            .collect::<Result<Vec<_>, _>>()?);
         let locks = roots.iter().map(head_lock).collect::<Result<Vec<_>, _>>()?;
         for lock in &locks { lock.check().map_err(invalid)?; }
         if census()?.iter().any(|record| record.branch.as_deref() == Some(full_ref.as_str())) {
@@ -105,6 +135,29 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             let (path, file) = authority::inherited_directory_scope(root)?;
             files.push(file); paths.push(path);
         }
+        let mut identities = Vec::new();
+        let quote = |bytes: &[u8]| -> Vec<u8> {
+            let mut result = vec![b'\''];
+            for byte in bytes {
+                if *byte == b'\'' { result.extend_from_slice(b"'\\''"); }
+                else { result.push(*byte); }
+            }
+            result.push(b'\''); result
+        };
+        for (root, path) in held.iter().zip(&paths) {
+            let metadata = root.metadata().map_err(|error| invalid(error.to_string()))?;
+            identities.extend_from_slice(b"[ ! -L ");
+            identities.extend(quote(root.path().as_os_str().as_encoded_bytes()));
+            identities.extend_from_slice(b" ]\n");
+            for path in [root.path(), path.as_path()] {
+                identities.extend_from_slice(b"[ \"$(/usr/bin/stat -Lc '%d:%i' -- ");
+                identities.extend(quote(path.as_os_str().as_encoded_bytes()));
+                identities.extend_from_slice(b")\" = ");
+                identities.extend(quote(format!("{}:{}", metadata.dev(), metadata.ino()).as_bytes()));
+                identities.extend_from_slice(b" ]\n");
+            }
+        }
+        write(&directory.join("check-identities"), &identities, 0o600)?;
         let child_directory = paths[2].join(directory.file_name()
             .ok_or_else(|| invalid("The private branch operation has no directory name"))?);
         let child_proof = child_directory.join("prepared");
@@ -121,11 +174,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .env("CAGENTS_BRANCH_PREVIOUS_HOOK", &previous)
                 .env("CAGENTS_BRANCH_ORIGINAL_CONFIG", &original)
                 .env("CAGENTS_BRANCH_PREVIOUS_CONFIG", &policy_config);
-            for (index, (root, path)) in held.iter().zip(&paths).enumerate() {
-                let metadata = root.metadata().map_err(|error| invalid(error.to_string()))?;
-                command = command.env(format!("CAGENTS_BRANCH_NAMED_{index}"), root.path())
-                    .env(format!("CAGENTS_BRANCH_FD_{index}"), path)
-                    .env(format!("CAGENTS_BRANCH_ID_{index}"), format!("{}:{}", metadata.dev(), metadata.ino()));
+            for (index, path) in paths.iter().take(3).enumerate() {
+                command = command.env(format!("CAGENTS_BRANCH_FD_{index}"), path);
             }
             for file in &files { command = command.inherit_file(file.clone()).map_err(|error| invalid(error.to_string()))?; }
             command.inherited_lease = Some(lease);

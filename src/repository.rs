@@ -12929,6 +12929,12 @@ struct WorktreeJournal {
     lease_identity: Option<(u64, u64)>,
     effects_started: bool,
     checkout_completed: bool,
+    #[serde(default)]
+    detached_creation: bool,
+    #[serde(default)]
+    branch_advance_attempted: bool,
+    #[serde(default)]
+    observed_branch_oid: Option<String>,
     base_oid: Option<String>,
     #[serde(default)]
     existing_branch_oid: Option<String>,
@@ -13566,6 +13572,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     }
                 }
             }
+            journal.detached_creation = journal.live_creation.is_some()
+                && journal.existing_branch_oid.as_ref().is_some_and(|existing| existing != &oid);
             journal.base_oid = Some(oid.clone());
             // Persist intention before the first managed-directory or Git effect.
             journal.effects_started = true;
@@ -13609,6 +13617,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     )
                     .into());
                 }
+                if journal.detached_creation {
+                    self.git_mutation(&journal.request.repository, [
+                        OsString::from("worktree"), "add".into(), "--lock".into(),
+                        "--reason".into(), format!("cagents:{}", journal.request.operation_id).into(),
+                        "--detach".into(), "--".into(),
+                        journal.request.destination.as_os_str().to_owned(), oid.as_str().into(),
+                    ])
+                } else {
                 self.git_mutation(
                     &journal.request.repository,
                     [
@@ -13622,6 +13638,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         journal.request.branch.as_str().into(),
                     ],
                 )
+                }
             } else {
                 if branch.exit_code != Some(1) {
                     return Err(ValidationError::InvalidBranch(
@@ -13654,19 +13671,45 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     .ok_or_else(|| ValidationError::Io("Git did not register the owned destination".into()))?;
                 journal.live_created = Some(scope.bind_created(
                     journal.creation_authority.as_mut().ok_or_else(|| ValidationError::Io("Missing creation authority".into()))?,
-                    &journal.request, &registered, &oid)?);
+                    &journal.request, &registered, &oid,
+                    if journal.detached_creation { creation_authority::RegistrationExpectation::Detached }
+                    else { creation_authority::RegistrationExpectation::RequestedBranch })?);
             }
             if journal
                 .existing_branch_oid
                 .as_ref()
                 .is_some_and(|existing| existing != &oid)
             {
-                let mut advance = self.git_mutation(
-                    &journal.request.destination,
-                    ["merge", "--ff-only", "--no-edit", oid.as_str()],
-                );
-                advance.inherited_lease = Some(lease.as_raw_fd());
-                self.run_checked(&advance, cancellation)?;
+                if journal.detached_creation {
+                    journal.branch_advance_attempted = true;
+                    journal.persist(store, &payload).map(|next| payload = next).map_err(|error| {
+                        journal_write_failed = true;
+                        ValidationError::Io(format!("journal write failed: {error}"))
+                    })?;
+                    self.advance_unoccupied_creation_branch(&journal, cancellation, lease.as_raw_fd())?;
+                    let created = journal.live_created.clone()
+                        .ok_or_else(|| ValidationError::Io("Missing provisional checkout authority".into()))?;
+                    let child = self.created_worktree_service(created)?;
+                    let mut attach = child.git_mutation(&journal.request.destination,
+                        ["switch", "--no-guess", "--", journal.request.branch.as_str()]);
+                    attach.inherited_lease = Some(lease.as_raw_fd());
+                    child.run_checked(&attach, cancellation)?;
+                    let registered = self.list_worktrees(&journal.request.repository, cancellation)?
+                        .into_iter().find(|record| record.path == journal.request.destination)
+                        .ok_or_else(|| ValidationError::Io("The advanced checkout lost its registration".into()))?;
+                    let scope = journal.live_creation.clone().expect("scoped detached creation");
+                    journal.live_created = Some(scope.bind_created(journal.creation_authority.as_mut()
+                        .ok_or_else(|| ValidationError::Io("Missing durable creation authority".into()))?,
+                        &journal.request, &registered, &oid,
+                        creation_authority::RegistrationExpectation::RequestedBranch)?);
+                } else {
+                    let mut advance = self.git_mutation(
+                        &journal.request.destination,
+                        ["merge", "--ff-only", "--no-edit", oid.as_str()],
+                    );
+                    advance.inherited_lease = Some(lease.as_raw_fd());
+                    self.run_checked(&advance, cancellation)?;
+                }
             }
             journal.checkout_completed = true;
             journal
@@ -13755,10 +13798,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .map(|oid| oid.to_string());
         if self.authority.is_some() && existing_branch_oid.is_some()
             && !(matches!(&request.base, BaseRevision::LocalBranch(branch) if branch == &request.branch)
-                && !request.track)
+                || (request.track && matches!(&request.base, BaseRevision::RemoteRef(_))))
         {
             return Err(ValidationError::InvalidBranch(
-                "Captured worktree creation cannot yet advance an existing branch; choose an unused branch or reconcile the existing branch explicitly. No fetch or creation was started".into()
+                "Existing branch needs its own local base or an explicit tracking remote base. No fetch or creation was started".into()
             ).into());
         }
         Ok(WorktreeJournal {
@@ -13771,6 +13814,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             lease_identity: None,
             effects_started: false,
             checkout_completed: false,
+            detached_creation: false,
+            branch_advance_attempted: false,
+            observed_branch_oid: None,
             base_oid: None,
             existing_branch_oid,
             admin_dir: None,
@@ -13904,12 +13950,24 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return;
             }
         };
+        if journal.branch_advance_attempted {
+            journal.observed_branch_oid = match self.resolve_optional_revision(
+                &journal.request.repository, &journal.request.branch.full_ref(), &CancellationToken::new()) {
+                Ok(oid) => oid.map(|oid| oid.to_string()),
+                Err(error) => {
+                    journal.state = WorktreeOperationState::OutcomeUnknown;
+                    journal.detail = format!("Branch advancement was attempted, but its final OID cannot be read: {error}");
+                    return;
+                }
+            };
+        }
         // Canonical paths and the .git backlink must agree, not just the list entry.
         let owned = residual
             .registered_worktree
             .as_ref()
             .is_some_and(|worktree| {
                 worktree.branch.as_deref() == Some(journal.request.branch.full_ref().as_str())
+                    && (!journal.branch_advance_attempted || journal.observed_branch_oid == journal.base_oid)
                     && journal
                         .base_oid
                         .as_ref()
@@ -13949,7 +14007,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         } else {
             journal.state = WorktreeOperationState::OutcomeUnknown;
             journal.outcome = Some(WorktreeCreationOutcome::OutcomeUnknown { failure, residual });
-            journal.detail = "Partial or unowned state; inspect manually, do not retry".into();
+            journal.detail = if journal.branch_advance_attempted {
+                format!("Partial creation; existing branch advancement was attempted (before {}, target {}, observed {}). Inspect manually; no rollback or replay was performed",
+                    journal.existing_branch_oid.as_deref().unwrap_or("unknown"),
+                    journal.base_oid.as_deref().unwrap_or("unknown"),
+                    journal.observed_branch_oid.as_deref().unwrap_or("absent"))
+            } else { "Partial or unowned state; inspect manually, do not retry".into() };
         }
     }
 
@@ -14012,7 +14075,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let registered = self.list_worktrees(&journal.request.repository, &CancellationToken::new()).ok()?
             .into_iter().find(|record| record.path == journal.request.destination)?;
         let created = scope.bind_created(journal.creation_authority.as_mut()?, &journal.request,
-            &registered, journal.base_oid.as_deref()?) .ok()?;
+            &registered, journal.base_oid.as_deref()?,
+            creation_authority::RegistrationExpectation::RequestedBranch) .ok()?;
         let (admin, checkout) = created.roots().ok()?;
         if !journal.checkout_completed {
             if !fs_safety::metadata_beneath(&admin, Path::new("index")).ok()?.is_file() {
@@ -14159,6 +14223,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                             .existing_branch_oid
                             .as_ref()
                             .is_none_or(|oid| is_hex_oid(oid))
+                        && journal.observed_branch_oid.as_ref().is_none_or(|oid| is_hex_oid(oid))
+                        && (!journal.detached_creation || (journal.creation_authority.is_some()
+                            && journal.effects_started && journal.base_oid.is_some()
+                            && journal.existing_branch_oid.is_some()))
+                        && (!journal.branch_advance_attempted || journal.detached_creation)
                         && (!journal.checkout_completed
                             || (journal.effects_started && journal.base_oid.is_some()))
                         && ValidatedBranchName::parse(journal.request.branch.as_str()).is_ok()
@@ -14495,7 +14564,7 @@ mod worktree_journal_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn scoped_existing_branch_advance_refuses_before_journal_or_directory_effects() {
+    fn scoped_incompatible_existing_branch_base_refuses_before_journal_or_directory_effects() {
         let fixture = Fixture::new();
         fixture.git(&["branch", "feature", "main"]);
         let authority = WorktreeAuthority::capture(&fixture.request.repository).unwrap();
@@ -14505,7 +14574,7 @@ mod worktree_journal_tests {
         let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
             7, &CancellationToken::new(), &sender);
         assert_eq!(report.state, WorktreeOperationState::MalformedPayload, "{report:?}");
-        assert!(report.detail.contains("cannot yet advance an existing branch"));
+        assert!(report.detail.contains("Existing branch needs its own local base"));
         assert!(!fixture.request.managed_root.exists());
         assert!(fixture.store.journaled_worktree_operations().unwrap().is_empty());
         assert_eq!(fixture.git(&["rev-parse", "feature"]), before);
@@ -14669,6 +14738,222 @@ mod worktree_journal_tests {
             } else {
                 assert!(fs::read_dir(&fixture.request.destination).unwrap().next().is_none(),
                     "a published directory is a known partial effect, never a rollback claim");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn existing_branch_advance_fixture() -> (Fixture, Fixture, String, String) {
+        let remote = Fixture::new();
+        remote.git(&["branch", "feature", "main"]);
+        remote.git(&["switch", "feature"]);
+        let mut local = Fixture::new();
+        local.add_remote("origin", &remote);
+        local.git(&["fetch", "origin"]);
+        let old = local.git(&["rev-parse", "refs/remotes/origin/feature"]);
+        local.git(&["branch", "feature", &old]);
+        fs::write(remote.request.repository.join("tracked.txt"), b"upstream content\n").unwrap();
+        remote.git(&["add", "tracked.txt"]);
+        remote.git(&["commit", "-m", "advance upstream"]);
+        let new = remote.git(&["rev-parse", "HEAD"]);
+        local.request.base = BaseRevision::remote_ref("refs/remotes/origin/feature").unwrap();
+        local.request.track = true;
+        (local, remote, old, new)
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AdvanceRace {
+        repository: PathBuf,
+        old: String,
+        replacement: Option<String>,
+        replace_admin: Option<PathBuf>,
+        fail_attach: bool,
+        attempted: AtomicBool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProcessExecutor for AdvanceRace {
+        fn execute(&self, command: &CommandSpec, token: &CancellationToken)
+            -> Result<ProcessOutput, ProcessFailure>
+        {
+            if command.arguments.windows(2).any(|pair| pair[0] == "branch" && pair[1] == "--force")
+                && !self.attempted.swap(true, Ordering::SeqCst)
+            {
+                if let Some(replacement) = &self.replacement {
+                    let output = Command::new("git").arg("-C").arg(&self.repository)
+                        .args(["update-ref", "refs/heads/feature", replacement, &self.old])
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
+                        .output().unwrap();
+                    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                }
+                if let Some(admin) = &self.replace_admin {
+                    let original = admin.with_extension("original");
+                    fs::rename(admin, &original).unwrap();
+                    fs::create_dir(admin).unwrap();
+                    for name in ["HEAD", "gitdir", "commondir"] {
+                        fs::copy(original.join(name), admin.join(name)).unwrap();
+                    }
+                    fs::write(admin.join("keep"), b"foreign admin replacement\n").unwrap();
+                }
+            }
+            if self.fail_attach && command.arguments.windows(2)
+                .any(|pair| pair[0] == "switch" && pair[1] == "--no-guess")
+            {
+                return Err(process_failure(command, ProcessFailureKind::Spawn,
+                    "injected failure before attaching an already-advanced branch", false));
+            }
+            SystemProcessExecutor.execute(&command.clone().env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1"), token)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_existing_branch_advances_then_attaches_with_exact_tracking() {
+        for unusual in [false, true] {
+            let (mut fixture, _remote, old, new) = existing_branch_advance_fixture();
+            if unusual {
+                let path = fixture.directory.path().join("source's\ncheckout");
+                fs::rename(&fixture.request.repository, &path).unwrap();
+                fixture.request.repository = path;
+            }
+            let executor = Arc::new(AdvanceRace { repository: fixture.request.repository.clone(),
+                old: old.clone(), replacement: None, replace_admin: None, fail_attach: false,
+                attempted: AtomicBool::new(false) });
+            let service = RepositoryService::new("git", executor.clone()).with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = service.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+            assert!(executor.attempted.load(Ordering::SeqCst));
+            assert_eq!(fixture.git(&["rev-parse", "feature"]), new);
+            assert_eq!(fixture.git(&["rev-parse", "feature@{upstream}"]), new);
+            assert_eq!(fs::read(fixture.request.destination.join("tracked.txt")).unwrap(), b"upstream content\n");
+            let record = fixture.service.list_worktrees(&fixture.request.repository, &CancellationToken::new())
+                .unwrap().into_iter().find(|record| record.path == fixture.request.destination).unwrap();
+            assert_eq!(record.branch.as_deref(), Some("refs/heads/feature"));
+            assert!(!record.detached);
+            let journal = fixture.journal(fixture.request.operation_id);
+            assert!(journal.detached_creation && journal.branch_advance_attempted);
+            assert_eq!(journal.existing_branch_oid.as_deref(), Some(old.as_str()));
+            assert_eq!(journal.observed_branch_oid.as_deref(), Some(new.as_str()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_branch_advance_refuses_new_oid_and_reports_partial_attach_without_replay() {
+        for fail_attach in [false, true] {
+            let (fixture, _remote, old, new) = existing_branch_advance_fixture();
+            let tree = fixture.git(&["rev-parse", &format!("{old}^{{tree}}")]);
+            let concurrent = fixture.git(&["commit-tree", &tree, "-p", &old, "-m", "concurrent branch edit"]);
+            let executor = Arc::new(AdvanceRace { repository: fixture.request.repository.clone(),
+                old: old.clone(), replacement: (!fail_attach).then_some(concurrent.clone()),
+                replace_admin: None, fail_attach, attempted: AtomicBool::new(false) });
+            let scoped = RepositoryService::new("git", executor.clone()).with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert!(executor.attempted.load(Ordering::SeqCst));
+            assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{report:?}");
+            let expected = if fail_attach { &new } else { &concurrent };
+            assert_eq!(fixture.git(&["rev-parse", "feature"]), *expected);
+            assert!(report.detail.contains(expected));
+            assert!(report.detail.contains("no rollback or replay"));
+            assert_eq!(fs::read(fixture.request.destination.join("tracked.txt")).unwrap(), b"upstream content\n");
+            let record = fixture.service.list_worktrees(&fixture.request.repository, &CancellationToken::new())
+                .unwrap().into_iter().find(|record| record.path == fixture.request.destination).unwrap();
+            assert!(record.detached && record.branch.is_none());
+            let recovered = scoped.rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert_eq!(recovered[0].state, WorktreeOperationState::OutcomeUnknown);
+            assert_eq!(fixture.git(&["rev-parse", "feature"]), *expected);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AliasPolicyExecutor {
+        inner: AdvanceRace,
+        admin: PathBuf,
+        worktree: PathBuf,
+        result: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProcessExecutor for AliasPolicyExecutor {
+        fn execute(&self, command: &CommandSpec, token: &CancellationToken)
+            -> Result<ProcessOutput, ProcessFailure>
+        {
+            self.inner.execute(&command.clone().env("CAGENTS_ALIAS_ADMIN", &self.admin)
+                .env("CAGENTS_ALIAS_WORKTREE", &self.worktree)
+                .env("CAGENTS_ALIAS_RESULT", &self.result), token)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_branch_advance_guards_actual_registered_admins_and_rejects_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        for replace_admin in [false, true] {
+            let (fixture, _remote, old, new) = existing_branch_advance_fixture();
+            let y = fixture.directory.path().join("other-y");
+            let z = fixture.directory.path().join("other-z");
+            fixture.git(&["worktree", "add", "-b", "y", y.to_str().unwrap(), "main"]);
+            fixture.git(&["worktree", "add", "-b", "z", z.to_str().unwrap(), "main"]);
+            let admin_y = fixture.service.git_dir(&y, &CancellationToken::new()).unwrap();
+            let admin_z = fixture.service.git_dir(&z, &CancellationToken::new()).unwrap();
+            let original_head = fs::read(admin_y.join("HEAD")).unwrap();
+            // Native worktree inventory still reads adminY. Looking up Y's
+            // mutable locator instead would incorrectly lock adminZ twice.
+            fs::write(y.join(".git"), format!("gitdir: {}\n", admin_z.display())).unwrap();
+            let result = fixture.directory.path().join("policy-result");
+            let hook = fixture.request.repository.join(".git/hooks/reference-transaction");
+            fs::write(&hook, r#"#!/bin/sh
+set -eu
+input=$(/bin/cat)
+[ "$1" = prepared ] || exit 0
+match=0
+while IFS=' ' read -r old new ref extra; do
+    if [ "$ref" = refs/heads/feature ]; then match=1; fi
+done <<EOF_INPUT
+$input
+EOF_INPUT
+[ "$match" = 1 ] || exit 0
+[ ! -e "$CAGENTS_ALIAS_RESULT" ] || exit 0
+printf entered > "$CAGENTS_ALIAS_RESULT"
+if git --git-dir="$CAGENTS_ALIAS_ADMIN" --work-tree="$CAGENTS_ALIAS_WORKTREE" \
+    symbolic-ref HEAD refs/heads/feature >/dev/null 2>&1; then
+    printf switched > "$CAGENTS_ALIAS_RESULT"
+    exit 1
+fi
+printf refused > "$CAGENTS_ALIAS_RESULT"
+"#).unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+            let executor = Arc::new(AliasPolicyExecutor {
+                inner: AdvanceRace { repository: fixture.request.repository.clone(), old: old.clone(),
+                    replacement: None, replace_admin: replace_admin.then_some(admin_y.clone()),
+                    fail_attach: false, attempted: AtomicBool::new(false) },
+                admin: admin_y.clone(), worktree: y, result: result.clone(),
+            });
+            let scoped = RepositoryService::new("git", executor.clone()).with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let (sender, _) = async_channel::bounded(8);
+            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+                7, &CancellationToken::new(), &sender);
+            assert!(executor.inner.attempted.load(Ordering::SeqCst));
+            assert_eq!(fs::read(admin_y.join("HEAD")).unwrap(), original_head);
+            if replace_admin {
+                assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{report:?}");
+                assert_eq!(fixture.git(&["rev-parse", "feature"]), old);
+                assert_eq!(fs::read(admin_y.join("keep")).unwrap(), b"foreign admin replacement\n");
+                assert_eq!(fs::read_dir(admin_y).unwrap().count(), 4);
+                assert!(!result.exists(), "identity refusal must precede repository policy");
+            } else {
+                assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+                assert_eq!(fixture.git(&["rev-parse", "feature"]), new);
+                assert_eq!(fs::read(result).unwrap(), b"refused",
+                    "the policy's actual adminY checkout attempt must hit adminY's native HEAD lock");
             }
         }
     }
