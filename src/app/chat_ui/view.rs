@@ -1317,7 +1317,8 @@ impl Runtime {
             {
                 builder.logical(notice_identity(None, error), Arc::from(error.as_str()));
             }
-            *document = Some((fingerprint, builder.finish()));
+            let catalog = builder.finish_reusing(document.as_ref().map(|(_, catalog)| catalog.as_ref()));
+            *document = Some((fingerprint, catalog));
         }
         let catalog = document.as_ref().unwrap().1.clone();
         let bookmark = self
