@@ -3,6 +3,9 @@ use super::*;
 
 pub(crate) const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PAGE_BYTES: usize = 256 * 1024;
+pub(super) const REQUEST_NAMESPACE: u64 = 1 << 63;
+pub(super) fn owns_request(request: u64) -> bool { request & REQUEST_NAMESPACE != 0 }
+
 
 #[derive(Clone)]
 pub(crate) struct Output {
@@ -100,7 +103,7 @@ impl ClientHandle {
         })
     }
 
-    fn provider_exit_page(
+    pub(super) fn provider_exit_page(
         &self,
         log_id: &str,
         offset: u64,
@@ -109,7 +112,7 @@ impl ClientHandle {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Reconnect this conversation before loading its saved output".into());
         }
-        let request = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let request = next_request_id(&self.inner.next)? | REQUEST_NAMESPACE;
         let (reply, response) = crossbeam_channel::bounded(1);
         {
             let mut pending = self
@@ -149,6 +152,16 @@ impl ClientHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_output_request_namespace_never_overlaps_normal_or_wraps() {
+        let next = AtomicU64::new(REQUEST_NAMESPACE - 2);
+        let ordinary = next_request_id(&next).unwrap();
+        assert!(!owns_request(ordinary));
+        assert!(owns_request(ordinary | REQUEST_NAMESPACE));
+        assert!(next_request_id(&next).is_err());
+        assert_eq!(next.load(Ordering::Relaxed), REQUEST_NAMESPACE - 1);
+    }
 
     #[test]
     fn provider_output_invalid_utf8_has_a_bounded_readable_expansion() {

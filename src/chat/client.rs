@@ -30,6 +30,14 @@ const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 mod provider_exit;
 pub(crate) use provider_exit::Output as ProviderExitOutput;
 
+// Keep ordinary request IDs below the local-query namespace. This prevents
+// an expired diagnostic reply from becoming an unrelated conversation error.
+fn next_request_id(next: &AtomicU64) -> Result<u64, String> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value.checked_add(1).filter(|next| *next < provider_exit::REQUEST_NAMESPACE)
+    }).map_err(|_| "Chat request identifiers are exhausted; reconnect this conversation".to_owned())
+}
+
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
@@ -980,13 +988,9 @@ impl ClientHandle {
                         chat_id: id,
                         visible: visibility_value.load(Ordering::Acquire),
                     };
-                    if transmit(
-                        &visibility_wire,
-                        &visibility_proof,
-                        visibility_next.fetch_add(1, Ordering::Relaxed),
-                        request,
-                    )
-                    .is_err()
+                    if next_request_id(&visibility_next).and_then(|id| {
+                        transmit(&visibility_wire, &visibility_proof, id, request)
+                    }).is_err()
                     {
                         let _ = visibility_wire
                             .lock()
@@ -1061,6 +1065,10 @@ impl ClientHandle {
                     let _ = reply.try_send(result);
                     continue;
                 }
+                // Timed-out/cancelled local queries retain their namespace even
+                // after the waiter is gone. Their late errors must not replace
+                // the provider crash reason in the watch snapshot.
+                if envelope.request_id.is_some_and(provider_exit::owns_request) { continue; }
                 if let Some(reply)=envelope.request_id.and_then(|request|file_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
                     let result=match envelope.message {
                         ServerMessage::Response{response:ServerResponse::ChatFileChanges{chat_id,summary}} if chat_id==id=>Ok(super::FileChangeReply::Files(summary)),
@@ -1140,7 +1148,7 @@ impl ClientHandle {
                 if read_again && !read_pending && visible.load(Ordering::Acquire) {
                     read_again = false;
                     let generation = snapshot.lock().unwrap_or_else(|p| p.into_inner()).generation;
-                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: (!resync).then_some(generation) }) { break error; }
+                    if let Err(error) = next_request_id(&next).and_then(|request| transmit(&wire, &proof, request, ClientRequest::ChatRead { chat_id: id, after_generation: (!resync).then_some(generation) })) { break error; }
                     read_pending = true;
                 }
             };
@@ -1266,7 +1274,7 @@ impl ClientHandle {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected; exact reattachment is required".into());
         }
-        let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let id = next_request_id(&self.inner.next)?;
         let (reply, response) = crossbeam_channel::bounded(1);
         {
             let mut pending = self.inner.pending.lock().unwrap_or_else(|p| p.into_inner());
@@ -1318,7 +1326,7 @@ impl ClientHandle {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected; retained file pages remain readable".into());
         }
-        let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let id = next_request_id(&self.inner.next)?;
         let (reply, response) = crossbeam_channel::bounded(1);
         {
             let mut pending = self
@@ -3029,8 +3037,21 @@ mod tests {
                 offset = end;
             }
             assert_eq!(offset, raw.len());
+            let late: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(late.request, ClientRequest::ChatProviderExitOutput { .. }));
+            // Release only after the client has removed its timed-out waiter.
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            codec.write(&mut server, &ServerEnvelope {
+                version: PROTOCOL_VERSION, request_id: Some(late.request_id), proof: proof.clone(),
+                message: ServerMessage::Error(ipc::ProtocolError::new(ipc::ProtocolErrorCode::TerminalUnavailable, "Expired saved output", false)),
+            }).unwrap();
+            codec.write(&mut server, &ServerEnvelope {
+                version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(),
+                message: ServerMessage::ChatActivity { chat_id, state: ActivityState::Working, generation: 100 },
+            }).unwrap();
             done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
         let handle = ClientHandle::connect_on(
             client,
             omp_card(None, None),
@@ -3039,7 +3060,7 @@ mod tests {
             false,
             None,
             None,
-            |_| {},
+            move |wake| { let _ = wake_tx.send(wake); },
         )
         .unwrap();
         let output = handle
@@ -3048,6 +3069,15 @@ mod tests {
         assert_eq!(output.text.as_str(), expected);
         assert_eq!(output.omitted, 17);
         assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());
+        handle.install_snapshot_for_test(Snapshot { error: Some("Original provider crash".into()), ..Default::default() });
+        handle.take_activity();
+        assert!(handle.provider_exit_page(&log.id, 0, Duration::from_millis(10)).is_err());
+        assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());
+        done_tx.send(()).unwrap();
+        loop {
+            if matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Activity) { break; }
+        }
+        assert_eq!(handle.snapshot().error.as_deref(), Some("Original provider crash"));
         done_tx.send(()).unwrap();
         worker.join().unwrap();
     }
