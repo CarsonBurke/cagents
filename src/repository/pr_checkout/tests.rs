@@ -605,24 +605,31 @@ fn concurrent_private_config_snapshot_never_widens_the_named_lock_or_exposes_new
     fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
     let plan = fixture.prepare(&fixture.request(fixture.original.clone()));
     let old = fs::read(&config).unwrap();
-    let mut new = old.clone(); new.extend_from_slice(b"\n[http]\n extraHeader = private-new-secret\n");
+    let mut new = old.clone();
+    new.extend_from_slice(b"\n[http]\n extraHeader = private-new-secret\n");
     let expected = new.clone();
     let lock = config.with_extension("lock");
     let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let changed_hook = changed.clone(); let checked_hook = checked.clone();
+    let changed_hook = changed.clone();
+    let checked_hook = checked.clone();
     let config_hook = config.clone();
-    effect::CONFIG_SNAPSHOT_TEST_HOOK.with_borrow_mut(|hook| *hook = Some(Box::new(move |phase| {
-        if phase == "after_source_metadata" {
-            fs::set_permissions(&config_hook, fs::Permissions::from_mode(0o600)).unwrap();
-            fs::write(&config_hook, &new).unwrap();
-            changed_hook.store(true, std::sync::atomic::Ordering::SeqCst);
-        } else if phase == "before_source_validation" {
-            assert_eq!(fs::metadata(&lock).unwrap().mode() & 0o777, 0o600);
-            assert!(fs::read(&lock).unwrap().is_empty(), "new private bytes must never reach the old public lock");
-            checked_hook.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    })));
+    effect::CONFIG_SNAPSHOT_TEST_HOOK.with_borrow_mut(|hook| {
+        *hook = Some(Box::new(move |phase| {
+            if phase == "after_source_metadata" {
+                fs::set_permissions(&config_hook, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::write(&config_hook, &new).unwrap();
+                changed_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+            } else if phase == "before_source_validation" {
+                assert_eq!(fs::metadata(&lock).unwrap().mode() & 0o777, 0o600);
+                assert!(
+                    fs::read(&lock).unwrap().is_empty(),
+                    "new private bytes must never reach the old public lock"
+                );
+                checked_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }))
+    });
     let result = fixture.apply(&plan);
     effect::CONFIG_SNAPSHOT_TEST_HOOK.with_borrow_mut(|hook| *hook = None);
     let failure = result.unwrap_err();
@@ -631,7 +638,10 @@ fn concurrent_private_config_snapshot_never_widens_the_named_lock_or_exposes_new
     assert!(checked.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(fs::read(&config).unwrap(), expected);
     assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o600);
-    assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), fixture.original.as_str());
+    assert_eq!(
+        git_text(&fixture.root, &["rev-parse", "HEAD"]),
+        fixture.original.as_str()
+    );
 }
 
 #[test]

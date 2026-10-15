@@ -114,14 +114,23 @@ thread_local! {
 fn snapshot_phase(_phase: &str) {
     #[cfg(test)]
     CONFIG_SNAPSHOT_TEST_HOOK.with_borrow_mut(|hook| {
-        if let Some(hook) = hook { hook(_phase); }
+        if let Some(hook) = hook {
+            hook(_phase);
+        }
     });
 }
 
-fn unchanged_source(source: &fs::File, original: &fs::Metadata, root: &fs_safety::Root) -> Result<(), String> {
-    let named = fs_safety::metadata_beneath(root, Path::new("config")).map_err(|error| error.to_string())?;
-    if GitFileLock::version(&source.metadata().map_err(|error| error.to_string())?) != GitFileLock::version(original)
-        || GitFileLock::version(&named) != GitFileLock::version(original) {
+fn unchanged_source(
+    source: &fs::File,
+    original: &fs::Metadata,
+    root: &fs_safety::Root,
+) -> Result<(), String> {
+    let named = fs_safety::metadata_beneath(root, Path::new("config"))
+        .map_err(|error| error.to_string())?;
+    if GitFileLock::version(&source.metadata().map_err(|error| error.to_string())?)
+        != GitFileLock::version(original)
+        || GitFileLock::version(&named) != GitFileLock::version(original)
+    {
         return Err("Clone configuration changed during tracking repair; it was preserved".into());
     }
     Ok(())
@@ -167,17 +176,25 @@ fn repair_tracking<E: ProcessExecutor>(
     // Freeze metadata beside the captured bytes inside the private0700
     // operation directory. The externally named config.lock stays0600.
     // Never copy live source ACL/ownership after validating this snapshot.
-    let metadata_snapshot = fs::File::create(private.join("config.metadata"))
-        .map_err(|error| error.to_string())?;
-    metadata_snapshot.set_permissions(fs::Permissions::from_mode(0o600))
+    let metadata_snapshot =
+        fs::File::create(private.join("config.metadata")).map_err(|error| error.to_string())?;
+    metadata_snapshot
+        .set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|error| error.to_string())?;
     fs_safety::copy_ownership(&source, &metadata_snapshot).map_err(|error| error.to_string())?;
     fs_safety::copy_access_acl(&source, &metadata_snapshot).map_err(|error| error.to_string())?;
     let uncopied = fs_safety::copy_extended_attributes(&source, &metadata_snapshot);
-    if !uncopied.is_empty() { return Err(format!("Configuration metadata could not be captured: {}", uncopied[0])); }
+    if !uncopied.is_empty() {
+        return Err(format!(
+            "Configuration metadata could not be captured: {}",
+            uncopied[0]
+        ));
+    }
     snapshot_phase("before_source_validation");
     unchanged_source(&source, &original, &pinned.roots[2])?;
-    metadata_snapshot.set_permissions(original.permissions()).map_err(|error| error.to_string())?;
+    metadata_snapshot
+        .set_permissions(original.permissions())
+        .map_err(|error| error.to_string())?;
     let staged = private.join("config.staged");
     fs::write(&staged, bytes).map_err(|error| error.to_string())?;
     for (key, value) in [
@@ -212,8 +229,10 @@ fn repair_tracking<E: ProcessExecutor>(
     // Recheck the source before making the lock visible under its old mode.
     // All transferred metadata comes from the coherent private snapshot.
     unchanged_source(&source, &original, &pinned.roots[2])?;
-    fs_safety::copy_ownership(&metadata_snapshot, &config.file).map_err(|error| error.to_string())?;
-    fs_safety::copy_access_acl(&metadata_snapshot, &config.file).map_err(|error| error.to_string())?;
+    fs_safety::copy_ownership(&metadata_snapshot, &config.file)
+        .map_err(|error| error.to_string())?;
+    fs_safety::copy_access_acl(&metadata_snapshot, &config.file)
+        .map_err(|error| error.to_string())?;
     let uncopied = fs_safety::copy_extended_attributes(&metadata_snapshot, &config.file);
     if !uncopied.is_empty() {
         return Err(format!(
