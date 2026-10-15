@@ -388,7 +388,7 @@ mod tests {
         agent::Provider,
         agent_execution::{Agent, Origin, Placement, Spec, Surface, Target},
         chat::Snapshot,
-        model::TerminalId,
+        model::{CardKind, TerminalId},
     };
     fn fixture() -> (AgentId, Session, ArchivedConversation) {
         let agent = AgentId::new();
