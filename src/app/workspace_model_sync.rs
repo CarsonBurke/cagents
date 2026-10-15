@@ -957,6 +957,16 @@ impl Cagents {
             }
             return Some(self.refresh_managed_display_strip());
         }
+        // An existing exact runtime may follow its managed owner above. Only
+        // new adoption needs the durable resurrection check; pending refuses
+        // without putting a SQLite probe on this UI path.
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.card_was_closed(card_id))
+        {
+            return None;
+        }
         let kind = match &session {
             crate::agent_execution::HostedSession::Chat(session) => CardKind::Chat(session.clone()),
             crate::agent_execution::HostedSession::Terminal(session) => {
@@ -2047,6 +2057,34 @@ mod tests {
                 .count(),
             1
         );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("closed-model.sqlite3");
+        let (runtime, _) =
+            crate::session::SessionRuntime::open(&path, crate::model::BootId::new("closed-model"))
+                .unwrap();
+        app.session = Some(runtime);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        let committed = app
+            .session
+            .as_ref()
+            .unwrap()
+            .take_committed_closures(app.durable.id);
+        assert_eq!(
+            Arc::make_mut(&mut app.durable).retire_committed_cards(&committed),
+            1
+        );
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        app.session.as_mut().unwrap().shutdown();
+        let (reopened, _) =
+            crate::session::SessionRuntime::open(&path, crate::model::BootId::new("closed-model"))
+                .unwrap();
+        app.session = Some(reopened);
+        assert!(app.adopt_execution_agent(&agent).is_none());
         agent.id = crate::model::AgentId::new();
         agent.spec.surface = Surface::Terminal;
         assert!(
@@ -2223,6 +2261,42 @@ mod tests {
                 .channels
                 .iter()
                 .find(|channel| channel.id == agent.channel().unwrap())
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
+    }
+
+    #[test]
+    fn closed_history_admission_preserves_existing_managed_runtime_during_unknown_lookup() {
+        let (mut app, agent, pane, destination) = managed_display_fixture();
+        let mut original_only = app.workspace_model.clone();
+        original_only.views.clear();
+        let display =
+            crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
+        assert!(app.adopt_execution_agent_display(&agent, display).is_some());
+        let directory = tempfile::tempdir().unwrap();
+        let (mut runtime, _) = crate::session::SessionRuntime::open(
+            &directory.path().join("managed-closure.sqlite3"),
+            crate::model::BootId::new("managed-closure"),
+        )
+        .unwrap();
+        runtime.shutdown();
+        assert!(
+            runtime.card_was_closed(pane.id),
+            "unknown lookup refuses new adoption"
+        );
+        app.session = Some(runtime);
+        let display =
+            crate::workspace_model::views::managed_display(&app.workspace_model, &agent).unwrap();
+        assert!(app.adopt_execution_agent_display(&agent, display).is_some());
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        assert!(matches!(app.cards.get(&pane.id), Some(CardRuntime::Loading)));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == destination)
                 .unwrap()
                 .cards
                 .contains(&pane.id)
