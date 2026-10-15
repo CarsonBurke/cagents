@@ -3918,9 +3918,9 @@ pub struct RepositoryService<E = SystemProcessExecutor> {
     git: PathBuf,
     executor: Arc<E>,
     authority: Option<WorktreeAuthority>,
-    // Only a verified creation-journal handoff can use this original executor
-    // to construct a separately scoped destination service. It is never exposed
-    // through the public authority API or used for ordinary foreign commands.
+    // Verified creation-journal handoffs and fixed typed recovery-object
+    // commands may use this original executor. It is never exposed through a
+    // public authority API or used for ordinary foreign commands.
     creation_executor: Arc<dyn ProcessExecutor>,
 }
 

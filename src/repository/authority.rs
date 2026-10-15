@@ -263,7 +263,100 @@ impl<E: ProcessExecutor> ProcessExecutor for WorktreeExecutor<E> {
     }
 }
 
+enum RecoveryObjectCommand<'a> { Unpack(&'a Oid), Hash(&'a Arc<fs::File>) }
+
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// Retain the original object-store authority for one recovery operation.
+    /// A legacy unscoped caller captures once here, never after materialization.
+    pub(super) fn recovery_source_authority(
+        &self, worktree: &Path, expected_root: &fs_safety::Root,
+    ) -> Result<WorktreeAuthority, RepositoryError> {
+        let authority = match &self.authority {
+            Some(authority) if authority.path() == worktree => authority.clone(),
+            Some(_) => return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into()),
+            None => WorktreeAuthority::capture(worktree)?,
+        };
+        authority.validate()?;
+        let expected = expected_root.metadata().map_err(metadata_error)?;
+        if authority.identity != (expected.dev(), expected.ino()) {
+            return Err(ValidationError::Io("The recovery source worktree was replaced; no replacement was changed".into()).into());
+        }
+        Ok(authority)
+    }
+
+    /// Fixed recovery-only commands. No general executor or foreign-root
+    /// service is exposed: the private destination is a published held inode,
+    /// and every Git metadata/worktree scope stays on the original authority.
+    pub(super) fn unpack_recovery_object(
+        &self, source: &WorktreeAuthority, holding: &fs_safety::DirectoryPublication,
+        oid: &Oid, cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, RepositoryError> {
+        self.run_recovery_object(source, holding, RecoveryObjectCommand::Unpack(oid), cancellation)
+    }
+
+    pub(super) fn hash_recovery_object(
+        &self, source: &WorktreeAuthority, holding: &fs_safety::DirectoryPublication,
+        file: &Arc<fs::File>, cancellation: &CancellationToken,
+    ) -> Result<Oid, RepositoryError> {
+        let output = self.run_recovery_object(source, holding, RecoveryObjectCommand::Hash(file), cancellation)?;
+        let oid = std::str::from_utf8(&output.stdout).map_err(|error| RepositoryError::InvalidOutput {
+            field: "recovery object hash", reason: error.to_string(),
+        })?;
+        Oid::parse_object(oid.trim()).map_err(Into::into)
+    }
+
+    fn run_recovery_object(
+        &self, source: &WorktreeAuthority, holding: &fs_safety::DirectoryPublication,
+        operation: RecoveryObjectCommand<'_>, cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, RepositoryError> {
+        source.validate()?;
+        let metadata = holding.directory().metadata().map_err(metadata_error)?;
+        if holding.identity() != (metadata.dev(), metadata.ino())
+            || metadata.mode() & 0o7777 != 0o700
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(ValidationError::Io("Recovery materialization requires the exact published private holding directory".into()).into());
+        }
+        if let Some(error) = holding.publication_error() {
+            return Err(ValidationError::Io(format!("Recovery holding publication requires resolution: {error}")).into());
+        }
+        let (holding_path, holding_file) = inherited_directory_scope(holding.directory())?;
+        let root_path = child_directory_path(&source.child_root)?;
+        let git_path = child_directory_path(&source.child_git)?;
+        let common_path = child_directory_path(&source.child_common)?;
+        let mut command = CommandSpec::new(&self.git);
+        // Remove ALL inherited Git injection, including object/config routing.
+        // Only explicit original metadata scopes are installed below.
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"GIT_") { command = command.env_remove(name); }
+        }
+        command = command.args([
+            OsString::from("--no-replace-objects"),
+            OsString::from(format!("--git-dir={}", git_path.display())),
+            OsString::from(format!("--work-tree={}", root_path.display())),
+            OsString::from("-C"), holding_path.into_os_string(),
+        ]).args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"])
+            .env("GIT_COMMON_DIR", common_path.into_os_string())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_PAGER", "cat").output_limits(8192, 256 * 1024)
+            .inherit_file(holding_file).map_err(metadata_error)?
+            .inherit_file(source.child_root.clone()).map_err(metadata_error)?
+            .inherit_file(source.child_git.clone()).map_err(metadata_error)?
+            .inherit_file(source.child_common.clone()).map_err(metadata_error)?;
+        command = match operation {
+            RecoveryObjectCommand::Unpack(oid) => command.args(["unpack-file", oid.as_str()]),
+            RecoveryObjectCommand::Hash(file) => command.args(["hash-object", "--no-filters", "--"])
+                .arg(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                .inherit_file(file.clone()).map_err(metadata_error)?,
+        };
+        // The original executor is private. Its only recovery use accepts the
+        // typed original authority plus this fixed operation and owned holding.
+        let output = self.creation_executor.execute(&command, cancellation)
+            .inspect_err(|failure| log_git_failure(&command, failure))?;
+        if output.success { Ok(output) } else { Err(git_failure(&command, output).into()) }
+    }
+
     pub(super) fn journal_source_service(
         &self,
         source: Arc<super::creation_authority::CreationSession>,
@@ -413,6 +506,88 @@ mod authority_tests {
         let output = SystemProcessExecutor.execute(&command, &CancellationToken::default()).unwrap();
         assert!(output.success, "{}", String::from_utf8_lossy(&output.stderr));
         output
+    }
+
+    fn recovery_holding(parent: &Path) -> fs_safety::DirectoryPublication {
+        let parent = fs_safety::Root::open(parent).unwrap();
+        match fs_safety::create_directory_beneath(&parent, Path::new("holding"), 0o700).unwrap() {
+            fs_safety::DirectoryCreation::Published(receipt) => receipt,
+            other => panic!("expected private holding publication: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_object_helper_materializes_and_hashes_only_inside_owned_holding() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        actual_git(&source, &["init", "-b", "main"]);
+        fs::write(source.join("file"), b"recovery proof").unwrap();
+        let output = actual_git(&source, &["hash-object", "-w", "--no-filters", "--", "file"]);
+        let oid = Oid::parse_object(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+        let service = RepositoryService::system("git");
+        let authority = WorktreeAuthority::capture(&source).unwrap();
+        let holding = recovery_holding(directory.path());
+        let cancel = CancellationToken::new();
+        let output = service.unpack_recovery_object(&authority, &holding, &oid, &cancel).unwrap();
+        let name = output.stdout.strip_suffix(b"\n").unwrap();
+        let path = Path::new(OsStr::from_bytes(name));
+        assert_eq!(path.components().count(), 1);
+        let file = Arc::new(fs_safety::open_beneath(holding.directory(), path).unwrap());
+        assert_eq!(service.hash_recovery_object(&authority, &holding, &file, &cancel).unwrap(), oid);
+        assert_eq!(fs::read(holding.directory().path().join(path)).unwrap(), b"recovery proof");
+        assert!(!source.join(path).exists(), "unpack-file must not create a shared worktree temporary");
+    }
+
+    #[test]
+    fn recovery_object_helper_refuses_changed_source_metadata_before_original_executor() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        actual_git(&source, &["init", "-b", "main"]);
+        let authority = WorktreeAuthority::capture(&source).unwrap();
+        let holding = recovery_holding(directory.path());
+        let inner = Arc::new(RecordingExecutor::default());
+        let service = RepositoryService::new("git", inner.clone());
+        fs::rename(source.join(".git"), directory.path().join("saved-metadata")).unwrap();
+        fs::create_dir(source.join(".git")).unwrap();
+        let oid = Oid::parse_object("a".repeat(40)).unwrap();
+        assert!(service.unpack_recovery_object(&authority, &holding, &oid, &CancellationToken::new()).is_err());
+        assert!(inner.0.lock().unwrap().is_empty());
+        assert_eq!(fs::read_dir(holding.directory().path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn recovery_object_helper_pins_metadata_and_holding_across_delayed_inner_launch() {
+        struct Delayed { source: PathBuf, parent: PathBuf, parked: PathBuf }
+        impl ProcessExecutor for Delayed {
+            fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+                assert!(command.arguments.iter().any(|argument| argument == "unpack-file"));
+                fs::rename(self.source.join(".git"), self.parent.join("saved-git")).unwrap();
+                fs::create_dir(self.source.join(".git")).unwrap();
+                fs::rename(self.parent.join("holding"), &self.parked).unwrap();
+                fs::create_dir(self.parent.join("holding")).unwrap();
+                fs::write(self.parent.join("holding").join("foreign"), b"preserve").unwrap();
+                SystemProcessExecutor.execute(command, cancel)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        actual_git(&source, &["init", "-b", "main"]);
+        fs::write(source.join("file"), b"original object").unwrap();
+        let output = actual_git(&source, &["hash-object", "-w", "--", "file"]);
+        let oid = Oid::parse_object(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+        let authority = WorktreeAuthority::capture(&source).unwrap();
+        let holding = recovery_holding(directory.path());
+        let parked = directory.path().join("retained-holding");
+        let service = RepositoryService::new("git", Arc::new(Delayed { source: source.clone(), parent: directory.path().to_owned(), parked: parked.clone() }));
+        let output = service.unpack_recovery_object(&authority, &holding, &oid, &CancellationToken::new()).unwrap();
+        let name = Path::new(OsStr::from_bytes(output.stdout.strip_suffix(b"\n").unwrap()));
+        assert_eq!(fs::read(parked.join(name)).unwrap(), b"original object");
+        assert!(!directory.path().join("holding").join(name).exists());
+        assert_eq!(fs::read(directory.path().join("holding/foreign")).unwrap(), b"preserve");
+        assert_eq!(fs::read_dir(source.join(".git")).unwrap().count(), 0);
     }
 
     #[test]
