@@ -10,6 +10,7 @@ pub(in crate::app) struct State {
     revision: u64,
     generation: u64,
     failed: Option<(Vec<PathBuf>,Instant)>,
+    last_failure: Option<String>,
 }
 
 impl State {
@@ -29,7 +30,9 @@ impl std::fmt::Debug for Receipt {
 
 impl Cagents {
     pub(in crate::app) fn prepare_window_protections(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
-        self.worktree_protection_sync.desired = paths.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let desired = paths.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        if desired != self.worktree_protection_sync.desired { self.worktree_protection_sync.last_failure = None; }
+        self.worktree_protection_sync.desired = desired;
         let state = &mut self.worktree_protection_sync;
         if state.inflight.is_some() || state.applied.as_ref()==Some(&state.desired)
             || state.failed.as_ref().is_some_and(|(paths,until)|paths==&state.desired && Instant::now()<*until)
@@ -64,12 +67,21 @@ impl Cagents {
         match result {
             Ok(prepared) => {
                 self.worktree_protections = prepared;
-                state.applied = Some(paths);
-                state.failed = None;
+                if self.worktree_protections.needs_retry() {
+                    state.applied = None;
+                    state.failed = Some((paths,Instant::now()+Duration::from_secs(30)));
+                } else {
+                    state.applied = Some(paths);
+                    state.failed = None;
+                }
+                state.last_failure = None;
             }
             Err(error) => {
                 state.failed = Some((paths,Instant::now()+Duration::from_secs(30)));
-                tracing::debug!(%error,"automatic worktree cleanup unavailable until window scopes are protected");
+                if state.last_failure.as_ref() != Some(&error) {
+                    tracing::debug!(%error,"automatic worktree cleanup unavailable until window scopes are protected");
+                    state.last_failure = Some(error);
+                }
             }
         }
         Task::none()
