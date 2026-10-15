@@ -24,6 +24,7 @@ const CONFIG_PATH: &str = ".cagents/worktree.toml";
 const CONFIG_LIMIT: u64 = 64 * 1024;
 const FILE_LIMIT: u64 = 64 * 1024 * 1024;
 const SCAN_LIMIT: usize = 100_000;
+const SCAN_DEPTH_LIMIT: usize = 64;
 const COPY_LIMIT: usize = 10_000;
 const TRUST_KEY: &str = "cagents.worktreeSetupTrust";
 
@@ -226,6 +227,9 @@ fn matches(
     cancel: &CancellationToken,
 ) -> Result<(), SetupError> {
     check_cancel(cancel)?;
+    if path.components().count() > SCAN_DEPTH_LIMIT {
+        return Err(error("copy glob exceeds 64 directory levels"));
+    }
     if parts.is_empty() {
         if path.as_os_str().is_empty() {
             return Ok(());
@@ -773,6 +777,22 @@ mod tests {
             b"cert"
         );
         assert!(!fixture.destination.join("config/link").exists());
+    }
+
+    #[test]
+    fn deep_glob_traversal_refuses_before_copy_and_keeps_created_checkout() {
+        let fixture = Fixture::new();
+        let mut directory = fixture.primary.clone();
+        for _ in 0..SCAN_DEPTH_LIMIT + 2 {
+            directory.push("nested");
+        }
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(".env"), "deep secret").unwrap();
+        let plan = fixture.config("copy = ['**/.env']");
+        assert!(fixture.prepare(&plan).unwrap_err().to_string().contains("64 directory levels"));
+        assert_eq!(fs::read(directory.join(".env")).unwrap(), b"deep secret");
+        assert!(fixture.destination.join("tracked").exists());
+        assert!(!fixture.destination.join("nested").exists());
     }
 
     #[test]
