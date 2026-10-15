@@ -9532,6 +9532,11 @@ mod tests {
         handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":pending.id,"result":[{"title":"Fix peer","data":{"opaque":7}}]}))).unwrap();
         let item=next_matching(&events,|event|match event {LspEvent::CodeActions{request:id,items,..}if *id==request=>items.first().cloned(),_=>None}).await;
         assert!(manager.validate_code_action_context(&item).is_ok());
+        let added=file.with_file_name("added.rs");std::fs::write(&added,"new peer").unwrap();
+        manager.open_for_test(LspDocumentId(4),&added,&worktree,rust_language(),1,"new peer");
+        assert!(manager.validate_code_action_context(&item).is_err(),"opaque command must not bless a newly opened same-session peer");
+        manager.close(LspDocumentId(4));
+        assert!(manager.validate_code_action_context(&item).is_ok());
         manager.close(LspDocumentId(2));manager.open_for_test(LspDocumentId(3),&peer,&worktree,rust_language(),1,"changed");
         assert!(manager.validate_code_action_context(&item).is_err());
         let request=manager.request_resolve_code_action(origin,item);let pending=handle.wait_for("codeAction/resolve").await;

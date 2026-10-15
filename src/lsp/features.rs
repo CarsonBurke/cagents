@@ -75,6 +75,7 @@ pub struct LspCodeAction {
     pub needs_resolve: bool,
     raw: lsp_types::CodeActionOrCommand,
     origin_version: i32,
+    origin_doc: Option<LspDocumentId>,
     // Retains original peer context across an opaque lazy resolve. Recapturing
     // current versions would bless stale server data after close/reopen.
     observed_documents: Arc<HashMap<Url, ObservedDocument>>,
@@ -190,13 +191,24 @@ impl LspManager {
     /// must validate its original peer context. An edit-only action instead
     /// fences only its actual targets via observed_incarnation in the planner.
     pub fn validate_code_action_context(&self,item:&LspCodeAction)->Result<(),LspError> {
+        let Some(doc)=item.origin_doc else {return Ok(());};
+        let reference=self.documents.get(&doc).ok_or(LspError::UnknownDocument(doc.0))?;
+        let inner=self.snapshots.lock();
+        // Opaque commands do not disclose edited targets. A newly opened peer
+        // therefore requires requesting a fresh action, just as conversion
+        // rejects a newly opened target of a request-time workspace edit.
+        let current=inner.uris.iter().filter(|(_,state)|state.session==reference.session);
+        if current.clone().count()!=item.observed_documents.len() || current.clone().any(|(uri,_)|!item.observed_documents.contains_key(&**uri)) {
+            return Err(LspError::Unsupported("The open peer documents changed after the code action was requested".into()));
+        }
         for (uri,observed) in item.observed_documents.iter() {
-            let Some((snapshot,incarnation))=self.snapshots.observation(uri) else {
+            let Some(state)=inner.uris.get(uri) else {
                 return Err(LspError::Unsupported("A code-action peer document was closed after the action was requested".into()));
             };
-            if incarnation!=observed.incarnation {
+            if state.incarnation!=observed.incarnation {
                 return Err(LspError::Unsupported("A code-action peer document was closed and reopened after the action was requested".into()));
             }
+            let snapshot=state.latest();
             if snapshot.version!=observed.version {
                 return Err(LspError::StaleVersion{result:observed.version,current:snapshot.version});
             }
@@ -348,7 +360,7 @@ fn convert_action(store:&SnapshotStore,req:&PendingRequest,raw:lsp_types::CodeAc
         lsp_types::CodeActionOrCommand::Command(c)=>(c.title.clone(),None,false,None,None,Some(command(c.clone())),false),
         lsp_types::CodeActionOrCommand::CodeAction(c)=>(c.title.clone(),c.kind.as_ref().map(|k|k.as_str().to_owned()),c.is_preferred.unwrap_or(false),c.disabled.as_ref().map(|d|d.reason.clone()),c.edit.clone().map(|e|convert_workspace_edit(store,e,Some(&req.observed_versions))).transpose()?,c.command.clone().map(command),(c.edit.is_none()||c.command.is_none())&&c.data.is_some()),
     };
-    Ok(LspCodeAction{title,kind,is_preferred,disabled,edit,command:cmd,needs_resolve,raw,origin_version:req.version,observed_documents:req.observed_versions.clone()})
+    Ok(LspCodeAction{title,kind,is_preferred,disabled,edit,command:cmd,needs_resolve,raw,origin_version:req.version,origin_doc:Some(req.doc),observed_documents:req.observed_versions.clone()})
 }
 fn documentation(d:lsp_types::Documentation)->String{match d{lsp_types::Documentation::String(s)=>s,lsp_types::Documentation::MarkupContent(c)=>c.value}}
 fn utf16_byte(label:&str,offset:u32)->Option<usize>{let mut units=0;for (byte,ch) in label.char_indices(){if units==offset{return Some(byte);}units+=ch.len_utf16() as u32;if units>offset{return None;}}(units==offset).then_some(label.len())}
@@ -629,7 +641,7 @@ impl LspCodeAction {
     /// Constructs a local action without protocol resolution data.
     pub fn local(title:String,edit:Option<LspWorkspaceEdit>,command:Option<LspCommand>)->Self {
         let raw=lsp_types::CodeActionOrCommand::CodeAction(lsp_types::CodeAction{title:title.clone(),..Default::default()});
-        Self{title,kind:None,is_preferred:false,disabled:None,edit,command,needs_resolve:false,raw,origin_version:-1,observed_documents:Arc::new(HashMap::new())}
+        Self{title,kind:None,is_preferred:false,disabled:None,edit,command,needs_resolve:false,raw,origin_version:-1,origin_doc:None,observed_documents:Arc::new(HashMap::new())}
     }
 }
 
