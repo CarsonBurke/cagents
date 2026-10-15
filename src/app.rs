@@ -2808,11 +2808,12 @@ pub enum SettingsField {
     ShortcutFocusPane9,
     ShortcutToggleProjects,
     ShortcutRenamePane,
+    ShortcutSearchInProject,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 39] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2851,6 +2852,7 @@ impl SettingsField {
         Self::ShortcutFocusPane9,
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
+        Self::ShortcutSearchInProject,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -2892,6 +2894,7 @@ impl SettingsField {
             Self::ConfirmMultilinePaste => "Confirm multiline paste",
             Self::ShortcutToggleProjects => "Toggle Projects sidebar",
             Self::ShortcutRenamePane => "Rename focused pane",
+            Self::ShortcutSearchInProject => "Search in selected project",
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
             Self::ShortcutChatPermissions => "Choose chat permission mode",
@@ -2992,6 +2995,7 @@ impl SettingsField {
             Self::ShortcutNewTerminal
             | Self::ShortcutToggleProjects
             | Self::ShortcutRenamePane
+            | Self::ShortcutSearchInProject
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
             | Self::ShortcutChatPermissions
@@ -3050,6 +3054,7 @@ enum SettingsFeedback {
 struct ShortcutDraft {
     toggle_projects: String,
     rename_pane: String,
+    search_in_project: String,
     command_palette: String,
     new_native_thread: String,
     chat_permissions: String,
@@ -3093,6 +3098,7 @@ impl ShortcutDraft {
         Self {
             toggle_projects: settings::format_chords(&shortcuts.toggle_projects),
             rename_pane: settings::format_chords(&shortcuts.rename_pane),
+            search_in_project: settings::format_chords(&shortcuts.search_in_project),
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
             chat_permissions: settings::format_chords(&shortcuts.chat_permissions),
@@ -3321,6 +3327,7 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.toggle_projects = value
             }
             SettingsField::ShortcutRenamePane => self.keyboard_shortcuts.rename_pane = value,
+            SettingsField::ShortcutSearchInProject => self.keyboard_shortcuts.search_in_project = value,
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
             }
@@ -3420,6 +3427,10 @@ fn settings_update(
         }
         SettingsField::ShortcutRenamePane => {
             next.keyboard_shortcuts.rename_pane = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSearchInProject => {
+            next.keyboard_shortcuts.search_in_project = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutCommandPalette => {
