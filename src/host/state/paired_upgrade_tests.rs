@@ -331,11 +331,30 @@ fn run_pair(mode: &str) {
     }
     // Observe the descriptor through the public attachment after the real
     // confirmation, rather than inventing a learned identity in the fixture.
-    let attached =
-        super::super::chat::process(&original, 1, ClientRequest::ChatAttach { session: initial })
-            .unwrap();
-    let ServerResponse::ChatAttached { session: saved, .. } = attached else {
-        panic!("missing confirmed pair")
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let saved = loop {
+        let attached = super::super::chat::process(
+            &original,
+            1,
+            ClientRequest::ChatAttach {
+                session: initial.clone(),
+            },
+        )
+        .unwrap();
+        let ServerResponse::ChatAttached { session, snapshot } = attached else {
+            panic!("missing confirmed pair")
+        };
+        if session.launch.session_id.as_deref() == Some(ID)
+            && snapshot.ready
+            && !snapshot.history_loading
+        {
+            break session;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "public pair attachment did not become ready"
+        );
+        thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(saved.launch.session_id.as_deref(), Some(ID));
     let store_path = cwd.join("checkpoint");
