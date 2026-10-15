@@ -34,6 +34,7 @@ pub struct State {
     next_safety_request: u64,
     deletion_authorizations: HashMap<WorktreeId, WorktreeSafetySnapshot>,
     branch_deletions: HashMap<WorktreeId, BranchDeletion>,
+    released_delete_protections: HashSet<WorktreeId>,
     branch_requests: HashSet<crate::model::OperationId>,
     force_branches: VecDeque<(BranchDeletion, String)>,
     remove_dialog: Option<ProjectRemoval>,
@@ -259,6 +260,7 @@ pub enum Action {
     /// Runs a failed deletion again. The user confirmed it once already.
     RetryDelete(WorktreeId),
     AwaitSessions(Target),
+    DeletionSessionsClosed { target: Target, started_at: Instant, result: Result<(), String> },
     AutomaticallyDeleted {
         target: Target,
         result: Result<RemovedWorktree, String>,
@@ -318,6 +320,8 @@ impl Cagents {
                 paths.push(runtime.descriptor.worktree.clone());
             }
         }
+        paths.retain(|path| !self.project_ui.deletions.iter().any(|(id, deletion)|
+            self.project_ui.released_delete_protections.contains(id) && path.starts_with(&deletion.target.path)));
         if let Err(error) = self.worktree_protections.sync(paths) {
             tracing::debug!(%error, "automatic worktree cleanup unavailable until window scopes are protected");
         }
@@ -1633,6 +1637,17 @@ impl Cagents {
                 }
                 return self.open_worktree_delete_dialog(target);
             }
+            Action::DeletionSessionsClosed { target, started_at, result } => {
+                let Some(id) = target.worktree else { return Task::none(); };
+                if !self.project_ui.deletions.get(&id).is_some_and(|deletion| deletion.started_at == started_at && deletion.failure.is_none() && deletion.target.path == target.path) { return Task::none(); }
+                if let Err(failure) = result { return self.handle_project_action(Action::Deleted { target, result: Err(failure) }); }
+                self.project_ui.released_delete_protections.insert(id);
+                // Sessions have stopped, and reopening this target is fenced by
+                // the running deletion. Release only our own target leases so
+                // the owning daemon can acquire an exclusive removal guard.
+                self.sync_worktree_protections();
+                return self.remove_worktree_after_sessions(target);
+            }
             Action::AutomaticallyDeleted { target, result } => {
                 let Some(id) = target.worktree else { return Task::none(); };
                 let Some(in_flight) = self.project_ui.automatic_in_flight.remove(&id) else { return Task::none(); };
@@ -1655,7 +1670,9 @@ impl Cagents {
                 self.sync_worktree_deletion_rows();
                 return self.lifecycle_sweep();
             }
-            Action::Deleted { target, result } => match result {
+            Action::Deleted { target, result } => {
+                if let Some(id) = target.worktree { self.project_ui.released_delete_protections.remove(&id); }
+                match result {
                 Err(failure) => {
                     if let Some(id) = target.worktree {
                         self.project_ui.branch_deletions.remove(&id);
@@ -1795,6 +1812,7 @@ impl Cagents {
                         self.sync_chrome(),
                     ]);
                 }
+                }
             },
             Action::Finished(result) => {
                 if let Err(error) = result {
@@ -1848,17 +1866,32 @@ impl Cagents {
                 Message::ProjectUi(Action::AwaitSessions(target))
             });
         }
-        let authorization = target
-            .worktree
-            .and_then(|id| self.project_ui.deletion_authorizations.get(&id))
-            .cloned();
+        let authorization = target.worktree.and_then(|id| self.project_ui.deletion_authorizations.get(&id)).cloned();
+        let Some(started_at) = target.worktree.and_then(|id| self.project_ui.deletions.get(&id)).map(|deletion| deletion.started_at) else { return Task::none(); };
+        cosmic::task::future(async move {
+            let request = target.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let confirmed = authorization.ok_or("Deletion safety must be checked and confirmed again.")?;
+                let service = RepositoryService::system("git"); let token = CancellationToken::new();
+                let records = service.list_worktrees(&request.repository, &token).map_err(|error| error.to_string())?;
+                let record = records.iter().find(|record| Some(record.id) == request.worktree && record.path == request.path).ok_or("Worktree changed before closing sessions")?;
+                if record.lock.locked || records.first().is_some_and(|primary| primary.id == record.id) || record.bare { return Err("Worktree is locked or is the primary checkout".into()); }
+                verify_worktree_safety(&service, &request.path, &confirmed, &token)?;
+                close_worktree_sessions(&request)
+            }).await.map_err(|error| error.to_string()).and_then(|result| result);
+            Message::ProjectUi(Action::DeletionSessionsClosed { target, started_at, result })
+        })
+    }
+
+    fn remove_worktree_after_sessions(&mut self, target: Target) -> Task<Message> {
+        let authorization = target.worktree.and_then(|id| self.project_ui.deletion_authorizations.get(&id)).cloned();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let authorization =
                     authorization.ok_or("Deletion safety must be checked and confirmed again.")?;
-                let removed = delete_worktree(&request, &authorization)?;
+                let removed = delete_worktree_inner(&request, &authorization, false)?;
                 if let Some(store) = store
                     && let Some(removed) = removed
                     && let Err(errors) =
@@ -2730,9 +2763,15 @@ fn remove_project_from_cagents(
 ///
 /// Returns what was removed, by which its creation is released, or `None`
 /// when Git could not say where the worktree's administrative files were.
-fn delete_worktree(
+#[cfg(test)]
+fn delete_worktree(target: &Target, confirmed: &WorktreeSafetySnapshot) -> Result<Option<RemovedWorktree>, String> {
+    delete_worktree_inner(target, confirmed, true)
+}
+
+fn delete_worktree_inner(
     target: &Target,
     confirmed: &WorktreeSafetySnapshot,
+    close_sessions: bool,
 ) -> Result<Option<RemovedWorktree>, String> {
     let id = target
         .worktree
@@ -2771,7 +2810,7 @@ fn delete_worktree(
         })
         .ok();
     verify_worktree_safety(&service, &target.path, confirmed, &cancellation)?;
-    close_worktree_sessions(target)?;
+    if close_sessions { close_worktree_sessions(target)?; }
     // Processes may have written during shutdown; consent covers only the
     // inspected state, not changes produced after confirmation.
     verify_worktree_safety(&service, &target.path, confirmed, &cancellation)?;
@@ -3100,6 +3139,17 @@ mod tests {
         app.project_ui.branch_requests.insert(request.id);
         drop(app.handle_project_action(Action::BranchDeleted { request, result: Err(crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::CheckedOutElsewhere, detail: "Checked out elsewhere".into() }) }));
         assert!(app.project_ui.force_branches.is_empty());
+    }
+
+    #[test]
+    fn late_session_closure_cannot_release_a_new_deletion_attempt() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let target = app.project_ui.begin_deleting("/repo/linked".into());
+        let id = target.worktree.unwrap();
+        let started_at = app.project_ui.deletions[&id].started_at;
+        drop(app.handle_project_action(Action::DeletionSessionsClosed { target, started_at: started_at - Duration::from_secs(1), result: Ok(()) }));
+        assert!(app.project_ui.released_delete_protections.is_empty());
+        assert!(app.project_ui.is_deleting(id));
     }
 
     #[test]
