@@ -2648,6 +2648,34 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_retained_claude_upgrade_carries_only_the_exact_attached_receipt() {
+        for mismatch in 0..3 {
+            let mut source=omp_card(None,Some(host_proof("prior")));
+            source.launch.provider=crate::agent::Provider::Claude;
+            source.launch.recipe.program="claude".into();
+            source.launch.recipe.arguments=vec!["--print".into()];
+            source.native_continuity=super::super::NativeContinuity::RetainedClaudeActor {protocol:1};
+            let mut replacement=source.clone();replacement.proof=Some(host_proof("live"));
+            let result=restore_with_lineage(source.clone(),Some(replacement.clone()),move |request| {
+                let ClientRequest::ChatAttach {mut session}=request else {panic!("must attach existing actor without provider start");};
+                let mut snapshot=Snapshot {native_continuity:session.native_continuity.clone(),ready:true,..Default::default()};
+                match mismatch {
+                    1=>{session.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(),"/unrelated-account".into());},
+                    2=>snapshot.session_id=Some(CONVERSATION.into()),
+                    _=>{},
+                }
+                ServerMessage::Response {response:ServerResponse::ChatAttached {session,snapshot}}
+            });
+            if mismatch==0 {
+                let handle=result.unwrap();
+                assert_eq!(handle.upgrade_recovery(),Some(&(source,replacement.clone())));
+                assert_eq!(handle.session(),replacement);
+                assert!(!handle.session().is_unstarted());
+            } else {assert!(result.is_err(),"invalid unnamed attachment {mismatch}");}
+        }
+    }
+
+    #[test]
     fn upgrade_provenance_requires_the_exact_attached_descriptor_and_confirmation() {
         for mismatch in 0..3 {
             let source = omp_card(Some("prior-conversation"), Some(host_proof("prior")));
