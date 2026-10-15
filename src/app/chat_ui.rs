@@ -4431,21 +4431,19 @@ impl Cagents {
         let Some(found) = runtime.find_matches.get(runtime.find_index).cloned() else {
             return Task::none();
         };
-        runtime
-            .find_disclosure
-            .turn(&found.turn, &mut runtime.opened);
-        if let Some(item) = runtime
-            .snapshot
-            .items
-            .iter()
-            .chain(
-                runtime
-                    .snapshot
-                    .subagents
-                    .iter()
-                    .flat_map(|agent| agent.items.iter()),
-            )
-            .find(|item| item.id.as_str() == found.item.as_ref())
+        // Item IDs are scoped to the selected transcript. A parent or another
+        // child may legitimately use the same opaque logical source ID.
+        let items = match runtime.selected_subagent.as_deref() {
+            Some(selected) => runtime.snapshot.subagents.iter()
+                .find(|agent| agent.id == selected)
+                .map(|agent| agent.items.as_slice()),
+            None => Some(runtime.snapshot.items.as_slice()),
+        };
+        let Some(item) = items.and_then(|items| items.iter()
+            .find(|item| item.id.as_str() == found.item.as_ref())).cloned() else {
+            return Task::none();
+        };
+        runtime.find_disclosure.turn(&found.turn, &mut runtime.opened);
         {
             if runtime
                 .find_disclosure
@@ -4463,7 +4461,7 @@ impl Cagents {
                     previous,
                     true,
                     false,
-                    chat::coordination::recognize(item, runtime.session.launch.provider),
+                    chat::coordination::recognize(&item, runtime.session.launch.provider),
                 );
                 cached.item = Some(item.clone());
                 runtime.cache.insert(item.id.clone(), cached);
@@ -12086,6 +12084,54 @@ mod tests {
         assert!(Action::FindLocated(target, 1, 1, 0, None).allowed_while_modal());
         assert!(Action::FindFrame.allowed_while_modal());
         assert!(!Action::FindNext(target, true).allowed_while_modal());
+    }
+
+    #[test]
+    fn find_reveal_keeps_the_selected_child_source_when_opaque_item_ids_repeat() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("scoped-find-reveal"));
+        let target = chat_runtime(&app, card).target;
+        let item = |output: &str| Arc::new(chat::Item {
+            id: "opaque-root".into(), role: chat::Role::Assistant,
+            content: ItemContent::Tool { name: "Inspect".into(), input: "{}".into(),
+                output: output.into(), status: chat::ToolStatus::Succeeded },
+            at: None, started_at: None,
+        });
+        let parent = item("parent has no matches");
+        let child = item("needle needle in the selected child");
+        let other = item("a different child's output");
+        let agent = |id: &str, item: Arc<chat::Item>| chat::Subagent {
+            id: id.into(), kind: "Worker".into(), description: id.into(),
+            status: chat::ToolStatus::Succeeded, model: None, waiting: false,
+            detail: String::new(), background: true, items: vec![item],
+        };
+        let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![parent.clone()];
+        snapshot.subagents = vec![agent("other", other), agent("selected", child.clone())];
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("selected".into()))));
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        complete_find_for_test(&mut app, target);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.find_matches.len(), 2);
+        assert!(Arc::ptr_eq(runtime.cache["opaque-root"].item.as_ref().unwrap(), &child),
+            "automatic reveal must never replace the selected child's cache with the parent's same-ID item");
+        assert!(runtime.find_reveal_source_current());
+        assert!(runtime.find_paint_for(&child).is_some());
+        assert!(runtime.find_paint_for(&parent).is_none());
+        app.chat_runtime_mut(target).unwrap().expanded.remove("opaque-root");
+        drop(app.handle_chat_ui(Action::FindNext(target, true)));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.find_index, 1);
+        assert!(Arc::ptr_eq(runtime.cache["opaque-root"].item.as_ref().unwrap(), &child));
+        assert!(runtime.find_reveal_source_current());
+        app.chat_runtime_mut(target).unwrap().selected_subagent = Some("missing-child".into());
+        app.chat_runtime_mut(target).unwrap().expanded.remove("opaque-root");
+        drop(app.handle_chat_ui(Action::FindNext(target, false)));
+        let runtime = chat_runtime(&app, card);
+        assert!(!runtime.expanded.contains("opaque-root"), "missing child cannot disclose a parent's same-ID item");
+        assert!(Arc::ptr_eq(runtime.cache["opaque-root"].item.as_ref().unwrap(), &child));
     }
 
     #[test]
