@@ -69,6 +69,7 @@ pub fn configure_typography(interface: &str, interface_size: f32, chat: &str, ch
         std::sync::LazyLock::new(cosmic::config::interface_font);
     let interface_font = font_for(interface, Font::from(DESKTOP.clone()));
     let chat_font = font_for(chat, interface_font);
+    cosmic::widget::text::set_default_size(interface_size);
     TYPOGRAPHY.with(|active| {
         let current = active.get();
         if (
@@ -255,6 +256,98 @@ pub fn markdown_settings(theme: &Theme, size: f32) -> cosmic::widget::markdown::
 #[cfg(test)]
 mod settings_typography_tests {
     use super::*;
+
+    #[test]
+    fn interface_size_reaches_toolkit_text_and_actual_context_menu_layout() {
+        use cosmic::iced::{
+            Event, Point, Rectangle, Size, Vector,
+            advanced::{Layout, Shell, clipboard, layout, widget::Tree},
+            mouse,
+        };
+        use cosmic::widget;
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        struct Action;
+        impl widget::menu::Action for Action {
+            type Message = ();
+            fn message(&self) {}
+        }
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(900.0, 700.0));
+        let text_height = |mut element: cosmic::Element<'_, ()>| {
+            let mut tree = Tree::new(element.as_widget());
+            element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            ).size().height
+        };
+        let menu_height = || {
+            let items = widget::menu::items(
+                &std::collections::HashMap::new(),
+                vec![widget::menu::Item::Button("Rename pane", None, Action)],
+            );
+            let mut element: cosmic::Element<'_, ()> = widget::context_menu(
+                widget::Space::new().width(300.0).height(100.0),
+                Some(items),
+            ).into();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let pointer = Point::new(10.0, 10.0);
+            let cursor = mouse::Cursor::Available(pointer);
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            let mut overlay = element.as_widget_mut().overlay(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &viewport,
+                Vector::ZERO,
+            ).expect("right click mounts the actual toolkit context menu");
+            let surface = layout::Node::new(viewport.size());
+            overlay.as_overlay_mut().update(
+                &Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+                Layout::new(&surface),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+            );
+            let menu = overlay.as_overlay_mut().layout(&renderer, viewport.size());
+            menu.children().first().expect("context menu row laid out").size().height
+        };
+
+        configure_typography("", 13.0, "", 14.0);
+        let small_label = text_height(widget::text("Rename pane").into());
+        let small_menu = menu_height();
+        let small_root = text_height(widget::menu::root::<(), Renderer>("Pane").into());
+        let explicit = text_height(widget::text("Fixed caption").size(12.0).into());
+        configure_typography("", 24.0, "", 14.0);
+        let large_label = text_height(widget::text("Rename pane").into());
+        let large_menu = menu_height();
+        let large_root = text_height(widget::menu::root::<(), Renderer>("Pane").into());
+        assert!(large_label > small_label * 1.5, "unsized toolkit labels inherit interface size");
+        assert!(large_root > small_root, "actual menu roots inherit interface size");
+        assert!(large_menu > small_menu, "context-menu rows grow with their labels");
+        assert!(large_menu >= large_label + 8.0, "menu padding must not clip the line box");
+        assert_eq!(text_height(widget::text("Fixed caption").size(12.0).into()), explicit);
+        configure_typography("", 13.0, "", 14.0);
+    }
 
     #[test]
     fn interface_and_chat_preferences_reach_rendered_text_and_markdown() {
