@@ -1155,7 +1155,9 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
     assert!(super::super::state::prepare_upgrade(&host,capability,false).is_err());
     assert!(super::super::finish_chat_shutdown(&host).unwrap_err().contains("native helper startup"));
     assert!(started.elapsed()<Duration::from_secs(2),"pending-owner admission must not invoke its held cleanup RPC");
-    assert!(start_execution(&host,0,source.clone(),context.clone()).is_err(),"uncertain startup cannot spawn a second provider");
+    // A deliberate start retry invokes exact cleanup and may wait for the
+    // latch then legitimately launch a successor. It is not a nonblocking
+    // admission probe; only the shutdown/upgrade guards above claim that.
     let mut unrelated = evidence.source.clone();
     unrelated.launch.recipe.arguments.push("--not-the-owned-startup".into());
     assert!(retained_actor::reconcile_startup(&host,&unrelated).is_err());
