@@ -734,6 +734,8 @@ enum PaneMenuCommand {
     Switch,
     Fork(chat_ui::Target),
     ReviewChanges(chat_ui::Target),
+    MoveTo(crate::model::ChannelId),
+    MoveToChannel,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -757,6 +759,12 @@ impl widget::menu::Action for PaneMenu {
             }
             PaneMenuCommand::ReviewChanges(target) => {
                 return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true));
+            }
+            PaneMenuCommand::MoveTo(channel) => {
+                return Message::MovePaneToChannel { card: id, channel };
+            }
+            PaneMenuCommand::MoveToChannel => {
+                return Message::Palette(palette_ui::Action::MovePane(id));
             }
         })
     }
@@ -1907,6 +1915,7 @@ impl Cagents {
         );
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
+            _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.chat_start_pending(id) => Some(("Updating conversation", true)),
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
@@ -2077,6 +2086,25 @@ impl Cagents {
                     "Review file changes".into(),
                     None,
                     PaneMenu(id, PaneMenuCommand::ReviewChanges(target)),
+                ));
+            }
+            let destinations = self.pane_move_destinations(id);
+            if !destinations.is_empty() {
+                entries.push(widget::menu::Item::Divider);
+            }
+            if destinations.len() <= 5 {
+                entries.extend(destinations.into_iter().map(|channel| {
+                    widget::menu::Item::Button(
+                        format!("Move to {}", self.pane_move_destination_label(channel)),
+                        None,
+                        PaneMenu(id, PaneMenuCommand::MoveTo(channel.id)),
+                    )
+                }));
+            } else {
+                entries.push(widget::menu::Item::Button(
+                    "Move to channel…".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::MoveToChannel),
                 ));
             }
             widget::menu::items(&HashMap::new(), entries)
