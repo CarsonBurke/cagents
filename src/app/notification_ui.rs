@@ -2381,9 +2381,11 @@ mod tests {
             Vec::new(),
             Vec::new(),
         ));
-        assert!(!app.reconcile_agent_attention_owners());
         assert_eq!(Arc::as_ptr(&app.durable), unchanged_cards);
-        drop(app.retry_notification_activation());
+        // Loaded inventory can change without touching pane membership. Drive
+        // the actual semantic notification and common update postlude rather
+        // than an unrelated attention-owner helper from the larger campaign.
+        drop(app.update(Message::GitUi(crate::app::git_ui::Action::Changed)));
         assert_eq!(app.workspace.focused(), Some(card));
         assert_eq!(app.durable.active_channel, Some(channel));
         assert!(app.notification_ui.session_activation.is_none());
