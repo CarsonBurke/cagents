@@ -8,7 +8,7 @@
 //! trusted. Unknown entries are retained, never removed
 //! using a diagnostic spelling or a guessed Git temporary filename.
 use super::*;
-use crate::recovery_authority::RecoverySlot;
+use crate::recovery_authority::{RecoverySlot, RecoveryContext};
 use std::os::unix::fs::FileExt;
 
 /// Create and retain the actual output inode before giving it to Git. Git
@@ -35,8 +35,8 @@ struct Holding {
 }
 
 impl Holding {
-    fn create(parent: &fs_safety::Root, recovery: &DiscardRecovery) -> Result<Self, String> {
-        let slot = RecoverySlot::reserve()?;
+    fn create(parent: &fs_safety::Root, recovery: &DiscardRecovery, context: &RecoveryContext) -> Result<Self, String> {
+        let slot = context.reserve()?;
         let held_parent = parent.try_clone().map_err(|error| error.to_string())?;
         let name = PathBuf::from(format!(".cagents-undo-{}", Uuid::new_v4()));
         let creation = match fs_safety::create_directory_beneath(parent, &name, 0o700) {
@@ -239,10 +239,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     pub(super) fn undo_saved_entry(
         &self, recovery: &DiscardRecovery, root: &fs_safety::Root,
         entry: &DiscardRecoveryEntry, parent: &fs_safety::Root, name: &OsStr,
-        cancellation: &CancellationToken,
+        context: &RecoveryContext, cancellation: &CancellationToken,
     ) -> Result<Option<String>, String> {
         let source = self.recovery_source_authority(&recovery.worktree, root).map_err(|error|error.to_string())?;
-        let mut holding = Holding::create(parent, recovery)?;
+        let mut holding = Holding::create(parent, recovery, context)?;
         let result = self.publish_saved_entry(&source, &mut holding, recovery, entry, name, cancellation);
         if !holding.publication.is_removed() { holding.retain(recovery); }
         result
@@ -367,7 +367,7 @@ mod tests {
             live_recovery: LiveDiscardRecovery::default(),
             directories: BTreeMap::new(), entries: vec![], expires_unix_ms: u64::MAX,
         };
-        let holding = Holding::create(&root, &recovery).unwrap();
+        let holding = Holding::create(&root, &recovery, &RecoveryContext::with_guard((), 0).unwrap()).unwrap();
         (directory, recovery, holding)
     }
 

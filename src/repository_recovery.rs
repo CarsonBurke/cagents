@@ -564,9 +564,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if !recovery.can_undo() {
             return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason: "Undo discard has expired; backups remain in Git objects and the system Trash".into() } });
         }
-        let _protection = crate::worktree_cleanup::protect(&recovery.worktree)
-            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let protection = Arc::new(crate::worktree_cleanup::protect(&recovery.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?);
         let root = self.captured_worktree_root(&recovery.worktree)?;
+        let descriptors = match protection.as_ref() {
+            Some(protection) => {
+                if !protection.protects_root(&root).map_err(|error|ValidationError::Io(error.to_string()))? {
+                    return Err(ValidationError::Io("The cleanup lease no longer protects this exact recovery worktree; no path was undone".into()).into());
+                }
+                protection.retained_descriptor_count()
+            }
+            None => 0,
+        };
+        let context = crate::recovery_authority::RecoveryContext::with_guard(protection, descriptors)
+            .map_err(ValidationError::Io)?;
         let directory = root
             .metadata()
             .map_err(|error| ValidationError::Io(error.to_string()))?;
@@ -579,7 +590,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let mut paths = Vec::new();
         let mut failures = Vec::new();
-        let mut created_directories = RecoveryDirectoryFrontier::new_with_recovery(&recovery.live_recovery);
+        let mut created_directories = RecoveryDirectoryFrontier::new_with_recovery(&recovery.live_recovery, &context);
         // Component order keeps each subtree contiguous. Release restored
         // siblings before entering the next one; descriptor use scales with
         // active ancestor depth, not the number of files/directories in Undo.
@@ -669,7 +680,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if let Some(trash) = &entry.trash {
             return restore_trashed_entry(trash, &parent, &name, cancellation, || {});
         }
-        self.undo_saved_entry(recovery, root, entry, &parent, &name, cancellation)
+        self.undo_saved_entry(recovery, root, entry, &parent, &name, &created_directories.context, cancellation)
     }
 }
 
@@ -709,6 +720,7 @@ struct RecoveryDirectoryFrontier {
     owned: BTreeMap<RepoPath, OwnedRecoveryDirectory>,
     warnings: BTreeMap<RepoPath, MutationFailure>,
     live: LiveDiscardRecovery,
+    context: crate::recovery_authority::RecoveryContext,
 }
 
 struct OwnedRecoveryDirectory {
@@ -760,9 +772,11 @@ fn open_directory_sync_handle(root: &fs_safety::Root) -> io::Result<fs::File> {
 
 impl RecoveryDirectoryFrontier {
     #[cfg(test)]
-    fn new(_root: &fs_safety::Root) -> Self { Self::new_with_recovery(&LiveDiscardRecovery::default()) }
-    fn new_with_recovery(live: &LiveDiscardRecovery) -> Self {
-        Self { owned: BTreeMap::new(), warnings: BTreeMap::new(), live: live.clone() }
+    fn new(_root: &fs_safety::Root) -> Self {
+        Self::new_with_recovery(&LiveDiscardRecovery::default(), &crate::recovery_authority::RecoveryContext::with_guard((), 0).unwrap())
+    }
+    fn new_with_recovery(live: &LiveDiscardRecovery, context: &crate::recovery_authority::RecoveryContext) -> Self {
+        Self { owned: BTreeMap::new(), warnings: BTreeMap::new(), live: live.clone(), context: context.clone() }
     }
     fn flush_before(&mut self, next: Option<&RepoPath>, failures: &mut Vec<MutationFailure>) {
         let mut done = self.owned.keys().filter(|path| next.is_none_or(|next| !next.as_path().starts_with(path.as_path()))).cloned().collect::<Vec<_>>();
@@ -822,7 +836,10 @@ fn recovery_parent(
         // directory. Published parents stay private while descendants need it;
         // their archived mode is restored by the component-ordered frontier.
         let temporary_mode = 0o700 | (mode & 0o2000);
-        let slot = crate::recovery_authority::RecoverySlot::reserve()?;
+        let slot = created.context.reserve()?;
+        // Own the exact parent before mkdir so error cleanup retains both its
+        // lease and the directory requiring fsync, without a post-effect clone.
+        let preparation_parent = parent.try_clone().map_err(|error|error.to_string())?;
         let result = match fs_safety::create_directory_beneath(
             &parent, Path::new(component.as_os_str()), temporary_mode,
         ) {
@@ -831,7 +848,10 @@ fn recovery_parent(
                 let message = error.to_string();
                 if let Some(mut preparation) = error.take_recovery() {
                     let description = format!("Recovery parent preparation originally named {}", preparation.diagnostic_path().display());
-                    created.live.retain(slot.retain(description, move || preparation.retry_cleanup().map_err(|error|error.to_string())));
+                    created.live.retain(slot.retain(description, move || {
+                        preparation.retry_cleanup().map_err(|error|error.to_string())?;
+                        fs_safety::sync_directory(&preparation_parent).map_err(|error|error.to_string())
+                    }));
                 }
                 return Err(message);
             }
