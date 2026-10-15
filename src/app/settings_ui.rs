@@ -1788,6 +1788,9 @@ mod keyboard_table_tests {
             1,
             "a numpad digit matches neither the number-row nor symbol binding"
         );
+        // This covers a source-admitted logical-zero event, not a claim about
+        // the default native keypad layout. XKB may instead emit unmodified
+        // Insert with modified_key 0, which the actual zoom handler rejects.
         let keypad_reset = press(
             "0",
             "0",
