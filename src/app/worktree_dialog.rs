@@ -246,6 +246,11 @@ impl WorktreeCreationSource {
 
     pub(super) fn repository(&self) -> &Path { self.authority.path() }
 
+    /// Pure original-Arc projection for final publication identity checks.
+    pub(super) fn retained_worktree_root(&self) -> Arc<crate::fs_safety::Root> {
+        self.authority.retained_worktree_root()
+    }
+
     pub(super) fn service(&self) -> Result<Arc<ScopedCreationService>, RepositoryError> {
         if !self.is_available() {
             return Err(ValidationError::Io("The displayed project source changed. Reload the project before creating a worktree.".into()).into());

@@ -41,6 +41,12 @@ impl WorktreeAuthority {
 
     pub fn path(&self) -> &Path { self.root.path() }
 
+    /// Clone the originally retained checkout Root. No filesystem work,
+    /// descriptor duplication, or reconstruction from a pathname is performed.
+    pub fn retained_worktree_root(&self) -> Arc<fs_safety::Root> {
+        Arc::clone(&self.root)
+    }
+
     pub fn validate(&self) -> Result<(), RepositoryError> {
         if let Some(reason) = Self::unsupported_reason() { return Err(ValidationError::Io(reason.into()).into()); }
         let named = fs_safety::Root::open(self.path()).map_err(|error| ValidationError::Io(format!("The original worktree is no longer available: {error}")))?;
