@@ -75,15 +75,14 @@ new work in that scope. Choose **Automatic** in Settings → Accounts to restore
 automatic provider routing; clear a project choice to inherit it. Existing
 saved conversations retain their previous account.
 
-For an automatic native chat, the next unsent message can switch accounts
-between turns. The daemon fences the exact idle actor, transfers only that
-conversation's transcript to the alternate home, and requires the provider
-to confirm the same conversation before saving the change and sending the
-untouched message. Busy conversations, queued work, approvals and other live
-owners prevent switching. A failed or partially executed turn is never replayed.
-Missing, divergent or unsupported history pauses the switch and preserves the
-unsent message and original saved conversation. Omp handles its own account
-rotation. Shell terminals retain their launch homes for their lifetime.
+Exact continuation on another account requires positive proof that the original
+provider has retired, a transferable transcript and confirmation of the same
+provider conversation on the replacement. An idle indicator alone does not
+authorize stopping a live provider. When exact continuation is unavailable,
+the original conversation and unsent message stay intact; the account picker
+offers an explicit new-conversation continuation instead. A failed or partially
+executed turn is never replayed. Omp handles its own account rotation. Shell
+terminals retain their launch homes for their lifetime.
 
 Device windows read quota and account configuration from their selected
 daemon, save account preferences there, and run sign-in on that device.
@@ -103,7 +102,16 @@ provider before sign-out. Divergent history is never overwritten. Saved
 conversation descriptors keep their original home until an explicit account
 switch confirms the same conversation on the replacement. **Delete files
 permanently** is a separate action requiring the account name; it deletes the
-home's conversations, caches, and app-retained original prompts and attachments, and cannot be undone. Archive and Move retain that original-prompt data. If the home was already removed externally, deletion uses a prior physical-home association where available; otherwise the result explicitly says that removal of older retained prompt data could not be verified.
+home's provider conversation files and caches, together with the relevant
+account-owned archives of original prompts and attachments. This cannot be
+undone. Archive and Move retain that original-prompt data. Cagents automation
+run records and saved result snapshots are separate reports: they may remain
+read-only after account deletion and cannot restore a resumable provider
+session. Deletion clears the requesting window's affected history readers;
+it does not promise to erase already displayed volatile text in every other
+window. If the home was already removed externally, deletion uses a prior
+physical-home association where available; otherwise the result explicitly
+says that removal of older retained prompt data could not be verified.
 
 Pending sign-ins survive a window restart and are verified on the
 device before joining its account list.
@@ -148,12 +156,15 @@ Provider references checked against the installed CLI versions:
 
 
 Started native conversations also expose the account picker. An explicit choice
-pins the conversation to the replacement account. When a turn, approval or
-queued message still owns work, the change waits for idle and shows “Switches
-to … after this turn”. At the idle boundary the daemon fences the exact actor,
-copies only its confirmed transcript and requires the same provider conversation
-identity before saving the replacement. A system transcript notice records the
-switch. If the transcript cannot be transferred, **Continue on … as a new
+requests that account even when the original account remains available. When
+a turn, approval or queued message still owns work, the choice waits and shows
+“Switches to … after this turn”; selecting the current account cancels it.
+The daemon checks exact handoff authority after the work settles. Completed,
+positively retired sources can transfer their confirmed transcript and must
+confirm the same provider conversation identity before the replacement is saved.
+A system transcript notice records a successful switch. Current live providers
+do not supply the conditional retirement proof needed for exact automatic
+handoff; their original actor stays running. **Continue on … as a new
 conversation (cache lost)** opens a separate draft seeded with a bounded recent
 transcript excerpt and the unsent request; the original conversation is retained.
 The draft is editable and is not sent automatically.
