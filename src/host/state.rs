@@ -6880,7 +6880,7 @@ for line in sys.stdin:
             let mut state = host.lock().unwrap();
             assert!(state.terminals[&id].handle.same_worker(&handle));
             assert_eq!(state.terminal_retirements[&id].failure.as_deref(), Some("fixture cleanup unconfirmed"));
-            let impact = state.upgrade_impact(crate::update::Policy::WhenIdle).unwrap();
+            let impact = state.upgrade_impact(crate::update::impact::Policy::WhenIdle).unwrap();
             assert!(impact.blockers.iter().any(|blocker| blocker.contains("cleanup is unconfirmed")),
                 "upgrade must preserve the uncertain completed worker before any Child handoff: {:?}", impact.blockers);
             assert!(state.terminal_retention_deadline(Duration::ZERO, &BTreeSet::new()).is_none());
