@@ -17143,11 +17143,6 @@ impl Application for Cagents {
             &self.settings.keyboard_shortcuts,
         )
         .map(Message::Sidebar);
-        // All mounted sidebar actions are outside the pane. Native editing
-        // markers still classify its search/commit fields as TextInput.
-        let sidebar: Element<'_, Message> = widget::container(sidebar)
-            .id(widget::Id::new("workspace.sidebar-controls"))
-            .into();
 
         // The focused card's own name and path are the card header's job, and
         // the window's header bar already carries the name; see
