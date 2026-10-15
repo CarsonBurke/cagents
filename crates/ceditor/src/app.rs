@@ -6874,6 +6874,7 @@ mod tests {
             message: "standing error".into(),
             source: None,
             code: None,
+            protocol: None,
         };
         let publish = |version, line| Message::Lsp(generation, Some(LspEvent::Diagnostics {
             doc,

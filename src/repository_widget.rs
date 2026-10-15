@@ -3246,10 +3246,14 @@ impl RepositoryRuntime {
         if self.is_read_only_source() || self.workspace_edit_pending() { return Task::none(); }
         let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
         let cursor = document.content.cursor(); let scroll = document.content.scroll_position();
+        document.history.seal();
+        document.saved_history_revision = document.history.reserve_revision();
         document.saved_text = version.text;
         document.disk_hash = version.content_hash;
         document.source = version.source; document.markdown = version.markdown;
         let edits = document.discard_edits();
+        document.saved_history_revision = document.history.revision();
+        document.saved_snapshot = document.content.text_snapshot();
         let map = |mut position: text_editor::Position| { position.line = version.mapping.map(position.line); position };
         document.content.set_cursor(text_editor::Cursor { position: map(cursor.position), selection: cursor.selection.map(map) });
         document.content.restore_scroll_position(text_editor::ScrollPosition { line: version.mapping.map(scroll.line), ..scroll });
@@ -4433,7 +4437,7 @@ impl RepositoryRuntime {
         if let Some(version) = document.bump_lsp_version() {
             self.lsp_edits.clear();
             self.lsp_edits_exact = false;
-            self.lsp_intents.push(LspIntent::Change { version, text: document.content.text() });
+            self.lsp_intents.push(LspIntent::Change { version, text: LspChangeText::Snapshot(document.content.text_snapshot()) });
         }
         self.refresh_find_matches();
         Ok(())
@@ -5589,8 +5593,11 @@ impl RepositoryRuntime {
                 let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
                 if document.active_save.is_some() { return Task::none(); }
                 if let Some(version) = document.external_version.take() {
+                    document.history.seal();
+                    document.saved_history_revision = document.history.reserve_revision();
                     document.disk_hash = version.content_hash; document.saved_text = version.text;
-                    document.dirty = !content_matches(&document.content, &document.saved_text);
+                    document.saved_snapshot = text_editor::Content::<cosmic::Renderer>::with_text(&document.saved_text).text_snapshot();
+                    document.refresh_dirty();
                 } else if document.external_deleted { document.recreate_missing = true; document.dirty = true; }
                 else { return self.request_save(card, true); }
                 document.conflict = false; document.error = None;
@@ -5775,7 +5782,11 @@ impl RepositoryRuntime {
                     }) => {
                         let retained = self.undo_lru.take(&identity.path, &source, content_hash);
                         let mut document = EditorDocument::new(identity.path, source, text, content_hash, markdown);
-                        if let Some(retained) = retained { document.history = retained.history; document.content.set_cursor(retained.cursor); }
+                        if let Some(retained) = retained {
+                            document.history = retained.history;
+                            document.saved_history_revision = document.history.revision();
+                            document.content.set_cursor(retained.cursor);
+                        }
                         DocumentState::Editable(document)
                     },
                     Ok(LoadedFile {
@@ -17764,8 +17775,8 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "first\nsecond\nthird\n");
         runtime.set_editor_diagnostics(vec![
-            crate::lsp::LspDiagnostic { range:LspRange::new(LspPosition::new(2,0),LspPosition::new(2,3)),severity:crate::lsp::LspSeverity::Error,message:"third error".into(),source:None,code:None },
-            crate::lsp::LspDiagnostic { range:LspRange::new(LspPosition::new(1,0),LspPosition::new(1,3)),severity:crate::lsp::LspSeverity::Warning,message:"second warning".into(),source:None,code:None },
+            crate::lsp::LspDiagnostic { range:LspRange::new(LspPosition::new(2,0),LspPosition::new(2,3)),severity:crate::lsp::LspSeverity::Error,message:"third error".into(),source:None,code:None,protocol:None },
+            crate::lsp::LspDiagnostic { range:LspRange::new(LspPosition::new(1,0),LspPosition::new(1,3)),severity:crate::lsp::LspSeverity::Warning,message:"second warning".into(),source:None,code:None,protocol:None },
         ]);
         runtime.move_cursor_to(LspPosition::new(0,0));
         runtime.navigate_diagnostic(true);
