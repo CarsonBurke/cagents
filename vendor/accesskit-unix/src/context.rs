@@ -265,12 +265,17 @@ async fn run_event_loop(
     pin!(changes);
 
     let mut atspi_bus: Option<Bus> = None;
+    let health_interval = std::time::Duration::from_secs(5);
+    let mut health_deadline = std::time::Instant::now() + health_interval;
     loop {
         let next_message = messages.next();
         #[cfg(not(feature = "tokio"))]
         let next_message = next_message.fuse();
         pin!(next_message);
-        let heartbeat = retry_sleep(std::time::Duration::from_secs(5));
+        // Adapter traffic must not postpone the status/transport probe.
+        let heartbeat = retry_sleep(
+            health_deadline.saturating_duration_since(std::time::Instant::now()),
+        );
         #[cfg(not(feature = "tokio"))]
         let heartbeat = heartbeat.fuse();
         pin!(heartbeat);
@@ -289,6 +294,7 @@ async fn run_event_loop(
                 if let Some(bus) = &atspi_bus {
                     bus.check_connection().await?;
                 }
+                health_deadline = std::time::Instant::now() + health_interval;
             }
             change = changes.next() => {
                 for entry in adapters.iter_mut() {
