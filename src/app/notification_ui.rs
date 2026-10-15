@@ -481,17 +481,8 @@ impl Cagents {
                         .iter()
                         .any(|notice| notice.id == *id && !notice.acknowledged)
                 });
-                // Project once per snapshot, before mutating local unread.
-                // Managed aliases cannot acquire canonical attention by row order.
-                let cards = self.notification_attention_cards();
-                for notice in &snapshot.notices {
-                    if !notice.acknowledged
-                        && !self.notification_ui.acknowledged.contains(&notice.id)
-                        && let Some(session) = notice.event.source_session()
-                        && let Some(Some(card)) = cards.get(&session)
-                    {
-                        self.observe_agent_update_for_card(*card);
-                    }
+                for card in self.notification_unread_cards(&snapshot) {
+                    self.observe_agent_update_for_card(card);
                 }
                 self.notification_ui.preview_generation =
                     self.notification_ui.preview_generation.wrapping_add(1);
@@ -820,6 +811,34 @@ impl Cagents {
             self.notification_ui.activation_attempt = None;
         }
         Task::batch([adopted, focus])
+    }
+
+    fn notification_unread_cards(&self, snapshot: &Snapshot) -> BTreeSet<CardId> {
+        if snapshot.notices.is_empty() {
+            return BTreeSet::new();
+        }
+        let cards = self.notification_attention_cards();
+        snapshot.notices.iter().filter_map(|notice| {
+            if notice.acknowledged || self.notification_ui.acknowledged.contains(&notice.id) {
+                return None;
+            }
+            let session = notice.event.source_session()?;
+            cards.get(&session).copied().flatten()
+        }).collect()
+    }
+
+    /// Journal and workspace-model watches are independent. Reconsider retained
+    /// unread evidence after canonical pane/scope reconciliation, without
+    /// waiting for a second journal snapshot or adopting/reading a pane.
+    pub(super) fn reproject_notification_unread(&mut self) {
+        let cards = self.notification_unread_cards(&self.notification_ui.snapshot);
+        if cards.is_empty() {
+            return;
+        }
+        for card in cards {
+            self.observe_agent_update_for_card(card);
+        }
+        self.refresh_sidebar_channels();
     }
 
     /// Attribution grants no adoption, focus, startup, persistence or read.
@@ -2570,6 +2589,87 @@ mod tests {
                     "an open alias must not bypass explicit canonical closure"
                 );
                 assert!(app.notification_ui.session_activation.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot() {
+        use crate::workspace_model::views::{Pane, View};
+        use super::super::workspace_model_sync::ModelUpdate;
+        for connected in [false, true] {
+            for control in ["valid", "locally-acknowledged", "replaced-proof"] {
+                let (mut app, agent) = scheduled_attention_fixture();
+                let session = agent.console.as_ref().unwrap().id;
+                let canonical = CardId::from_uuid(agent.id.as_uuid());
+                app.workspace_model.agents.push(agent.clone());
+                drop(app.adopt_execution_agent(&agent).unwrap());
+                let card = app.card_state(canonical).unwrap().clone();
+                app.workspace_model.views = vec![View {
+                    scope: agent.placement.clone(),
+                    revision: 1,
+                    panes: vec![Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap()],
+                    retired: vec![],
+                }];
+                let mut alias = card.clone();
+                alias.id = CardId::new();
+                let alias_id = alias.id;
+                Arc::make_mut(&mut app.durable).cards.insert(0, alias);
+                app.chat_ui = crate::app::chat_ui::State::with_drafts(HashMap::from([
+                    (alias_id, "Preserved alias draft".into()),
+                    (canonical, "Preserved canonical draft".into()),
+                ]));
+                // Establish the actual initialized shared-view blocker. These
+                // two live aliases cannot be made unique by discarding a draft.
+                app.acknowledge_view_edit(agent.placement.clone(), None);
+                drop(app.reconcile_shared_views());
+                assert!(app.shared_views.blocked.contains(&agent.placement));
+                app.refresh_ui.focused = false;
+                let focus = app.workspace.focused();
+                Arc::make_mut(&mut app.durable).workspace_model_identity = Some(app.workspace_model.identity);
+                let mut model = std::mem::take(&mut app.workspace_model);
+                let mut snapshot = attention_snapshot(session);
+                // A cold, already-completed source need not emit another runtime
+                // activity transition or another identical broker snapshot.
+                snapshot.notices[0].event.evidence.kind = crate::notifications::Kind::Succeeded;
+                let notice = snapshot.notices[0].id;
+                drop(app.update(Message::NotificationUi(Action::Snapshot(snapshot.clone()))));
+                assert!(!app.sidebar_state.has_card_update(canonical));
+                assert!(!app.sidebar_state.has_card_update(alias_id));
+                if control == "locally-acknowledged" {
+                    app.notification_ui.acknowledge(notice);
+                }
+                if control == "replaced-proof" {
+                    let CardKind::Terminal(replaced) = &mut model.views[0].panes[0].kind else {
+                        unreachable!()
+                    };
+                    replaced.continuity = TerminalContinuity::Live {
+                        host_session_id: crate::model::HostSessionId::new("replacement-host"),
+                        boot_id: crate::model::BootId::new("replacement-boot"),
+                        host_incarnation: crate::model::HostIncarnation::new("replacement-incarnation"),
+                    };
+                }
+                let update = if connected { ModelUpdate::Connected(model) } else { ModelUpdate::Read(model) };
+                drop(app.update(Message::WorkspaceModelObserved(update)));
+                assert_eq!(app.sidebar_state.has_card_update(canonical), control == "valid");
+                assert!(!app.sidebar_state.has_card_update(alias_id));
+                assert!(app.shared_views.blocked.contains(&agent.placement));
+                assert!(app.card_state(alias_id).unwrap().existence.is_open());
+                assert_eq!(app.card_state(canonical).unwrap().kind, card.kind);
+                assert_eq!(app.workspace.focused(), focus, "unread projection cannot focus or activate");
+                assert_eq!(app.notification_ui.snapshot, snapshot, "no second Snapshot was delivered");
+                assert_eq!(app.notification_ui.acknowledged_for_test(notice), control == "locally-acknowledged");
+                assert!(app.notification_ui.session_activation.is_none());
+                assert!(!app.chat_start_pending(canonical));
+                // The exact local ACK must also survive a later model replay.
+                if control == "valid" {
+                    drop(app.mark_cards_read(vec![canonical]));
+                    let replay = app.workspace_model.clone();
+                    drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(replay))));
+                    assert!(!app.sidebar_state.has_card_update(canonical));
+                    assert!(!app.sidebar_state.has_card_update(alias_id));
+                    assert!(app.notification_ui.acknowledged_for_test(notice));
+                }
             }
         }
     }

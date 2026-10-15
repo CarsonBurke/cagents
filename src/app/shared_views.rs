@@ -1145,6 +1145,7 @@ impl Cagents {
                 tasks.push(self.add_default_pane(path, settings::DefaultPane::Terminal));
             }
         }
+        self.reproject_notification_unread();
         Task::batch(tasks)
     }
 
