@@ -262,7 +262,11 @@ mod tests {
         let proc_root = tempfile::tempdir().unwrap();
         let fd = proc_root.path().join("123/fd");
         fs::create_dir_all(&fd).unwrap();
-        std::os::unix::fs::symlink(fs::canonicalize(&legacy).unwrap().join("transcript.sqlite"), fd.join("4")).unwrap();
+        std::os::unix::fs::symlink(
+            fs::canonicalize(&legacy).unwrap().join("transcript.sqlite"),
+            fd.join("4"),
+        )
+        .unwrap();
         let removed = sweep_with_procfs(root.path(), proc_root.path()).unwrap();
         assert_eq!(removed.count, 1);
         assert!(!orphan.exists());
@@ -306,12 +310,20 @@ mod tests {
             let proc_root = fixture.path().join("proc");
             fs::create_dir_all(proc_root.join("123")).unwrap();
             std::os::unix::fs::symlink(
-                format!("/proc/{}/fd", std::process::id()), proc_root.join("123/fd"),
-            ).unwrap();
+                format!("/proc/{}/fd", std::process::id()),
+                proc_root.join("123/fd"),
+            )
+            .unwrap();
             let removed = sweep_with_procfs(&alias, &proc_root).unwrap();
-            assert_eq!(removed.count, 1, "an unrelated abandoned legacy directory is reclaimed");
+            assert_eq!(
+                removed.count, 1,
+                "an unrelated abandoned legacy directory is reclaimed"
+            );
             assert!(!root.join(&abandoned_name).exists());
-            assert!(root.join(&live_name).exists(), "the real open FD protects either alias spelling");
+            assert!(
+                root.join(&live_name).exists(),
+                "the real open FD protects either alias spelling"
+            );
             drop(held);
             assert_eq!(sweep_with_procfs(&alias, &proc_root).unwrap().count, 1);
             assert!(!root.join(&live_name).exists());
