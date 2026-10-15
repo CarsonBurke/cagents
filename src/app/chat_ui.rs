@@ -35,6 +35,7 @@ mod step;
 mod thumbnails;
 mod tool_text;
 mod turn;
+mod turn_actions;
 mod view;
 
 pub(super) fn prune_pasted_images() {
@@ -122,6 +123,7 @@ impl std::fmt::Debug for Ready {
 #[derive(Debug, Clone)]
 pub enum CopyPart {
     Text,
+    PlainText,
     Input,
     Output,
     Change(usize),
@@ -216,6 +218,9 @@ pub enum Action {
     SessionLinkWindowBackend(String, TerminalId, bool),
     SessionLinkToken(String, TerminalId, Option<String>),
     Copy(Target, String, CopyPart),
+    RetryTurn(Target, String),
+    EditPrompt(Target, String),
+    LoadEditedPrompt(Target),
     OpenUrl(String),
     OpenDocument(Target, String),
     OpenChangedFile(Target, PathBuf),
@@ -366,6 +371,9 @@ impl Action {
             | Self::ResumeAfterSignIn(target)
             | Self::AcceptSuggestion(target, _)
             | Self::Submit(target, _)
+            | Self::RetryTurn(target, _)
+            | Self::EditPrompt(target, _)
+            | Self::LoadEditedPrompt(target)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
             | Self::Interrupt(target)
@@ -472,6 +480,7 @@ pub(super) struct State {
     /// refused. Holding the draft here makes the round trip lossless, and the
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
+    recovery_drafts: HashMap<CardId, turn_actions::Prompt>,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -499,6 +508,7 @@ impl Default for State {
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
             drafts: HashMap::new(),
+            recovery_drafts: HashMap::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -845,6 +855,8 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
     }
     match (part, content) {
         (CopyPart::Text, ItemContent::Text { text, .. }) => joined(&[text]),
+        (CopyPart::PlainText, ItemContent::Text { text, .. }) => Some(turn_actions::plain_text(text)),
+        (CopyPart::PlainText, content) => copy_text(CopyPart::Text, content),
         (
             CopyPart::Text,
             ItemContent::Command {
@@ -1491,6 +1503,7 @@ pub(super) struct Runtime {
     changes: changes::State,
     fork_requested: bool,
     fork_seen: Option<String>,
+    recovery: turn_actions::State,
     snapshot: Arc<Snapshot>,
     source_clock: Option<chat::client::SourceClock>,
     finished_stamp: Option<(u64, String, String)>,
@@ -2077,6 +2090,7 @@ impl Runtime {
             changes: changes::State::default(),
             fork_requested: false,
             fork_seen: None,
+            recovery: turn_actions::State::default(),
             files: None,
             find: None,
             find_focused: false,
@@ -2139,6 +2153,7 @@ impl Runtime {
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
+        self.recovery.connection_replaced();
         self.cache.clear();
         self.turns.clear();
         self.selected_subagent = None;
@@ -2474,6 +2489,12 @@ impl Runtime {
         {
             self.replace_draft(text_editor::Content::with_text(text));
         }
+        if self.session.launch.provider == Provider::Omp && snapshot.ready
+            && self.recovery.branch_draft.is_some()
+            && snapshot.session_id != self.recovery.branch_session {
+            let prompt=self.recovery.branch_draft.take().unwrap();
+            self.load_recovery_prompt(prompt,"Editing this prompt continues the new branch.");
+        }
         if snapshot.session_id.is_some() || self.snapshot.session_id.is_some() {
             self.session.launch.session_id = snapshot.session_id.clone();
         }
@@ -2535,6 +2556,10 @@ impl Runtime {
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
             self.interrupt_armed = None;
         }
+        if self.snapshot.session_id.is_some() && self.snapshot.session_id != snapshot.session_id {
+            self.recovery.connection_replaced();
+        }
+        self.recovery.observe(&snapshot);
         self.snapshot = snapshot;
         images::sync(self);
         self.refresh_find();
@@ -4655,6 +4680,7 @@ impl Cagents {
         }
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
+        self.chat_ui.recovery_drafts.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
@@ -5711,6 +5737,8 @@ impl Cagents {
             Command::SetModel { model, reasoning } => Some((model.clone(), reasoning.clone())),
             _ => None,
         };
+        runtime.recovery.submitting(&handle.snapshot(), &command);
+        runtime.recovery.notice = None;
         runtime.pending = Some(PendingCommand {
             followup: false,
             take_back: None,
@@ -6223,6 +6251,7 @@ impl Cagents {
                         let visible = self.workspace.visibility(target.card)
                             == Some(VisibilityClass::Visible);
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                            runtime.recovery.connection_replaced();
                             runtime.target = target;
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
@@ -6262,6 +6291,10 @@ impl Cagents {
                             {
                                 self.retire_switched_terminal(terminal, &session);
                             }
+                        }
+                        if let Some(prompt)=self.chat_ui.recovery_drafts.remove(&target.card)
+                            && let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                            runtime.load_recovery_prompt(prompt,"Editing this prompt continues the new branch.");
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
@@ -6311,6 +6344,7 @@ impl Cagents {
                             usage,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
+                            self.dispatch_chat_recovery(target),
                             focus,
                         ]);
                     }
@@ -6580,6 +6614,7 @@ impl Cagents {
                         } else {
                             None
                         };
+                        let branch_draft=if fork.is_some() {runtime.recovery.branch_draft.take()} else {None};
                         let activity = Activity {
                             provider: runtime.session.launch.provider,
                             state: handle.take_activity(),
@@ -6603,6 +6638,7 @@ impl Cagents {
                         return Task::batch([
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
+                            self.dispatch_chat_recovery(target),
                             self.resume_history_navigation(target),
                             fork.map_or_else(Task::none, |session| {
                                 let scope = if let Some(channel) = self
@@ -6621,6 +6657,10 @@ impl Cagents {
                                 };
                                 let insert =
                                     self.insert_chat_card(session, Some(target.card), None);
+                                if let Some(prompt)=branch_draft
+                                    && let Some(card)=self.durable.focused {
+                                    self.chat_ui.recovery_drafts.insert(card,prompt);
+                                }
                                 Task::batch([scope, insert])
                             }),
                         ]);
@@ -7443,6 +7483,16 @@ impl Cagents {
                     return self.chat_send(target, Command::ListBranches, false);
                 }
             }
+            Action::RetryTurn(target, user) => return self.retry_chat_turn(target, &user),
+            Action::EditPrompt(target, user) => return self.edit_chat_prompt(target, &user),
+            Action::LoadEditedPrompt(target) => {
+                if let Some(runtime)=self.chat_runtime_mut(target)
+                    && runtime.recovery_composer_empty()
+                    && let Some(prompt)=runtime.recovery.prepared_prompt.take() {
+                    runtime.load_recovery_prompt(prompt,"Editing this prompt continues the new branch.");
+                    return iced::widget::operation::focus(card_control_id(target.card,"chat-composer")).map(cosmic::Action::App);
+                }
+            }
             Action::CommandFinished(target, id, result) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -7455,6 +7505,12 @@ impl Cagents {
                     return Task::none();
                 }
                 let pending = runtime.pending.take().unwrap();
+                if runtime.recovery.inflight == Some(id) {
+                    runtime.recovery.inflight = None;
+                    if result.is_ok() { runtime.recovery.commands.pop_front(); }
+                    else { runtime.recovery.commands.clear(); }
+                    if runtime.recovery.commands.is_empty() {runtime.recovery.replay_settings=None;}
+                }
                 let provider = runtime.session.launch.provider;
                 if result.is_ok()
                     && let Some((model, reasoning)) = pending.model.clone()
@@ -7522,6 +7578,7 @@ impl Cagents {
                         }
                         runtime.note(error.clone());
                         runtime.fork_requested = false;
+                        runtime.recovery.branch_draft=None;
                         runtime.error = Some(error);
                         None
                     }
@@ -7534,6 +7591,7 @@ impl Cagents {
                 // wake the follow-up again once the command releases it.
                 return Task::batch([
                     self.dispatch_queued(target),
+                    self.dispatch_chat_recovery(target),
                     self.resume_history_navigation(target),
                 ]);
             }
@@ -7621,6 +7679,9 @@ impl Cagents {
                         )
                         .find(|item| item.id == id)
                         .and_then(|item| {
+                            if matches!(part,CopyPart::PlainText) && item.role == chat::Role::User {
+                                return copy_text(CopyPart::Text,&item.content);
+                            }
                             let card = runtime
                                 .cache
                                 .get(&item.id)
@@ -16850,4 +16911,88 @@ mod tests {
             assert_eq!(chat_runtime(&app, card).failures, recorded);
         }
     }
+    #[test]
+    fn failed_turn_retry_preserves_prompt_and_attachments_and_dispatches_once() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let card=live_chat(&mut app,Some(KNOWN_THREAD));
+        let target=chat_runtime(&app,card).target;
+        let prompt=Command::Prompt {text:"error".into(),attachments:vec![Attachment {path:"/tmp/image.png".into()}],mode:PromptMode::Send};
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        let mut snapshot=(*runtime.snapshot).clone();
+        snapshot.items=vec![Arc::new(chat::Item {id:"user".into(),role:chat::Role::User,started_at:None,at:None,
+            content:ItemContent::Text {text:"error".into(),thinking:false,phase:chat::Phase::Final}})];
+        snapshot.error=Some("API Error: 529 Overloaded... try again.".into());
+        runtime.recovery.submitting(&Snapshot::default(),&prompt);
+        show_chat_snapshot_for_test(&mut app,card,snapshot);
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        assert_eq!(runtime.retry_user_for_error("API Error: 529 Overloaded... try again.",Some("user")),Some("user".into()));
+        assert!(runtime.retry_user_for_error("401 invalid API key",Some("user")).is_none());
+        drop(app.handle_chat_ui(Action::RetryTurn(target,"user".into())));
+        let runtime=chat_runtime(&app,card);
+        assert_eq!(runtime.recovery.commands.front(),Some(&prompt));
+        let dispatched=runtime.pending.as_ref().unwrap().id;
+        drop(app.handle_chat_ui(Action::RetryTurn(target,"user".into())));
+        assert_eq!(chat_runtime(&app,card).pending.as_ref().unwrap().id,dispatched);
+        settle(&mut app,card,Ok(()));
+        assert!(chat_runtime(&app,card).recovery.commands.is_empty());
+        drop(app.handle_chat_ui(Action::RetryTurn(target,"user".into())));
+        assert!(chat_runtime(&app,card).pending.is_none(),"an ACK without a new turn cannot replay twice");
+    }
+
+    #[test]
+    fn edit_prompt_uses_claude_new_turn_or_a_supported_provider_branch() {
+        for provider in [Provider::Claude,Provider::Codex,Provider::Omp] {
+            let mut app=crate::app::tests::context_inspector_test_app(false);
+            let card=live_chat(&mut app,Some(KNOWN_THREAD));
+            let target=chat_runtime(&app,card).target;
+            let runtime=app.chat_runtime_mut(target).unwrap();
+            runtime.session.launch.provider=provider;
+            let mut snapshot=(*runtime.snapshot).clone();
+            snapshot.items=vec![Arc::new(chat::Item {id:"turn/user".into(),role:chat::Role::User,started_at:None,at:None,
+                content:ItemContent::Text {text:"Original prompt".into(),thinking:false,phase:chat::Phase::Final}})];
+            snapshot.capabilities.branch=provider != Provider::Claude;
+            snapshot.branch_points=vec![chat::BranchPoint {id:"turn".into(),label:"Original prompt".into()}];
+            show_chat_snapshot_for_test(&mut app,card,snapshot);
+            let runtime=app.chat_runtime_mut(target).unwrap();
+            runtime.session.launch.provider=provider;
+            assert!(runtime.can_edit_prompt(&runtime.snapshot.items[0]));
+            drop(app.handle_chat_ui(Action::EditPrompt(target,"turn/user".into())));
+            let runtime=chat_runtime(&app,card);
+            if provider == Provider::Claude {
+                assert_eq!(runtime.composer.text().trim_end(),"Original prompt");
+                assert!(runtime.recovery.notice.as_ref().unwrap().contains("new turn"));
+                assert!(runtime.pending.is_none());
+            } else {
+                assert!(runtime.pending.is_some());
+                assert_eq!(runtime.recovery.branch_draft.as_ref().unwrap().text,"Original prompt");
+                assert_eq!(runtime.fork_requested,provider == Provider::Codex);
+            }
+        }
+    }
+
+    #[test]
+    fn editing_and_delayed_branch_completion_preserve_an_unrelated_draft() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let card=live_chat(&mut app,Some(KNOWN_THREAD));let target=chat_runtime(&app,card).target;
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        let mut snapshot=(*runtime.snapshot).clone();
+        snapshot.items=vec![Arc::new(chat::Item {id:"user".into(),role:chat::Role::User,started_at:None,at:None,
+            content:ItemContent::Text {text:"Original prompt".into(),thinking:false,phase:chat::Phase::Final}})];
+        show_chat_snapshot_for_test(&mut app,card,snapshot);
+        let runtime=app.chat_runtime_mut(target).unwrap();runtime.session.launch.provider=Provider::Claude;
+        runtime.replace_draft(text_editor::Content::with_text("Unsent draft"));
+        runtime.attachments=vec![Attachment {path:"draft.png".into()}];
+        let prompt=runtime.recovery.for_user(&runtime.snapshot,"user").unwrap();
+        assert!(!runtime.can_edit_prompt(&runtime.snapshot.items[0]));
+        drop(app.handle_chat_ui(Action::EditPrompt(target,"user".into())));
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        runtime.load_recovery_prompt(prompt,"Branch ready");
+        assert_eq!(runtime.composer.text().trim_end(),"Unsent draft");
+        assert_eq!(runtime.attachments,vec![Attachment {path:"draft.png".into()}]);
+        assert!(runtime.recovery.prepared_prompt.is_some());
+        runtime.replace_draft(text_editor::Content::new());runtime.take_attachments();
+        drop(app.handle_chat_ui(Action::LoadEditedPrompt(target)));
+        assert_eq!(chat_runtime(&app,card).composer.text().trim_end(),"Original prompt");
+    }
+
 }

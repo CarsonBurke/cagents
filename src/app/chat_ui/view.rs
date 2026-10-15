@@ -1297,7 +1297,7 @@ impl Runtime {
             for (_, error) in self.failures.iter().filter(|(anchor, error)| {
                 anchor.is_none() && !self.active_auth_notice(anchor, error)
             }) {
-                transcript.push(notice_entry(error, target));
+                transcript.push(self.failure_notice(error, None));
             }
             for turn in &self.turns {
                 transcript.push_with_gap(
@@ -1312,7 +1312,7 @@ impl Runtime {
                 for (_, error) in self.failures.iter().filter(|(anchor, error)| {
                     anchor.as_ref() == Some(&turn.key) && !self.active_auth_notice(anchor, error)
                 }) {
-                    transcript.push(notice_entry(error, target));
+                    transcript.push(self.failure_notice(error, Some(&turn.key)));
                 }
             }
             if !snapshot.has_later
@@ -1374,7 +1374,7 @@ impl Runtime {
             && !chat::requires_sign_in(self.session.launch.provider, error)
             && !self.failures.iter().any(|(_, recorded)| recorded == error)
         {
-            transcript.push(notice_entry(error, target));
+            transcript.push(self.failure_notice(error, None));
         }
         content.extend(self.plan_view());
         if let Some(query) = &self.find {
@@ -1638,6 +1638,13 @@ impl Runtime {
                     .padding([space::XS, space::M])
                     .into(),
             );
+        }
+        if let Some(notice)=&self.recovery.notice {
+            content.push(design::caption(notice.clone()).into());
+        }
+        if self.recovery.prepared_prompt.is_some() {
+            content.push(crate::ui_controls::button::secondary("Load branch prompt")
+                .on_press_maybe(self.recovery_composer_empty().then(||action(Action::LoadEditedPrompt(target)))).into());
         }
         // The draft is copied out only where its text is shown or searched:
         // `text()` allocates the whole draft, and this runs on every frame.
@@ -3039,6 +3046,9 @@ impl Runtime {
         self.opened.get(&turn.key).hash(&mut hasher);
         self.tool_groups_expanded.hash(&mut hasher);
         self.find.hash(&mut hasher);
+        (self.snapshot.busy,self.snapshot.ready,self.snapshot.exited,self.pending.is_some(),
+            &self.recovery.retried,self.recovery.commands.len(),self.snapshot.branch_points.len()).hash(&mut hasher);
+        if turn.running {self.snapshot.detail.starts_with("Retrying").then_some(&self.snapshot.detail).hash(&mut hasher);}
         // Only reasoning uses the transcript's busy state to decide whether
         // its disclosure has finished. Other rows derive activity from their
         // own items and the group's status and duration.
@@ -3454,16 +3464,38 @@ impl Runtime {
         )
     }
 
+    pub(super) fn failure_notice(&self,message:&str,anchor:Option<&str>)->Element<'static,Message> {
+        let notice=notice_entry(message,self.target);
+        let Some(user)=self.retry_user_for_error(message,anchor) else {return notice;};
+        widget::column::with_children(vec![notice,
+            crate::ui_controls::button::secondary("Retry")
+                .on_press(action(Action::RetryTurn(self.target,user))).into()])
+            .spacing(step::GAP_XS).into()
+    }
+
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
-        small_icon(
-            if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
-                Icon::Check
-            } else {
-                Icon::Copy
-            },
-            "Copy this message",
-            Action::Copy(self.target, item.id.clone(), CopyPart::Text),
-        )
+        let is_text=matches!(item.content,ItemContent::Text {thinking:false,..});
+        let mut controls=vec![small_icon(
+            if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {Icon::Check} else {Icon::Copy},
+            if is_text {"Copy as Markdown"} else {"Copy this message"},
+            Action::Copy(self.target,item.id.clone(),CopyPart::Text))];
+        if is_text {
+            controls.push(small_icon(Icon::TextFile,"Copy as plain text",
+                Action::Copy(self.target,item.id.clone(),CopyPart::PlainText)));
+            if self.edit_supported(item) {
+                let enabled=self.can_edit_prompt(item);
+                controls.push(crate::ui_controls::icon_button(Icon::Edit,
+                    if !self.recovery_composer_empty() {"Send or clear your draft before editing this prompt"}
+                    else if self.session.launch.provider == Provider::Claude {"Edit and resend as a new turn"}
+                    else {"Edit and resend in a new branch"})
+                    .compact().on_press_maybe(enabled.then(||action(Action::EditPrompt(self.target,item.id.clone())))).into());
+            }
+            if let Some(user)=self.retry_for_assistant(item) {
+                controls.push(small_icon(Icon::Refresh,"Retry this turn",
+                    Action::RetryTurn(self.target,user)));
+            }
+        }
+        widget::row::with_children(controls).spacing(step::GAP_XS).into()
     }
 
     /// A draft's first message while its conversation starts.

@@ -332,6 +332,11 @@ impl Runtime {
         steps: impl FnOnce() -> Vec<Element<'a, Message>>,
     ) -> Element<'a, Message> {
         let target = self.target;
+        let retrying=turn.running && self.snapshot.detail.starts_with("Retrying");
+        let summary=if retrying {
+            turn.summary.strip_suffix(" · working").map(|summary|format!("{summary} · {}",self.snapshot.detail))
+                .unwrap_or_else(||turn.summary.clone())
+        } else {turn.summary.clone()};
         let key = turn.key.as_str();
         // Explicit reader choices override the configured default.
         let open = self
@@ -348,7 +353,9 @@ impl Runtime {
             .size(design::COMPACT_ICON_SIZE)
             .into(),
         ];
-        let tone = match turn.glyph().map(status_indicator) {
+        let tone = match if retrying {
+            Some((widget::icon(Icon::AgentWaiting.handle()).size(design::COMPACT_ICON_SIZE).into(),None))
+        } else {turn.glyph().map(status_indicator)} {
             Some((indicator, tone)) => {
                 line.push(indicator);
                 tone
@@ -356,7 +363,7 @@ impl Runtime {
             None => None,
         };
         line.push(
-            design::heading(turn.summary.clone())
+            design::heading(summary.clone())
                 .width(Length::Fill)
                 .into(),
         );
@@ -372,8 +379,8 @@ impl Runtime {
         // name as well: a reader on a screen reader is the one who cannot see
         // the caption beside it.
         let name = match &elapsed {
-            Some(elapsed) => format!("{} · {elapsed}", turn.summary),
-            None => turn.summary.clone(),
+            Some(elapsed) => format!("{summary} · {elapsed}"),
+            None => summary.clone(),
         };
         let header = widget::button::custom(
             widget::row::with_children(line)
