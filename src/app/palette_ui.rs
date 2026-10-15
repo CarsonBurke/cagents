@@ -208,7 +208,10 @@ impl Cagents {
             .iter()
             .filter(|descriptor| descriptor.action != Command::CommandPalette)
             .filter(|descriptor| descriptor.scope.applies_to(self.focused_pane()))
-            .filter(|descriptor| descriptor.action != Command::SearchInProject || self.project_content_search_available())
+            .filter(|descriptor| {
+                descriptor.action != Command::SearchInProject
+                    || self.project_content_search_available()
+            })
             .map(|descriptor| {
                 (
                     descriptor.label.to_owned(),
@@ -372,7 +375,9 @@ impl Cagents {
                 .map_or_else(Task::none, |message| self.update(message)),
             Command::FocusProjectSearch => self.update(Message::FocusProjectSearch),
             Command::SearchInProject => {
-                if !self.project_content_search_available() { return Task::none(); }
+                if !self.project_content_search_available() {
+                    return Task::none();
+                }
                 self.update(Message::SelectContextTab(ContextTab::Search))
             }
             Command::FindInPane => {
@@ -651,25 +656,42 @@ mod tests {
     fn project_content_search_palette_command_requires_a_selected_root_and_opens_search() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         assert!(!app.project_content_search_available());
-        assert!(!app.palette_entries().iter().any(|(_, _, message)|
-            matches!(message, Message::RunCommand(Command::SearchInProject))));
+        assert!(
+            !app.palette_entries().iter().any(|(_, _, message)| matches!(
+                message,
+                Message::RunCommand(Command::SearchInProject)
+            ))
+        );
         let before = app.context_tab;
         drop(app.update(Message::RunCommand(Command::SearchInProject)));
         assert_eq!(app.context_tab, before);
         app.sidebar_model = sidebar::tests::panel_model();
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         let root = app.sidebar_state.active_worktree().unwrap().clone();
-        let (_, hint, command) = app.palette_entries().into_iter().find(|(_, _, message)|
-            matches!(message, Message::RunCommand(Command::SearchInProject))).unwrap();
+        let (_, hint, command) = app
+            .palette_entries()
+            .into_iter()
+            .find(|(_, _, message)| {
+                matches!(message, Message::RunCommand(Command::SearchInProject))
+            })
+            .unwrap();
         assert_eq!(hint, "Ctrl+Alt+F");
         drop(app.update(command));
         assert_eq!(app.context_tab, ContextTab::Search);
         assert!(app.context_inspector_open);
         assert_eq!(app.sidebar_state.active_worktree(), Some(&root));
-        let SettingsDecision::Persist(edited) = settings_update(&app.settings,
-            SettingsField::ShortcutSearchInProject, "Ctrl+Alt+J") else { panic!("new field must accept a free chord"); };
+        let SettingsDecision::Persist(edited) = settings_update(
+            &app.settings,
+            SettingsField::ShortcutSearchInProject,
+            "Ctrl+Alt+J",
+        ) else {
+            panic!("new field must accept a free chord");
+        };
         assert_eq!(edited.keyboard_shortcuts.search_in_project, ["Ctrl+Alt+J"]);
-        assert_eq!(edited.keyboard_shortcuts.search_projects, app.settings.keyboard_shortcuts.search_projects);
+        assert_eq!(
+            edited.keyboard_shortcuts.search_projects,
+            app.settings.keyboard_shortcuts.search_projects
+        );
     }
 
     /// Run a real scroll operation against the retained native widget tree.

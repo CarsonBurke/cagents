@@ -3478,7 +3478,10 @@ next_column = ["Alt+W", "Alt+Right"]
         let mut settings = AppSettings::default();
         settings.keyboard_shortcuts.new_terminal = vec!["Ctrl+Alt+F".into()];
         let mut document = toml::Table::try_from(settings).unwrap();
-        document["keyboard_shortcuts"].as_table_mut().unwrap().remove("search_in_project");
+        document["keyboard_shortcuts"]
+            .as_table_mut()
+            .unwrap()
+            .remove("search_in_project");
         fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.keyboard_shortcuts.new_terminal, ["Ctrl+Alt+F"]);

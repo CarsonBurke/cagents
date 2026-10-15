@@ -3032,16 +3032,47 @@ mod tests {
     fn project_content_search_uses_its_own_configurable_chord() {
         use keyboard::key::Code;
         let mut shortcuts = KeyboardShortcuts::default();
-        let old = key_press("F", Code::KeyF, keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT, false);
-        assert_eq!(global_shortcut(&old, &shortcuts, FocusedPane::Terminal), Some(GlobalShortcut::SearchInProject));
-        assert_eq!(global_shortcut(&key_press("F", Code::KeyF,
-            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, false), &shortcuts, FocusedPane::Terminal),
-            Some(GlobalShortcut::FocusProjectSearch));
+        let old = key_press(
+            "F",
+            Code::KeyF,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            false,
+        );
+        assert_eq!(
+            global_shortcut(&old, &shortcuts, FocusedPane::Terminal),
+            Some(GlobalShortcut::SearchInProject)
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press(
+                    "F",
+                    Code::KeyF,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                    false
+                ),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            Some(GlobalShortcut::FocusProjectSearch)
+        );
         shortcuts.search_in_project = vec!["Ctrl+Alt+J".into()];
-        assert_eq!(global_shortcut(&old, &shortcuts, FocusedPane::Terminal), None);
-        assert_eq!(global_shortcut(&key_press("J", Code::KeyJ,
-            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT, false), &shortcuts, FocusedPane::Terminal),
-            Some(GlobalShortcut::SearchInProject));
+        assert_eq!(
+            global_shortcut(&old, &shortcuts, FocusedPane::Terminal),
+            None
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press(
+                    "J",
+                    Code::KeyJ,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+                    false
+                ),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            Some(GlobalShortcut::SearchInProject)
+        );
     }
 
     #[test]
