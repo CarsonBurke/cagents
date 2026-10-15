@@ -4934,6 +4934,7 @@ mod tests {
                 chat_id,
                 state,
                 generation: 1,
+                outcome: None,
             };
             let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             write_frame(

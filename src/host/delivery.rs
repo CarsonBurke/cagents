@@ -507,6 +507,7 @@ mod tests {
                 chat_id,
                 state,
                 generation,
+                outcome: None,
             };
             queue.push(envelope.clone()).unwrap();
         }
