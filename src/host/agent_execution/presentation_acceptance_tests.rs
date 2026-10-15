@@ -83,7 +83,8 @@ fn owning_close_isolated(name: &str) -> Option<tempfile::TempDir> {
         .env("TMPDIR", root.join("tmp")).env("XDG_RUNTIME_DIR", root.join("run"))
         .env("PATH", format!("{}:/usr/bin:/bin", root.join("bin").display()))
         .stdin(Stdio::null()).stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
-    if name == "combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflict" {
+    if name == "combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflict"
+        || name.starts_with("retained_close_") {
         command.env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1");
     }
     // SAFETY: only async-signal-safe setrlimit calls run between fork and exec;

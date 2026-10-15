@@ -3293,3 +3293,6 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
 
 // Owning native-holder/Codex presentation-close acceptance contracts.
 include!("presentation_acceptance_tests.rs");
+
+// Actual retained backend lifecycle/receipt scheduling contracts.
+include!("retained_close_race_tests.rs");
