@@ -60,7 +60,8 @@ impl CheckoutGit for LocalGit<'_> {
         RepositoryService::system("git").list_worktrees(self.repository, self.cancellation).map_err(|error| error.to_string())
     }
     fn add_remote(&self, name: &str, url: &str) -> Result<(), String> {
-        let command = CommandSpec::new("git").args(["remote", "add", name, url]).cwd(self.repository).env("GIT_TERMINAL_PROMPT", "0");
+        let command = CommandSpec::new("git").args(["-c", "core.fsmonitor=false", "remote", "add", name, url]).cwd(self.repository).env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").env_remove("GIT_COMMON_DIR");
         let output = SystemProcessExecutor.execute(&command, self.cancellation).map_err(|error| error.to_string())?;
         output.require_success(Path::new("git")).map(|_| ()).map_err(|error| error.to_string())
     }

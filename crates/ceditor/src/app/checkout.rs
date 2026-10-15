@@ -153,7 +153,7 @@ impl Editor {
                 if let Some(dialog) = self
                     .checkout_dialog
                     .as_mut()
-                    .filter(|d| !d.busy() && d.request.is_none())
+                    .filter(|d| !d.busy() && d.request.is_none() && d.target.pull_request.is_none())
                 {
                     dialog.branch = value;
                     dialog.error = None;
@@ -429,7 +429,7 @@ impl Editor {
                 &dialog.destination,
             );
             if !dialog.busy() {
-                branch = branch.on_input(|v| Message::Checkout(Action::Branch(v)));
+                if dialog.target.pull_request.is_none() { branch = branch.on_input(|v| Message::Checkout(Action::Branch(v))); }
                 destination = destination.on_input(|v| Message::Checkout(Action::Destination(v)));
             }
             body.push(branch.into());

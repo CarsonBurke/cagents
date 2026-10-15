@@ -224,7 +224,7 @@ impl WorktreeDialog {
     /// Edits a field. An error about that field no longer describes it; one
     /// about another field, or about the request as a whole, still does.
     pub fn edit(&mut self, field: WorktreeField, value: String) {
-        if self.resolving.is_some() {
+        if self.resolving.is_some() || (self.checkout_notice.is_some() && matches!(field, WorktreeField::Branch | WorktreeField::Base)) {
             return;
         }
         *match field {
@@ -459,7 +459,7 @@ impl Cagents {
             let mut input = crate::ui_controls::field::text(placeholder, value)
                 .id(field.focus_id())
                 .on_submit(|_| Message::SubmitWorktree);
-            if editable {
+            if editable && !(dialog.checkout_notice.is_some() && matches!(field, WorktreeField::Branch | WorktreeField::Base)) {
                 input = input.on_input(on_input);
             }
             if let Some(error) = field_error(field) {
