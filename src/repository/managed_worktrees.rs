@@ -137,11 +137,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             )
             .into());
         }
+        // The first effective query already said this directory is visible.
+        // A matching earlier line can have been cancelled by a later negation.
+        // If our exact rule is already last, a higher-precedence .gitignore is
+        // overriding it; preserve that file and refuse instead of adding copies.
         if bytes
             .split(|byte| *byte == b'\n')
-            .any(|line| line == pattern)
+            .rfind(|line| !line.is_empty())
+            == Some(pattern.as_slice())
         {
-            return Ok(());
+            return Err(ValidationError::Io(
+                "A higher-priority Git ignore rule keeps the managed directory visible; update that rule before creating the worktree".into(),
+            ).into());
         }
         if !bytes.is_empty() && !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
@@ -164,6 +171,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         lock.active = false;
         fs_safety::sync_directory(&lock.parent)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let effective = self.run(&check, cancellation)?;
+        if !effective.success {
+            if effective.exit_code != Some(1) {
+                return Err(git_failure(&check, effective).into());
+            }
+            return Err(ValidationError::Io(
+                "A higher-priority Git ignore rule keeps the managed directory visible; update that rule before creating the worktree".into(),
+            ).into());
+        }
         Ok(())
     }
 
@@ -389,6 +405,43 @@ mod tests {
     }
 
     #[test]
+    fn effective_ignore_repairs_later_exclude_negation_and_preserves_tracked_rules() {
+        if isolated_git_test(concat!(
+            module_path!(),
+            "::effective_ignore_repairs_later_exclude_negation_and_preserves_tracked_rules"
+        )) {
+            return;
+        }
+        let (_directory, root) = fixture();
+        fs::create_dir_all(root.join(".git/info")).unwrap();
+        let exclude = root.join(".git/info/exclude");
+        let original = b"/.worktrees/\n!/.worktrees/\n";
+        fs::write(&exclude, original).unwrap();
+        let service = RepositoryService::system("git");
+        let cancel = CancellationToken::new();
+        service
+            .ensure_managed_directory_ignored(&root, &root.join(".worktrees"), &cancel)
+            .unwrap();
+        let repaired = fs::read(&exclude).unwrap();
+        assert!(repaired.starts_with(original));
+        assert!(repaired.ends_with(b"!/.worktrees/\n/.worktrees/\n"));
+        service
+            .ensure_managed_directory_ignored(&root, &root.join(".worktrees"), &cancel)
+            .unwrap();
+        assert_eq!(fs::read(&exclude).unwrap(), repaired);
+        let tracked_rule = b"!/.worktrees/\n";
+        fs::write(root.join(".gitignore"), tracked_rule).unwrap();
+        git(&root, &["add", ".gitignore"]);
+        assert!(
+            service
+                .ensure_managed_directory_ignored(&root, &root.join(".worktrees"), &cancel)
+                .is_err()
+        );
+        assert_eq!(fs::read(&exclude).unwrap(), repaired);
+        assert_eq!(fs::read(root.join(".gitignore")).unwrap(), tracked_rule);
+    }
+
+    #[test]
     fn separate_git_directory_excludes_the_actual_primary_checkout() {
         if isolated_git_test(concat!(
             module_path!(),
@@ -511,6 +564,146 @@ mod tests {
         assert_eq!(
             rules.lines().filter(|line| *line == "/worktrees/").count(),
             1
+        );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn journaled_overrides_ignore_only_the_destination_and_preserve_legacy_requests() {
+        if isolated_git_test(concat!(
+            module_path!(),
+            "::journaled_overrides_ignore_only_the_destination_and_preserve_legacy_requests"
+        )) {
+            return;
+        }
+        let (directory, root) = fixture();
+        let service = RepositoryService::system("git");
+        let cancel = CancellationToken::new();
+        let store = StateStore::open(
+            directory.path().join("journal.sqlite3"),
+            crate::model::BootId::new("override-test"),
+        )
+        .unwrap();
+        fs::create_dir(root.join("shared")).unwrap();
+        fs::write(root.join("shared/keep"), b"unrelated data").unwrap();
+        for (branch, destination) in [
+            ("direct", "custom"),
+            ("nested", "shared/chosen"),
+            ("legacy", "shared/legacy"),
+        ] {
+            let mut request = service
+                .resolve_worktree_request(
+                    &WorktreeInput {
+                        repository: root.clone(),
+                        input: branch.into(),
+                        base: String::new(),
+                        managed_directory: String::new(),
+                        destination: destination.into(),
+                        operation_id: OperationId::new(),
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(
+                request.managed_ignore_root.as_ref(),
+                Some(&request.destination)
+            );
+            if branch == "legacy" {
+                let mut old = serde_json::to_value(&request).unwrap();
+                old.as_object_mut().unwrap().remove("managed_ignore_root");
+                request = serde_json::from_value(old.clone()).unwrap();
+                assert!(request.managed_ignore_root.is_none());
+                assert_eq!(serde_json::to_value(&request).unwrap(), old);
+            }
+            let (send, _recv) = async_channel::bounded(8);
+            let report = service.create_worktree_journaled(&store, &request, 1, &cancel, &send);
+            assert!(
+                matches!(
+                    report.outcome,
+                    Some(WorktreeCreationOutcome::Created { .. })
+                ),
+                "{report:?}"
+            );
+        }
+        let rules = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+        assert_eq!(rules, "/custom/\n/shared/chosen/\n/shared/legacy/\n");
+        assert_eq!(
+            git(&root, &["status", "--porcelain", "-uall"]),
+            b"?? shared/keep\n"
+        );
+        assert_eq!(
+            fs::read(root.join("shared/keep")).unwrap(),
+            b"unrelated data"
+        );
+        let restored = service.rehydrate_worktree_operations(&store).unwrap();
+        assert_eq!(restored.len(), 3);
+        assert!(
+            restored
+                .iter()
+                .all(|report| report.state == WorktreeOperationState::Created)
+        );
+        assert!(restored.iter().any(|report| {
+            report.request.as_ref().is_some_and(|request| {
+                request.branch.as_str() == "legacy" && request.managed_ignore_root.is_none()
+            })
+        }));
+        assert_eq!(
+            fs::read_to_string(root.join(".git/info/exclude")).unwrap(),
+            rules
+        );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn journaled_creation_refuses_effectively_unignored_destination() {
+        if isolated_git_test(concat!(
+            module_path!(),
+            "::journaled_creation_refuses_effectively_unignored_destination"
+        )) {
+            return;
+        }
+        let (directory, root) = fixture();
+        let service = RepositoryService::system("git");
+        let cancel = CancellationToken::new();
+        let store = StateStore::open(
+            directory.path().join("journal.sqlite3"),
+            crate::model::BootId::new("conflict-test"),
+        )
+        .unwrap();
+        fs::write(root.join(".gitignore"), b"!/.worktrees/\n").unwrap();
+        let request = service
+            .resolve_worktree_request(
+                &WorktreeInput {
+                    repository: root.clone(),
+                    input: "conflict".into(),
+                    base: String::new(),
+                    managed_directory: String::new(),
+                    destination: String::new(),
+                    operation_id: OperationId::new(),
+                },
+                &cancel,
+            )
+            .unwrap();
+        let (send, _recv) = async_channel::bounded(8);
+        let report = service.create_worktree_journaled(&store, &request, 1, &cancel, &send);
+        assert!(
+            !matches!(
+                report.outcome,
+                Some(WorktreeCreationOutcome::Created { .. })
+            ),
+            "{report:?}"
+        );
+        assert!(report.detail.contains("higher-priority"), "{report:?}");
+        assert!(!request.destination.exists());
+        assert!(
+            service
+                .resolve_optional_revision(&root, "refs/heads/conflict", &cancel)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fs::read(root.join(".gitignore")).unwrap(),
+            b"!/.worktrees/\n"
         );
     }
 }

@@ -979,6 +979,20 @@ mod tests {
         assert!(
             matches!(invoke(GitOperation::Diff {staged:false}).unwrap(),Reply::Text(text) if text.contains("+changed"))
         );
+        std::fs::write(root.join(".gitignore"), "!/.worktrees/\n").unwrap();
+        assert!(
+            invoke(GitOperation::CreateWorktree {
+                name: "conflict".into(),
+                branch: "feature/conflict".into(),
+            })
+            .is_err()
+        );
+        assert!(!root.join(".worktrees/conflict").exists());
+        assert_eq!(
+            std::fs::read(root.join(".gitignore")).unwrap(),
+            b"!/.worktrees/\n"
+        );
+        std::fs::remove_file(root.join(".gitignore")).unwrap();
         invoke(GitOperation::CreateWorktree {
             name: "dev".into(),
             branch: "feature/dev".into(),

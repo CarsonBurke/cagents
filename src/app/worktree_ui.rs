@@ -2345,6 +2345,7 @@ mod tests {
             setup_intent: None,
             repository: repository.clone(),
             managed_root: repository.join("worktrees"),
+            managed_ignore_root: None,
             destination: destination.clone(),
             branch: crate::repository::ValidatedBranchName::parse("zulu-new").unwrap(),
             base: crate::repository::BaseRevision::LocalBranch(

@@ -87,6 +87,10 @@ keeps existing rules and skips the write when Git already ignores the directory
 or the managed location is outside the primary checkout. Tracked `.gitignore`
 is unchanged.
 
+A destination override excludes only that exact checkout, so other files in a
+shared parent remain visible. If a higher-priority `.gitignore` rule explicitly
+keeps the destination visible, creation stops and asks you to adjust that rule.
+
 Existing registered worktrees under the old `worktrees/` directory stay in
 place. The next worktree creation excludes that legacy directory too; changing
 the default does not move or delete existing worktrees.
