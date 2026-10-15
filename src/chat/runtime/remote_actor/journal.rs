@@ -54,6 +54,7 @@ impl Journal {
         let db = Connection::open(path).map_err(|error| error.to_string())?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
             CREATE TABLE outcomes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,payload BLOB NOT NULL);
+            CREATE TABLE retained_runs(run TEXT PRIMARY KEY,finished INTEGER);
             CREATE TABLE inputs(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,hash BLOB NOT NULL,state BLOB NOT NULL);
             CREATE TABLE metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL);
             INSERT INTO metadata VALUES('input_sequence','0'),('outcome_ack','0');")
@@ -85,8 +86,14 @@ impl Journal {
             self.record_loss(reason)?;
             return Err(reason.into());
         }
-        self.db.execute("INSERT INTO outcomes(payload) VALUES(?1)",[bytes]).map_err(|error|error.to_string())?;
-        Ok(())
+        if let Update::Execution {run,..}=update {self.check_run_capacity(*run)?;}
+        let tx=self.db.transaction().map_err(|error|error.to_string())?;
+        tx.execute("INSERT INTO outcomes(payload) VALUES(?1)",[bytes]).map_err(|error|error.to_string())?;
+        if let Update::Execution {run,update}=update {
+            let finished=matches!(update,crate::agent_execution::Update::Finished{..}).then(||tx.last_insert_rowid());
+            tx.execute("INSERT INTO retained_runs(run,finished) VALUES(?1,?2) ON CONFLICT(run) DO UPDATE SET finished=COALESCE(excluded.finished,retained_runs.finished)",params![run.to_string(),finished]).map_err(|error|error.to_string())?;
+        }
+        tx.commit().map_err(|error|error.to_string())
     }
     pub fn page(&self, after:u64) -> Result<Vec<OutboxEntry>,String> {
         let ack=self.number("outcome_ack")?;
@@ -115,6 +122,7 @@ impl Journal {
             .map_err(|error|error.to_string())?;
         if through>latest { return Err("Outcome acknowledgement exceeds the published sequence".into()); }
         let tx=self.db.transaction().map_err(|error|error.to_string())?;
+        tx.execute("DELETE FROM retained_runs WHERE finished IS NOT NULL AND finished<=?1",[through]).map_err(|error|error.to_string())?;
         tx.execute("DELETE FROM outcomes WHERE sequence<=?1",[through]).map_err(|error|error.to_string())?;
         tx.execute("UPDATE metadata SET value=?1 WHERE key='outcome_ack'",[through.to_string()]).map_err(|error|error.to_string())?;
         tx.commit().map_err(|error|error.to_string())
@@ -129,7 +137,20 @@ impl Journal {
         if identity.sequence<=self.number("input_sequence")? { return Err("Input receipt is retired or unavailable; never replay this command".into()); }
         Ok(None)
     }
-    pub fn admit(&mut self,identity:&InputIdentity) -> Result<InputReceipt,String> {
+    fn check_run_capacity(&self,run:crate::model::RunId)->Result<(),String> {
+        let (count,exists):(usize,bool)=self.db.query_row("SELECT COUNT(*),EXISTS(SELECT 1 FROM retained_runs WHERE run=?1) FROM retained_runs",[run.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|error|error.to_string())?;
+        if count>=MAX_ENTRIES && !exists {return Err("Retained actor run identity capacity reached; outcome continuity is unconfirmed".into());}Ok(())
+    }
+    pub fn retained_runs(&self)->Result<Vec<crate::model::RunId>,String> {
+        let mut query=self.db.prepare("SELECT run FROM retained_runs ORDER BY run").map_err(|error|error.to_string())?;
+        let rows=query.query_map([],|row|row.get::<_,String>(0)).map_err(|error|error.to_string())?;
+        rows.map(|row|row.map_err(|error|error.to_string())?.parse().map_err(|_|"Invalid retained run identity".to_owned())).collect()
+    }
+    pub fn refuse_unexecuted_run(&mut self,run:crate::model::RunId)->Result<(),String> {
+        self.db.execute("DELETE FROM retained_runs WHERE run=?1",[run.to_string()]).map_err(|error|error.to_string())?;Ok(())
+    }
+    pub fn admit(&mut self,identity:&InputIdentity) -> Result<InputReceipt,String> {self.admit_with_run(identity,None)}
+    pub fn admit_with_run(&mut self,identity:&InputIdentity,run:Option<crate::model::RunId>) -> Result<InputReceipt,String> {
         if let Some(receipt)=self.input(identity)? { return Ok(receipt); }
         if self.loss()?.is_some() { return Err("Actor outcome continuity is unconfirmed; new input is refused".into()); }
         if identity.sequence!=self.number("input_sequence")?.checked_add(1).ok_or("Input sequence exhausted")? {
@@ -137,9 +158,11 @@ impl Journal {
         }
         let count:usize=self.db.query_row("SELECT COUNT(*) FROM inputs",[],|row|row.get(0)).map_err(|error|error.to_string())?;
         if count>=MAX_INPUTS { return Err("Actor input receipt capacity reached; commit completed receipts before sending more".into()); }
+        if let Some(run)=run {self.check_run_capacity(run)?;}
         let state=InputState::Accepted;
         let tx=self.db.transaction().map_err(|error|error.to_string())?;
         tx.execute("INSERT INTO inputs(sequence,id,hash,state) VALUES(?1,?2,?3,?4)",params![identity.sequence,identity.id.to_string(),identity.hash.as_slice(),serde_json::to_vec(&state).map_err(|error|error.to_string())?]).map_err(|error|error.to_string())?;
+        if let Some(run)=run {tx.execute("INSERT OR IGNORE INTO retained_runs(run,finished) VALUES(?1,NULL)",[run.to_string()]).map_err(|error|error.to_string())?;}
         tx.execute("UPDATE metadata SET value=?1 WHERE key='input_sequence'",[identity.sequence.to_string()]).map_err(|error|error.to_string())?;
         tx.commit().map_err(|error|error.to_string())?;
         Ok(InputReceipt {identity:identity.clone(),state})
@@ -175,6 +198,21 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepted_run_survives_input_ack_and_finished_delivery_until_durable_outcome_ack() {
+        let dir=tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal=Journal::with_budget(dir.path(),4096).unwrap();
+        let run=crate::model::RunId::new();
+        let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:[7;32]};
+        journal.admit_with_run(&identity,Some(run)).unwrap();
+        assert_eq!(journal.retained_runs().unwrap(),vec![run]);
+        journal.finish(&identity,InputState::Acknowledged(Ok(()))).unwrap();journal.retire_inputs(1).unwrap();
+        journal.append(&Update::Execution {run,update:crate::agent_execution::Update::Started {provider_key:"turn".into()}}).unwrap();
+        journal.ack(1).unwrap();assert_eq!(journal.retained_runs().unwrap(),vec![run]);
+        journal.append(&Update::Execution {run,update:crate::agent_execution::Update::Finished {state:crate::agent_execution::State::Succeeded,result:Default::default()}}).unwrap();
+        assert_eq!(journal.retained_runs().unwrap(),vec![run],"delivery to a proxy is not a durable registry ACK");
+        journal.ack(2).unwrap();assert!(journal.retained_runs().unwrap().is_empty());
+    }
     #[test]
     fn receipts_never_readmit_duplicate_or_retired_inputs() {
         let dir=tempfile::tempdir_in("/var/tmp").unwrap();

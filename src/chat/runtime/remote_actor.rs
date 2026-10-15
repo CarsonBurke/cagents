@@ -47,6 +47,7 @@ pub(crate) struct Resident {
     pub interrupt_subagents:Vec<String>,
     pub account_reports:Vec<Update>,
     next_input:u64,
+    pub retained_runs:Vec<crate::model::RunId>,
     pub outbox_ack:u64,
     pub outbox_latest:u64,
     changed:u64,
@@ -139,7 +140,7 @@ impl RemoteActor {
         use crate::model::{BootId,HostSessionId,HostIncarnation,TerminalId};
         let process=Process::read(std::process::id() as i32).unwrap();
         let boot=BootId::new("fixture-boot");
-        let resident=Resident {generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,installed:true,close:super::CloseObservation {actor_id:uuid::Uuid::new_v4(),close_revision:0,turn_generation:0,activity:crate::agent::ActivityState::Idle,ready:true,exited:false,completed:false,closing:false,owns_work:true,working_directory:PathBuf::from("/var/tmp")},idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,outbox_ack:0,outbox_latest:0,changed:1};
+        let resident=Resident {generation:1,session_id:None,title:None,ready:true,busy:false,waiting:false,working:false,activity:crate::agent::ActivityState::Idle,outcome:None,usage:Default::default(),native_continuity:Default::default(),requests:Vec::new(),completed:false,owns_work:true,installed:true,close:super::CloseObservation {actor_id:uuid::Uuid::new_v4(),close_revision:0,turn_generation:0,activity:crate::agent::ActivityState::Idle,ready:true,exited:false,completed:false,closing:false,owns_work:true,working_directory:PathBuf::from("/var/tmp")},idle:true,failure:None,confirmed_session:None,background_subagents:Vec::new(),interrupt_subagents:Vec::new(),account_reports:Vec::new(),next_input:1,retained_runs:Vec::new(),outbox_ack:0,outbox_latest:0,changed:1};
         Self(Arc::new(Remote {identity:ActorIdentity {instance:uuid::Uuid::new_v4(),record:Record {version:4,build:Some(registry::BuildIdentity::current(Kind::Native)),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot:boot.clone(),terminal:TerminalId::new(),holder:process.clone(),root:process}},epoch:uuid::Uuid::new_v4(),proof:HostSessionProof {boot_id:boot,host_session_id:HostSessionId::new("fixture"),host_incarnation:HostIncarnation::new("fixture")},socket:PathBuf::from("/nonexistent/cagents-actor-fixture"),state:Mutex::new(Arc::new(resident)),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:Default::default(),desired_visible:Mutex::new(None),desired_observe:AtomicBool::new(false),input_sequence:Mutex::new(1),uncertain_input:Mutex::new(None),pending:Mutex::new(Vec::new()),notify:Arc::new(|_|{}),stop:AtomicBool::new(false),installed:AtomicBool::new(true),preserved:AtomicBool::new(false),worker:Mutex::new(None),startup:Mutex::new(None)}))
     }
     #[cfg(test)]
@@ -493,7 +494,7 @@ impl Server {
         drop(state);
         let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
         let failure=journal.loss()?.or_else(||self.actor.failure());
-        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},close:self.actor.close_observation(),installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,outbox_ack:journal.acknowledged()?,outbox_latest:journal.latest()?,changed:self.revision()})
+        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},close:self.actor.close_observation(),installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,retained_runs:journal.retained_runs()?,outbox_ack:journal.acknowledged()?,outbox_latest:journal.latest()?,changed:self.revision()})
     }
 
     fn published_sources(&self)->Vec<chat::Session> {
@@ -533,7 +534,7 @@ impl Server {
             "state"=>{let (after,)=decode!((u64,));if after==self.revision() {Ok(Value::Null)}else {value!(Some(self.resident()?))}},
             "outbox_unacked"=>{let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());value!(journal.page(journal.acknowledged()?)?)},
             "outbox"=>{let (after,)=decode!((u64,));value!(self.journal.lock().unwrap_or_else(|p|p.into_inner()).page(after)?)},
-            "ack_outbox"=>{let (through,)=decode!((u64,));self.journal.lock().unwrap_or_else(|p|p.into_inner()).ack(through)?;Ok(Value::Null)},
+            "ack_outbox"=>{let (through,)=decode!((u64,));self.journal.lock().unwrap_or_else(|p|p.into_inner()).ack(through)?;self.changed.fetch_add(1,Ordering::Release);Ok(Value::Null)},
             "input_receipt"=>{let (identity,)=decode!((InputIdentity,));value!(self.journal.lock().unwrap_or_else(|p|p.into_inner()).input(&identity)?)},
             "input_receipts"=>{let (identities,)=decode!((Vec<InputIdentity>,));if identities.len()>65 {return Err("Input receipt batch exceeds capacity".into());}let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());let mut receipts=Vec::new();for identity in identities {if let Some(receipt)=journal.input(&identity)? {receipts.push(receipt);}}value!(receipts)},
             "ack_inputs"=>{let (through,)=decode!((u64,));self.journal.lock().unwrap_or_else(|p|p.into_inner()).retire_inputs(through)?;Ok(Value::Null)},
@@ -545,8 +546,10 @@ impl Server {
                 if let Some(receipt)=journal.input(&identity)? {return value!(receipt);}
                 if self.pending.len()>=65 {return Err("Retained actor input completion capacity reached".into());}
                 let command=match serde_json::from_value::<InputPayload>(payload).map_err(|error|error.to_string())? {InputPayload::Command {run,command}=>super::ActorCommand::Provider {run,command},InputPayload::Interrupt {run,including_subagents}=>super::ActorCommand::Interrupt {run,including_subagents}};
-                let receipt=journal.admit(&identity)?;
-                match self.actor.enqueue_actor(command) {Ok(reply)=>self.pending.push((identity,reply)),Err(error)=>{journal.finish(&identity,InputState::Acknowledged(Err(error)))?;}}
+                let run=match &command {super::ActorCommand::Provider {run,..}=>*run,_=>None};
+                let receipt=journal.admit_with_run(&identity,run)?;
+                self.changed.fetch_add(1,Ordering::Release);
+                match self.actor.enqueue_actor(command) {Ok(reply)=>self.pending.push((identity,reply)),Err(error)=>{journal.finish(&identity,InputState::Acknowledged(Err(error)))?;if let Some(run)=run {journal.refuse_unexecuted_run(run)?;}}}
                 value!(receipt)
             },
             "snapshot"=>{let (after,)=decode!((Option<u64>,));value!(self.actor.snapshot(after))},
