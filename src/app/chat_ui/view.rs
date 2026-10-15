@@ -5301,12 +5301,26 @@ mod tests {
     }
 
     #[test]
-    fn attention_historical_observation_loss_reprojects_and_survives_ui_reattach_without_settling_b() {
+    fn attention_historical_observation_loss_reprojects_and_survives_ui_reattach_without_settling_b()
+     {
         use chat::turn_outcomes::TurnOutcomeProjection;
-        let item = |id: &str, role| chat::Item { id: id.into(), role, started_at: None, at: Some(1000),
-            content: ItemContent::Text { text: id.into(), thinking: false, phase: chat::Phase::Final } };
-        let items = [item("input-A1", chat::Role::User), item("answer-A", chat::Role::Assistant),
-            item("input-B", chat::Role::User), item("answer-B", chat::Role::Assistant)];
+        let item = |id: &str, role| chat::Item {
+            id: id.into(),
+            role,
+            started_at: None,
+            at: Some(1000),
+            content: ItemContent::Text {
+                text: id.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        };
+        let items = [
+            item("input-A1", chat::Role::User),
+            item("answer-A", chat::Role::Assistant),
+            item("input-B", chat::Role::User),
+            item("answer-B", chat::Role::Assistant),
+        ];
         let (mut runtime, handle) = frame_cost::live_runtime(&items);
         let mut snapshot = (*runtime.snapshot).clone();
         snapshot.session_id = Some("native-session".into());
@@ -5316,23 +5330,48 @@ mod tests {
         handle.replace_snapshot_for_test(snapshot.clone());
         runtime.refresh();
         assert_eq!(runtime.turns.len(), 2);
-        let before = runtime.turns.iter().map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000))).collect::<Vec<_>>();
+        let before = runtime
+            .turns
+            .iter()
+            .map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000)))
+            .collect::<Vec<_>>();
         snapshot.generation += 1;
-        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection { revision: 1, complete: true, records: vec![],
-            losses: vec![outcomes::loss_for_test("native-session", &["input-A1", "input-A2"])] });
+        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection {
+            revision: 1,
+            complete: true,
+            records: vec![],
+            losses: vec![outcomes::loss_for_test(
+                "native-session",
+                &["input-A1", "input-A2"],
+            )],
+        });
         let source = snapshot.turn_outcomes.clone();
         let original_items = snapshot.items.clone();
         handle.replace_snapshot_for_test(snapshot.clone());
         runtime.refresh();
-        assert_eq!(runtime.turn_outcome_markers["input-A1"].tone, outcomes::Tone::ObservationEnded);
+        assert_eq!(
+            runtime.turn_outcome_markers["input-A1"].tone,
+            outcomes::Tone::ObservationEnded
+        );
         assert!(!runtime.turn_outcome_markers.contains_key("input-B"));
         assert!(runtime.snapshot.busy);
         assert_eq!(runtime.snapshot.turn_generation, 2);
         assert!(runtime.snapshot.outcome.is_none());
         assert_eq!(runtime.conversation_status(false).1, "Responding");
-        assert!(runtime.snapshot.items.iter().zip(&original_items).all(|(shown, original)| Arc::ptr_eq(shown, original)),
-            "historical observation evidence does not rewrite any native item/body/status");
-        let after = runtime.turns.iter().map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000))).collect::<Vec<_>>();
+        assert!(
+            runtime
+                .snapshot
+                .items
+                .iter()
+                .zip(&original_items)
+                .all(|(shown, original)| Arc::ptr_eq(shown, original)),
+            "historical observation evidence does not rewrite any native item/body/status"
+        );
+        let after = runtime
+            .turns
+            .iter()
+            .map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000)))
+            .collect::<Vec<_>>();
         assert_ne!(before[0], after[0]);
         assert_eq!(before[1], after[1], "current B retains its existing row");
 
@@ -5344,12 +5383,18 @@ mod tests {
         runtime.refresh();
         assert!(Arc::ptr_eq(&source, &runtime.snapshot.turn_outcomes));
         assert!(!runtime.turn_outcome_markers.contains_key("input-A1"));
-        assert_eq!(runtime.turn_outcome_markers["input-A2"].tone, outcomes::Tone::ObservationEnded);
+        assert_eq!(
+            runtime.turn_outcome_markers["input-A2"].tone,
+            outcomes::Tone::ObservationEnded
+        );
         snapshot.generation += 1;
         snapshot.items[0] = Arc::new(item("input-A2", chat::Role::Assistant));
         handle.replace_snapshot_for_test(snapshot.clone());
         runtime.refresh();
-        assert!(runtime.turn_outcome_markers.is_empty(), "user-input proof never follows a corrected assistant role or nearest B");
+        assert!(
+            runtime.turn_outcome_markers.is_empty(),
+            "user-input proof never follows a corrected assistant role or nearest B"
+        );
         snapshot.generation += 1;
         snapshot.items[0] = Arc::new(item("input-A2", chat::Role::User));
         handle.replace_snapshot_for_test(snapshot.clone());
@@ -5361,12 +5406,15 @@ mod tests {
         runtime.refresh();
         assert!(Arc::ptr_eq(&same_snapshot, &runtime.snapshot));
         assert_eq!(runtime.turn_outcome_markers, expected);
-        let replay: Snapshot = postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
+        let replay: Snapshot =
+            postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
         let (mut reattached, fresh_handle) = frame_cost::live_runtime(&items);
         fresh_handle.replace_snapshot_for_test(replay);
         reattached.refresh();
-        assert_eq!(reattached.turn_outcome_markers, expected,
-            "a fresh UI renders supplied durable proof, not local completion memory");
+        assert_eq!(
+            reattached.turn_outcome_markers, expected,
+            "a fresh UI renders supplied durable proof, not local completion memory"
+        );
         assert!(reattached.snapshot.busy && reattached.snapshot.outcome.is_none());
 
         // The valid durable transition replaces loss with exact native fate
@@ -5374,22 +5422,39 @@ mod tests {
         // does not inherit A's result or lose its retained row.
         let b_before = runtime.turn_fingerprint_at(&runtime.turns[1], false, Some(5000));
         snapshot.generation += 1;
-        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection { revision: 2, complete: true, losses: vec![],
+        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection {
+            revision: 2,
+            complete: true,
+            losses: vec![],
             records: vec![chat::turn_outcomes::VisibleTurnOutcome {
-                outcome: chat::turn_outcomes::TurnOutcome { identity: source.losses[0].accepted.input.clone(),
-                    outcome: crate::agent::ActivityOutcome::Cancelled, finished_at: 3000 },
+                outcome: chat::turn_outcomes::TurnOutcome {
+                    identity: source.losses[0].accepted.input.clone(),
+                    outcome: crate::agent::ActivityOutcome::Cancelled,
+                    finished_at: 3000,
+                },
                 item_ids: vec!["input-A2".into()],
-            }] });
+            }],
+        });
         snapshot.turn_outcomes.validate().unwrap();
         handle.replace_snapshot_for_test(snapshot.clone());
         runtime.refresh();
-        assert_eq!(runtime.turn_outcome_markers["input-A2"].tone, outcomes::Tone::Cancelled);
-        assert_eq!(runtime.turn_fingerprint_at(&runtime.turns[1], false, Some(5000)), b_before);
+        assert_eq!(
+            runtime.turn_outcome_markers["input-A2"].tone,
+            outcomes::Tone::Cancelled
+        );
+        assert_eq!(
+            runtime.turn_fingerprint_at(&runtime.turns[1], false, Some(5000)),
+            b_before
+        );
         assert!(runtime.snapshot.busy && runtime.snapshot.outcome.is_none());
-        let terminal_replay: Snapshot = postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
+        let terminal_replay: Snapshot =
+            postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
         fresh_handle.replace_snapshot_for_test(terminal_replay);
         reattached.refresh();
-        assert_eq!(reattached.turn_outcome_markers["input-A2"].tone, outcomes::Tone::Cancelled);
+        assert_eq!(
+            reattached.turn_outcome_markers["input-A2"].tone,
+            outcomes::Tone::Cancelled
+        );
     }
 
     #[test]
