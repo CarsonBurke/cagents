@@ -444,7 +444,7 @@ mod tests {
             let stopped=match action {
                 "interrupt"=>adapter.command(Command::Interrupt).unwrap(),
                 "close"=>adapter.discard_undispatched().unwrap().unwrap(),
-                _=>adapter.receive(json!({"type":"system","subtype":"session_state_changed","session_id":SESSION,"state":"working"})).unwrap(),
+                _=>adapter.receive(json!({"type":"system","subtype":"session_state_changed","session_id":SESSION,"state":"running"})).unwrap(),
             };
             assert!(stopped.writes.is_empty());
             assert!(stopped.events.iter().all(|event|!matches!(event,Event::Error{..})));

@@ -24,7 +24,7 @@ while True:
   if mode in ('eof','crash'):
    if mode=='crash': print('original-provider-crash',file=sys.stderr,flush=True)
    sys.exit(7 if mode=='crash' else 0)
-  if mode=='native': emit({'type':'system','subtype':'session_state_changed','session_id':session,'state':'working'})
+  if mode=='native': emit({'type':'system','subtype':'session_state_changed','session_id':session,'state':'running'})
   reply(pending,{},mode!='refusal');pending=None;(root/'late-setter-sent').touch()
  if not select.select([0],[],[],0.01)[0]: continue
  block=os.read(0,65536)
@@ -35,7 +35,7 @@ while True:
   if frame.get('type')=='control_request':
    request=frame['request'];subtype=request['subtype']
    if subtype=='initialize':
-    reply(frame,{'claude_code_version':'2.1.289','current_permission_mode':permission,'fast_mode_state':'on' if fast else 'off','session_state':'working' if mode=='native' and users else 'idle'})
+    reply(frame,{'claude_code_version':'2.1.289','current_permission_mode':permission,'fast_mode_state':'on' if fast else 'off','session_state':'running' if mode=='native' and users else 'idle'})
     if not initialized:
      initialized=True;emit({'type':'system','subtype':'init','session_id':session,'model':model,'effort':effort,'permissionMode':permission,'fast_mode_state':'on' if fast else 'off'})
    elif subtype=='get_settings': reply(frame,{'applied':{'model':model,'effort':effort}})
