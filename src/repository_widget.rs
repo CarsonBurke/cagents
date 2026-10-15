@@ -11,7 +11,7 @@ use std::{
 };
 
 #[path = "editor_widget.rs"]
-mod text_editor;
+pub(crate) mod text_editor;
 
 mod diff_layout;
 mod preview;
@@ -8936,7 +8936,7 @@ fn editable_document_view<'a>(
                 crate::ui_controls::field::text("Line or line:column", value)
                     .id(widget::Id::new(format!("repository.{card}.go-to-line")))
                     .on_input(move |value| RepositoryAction::GoToLineChanged { card, value })
-                    .on_submit(RepositoryAction::SubmitGoToLine { card })
+                    .on_submit(move |_| RepositoryAction::SubmitGoToLine { card })
                     .into(),
                 widget::row::with_children(vec![
                     crate::ui_controls::button::secondary("Go")

@@ -1,7 +1,7 @@
 //! Source locations, per-card navigation, and bounded saved-file undo retention.
 use crate::{
     editor_history::History,
-    editor_widget::{Cursor, ScrollPosition},
+    repository_widget::text_editor::{Cursor, ScrollPosition},
 };
 use std::{collections::VecDeque, path::PathBuf};
 
@@ -149,7 +149,7 @@ impl UndoLru {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor_widget::Position;
+    use crate::repository_widget::text_editor::Position;
     fn location(path: &str, line: usize) -> Location {
         Location {
             path: path.into(),
