@@ -3,6 +3,7 @@ use super::*;
 use iced::advanced::text::{Paragraph, Renderer as TextRenderer};
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
+    Renderer as _,
     widget::{Tree, tree},
 };
 use iced::widget::text::{Span, Wrapping};
