@@ -71,6 +71,10 @@ impl State {
         let run = session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID")?.parse().ok()?;
         self.authorized_runs.lock().expect("setup launch authorization lock").remove(&run).then_some(run)
     }
+    pub(super) fn run_snapshot(&self) -> HashMap<PathBuf, OperationId> { self.expected_runs.clone() }
+    pub(super) fn current_run(&self, path: &Path) -> Option<OperationId> { self.expected_runs.get(path).copied() }
+    #[cfg(test)]
+    pub(super) fn recovered_creation(&self, path: &Path) -> Option<OperationId> { self.recovered.get(path).map(|(creation, _)| *creation) }
     pub fn preparing(&self, path: &Path) -> bool { self.pending.contains_key(path) }
     pub fn protected_directories(&self) -> impl Iterator<Item = &PathBuf> { self.pending.keys() }
     pub fn active(&self) -> bool {
@@ -266,7 +270,14 @@ impl Cagents {
     pub(super) fn forget_worktree_setup(&mut self, path: &Path) {
         self.setup_ui.recovered.remove(path); self.setup_ui.statuses.remove(path); self.setup_ui.terminals.remove(path); self.setup_ui.expected_runs.remove(path); self.setup_ui.review_requests.remove(path); self.setup_ui.daemon_receipts.remove(path); self.setup_ui.uncertain_receipts.remove(path);
     }
+    pub(super) fn mark_unverified_worktree_setup(&mut self, path: PathBuf) {
+        if self.setup_ui.pending.contains_key(&path) { return; }
+        self.setup_ui.uncertain_receipts.insert(path.clone());
+        self.setup_ui.statuses.insert(path, WorktreeSetupStatus::Interrupted("The saved setup receipt does not verify this checkout generation. Inspect its current files and configuration before running setup.".into()));
+    }
+
     pub(super) fn recover_worktree_setup(&mut self, creation: OperationId, path: PathBuf, intent: SetupIntent) {
+        self.setup_ui.uncertain_receipts.remove(&path);
         let status = restored_setup_status(&intent);
         if let Some(run) = intent.run_id { self.setup_ui.expected_runs.insert(path.clone(), run); }
         self.setup_ui.recovered.insert(path.clone(), (creation, intent));

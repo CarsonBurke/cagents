@@ -158,6 +158,28 @@ fn stage_order(stage: WorktreeProgressStage) -> u8 {
         WorktreeProgressStage::Finished => 4,
     }
 }
+#[derive(Debug)]
+pub(super) struct Rehydrated {
+    reports: Vec<WorktreeOperationReport>,
+    current_setups: HashSet<OperationId>,
+    observed_runs: HashMap<PathBuf, OperationId>,
+}
+
+fn verified_setup_generations(store: &crate::persistence::StateStore, reports: &[WorktreeOperationReport]) -> HashSet<OperationId> {
+    let service = RepositoryService::system("git"); let token = CancellationToken::new();
+    let mut locations = HashMap::new();
+    reports.iter().filter_map(|report| {
+        let request = report.request.as_ref()?;
+        if report.state != WorktreeOperationState::Created || request.setup_intent.is_none() { return None; }
+        let current = locations.entry(request.destination.clone()).or_insert_with(|| {
+            service.common_dir(&request.destination, &token).ok().zip(service.git_dir(&request.destination, &token).ok())
+        });
+        let (common, admin) = current.as_ref()?;
+        let identity = service.worktree_setup_creation_identity(store, report.operation_id).ok()??;
+        identity.matches_checkout(common, admin).ok()?.then_some(report.operation_id)
+    }).collect()
+}
+
 impl Cagents {
     pub(super) fn has_active_worktree_operations(&self) -> bool {
         self.worktree_operations
@@ -352,10 +374,13 @@ impl Cagents {
             return Task::none();
         };
         let store = session.operation_store();
+        let observed_runs = self.setup_ui.run_snapshot();
         cosmic::task::future(async move {
             Message::WorktreeOperationsRehydrated(
                 tokio::task::spawn_blocking(move || {
-                    RepositoryService::system("git").rehydrate_worktree_operations(&store)
+                    let reports = RepositoryService::system("git").rehydrate_worktree_operations(&store)?;
+                    let current_setups = verified_setup_generations(&store, &reports);
+                    Ok::<_, crate::persistence::StoreError>(Rehydrated { reports, current_setups, observed_runs })
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -365,10 +390,19 @@ impl Cagents {
     }
     pub(super) fn restore_worktree_operations(
         &mut self,
-        result: Result<Vec<WorktreeOperationReport>, String>,
+        result: Result<Rehydrated, String>,
     ) -> Task<Message> {
         match result {
-            Ok(reports) => {
+            Ok(Rehydrated { reports, current_setups, observed_runs }) => {
+                let unchanged = |path: &Path| self.setup_ui.current_run(path) == observed_runs.get(path).copied();
+                let verified_paths = reports.iter().filter(|report| current_setups.contains(&report.operation_id)).filter_map(|report| report.request.as_ref().map(|request| request.destination.clone())).filter(|path| unchanged(path)).collect::<HashSet<_>>();
+                let superseded_paths = reports.iter().filter_map(|report| report.request.as_ref().map(|request| request.destination.clone())).filter(|path| !unchanged(path)).collect::<HashSet<_>>();
+                for report in &reports {
+                    if report.state != WorktreeOperationState::Created { continue; }
+                    let Some(request) = report.request.as_ref().filter(|request| request.setup_intent.is_some()) else { continue; };
+                    let locally_created = self.worktree_operations.values().any(|operation| !operation.restored && operation.request.as_ref().is_some_and(|current| current.destination == request.destination));
+                    if !verified_paths.contains(&request.destination) && !superseded_paths.contains(&request.destination) && !locally_created { self.mark_unverified_worktree_setup(request.destination.clone()); }
+                }
                 for report in reports {
                     if self.worktree_operations.contains_key(&report.operation_id) {
                         continue;
@@ -391,7 +425,8 @@ impl Cagents {
                         continue;
                     };
                     let setup_intent = report.request.as_ref().and_then(|request| request.setup_intent.clone());
-                    if report.state == WorktreeOperationState::Created
+                    if report.state == WorktreeOperationState::Created && current_setups.contains(&report.operation_id)
+                        && report.request.as_ref().is_some_and(|request| verified_paths.contains(&request.destination))
                         && let (Some(intent), Some(WorktreeCreationOutcome::Created { worktree, .. })) = (setup_intent.clone(), &report.outcome)
                     { self.recover_worktree_setup(report.operation_id, worktree.path.clone(), intent); }
                     self.worktree_operations.insert(
@@ -532,13 +567,17 @@ mod tests {
             if state == WorktreeOperationState::ReconcileRequired {
                 assert_eq!(app.worktree_operations[&id].row(&[]).unwrap().0, WorktreeOperationPhase::Failed);
                 assert_eq!(app.worktree_operations[&id].setup_intent, Some(intent));
+            assert_eq!(app.setup_ui.recovered_creation(&path), if superseded { Some(newer) } else { (state == WorktreeOperationState::Created).then_some(id) }, "only the verified nonsuperseded generation is current regardless of imported history order");
             }
         }
     }
 
     #[test]
     fn restored_creation_keeps_setup_intent_without_starting_effects() {
-        for state in [WorktreeOperationState::Created, WorktreeOperationState::ReconcileRequired] {
+        for (state, reverse, superseded) in [
+            (WorktreeOperationState::Created, false, false), (WorktreeOperationState::Created, true, false),
+            (WorktreeOperationState::Created, false, true), (WorktreeOperationState::ReconcileRequired, false, false),
+        ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let project = ProjectId::new();
             let repository = PathBuf::from("/repo");
@@ -558,7 +597,15 @@ mod tests {
                     created_at_unix_ms: Some(1), head_oid: Some("a".repeat(40)), branch: Some("refs/heads/recovered".into()),
                     detached: false, bare: false, lock: Default::default(), prunable_reason: None,
                 }, warnings: vec![] }), detail: "recovered".into(), created_at_unix_ms: 1 };
-            let task = app.restore_worktree_operations(Ok(vec![report]));
+            // Synthetic imported history can retain both Applied generations.
+            // A newer run can also finish while this snapshot is in flight.
+            let newer = OperationId::new();
+            if superseded { let mut current = intent.clone(); current.run_id = Some(newer); app.recover_worktree_setup(newer, path.clone(), current); }
+            let mut old = report.clone(); let old_id = OperationId::new(); old.operation_id = old_id;
+            let old_request = old.request.as_mut().unwrap(); old_request.operation_id = old_id;
+            old_request.setup_intent.as_mut().unwrap().run_id = Some(old_id);
+            let reports = if reverse { vec![report, old] } else { vec![old, report] };
+            let task = app.restore_worktree_operations(Ok(Rehydrated { reports, current_setups: HashSet::from([id]), observed_runs: HashMap::new() }));
             assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
             assert_eq!(app.worktree_operations[&id].setup_intent, Some(intent));
             assert!(!app.setup_ui.active());

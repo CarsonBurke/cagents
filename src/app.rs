@@ -4282,7 +4282,7 @@ pub enum Message {
         generation: u64,
         result: Result<crate::repository::WorktreeOperationReport, String>,
     },
-    WorktreeOperationsRehydrated(Result<Vec<crate::repository::WorktreeOperationReport>, String>),
+    WorktreeOperationsRehydrated(Result<worktree_operations::Rehydrated, String>),
     WorktreeCreated {
         project_id: ProjectId,
         repository: PathBuf,
