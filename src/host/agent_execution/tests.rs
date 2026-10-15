@@ -1184,7 +1184,7 @@ fn combined_close_retains_real_cleanup_receipt_after_late_view_conflict_and_retr
 
 #[test]
 fn combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflict() {
-    if isolated("combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflict").is_some() { return; }
+    if owning_close_isolated("combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflict").is_some() { return; }
     let (host, request, path) = fixture();
     let proof = host.lock().unwrap().proof().clone();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
