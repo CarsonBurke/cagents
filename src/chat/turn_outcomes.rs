@@ -10,6 +10,28 @@ pub const MAX_TURN_REASON_BYTES: usize = 4096;
 pub const MAX_PROJECTED_TURNS: usize = 128;
 pub const MAX_PROJECTION_BYTES: usize = 256 * 1024;
 
+/// Physical source of parsed native history, not a selected account or login.
+/// The producer captures this beside the opened history file; consumers must
+/// revalidate it and keep it separate from live/original-command authority.
+#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
+pub struct HistoryAccountOrigin {
+    pub provider:crate::agent::Provider,
+    pub canonical_home:std::path::PathBuf,
+    pub device:u64,
+    pub inode:u64,
+}
+impl HistoryAccountOrigin {
+    pub fn validate(&self)->Result<(),String> {
+        use std::os::unix::ffi::OsStrExt;
+        if !matches!(self.provider,crate::agent::Provider::Claude|crate::agent::Provider::Codex)
+            || !self.canonical_home.is_absolute() || self.canonical_home.as_os_str().as_bytes().len()>4096
+            || self.canonical_home.components().any(|part|matches!(part,std::path::Component::ParentDir|std::path::Component::CurDir)) {
+            return Err("Invalid native history physical account origin".into());
+        }
+        Ok(())
+    }
+}
+
 /// These are different provider proofs, not interchangeable native turn IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TurnIdentityKind {
