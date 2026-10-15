@@ -90,8 +90,11 @@ impl std::fmt::Display for LimitReached {
             "Agent {:?} concurrency limit reached ({}/{} reservations)",
             self.capacity.scope, self.capacity.running, self.capacity.limit
         )?;
-        for holder in &self.capacity.holders {
+        for holder in self.capacity.holders.iter().take(12) {
             write!(f, "\n  {} {:?}", holder.id, holder.state)?;
+        }
+        if self.capacity.holders.len() > 12 {
+            write!(f, "\n  {} additional holders; --json includes the complete list", self.capacity.holders.len() - 12)?;
         }
         f.write_str("\nWait for running work or close interrupted agents with `cagents agent close --interrupted`.")
     }

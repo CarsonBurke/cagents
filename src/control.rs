@@ -3606,6 +3606,22 @@ mod tests {
         assert!(error.message.contains("close --interrupted"));
     }
     #[test]
+    fn large_capacity_errors_keep_all_machine_holders_with_bounded_human_output() {
+        use crate::agent_execution::{Capacity, CapacityHolder, CapacityScope, LimitReached, State};
+        let holders: Vec<_> = (0..4096).map(|_| CapacityHolder { id: crate::model::AgentId::new(), run: crate::model::RunId::new(), state: State::Waiting }).collect();
+        let last = holders.last().unwrap().id;
+        let wire = terminal::ipc::ProtocolError::agent_limit_reached(LimitReached {
+            capacity: Capacity { running: holders.len(), limit: holders.len(), scope: CapacityScope::Global, holders }, retryable: true,
+        });
+        let error = protocol_error(ControlError::Remote { code: wire.code, message: wire.message, retryable: wire.retryable, details: wire.details });
+        let details = error.details.unwrap();
+        assert_eq!(details["holders"].as_array().unwrap().len(), 4096);
+        assert_eq!(details["holders"][4095]["id"], last.to_string());
+        assert!(error.message.len() < 2048);
+        assert!(error.message.contains("additional holders"));
+        assert!(!error.message.contains(&last.to_string()));
+    }
+    #[test]
     fn rebuild_stop_requires_explicit_permission_before_touching_a_daemon() {
         let error = execute_daemon(DaemonCommand::StopForRebuild {
             including_subagents: false,
