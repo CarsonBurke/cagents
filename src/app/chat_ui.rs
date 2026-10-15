@@ -4060,6 +4060,60 @@ impl Cagents {
         Some(task.map(cosmic::Action::App))
     }
 
+    /// Stage forge context in the worktree's latest conversation. The user's
+    /// existing unsent draft stays ahead of the context; sending remains explicit.
+    pub(super) fn prepare_pr_agent_context(&mut self, worktree: PathBuf, prompt: String) -> Task<Message> {
+        let candidates = self.durable.cards.iter().enumerate().filter(|(_, card)| {
+            card.existence.is_open() && matches!(&card.kind, CardKind::Chat(session)
+                if self.card_worktree(card) == Some(worktree.as_path())
+                    || session.launch.recipe.working_directory == worktree)
+        });
+        let existing = candidates.max_by_key(|(index, card)| {
+            let at = match self.cards.get(&card.id) {
+                Some(CardRuntime::Chat(runtime)) => runtime.snapshot.items.iter()
+                    .filter_map(|item| item.at.or(item.started_at)).max().or(runtime.snapshot.finished_at).unwrap_or(0),
+                _ => 0,
+            };
+            (Some(card.id) == self.workspace.focused(), at, *index)
+        }).map(|(_, card)| card.id);
+        let (card, open) = match existing {
+            Some(card) => {
+                let channel = self.durable.channels.iter().find(|channel| channel.cards.contains(&card)).map(|channel| channel.id);
+                let open = match channel {
+                    Some(channel) => self.select_channel(channel),
+                    None => self.select_worktree(worktree.clone(), false),
+                };
+                (card, open)
+            }
+            None => {
+                let open = self.new_native_chat(self.preferred_chat_provider(), Some(worktree.clone()));
+                let Some(card) = self.workspace.focused().filter(|card| matches!(self.card_state(*card).map(|state| &state.kind),
+                    Some(CardKind::Chat(session)) if session.launch.recipe.working_directory == worktree)) else { return open; };
+                (card, open)
+            }
+        };
+        self.chat_ui.default_chats.remove(&card);
+        let runtime = match self.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_mut()),
+            _ => self.chat_ui.parked.get_mut(&card).map(Box::as_mut),
+        };
+        if let Some(runtime) = runtime {
+            let mut draft = runtime.unsent_text();
+            if !draft.trim().is_empty() { draft.push_str("\n\n"); }
+            draft.push_str(&prompt);
+            runtime.history_cursor = None;
+            runtime.history_stash = None;
+            runtime.replace_draft(text_editor::Content::with_text(&draft));
+        } else {
+            let draft = self.chat_ui.drafts.entry(card).or_default();
+            if !draft.trim().is_empty() { draft.push_str("\n\n"); }
+            draft.push_str(&prompt);
+        }
+        self.persist();
+        let focus = self.focus_workspace_card(card);
+        Task::batch([open, focus, iced::widget::operation::focus(card_control_id(card, "chat-composer")).map(cosmic::Action::App)])
+    }
+
     pub(super) fn new_native_thread(&mut self) -> Task<Message> {
         self.new_native_chat(self.preferred_chat_provider(), None)
     }
@@ -12170,6 +12224,30 @@ mod tests {
         assert!(runtime.snapshot.busy && runtime.snapshot.capabilities.steer);
         drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
         assert_eq!(chat_runtime(&app, card).composer.text(), original);
+    }
+
+    #[test]
+    fn pr_context_uses_existing_worktree_chat_and_preserves_unsent_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        write(&mut app, card, "My existing request");
+        let count = app.durable.cards.len();
+        drop(app.prepare_pr_agent_context(PathBuf::from(FIXTURE_DIRECTORY), "PR context ready to review".into()));
+        assert_eq!(app.durable.cards.len(), count);
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert_eq!(chat_runtime(&app, card).composer.text(), "My existing request\n\nPR context ready to review");
+        assert!(chat_runtime(&app, card).is_draft());
+        assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn pr_context_creates_a_default_provider_chat_without_sending() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.prepare_pr_agent_context(PathBuf::from(FIXTURE_DIRECTORY), "Review these selected threads".into()));
+        let card = app.workspace.focused().unwrap();
+        assert!(chat_runtime(&app, card).is_draft());
+        assert_eq!(chat_runtime(&app, card).composer.text(), "Review these selected threads");
+        assert!(!app.chat_start_pending(card));
     }
 
     #[test]
