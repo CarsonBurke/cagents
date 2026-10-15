@@ -26,10 +26,19 @@ pub(crate) struct Recovery {
     pub server_identity: Option<super::protocol::ServerIdentity>,
     pub server_process: Option<crate::daemon::holder_registry::Process>,
     pub execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    /// Private startup evidence, retained across daemon adoption. A legacy
+    /// holder without it remains usable but cannot authorize annotations.
+    #[serde(default)]
+    pub launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
 }
 
 impl Recovery {
     fn validate(&self, boot: &BootId) -> Result<(), String> {
+        if self.launch_account_scope.as_ref().is_some_and(|scope| {
+            scope.provider != self.source.launch.provider || !scope.canonical_home.is_absolute()
+        }) {
+            return Err("Native holder has inconsistent credential-directory scope".into());
+        }
         if self.paired_holder.as_ref().is_some_and(|record| {
             self.source
                 .terminal
@@ -304,6 +313,7 @@ mod tests {
             server_identity: None,
             server_process: None,
             execution_environment: Default::default(),
+            launch_account_scope: None,
         }
     }
 
@@ -359,6 +369,26 @@ mod tests {
         successor.boot_id = BootId::new("another-boot");
         assert!(recovery.adopt(&original, successor).is_err());
         assert_eq!(recovery.confirmed_thread.as_ref(), Some(&thread));
+    }
+
+    #[test]
+    fn account_scope_is_retained_as_startup_evidence_without_rebinding_after_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let mut original = recovery();
+        let scope = crate::account::scope::LaunchAccountScope::resolve(Provider::Codex, directory.path(), |name| (name == "CODEX_HOME").then(|| home.as_os_str().to_owned())).unwrap();
+        original.launch_account_scope = Some(scope.clone());
+        let wire = serde_json::to_vec(&original).unwrap();
+        std::fs::rename(&home, directory.path().join("old-home")).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let retained: Recovery = serde_json::from_slice(&wire).unwrap();
+        retained.validate(&BootId::new("fixture-boot")).unwrap();
+        assert_eq!(retained.launch_account_scope.as_ref(), Some(&scope));
+        assert!(retained.launch_account_scope.unwrap().revalidate().is_err());
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy.as_object_mut().unwrap().remove("launch_account_scope");
+        assert!(serde_json::from_value::<Recovery>(legacy).unwrap().launch_account_scope.is_none());
     }
 
     #[test]
