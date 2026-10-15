@@ -1,3 +1,8 @@
+#[cfg(target_os = "linux")]
+pub(crate) mod created_root_rights;
+#[cfg(target_os = "linux")]
+pub(crate) mod created_journal_io;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::{OsStr, OsString},
