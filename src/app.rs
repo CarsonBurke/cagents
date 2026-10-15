@@ -20005,6 +20005,13 @@ mod tests {
             drop(app.update(Message::AgentListEdited { provider, owner, edit }));
         }
         assert_eq!(app.settings_draft, before);
+        // Semantic draft equality intentionally excludes callback metadata.
+        // Rejected old messages must preserve the new tree's authority too.
+        let (after, before) = (&app.settings_draft.agents[&provider], &before.agents[&provider]);
+        assert_eq!(after.argument_owner, before.argument_owner);
+        assert_eq!(after.argument_rows, before.argument_rows);
+        assert_eq!(after.environment_owner, before.environment_owner);
+        assert_eq!(after.environment_rows, before.environment_rows);
         assert!(app.settings_pending.is_empty());
         assert_eq!(app.settings_generation, generation);
     }
