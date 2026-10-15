@@ -40,6 +40,8 @@ fn isolated(name: &str) -> Option<tempfile::TempDir> {
         .env_clear()
         .env(CHILD, name)
         .env("CAGENTS_EXECUTION_FIXTURE", root)
+        .envs((name == "combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflict")
+            .then_some(("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")))
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
@@ -1138,6 +1140,104 @@ fn combined_close_retains_real_cleanup_receipt_after_late_view_conflict_and_retr
     assert!(store.lock().unwrap().inspect_presentation_repair(&Origin::User, agent.id).unwrap().is_none());
     assert_eq!(close(&host, &Authority::default(), agent.id).unwrap(), closed);
     drop(detached); // No close command: the already-confirmed receipt owns retry.
+}
+
+#[test]
+fn combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflict() {
+    if isolated("combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflict").is_some() { return; }
+    let (host, request, path) = fixture();
+    let proof = host.lock().unwrap().proof().clone();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let notifications = crate::host::notifications::Broker::start(&host,
+        crate::notifications::Application::Cagents).unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    host.lock().unwrap().enable_holder_recovery();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let result = settled(&host, accepted.run.id);
+    assert_eq!(result.state, State::Succeeded);
+    let store = registry(&host).unwrap();
+    let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+    let id = agent.session.as_ref().unwrap().id();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let owner = handle.actor_identity().expect("fixture uses genuine retained actor facade");
+    struct Cleanup {handle: chat::runtime::Handle, owner: crate::daemon::holder_registry::Record,
+        pair: Option<crate::daemon::holder_registry::Record>}
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.handle.close_for_resume();
+            let _ = self.handle.finish_retained_close();
+            // Panic cleanup is restricted to this fixture's captured process
+            // incarnations. It never discovers or signals unrelated sessions.
+            for record in std::iter::once(&self.owner).chain(self.pair.iter()) {
+                for process in [&record.root, &record.holder] {
+                    if process.is_current() { unsafe { libc::kill(process.pid, libc::SIGKILL); } }
+                }
+            }
+        }
+    }
+    let mut cleanup = Cleanup {handle: handle.clone(), owner: owner.record.clone(), pair: None};
+    assert!(owner.record.root.is_current());
+    let recipe = crate::model::LaunchRecipe {program: "/bin/cat".into(), arguments: vec![],
+        working_directory: path.parent().unwrap().join("project"), environment: Default::default(),
+        unset_environment: Default::default()};
+    host.lock().unwrap().chats.get_mut(&id).unwrap().console_recipe = Some(recipe.clone());
+    let (descriptor, console) = crate::host::state::spawn_terminal_view_owned(&host, 0,
+        crate::terminal_ipc::TerminalDescriptor::relaunchable(id, recipe.clone(), None).session,
+        Default::default(), None, true).unwrap();
+    let pair = console.holder_identity().expect("real holder-backed terminal fixture").clone();
+    cleanup.pair = Some(pair.clone());
+    let mut paired = crate::chat::runtime::Handle::inspect_remote(&owner.record, proof.clone()).unwrap().source;
+    paired.terminal = Some(descriptor.session.clone());
+    handle.update_native_source(paired.clone(), Some(recipe), Some(pair.clone())).unwrap();
+    {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&id).unwrap();
+        record.session = paired; record.paired_terminal = Some(console.clone());
+    }
+    let agent = store.lock().unwrap().bind_agent_console(agent.id,
+        agent.session.as_ref().unwrap(), descriptor.session.clone()).unwrap();
+    let mut ended = descriptor.session;
+    ended.continuity = crate::model::TerminalContinuity::Exited {last_exit: crate::model::TerminalExit {
+        code: Some(0), signal: None, occurred_at_unix_ms: 1}};
+    let pane = crate::workspace_model::views::Pane {id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+        title: "Unverified historical presentation".into(), user_title: None, pending_terminal_start: false,
+        width_fraction: 1.0, kind: crate::model::CardKind::Terminal(ended), scope: None};
+    store.lock().unwrap().apply(&ModelEdit::SeedView {scope: agent.placement.clone(),
+        panes: vec![pane.clone()], closed: vec![]}).unwrap();
+    assert!(close(&host, &Authority::default(), agent.id).is_err());
+    assert!(owner.record.root.is_current()); assert!(!console.is_completed());
+    let Reply::PresentationClose(Some(target)) = process(&host, Authority::default(),
+        Operation::InspectPresentationClose(agent.id)).unwrap() else {panic!("missing actor close target")};
+    assert_eq!(target.actor_instance, Some(owner.instance));
+    assert_eq!(target.paired_owner.as_ref().unwrap().holder_pid, pair.holder.pid);
+    let mut forged = target.clone(); forged.actor_instance = Some(uuid::Uuid::new_v4());
+    assert!(process(&host, Authority::default(), Operation::ConfirmPresentationClose {observed: forged}).is_err());
+    assert!(owner.record.root.is_current()); assert!(!console.is_completed());
+    let database = path.clone();
+    crate::host::chat::before_presentation_close_commit(move || {
+        let db = rusqlite::Connection::open(database).unwrap();
+        db.execute("UPDATE shared_views SET revision=revision+1", []).unwrap();
+    });
+    let error = process(&host, Authority::default(), Operation::ConfirmPresentationClose {observed: target}).unwrap_err();
+    assert!(error.contains("view revision changed"), "{error}");
+    assert!(!owner.record.root.is_current()); assert!(!pair.root.is_current());
+    assert!(!pair.holder.is_current(), "only confirmed family cleanup authorizes retirement");
+    assert!(host.lock().unwrap().native_closing.contains_key(&id));
+    assert_eq!(store.lock().unwrap().agent(agent.id).unwrap(), agent);
+    assert_eq!(store.lock().unwrap().agent_run(result.id).unwrap(), result);
+    let Reply::PresentationClose(Some(fresh)) = process(&host, Authority::default(),
+        Operation::InspectPresentationClose(agent.id)).unwrap() else {panic!("missing actor receipt target")};
+    assert_eq!(fresh.observation.pane, pane);
+    let Reply::Closed(closed) = process(&host, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: fresh}).unwrap() else {panic!("not closed")};
+    assert!(closed.closed);
+    assert_eq!(store.lock().unwrap().agent_run(result.id).unwrap(), result);
+    assert!(store.lock().unwrap().inspect_presentation_repair(&Origin::User, agent.id).unwrap().is_none());
+    assert!(!host.lock().unwrap().native_closing.contains_key(&id));
+    assert_eq!(std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap(), "spawn\n");
+    assert_eq!(std::fs::read_to_string(path.parent().unwrap().join("prompts")).unwrap(), "prompt\n");
+    drop(notifications);
 }
 
 #[test]
