@@ -241,7 +241,26 @@ async fn run_event_loop(
         "accesskit_session_bus_task",
     );
 
-    let status = StatusProxy::new(&session_bus).await?;
+    // Probe without a property cache first: a missing service must fail here,
+    // rather than stranding zbus's lazy cache updater and property stream.
+    // This also avoids a cache-population warning on every retry while absent.
+    let status_probe = StatusProxy::builder(&session_bus)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
+    status_probe.screen_reader_enabled().await?;
+    let dbus = zbus::fdo::DBusProxy::new(&session_bus).await?;
+    let status_name = zbus::names::BusName::try_from("org.a11y.Bus")?;
+    let status_owner = dbus.get_name_owner(status_name.clone()).await?;
+    let status = StatusProxy::builder(&session_bus)
+        .cache_properties(zbus::proxy::CacheProperties::Yes)
+        .build()
+        .await?;
+    if dbus.get_name_owner(status_name.clone()).await? != status_owner {
+        return Err(zbus::Error::Failure(
+            "Accessibility status owner changed during connection".into(),
+        ));
+    }
     let changes = status.receive_screen_reader_enabled_changed().await.fuse();
     pin!(changes);
 
@@ -259,7 +278,14 @@ async fn run_event_loop(
             _ = heartbeat => {
                 // A restarted bus may leave the property stream pending without
                 // another adapter message. Check both transports independently.
-                zbus::fdo::DBusProxy::new(&session_bus).await?.get_id().await?;
+                // A healthy session bus alone cannot establish status-service
+                // health. Its owner can disappear/restart while that bus lives.
+                if dbus.get_name_owner(status_name.clone()).await? != status_owner {
+                    return Err(zbus::Error::Failure(
+                        "Accessibility status owner changed".into(),
+                    ));
+                }
+                status_probe.screen_reader_enabled().await?;
                 if let Some(bus) = &atspi_bus {
                     bus.check_connection().await?;
                 }
