@@ -33,14 +33,6 @@ impl Runtime {
                 .on_press(action(Action::CopyProviderExit(target)))
                 .into(),
         );
-        if self.snapshot.exited && !self.is_draft() {
-            controls.push(
-                widget::button::custom(design::caption("Restart session"))
-                    .class(crate::ui_controls::control_style(false, None))
-                    .on_press(action(Action::Reconnect(target)))
-                    .into(),
-            );
-        }
         content.push(
             widget::row::with_children(controls)
                 .spacing(step::GAP_S)
