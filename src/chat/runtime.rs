@@ -122,6 +122,11 @@ pub(crate) enum Update {
         update: crate::agent_execution::Update,
     },
     Attention(crate::notifications::Evidence),
+    /// Immutable context belongs to this evidence, not a later snapshot.
+    AttentionContext {
+        evidence: crate::notifications::Evidence,
+        content: Option<crate::notifications::Content>,
+    },
     Presentation,
     /// Wake the host's single coalescing broker; this is never a durable ACK.
     RetainedOutcomes,
