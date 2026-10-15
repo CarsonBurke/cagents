@@ -555,6 +555,9 @@ pub struct CommandContext {
     pub can_cycle_workspace: bool,
 }
 
+/// Display order shared by the Keyboard table and its registry coverage checks.
+pub const SHORTCUT_CATEGORIES: [&str; 6] = ["Panes", "Navigation", "Chat", "Review", "Editor", "Git"];
+
 impl ShortcutDescriptor {
     pub const fn id(self) -> &'static str {
         self.action.id()

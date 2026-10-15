@@ -1243,7 +1243,7 @@ fn keyboard_groups<'a>(
         widget::button::text("Conflicts").on_press(Message::SettingsSearchChanged("conflicts".into())).into(),
     ]).spacing(space::S).into()).label_in_control()]).compact()];
     let shortcut_values = draft.keyboard_shortcuts.shortcut_values();
-    for group in ["Panes", "Navigation", "Chat", "Review", "Editor"] {
+    for group in workspace_widget::SHORTCUT_CATEGORIES {
         let mut rows: Vec<_> = SettingsField::SHORTCUTS
             .into_iter()
             .filter(|field| shortcut_group(*field) == group)
@@ -1533,6 +1533,14 @@ mod keyboard_table_tests {
                 workspace_widget::shortcut_keys(field.shortcut_action().unwrap(), &settings),
                 values
             );
+        }
+    }
+
+    #[test]
+    fn git_commands_are_mounted_in_the_keyboard_settings_table() {
+        let draft = SettingsDraft::from_settings(&AppSettings::default());
+        for label in ["Fetch", "Accept ours and stage", "Trigger completion"] {
+            assert_eq!(keyboard_groups(&draft, &HashMap::new()).into_iter().filter_map(|group| group.view("Keyboard", label)).count(), 1, "registered command {label} must have a visible settings row");
         }
     }
 

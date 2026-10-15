@@ -2463,7 +2463,7 @@ mod tests {
         for (index, field) in SettingsField::SHORTCUTS.into_iter().enumerate() {
             let action = field.shortcut_action().unwrap();
             let descriptor = workspace_widget::shortcut_descriptor(action);
-            assert!(["Panes", "Navigation", "Chat", "Review", "Editor"].contains(&descriptor.category()));
+            assert!(workspace_widget::SHORTCUT_CATEGORIES.contains(&descriptor.category()));
             assert_eq!(drafts[index].0, action);
             assert_eq!(action.id(), KeyboardShortcuts::action_names()[index]);
         }
