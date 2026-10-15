@@ -3145,12 +3145,14 @@ impl ShortcutDraft {
 struct AgentDraft {
     configuration: settings::AgentLaunchSettings,
     environment: Vec<(String, String)>,
+    launch_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
     agents: std::collections::BTreeMap<crate::agent::Provider, AgentDraft>,
     default_shell: String,
+    default_shell_unavailable: bool,
     notifications: crate::notifications::Preferences,
     app_theme: String,
     ui_scale: String,
@@ -3202,9 +3204,11 @@ impl SettingsDraft {
             agents: crate::agent::Provider::ALL.into_iter().map(|provider| {
                 let configuration = settings.agents.get(settings::agents::provider_key(provider)).cloned().unwrap_or_default();
                 let environment = configuration.environment.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
-                (provider, AgentDraft { configuration, environment })
+                let launch_error = configuration.validate(provider).err();
+                (provider, AgentDraft { configuration, environment, launch_error })
             }).collect(),
             default_shell: settings.default_shell.clone().unwrap_or_default(),
+            default_shell_unavailable: settings.default_shell.as_deref().is_some_and(|path| !settings::agents::executable_available(path)),
             notifications: settings.notifications,
             app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
@@ -3267,7 +3271,10 @@ impl SettingsDraft {
 
     fn set(&mut self, field: SettingsField, value: String) {
         match field {
-            SettingsField::DefaultShell => self.default_shell = value,
+            SettingsField::DefaultShell => {
+                self.default_shell_unavailable = !value.is_empty() && !settings::agents::executable_available(&value);
+                self.default_shell = value;
+            }
             SettingsField::Agent(provider, field) => {
                 let draft = self.agents.entry(provider).or_default();
                 let optional = |value: String| (!value.is_empty()).then_some(value);
@@ -3279,6 +3286,7 @@ impl SettingsDraft {
                     AgentSetting::Arguments => if let Ok(arguments) = serde_json::from_str(&value) { draft.configuration.arguments = arguments; },
                     AgentSetting::Environment => if let Ok(environment) = serde_json::from_str::<Vec<(String, String)>>(&value) { draft.configuration.environment = environment.iter().cloned().collect(); draft.environment = environment; },
                 }
+                draft.launch_error = draft.configuration.validate(provider).err();
             }
             SettingsField::Notifications(field) => self.notifications.set(field, value == "true"),
             SettingsField::AppTheme => self.app_theme = value,

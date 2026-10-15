@@ -12,7 +12,7 @@ fn select<'a>(provider: Provider, field: AgentSetting, selected: Option<&str>, o
 }
 
 pub(super) fn controls<'a>(draft: &'a SettingsDraft, context: &SettingsContext<'a>) -> Vec<Group<'a, Message>> {
-    let shell_error = (!draft.default_shell.is_empty() && !settings::agents::executable_available(&draft.default_shell)).then_some("Configured shell is unavailable. New terminals cannot start until this path is repaired.");
+    let shell_error = draft.default_shell_unavailable.then_some("Configured shell is unavailable. New terminals cannot start until this path is repaired.");
     let mut groups = vec![settings_group("Terminals", "Choose the shell used for a new terminal and terminal spawn without a command.", vec![setting_input("Absolute executable path. Leave blank to use your login shell.", &draft.default_shell, SettingsField::DefaultShell, context.invalid).error(shell_error.or_else(|| context.invalid.get(&SettingsField::DefaultShell).map(String::as_str)))])];
     for provider in Provider::ALL {
         let entry = draft.agents.get(&provider).expect("all provider drafts exist");
@@ -21,8 +21,8 @@ pub(super) fn controls<'a>(draft: &'a SettingsDraft, context: &SettingsContext<'
         let models = context.agent_models.iter().find(|(candidate, _)| *candidate == provider).map(|(_, models)| *models).unwrap_or(&[]);
         let field = |field| SettingsField::Agent(provider, field);
         let mut options = vec![select(provider, AgentSetting::Model, configuration.model.as_deref(), models.iter().map(|model| model.id.clone()))];
-        if let Err(reason) = configuration.validate(provider) {
-            options.push(setting_field("Launch unavailable", "Repair these preferences before starting a new conversation.", design::caption(reason).class(cosmic::theme::Text::Custom(design::destructive_text)).into()));
+        if let Some(reason) = &entry.launch_error {
+            options.push(setting_field("Launch unavailable", "Repair these preferences before starting a new conversation.", design::caption(reason.as_str()).class(cosmic::theme::Text::Custom(design::destructive_text)).into()));
         }
         let efforts = models.iter().filter(|model| Some(model.id.as_str()) == configuration.model.as_deref()).flat_map(|model| model.reasoning.iter().cloned()).collect::<Vec<_>>();
         options.push(select(provider, AgentSetting::Effort, configuration.effort.as_deref(), efforts));
