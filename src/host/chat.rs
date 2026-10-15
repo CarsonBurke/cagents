@@ -387,7 +387,13 @@ fn attached_mut(
     }
     Ok(record)
 }
+pub(super) fn changed_owned(host: &Weak<HostLock>, id: TerminalId, instance: uuid::Uuid, update: Update) {
+    changed_from(host, id, Some(instance), update);
+}
 fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
+    changed_from(host, id, None, update);
+}
+fn changed_from(host: &Weak<HostLock>, id: TerminalId, instance: Option<uuid::Uuid>, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -423,6 +429,9 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
         }
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if instance.is_some_and(|instance| !state.chats.get(&id).is_some_and(|record| record.execution_instance == instance)) {
+        return;
+    }
     let proof = state.proof().clone();
     // A conversation that starts or settles may take the messages left for it.
     if matches!(
@@ -1323,12 +1332,16 @@ fn start_with_execution(
         // If removal wins between them, startup's validation refuses the launch.
         let weak = Arc::downgrade(host);
         let id = session.id;
+        let owner_instance = Arc::new(std::sync::OnceLock::<uuid::Uuid>::new());
+        let notified_instance = owner_instance.clone();
         let notify = move |update| {
             if let Update::Execution { run, update } = update {
                 if let Some(host) = weak.upgrade() {
                     super::agent_execution::observed(&host, id, execution_instance, run, update);
                 }
-            } else { changed(&weak, id, update); }
+            } else if let Some(instance) = notified_instance.get() {
+                changed_owned(&weak, id, *instance, update);
+            }
         };
         let remote = retained_actor::enabled(session.launch.provider, &spec.transport);
         let startup_source = session.clone();
@@ -1371,6 +1384,7 @@ fn start_with_execution(
         // Keep its exact context in native_actor_startups on any uncertainty.
         handle.commit_native_installation().map_err(unavailable)?;
         let execution_instance = handle.actor_identity().map_or(execution_instance, |identity| identity.instance);
+        let _ = owner_instance.set(execution_instance);
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             drop(state);

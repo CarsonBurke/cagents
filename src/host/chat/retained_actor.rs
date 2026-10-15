@@ -148,7 +148,8 @@ pub(super) fn restore(host: &SharedHost, client: ClientId, requested: &Session, 
     { return Err("The retained Claude actor identity changed during inspection".into()); }
     let weak = Arc::downgrade(host);
     let id = requested.id;
-    let handle = Handle::adopt_remote(&owner, requested.clone(), proof.clone(), move |update| changed(&weak, id, update))?;
+    let expected_instance = inspection.identity.instance;
+    let handle = Handle::adopt_remote(&owner, requested.clone(), proof.clone(), move |update| changed_owned(&weak, id, expected_instance, update))?;
     let identity = handle.actor_identity().ok_or("The retained actor did not provide its stable identity")?;
     if identity != inspection.identity { return Err("The retained actor changed while attaching".into()); }
     let mut session = requested.clone();
