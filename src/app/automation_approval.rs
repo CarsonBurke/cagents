@@ -9,11 +9,12 @@ pub(super) struct State {
     available: Option<Proposal>,
     pending: Vec<ProposalSummary>,
     total: u64,
-    pushed: Option<(uuid::Uuid, u64)>,
+    pushed: Option<(uuid::Uuid, u64, u64)>,
+    watch_epoch: u64,
     page_generation: u64,
     page_offset: u64,
     page_loading: bool,
-    review_refresh: Option<(u64, Option<(uuid::Uuid, u64)>)>,
+    review_refresh: Option<(u64, Option<(uuid::Uuid, u64, u64)>)>,
     reading: Option<(uuid::Uuid, u64)>,
     deciding: bool,
     generation: u64,
@@ -33,7 +34,7 @@ pub enum Action {
     Updated(Vec<ProposalSummary>),
     Page { generation: u64, after: Option<uuid::Uuid>, offset: u64 },
     PageLoaded { generation: u64, after: Option<uuid::Uuid>, offset: u64, result: Arc<Result<Vec<ProposalSummary>, String>> },
-    ReviewRefreshed { generation: u64, pushed: Option<(uuid::Uuid, u64)>, result: Arc<Result<Proposal, String>> },
+    ReviewRefreshed { generation: u64, pushed: Option<(uuid::Uuid, u64, u64)>, result: Arc<Result<Proposal, String>> },
     Loaded {
         id: uuid::Uuid,
         revision: u64,
@@ -130,8 +131,17 @@ impl Cagents {
         .into()
     }
 
+    pub(super) fn automation_proposals_reconnected(&mut self) {
+        let state = &mut self.automation_approval;
+        state.watch_epoch = state.watch_epoch.wrapping_add(1);
+        state.pushed = None;
+        state.review_refresh = None;
+        state.page_generation = state.page_generation.wrapping_add(1);
+        state.page_loading = false;
+    }
+
     pub(super) fn sync_automation_proposal_page(&mut self, identity: uuid::Uuid, sequence: u64, total: u64, pending: Vec<ProposalSummary>) -> Task<Message> {
-        let key = (identity, sequence);
+        let key = (identity, sequence, self.automation_approval.watch_epoch);
         if self.automation_approval.pushed == Some(key) { return Task::none(); }
         self.automation_approval.pushed = Some(key);
         self.automation_approval.total = total;
@@ -1126,6 +1136,37 @@ mod tests {
         assert_eq!(labels.0.iter().filter(|text| text.starts_with("Scheduled work requested:")).count(),64);
         assert!(labels.0.iter().any(|text| text=="10000 pending scheduled-work request(s)"));
         assert!(labels.0.iter().any(|text| text=="Next requests"));
+    }
+    #[test]
+    fn reconnect_fences_pages_and_private_review_receipts_even_at_the_same_clock() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let identity = uuid::Uuid::new_v4();
+        let mut proposal = proposal();
+        proposal.id = uuid::Uuid::from_u128(999);
+        drop(app.sync_automation_proposal_page(identity,1,1_000,request_page(&proposal,1,64)));
+        let generation = app.automation_approval.page_generation;
+        drop(app.update_automation_approval(Action::Page { generation, after:Some(uuid::Uuid::from_u128(64)),offset:64 }));
+        let old_page = app.automation_approval.page_generation;
+        app.automation_approval.available = Some(proposal.clone());
+        drop(app.update_automation_approval(Action::Open { id:proposal.id,revision:proposal.revision }));
+        drop(app.sync_automation_proposal_page(identity,2,1_000,request_page(&proposal,1,64)));
+        let old_push = app.automation_approval.pushed;
+        let review = app.automation_approval.generation;
+        assert!(app.automation_approval.review_refresh.is_some());
+        app.automation_proposals_reconnected();
+        drop(app.sync_automation_proposal_page(identity,2,1_000,request_page(&proposal,1,64)));
+        let new_push = app.automation_approval.pushed;
+        assert_ne!(old_push,new_push);
+        assert!(app.automation_approval.review_refresh.is_some());
+        let mut stale = proposal.clone(); stale.state=ProposalState::Declined;
+        drop(app.update_automation_approval(Action::ReviewRefreshed {generation:review,pushed:old_push,result:Arc::new(Ok(stale))}));
+        assert!(app.automation_approval_open(),"old daemon receipt cannot retire the current review");
+        drop(app.update_automation_approval(Action::PageLoaded {generation:old_page,after:Some(uuid::Uuid::from_u128(64)),offset:64,result:Arc::new(Ok(request_page(&proposal,65,128)))}));
+        assert_eq!(app.automation_approval.page_offset,0);
+        assert_eq!(app.automation_approval.pending[0].id,uuid::Uuid::from_u128(1));
+        drop(app.update_automation_approval(Action::ReviewRefreshed {generation:review,pushed:new_push,result:Arc::new(Ok(proposal))}));
+        assert!(app.automation_approval_open());
+        assert!(app.automation_approval.review_refresh.is_none());
     }
 
 }

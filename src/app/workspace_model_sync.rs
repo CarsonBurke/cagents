@@ -424,6 +424,7 @@ impl Cagents {
                     return Task::none();
                 }
                 self.chat_ui.archive_discovery.reconnected();
+                self.automation_proposals_reconnected();
                 self.join_workspace_model(model.identity);
                 self.workspace_model = model;
                 let closed = self.apply_closed_project_tombstones();
