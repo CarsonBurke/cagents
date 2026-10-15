@@ -54,6 +54,7 @@ pub(super) struct Journal {
     acknowledged_inputs: std::collections::BTreeSet<u64>,
     outcome_ack: u64,
     outcome_latest: u64,
+    source_authority: Option<super::SourceAuthority>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
 /// independently authoritative evidence or block later execution settlements.
@@ -101,6 +102,7 @@ impl Journal {
             acknowledged_inputs: Default::default(),
             outcome_ack: 0,
             outcome_latest: 0,
+            source_authority: None,
         })
     }
     pub fn continuity_loss(&self) -> Result<Option<ContinuityLoss>, String> {
@@ -164,7 +166,19 @@ impl Journal {
         self.last_loss = None;
         Ok(())
     }
+    pub fn source_authority(&self) -> Option<super::SourceAuthority> {
+        self.source_authority
+    }
     pub fn append(&mut self, update: &Update) -> Result<(), String> {
+        // Invalidation survives even a failed Reset/storage write. It is a
+        // coalesced scalar of this exact retained Store, never a semantic row
+        // or a cursor/ACK. Never derive it from a Snapshot or raw-owner nonce.
+        if let Update::SourceAuthority { incarnation, generation } = update {
+            super::source_authority::advance(&mut self.source_authority, Some(super::SourceAuthority {
+                incarnation: *incarnation, generation: *generation,
+            }));
+            return Ok(());
+        }
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
         if !matches!(
@@ -1188,5 +1202,27 @@ mod tests {
         journal.ack(1).unwrap();
         assert!(journal.page(0).is_err());
         assert!(journal.page(1).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod source_authority_tests {
+    use super::*;
+    use super::super::{Journal, SourceAuthority};
+    #[test]
+    fn journal_coalesces_actual_tokens_without_sql_or_semantic_ack() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        let first = SourceAuthority { incarnation: uuid::Uuid::new_v4(), generation: 7 };
+        journal.append(&Update::SourceAuthority {incarnation:first.incarnation,generation:7}).unwrap();
+        assert_eq!(journal.source_authority(), Some(first));
+        journal.db.execute_batch("DROP TABLE metadata; DROP TABLE outcomes;").unwrap();
+        let reset = SourceAuthority { incarnation: uuid::Uuid::new_v4(), generation: 11 };
+        journal.append(&Update::SourceAuthority {incarnation:reset.incarnation,generation:11}).unwrap();
+        journal.append(&Update::SourceAuthority {incarnation:first.incarnation,generation:7}).unwrap();
+        assert_eq!(journal.source_authority(), Some(reset));
+        assert_eq!(journal.latest().unwrap(), 0);
+        assert_eq!(journal.acknowledged().unwrap(), 0);
+        assert!(journal.continuity_loss().unwrap().is_none());
     }
 }

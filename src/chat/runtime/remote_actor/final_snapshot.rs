@@ -6,6 +6,8 @@ struct Receipt {
     identity: ActorIdentity,
     proof: HostSessionProof,
     snapshot: Snapshot,
+    #[serde(default)]
+    source_authority: Option<SourceAuthority>,
 }
 fn path(record: &Record) -> Result<PathBuf, String> {
     Ok(registry::directory(Kind::Native)?.join(format!(
@@ -17,11 +19,14 @@ pub(super) fn save(
     identity: &ActorIdentity,
     proof: &HostSessionProof,
     snapshot: &Snapshot,
+    source_authority: Option<SourceAuthority>,
 ) -> Result<(), String> {
+    validate_source_authority(snapshot, source_authority)?;
     let bytes = serde_json::to_vec(&Receipt {
         identity: identity.clone(),
         proof: proof.clone(),
         snapshot: snapshot.clone(),
+        source_authority,
     })
     .map_err(|error| error.to_string())?;
     if bytes.len() > MAX_FRAME - 64 * 1024 {
@@ -55,7 +60,11 @@ fn save_at(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     }
     result
 }
-pub(super) fn read(identity: &ActorIdentity, proof: &HostSessionProof) -> Result<Snapshot, String> {
+pub(super) struct Publication {
+    pub snapshot: Snapshot,
+    pub source_authority: Option<SourceAuthority>,
+}
+pub(super) fn read_publication(identity: &ActorIdentity, proof: &HostSessionProof) -> Result<Publication, String> {
     let file = crate::secure_file::open_existing_private_file(&path(&identity.record)?)
         .map_err(|error| error.to_string())?;
     let mut bytes = Vec::new();
@@ -65,11 +74,21 @@ pub(super) fn read(identity: &ActorIdentity, proof: &HostSessionProof) -> Result
     if bytes.len() > MAX_FRAME {
         return Err("Final retained snapshot is oversized".into());
     }
-    let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    decode_publication(identity, proof, &bytes)
+}
+fn decode_publication(identity: &ActorIdentity, proof: &HostSessionProof, bytes: &[u8]) -> Result<Publication, String> {
+    let receipt: Receipt = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     if &receipt.identity != identity || &receipt.proof != proof {
         return Err("Final retained snapshot belongs to another actor or attachment".into());
     }
-    Ok(receipt.snapshot)
+    validate_source_authority(&receipt.snapshot, receipt.source_authority)?;
+    Ok(Publication { snapshot: receipt.snapshot, source_authority: receipt.source_authority })
+}
+fn validate_source_authority(snapshot: &Snapshot, authority: Option<SourceAuthority>) -> Result<(), String> {
+    if authority.is_some_and(|authority| authority.incarnation.is_nil() || authority.generation > snapshot.generation) {
+        return Err("Final retained source authority is invalid or newer than its body".into());
+    }
+    Ok(())
 }
 #[derive(Serialize, Deserialize)]
 struct Retirement {
@@ -146,6 +165,26 @@ pub(crate) fn remove(record: &Record) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn lost_close_reply_replays_exact_token_while_legacy_final_receipt_stays_unavailable() {
+        let actor = RemoteActor::fixture();
+        let identity = actor.identity();
+        let proof = actor.0.proof.clone();
+        let token = SourceAuthority { incarnation: uuid::Uuid::new_v4(), generation: 17 };
+        let receipt = Receipt { identity: identity.clone(), proof: proof.clone(),
+            snapshot: Snapshot { generation: 20, ..Default::default() }, source_authority: Some(token) };
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        let read = decode_publication(&identity, &proof, &bytes).unwrap();
+        assert_eq!(read.source_authority, Some(token));
+        let mut legacy = serde_json::to_value(&receipt).unwrap();
+        legacy.as_object_mut().unwrap().remove("source_authority");
+        assert_eq!(decode_publication(&identity, &proof, &serde_json::to_vec(&legacy).unwrap()).unwrap().source_authority, None);
+        let mut other = identity.clone(); other.instance = uuid::Uuid::new_v4();
+        assert!(decode_publication(&other, &proof, &bytes).is_err());
+        let mut malformed = receipt;
+        malformed.source_authority = Some(SourceAuthority { generation:21, ..token });
+        assert!(decode_publication(&identity, &proof, &serde_json::to_vec(&malformed).unwrap()).is_err());
+    }
+    #[test]
     fn final_publication_is_private_durable_and_bound_to_the_exact_actor() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -156,6 +195,7 @@ mod tests {
         let receipt = Receipt {
             identity: identity.clone(),
             proof: proof.clone(),
+            source_authority: Some(SourceAuthority { incarnation: uuid::Uuid::new_v4(), generation: 76 }),
             snapshot: Snapshot {
                 generation: 77,
                 title: Some("final".into()),
@@ -171,6 +211,7 @@ mod tests {
         assert_eq!(read.identity, identity);
         assert_eq!(read.proof, proof);
         assert_eq!(read.snapshot, receipt.snapshot);
+        assert_eq!(read.source_authority, receipt.source_authority);
         assert_eq!(
             std::fs::read_dir(directory.path()).unwrap().count(),
             1,

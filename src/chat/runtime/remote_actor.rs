@@ -1,11 +1,12 @@
 //! Exact retained Claude actor. Only bounded semantic publications cross this
 //! socket; provider stdout and mutable reducer state never leave the helper.
 mod journal;
+mod source_authority;
 pub(crate) mod restart;
 pub(crate) use restart::{RestartCleanup, RestartFailure, RestartReceipt, RestartState};
 mod deadline_io;
 pub(crate) mod final_snapshot;
-use super::{LocalHandle, Rejection, Update};
+use super::{LocalHandle, Rejection, SourceAuthority, Update};
 use crate::{
     chat::{
         self, Command, Snapshot,
@@ -70,6 +71,9 @@ pub(crate) struct ActorIdentity {
 pub(crate) struct Resident {
     pub provider_process: Option<Process>,
     pub generation: u64,
+    /// Exact Store-issued invalidation scalar; absent on legacy helpers.
+    #[serde(default)]
+    pub source_authority: Option<SourceAuthority>,
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub ready: bool,
@@ -259,6 +263,7 @@ impl RemoteActor {
         let resident = Resident {
             provider_process: Some(process.clone()),
             generation: 1,
+            source_authority: None,
             session_id: None,
             title: None,
             ready: true,
@@ -406,7 +411,6 @@ impl RemoteActor {
         if let Some(mut resident) =
             self.call::<Option<Resident>>("state", json!([self.state().changed]))?
         {
-            let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
             if self.0.stop.load(Ordering::Acquire) {
                 if !closed || !resident.close.completed {
                     return Err(
@@ -416,7 +420,7 @@ impl RemoteActor {
                 resident.completed = true;
                 resident.owns_work = false;
             }
-            *state = Arc::new(resident);
+            self.replace_resident(resident, closed);
         }
         Ok(())
     }
@@ -833,12 +837,7 @@ impl RemoteActor {
         Ok(remote)
     }
     fn publish_resident(&self, resident: Resident) -> bool {
-        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        if self.0.stop.load(Ordering::Acquire) {
-            return false;
-        }
-        *state = Arc::new(resident);
-        true
+        self.replace_resident(resident, false)
     }
     fn publish_closed(&self, snapshot: Snapshot) {
         *self
@@ -1187,9 +1186,11 @@ impl RemoteActor {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
         {
-            return (after != Some(snapshot.generation)).then(|| snapshot.as_ref().clone());
+            return (after != Some(snapshot.generation) && self.accepts_body(snapshot.generation))
+                .then(|| snapshot.as_ref().clone());
         }
-        self.call("snapshot", json!([after])).ok().flatten()
+        self.call::<Option<Snapshot>>("snapshot", json!([after])).ok().flatten()
+            .filter(|snapshot| self.accepts_body(snapshot.generation))
     }
     pub fn pinned_directory(
         &self,
@@ -1380,10 +1381,7 @@ impl RemoteActor {
             Ok(publication) => {
                 // Keep the final semantic cursors visible to the broker even
                 // though this proxy's provider is now closed.
-                {
-                    let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-                    *state = Arc::new(publication.resident);
-                }
+                self.replace_resident(publication.resident, true);
                 publication.snapshot
             }
             Err(error) => {
@@ -1391,7 +1389,9 @@ impl RemoteActor {
                 {
                     return Err(error);
                 }
-                final_snapshot::read(&self.0.identity,&self.0.proof).map_err(|detail|format!("Provider cleanup is proved, but the exact final publication is unavailable: {detail}"))?
+                let publication = final_snapshot::read_publication(&self.0.identity,&self.0.proof).map_err(|detail|format!("Provider cleanup is proved, but the exact final publication is unavailable: {detail}"))?;
+                self.publish_source_authority(publication.source_authority);
+                publication.snapshot
             }
         };
         self.publish_closed(snapshot);
@@ -1832,6 +1832,7 @@ impl Server {
         Ok(Resident {
             provider_process,
             generation,
+            source_authority: journal.source_authority(),
             session_id,
             title,
             ready,
@@ -2407,7 +2408,8 @@ impl Server {
         // A closing actor may be adopted by a new authenticated daemon before
         // its last semantic ACK. Refresh receipt authority without changing
         // the exact immutable final publication.
-        final_snapshot::save(&self.identity, &self.proof, &snapshot)?;
+        let source_authority = self.journal.lock().unwrap_or_else(|p| p.into_inner()).source_authority();
+        final_snapshot::save(&self.identity, &self.proof, &snapshot, source_authority)?;
         chat::native_holder::publish_actor_close(
             &self.identity.record,
             &self.proof,

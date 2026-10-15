@@ -236,6 +236,11 @@ impl Server {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .generation;
+        // restart() already positively closed/joined this exact old actor.
+        // Include ALL final metadata generations before the same Store is
+        // bound to a replacement LocalHandle; preparation's Store is unused.
+        self.actor.0.store.lock().unwrap_or_else(|p| p.into_inner())
+            .note_source_generation_floor(old_generation);
         let account_scope = self
             .actor
             .launch_account_scope()

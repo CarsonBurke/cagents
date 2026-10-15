@@ -16,6 +16,13 @@ enum Owner {
     Remote(RemoteActor),
 }
 impl Handle {
+    /// Cached exact Store authority, with no transcript read or helper RPC.
+    pub(crate) fn source_authority(&self) -> Option<super::SourceAuthority> {
+        match &self.0 {
+            Owner::Local(local) => local.source_authority(),
+            Owner::Remote(remote) => remote.state().source_authority,
+        }
+    }
     /// Exact authenticated helper metadata. Callers must compare the complete
     /// record against an installed host entry; this is never cleanup authority.
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
@@ -516,10 +523,7 @@ impl Handle {
     ) -> Option<crate::terminal_ipc::ServerResponse> {
         match &self.0 {
             Owner::Local(local) => local.presentation(chat_id, after),
-            Owner::Remote(remote) => remote
-                .call("presentation", serde_json::json!([chat_id, after]))
-                .ok()
-                .flatten(),
+            Owner::Remote(remote) => remote.presentation(chat_id, after),
         }
     }
     pub fn session_id(&self) -> Option<String> {
