@@ -648,7 +648,7 @@ pub enum RepositoryAction {
     FindLoaded {
         card: CardId,
         ticket: uuid::Uuid,
-        result: Result<Option<Vec<(text_editor::Position, text_editor::Position)>>, String>,
+        result: Result<Option<text_editor::MatchIndex>, String>,
     },
     ReplaceQueryChanged {
         card: CardId,
@@ -1836,14 +1836,13 @@ fn visible_diff_rows(rows: &RowOffsets, viewport: ListViewport) -> VisibleRows {
 type FindScope = ((usize, usize), (usize, usize));
 
 fn scoped_matches(
-    matches: &mut Vec<(text_editor::Position, text_editor::Position)>,
+    matches: &mut text_editor::MatchIndex,
     scope: Option<FindScope>,
 ) {
-    if let Some((first, last)) = scope {
-        matches.retain(|(start, end)| {
-            (start.line, start.column) >= first && (end.line, end.column) <= last
-        });
-    }
+    *matches=matches.scoped(scope.map(|(first,last)|(
+        text_editor::Position {line:first.0,column:first.1},
+        text_editor::Position {line:last.0,column:last.1},
+    )));
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1944,7 +1943,7 @@ pub struct RepositoryRuntime {
     replace_open: bool,
     replace_query: String,
     toolbar_overflow_open: bool,
-    find_matches: Vec<(text_editor::Position, text_editor::Position)>,
+    find_matches: text_editor::MatchIndex,
     find_cache: Option<FindKey>,
     find_snapshot: Option<(u64, u64, Arc<text_editor::SearchSnapshot>)>,
     find_active: Option<FindJob>,
@@ -2133,7 +2132,7 @@ impl RepositoryRuntime {
             replace_open: false,
             replace_query: String::new(),
             toolbar_overflow_open: false,
-            find_matches: Vec::new(),
+            find_matches: text_editor::MatchIndex::default(),
             find_cache: None,
             find_snapshot: None,
             find_active: None,
@@ -3129,7 +3128,7 @@ impl RepositoryRuntime {
             query: query.to_owned(),
         };
         if self.find_cache.as_ref() != Some(&key) {
-            self.find_matches = document.content.find_matches(query);
+            self.find_matches = document.content.find_matches_with(query,Default::default()).ok()?;
             self.find_cache = Some(key);
         }
         self.select_cached_match(occurrence)
@@ -3147,7 +3146,7 @@ impl RepositoryRuntime {
                 .perform(text_editor::Action::ClearSelection);
             return None;
         }
-        let (start, end) = self.find_matches[occurrence % total];
+        let (start, end) = self.find_matches.get(occurrence % total).expect("current find occurrence");
         document.content.move_to(text_editor::Cursor {
             position: end,
             selection: Some(start),
@@ -3447,7 +3446,7 @@ impl RepositoryRuntime {
     fn finish_find(
         &mut self,
         ticket: uuid::Uuid,
-        result: Result<Option<Vec<(text_editor::Position, text_editor::Position)>>, String>,
+        result: Result<Option<text_editor::MatchIndex>, String>,
     ) {
         if self
             .find_active
@@ -3538,10 +3537,7 @@ impl RepositoryRuntime {
             origin = origin.min((anchor.line, anchor.column));
         }
         origin = self.find_origin.unwrap_or(origin);
-        self.find_matches
-            .iter()
-            .take_while(|(start, _)| (start.line, start.column) < origin)
-            .count()
+        self.find_matches.partition_point(|(start,_)|(start.line,start.column)<origin)
     }
 
     /// Applies a completion's edits to the open buffer.
@@ -6060,7 +6056,7 @@ impl RepositoryRuntime {
                         protocols.push(protocol);
                     }
                 } else {
-                    let (start, end) = self.find_matches[self.find_index];
+                    let (start, end) = self.find_matches.get(self.find_index).expect("current find occurrence");
                     let replacement = document.content.with_line(start.line, |line, _| {
                         crate::editor_search::replacement(
                             line,
@@ -8789,11 +8785,7 @@ fn editable_document_view<'a>(
             )
             .font(runtime.editor_font)
             .find_matches(
-                if runtime.find_open {
-                    &runtime.find_matches
-                } else {
-                    &[]
-                },
+                runtime.find_open.then_some(&runtime.find_matches),
                 runtime.find_index,
             )
             .size(runtime.editor_font_size)
@@ -18441,6 +18433,33 @@ mod tests {
     }
 
     #[test]
+    fn compact_dense_find_preserves_all_occurrences_wraps_and_one_undo_replace_all() {
+        let card=CardId::new();
+        let text="a".repeat(16*1024);
+        let (mut runtime,_)=RepositoryRuntime::open_fixture(card,"dense.txt",&text);
+        drop(runtime.update(RepositoryAction::OpenFind {card}));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {card,query:"a".into()}));
+        assert_eq!(runtime.find_total,text.len());
+        assert!(runtime.find_matches.retained_bytes()<1024);
+        let allocation=runtime.find_matches.allocation_id();
+        drop(runtime.update(RepositoryAction::FindPrevious {card}));
+        assert_eq!(runtime.find_index,text.len()-1);
+        assert_eq!(runtime.find_matches.get(runtime.find_index).unwrap().0.column,text.len()-1);
+        drop(runtime.update(RepositoryAction::FindNext {card}));
+        assert_eq!(runtime.find_index,0);
+        assert_eq!(runtime.find_matches.allocation_id(),allocation);
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {card,query:"b".into()}));
+        drop(runtime.update(RepositoryAction::ReplaceMatch {card,all:true}));
+        assert_eq!(buffer_text(&runtime),"b".repeat(text.len()));
+        assert_eq!(runtime.find_total,0);
+        drop(runtime.update(RepositoryAction::Undo {card}));
+        assert_eq!(buffer_text(&runtime),text);
+        assert_eq!(runtime.find_total,text.len());
+        drop(runtime.update(RepositoryAction::Redo {card}));
+        assert_eq!(buffer_text(&runtime),"b".repeat(text.len()));
+    }
+
+    #[test]
     fn find_navigation_reuses_cached_match_storage_and_open_starts_from_selection() {
         let card = CardId::new();
         let (mut runtime, _) =
@@ -18448,12 +18467,12 @@ mod tests {
         assert_eq!(runtime.select_text_match("alpha", 1), Some(3));
         drop(runtime.update(RepositoryAction::OpenFind { card }));
         assert_eq!(runtime.find_index, 1);
-        let cached = runtime.find_matches.as_ptr();
+        let cached = runtime.find_matches.allocation_id();
         for _ in 0..100 {
             drop(runtime.update(RepositoryAction::FindNext { card }));
-            assert_eq!(runtime.find_matches.as_ptr(), cached);
+            assert_eq!(runtime.find_matches.allocation_id(), cached);
             drop(runtime.update(RepositoryAction::FindPrevious { card }));
-            assert_eq!(runtime.find_matches.as_ptr(), cached);
+            assert_eq!(runtime.find_matches.allocation_id(), cached);
             assert_eq!(runtime.find_index, 1);
         }
     }
@@ -18508,9 +18527,9 @@ mod tests {
         assert_eq!(runtime.find_total, 0);
         drop(runtime.update(find_output(latest)));
         assert_eq!(runtime.find_total, 3000);
-        let cached = runtime.find_matches.as_ptr();
+        let cached = runtime.find_matches.allocation_id();
         drop(runtime.update(RepositoryAction::FindNext { card }));
-        assert_eq!(runtime.find_matches.as_ptr(), cached);
+        assert_eq!(runtime.find_matches.allocation_id(), cached);
         assert!(runtime.find_active.is_none());
 
         let DocumentState::Editable(document) = &mut runtime.document else {
@@ -18605,7 +18624,7 @@ mod tests {
 
         drop(replacement.update(find_output(current)));
         assert_eq!(replacement.find_total, 3000);
-        assert_eq!(replacement.find_matches[0].0.column, 6);
+        assert_eq!(replacement.find_matches.get(0).unwrap().0.column, 6);
         assert!(replacement.find_active.is_none());
     }
 
