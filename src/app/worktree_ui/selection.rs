@@ -248,6 +248,53 @@ mod tests {
     }
 
     #[test]
+    fn blocked_production_preparation_keeps_real_old_lease_then_installs_new_lease_before_exposure() {
+        use crate::worktree_cleanup::fixture_protection;
+        let runtime = tempfile::tempdir().unwrap();
+        let old = tempfile::tempdir().unwrap();
+        let next = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.known_worktree_roots.extend([old.path().to_owned(),next.path().to_owned()]);
+        drop(app.select_worktree_inner(old.path().to_owned(),false));
+        app.worktree_protections.install_prepared(Some(fixture_protection(runtime.path(),old.path(),false).unwrap()));
+        app.worktree_selection.cancel();
+        app.worktree_selection.pending = true;
+        let generation = app.worktree_selection.generation;
+        let epoch = app.worktree_owner_paths.invalidate_watched();
+        let monitor = app.worktree_owner_paths.watch.clone();
+        let roots = vec![(old.path().to_owned(),None,true),(next.path().to_owned(),None,true)];
+        let worker_runtime = runtime.path().to_owned();
+        let (entered,entered_rx) = crossbeam_channel::bounded(1);
+        let (release,release_rx) = crossbeam_channel::bounded(1);
+        let task = app.prepare_worktree_selection(generation,next.path().to_owned(),false,Intent::Navigate,epoch,move |path| {
+            prepare_target(path,roots,None,&monitor,|path|path.canonicalize(),|physical| {
+                entered.send(()).unwrap();
+                release_rx.recv().unwrap();
+                fixture_protection(&worker_runtime,physical,false).map(Some)
+            })
+        });
+        let worker = std::thread::spawn(move || crate::app::tests::task_app_message(task));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let input_started = Instant::now();
+        drop(app.update(Message::SettingsSearchChanged("typing before lease acquisition".into())));
+        eprintln!("blocked_real_selection_lease_input_elapsed_us={}",input_started.elapsed().as_micros());
+        assert_eq!(app.settings_search,"typing before lease acquisition");
+        assert_eq!(app.active_workspace.as_deref(),Some(old.path()));
+        assert!(matches!(fixture_protection(runtime.path(),old.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        drop(fixture_protection(runtime.path(),next.path(),true).unwrap());
+        release.send(()).unwrap();
+        let Message::WorktreeSelectionPrepared {generation,create,receipt} = worker.join().unwrap() else {panic!("unexpected selection reply")};
+        // A completed receipt owns the new guard before it is committed.
+        assert_eq!(app.active_workspace.as_deref(),Some(old.path()));
+        assert!(matches!(fixture_protection(runtime.path(),next.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        drop(app.worktree_selection_prepared(generation,create,receipt));
+        assert_eq!(app.active_workspace.as_deref(),Some(next.path()));
+        assert!(matches!(fixture_protection(runtime.path(),next.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        drop(app);
+        fixture_protection(runtime.path(),next.path(),true).unwrap();
+    }
+
+    #[test]
     fn failed_watch_does_not_invalidate_every_prepared_selection_receipt() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.worktree_owner_paths.watch.force_unavailable_for_test();

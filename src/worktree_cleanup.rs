@@ -424,6 +424,11 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
     acquire(&crate::instance::runtime_directory()?, directory, false).map(Some)
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_protection(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Protection> {
+    acquire(runtime,directory,exclusive)
+}
+
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
 #[derive(Default, Clone)]
