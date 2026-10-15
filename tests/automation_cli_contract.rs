@@ -787,56 +787,112 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
         model::{BootId, CardId, CardKind, CardState, Existence, Exposure, Residency, WorkspaceState},
         persistence::{SnapshotBase, StateStore},
     };
-    // Even if an assertion fails after native confirmation, retire only this
-    // fixture's exact peer before the daemon guard is dropped. A durable peer
-    // may intentionally outlive its daemon; killing only the daemon is not cleanup.
-    struct PeerCleanup(std::path::PathBuf);
-    impl Drop for PeerCleanup {
-        fn drop(&mut self) {
-            let Ok(bytes) = fs::read(self.0.join("codex-process.json")) else { return; };
-            let Ok(identity) = serde_json::from_slice::<Value>(&bytes) else { return; };
-            let Some(pid) = identity["pid"].as_u64().and_then(|pid| i32::try_from(pid).ok()).filter(|pid| *pid > 1) else { return; };
-            let Some(start) = identity["start_ticks"].as_str() else { return; };
-            // Pin this process before the identity recheck: a PID recycled
-            // between a /proc read and kill must never receive our signal.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open,pid,0) };
-            if fd < 0 { return; }
-            let same = fs::read_to_string(format!("/proc/{pid}/stat")).ok().is_some_and(|stat|stat.rsplit_once(')').and_then(|(_,tail)|tail.split_whitespace().nth(19)) == Some(start));
-            if same {
-                // SAFETY: the owned pidfd pins the exact start-ticks-checked
-                // indirect child recorded by this private fixture.
-                unsafe { libc::syscall(libc::SYS_pidfd_send_signal,fd as i32,libc::SIGKILL,std::ptr::null::<libc::siginfo_t>(),0); }
-                let deadline = Instant::now() + Duration::from_secs(3);
-                let mut settled = false;
-                while Instant::now() < deadline {
-                    let millis = deadline.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32;
-                    let mut poll = libc::pollfd {fd:fd as i32,events:libc::POLLIN,revents:0};
-                    // SAFETY: one initialized pollfd retains the same owned
-                    // process handle until positive exit readiness or deadline.
-                    let ready = unsafe { libc::poll(&mut poll,1,millis) };
-                    if ready > 0 && poll.revents & libc::POLLIN != 0 {
-                        settled = true;
-                        break;
-                    }
-                    if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                        break;
-                    }
+    const ROLE: &str = "CAGENTS_DELAYED_ARCHIVE_TEST_ROLE";
+    const TEST: &str = "delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provider_restart";
+    let role = std::env::var(ROLE).unwrap_or_default();
+    if role.is_empty() {
+        // Keep process-wide subreaper state out of the ordinary test runner.
+        let status = Command::new(std::env::current_exe().unwrap()).args(["--exact",TEST,"--nocapture"]).env(ROLE,"controller").status().unwrap();
+        assert!(status.success(),"isolated archive fixture/controller failed: {status}");
+        return;
+    }
+    if role == "controller" {
+        struct Family { settled:bool }
+        impl Family {
+            fn identity(pid:i32) -> std::io::Result<(u32,String)> {
+                let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+                let fields:Vec<_> = stat.rsplit_once(')').ok_or_else(||std::io::Error::other("invalid child stat"))?.1.split_whitespace().collect();
+                Ok((fields.get(1).ok_or_else(||std::io::Error::other("missing child parent"))?.parse().map_err(std::io::Error::other)?,fields.get(19).ok_or_else(||std::io::Error::other("missing child start"))?.to_string()))
+            }
+            fn kill_direct(pid:i32) -> std::io::Result<()> {
+                use std::os::fd::{AsRawFd,FromRawFd};
+                let before = match Self::identity(pid) {
+                    Ok(value) => value,
+                    Err(error) if error.kind()==std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                if before.0 != std::process::id() { return Err(std::io::Error::other("fixture child parent changed")); }
+                let raw = unsafe { libc::syscall(libc::SYS_pidfd_open,pid,0) };
+                if raw < 0 {
+                    let error = std::io::Error::last_os_error();
+                    return if error.raw_os_error()==Some(libc::ESRCH) { Ok(()) } else { Err(error) };
                 }
-                if !settled {
-                    unsafe { libc::close(fd as i32); }
-                    if std::thread::panicking() {
-                        eprintln!("fixture cleanup failed: exact Codex peer {pid}/{start} did not settle after pidfd signal");
-                        return;
+                // SAFETY: pidfd_open returned one newly owned descriptor.
+                let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+                match Self::identity(pid) {
+                    Ok(after) if after==before=>{},
+                    Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(()),
+                    Ok(_)=>return Err(std::io::Error::other("fixture child identity changed after pinning")),
+                    Err(error)=>return Err(error),
+                }
+                // SAFETY: the pidfd pins the start/parent-checked direct child.
+                let sent = unsafe { libc::syscall(libc::SYS_pidfd_send_signal,fd.as_raw_fd(),libc::SIGKILL,std::ptr::null::<libc::siginfo_t>(),0) };
+                if sent < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error()!=Some(libc::ESRCH) { return Err(error); }
+                }
+                Ok(())
+            }
+            fn finish(&mut self) -> Result<(),String> {
+                if self.settled { return Ok(()); }
+                let deadline = Instant::now()+Duration::from_secs(5);
+                loop {
+                    loop {
+                        let mut status = 0;
+                        let reaped = unsafe { libc::waitpid(-1,&mut status,libc::WNOHANG) };
+                        if reaped > 0 { eprintln!("archive fixture reaped child {reaped}: wait status {status}");continue; }
+                        if reaped == 0 { break; }
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error()==Some(libc::ECHILD) {
+                            self.settled=true;
+                            eprintln!("archive fixture family settled: kernel ECHILD");
+                            return Ok(());
+                        }
+                        if error.kind()!=std::io::ErrorKind::Interrupted { return Err(format!("fixture waitpid failed: {error}")); }
                     }
-                    panic!("fixture cleanup failed: exact Codex peer {pid}/{start} did not settle after pidfd signal");
+                    if Instant::now()>=deadline { return Err("fixture family did not settle before its deadline".into()); }
+                    let mut children=std::collections::BTreeSet::new();
+                    for task in fs::read_dir("/proc/self/task").map_err(|error|format!("fixture task census failed: {error}"))? {
+                        let task=task.map_err(|error|error.to_string())?;
+                        let members=match fs::read_to_string(task.path().join("children")) {
+                            Ok(value)=>value,
+                            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>continue,
+                            Err(error)=>return Err(format!("fixture child census failed: {error}")),
+                        };
+                        for member in members.split_whitespace() { children.insert(member.parse::<i32>().map_err(|error|error.to_string())?); }
+                    }
+                    for child in children { Self::kill_direct(child).map_err(|error|format!("cannot retire exact fixture child {child}: {error}"))?; }
+                    thread::sleep(Duration::from_millis(10));
                 }
             }
-            unsafe { libc::close(fd as i32); }
         }
+        impl Drop for Family {
+            fn drop(&mut self) {
+                if let Err(error)=self.finish() {
+                    eprintln!("archive fixture cleanup FAILED: {error}");
+                    if !std::thread::panicking() { panic!("{error}"); }
+                }
+            }
+        }
+        // Every orphaned fixture holder/provider remains a descendant of this
+        // dedicated controller, even after it leaves the worker's session.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER,1,0,0,0) },0);
+        let mut family=Family{settled:false};
+        let mut worker=Command::new(std::env::current_exe().unwrap()).args(["--exact",TEST,"--nocapture"]).env(ROLE,"worker").spawn().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(90);
+        let outcome=loop {
+            if let Some(status)=worker.try_wait().unwrap() { break Some(status); }
+            if Instant::now()>=deadline { Family::kill_direct(worker.id() as i32).unwrap();break None; }
+            thread::sleep(Duration::from_millis(10));
+        };
+        eprintln!("archive fixture worker outcome: {outcome:?}");
+        family.finish().unwrap();
+        assert!(outcome.is_some_and(|status|status.success()),"archive fixture worker failed/timed out: {outcome:?}");
+        return;
     }
+    assert_eq!(role,"worker","unknown isolated fixture role");
     let fixture = Fixture::new();
     let root = fixture.root.path();
-    let _peer_cleanup = PeerCleanup(root.to_owned());
     let project = root.join("project");
     fixture.cli(&["project", "open", project.to_str().unwrap()]);
     fs::write(root.join("automation-codex-fixture"), uuid::Uuid::new_v4().to_string()).unwrap();
