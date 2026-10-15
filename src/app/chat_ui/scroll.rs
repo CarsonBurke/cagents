@@ -234,8 +234,9 @@ struct LocateLogical {
     byte: usize,
     content: Option<Rectangle>,
     viewport: Option<Rectangle>,
-    found: Option<(Rectangle, u8)>,
+    found: Option<(Rectangle, u8, Option<HorizontalLocation>)>,
     horizontal: Vec<(Id, Rectangle, Rectangle)>,
+    pending_horizontal: Option<(Id, Rectangle, Rectangle)>,
     active: bool,
     scopes: Vec<bool>,
 }
@@ -244,15 +245,23 @@ impl LocateLogical {
         if self
             .found
             .as_ref()
-            .is_none_or(|(_, previous)| stage >= *previous)
+            .is_none_or(|(_, previous, _)| stage >= *previous)
         {
-            self.found = Some((bounds, stage));
+            let horizontal = (stage >= 2).then(|| self.horizontal.last()).flatten().map(|(id, viewport, content)| HorizontalLocation {
+                id: id.clone(),
+                offset: (bounds.x - content.x - (viewport.width - bounds.width) / 2.0)
+                    .clamp(0.0, (content.width - viewport.width).max(0.0)),
+            });
+            self.found = Some((bounds, stage, horizontal));
         }
     }
 }
 impl Operation<Option<LogicalLocation>> for LocateLogical {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<LogicalLocation>>)) {
+        let previous = self.horizontal.len();
+        if let Some(viewport) = self.pending_horizontal.take() { self.horizontal.push(viewport); }
         visit(self);
+        self.horizontal.truncate(previous);
     }
     fn scrollable(
         &mut self,
@@ -268,7 +277,7 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
             self.viewport = Some(viewport);
         } else if content.width > viewport.width + 1.0 {
             if let Some(id) = id {
-                self.horizontal.push((id.clone(), viewport, content));
+                self.pending_horizontal = Some((id.clone(), viewport, content));
             }
         }
     }
@@ -307,36 +316,11 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         }
     }
     fn finish(&self) -> operation::Outcome<Option<LogicalLocation>> {
-        operation::Outcome::Some(self.content.zip(self.viewport).zip(self.found).map(
-            |((content, viewport), (found, stage))| {
+        operation::Outcome::Some(self.content.zip(self.viewport).zip(self.found.as_ref()).map(
+            |((content, viewport), (found, stage, horizontal))| {
                 let travel = (content.height - viewport.height).max(0.0);
-                let from_top = (found.y - content.y - (viewport.height - found.height) / 2.0)
-                    .clamp(0.0, travel);
-                LogicalLocation {
-                    offset: travel - from_top,
-                    exact: stage == 3,
-                    stage,
-                    horizontal: self
-                        .horizontal
-                        .iter()
-                        .rev()
-                        .find_map(|(id, viewport, content)| {
-                            if stage < 2 {
-                                return None;
-                            }
-                            let center = Point::new(
-                                found.x + found.width / 2.0,
-                                found.y + found.height / 2.0,
-                            );
-                            content.contains(center).then(|| HorizontalLocation {
-                                id: id.clone(),
-                                offset: (found.x
-                                    - content.x
-                                    - (viewport.width - found.width) / 2.0)
-                                    .clamp(0.0, (content.width - viewport.width).max(0.0)),
-                            })
-                        }),
-                }
+                let from_top = (found.y - content.y - (viewport.height - found.height) / 2.0).clamp(0.0, travel);
+                LogicalLocation { offset: travel - from_top, exact: *stage == 3, stage: *stage, horizontal: horizontal.clone() }
             },
         ))
     }
@@ -357,6 +341,7 @@ pub(super) fn locate_logical(
         viewport: None,
         found: None,
         horizontal: Vec::new(),
+        pending_horizontal: None,
         active: false,
         scopes: Vec::new(),
     })
@@ -1530,6 +1515,49 @@ mod tests {
     }
 
     #[test]
+    fn logical_find_uses_horizontal_ancestors_without_moving_overlapping_siblings() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target { card: CardId::new(), generation: 0 };
+        let identity = 0x7618;
+        let earlier = Id::new("earlier-overlapping-content");
+        let outer = Id::new("actual-outer-viewport");
+        let inner = Id::new("actual-inner-viewport");
+        for nested in [false, true] {
+            let prose = selectable_prose::logical_text(
+                vec![iced::widget::text::Span::new("matching prose".to_owned())].into(),
+                design::TEXT_BODY.into(), iced::Font::MONOSPACE, target, None,
+                selectable_prose::Logical { identity, start: 0, paint: None });
+            let matched: Element<'static, Message> = if nested {
+                widget::scrollable(widget::container(widget::scrollable(widget::container(prose).width(4000))
+                    .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+                    .id(inner.clone())).width(6000))
+                    .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+                    .id(outer.clone()).into()
+            } else { prose };
+            let sibling = widget::scrollable(widget::Space::new().width(30000).height(10000))
+                .direction(iced::widget::scrollable::Direction::Horizontal(design::scrollbar()))
+                .height(80).id(earlier.clone());
+            let mut element = transcript(widget::column::with_children(vec![sibling.into(), item("answer", matched),
+                widget::Space::new().height(1000).into()]), target, None, vec![], false, vec![]);
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0)));
+            let result = Arc::new(std::sync::Mutex::new(None)); let sink = result.clone();
+            let mut locate = operation::map(LocateLogical {
+                scroll: card_control_id(target.card, "chat-transcript"), item: item_id("answer"), identity, byte: 0,
+                content: None, viewport: None, found: None, horizontal: vec![], pending_horizontal: None,
+                active: false, scopes: vec![],
+            }, move |location| { *sink.lock().unwrap() = location; });
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut locate);
+            let _ = locate.finish();
+            let location = result.lock().unwrap().take().expect("target glyph is mounted");
+            assert!(location.exact);
+            assert_eq!(location.horizontal.map(|viewport| viewport.id), nested.then(|| inner.clone()),
+                "only the nearest native ancestor belongs to this match; overlapping sibling content is unrelated");
+        }
+    }
+
+    #[test]
     fn logical_find_geometry_is_scoped_to_its_transcript_when_source_ids_repeat() {
         let renderer = crate::app::tests::headless_renderer();
         let target = Target { card: CardId::new(), generation: 0 };
@@ -1555,7 +1583,7 @@ mod tests {
         let mut locate = operation::map(LocateLogical {
             scroll: card_control_id(target.card, "chat-transcript"), item: item_id("shared-source"),
             identity, byte: 0, content: None, viewport: None, found: None,
-            horizontal: vec![], active: false, scopes: vec![],
+            horizontal: vec![], pending_horizontal: None, active: false, scopes: vec![],
         }, move |location| { *sink.lock().unwrap() = location; });
         first.as_widget_mut().operate(&mut first_tree, Layout::new(&first_node), &renderer, &mut locate);
         let _ = locate.finish();
@@ -1627,6 +1655,7 @@ mod tests {
                         viewport: None,
                         found: None,
                         horizontal: Vec::new(),
+        pending_horizontal: None,
         active: false,
         scopes: Vec::new(),
                     },
@@ -1873,6 +1902,7 @@ mod tests {
                         viewport: None,
                         found: None,
                         horizontal: Vec::new(),
+        pending_horizontal: None,
         active: false,
         scopes: Vec::new(),
                     },
