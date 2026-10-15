@@ -215,6 +215,8 @@ pub enum Action {
 
 impl Cagents {
     pub(super) fn sync_worktree_protections(&mut self) {
+        #[cfg(test)]
+        super::terminal_output_tests::record_protection();
         let mut paths = Vec::new();
         if let Some(path) = &self.active_workspace {
             paths.push(path.clone());

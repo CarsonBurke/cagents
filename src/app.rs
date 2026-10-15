@@ -42,6 +42,8 @@ mod terminal_close;
 mod terminal_end_ui;
 mod terminal_failure;
 mod terminal_ui;
+#[cfg(test)]
+mod terminal_output_tests;
 mod update_ui;
 mod workspace_model_sync;
 mod worktree_dialog;
@@ -8479,24 +8481,31 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    fn drain_terminal(&mut self, card: CardId, _generation: u64) -> Task<Message> {
+    fn drain_terminal(&mut self, card: CardId, generation: u64) -> Task<Message> {
+        self.drain_terminal_update(card, generation).0
+    }
+
+    /// Drain controls and lifecycle events on every wake, independently of grid
+    /// repaint. Only actual metadata changes need the workspace projection tail.
+    fn drain_terminal_update(&mut self, card: CardId, _generation: u64) -> (Task<Message>, bool) {
         if self.chat_start_pending(card) {
-            return Task::none();
+            return (Task::none(), false);
         }
         let (proof, collected) = {
             let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
-                return Task::none();
+                return (Task::none(), false);
             };
             let events = handle.events();
             (handle.host_proof(), events.try_iter().collect::<Vec<_>>())
         };
         let mut durable_changed = false;
+        let mut metadata_changed = false;
         let mut recovery = None;
         let mut clipboard_task = Task::none();
         if let Some(proof) = proof
             && ended_terminal(self.card_state(card)).is_none()
         {
-            self.uncertain_terminal_proofs.remove(&card);
+            metadata_changed |= self.uncertain_terminal_proofs.remove(&card).is_some();
             let live = TerminalContinuity::Live {
                 host_session_id: proof.host_session_id,
                 boot_id: proof.boot_id,
@@ -8521,14 +8530,20 @@ impl Cagents {
                 // not bring a finished agent's row back to life.
                 TerminalEvent::AgentActivityChanged(activity) => {
                     if ended_terminal(self.card_state(card)).is_none() {
-                        self.observe_agent_activity_for_card(card, activity);
+                        if self.sidebar_state.card_activity(card) != activity {
+                            self.observe_agent_activity_for_card(card, activity);
+                            metadata_changed = true;
+                        }
                     }
                 }
                 TerminalEvent::TitleChanged(title) => {
                     durable_changed |= self.apply_reported_title(card, title);
                 }
                 TerminalEvent::WorkingDirectoryChanged(path) => {
-                    self.terminal_working_directories.insert(card, path);
+                    if self.terminal_working_directories.get(&card) != Some(&path) {
+                        self.terminal_working_directories.insert(card, path);
+                        metadata_changed = true;
+                    }
                 }
                 TerminalEvent::ClipboardText { request, text } => {
                     if let Some(find) = self.terminal_find.get_mut(&card)
@@ -8551,23 +8566,30 @@ impl Cagents {
                 }
                 TerminalEvent::ConversationTitleChanged(title) => {
                     if let Some(title) = crate::workspace_model::channel_title(&title) {
+                        let previous = Arc::clone(&self.durable);
                         self.suggest_channel_title(
                             card,
                             title,
                             crate::model::ChannelTitleSource::Provider,
                         );
+                        metadata_changed |= !Arc::ptr_eq(&previous, &self.durable);
                     }
                 }
                 TerminalEvent::ResumeHintChanged(hint) => {
-                    if let Some(state) = self.card_state_mut(card)
+                    if self.card_state(card).is_some_and(|state| {
+                        matches!(&state.kind, CardKind::Terminal(session) if session.resume_hint != hint)
+                    })
+                        && let Some(state) = self.card_state_mut(card)
                         && let CardKind::Terminal(session) = &mut state.kind
-                        && session.resume_hint != hint
                     {
                         session.resume_hint = hint;
                         durable_changed = true;
                     }
                 }
-                TerminalEvent::Bell => self.observe_agent_update_for_card(card),
+                TerminalEvent::Bell => {
+                    self.observe_agent_update_for_card(card);
+                    metadata_changed = true;
+                }
                 // Root exit is not PTY completion: a descendant may still
                 // accept input and produce output. Keep its live surface.
                 TerminalEvent::Exited {
@@ -8593,6 +8615,7 @@ impl Cagents {
                     durable_changed = true;
                 }
                 TerminalEvent::Error { operation, message } => {
+                    metadata_changed = true;
                     if matches!(
                         operation,
                         "retain completed terminal history"
@@ -8652,7 +8675,10 @@ impl Cagents {
                 CardRuntime::Terminal(handle) => handle.agent_activity(),
                 _ => None,
             });
-            self.observe_agent_activity_for_card(card, activity);
+            if self.sidebar_state.card_activity(card) != activity {
+                self.observe_agent_activity_for_card(card, activity);
+                metadata_changed = true;
+            }
         }
         // Attention follows semantic agent transitions, not ordinary terminal output.
         if durable_changed {
@@ -8672,7 +8698,7 @@ impl Cagents {
                 }
                 self.cards.insert(card, CardRuntime::Loading);
                 self.restored_agent_attaches.push_back(card);
-                return self.attach_next_restored_agent();
+                return (self.attach_next_restored_agent(), true);
             }
             let residency = Residency::Hydrating {
                 epoch: unix_millis().max(1) as u64,
@@ -8691,9 +8717,12 @@ impl Cagents {
                 Instant::now(),
             );
             self.cards.insert(card, CardRuntime::Loading);
-            return self.start_terminal(card, session, visible, false);
+            return (self.start_terminal(card, session, visible, false), true);
         }
-        Task::batch([clipboard_task, self.refresh_live_terminal_find(card)])
+        (
+            Task::batch([clipboard_task, self.refresh_live_terminal_find(card)]),
+            metadata_changed || durable_changed,
+        )
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -13239,6 +13268,7 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
+        let mut terminal_visual_only = false;
         let task = match message {
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
             Message::Device(action) => self.update_device(action),
@@ -13320,7 +13350,8 @@ impl Application for Cagents {
                 let started =
                     tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::DEBUG)
                         .then(Instant::now);
-                let task = self.drain_terminal(card, generation);
+                let (task, metadata_changed) = self.drain_terminal_update(card, generation);
+                terminal_visual_only = !metadata_changed;
                 if let Some(started) = started {
                     let activity_sequence = match self.cards.get(&card) {
                         Some(CardRuntime::Terminal(handle)) => {
@@ -16435,9 +16466,11 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
-        self.sync_notification_presence();
-        self.sync_worktree_protections();
-        self.sync_popup_keyboard_nav();
+        if !terminal_visual_only {
+            self.sync_notification_presence();
+            self.sync_worktree_protections();
+            self.sync_popup_keyboard_nav();
+        }
         if let Some(notice) = self.status.take()
             && !crate::daemon_health::replaces_notice(&notice.message)
         {
@@ -16455,9 +16488,18 @@ impl Application for Cagents {
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
+        if terminal_visual_only {
+            return Task::batch([
+                task,
+                self.reconcile_notice_popup(),
+                self.release_deferred_navigation_if_unblocked(),
+            ]);
+        }
         if camera_only {
             return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
         }
+        #[cfg(test)]
+        terminal_output_tests::record_projection();
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
         self.refresh_sidebar_channels();
