@@ -62,6 +62,7 @@ impl AccountBindingData {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) enum SessionNamespace { Unconfirmed, Confirmed { native_id: String } }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,4 +160,12 @@ mod tests {
             assert!(UnixPath(bad.to_vec()).validate().is_err());
         }
     }
+    #[test]
+    fn confirmed_namespace_rejects_unknown_nested_authority_fields() {
+        let valid = SessionNamespace::Confirmed { native_id: "exact-native-session".into() };
+        let encoded = serde_json::to_vec(&valid).unwrap();
+        assert_eq!(serde_json::from_slice::<SessionNamespace>(&encoded).unwrap(), valid);
+        assert!(serde_json::from_str::<SessionNamespace>(r#"{"Confirmed":{"native_id":"exact-native-session","future_scope":"unrecognized"}}"#).is_err());
+    }
+
 }
