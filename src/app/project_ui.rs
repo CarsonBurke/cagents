@@ -467,6 +467,8 @@ impl Cagents {
     }
 
     fn open_worktree_delete_dialog(&mut self, target: Target) -> Task<Message> {
+        self.project_ui.cleanup_dialog = None;
+        self.project_ui.remove_dialog = None;
         self.project_ui.next_safety_request += 1;
         let request = self.project_ui.next_safety_request;
         let blocker = self.worktree_deletion_blocker_ignoring_lock(&target, true);
@@ -1000,6 +1002,8 @@ impl Cagents {
                 self.project_ui.next_safety_request += 1;
                 let request = self.project_ui.next_safety_request;
                 let repository = project.repository.clone();
+                self.project_ui.dialog = None;
+                self.project_ui.remove_dialog = None;
                 self.project_ui.cleanup_dialog = Some(CleanupPolicyDialog {
                     repository: repository.clone(),
                     name: project.name.clone(),
@@ -1010,12 +1014,7 @@ impl Cagents {
                 });
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        RepositoryService::system("git")
-                            .disposable_ignored_directories(
-                                &repository,
-                                &CancellationToken::default(),
-                            )
-                            .map_err(|error| error.to_string())
+                        inspect_worktree(&repository, &repository).map(|(_, directories)| directories)
                     })
                     .await
                     .map_err(|error| error.to_string())
@@ -1078,13 +1077,12 @@ impl Cagents {
                 let request = dialog.request;
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        RepositoryService::system("git")
-                            .set_disposable_ignored_directories(
-                                &repository,
-                                &directories,
-                                &CancellationToken::default(),
-                            )
-                            .map_err(|error| error.to_string())
+                        let reply = crate::device_service::request(crate::device_service::Operation::Worktree {
+                            operation: crate::worktree_control::Operation::SetDisposableIgnoredDirectories {
+                                path: repository.clone(), repository, directories,
+                            },
+                        })?;
+                        inspected_worktree(reply).map(|_| ())
                     })
                     .await
                     .map_err(|error| error.to_string())
@@ -1314,6 +1312,8 @@ impl Cagents {
                             return Task::none();
                         }
                         let worktrees = project_worktree_roots(project);
+                        self.project_ui.dialog = None;
+                        self.project_ui.cleanup_dialog = None;
                         self.project_ui.remove_dialog = Some(ProjectRemoval {
                             project: project_id,
                             repository: project.repository.clone(),
@@ -2949,12 +2949,31 @@ fn delete_options_task(target: Target, request: u64, store: crate::persistence::
     })
 }
 
+/// All paths belong to the selected device. The UI never opens a remote
+/// path with local Git or reads a different clone's cleanup policy.
+fn inspect_worktree(repository: &Path, path: &Path) -> Result<(WorktreeSafetySnapshot, Vec<String>), String> {
+    let reply = crate::device_service::request(crate::device_service::Operation::Worktree {
+        operation: crate::worktree_control::Operation::Inspect {
+            repository: repository.to_owned(), path: path.to_owned(),
+        },
+    })?;
+    inspected_worktree(reply)
+}
+
+fn inspected_worktree(reply: crate::device_service::Reply) -> Result<(WorktreeSafetySnapshot, Vec<String>), String> {
+    let crate::device_service::Reply::Worktree(crate::worktree_control::Reply::Inspected {
+        snapshot, disposable_ignored_directories,
+    }) = reply else { return Err("The selected device returned an unexpected worktree inspection reply.".into()); };
+    let safety = serde_json::from_str(&snapshot)
+        .map_err(|error| format!("The selected device returned invalid worktree safety data: {error}"))?;
+    Ok((safety, disposable_ignored_directories))
+
+}
+
 fn safety_read_task(target: Target, request: u64, confirming: bool) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
-            RepositoryService::system("git")
-                .worktree_safety(&target.path, &CancellationToken::default())
-                .map_err(|error| error.to_string())
+            inspect_worktree(&target.repository, &target.path).map(|(safety, _)| safety)
         })
         .await
         .map_err(|error| error.to_string())
@@ -3047,6 +3066,30 @@ fn parse_disposable_directories(value: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worktree_inspection_rejects_wrong_or_malformed_device_reply() {
+        assert!(inspected_worktree(crate::device_service::Reply::Worktree(
+            crate::worktree_control::Reply::Listed { worktrees: Vec::new() })).is_err());
+        assert!(inspected_worktree(crate::device_service::Reply::Worktree(
+            crate::worktree_control::Reply::Inspected { snapshot: "{}".into(), disposable_ignored_directories: vec![] })).is_err());
+    }
+
+    #[test]
+    fn worktree_inspection_preserves_byte_exact_ignored_paths_and_policy_names() {
+        let safety = WorktreeSafetySnapshot {
+            fingerprint: "fresh-device-snapshot".into(), modified: 0, untracked: 1,
+            notable_ignored: vec![crate::repository::RepoPath::from_bytes(b"ignored-\xff").unwrap()],
+            unpushed_commits: 2, detached_only_commits: 0, branch: Some("feature".into()), head_oid: Some("abcd".into()),
+        };
+        let directories = vec!["build,data".to_owned(), "cache ".to_owned()];
+        let reply = crate::device_service::Reply::Worktree(crate::worktree_control::Reply::Inspected {
+            snapshot: serde_json::to_string(&safety).unwrap(), disposable_ignored_directories: directories.clone(),
+        });
+        let (decoded,policy) = inspected_worktree(reply).unwrap();
+        assert_eq!(decoded,safety);
+        assert_eq!(policy,directories);
+    }
+
     use super::*;
     use crate::sidebar::RowDeletion;
 
