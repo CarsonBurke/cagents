@@ -231,6 +231,13 @@ struct Selectable {
 }
 
 impl Selectable {
+    /// Search backgrounds are paint-only: the same shaped prose spans remain
+    /// authoritative for drawing, links, selection, and exact match geometry.
+    fn search_spans(&self,mut visit:impl FnMut(&std::ops::Range<usize>,bool)) {
+        for range in &self.matches {visit(range,false);}
+        if let Some(current)=&self.current {visit(current,true);}
+    }
+
     #[cfg(test)]
     fn selected_spans(&self, state: &State) -> Arc<[Span<'static, String>]> {
         let start = state.anchor.min(state.end);
@@ -490,10 +497,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 }
             }
         }
-        paint_ranges(renderer, paragraph, &self.matches, translation, design::accent_wash(theme));
-        if let Some(current) = &self.current {
-            paint_ranges(renderer,paragraph,std::slice::from_ref(current),translation,design::accent_color(theme));
-        }
+        self.search_spans(|range,current| {
+            paint_ranges(renderer,paragraph,std::slice::from_ref(range),translation,
+                if current {design::accent_color(theme)} else {design::accent_wash(theme)});
+        });
         let selection = state.anchor.min(state.end)..state.anchor.max(state.end);
         if !selection.is_empty() {
             paint_ranges(renderer, paragraph, &[selection], translation, design::accent_color(theme));
@@ -625,6 +632,10 @@ mod tests {
             spans:vec![Span::new("cat cat")].into(),matches:vec![0..3,4..7],current:Some(4..7),
             size:design::TEXT_PROSE.into(),font:iced::Font::default(),
             target:Target {card:CardId::new(),generation:0} };
+        let mut painted=Vec::new();
+        selectable.search_spans(|range,current|painted.push((range.clone(),current)));
+        assert_eq!(painted,vec![(0..3,false),(4..7,false),(4..7,true)],
+            "the actual renderer paints all matched spans and a distinct current overlay");
         let spans = selectable.selected_spans(&State::default());
         assert_eq!(spans.iter().map(|span| span.text.as_ref()).collect::<String>(),"cat cat");
         let ordinary = spans.iter().find(|span| span.text == "cat" && span.highlight.as_ref().is_some_and(|highlight| highlight.background == design::accent_wash(&cosmic::theme::active()).into())).unwrap();
