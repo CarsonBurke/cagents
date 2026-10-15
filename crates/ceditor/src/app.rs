@@ -2813,7 +2813,14 @@ impl Editor {
     }
 
     fn refuse_git_mutation(&mut self, card: CardId) -> Task<Message> {
-        self.notice = Some(self.tab(card).and_then(|tab| tab.sidebar.source_control.as_ref()).and_then(SourceControlModel::mutation_unavailable_reason).or_else(WorktreeAuthority::unsupported_reason).unwrap_or("The original worktree binding is unavailable. Reopen the worktree before changing Git state.").into());
+        let reason = self
+            .tab(card)
+            .and_then(|tab| tab.sidebar.source_control.as_ref())
+            .and_then(SourceControlModel::mutation_unavailable_reason)
+            .map(str::to_owned)
+            .or_else(|| WorktreeAuthority::unsupported_reason().map(str::to_owned))
+            .unwrap_or_else(|| "The original worktree binding is unavailable. Reopen the worktree before changing Git state.".into());
+        self.notice = Some(reason);
         Task::none()
     }
 
@@ -10298,6 +10305,9 @@ mod tests {
                 ..StatusSnapshot::default()
             },
             files: WorkingFiles::default(),
+            last_fetch_unix_ms: None,
+            operation: None,
+            stashes: Vec::new(),
             remotes: Vec::new(),
             local_refs: Vec::new(),
             remote_refs: Vec::new(),

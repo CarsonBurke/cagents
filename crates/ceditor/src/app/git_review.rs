@@ -122,7 +122,7 @@ impl Editor {
     /// Returns Some only for actions owned by this adapter. Operations still
     /// enter the shell's normal Git dispatcher and its per-worktree queue.
     pub(super) fn git_review_sidebar(&mut self, action: &SidebarAction) -> Option<Task<Message>> {
-        use sidebar::{ChangesTab, HistoryCommand, PanelSection};
+        use sidebar::{ChangesTab, HistoryCommand};
         let key = match action {
             SidebarAction::AmendChanged { key, .. }
             | SidebarAction::Commit { key, .. }
@@ -139,10 +139,6 @@ impl Editor {
             | SidebarAction::SetChangesTab {
                 key,
                 tab: ChangesTab::History,
-            }
-            | SidebarAction::ToggleSection {
-                key,
-                section: PanelSection::History,
             } => Some(key),
             SidebarAction::CancelHistoryBranch => None,
             _ => return None,
@@ -247,7 +243,7 @@ impl Editor {
             SidebarAction::LoadMoreHistory { page, .. } => {
                 self.read_history_page(origin, *page, None)
             }
-            SidebarAction::SetChangesTab { .. } | SidebarAction::ToggleSection { .. } => {
+            SidebarAction::SetChangesTab { .. } => {
                 self.ensure_git_history(card)
             }
             SidebarAction::HistoryCommand {
@@ -1201,7 +1197,7 @@ mod tests {
             .source_control
             .as_mut()
             .unwrap()
-            .head_oid = Some("f".repeat(40));
+            .head_oid = Some("f".repeat(40).into_boxed_str());
         run_tasks(&mut app, task);
         let source = app
             .tab(card)
