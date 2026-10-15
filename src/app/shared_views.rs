@@ -867,6 +867,14 @@ impl Cagents {
                     change => change,
                 };
                 let operation = match &change {
+                    Change::RemoveArchivedAutomationSource {before,..} => {
+                        let Some(operation)=self.shared_views.removal_sources.get(&before.id)
+                            .and_then(RemovalSource::archived_membership_operation) else {
+                            self.status=Some(TransientNotice::warning("The original archive removal operation is unavailable. Its shared pane was preserved."));
+                            continue;
+                        };
+                        operation
+                    }
                     Change::Insert { pane, .. }
                         if self.durable.pending_terminal_creations.contains(&pane.id) =>
                     {
@@ -916,7 +924,7 @@ impl Cagents {
     pub(super) fn acknowledge_view_edit(&mut self, scope: Scope, operation: Option<uuid::Uuid>) {
         if let Some(operation) = operation {
             self.shared_views.requested_transfers.remove(&operation);
-            if let Some((_, _, Change::RemoveSource { before, .. })) = self
+            if let Some((_, _, Change::RemoveSource { before, .. } | Change::RemoveArchivedAutomationSource { before, .. })) = self
                 .shared_views
                 .pending
                 .iter()

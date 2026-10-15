@@ -287,6 +287,7 @@ fn send(
         &request,
         ModelEdit::ChangeView {
             change: crate::workspace_model::views::Change::RemoveSource { .. }
+                | crate::workspace_model::views::Change::RemoveArchivedAutomationSource { .. }
                 | crate::workspace_model::views::Change::Remove { .. },
             ..
         }
@@ -385,12 +386,12 @@ fn prepare_removal_request(edit: &mut ModelEdit, model: &WorkspaceModel) -> bool
         // A lost ACK can leave our original operation durably applied. Probe
         // only that same typed operation; the server's atomic source check
         // refuses an unrecorded absent removal without consuming its receipt.
-        let crate::workspace_model::views::Change::RemoveSource {
+        let (crate::workspace_model::views::Change::RemoveSource {
             registry,
             repository,
             before,
             ..
-        } = change
+        } | crate::workspace_model::views::Change::RemoveArchivedAutomationSource {registry,repository,before}) = change
         else {
             return false;
         };
@@ -3339,18 +3340,23 @@ mod tests {
             });
             (ControlClient::from_stream(reader).unwrap(), handle)
         }
+        // The framed peer simulates a durably recorded operation, not the
+        // private archive-owner SQL checks covered by producer fixtures.
+        for archived in [false,true] {
         let (model, scope, before) = removal_wire_fixture();
         let operation = uuid::Uuid::new_v4();
         let edit = ModelEdit::ChangeView {
-            scope,
+            scope:scope.clone(),
             expected_revision: 0,
             operation,
-            change: crate::workspace_model::views::Change::RemoveSource {
+            change: if archived {
+                crate::workspace_model::views::Change::RemoveArchivedAutomationSource {registry:model.identity,repository:"/repo".into(),before:before.clone()}
+            } else { crate::workspace_model::views::Change::RemoveSource {
                 registry: model.identity,
                 repository: "/repo".into(),
-                before,
+                before:before.clone(),
                 execution_instance: None,
-            },
+            } },
         };
         let (updates, rx) = async_channel::unbounded();
         let (mut first, server) = connection(model.clone(), edit.clone(), true);
@@ -3358,7 +3364,7 @@ mod tests {
         drop(first);
         server.join().unwrap();
         assert!(rx.is_empty());
-        let mut applied = model;
+        let mut applied = model.clone();
         applied.sequence += 1;
         applied.views[0].revision += 1;
         applied.views[0].panes.clear();
@@ -3366,9 +3372,12 @@ mod tests {
         send(&mut reconnected, edit, &updates).unwrap();
         drop(reconnected);
         server.join().unwrap();
-        assert!(
-            matches!(rx.try_recv().unwrap(),ModelUpdate::ViewApplied {operation:Some(id),..} if id==operation)
-        );
+        let ModelUpdate::ViewApplied {operation:Some(id),model:acknowledged,..}=rx.try_recv().unwrap() else {panic!("expected successful original operation");};
+        assert_eq!(id,operation);
+        assert!(acknowledged.views[0].panes.is_empty());
+        // Ordinary view acknowledgment/projection is sufficient. Durable report
+        // provenance comes from the Registry receipt, including after lost ACK.
         assert!(rx.is_empty());
+        }
     }
 }
