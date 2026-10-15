@@ -1066,7 +1066,14 @@ mod tests {
         assert_eq!(serde_json::from_str::<HostedSession>(&stored).unwrap(), source);
         db.execute_batch("DROP TRIGGER reject_observed_authority").unwrap();
         fixture.host.lock().unwrap().directory_thread_retry = None;
-        super::super::agent_execution::retain_chat_identity(&fixture.host, fixture.source.id);
+        let instance = fixture.host.lock().unwrap().chats[&fixture.source.id].execution_instance;
+        let reconciled = super::super::agent_execution::reconcile_bound_chat(
+            &fixture.host, &registry, &agent, &fixture.handle, instance,
+        ).unwrap();
+        assert_eq!(reconciled.launch.session_id.as_deref(), Some(thread));
+        assert!(super::super::agent_execution::reconcile_bound_chat(
+            &fixture.host, &registry, &agent, &fixture.handle, uuid::Uuid::new_v4(),
+        ).is_err(), "a replacement actor must never receive stale binding consent");
         let mut expected = fixture.source.clone();
         expected.launch.session_id = Some(thread.into());
         assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, expected);

@@ -450,20 +450,14 @@ fn dispatch(
                 "Provider start returned an unexpected response".into(),
             ));
         };
-        let handle = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .chats
-            .get(&session.id)
-            .ok_or_else(|| {
-                (
-                    State::Interrupted,
-                    "The new agent disappeared before attachment; its launch intent is retained"
-                        .into(),
-                )
-            })?
-            .handle
-            .clone();
+        let (handle, execution_instance) = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let record = state.chats.get(&session.id).filter(|record|
+                HostedSession::Chat(record.session.clone()).same_process(&HostedSession::Chat(session.clone()))
+            ).ok_or_else(|| (State::Interrupted,
+                "The new agent changed before attachment; its exact launch intent was retained".to_owned()))?;
+            (record.handle.clone(), record.execution_instance)
+        };
         let binding = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -472,7 +466,9 @@ fn dispatch(
                 None,
                 HostedSession::Chat(session.clone()),
             );
-        if let Err(error) = binding {
+        let bound = match binding {
+            Ok(bound) => bound,
+            Err(error) => {
             // Teardown is synchronous and uses the same exact actor retirement
             // path as UI close. A failed teardown retains the private launch
             // identity and interrupted capacity instead of losing ownership.
@@ -498,7 +494,10 @@ fn dispatch(
                     ));
                 }
             }
-        }
+            }
+        };
+        let session = reconcile_bound_chat(host, &registry, &bound, &handle, execution_instance)
+            .map_err(|error| (State::Interrupted, format!("Cannot publish the confirmed agent binding: {error}. The exact provider was retained; no prompt was sent.")))?;
         announce(host, &registry);
         (session, handle)
     };
@@ -582,6 +581,45 @@ fn dispatch(
         .map_err(|error| (State::Interrupted, error))?;
     let _ = session;
     Ok(())
+}
+
+/// The private launch may have learned a provider thread after ChatAttached
+/// was captured. Reconcile through the exact stamped actor, then use the actual
+/// canonical Agent row rather than the pre-reconciliation return value.
+pub(super) fn reconcile_bound_chat(
+    host: &SharedHost, registry: &SharedRegistry, bound: &Agent,
+    handle: &chat::runtime::Handle, execution_instance: uuid::Uuid,
+) -> Result<chat::Session, String> {
+    let Some(HostedSession::Chat(source)) = &bound.session else {
+        return Err("The bound agent has no native provider source".into());
+    };
+    if execution_instance.is_nil() || source.proof.as_ref().is_none_or(|proof| !proof.is_complete()) {
+        return Err("The bound provider has no authenticated actor incarnation".into());
+    }
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.chats.get(&source.id).is_some_and(|record|
+            record.execution_instance == execution_instance && record.handle.same_actor(handle)
+                && HostedSession::Chat(record.session.clone()).same_process(&HostedSession::Chat(source.clone()))) {
+            return Err("The exact provider changed before binding reconciliation".into());
+        }
+    }
+    super::session_locations::observe_chat_directory_thread(host, source.id, execution_instance, true)?;
+    let current = registry.lock().unwrap_or_else(|p| p.into_inner()).agent(bound.id)?;
+    if current.closed || current.origin != bound.origin || current.spec != bound.spec {
+        return Err("The accepted agent changed while its binding was reconciled".into());
+    }
+    let Some(HostedSession::Chat(canonical)) = current.session else {
+        return Err("The canonical agent lost its native provider binding".into());
+    };
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if !state.chats.get(&source.id).is_some_and(|record|
+        record.execution_instance == execution_instance && record.handle.same_actor(handle)
+            && HostedSession::Chat(record.session.clone()).same_process(&HostedSession::Chat(canonical.clone()))
+            && record.session.launch.session_id == canonical.launch.session_id) {
+        return Err("The exact provider or confirmed binding changed during reconciliation".into());
+    }
+    Ok(canonical)
 }
 
 /// Save provider-confirmed identity even when no window has opened the chat.
