@@ -268,7 +268,8 @@ impl Cagents {
     pub(super) fn admit_modal_surface_message(&self, message: Message) -> Option<Message> {
         match message {
             Message::ModalSurface { target, message } => {
-                (self.top_modal() == Some(target.modal)
+                (!self.update_prepared
+                    && self.top_modal() == Some(target.modal)
                     && self.modal_stack.focus_revision.load(Ordering::Relaxed) == target.revision
                     && !matches!(&*message, Message::ModalSurface { .. }))
                 .then_some(*message)
@@ -652,6 +653,22 @@ mod tests {
         app.resume_ui.open = false;
         drop(app.finish_modal_update(Task::none()));
         drop(app.update(current));
+        assert!(!app.modal_is_open());
+    }
+
+    #[test]
+    fn prepared_update_freezes_widget_decisions_without_retiring_the_modal() {
+        let mut app = app();
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        let decision = emitted_reset_cancel(&app);
+        app.update_prepared = true;
+        let revision = app.modal_stack.focus_revision.load(Ordering::Relaxed);
+        drop(app.update(decision.clone()));
+        assert!(app.settings_reset_confirm);
+        assert_eq!(app.modal_stack.focus_revision.load(Ordering::Relaxed), revision);
+        app.update_prepared = false;
+        drop(app.update(decision));
         assert!(!app.modal_is_open());
     }
     #[test]
