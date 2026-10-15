@@ -7676,22 +7676,11 @@ impl Cagents {
             }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    let Some(item)=runtime.active_item(&id).cloned() else {return Task::none();};
                     runtime.find_disclosure.manual_item(&id);
                     if !runtime.expanded.remove(&id) {
                         runtime.expanded.insert(id.clone());
                     }
-                    if let Some(item) = runtime
-                        .snapshot
-                        .items
-                        .iter()
-                        .chain(
-                            runtime
-                                .snapshot
-                                .subagents
-                                .iter()
-                                .flat_map(|agent| agent.items.iter()),
-                        )
-                        .find(|item| item.id == id)
                     {
                         let previous = runtime.cache.remove(&id);
                         runtime.cache.insert(
@@ -7744,38 +7733,7 @@ impl Cagents {
                 };
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
-                let text = match part {
-                    part => runtime
-                        .snapshot
-                        .items
-                        .iter()
-                        .chain(
-                            runtime
-                                .snapshot
-                                .subagents
-                                .iter()
-                                .flat_map(|agent| agent.items.iter()),
-                        )
-                        .find(|item| item.id == id)
-                        .and_then(|item| {
-                            if matches!(part,CopyPart::PlainText) && item.role == chat::Role::User {
-                                return copy_text(CopyPart::Text,&item.content);
-                            }
-                            let card = runtime
-                                .cache
-                                .get(&item.id)
-                                .and_then(|cached| cached.coordination.as_deref())
-                                .filter(|coordinated| coordinated.is_card());
-                            match card {
-                                // A message read from a file copies as the
-                                // command that sent it.
-                                Some(card) if matches!(part, CopyPart::Text) => {
-                                    card.copy_text().or_else(|| copy_text(part, &item.content))
-                                }
-                                _ => copy_text(part, &item.content),
-                            }
-                        }),
-                };
+                let text = runtime.active_copy_text(&id,part);
                 if let Some(text) = text {
                     let at = Instant::now();
                     runtime.copied = Some((id, at));

@@ -545,4 +545,30 @@ mod tests {
         assert_eq!(runtime.prompt_attachment_names(ordinary.clone()),ordinary);
     }
 
+    #[test]
+    fn selected_child_copy_and_toggle_use_exact_current_transcript_for_reused_opaque_ids() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);let mut runtime=runtime();let target=runtime.target;
+        let item=|text:&str|Arc::new(chat::Item {id:"shared-opaque-id".into(),role:chat::Role::Assistant,at:None,started_at:None,
+            content:ItemContent::Text {text:text.into(),thinking:false,phase:chat::Phase::Final}});
+        let parent=item("**PARENT** original markdown");let child=item("**CHILD** original markdown");
+        Arc::make_mut(&mut runtime.snapshot).items=vec![parent.clone()];
+        Arc::make_mut(&mut runtime.snapshot).subagents=vec![chat::Subagent {id:"selected-child".into(),kind:String::new(),description:String::new(),status:chat::ToolStatus::Succeeded,
+            model:None,waiting:false,detail:String::new(),background:false,items:vec![child.clone()]}];
+        runtime.selected_subagent=Some("selected-child".into());
+        assert!(Arc::ptr_eq(runtime.active_item("shared-opaque-id").unwrap(),&child));
+        assert_eq!(runtime.active_copy_text("shared-opaque-id",CopyPart::Text).as_deref(),Some("**CHILD** original markdown"));
+        assert_eq!(runtime.active_copy_text("shared-opaque-id",CopyPart::PlainText).as_deref(),Some("CHILD original markdown"));
+        app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::Toggle(target,"shared-opaque-id".into())));
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.expanded.contains("shared-opaque-id"));
+        assert!(runtime.cache["shared-opaque-id"].markdown.items().iter().any(|item|matches!(item,markdown::Item::Paragraph(text) if text.spans(design::markdown_settings(&cosmic::Theme::dark(),design::TEXT_PROSE).style).iter().any(|span|span.text.contains("CHILD")))));
+        runtime.selected_subagent=Some("missing-child".into());runtime.copied=None;
+        assert!(runtime.active_copy_text("shared-opaque-id",CopyPart::Text).is_none());
+        drop(app.handle_chat_ui(Action::Copy(target,"shared-opaque-id".into(),CopyPart::Text)));
+        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        app.chat_runtime_mut(target).unwrap().expanded.clear();drop(app.handle_chat_ui(Action::Toggle(target,"shared-opaque-id".into())));
+        assert!(app.chat_runtime_mut(target).unwrap().expanded.is_empty());
+    }
+
 }

@@ -316,6 +316,23 @@ mod tests {
 }
 
 impl Runtime {
+    /// Opaque provider item IDs are unique only inside one transcript.
+    pub(super) fn active_item(&self,id:&str)->Option<&Arc<chat::Item>> {
+        let items=match self.selected_subagent.as_deref() {
+            Some(selected)=>self.snapshot.subagents.iter().find(|agent|agent.id==selected).map(|agent|agent.items.as_slice()),
+            None=>Some(self.snapshot.items.as_slice()),
+        }?;
+        items.iter().find(|item|item.id==id)
+    }
+    pub(super) fn active_copy_text(&self,id:&str,part:CopyPart)->Option<String> {
+        let item=self.active_item(id)?;
+        if matches!(part,CopyPart::PlainText) && item.role==chat::Role::User {return copy_text(CopyPart::Text,&item.content);}
+        let card=self.cache.get(&item.id).and_then(|cached|cached.coordination.as_deref()).filter(|card|card.is_card());
+        match card {
+            Some(card) if matches!(part,CopyPart::Text)=>card.copy_text().or_else(||copy_text(part,&item.content)),
+            _=>copy_text(part,&item.content),
+        }
+    }
     /// Resident recovery data is deliberately separate from hydrated transcript
     /// bodies. Attachment paths are retained; file bytes remain on disk.
     pub(super) fn recovery_retained_bytes(&self)->(usize,usize) {
