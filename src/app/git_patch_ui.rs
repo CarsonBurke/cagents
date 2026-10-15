@@ -461,6 +461,31 @@ mod tests {
         let (temporary, mut app, card, key) = fixture();
         let original = app.refresh_ui.source_binding.as_ref().unwrap().read_source.as_ref().unwrap().clone();
         drop(app.release_source_control());
+        let other = tempfile::tempdir().unwrap();
+        git_binding::tests::init(other.path(), "other\n");
+        let mut other_project = app.sidebar_model.project(key.project_id).unwrap().clone();
+        other_project.id = ProjectId::new();
+        other_project.repository = other.path().to_owned();
+        let mut other_row = other_project.worktrees.iter().find(|row| row.id == key.worktree_id).unwrap().clone();
+        other_row.id = crate::model::WorktreeId::new();
+        other_row.path = other.path().to_owned();
+        let other_key = ActiveWorktreeKey { project_id: other_project.id,
+            worktree_id: other_row.id, canonical_path: other_row.path.clone() };
+        other_project.worktrees = vec![other_row];
+        app.sidebar_model.projects.push(other_project);
+        app.active_workspace = Some(other.path().to_owned());
+        app.sidebar_state.sync_active_worktree(&app.sidebar_model,
+            &SidebarFocus::Repository { worktree: other.path().to_owned() });
+        app.sidebar_model.source_control = Some(SourceControlModel::loading(other_key.clone()));
+        let other_read = app.reload_source_control(&other_key);
+        let other_loaded = worker_message(other_read, |message| matches!(message, Message::SourceControlLoaded { .. })).await;
+        drop(app.update(other_loaded));
+        assert_ne!(app.refresh_ui.source_binding.as_ref().unwrap().id, original.id());
+        assert!(original.is_available());
+        drop(app.release_source_control());
+        app.active_workspace = Some(key.canonical_path.clone());
+        app.sidebar_state.sync_active_worktree(&app.sidebar_model,
+            &SidebarFocus::Repository { worktree: key.canonical_path.clone() });
         app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
         let reload = app.reload_source_control(&key);
         let binding = app.refresh_ui.source_binding.as_ref().unwrap();
@@ -476,6 +501,28 @@ mod tests {
         drop(app.update(completed));
         assert_eq!(git_binding::tests::git(temporary.path(), &["show", ":file.txt"]).stdout, b"changed\nkeep\n");
         assert_eq!(original.mutation_revision().load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remapped_worktree_row_cannot_reuse_a_mounted_readers_original_actor() {
+        let (_temporary, mut app, card, key) = fixture();
+        let original = app.refresh_ui.source_binding.as_ref().unwrap().read_source.as_ref().unwrap().clone();
+        let mut remapped = key.clone();
+        remapped.worktree_id = crate::model::WorktreeId::new();
+        let row = app.sidebar_model.projects.iter_mut().find(|project| project.id == key.project_id).unwrap()
+            .worktrees.iter_mut().find(|row| row.id == key.worktree_id).unwrap();
+        row.id = remapped.worktree_id;
+        app.refresh_ui.source_binding = git_binding::Binding::from_read_source(remapped.clone(), original.clone());
+        app.sidebar_model.source_control = Some(SourceControlModel::loading(remapped));
+        app.sidebar_model.source_control.as_mut().unwrap().set_command_binding_id(original.id());
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!() };
+        assert!(runtime.capture_diff_mutation(card, git_patch::Kind::Stage, None).is_some(),
+            "the physical/model receipt is still current; this refusal is logical ownership");
+        assert!(!app.runtime_git_source_is_current(card, runtime));
+        drop(app.start_diff_patch(card, git_patch::Kind::Stage, None));
+        drop(app.update(Message::Repository(RepositoryAction::StageSelected { card, stage: true })));
+        assert!(app.source_control_mutations.is_empty());
     }
 
     #[cfg(target_os = "linux")]
