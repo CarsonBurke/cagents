@@ -1615,6 +1615,8 @@ pub(super) struct Runtime {
     image_pastes_saving: usize,
     routing_refresh: bool,
     account_switch_checking: bool,
+    account_switch_checked_idle: Option<u64>,
+    account_switch_recheck: bool,
     pending_account_switch: Option<(AccountId, String)>,
     account_switch_fallback: Option<(AccountId, String)>,
     submit_after_paste: Option<PromptMode>,
@@ -2205,6 +2207,8 @@ impl Runtime {
             image_pastes_saving: 0,
             routing_refresh: false,
             account_switch_checking: false,
+            account_switch_checked_idle: None,
+            account_switch_recheck: false,
             pending_account_switch: None,
             account_switch_fallback: None,
             submit_after_paste: None,
@@ -4182,6 +4186,8 @@ impl Cagents {
             }) {
                 runtime.pending_account_switch = None;
                 runtime.account_switch_fallback = None;
+                runtime.account_switch_checked_idle = None;
+                runtime.account_switch_recheck = false;
                 return Task::none();
             }
             runtime.account_switch_fallback = Some((id.clone(), account_name.clone()));
@@ -4251,17 +4257,26 @@ impl Cagents {
         let Some(runtime) = runtime.filter(|runtime| runtime.target == target) else {
             return Task::none();
         };
-        if runtime.account_switch_checking
-            || runtime.pending.is_some()
-            || !runtime.followups.is_empty()
-        {
+        if runtime.pending.is_some() || !runtime.followups.is_empty() {
             return Task::none();
         }
         let Some((id, _)) = &runtime.pending_account_switch else {
+            runtime.account_switch_recheck = false;
             return Task::none();
         };
+        let observed_idle = runtime.handle().and_then(|handle| handle.account_switch_idle_observation());
+        if runtime.account_switch_checking {
+            // A successful old busy-read may arrive after this newer idle
+            // wake. Remember one fresh observation instead of losing it.
+            if observed_idle.is_some() && observed_idle != runtime.account_switch_checked_idle {
+                runtime.account_switch_recheck = true;
+            }
+            return Task::none();
+        }
         let id = id.clone();
         let source = runtime.session.clone();
+        runtime.account_switch_checked_idle = observed_idle;
+        runtime.account_switch_recheck = false;
         runtime.account_switch_checking = true;
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -6489,13 +6504,22 @@ impl Cagents {
                     return self.probe_queued_account_switch(target);
                 }
                 let generation = match result {
-                    Ok(Some(generation)) => generation,
-                    Ok(None) => return Task::none(),
+                    Ok(Some(generation)) => {
+                        runtime.account_switch_recheck = false;
+                        generation
+                    }
+                    Ok(None) => {
+                        if std::mem::take(&mut runtime.account_switch_recheck) {
+                            return self.probe_queued_account_switch(target);
+                        }
+                        return Task::none();
+                    }
                     Err(error) => {
                         // No handoff was admitted by this read-only query. Stop
                         // the misleading queued wait and expose the retained
                         // explicit continuation, without retrying the transport.
                         runtime.pending_account_switch = None;
+                        runtime.account_switch_recheck = false;
                         runtime.error = Some(error);
                         return Task::none();
                     }
@@ -6521,6 +6545,8 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.pending_account_switch = None;
                     runtime.account_switch_fallback = None;
+                    runtime.account_switch_checked_idle = None;
+                    runtime.account_switch_recheck = false;
                 }
                 return Task::none();
             }
@@ -12233,6 +12259,92 @@ mod tests {
         match app.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
+        }
+    }
+
+    #[test]
+    fn queued_account_switch_retains_one_idle_wake_during_a_busy_read() {
+        fn current(app: &Cagents, card: CardId) -> &Runtime {
+            match app.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => runtime,
+                _ => app.chat_ui.parked.get(&card).unwrap(),
+            }
+        }
+        for parked in [false, true] {
+            for outcome in ["none", "no-wake", "error", "cancel", "stale"] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 449);
+                let card = live_chat(&mut app, Some(KNOWN_THREAD));
+                let target = chat_runtime(&app, card).target;
+                let source = chat_runtime(&app, card).session.clone();
+                let handle = chat_runtime(&app, card).handle().unwrap().clone();
+                let mut busy = handle.snapshot().as_ref().clone();
+                busy.busy = true;
+                busy.generation = 1;
+                handle.publish_snapshot_for_test(busy);
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                Arc::make_mut(&mut runtime.snapshot).busy = true;
+                runtime.replace_draft(text_editor::Content::with_text("Keep queued source work"));
+                drop(app.choose_chat_account(target, alternate.clone()));
+                drop(app.probe_queued_account_switch(target));
+                assert!(current(&app, card).account_switch_checking);
+                if parked {
+                    app.chat_runtime_mut(target).unwrap().show(false);
+                    let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else { panic!("chat") };
+                    app.chat_ui.parked.insert(card, runtime);
+                }
+                if outcome != "no-wake" {
+                    let mut idle = handle.snapshot().as_ref().clone();
+                    idle.busy = false;
+                    idle.generation = 2;
+                    handle.publish_snapshot_for_test(idle);
+                    // This is the actual UI wake path, before the older busy
+                    // query result arrives over its independent connection.
+                    drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+                    assert!(current(&app, card).account_switch_recheck);
+                }
+                if outcome == "cancel" {
+                    drop(app.handle_chat_ui(Action::CancelAccountSwitch(target)));
+                    assert!(!current(&app, card).account_switch_recheck);
+                }
+                let response_target = if outcome == "stale" {
+                    Target { generation: target.generation.wrapping_add(1), ..target }
+                } else { target };
+                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(response_target, alternate.clone(),
+                    if outcome == "error" { Err("Read-only transport failed".into()) } else { Ok(None) })));
+                let runtime = current(&app, card);
+                assert_eq!(runtime.session, source);
+                assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+                assert_eq!(runtime.composer.text(), "Keep queued source work");
+                assert!(!app.chat_start_pending(card));
+                assert!(app.chat_ui.retiring.is_empty());
+                match outcome {
+                    "none" => {
+                        assert!(runtime.account_switch_checking, "fresh idle wake schedules one new read");
+                        assert!(!runtime.account_switch_recheck);
+                        assert_eq!(runtime.account_switch_checked_idle, Some(2));
+                        // No newer semantic idle observation: a second busy
+                        // response must quiesce instead of spinning.
+                        drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
+                        assert!(!current(&app, card).account_switch_checking);
+                        assert!(!current(&app, card).account_switch_recheck);
+                    }
+                    "error" => {
+                        assert!(!runtime.account_switch_checking);
+                        assert!(!runtime.account_switch_recheck);
+                        assert!(runtime.pending_account_switch.is_none());
+                        assert!(runtime.account_switch_fallback.is_some());
+                    }
+                    "cancel" => {
+                        assert!(!runtime.account_switch_checking);
+                        assert!(!runtime.account_switch_recheck);
+                        assert!(runtime.pending_account_switch.is_none());
+                    }
+                    "no-wake" => assert!(!runtime.account_switch_checking),
+                    "stale" => assert!(runtime.account_switch_checking, "stale result cannot consume the current request"),
+                    _ => unreachable!(),
+                }
+            }
         }
     }
 
