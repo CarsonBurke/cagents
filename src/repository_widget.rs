@@ -16176,25 +16176,44 @@ mod tests {
     #[test]
     fn external_editor_caret_maps_actual_mixed_native_line_endings_for_code() {
         let card = CardId::new();
-        let (mut runtime, _) = RepositoryRuntime::open_fixture(
-            card, "mixed.rs", "α\n\rβ\r\nγ\rδ\né😀X",
-        );
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editable"); };
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "mixed.rs", "α\n\rβ\r\nγ\rδ\né😀X");
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editable");
+        };
         assert_eq!(document.content.line_count(), 5);
-        assert_eq!(document.content.with_line(0, |_, ending| ending.as_str()), Some("\n\r"));
+        assert_eq!(
+            document.content.with_line(0, |_, ending| ending.as_str()),
+            Some("\n\r")
+        );
         for (native_line, byte_column, code_line, code_column, scalar_column) in [
-            (0, 0, 1, 1, 1), (1, 0, 3, 1, 1), (2, 0, 4, 1, 1),
-            (3, 0, 5, 1, 1), (4, 6, 6, 4, 3),
+            (0, 0, 1, 1, 1),
+            (1, 0, 3, 1, 1),
+            (2, 0, 4, 1, 1),
+            (3, 0, 5, 1, 1),
+            (4, 6, 6, 4, 3),
         ] {
-            let DocumentState::Editable(document) = &mut runtime.document else { unreachable!(); };
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!();
+            };
             document.content.set_cursor(text_editor::Cursor {
-                position: text_editor::Position { line: native_line, column: byte_column },
+                position: text_editor::Position {
+                    line: native_line,
+                    column: byte_column,
+                },
                 selection: None,
             });
             for editor in ["code", "codium", "cursor"] {
-                assert_eq!(runtime.editor_caret_for(editor), Some((code_line, code_column)), "{editor}");
+                assert_eq!(
+                    runtime.editor_caret_for(editor),
+                    Some((code_line, code_column)),
+                    "{editor}"
+                );
             }
-            assert_eq!(runtime.editor_caret_for("zed"), Some((native_line + 1, scalar_column)));
+            assert_eq!(
+                runtime.editor_caret_for("zed"),
+                Some((native_line + 1, scalar_column))
+            );
         }
     }
 
