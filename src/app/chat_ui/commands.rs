@@ -38,8 +38,12 @@ impl Runtime {
         !transitioning && !self.disconnected && !self.snapshot.exited && self.pending.is_none() && self.queued.is_none()
     }
 
+    pub(super) fn composer_has_text(&self) -> bool {
+        self.composer.lines().any(|line| !line.text.trim().is_empty())
+    }
+
     pub(super) fn composer_has_draft(&self) -> bool {
-        !self.attachments.is_empty() || self.composer.lines().any(|line| !line.text.trim().is_empty())
+        !self.attachments.is_empty() || self.composer_has_text()
     }
 
     pub(super) fn registered_chat_request(&self, command: RegisteredAction, transitioning: bool, has_draft: bool) -> Option<RegisteredChatCommand> {

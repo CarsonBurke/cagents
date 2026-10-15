@@ -1805,7 +1805,8 @@ impl Runtime {
             .height(Length::Fill)
             .into(),
         ];
-        let has_draft = self.composer_has_draft();
+        let has_text = self.composer_has_text();
+        let has_draft = has_text || !self.attachments.is_empty();
         // The submit modes the send controls expose, in the order the keyboard
         // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
         let modes: &[PromptMode] = if snapshot.busy {
@@ -1915,11 +1916,6 @@ impl Runtime {
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
                 .key_binding(move |press| {
                     if !matches!(press.status, text_editor::Status::Focused { .. }) { return None; }
-                    if press.modifiers.command()
-                        && matches!(press.key, keyboard::Key::Named(keyboard::key::Named::End))
-                    {
-                        return Some(text_editor::Binding::Custom(action(Action::Latest(target))));
-                    }
                     if !press.modifiers.shift()
                         && !press.modifiers.control()
                         && !press.modifiers.alt()
@@ -6972,12 +6968,13 @@ mod tests {
                 let mut messages = Vec::new();
                 element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
                 let actions: Vec<_> = messages.iter().filter_map(|message| match message {
-                    Message::ChatUi(Action::Latest(target)) if latest => Some(*target),
+                    Message::ChatUi(Action::Composer(target, _)) if latest => Some(*target),
                     Message::ChatUi(Action::Submit(target, PromptMode::Send)) if !latest => Some(*target),
                     _ => None,
                 }).collect();
                 assert_eq!(actions, expected.into_iter().collect::<Vec<_>>());
-                assert_eq!(messages.len(), actions.len(), "inactive composers and sidebar fields must not publish another chat action");
+                assert!(!messages.iter().any(|message| matches!(message, Message::ChatUi(Action::Latest(_)))), "CtrlEnd must use registered root routing; native editing cannot retain a retired Latest alias");
+                assert!(messages.iter().all(|message| match message { Message::ChatUi(Action::Composer(target, _) | Action::ComposerCursor(target, _) | Action::Submit(target, _)) => Some(*target) == expected, _ => false }), "inactive composers and sidebar fields must not publish another chat action");
             }
         }
     }

@@ -641,7 +641,7 @@ impl Default for KeyboardShortcuts {
             chat_compact: Vec::new(),
             chat_attach: Vec::new(),
             chat_reasoning: Vec::new(),
-            chat_latest: Vec::new(),
+            chat_latest: vec!["Ctrl+End".into()],
             chat_take_back_queued: Vec::new(),
             chat_cancel_queued: Vec::new(),
             chat_toggle_steering: Vec::new(),
