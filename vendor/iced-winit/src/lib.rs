@@ -1720,7 +1720,9 @@ async fn run_instance<P>(
             Event::AccessibilityEnabled(id, enabled) => {
                 events.push((
                     Some(id),
-                    core::Event::Window(core::window::Event::AccessibilityEnabled(enabled)),
+                    core::Event::Window(
+                        core::window::Event::AccessibilityEnabled(enabled),
+                    ),
                 ));
                 if enabled {
                     a11y_enabled.insert(id);
