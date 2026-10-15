@@ -985,8 +985,8 @@ fn parse_with<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super as native;
     use super::*;
+    use crate::app::chat_ui::markdown as native;
     use cosmic::widget::markdown as original;
 
     macro_rules! outline {
