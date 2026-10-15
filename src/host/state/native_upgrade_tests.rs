@@ -907,7 +907,7 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
 }
 
 /// Runs `test` again in a private runtime, data and provider home, in `mode`.
-fn run_isolated(test: &str, mode: &str) {
+pub(super) fn run_isolated(test: &str, mode: &str) {
     let directory = tempfile::tempdir_in("/var/tmp").unwrap();
     let root = directory.path();
     for path in [

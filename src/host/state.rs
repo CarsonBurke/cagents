@@ -6849,6 +6849,14 @@ for line in sys.stdin:
 
     #[test]
     fn retirement_failure_retains_listed_worker_and_explicit_retry_without_an_overdue_timer() {
+        // Upgrade impact inspects runtime directories. Keep that inspection
+        // and the actual PTY inside a private process-wide XDG namespace.
+        if std::env::var("CAGENTS_UPGRADE_NATIVE_TEST").as_deref() != Ok("retention-failure") {
+            return super::native_upgrade_tests::run_isolated(
+                "host::state::tests::retirement_failure_retains_listed_worker_and_explicit_retry_without_an_overdue_timer",
+                "retention-failure",
+            );
+        }
         let (mut state, id, handle) = completed_retention_fixture();
         state.unregister_client(1);
         state.register_client(2);
@@ -6872,6 +6880,9 @@ for line in sys.stdin:
             let mut state = host.lock().unwrap();
             assert!(state.terminals[&id].handle.same_worker(&handle));
             assert_eq!(state.terminal_retirements[&id].failure.as_deref(), Some("fixture cleanup unconfirmed"));
+            let impact = state.upgrade_impact(crate::update::Policy::WhenIdle).unwrap();
+            assert!(impact.blockers.iter().any(|blocker| blocker.contains("cleanup is unconfirmed")),
+                "upgrade must preserve the uncertain completed worker before any Child handoff: {:?}", impact.blockers);
             assert!(state.terminal_retention_deadline(Duration::ZERO, &BTreeSet::new()).is_none());
             assert!(state.attach(2, id).is_ok(), "failed cleanup restores explicit access to its retained result");
         }
