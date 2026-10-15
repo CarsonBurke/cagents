@@ -11,6 +11,12 @@ use crate::automations::{
     Occurrence, Summary,
 };
 
+// This is only a convenience slice in each shared-model push. Exact scoped
+// discovery remains the authority for every retained destination/result.
+const ARCHIVED_AGENT_PUSH_ROWS: usize = 64;
+const ARCHIVED_AGENT_PUSH_BYTES: usize = 512 * 1024;
+const ARCHIVED_AGENT_PAGE_BYTES: usize = 3 * 1024 * 1024;
+
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     db.execute_batch(
         "BEGIN IMMEDIATE;
@@ -116,7 +122,7 @@ impl Registry {
         }
         let limit = limit.clamp(1, 64);
         let mut query=self.db.prepare(
-            "SELECT g.id,g.record FROM agents g JOIN automations a ON a.id=json_extract(g.record,'$.origin.Automation.id')
+            "SELECT g.id,CASE WHEN length(CAST(g.record AS BLOB))<=?4 THEN g.record END FROM agents g JOIN automations a ON a.id=json_extract(g.record,'$.origin.Automation.id')
              LEFT JOIN shared_view_panes p ON p.id=g.id
              WHERE g.closed=1 AND EXISTS(SELECT 1 FROM automation_snapshots s WHERE s.agent=g.id)
                AND (json_extract(a.record,'$.definition.visibility') IS NOT 'headless' OR p.id IS NOT NULL)
@@ -127,12 +133,11 @@ impl Registry {
                 params![
                     encode(&scope)?,
                     after.map(|id| id.to_string()).unwrap_or_default(),
-                    limit + 1
+                    limit + 1,
+                    ARCHIVED_AGENT_PAGE_BYTES
                 ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
         let model = crate::workspace_model::WorkspaceModel {
             views: super::views::all(&self.db)?,
@@ -142,10 +147,18 @@ impl Registry {
         let mut agents = Vec::new();
         let mut bytes = 0usize;
         let mut last = None;
-        let mut more = rows.len() > limit;
-        for (id, record) in rows.into_iter().take(limit) {
+        let mut more = false;
+        // Stream the bounded SQL cursor so a page never first materializes
+        // 65 individually valid multi-megabyte descriptors in memory.
+        for (offset, row) in rows.enumerate() {
+            if offset == limit {
+                more = true;
+                break;
+            }
+            let (id, record) = row.map_err(|error| error.to_string())?;
+            let record = record.ok_or("A saved agent descriptor exceeds the discovery page limit")?;
             // Keep each IPC page below the ordinary archive payload limit.
-            if bytes.saturating_add(record.len()) > 3 * 1024 * 1024 {
+            if bytes.saturating_add(record.len()) > ARCHIVED_AGENT_PAGE_BYTES {
                 if last.is_none() {
                     return Err("A saved agent descriptor exceeds the discovery page limit".into());
                 }
@@ -216,15 +229,24 @@ impl Registry {
         let mut query = self
             .db
             .prepare(
-                "SELECT g.record FROM agents g JOIN automation_snapshots s ON s.agent=g.id
-            JOIN automation_firings f ON f.id=s.firing JOIN automations a ON a.id=f.automation
-            LEFT JOIN shared_view_panes p ON p.id=g.id
-            WHERE g.closed=1 AND (json_extract(a.record,'$.definition.visibility') IS NOT 'headless' OR p.id IS NOT NULL)
-            ORDER BY f.created_ms DESC,f.id DESC LIMIT 1024",
+                "WITH candidates AS MATERIALIZED (
+                SELECT g.id,length(CAST(g.record AS BLOB)) AS bytes,f.created_ms,f.id AS firing
+                FROM agents g JOIN automation_snapshots s ON s.agent=g.id
+                JOIN automation_firings f ON f.id=s.firing JOIN automations a ON a.id=f.automation
+                LEFT JOIN shared_view_panes p ON p.id=g.id
+                WHERE g.closed=1 AND (json_extract(a.record,'$.definition.visibility') IS NOT 'headless' OR p.id IS NOT NULL)
+                ORDER BY f.created_ms DESC,f.id DESC LIMIT ?1
+            ), budgeted AS (
+                SELECT id,created_ms,firing,
+                    sum(bytes) OVER (ORDER BY created_ms DESC,firing DESC) AS used
+                FROM candidates WHERE bytes<=?2
+            )
+            SELECT g.record FROM budgeted b JOIN agents g ON g.id=b.id
+            WHERE b.used<=?2 ORDER BY b.created_ms DESC,b.firing DESC",
             )
             .map_err(|error| error.to_string())?;
         query
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map(params![ARCHIVED_AGENT_PUSH_ROWS, ARCHIVED_AGENT_PUSH_BYTES], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
             .map(|record| decode(&record.map_err(|error| error.to_string())?))
             .collect()
@@ -4738,6 +4760,7 @@ mod tests {
             host_incarnation: crate::model::HostIncarnation::new("archive-incarnation"),
         };
         let mut first = None;
+        let mut retained_agents = Vec::new();
         for index in 0..1025 {
             let mut saved = definition.clone();
             if index > 0 {
@@ -4759,13 +4782,46 @@ mod tests {
                 )
                 .unwrap();
             registry.db.execute("UPDATE automation_firings SET created_ms=?2,record=json_set(record,'$.created_ms',?2) WHERE id=?1",params![firing.id.to_string(),1000+index as u64]).unwrap();
-            if first.is_none() {
-                first = Some(registry.agent(agent.id).unwrap());
+            let mut saved = registry.agent(agent.id).unwrap();
+            let Some(crate::agent_execution::HostedSession::Chat(session)) = &mut saved.session else {
+                unreachable!()
+            };
+            // Ordinary provider environment/recipe data is part of each Agent,
+            // independently of the much smaller transcript fixture above.
+            let variables = if index == 1024 { 64 } else { 1 };
+            for variable in 0..variables {
+                session.launch.recipe.environment.insert(format!("SAVED_PROVIDER_CONFIGURATION_{variable}"), "x".repeat(16 * 1024));
             }
+            registry.db.execute("UPDATE agents SET record=?2 WHERE id=?1",params![saved.id.to_string(),encode(&saved).unwrap()]).unwrap();
+            if first.is_none() {
+                first = Some(saved.clone());
+            }
+            retained_agents.push(saved);
         }
         let first = first.unwrap();
         let model = registry.model().unwrap();
-        assert_eq!(model.archived_automation_agents.len(), 1024);
+        assert!(!model.archived_automation_agents.is_empty());
+        assert!(model.archived_automation_agents.len() <= ARCHIVED_AGENT_PUSH_ROWS);
+        let descriptor_bytes:usize = model.archived_automation_agents.iter().map(|agent| encode(agent).unwrap().len()).sum();
+        assert!(descriptor_bytes <= ARCHIVED_AGENT_PUSH_BYTES);
+        assert!(!model.archived_automation_agents.iter().any(|agent| agent.id == retained_agents.last().unwrap().id), "a large descriptor stays scoped/paged rather than entering every model push");
+        let envelope = |model| crate::terminal_ipc::ServerEnvelope {
+            version: crate::terminal_ipc::PROTOCOL_VERSION,
+            request_id: Some(1),
+            proof: proof.clone(),
+            message: crate::terminal_ipc::ServerMessage::Response {
+                response: crate::terminal_ipc::ServerResponse::WorkspaceModel { model },
+            },
+        };
+        let mut old_model = model.clone();
+        old_model.archived_automation_agents = retained_agents;
+        assert!(crate::terminal_ipc::write_frame(&mut Vec::new(), &envelope(old_model)).is_err(), "the old row-only push exceeds the real frame limit with legal provider metadata");
+        let expected = envelope(model.clone());
+        let mut framed = Vec::new();
+        crate::terminal_ipc::write_frame(&mut framed, &expected).unwrap();
+        assert!(framed.len() < crate::terminal_ipc::MAX_FRAME_BYTES);
+        let decoded:crate::terminal_ipc::ServerEnvelope = crate::terminal_ipc::read_frame(&mut std::io::Cursor::new(framed)).unwrap().unwrap();
+        assert_eq!(decoded, expected);
         assert!(
             !model
                 .archived_automation_agents
@@ -4838,6 +4894,28 @@ mod tests {
                 .is_err(),
             "a changed view/model must restart discovery before using its old cursor"
         );
+    }
+
+    #[test]
+    fn oversized_archive_descriptors_stay_out_of_pushes_and_report_scoped_read_failure() {
+        let (mut registry, _directory, definition) = fixture();
+        let (_, firing, agent) = completed_reusable_run(&mut registry, definition);
+        let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
+        registry.finish_automation_release(firing.id, &closed, 230).unwrap();
+        registry.archive_automation_conversation(firing.id, &closed, crate::chat::Snapshot {
+            session_id: Some("oversized-archive-thread".into()),
+            ..Default::default()
+        }).unwrap();
+        // Corrupt/oversized saved metadata must not be allocated and decoded
+        // merely to decide whether it fits a broadcast or a discovery page.
+        registry.db.execute("UPDATE agents SET record=json_set(record,'$.name',?2) WHERE id=?1",params![agent.id.to_string(),"x".repeat(ARCHIVED_AGENT_PAGE_BYTES + 1)]).unwrap();
+        let model = registry.model().unwrap();
+        assert!(model.archived_automation_agents.is_empty());
+        let Some(crate::agent_execution::HostedSession::Chat(session)) = &agent.session else {
+            unreachable!()
+        };
+        let error = registry.archived_automation_agents_page(agent.placement.clone(),model.identity,model.sequence,None,64,session.proof.clone().unwrap()).unwrap_err();
+        assert!(error.contains("descriptor exceeds"), "{error}");
     }
 
     #[test]
