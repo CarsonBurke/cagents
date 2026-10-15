@@ -142,7 +142,25 @@ pub(crate) fn confirmed_owner(expected: &Record, proof: &HostSessionProof) -> Re
 /// and revalidate it after this check; a filename or parsed Record alone is not
 /// cleanup proof. The verifier rereads the canonical receipt under our lease.
 pub(crate) fn retired_for_census(expected: &Record, proof: &HostSessionProof) -> Result<bool, String> {
-    confirmed_receipt(expected, proof, None)
+    authorize(proof)?;
+    let Some(receipt) = read_receipt(expected)? else { return Ok(false); };
+    if !strong_receipt_matches(&receipt, expected) { return Ok(false); }
+    let directory = super::directory()?;
+    if super::evidence(&super::socket(&directory, expected.terminal))?.as_ref() == Some(expected) {
+        return Ok(false);
+    }
+    // A separately accounted successor may reuse the terminal ID. It cannot
+    // invalidate proof that this exact former writer retired. Process identity
+    // includes boot: a previous-boot incarnation cannot survive into this one.
+    Ok(expected.boot != proof.boot_id
+        || (holder_exited(&expected.holder)? && !expected.root.is_current()))
+}
+
+fn strong_receipt_matches(receipt: &Receipt, expected: &Record) -> bool {
+    receipt.family_reaped && receipt.record == *expected
+        && receipt.record.kind == Kind::Terminal
+        && receipt.record.version == 5
+        && receipt.record.application == crate::instance::APPLICATION_ID
 }
 
 fn confirmed_receipt(
@@ -155,13 +173,23 @@ fn confirmed_receipt(
     if super::evidence(&super::socket(&directory, expected.terminal))?.is_some() {
         return Ok(false);
     }
+    let Some(receipt) = read_receipt(expected)? else { return Ok(false); };
+    Ok(strong_receipt_matches(&receipt, expected)
+        && receipt.record.boot == proof.boot_id
+        && holder_exited(&receipt.record.holder)?
+        && !receipt.record.root.is_current()
+        && source.is_none_or(|digest| receipt.sources.contains(&digest)))
+}
+
+fn read_receipt(expected: &Record) -> Result<Option<Receipt>, String> {
+    let directory = super::directory()?;
     let path = directory.join(format!(
         "{}-{}-{}.closed",
         expected.terminal, expected.holder.pid, expected.holder.start
     ));
     let file = match crate::secure_file::open_existing_private_file(&path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
     let mut bytes = Vec::new();
@@ -172,14 +200,7 @@ fn confirmed_receipt(
         return Err("Terminal close receipt is oversized".into());
     }
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    Ok(receipt.family_reaped && receipt.record == *expected
-        && receipt.record.kind == Kind::Terminal
-        && receipt.record.version == 5
-        && receipt.record.application == crate::instance::APPLICATION_ID
-        && receipt.record.boot == proof.boot_id
-        && holder_exited(&receipt.record.holder)?
-        && !receipt.record.root.is_current()
-        && source.is_none_or(|digest| receipt.sources.contains(&digest)))
+    Ok(Some(receipt))
 }
 
 /// An orphan holder may remain a zombie until its new parent reaps it. Its

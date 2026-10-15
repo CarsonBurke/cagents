@@ -2800,6 +2800,34 @@ mod tests {
         let mut wrong = original.clone();
         wrong.launch.arguments.push("different".into());
         assert!(!registry::cleanup::confirmed(&wrong, &record, &final_proof).unwrap());
+        // An ordinary relaunch can reuse the durable TerminalId. The live
+        // successor remains a separately accounted writer; it must not make
+        // this exact former writer permanently unknown to a bounded census.
+        let mut successor_recovery=Recovery {source:completed_source.clone(),previous_sources:Vec::new(),relaunches:Vec::new(),options:Default::default(),execution_environment:None};
+        successor_recovery.source.continuity=crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id:final_proof.host_session_id.clone(),boot_id:final_proof.boot_id.clone(),host_incarnation:final_proof.host_incarnation.clone(),
+        };
+        let (exits,_exited)=crossbeam_channel::bounded(1);
+        let mut successor=spawn_recoverable(command("echo successor-ready; exec sleep 600"),size(),exits,Some(successor_recovery)).unwrap();
+        read_until(&successor.master,"successor-ready");
+        let successor_record=successor.holder.record.as_ref().unwrap().clone();
+        assert_ne!(successor_record,record);
+        assert!(registry::cleanup::retired_for_census(&record,&final_proof).unwrap());
+        assert!(!registry::cleanup::retired_for_census(&successor_record,&final_proof).unwrap(),"a live successor never inherits retirement");
+        assert!(!registry::cleanup::confirmed(&original,&record,&final_proof).unwrap(),"source-close authority still refuses a resident successor");
+        successor.holder.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        drop(successor);
+        // Model a receipt preserved across a reboot only after a real family
+        // has reaped. Census can exclude that prior boot's writer, while the
+        // stronger source-close API must retain its same-boot restriction.
+        let positive=std::fs::read(&receipt).unwrap();
+        let mut previous_boot:serde_json::Value=serde_json::from_slice(&positive).unwrap();
+        previous_boot["record"]["boot"]=serde_json::Value::String("previous-boot-fixture".into());
+        std::fs::write(&receipt,serde_json::to_vec(&previous_boot).unwrap()).unwrap();
+        let previous_record:Record=serde_json::from_value(previous_boot["record"].clone()).unwrap();
+        assert!(registry::cleanup::retired_for_census(&previous_record,&final_proof).unwrap());
+        assert!(!registry::cleanup::confirmed(&original,&previous_record,&final_proof).unwrap());
+        std::fs::write(&receipt,positive).unwrap();
         drop(_lease);
         let retry = crate::model::HostSessionProof {
             host_incarnation: crate::model::HostIncarnation::new("close-retry"),
