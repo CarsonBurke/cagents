@@ -772,6 +772,7 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    let requested_source = session.clone();
     retained_actor::reconcile_startup(host, &session).map_err(unavailable)?;
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
@@ -1184,7 +1185,9 @@ fn start_with_execution(
                 return Err(unavailable("Retained startup cleanup or capacity prevents another launch; no source was stopped"));
             }
             let context = execution.as_ref().expect("Claude startup captured its exact context");
-            state.native_actor_startups.insert(session.id, (session.clone(), context.clone()));
+            state.native_actor_startups.insert(session.id, retained_actor::Startup {
+                source: session.clone(), requested: requested_source.clone(), context: context.clone(),
+            });
         }
         state.chat_spawning.insert(session.id, session.clone());
         state.inventory_generation += 1;

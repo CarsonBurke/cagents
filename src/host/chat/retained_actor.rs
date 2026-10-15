@@ -5,6 +5,13 @@ use super::*;
 use crate::host::model::NativeActorEvent;
 use std::{collections::BTreeSet, sync::{Condvar, Mutex}};
 
+#[derive(Clone)]
+pub(in crate::host) struct Startup {
+    pub(super) source: Session,
+    pub(super) requested: Session,
+    pub(super) context: Arc<chat::protocol::ExecutionContext>,
+}
+
 /// Unit-only HostState fixtures intentionally exercise local transports without
 /// a daemon lease. The retained-actor integration fixture opts into the genuine
 /// exec/socket/lease boundary. Production has no fallback or environment knob.
@@ -130,7 +137,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
 /// fail. A later retry must prove this owner's teardown before any new launch.
 pub(super) fn forget_startup(host: &SharedHost, source: &Session, context: &Arc<chat::protocol::ExecutionContext>) {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if state.native_actor_startups.get(&source.id).is_some_and(|(expected, current)| expected == source && Arc::ptr_eq(current, context)) {
+    if state.native_actor_startups.get(&source.id).is_some_and(|pending| &pending.source == source && Arc::ptr_eq(&pending.context, context)) {
         state.native_actor_startups.remove(&source.id);
     }
 }
@@ -138,15 +145,13 @@ pub(super) fn forget_startup(host: &SharedHost, source: &Session, context: &Arc<
 pub(super) fn reconcile_startup(host: &SharedHost, source: &Session) -> Result<bool, String> {
     let pending = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let Some((expected, context)) = state.native_actor_startups.get(&source.id) else { return Ok(false); };
+        let Some(pending) = state.native_actor_startups.get(&source.id) else { return Ok(false); };
         if state.chats.contains_key(&source.id) || state.chat_spawning.contains_key(&source.id)
-            || expected.launch != source.launch || expected.terminal != source.terminal
-            || expected.owned_codex_listener != source.owned_codex_listener
-            || source.proof.as_ref().is_some_and(|proof| Some(proof) != expected.proof.as_ref())
+            || (&pending.source != source && &pending.requested != source)
         {
             return Err("The retained startup belongs to another exact descriptor or is still transitioning".into());
         }
-        (expected.clone(), context.clone())
+        (pending.source.clone(), pending.context.clone())
     };
     match pending.1.reconcile_cleanup()? {
         chat::protocol::LaunchOutcome::NoProvider | chat::protocol::LaunchOutcome::TeardownProved => {

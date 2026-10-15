@@ -276,7 +276,7 @@ pub(crate) struct HostState {
     client_pids: BTreeMap<ClientId, u32>,
     pub(super) notifications: Option<super::notifications::Handle>,
     pub(super) native_actor_outcomes: Option<super::chat::retained_actor::Broker>,
-    pub(super) native_actor_startups: BTreeMap<TerminalId, (crate::chat::Session, Arc<crate::chat::protocol::ExecutionContext>)>,
+    pub(super) native_actor_startups: BTreeMap<TerminalId, super::chat::retained_actor::Startup>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
     notification_activation:
