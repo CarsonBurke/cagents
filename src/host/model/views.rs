@@ -1,14 +1,12 @@
 use super::*;
 use crate::workspace_model::views::{Change, Scope, View};
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
     if current >= 8 {
-        return tx.commit().map_err(|error| error.to_string());
+        return Ok(());
     }
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS shared_view_scopes(
@@ -45,9 +43,7 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
             INSERT INTO shared_view_edits SELECT operation,json_object('Channel',channel) FROM workspace_view_edits;
             DROP TABLE workspace_view_edits; DROP TABLE workspace_view_panes; DROP TABLE workspace_views;") .map_err(|error| error.to_string())?;
     }
-    tx.execute_batch("PRAGMA user_version=8;")
-        .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 fn key(scope: &Scope) -> Result<String, String> {
     serde_json::to_string(scope).map_err(|error| error.to_string())

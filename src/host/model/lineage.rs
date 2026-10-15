@@ -14,9 +14,7 @@ use std::collections::BTreeMap;
 /// reach: requests cannot contain control characters, so no retry matches it.
 const RETIRED_KEY_SEPARATOR: char = '\u{1f}';
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -30,11 +28,9 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
                  ON session_lineages(lineage);",
         )
         .map_err(|error| error.to_string())?;
-        seed(&tx)?;
-        tx.execute_batch("PRAGMA user_version = 4;")
-            .map_err(|error| error.to_string())?;
+        seed(tx)?;
     }
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 /// Reconstructs lineages from the sessions that were issued authority, whose
