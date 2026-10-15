@@ -16,6 +16,7 @@ use std::sync::{
 mod auth_recovery;
 mod changes;
 mod clipboard_image;
+mod closed_draft;
 mod completion;
 mod coordination;
 mod find;
@@ -28,7 +29,6 @@ mod monospace;
 mod permissions;
 mod prose;
 mod retained;
-mod closed_draft;
 pub(super) use closed_draft::closed_draft_source_matches;
 mod scroll;
 mod selectable_prose;
@@ -4585,7 +4585,9 @@ impl Cagents {
             _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
         };
         runtime.is_some_and(|runtime| {
-            runtime.closed_elsewhere || runtime.has_unsent_text() || runtime.transition_blocker().is_some()
+            runtime.closed_elsewhere
+                || runtime.has_unsent_text()
+                || runtime.transition_blocker().is_some()
         }) || self
             .chat_ui
             .drafts
@@ -5851,8 +5853,12 @@ impl Cagents {
             return Task::none();
         }
         match action {
-            Action::CopyClosedDraft(target, revision) => return self.copy_closed_chat_draft(target, revision),
-            Action::DiscardClosedDraft(target, revision) => return self.discard_closed_chat_draft(target, revision),
+            Action::CopyClosedDraft(target, revision) => {
+                return self.copy_closed_chat_draft(target, revision);
+            }
+            Action::DiscardClosedDraft(target, revision) => {
+                return self.discard_closed_chat_draft(target, revision);
+            }
             Action::DraftModel(target, provider, model) => {
                 return self.choose_draft_model(target, provider, model);
             }

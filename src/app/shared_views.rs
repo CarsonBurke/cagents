@@ -1035,22 +1035,44 @@ impl Cagents {
         self.shared_views.prune_restoration_requests(&self.durable);
         // A delayed tombstone must not borrow a newer local actor's identity.
         // Record only raw authoritative panes, never the pending overlay below.
-        let local_cards = self.durable.cards.iter().filter(|card| card.existence.is_open()).map(|card| card.id).collect::<HashSet<_>>();
-        self.shared_views.observed_chats.retain(|id, _| local_cards.contains(id));
-        self.shared_views.closed_chats.retain(|id, _| local_cards.contains(id));
+        let local_cards = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .map(|card| card.id)
+            .collect::<HashSet<_>>();
+        self.shared_views
+            .observed_chats
+            .retain(|id, _| local_cards.contains(id));
+        self.shared_views
+            .closed_chats
+            .retain(|id, _| local_cards.contains(id));
         let mut seen = HashSet::new();
         let mut ambiguous = HashSet::new();
-        for pane in self.workspace_model.views.iter().flat_map(|view| &view.panes).filter(|pane| local_cards.contains(&pane.id)) {
-            if !seen.insert(pane.id) { ambiguous.insert(pane.id); }
+        for pane in self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .filter(|pane| local_cards.contains(&pane.id))
+        {
+            if !seen.insert(pane.id) {
+                ambiguous.insert(pane.id);
+            }
             if let CardKind::Chat(session) = &pane.kind {
                 if self.shared_views.observed_chats.get(&pane.id) != Some(session) {
-                    self.shared_views.observed_chats.insert(pane.id, session.clone());
+                    self.shared_views
+                        .observed_chats
+                        .insert(pane.id, session.clone());
                 }
             } else {
                 self.shared_views.observed_chats.remove(&pane.id);
             }
         }
-        for id in ambiguous { self.shared_views.observed_chats.remove(&id); }
+        for id in ambiguous {
+            self.shared_views.observed_chats.remove(&id);
+        }
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
         let mut views = self.workspace_model.views.clone();

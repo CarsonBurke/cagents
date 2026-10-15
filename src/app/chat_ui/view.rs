@@ -913,7 +913,9 @@ impl Cagents {
                     accounts,
                     offers,
                 );
-                if !runtime.closed_elsewhere && let Some(recovery) = self.account_recovery_controls(card) {
+                if !runtime.closed_elsewhere
+                    && let Some(recovery) = self.account_recovery_controls(card)
+                {
                     widget::column::with_children(vec![recovery, view]).into()
                 } else {
                     view
@@ -1067,7 +1069,14 @@ impl Runtime {
     pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, &str) {
         let snapshot = &self.snapshot;
         if self.closed_elsewhere {
-            (Some(Icon::Close), if !self.has_unsent_text() && self.attachments.is_empty() { "Closed" } else { "Closed · draft retained" })
+            (
+                Some(Icon::Close),
+                if !self.has_unsent_text() && self.attachments.is_empty() {
+                    "Closed"
+                } else {
+                    "Closed · draft retained"
+                },
+            )
         } else if self.queued.is_some() {
             (Some(Icon::AgentWorking), "Starting")
         } else if transitioning {
@@ -1302,7 +1311,9 @@ impl Runtime {
                 );
             }
             for (_, error) in self.failures.iter().filter(|(anchor, error)| {
-                anchor.is_none() && !self.expected_remote_close_error(error) && !self.active_auth_notice(anchor, error)
+                anchor.is_none()
+                    && !self.expected_remote_close_error(error)
+                    && !self.active_auth_notice(anchor, error)
             }) {
                 transcript.push(notice_entry(error, target));
             }
@@ -1317,7 +1328,9 @@ impl Runtime {
                     self.turn_trailing_footer(turn),
                 );
                 for (_, error) in self.failures.iter().filter(|(anchor, error)| {
-                    anchor.as_ref() == Some(&turn.key) && !self.expected_remote_close_error(error) && !self.active_auth_notice(anchor, error)
+                    anchor.as_ref() == Some(&turn.key)
+                        && !self.expected_remote_close_error(error)
+                        && !self.active_auth_notice(anchor, error)
                 }) {
                     transcript.push(notice_entry(error, target));
                 }
