@@ -234,7 +234,7 @@ impl SetupCheckout {
         for root in [&self.target, &self.admin, &self.common] {
             if !same_directory(
                 &root.metadata().map_err(error)?,
-                &fs::metadata(root.path()).map_err(error)?,
+                &fs::symlink_metadata(root.path()).map_err(error)?,
             ) {
                 return Err(error(
                     "checkout directory changed during setup; the worktree was kept",
@@ -955,6 +955,26 @@ mod tests {
             .git_dir(&fixture.destination, &CancellationToken::new())
             .unwrap();
         assert!(!admin.join("index.lock").exists());
+    }
+
+    #[test]
+    fn retained_checkout_rejects_a_named_symlink_to_the_same_directory() {
+        let fixture = Fixture::new();
+        let common = RepositoryService::system("git")
+            .common_dir(&fixture.primary, &CancellationToken::new())
+            .unwrap();
+        let checkout = SetupCheckout::capture(&fixture.destination, &common).unwrap();
+        let moved = fixture.destination.with_file_name("moved");
+        fs::rename(&fixture.destination, &moved).unwrap();
+        symlink(&moved, &fixture.destination).unwrap();
+        assert!(
+            checkout
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("directory changed")
+        );
+        assert!(!moved.join(".env").exists());
     }
 
     #[test]
