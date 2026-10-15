@@ -18,6 +18,7 @@ impl Read for Reading {
 
 struct ReaderOwner {
     wake: Option<OwnedFd>,
+    discard_pending: Arc<AtomicBool>,
     done: Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
@@ -30,18 +31,26 @@ impl ReaderOwner {
     ) -> Self {
         let (wake_rx, wake) = wake_pipe().unwrap();
         let (done_tx, done) = crossbeam_channel::bounded(0);
+        let discard_pending = Arc::new(AtomicBool::new(false));
+        let reader_discard_pending = Arc::clone(&discard_pending);
         let thread = thread::spawn(move || {
             let _done = done_tx;
-            read_pty(&mut reader, &sender, readiness, wake_rx);
+            read_pty(&mut reader, &sender, readiness, wake_rx, &reader_discard_pending);
         });
         Self {
             wake: Some(wake),
+            discard_pending,
             done,
             thread: Some(thread),
         }
     }
 
     fn cancel(&mut self) {
+        self.discard_pending.store(true, Ordering::Release);
+        self.stop_for_carry();
+    }
+
+    fn stop_for_carry(&mut self) {
         drop(self.wake.take());
     }
 
@@ -145,6 +154,26 @@ fn actual_pty_output_survives_parser_backpressure_in_order_until_eof() {
         PtyMessage::Eof
     ));
     owner.finish();
+}
+
+#[test]
+fn stopping_for_carry_keeps_already_read_bytes_behind_a_full_output_queue() {
+    let (reader, mut slave) = private_pty();
+    let readiness = reader.try_clone().unwrap().into();
+    let (observed, read) = crossbeam_channel::bounded(1);
+    let (sender, output) = crossbeam_channel::bounded(1);
+    sender.send(PtyMessage::Bytes(b"previous screen".to_vec())).unwrap();
+    let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
+    slave.write_all(b"already read").unwrap();
+    assert!(read.recv_timeout(Duration::from_secs(2)).unwrap() > 0);
+    // Carry closes the same original wake pipe but must collect this in-flight
+    // read before the holder snapshots the screen and transfers the PTY.
+    owner.stop_for_carry();
+    assert!(matches!(owner.done.try_recv(), Err(TryRecvError::Empty)));
+    expect_bytes(&output, b"previous screen");
+    expect_bytes(&output, b"already read");
+    owner.finish();
+    assert!(output.try_recv().is_err());
 }
 
 struct ConsumedReadiness {
