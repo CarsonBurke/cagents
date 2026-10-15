@@ -18772,6 +18772,17 @@ impl Application for Cagents {
                         return Task::none();
                     }
                 }
+                let current_actor = self.refresh_ui.source_binding.as_ref().map(|binding| binding.id);
+                if matches!(&action, SidebarAction::OpenPublish { .. }) { self.refresh_ui.publish_binding = current_actor; }
+                if matches!(&action, SidebarAction::HistoryCommand { command: sidebar::HistoryCommand::CreateBranch, .. }) { self.refresh_ui.history_branch_binding = current_actor; }
+                if matches!(&action, SidebarAction::Push { .. }) && self.sidebar_state.publish_draft().is_some()
+                    && (self.refresh_ui.publish_binding.is_none() || self.refresh_ui.publish_binding != current_actor) { return Task::none(); }
+                if let SidebarAction::CreateHistoryBranch { oid, name, .. } = &action {
+                    if self.refresh_ui.history_branch_binding.is_none() || self.refresh_ui.history_branch_binding != current_actor
+                        || !self.sidebar_state.history_branch_matches(oid, name) { return Task::none(); }
+                }
+                if matches!(&action, SidebarAction::CancelPublish) { self.refresh_ui.publish_binding = None; }
+                if matches!(&action, SidebarAction::CancelHistoryBranch) { self.refresh_ui.history_branch_binding = None; }
                 if matches!(&action, SidebarAction::RequestDiscard { .. }) {
                     self.refresh_ui.discard_binding = self.refresh_ui.source_binding.as_ref().map(|binding| binding.id);
                 }
@@ -21455,6 +21466,15 @@ impl Application for Cagents {
                 // mutation, its last failure, and the history already walked
                 // belong to the binding, not to the page of Git output.
                 if let Some(binding) = self.refresh_ui.source_binding.as_ref() { next.set_command_binding_id(binding.id); }
+                let current_actor = self.refresh_ui.source_binding.as_ref().map(|binding| binding.id);
+                if self.refresh_ui.publish_binding.is_some() && self.refresh_ui.publish_binding != current_actor {
+                    self.sidebar_state.apply(&SidebarAction::CancelPublish);
+                    self.refresh_ui.publish_binding = None;
+                }
+                if self.refresh_ui.history_branch_binding.is_some() && self.refresh_ui.history_branch_binding != current_actor {
+                    self.sidebar_state.apply(&SidebarAction::CancelHistoryBranch);
+                    self.refresh_ui.history_branch_binding = None;
+                }
                 if let Some(previous) = self.sidebar_model.source_control.as_ref() {
                     previous.carry_mutation_into(&mut next);
                 }

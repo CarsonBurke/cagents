@@ -25,6 +25,8 @@ pub(super) struct State {
     pub(super) source_generation: u64,
     pub(super) source_binding: Option<git_binding::Binding>,
     pub(super) discard_binding: Option<crate::model::OperationId>,
+    pub(super) publish_binding: Option<crate::model::OperationId>,
+    pub(super) history_branch_binding: Option<crate::model::OperationId>,
     pub(super) recovery_bindings: HashMap<PathBuf, crate::model::OperationId>,
     pub(super) source_cancel: Option<CancellationToken>,
     pub(super) source_cache: Option<(
@@ -49,6 +51,8 @@ impl Default for State {
             source_generation: 0,
             source_binding: None,
             discard_binding: None,
+            publish_binding: None,
+            history_branch_binding: None,
             recovery_bindings: HashMap::new(),
             source_cancel: None,
             source_cache: None,
