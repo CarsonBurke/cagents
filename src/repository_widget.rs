@@ -16142,6 +16142,17 @@ mod tests {
     }
 
     #[test]
+    fn external_editor_caret_translates_native_utf8_to_selected_column_units() {
+        let card = CardId::new();
+        let text = format!("{}a😀ébcdeX\n", "\n".repeat(119));
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "unicode.rs", &text);
+        assert!(runtime.move_cursor_to(LspPosition::new(119, 7)));
+        assert_eq!(runtime.editor_caret_for("code"), Some((120, 9)));
+        assert_eq!(runtime.editor_caret_for("zed"), Some((120, 8)));
+        assert_eq!(runtime.editor_caret(), Some((120, 8)));
+    }
+
+    #[test]
     fn a_completion_applies_every_edit_and_reports_one_version() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(
