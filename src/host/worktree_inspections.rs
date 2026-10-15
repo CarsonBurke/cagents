@@ -72,9 +72,16 @@ impl Physical {
         )?;
         // A bare metadata root is a real source. A non-bare metadata-only
         // invocation has no originally selected checkout/HEAD role to retain.
-        if repository.path == common.path && !service.list_worktrees(&repository.path, &cancel)
-            .map_err(|error| error.to_string())?.iter().any(|record| record.bare && record.path == common.path) {
-            return Err("Select the original repository checkout, not an unbound metadata directory".into());
+        if repository.path == common.path
+            && !service
+                .list_worktrees(&repository.path, &cancel)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|record| record.bare && record.path == common.path)
+        {
+            return Err(
+                "Select the original repository checkout, not an unbound metadata directory".into(),
+            );
         }
         let admin = Pin::open(
             service
@@ -129,23 +136,39 @@ impl Physical {
         {
             return Err(REFRESH.into());
         }
-        let records = service.list_worktrees(&self.repository.path, &cancel)
+        let records = service
+            .list_worktrees(&self.repository.path, &cancel)
             .map_err(|error| error.to_string())?;
-        let target = records.iter().find(|record| !record.bare && record.path == self.checkout.path)
+        let target = records
+            .iter()
+            .find(|record| !record.bare && record.path == self.checkout.path)
             .ok_or("The inspected checkout is no longer registered")?;
         crate::worktree_branch::registered_heads::check_checkout_binding(
-            &self.checkout.root, &self.admin.root, &self.common.root, target)?;
+            &self.checkout.root,
+            &self.admin.root,
+            &self.common.root,
+            target,
+        )?;
         if self.repository.path != self.common.path && self.repository.path != self.checkout.path {
-            let source = if let Some(source) = records.iter().find(|record| !record.bare && record.path == self.repository.path) {
+            let source = if let Some(source) = records
+                .iter()
+                .find(|record| !record.bare && record.path == self.repository.path)
+            {
                 source.clone()
             } else if self.repository_admin_path() == self.common.path {
                 // Native worktree-list may name the common metadata for a
                 // separate-git-dir primary. Normalize only the invocation that
                 // still resolves to our ORIGINAL retained checkout.
-                let mut primary = records.iter().find(|record| !record.bare && record.path == self.common.path)
-                    .ok_or("Select the exact registered repository checkout")?.clone();
-                let actual = service.invocation_worktree(&self.repository.path, &cancel)
-                    .map_err(|error| error.to_string())?.canonicalize().map_err(|error| error.to_string())?;
+                let mut primary = records
+                    .iter()
+                    .find(|record| !record.bare && record.path == self.common.path)
+                    .ok_or("Select the exact registered repository checkout")?
+                    .clone();
+                let actual = service
+                    .invocation_worktree(&self.repository.path, &cancel)
+                    .map_err(|error| error.to_string())?
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?;
                 if actual != self.repository.path {
                     return Err(REFRESH.into());
                 }
@@ -156,7 +179,11 @@ impl Physical {
             };
             let admin = self.repository_admin.as_ref().unwrap_or(&self.common);
             crate::worktree_branch::registered_heads::check_checkout_binding(
-                &self.repository.root, &admin.root, &self.common.root, &source)?;
+                &self.repository.root,
+                &admin.root,
+                &self.common.root,
+                &source,
+            )?;
         }
         // Git resolved names above; repeat descriptor identity checks afterward.
         self.repository.validate()?;

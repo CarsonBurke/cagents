@@ -68,7 +68,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let operation_id = reason
             .strip_prefix("cagents:")
             .ok_or("This lock belongs to another tool; unlock it explicitly in Git")?;
-        let id = operation_id.parse::<OperationId>()
+        let id = operation_id
+            .parse::<OperationId>()
             .map_err(|_| "Malformed cagents operation lock identity")?;
         if id.to_string() != operation_id {
             return Err("Malformed cagents operation lock identity".into());

@@ -456,28 +456,62 @@ fn removed_source_checkout_continues_on_original_common_without_deleted_head() {
 #[test]
 fn target_and_source_locators_cannot_borrow_a_sibling_registration() {
     const TEST: &str = "host::worktree_inspections::tests::continuation_tests::target_and_source_locators_cannot_borrow_a_sibling_registration";
-    let Some(root) = super::private_runtime::enter(TEST) else { return; };
+    let Some(root) = super::private_runtime::enter(TEST) else {
+        return;
+    };
     let (repository, target) = setup(&root, false);
     let sibling = root.join("sibling");
-    git(&repository, &["worktree", "add", "--quiet", "-b", "sibling", sibling.to_str().unwrap()]);
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "sibling",
+            sibling.to_str().unwrap(),
+        ],
+    );
     let third = root.join("third");
-    git(&repository, &["worktree", "add", "--quiet", "-b", "third", third.to_str().unwrap()]);
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "third",
+            third.to_str().unwrap(),
+        ],
+    );
     let host = host_with_registry(&root);
     let original = std::fs::read(target.join(".git")).unwrap();
     let sibling_locator = std::fs::read(sibling.join(".git")).unwrap();
     std::fs::write(target.join(".git"), &sibling_locator).unwrap();
-    let refusal = request(&host, 1, Operation::InspectForSessionStop {
-        repository: repository.clone(), path: target.clone(),
-    }).unwrap_err();
+    let refusal = request(
+        &host,
+        1,
+        Operation::InspectForSessionStop {
+            repository: repository.clone(),
+            path: target.clone(),
+        },
+    )
+    .unwrap_err();
     assert!(refusal.contains("backlink disagree"), "{refusal}");
     assert!(target.exists() && sibling.exists());
     assert!(host.lock().unwrap().stop_inspections.is_empty());
     std::fs::write(target.join(".git"), &original).unwrap();
     inspected(&host, &repository, &target);
     std::fs::write(target.join(".git"), &sibling_locator).unwrap();
-    let refusal = request(&host, 1, Operation::InspectForSessionStop {
-        repository: target.clone(), path: third.clone(),
-    }).unwrap_err();
+    let refusal = request(
+        &host,
+        1,
+        Operation::InspectForSessionStop {
+            repository: target.clone(),
+            path: third.clone(),
+        },
+    )
+    .unwrap_err();
     assert!(refusal.contains("backlink disagree"), "{refusal}");
     std::fs::write(target.join(".git"), &original).unwrap();
     inspected(&host, &target, &third);
@@ -486,22 +520,56 @@ fn target_and_source_locators_cannot_borrow_a_sibling_registration() {
 #[test]
 fn separate_git_primary_retains_its_checkout_but_metadata_only_source_refuses() {
     const TEST: &str = "host::worktree_inspections::tests::continuation_tests::separate_git_primary_retains_its_checkout_but_metadata_only_source_refuses";
-    let Some(root) = super::private_runtime::enter(TEST) else { return; };
+    let Some(root) = super::private_runtime::enter(TEST) else {
+        return;
+    };
     let repository = root.join("primary");
     let metadata = root.join("metadata");
-    git(&root, &["init", "--quiet", "--initial-branch=main", "--separate-git-dir", metadata.to_str().unwrap(), repository.to_str().unwrap()]);
-    git(&repository, &["commit", "--quiet", "--allow-empty", "-m", "base"]);
+    git(
+        &root,
+        &[
+            "init",
+            "--quiet",
+            "--initial-branch=main",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+            repository.to_str().unwrap(),
+        ],
+    );
+    git(
+        &repository,
+        &["commit", "--quiet", "--allow-empty", "-m", "base"],
+    );
     let target = root.join("target");
-    git(&repository, &["worktree", "add", "--quiet", "-b", "topic", target.to_str().unwrap()]);
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "topic",
+            target.to_str().unwrap(),
+        ],
+    );
     let host = host_with_registry(&root);
-    let refusal = request(&host, 1, Operation::InspectForSessionStop {
-        repository: metadata.clone(), path: target.clone(),
-    }).unwrap_err();
+    let refusal = request(
+        &host,
+        1,
+        Operation::InspectForSessionStop {
+            repository: metadata.clone(),
+            path: target.clone(),
+        },
+    )
+    .unwrap_err();
     assert!(refusal.contains("unbound metadata"), "{refusal}");
     let (snapshot, token) = inspected(&host, &repository, &target);
     let token = stopped(&host, &repository, &target, &snapshot, token);
     let token = removed(&host, &repository, &target, &snapshot, token);
-    assert!(matches!(request(&host, 1, branch(&repository, &snapshot, false, token)).unwrap(), Reply::BranchDeleted { .. }));
+    assert!(matches!(
+        request(&host, 1, branch(&repository, &snapshot, false, token)).unwrap(),
+        Reply::BranchDeleted { .. }
+    ));
     assert!(!target.exists());
     assert!(repository.exists() && metadata.exists());
     // A native create with the same name succeeds only if deletion removed it.

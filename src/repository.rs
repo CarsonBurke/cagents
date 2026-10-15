@@ -10610,10 +10610,19 @@ pub fn capture_worktree_creation_retirements(
     store: Arc<StateStore>,
     planned: &RemovedWorktree,
 ) -> Result<WorktreeCreationRetirements, StoreError> {
-    let candidates = store.worktree_creation_retirement_candidates()?.into_iter()
-        .filter(|operation| worktree_setup_intent::settled_setup_journal(operation)
-            .is_ok_and(|journal| journal.created(planned))).collect();
-    Ok(WorktreeCreationRetirements { store, planned: planned.clone(), candidates })
+    let candidates = store
+        .worktree_creation_retirement_candidates()?
+        .into_iter()
+        .filter(|operation| {
+            worktree_setup_intent::settled_setup_journal(operation)
+                .is_ok_and(|journal| journal.created(planned))
+        })
+        .collect();
+    Ok(WorktreeCreationRetirements {
+        store,
+        planned: planned.clone(),
+        candidates,
+    })
 }
 impl WorktreeCreationRetirements {
     /// Descriptive pre-effect tuple, not a removal receipt or filesystem
@@ -10628,9 +10637,20 @@ impl WorktreeCreationRetirements {
         if self.planned != *removed {
             return Err(vec![StoreError::InvalidState("The removed worktree differs from the pre-effect creation snapshot; metadata was kept".into())]);
         }
-        let failures = self.candidates.iter().filter_map(|expected|
-            self.store.release_captured_worktree_creation(expected).err()).collect::<Vec<_>>();
-        if failures.is_empty() { Ok(()) } else { Err(failures) }
+        let failures = self
+            .candidates
+            .iter()
+            .filter_map(|expected| {
+                self.store
+                    .release_captured_worktree_creation(expected)
+                    .err()
+            })
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures)
+        }
     }
 }
 
@@ -10639,17 +10659,28 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// candidates only; the independently inspected deletion still authorizes
     /// all effects. Remote paths must never use a local system executor here.
     pub fn creation_retirements_before_removal(
-        &self, store: Arc<StateStore>, repository: &Path, path: &Path,
+        &self,
+        store: Arc<StateStore>,
+        repository: &Path,
+        path: &Path,
         cancellation: &CancellationToken,
     ) -> Result<WorktreeCreationRetirements, String> {
         let path = path.canonicalize().map_err(|error| error.to_string())?;
-        let record = self.list_worktrees(repository, cancellation).map_err(|error| error.to_string())?
-            .into_iter().find(|record| !record.bare && record.path == path)
+        let record = self
+            .list_worktrees(repository, cancellation)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|record| !record.bare && record.path == path)
             .ok_or("The selected worktree is no longer registered")?;
         let planned = RemovedWorktree {
-            common_dir: self.common_dir(repository, cancellation).map_err(|error| error.to_string())?,
-            admin_dir: self.git_dir(&path, cancellation).map_err(|error| error.to_string())?,
-            path, branch: record.branch,
+            common_dir: self
+                .common_dir(repository, cancellation)
+                .map_err(|error| error.to_string())?,
+            admin_dir: self
+                .git_dir(&path, cancellation)
+                .map_err(|error| error.to_string())?,
+            path,
+            branch: record.branch,
         };
         capture_worktree_creation_retirements(store, &planned).map_err(|error| error.to_string())
     }
@@ -11729,11 +11760,16 @@ mod worktree_journal_tests {
             .arg("-C")
             .arg(repository)
             .args([
-                "-c", "user.name=Test",
-                "-c", "user.email=test@example.invalid",
-                "-c", "commit.gpgsign=false",
-                "-c", "core.hooksPath=/dev/null",
-                "-c", "init.templateDir=",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "init.templateDir=",
             ])
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -11926,7 +11962,8 @@ mod worktree_journal_tests {
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         let destination = fixture.request.destination.clone();
         let removed = fixture.removal(&destination);
-        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
+        let retirements =
+            capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
         fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
 
         retirements.finish(&removed).unwrap();
@@ -11963,7 +12000,10 @@ mod worktree_journal_tests {
 
         let mut other_repository = fixture.removal(&destination);
         other_repository.common_dir = PathBuf::from("/elsewhere/.git");
-        capture_worktree_creation_retirements(fixture.store.clone(), &other_repository).unwrap().finish(&other_repository).unwrap();
+        capture_worktree_creation_retirements(fixture.store.clone(), &other_repository)
+            .unwrap()
+            .finish(&other_repository)
+            .unwrap();
         assert!(
             fixture.holds(doomed.operation_id),
             "another repository's deletion released this creation"
@@ -11986,7 +12026,8 @@ mod worktree_journal_tests {
             moved_from.to_str().unwrap(),
         ]);
         let squatter = fixture.removal(&moved_from);
-        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &squatter).unwrap();
+        let retirements =
+            capture_worktree_creation_retirements(fixture.store.clone(), &squatter).unwrap();
         fixture.git(&["worktree", "remove", moved_from.to_str().unwrap()]);
         retirements.finish(&squatter).unwrap();
         assert!(
@@ -11995,14 +12036,16 @@ mod worktree_journal_tests {
         );
 
         let removed = fixture.removal(&destination);
-        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
+        let retirements =
+            capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
         fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
         retirements.finish(&removed).unwrap();
         assert!(!fixture.holds(doomed.operation_id));
         assert!(fixture.holds(moved.operation_id));
 
         let removed = fixture.removal(&moved_to);
-        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
+        let retirements =
+            capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
         fixture.git(&["worktree", "remove", moved_to.to_str().unwrap()]);
         retirements.finish(&removed).unwrap();
         assert!(
@@ -12016,24 +12059,39 @@ mod worktree_journal_tests {
         let mut fixture = Fixture::new();
         fixture.resolve(fixture.input("foo"));
         let original = fixture.run(&CancellationToken::new());
-        assert_eq!(original.state, WorktreeOperationState::Created, "{original:?}");
+        assert_eq!(
+            original.state,
+            WorktreeOperationState::Created,
+            "{original:?}"
+        );
         let destination = fixture.request.destination.clone();
         let removed = fixture.removal(&destination);
-        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
+        let retirements =
+            capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
         fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
 
         fixture.resolve(fixture.input("bar"));
         fixture.request.destination = destination.clone();
         let replacement = fixture.run(&CancellationToken::new());
-        assert_eq!(replacement.state, WorktreeOperationState::Created, "{replacement:?}");
+        assert_eq!(
+            replacement.state,
+            WorktreeOperationState::Created,
+            "{replacement:?}"
+        );
         let current = fixture.removal(&destination);
         assert_eq!(current.common_dir, removed.common_dir);
-        assert_eq!(current.admin_dir, removed.admin_dir, "exercise actual Git administrative-name reuse");
+        assert_eq!(
+            current.admin_dir, removed.admin_dir,
+            "exercise actual Git administrative-name reuse"
+        );
         assert_ne!(current.branch, removed.branch);
 
         retirements.finish(&removed).unwrap();
         assert!(!fixture.holds(original.operation_id));
-        assert!(fixture.holds(replacement.operation_id), "a delayed reply retired the newer creation");
+        assert!(
+            fixture.holds(replacement.operation_id),
+            "a delayed reply retired the newer creation"
+        );
         assert!(destination.join("tracked.txt").is_file());
     }
 
@@ -12042,19 +12100,43 @@ mod worktree_journal_tests {
         let mut fixture = Fixture::new();
         fixture.resolve(fixture.input("foo"));
         let original = fixture.run(&CancellationToken::new());
-        assert_eq!(original.state, WorktreeOperationState::Created, "{original:?}");
+        assert_eq!(
+            original.state,
+            WorktreeOperationState::Created,
+            "{original:?}"
+        );
         let destination = fixture.request.destination.clone();
         let removed = fixture.removal(&destination);
-        let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
-        let row = fixture.store.journaled_worktree_operation(original.operation_id).unwrap().unwrap();
+        let retirements =
+            capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
+        let row = fixture
+            .store
+            .journaled_worktree_operation(original.operation_id)
+            .unwrap()
+            .unwrap();
         let mut updated = row.payload.clone();
         updated["detail"] = serde_json::Value::String("newer creation evidence".into());
-        fixture.store.update_operation(row.id, &row.payload, &updated, PendingOperationStatus::Applied).unwrap();
+        fixture
+            .store
+            .update_operation(
+                row.id,
+                &row.payload,
+                &updated,
+                PendingOperationStatus::Applied,
+            )
+            .unwrap();
         fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
 
         assert!(retirements.finish(&removed).is_err());
-        assert!(!destination.exists(), "bookkeeping failure must not erase known removal");
-        let retained = fixture.store.journaled_worktree_operation(row.id).unwrap().unwrap();
+        assert!(
+            !destination.exists(),
+            "bookkeeping failure must not erase known removal"
+        );
+        let retained = fixture
+            .store
+            .journaled_worktree_operation(row.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(retained.payload, updated);
         assert_eq!(retained.status, PendingOperationStatus::Applied);
     }
@@ -12065,29 +12147,63 @@ mod worktree_journal_tests {
             let mut fixture = Fixture::new();
             fixture.resolve(fixture.input("foo"));
             let original = fixture.run(&CancellationToken::new());
-            assert_eq!(original.state, WorktreeOperationState::Created, "{original:?}");
+            assert_eq!(
+                original.state,
+                WorktreeOperationState::Created,
+                "{original:?}"
+            );
             let destination = fixture.request.destination.clone();
             let removed = fixture.removal(&destination);
-            let row = fixture.store.journaled_worktree_operation(original.operation_id).unwrap().unwrap();
+            let row = fixture
+                .store
+                .journaled_worktree_operation(original.operation_id)
+                .unwrap()
+                .unwrap();
             let mut updated = row.payload.clone();
             match mutation {
                 "version" => updated["version"] = serde_json::json!(99),
-                "state" => updated["state"] = serde_json::to_value(WorktreeOperationState::OutcomeUnknown).unwrap(),
-                "operation" => updated["request"]["operation_id"] = serde_json::to_value(OperationId::new()).unwrap(),
+                "state" => {
+                    updated["state"] =
+                        serde_json::to_value(WorktreeOperationState::OutcomeUnknown).unwrap()
+                }
+                "operation" => {
+                    updated["request"]["operation_id"] =
+                        serde_json::to_value(OperationId::new()).unwrap()
+                }
                 "outcome" => updated["outcome"] = serde_json::Value::Null,
                 _ => unreachable!(),
             }
             assert!(serde_json::from_value::<WorktreeJournal>(updated.clone()).is_ok());
-            fixture.store.update_operation(row.id, &row.payload, &updated, PendingOperationStatus::Applied).unwrap();
-            let captured = fixture.store.journaled_worktree_operation(row.id).unwrap().unwrap();
+            fixture
+                .store
+                .update_operation(
+                    row.id,
+                    &row.payload,
+                    &updated,
+                    PendingOperationStatus::Applied,
+                )
+                .unwrap();
+            let captured = fixture
+                .store
+                .journaled_worktree_operation(row.id)
+                .unwrap()
+                .unwrap();
             assert!(worktree_setup_intent::settled_setup_journal(&captured).is_err());
-            let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
+            let retirements =
+                capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
             fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
 
             retirements.finish(&removed).unwrap();
             assert!(!destination.exists());
-            let retained = fixture.store.journaled_worktree_operation(row.id).unwrap().unwrap();
-            assert_eq!(retained.payload, updated, "{mutation} must not grant journal retirement");
+            let retained = fixture
+                .store
+                .journaled_worktree_operation(row.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                retained.payload, updated,
+                "{mutation} must not grant journal retirement"
+            );
         }
     }
 

@@ -111,7 +111,10 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
             WorkspaceUpdate::Edited { sequence, edit } => (sequence, edit),
             WorkspaceUpdate::WorktreesChanged { repository } => {
                 sender
-                    .send_blocking(ModelUpdate::WorktreesChanged { registry, repository })
+                    .send_blocking(ModelUpdate::WorktreesChanged {
+                        registry,
+                        repository,
+                    })
                     .map_err(|error| error.to_string())?;
                 continue;
             }
@@ -410,18 +413,26 @@ impl Cagents {
 
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
-            ModelUpdate::WorktreesChanged { registry, repository } => {
+            ModelUpdate::WorktreesChanged {
+                registry,
+                repository,
+            } => {
                 if registry == NO_REGISTRY || registry != self.workspace_model.identity {
                     return Task::none();
                 }
                 // This edge invalidates inventory only. Keep the loaded project
                 // identities, filing and focus; the usual loader fences late
                 // results by generation and preserves remote project routing.
-                let targets = self.sidebar_model.projects.iter()
-                    .filter(|project| project.kind == ProjectKind::Git
-                        && project.repository == repository
-                        && !self.project_ui.closing.contains_key(&project.id)
-                        && !self.project_ui.closed.contains(&project.repository))
+                let targets = self
+                    .sidebar_model
+                    .projects
+                    .iter()
+                    .filter(|project| {
+                        project.kind == ProjectKind::Git
+                            && project.repository == repository
+                            && !self.project_ui.closing.contains_key(&project.id)
+                            && !self.project_ui.closed.contains(&project.repository)
+                    })
                     .map(|project| (project.id, project.repository.clone(), project.kind))
                     .collect::<Vec<_>>();
                 Task::batch(targets.into_iter().map(|(id, repository, kind)| {
@@ -1574,8 +1585,12 @@ mod tests {
         let (mut app, project, repository) = app_with_project();
         let other = ProjectId::new();
         app.sidebar_model.projects.push(SidebarProject::new(
-            other, RepositoryId::new(), "other".into(), PathBuf::from("/other/.git"),
-            Vec::new(), Vec::new(),
+            other,
+            RepositoryId::new(),
+            "other".into(),
+            PathBuf::from("/other/.git"),
+            Vec::new(),
+            Vec::new(),
         ));
         app.workspace_model = registry(Vec::new());
         let registry = app.workspace_model.identity;
@@ -1585,10 +1600,16 @@ mod tests {
         let focused = app.workspace.focused();
         let sequence = app.workspace_model.sequence;
         let old_generation = app.repository_generations.get(&project).copied();
-        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::WorktreesChanged {
-            registry, repository: repository.clone(),
-        })));
-        assert_ne!(app.repository_generations.get(&project).copied(), old_generation);
+        drop(app.update(Message::WorkspaceModelObserved(
+            ModelUpdate::WorktreesChanged {
+                registry,
+                repository: repository.clone(),
+            },
+        )));
+        assert_ne!(
+            app.repository_generations.get(&project).copied(),
+            old_generation
+        );
         assert!(app.sidebar_model.project(project).unwrap().reloading);
         assert!(!app.repository_generations.contains_key(&other));
         assert_eq!(app.workspace_model.sequence, sequence);
@@ -1608,17 +1629,30 @@ mod tests {
             (NO_REGISTRY, repository.clone()),
             (registry, PathBuf::from("/unknown/.git")),
         ] {
-            drop(app.apply_workspace_model_update(ModelUpdate::WorktreesChanged { registry, repository }));
+            drop(
+                app.apply_workspace_model_update(ModelUpdate::WorktreesChanged {
+                    registry,
+                    repository,
+                }),
+            );
             assert!(!app.repository_generations.contains_key(&project));
         }
         app.project_ui.closing.insert(project, repository.clone());
-        drop(app.apply_workspace_model_update(ModelUpdate::WorktreesChanged {
-            registry, repository: repository.clone(),
-        }));
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::WorktreesChanged {
+                registry,
+                repository: repository.clone(),
+            }),
+        );
         assert!(!app.repository_generations.contains_key(&project));
         app.project_ui.closing.remove(&project);
         app.project_ui.closed.insert(repository.clone());
-        drop(app.apply_workspace_model_update(ModelUpdate::WorktreesChanged { registry, repository }));
+        drop(
+            app.apply_workspace_model_update(ModelUpdate::WorktreesChanged {
+                registry,
+                repository,
+            }),
+        );
         assert!(!app.repository_generations.contains_key(&project));
     }
 

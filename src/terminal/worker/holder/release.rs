@@ -141,4 +141,3 @@ pub(super) fn request(mut holder: Holder) {
     // pin and setup flock for a successor. Absence is never cleanup proof.
     holder.leave_for_successor();
 }
-

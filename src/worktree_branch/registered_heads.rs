@@ -132,18 +132,23 @@ pub(crate) fn check_checkout_binding(
         }
     } else {
         let locator = read_regular(checkout, OsStr::new(".git"))?;
-        let locator = strip_line(&locator).strip_prefix(b"gitdir: ")
+        let locator = strip_line(&locator)
+            .strip_prefix(b"gitdir: ")
             .ok_or("Invalid checkout Git locator; repair the registration")?;
         if fs::canonicalize(checkout.path().join(path(locator))).map_err(io)? != admin.path() {
             return Err("Checkout locator changed; repair the registration".into());
         }
     }
     if identity(admin)? != identity(common)? {
-        let relative = admin.path().strip_prefix(common.path())
+        let relative = admin
+            .path()
+            .strip_prefix(common.path())
             .map_err(|_| "Linked admin is outside the original common registration")?;
         let components = relative.components().collect::<Vec<_>>();
-        if components.len() != 2 || components[0].as_os_str() != "worktrees"
-            || !matches!(components[1], std::path::Component::Normal(_)) {
+        if components.len() != 2
+            || components[0].as_os_str() != "worktrees"
+            || !matches!(components[1], std::path::Component::Normal(_))
+        {
             return Err("Linked admin is not a native registered worktree".into());
         }
         let registered = fs_safety::open_directory_beneath(common, relative).map_err(io)?;
@@ -155,7 +160,9 @@ pub(crate) fn check_checkout_binding(
             return Err("Checkout locator and registered admin backlink disagree; run git worktree repair and retry".into());
         }
         let relative = read_regular(admin, OsStr::new("commondir"))?;
-        if fs::canonicalize(admin.path().join(path(strip_line(&relative)))).map_err(io)? != common.path() {
+        if fs::canonicalize(admin.path().join(path(strip_line(&relative)))).map_err(io)?
+            != common.path()
+        {
             return Err("Registered admin points to another common directory".into());
         }
     }
@@ -164,7 +171,9 @@ pub(crate) fn check_checkout_binding(
         if strip_line(&head) != format!("ref: {branch}").as_bytes() {
             return Err("Registered branch changed during inspection".into());
         }
-    } else if record.detached && record.head_oid.as_deref().map(str::as_bytes) != Some(strip_line(&head)) {
+    } else if record.detached
+        && record.head_oid.as_deref().map(str::as_bytes) != Some(strip_line(&head))
+    {
         return Err("Registered detached HEAD changed during inspection".into());
     }
     Ok(())

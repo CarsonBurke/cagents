@@ -808,7 +808,9 @@ impl ControlClient {
         if let Some(edge) = self.observed_model.pop_front() {
             return Ok(edge);
         }
-        self.stream.set_read_timeout(None).map_err(ControlError::Configure)?;
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
         loop {
             let envelope = self.read_envelope()?;
             self.validate_pinned_envelope(&envelope)?;
@@ -820,9 +822,13 @@ impl ControlClient {
                     return Ok(WorkspaceUpdate::WorktreesChanged { repository });
                 }
                 ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
-                ServerMessage::Error(error) => return Err(ControlError::Remote {
-                    code: error.code, message: error.message, retryable: error.retryable,
-                }),
+                ServerMessage::Error(error) => {
+                    return Err(ControlError::Remote {
+                        code: error.code,
+                        message: error.message,
+                        retryable: error.retryable,
+                    });
+                }
                 _ => {}
             }
         }
@@ -3978,27 +3984,61 @@ mod tests {
         let proof = proof("worktrees", "boot", "incarnation");
         let repository = PathBuf::from("/private/checkout");
         let expected = repository.clone();
-        let edit = ModelEdit::CloseProject { repository: repository.clone() };
+        let edit = ModelEdit::CloseProject {
+            repository: repository.clone(),
+        };
         let expected_edit = edit.clone();
         let server = thread::spawn(move || {
             let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-            write_frame(&mut peer, &connected_envelope(hello.request_id, proof.clone(), proof.clone())).unwrap();
+            write_frame(
+                &mut peer,
+                &connected_envelope(hello.request_id, proof.clone(), proof.clone()),
+            )
+            .unwrap();
             let list: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
             for message in [
                 ServerMessage::WorktreesChanged { repository },
                 ServerMessage::WorkspaceModelEdited { sequence: 7, edit },
             ] {
-                write_frame(&mut peer, &ServerEnvelope { version: PROTOCOL_VERSION,
-                    request_id: None, proof: proof.clone(), message }).unwrap();
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
             }
-            write_frame(&mut peer, &ServerEnvelope { version: PROTOCOL_VERSION,
-                request_id: Some(list.request_id), proof,
-                message: ServerMessage::Response { response: ServerResponse::Listed { terminals: vec![] } } }).unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(list.request_id),
+                    proof,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Listed { terminals: vec![] },
+                    },
+                },
+            )
+            .unwrap();
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
         assert!(client.list().unwrap().is_empty());
-        assert_eq!(client.next_workspace_update().unwrap(), WorkspaceUpdate::WorktreesChanged { repository: expected });
-        assert_eq!(client.next_workspace_update().unwrap(), WorkspaceUpdate::Edited { sequence: 7, edit: expected_edit });
+        assert_eq!(
+            client.next_workspace_update().unwrap(),
+            WorkspaceUpdate::WorktreesChanged {
+                repository: expected
+            }
+        );
+        assert_eq!(
+            client.next_workspace_update().unwrap(),
+            WorkspaceUpdate::Edited {
+                sequence: 7,
+                edit: expected_edit
+            }
+        );
         server.join().unwrap();
     }
 

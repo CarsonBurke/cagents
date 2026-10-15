@@ -69,20 +69,30 @@ pub enum Operation {
 impl Operation {
     pub fn repository(&self) -> Option<&std::path::Path> {
         let repository = match self {
-            Self::List { repository } | Self::Remove { repository, .. }
-            | Self::Inspect { repository, .. } | Self::InspectForSessionStop { repository, .. }
+            Self::List { repository }
+            | Self::Remove { repository, .. }
+            | Self::Inspect { repository, .. }
+            | Self::InspectForSessionStop { repository, .. }
             | Self::StaleLock { repository, .. }
             | Self::SetDisposableIgnoredDirectories { repository, .. }
             | Self::GetDisposableIgnoredDirectories { repository, .. }
-            | Self::DeleteBranch { repository, .. } | Self::BusySessions { repository, .. }
-            | Self::CloseSessions { repository, .. } | Self::StopSessions { repository, .. } => repository,
+            | Self::DeleteBranch { repository, .. }
+            | Self::BusySessions { repository, .. }
+            | Self::CloseSessions { repository, .. }
+            | Self::StopSessions { repository, .. } => repository,
         };
         Some(repository)
     }
     pub fn mutates(&self) -> bool {
-        !matches!(self, Self::List { .. } | Self::Inspect { .. }
-            | Self::InspectForSessionStop { .. } | Self::BusySessions { .. }
-            | Self::StaleLock { unlock: false, .. } | Self::GetDisposableIgnoredDirectories { .. })
+        !matches!(
+            self,
+            Self::List { .. }
+                | Self::Inspect { .. }
+                | Self::InspectForSessionStop { .. }
+                | Self::BusySessions { .. }
+                | Self::StaleLock { unlock: false, .. }
+                | Self::GetDisposableIgnoredDirectories { .. }
+        )
     }
 }
 

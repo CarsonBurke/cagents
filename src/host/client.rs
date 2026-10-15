@@ -370,12 +370,11 @@ pub(super) fn process_request(
             Ok(prepared) => {
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
-                prepared
-                    .remove(|windows| {
-                        host.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .allow_automatic_worktree_cleanup(client_id, windows)
-                    })
+                prepared.remove(|windows| {
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .allow_automatic_worktree_cleanup(client_id, windows)
+                })
             }
             Err(error) => Err(error),
         };

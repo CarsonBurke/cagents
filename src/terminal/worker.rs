@@ -2314,7 +2314,9 @@ impl Worker {
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
         held.holder.commit_adoption()?;
-        let _ = published.family_cleanup_capable.set(held.holder.proves_family_on_exit());
+        let _ = published
+            .family_cleanup_capable
+            .set(held.holder.proves_family_on_exit());
         if let Some(record) = held.holder.record() {
             let _ = published.holder_identity.set(record.clone());
         }
@@ -6399,10 +6401,13 @@ mod tests {
                     worker: Arc::new(Mutex::new(None)),
                 }),
             };
-            let refusal = handle.fence_session_stop(
-                published.execution_instance,
-                Instant::now() + Duration::from_secs(1),
-            ).err().expect("missing cleanup capability must refuse before teardown");
+            let refusal = handle
+                .fence_session_stop(
+                    published.execution_instance,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .err()
+                .expect("missing cleanup capability must refuse before teardown");
             assert!(refusal.contains("cannot confirm whole-session cleanup"));
             assert!(!published.input_order.lock().unwrap().closing);
             assert!(published.priority_close.lock().unwrap().is_none());

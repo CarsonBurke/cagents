@@ -68,8 +68,13 @@ pub(crate) fn execute(
         operation @ Operation::Remove { .. } => {
             let store = journal_store()?;
             remove_with_executor(
-                operation, &service, &SystemProcessExecutor, &store,
-                &mut live_sessions, |_| Ok(()), || {},
+                operation,
+                &service,
+                &SystemProcessExecutor,
+                &store,
+                &mut live_sessions,
+                |_| Ok(()),
+                || {},
             )
         }
         Operation::StaleLock {
@@ -335,7 +340,8 @@ fn remove_with_executor<E: ProcessExecutor + Clone + 'static>(
     };
     // Metadata candidates are fixed before the effect. New creations that
     // reuse these names before the reply can never enter this cleanup set.
-    let retirements = crate::repository::capture_worktree_creation_retirements(store.clone(), &removed);
+    let retirements =
+        crate::repository::capture_worktree_creation_retirements(store.clone(), &removed);
     let command = super::git_command(&repository).args(["worktree", "remove"]);
     let command = if force && safety.files_to_discard() > 0 {
         command.arg("--force")
@@ -355,7 +361,10 @@ fn remove_with_executor<E: ProcessExecutor + Clone + 'static>(
     // this point, before receipt cleanup or response construction.
     after_effect();
     let mut warnings = Vec::new();
-    if let Err(failures) = retirements.map_err(|error| vec![error]).and_then(|capture| capture.finish(&removed)) {
+    if let Err(failures) = retirements
+        .map_err(|error| vec![error])
+        .and_then(|capture| capture.finish(&removed))
+    {
         warnings.push(format!(
             "Worktree was removed, but its creation receipt could not be retired: {}",
             failures
