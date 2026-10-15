@@ -37,6 +37,7 @@ mod mailbox;
 mod navigation;
 mod relocation;
 mod project_checkout;
+mod project_instances;
 mod terminal_owners;
 mod views;
 
@@ -340,7 +341,8 @@ impl Registry {
             // The channels go with it through the foreign key's cascade, which
             // `foreign_keys = ON` is verified to enforce: a channel in a project
             // nobody has open is reachable from no window's sidebar.
-            ModelEdit::CloseProject { repository } => {
+            ModelEdit::CloseProject { repository } | ModelEdit::CloseProjectInstance { project: crate::project_recovery::ProjectInstance { repository, .. } } => {
+                if let ModelEdit::CloseProjectInstance { project } = edit { project_instances::require(&transaction, project)?; }
                 let key = repository_key(repository)?;
                 let removed = transaction
                     .execute("DELETE FROM projects WHERE repository = ?1", params![key])

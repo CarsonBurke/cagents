@@ -144,7 +144,7 @@ use crate::{
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
 /// Version 82 binds source-checked close to the exact resident worker.
-pub const PROTOCOL_VERSION: u16 = 82;
+pub const PROTOCOL_VERSION: u16 = 83;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -480,6 +480,13 @@ pub enum ClientRequest {
         execution_instance: uuid::Uuid,
         allow_active: bool,
     },
+    /// Exact actor/worker identities for a guarded project removal census.
+    ProjectCloseInventory { project: crate::project_recovery::ProjectInstance },
+    /// Explicit project removal, fenced before teardown and final deletion.
+    CloseProjectGuarded {
+        project: crate::project_recovery::ProjectInstance,
+        sessions: Vec<crate::project_recovery::SessionClose>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -787,6 +794,7 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
     },
+    ProjectCloseInventory { sessions: Vec<crate::project_recovery::SessionClose> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

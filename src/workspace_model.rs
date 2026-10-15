@@ -328,7 +328,9 @@ impl WorkspaceModel {
                     if !self.closed_projects.contains(&relocation.repository) { self.closed_projects.push(relocation.repository.clone()); }
                 }
             }
-            ModelEdit::CloseProject { repository } => {
+            ModelEdit::CloseProject { repository } | ModelEdit::CloseProjectInstance { project: crate::project_recovery::ProjectInstance { repository, .. } } => {
+                if let ModelEdit::CloseProjectInstance { project } = edit
+                    && (self.identity != project.registry || self.project(repository).is_none_or(|current| current.ordinal != project.ordinal)) { return; }
                 self.navigation_orders
                     .retain(|order| order.repository != *repository);
                 if !self.closed_projects.contains(repository) {
@@ -484,6 +486,8 @@ pub enum ModelEdit {
         operation: Uuid,
         change: views::Change,
     },
+    /// Remove only the exact registry/project incarnation the user selected.
+    CloseProjectInstance { project: crate::project_recovery::ProjectInstance },
 }
 
 fn verified_primary_checkout(
@@ -572,6 +576,7 @@ impl ModelEdit {
                     new_root: canonical_repository(&relocation.new_root)?,
                 } }
             }
+            Self::CloseProjectInstance { project } => { project.validate()?; Self::CloseProjectInstance { project } },
             Self::CloseProject { repository } => Self::CloseProject {
                 repository: canonical_repository(&repository)?,
             },

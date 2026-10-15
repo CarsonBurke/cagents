@@ -10,6 +10,7 @@ mod model;
 mod notifications;
 mod service;
 mod session_locations;
+mod project_removal;
 mod state;
 
 use std::{

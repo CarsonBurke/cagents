@@ -4,6 +4,30 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::{model::{CardKind, TerminalSession, TerminalContinuity}, workspace_model::views::{Scope, View}};
 
+/// A user-visible project selected from one exact registry incarnation.
+/// Paths and ranks can both be reused; neither is sufficient alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectInstance {
+    pub registry: uuid::Uuid,
+    pub repository: PathBuf,
+    pub ordinal: u32,
+}
+impl ProjectInstance {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.registry == crate::workspace_model::NO_REGISTRY || self.ordinal == crate::workspace_model::PENDING_ORDINAL || !self.repository.is_absolute()
+            || self.repository.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+            return Err("Project removal requires its original registry and assigned project identity".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionClose {
+    pub source: crate::agent_execution::HostedSession,
+    pub execution_instance: Option<uuid::Uuid>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relocation {
     pub repository: PathBuf,

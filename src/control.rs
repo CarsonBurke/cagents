@@ -1014,6 +1014,20 @@ impl ControlClient {
     /// Close the exact source and worker returned by inventory. This does not
     /// attach by ID first: attachment could resolve a replacement before the
     /// source check and needlessly change its presentation state.
+    pub fn project_close_inventory(&mut self, project: crate::project_recovery::ProjectInstance) -> Result<Vec<crate::project_recovery::SessionClose>, ControlError> {
+        match self.request_strict(ClientRequest::ProjectCloseInventory { project })? {
+            ServerResponse::ProjectCloseInventory { sessions } => Ok(sessions),
+            response => Err(unexpected_response("project removal inventory", &response)),
+        }
+    }
+
+    pub fn close_project_guarded(&mut self, project: crate::project_recovery::ProjectInstance, sessions: Vec<crate::project_recovery::SessionClose>) -> Result<WorkspaceModel, ControlError> {
+        match self.request_with_deadline(ClientRequest::CloseProjectGuarded { project, sessions }, Instant::now() + Duration::from_secs(75))? {
+            ServerResponse::WorkspaceModel { model } => Ok(model),
+            response => Err(unexpected_response("guarded project removal", &response)),
+        }
+    }
+
     pub fn close_terminal_source_checked(
         &mut self,
         source: crate::model::TerminalSession,
@@ -1818,6 +1832,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::BuildInfo { .. } => "build_info",
         ServerResponse::Connected { .. } => "connected",
         ServerResponse::Listed { .. } => "listed",
+        ServerResponse::ProjectCloseInventory { .. } => "project_close_inventory",
         ServerResponse::Spawned { .. } => "spawned",
         ServerResponse::Attached { .. } => "attached",
         ServerResponse::Detached => "detached",

@@ -402,6 +402,7 @@ pub(super) fn process_request(
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
             | ClientRequest::CloseTerminalSourceChecked { .. }
+            | ClientRequest::CloseProjectGuarded { .. }
             | ClientRequest::ChatRecoverAccount {
                 idle_generation: Some(_),
                 ..
@@ -414,8 +415,15 @@ pub(super) fn process_request(
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
+    process_admitted(host, client_id, request)
+}
+
+/// Caller owns control admission for this complete effect; never reacquires it.
+pub(super) fn process_admitted(host: &SharedHost, client_id: ClientId, request: ClientRequest) -> Result<RequestOutcome, ProtocolError> {
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::ProjectCloseInventory { project } => Ok((ServerResponse::ProjectCloseInventory { sessions: super::project_removal::inventory(host, client_id, &project)? }, Vec::new(), false)),
+        ClientRequest::CloseProjectGuarded { project, sessions } => super::project_removal::remove(host, client_id, project, sessions),
         ClientRequest::DeviceOperation { operation } => {
             if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
                 let account =
