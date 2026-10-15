@@ -94,7 +94,7 @@ impl Cagents {
     }
 
     pub(super) fn fence_account_history_ready(&mut self, target: Target, handle: &ClientHandle) -> bool {
-        let Some(deletions)=self.chat_ui.history_deletions.inflight.remove(&target) else {return true;};
+        let Some(deletions)=self.chat_ui.history_deletions.inflight.get(&target) else {return true;};
         let mut unverified=false;
         for deletion in deletions {
             match decide(&deletion,handle.session().launch.provider,handle.account_home(),handle.local_history_is_read_only(),true) {
@@ -104,6 +104,10 @@ impl Cagents {
             }
         }
         !unverified
+    }
+
+    pub(super) fn finish_account_history_ready(&mut self,target:Target) {
+        self.chat_ui.history_deletions.inflight.remove(&target);
     }
 
 }
