@@ -4084,6 +4084,13 @@ impl Actor {
                 close.admitted_work = false;
             }
         }
+        // The immutable frame projector owns this frame's enrichment, while
+        // later frames capture this persistent bounded preview. Both must see
+        // the same turn/reset boundary; a final response from A cannot suppress
+        // B's different-ID streaming deltas or survive an accepted Reset.
+        if matches!(&event, Event::TurnStarted | Event::Reset { .. }) {
+            Arc::make_mut(&mut state.notification_preview).observe(&event);
+        }
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
         apply_event(&mut state, &mut self.indices, event);
@@ -5241,6 +5248,64 @@ mod tests {
         assert!(state.requests.is_empty());
         assert!(!state.waiting);
         assert_eq!(state.activity(), ActivityState::Unknown);
+    }
+
+    #[test]
+    fn notification_preview_follows_multiframe_turn_boundaries_and_reset() {
+        struct Frames(usize);
+        impl Adapter for Frames {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.0 += 1;
+                Ok(Step { writes: vec![json!({"frame": self.0})], ..Default::default() })
+            }
+            fn receive(&mut self, value: Value) -> Result<Step, String> {
+                let events = match value["frame"].as_u64().unwrap() {
+                    1 => vec![Event::TurnStarted, Event::Item(Item {
+                        id: "a".into(), role: Role::Assistant, started_at: None, at: None,
+                        content: ItemContent::Text { text: "First answer".into(), thinking: false, phase: Phase::Final },
+                    }), Event::TurnSettled, Event::TurnFinished { key: Some("a".into()), outcome: crate::notifications::Kind::Succeeded }],
+                    2 => vec![Event::TurnStarted],
+                    3 => vec![Event::TextDelta { id: "b".into(), role: Role::Assistant, thinking: false, delta: "Second answer".into() }],
+                    4 => vec![Event::TurnSettled, Event::TurnFinished { key: Some("b".into()), outcome: crate::notifications::Kind::Succeeded }],
+                    5 => vec![Event::Reset { reason: "Exact preview reset".into() }],
+                    _ => unreachable!(),
+                };
+                Ok(Step { events, ..Default::default() })
+            }
+        }
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec::from(&crate::model::LaunchRecipe {
+            program: "/bin/cat".into(), arguments: Vec::new(), working_directory: root.path().into(),
+            environment: Default::default(), unset_environment: Default::default(),
+        });
+        let mut initial = Step { events: vec![Event::Ready(true)], ..Default::default() };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, received) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, Box::new(Frames(0)), initial, store, None, move |update| {
+            if let Update::AttentionContext { evidence, content } = update {
+                let _ = send.send((evidence, content));
+            }
+        }).unwrap();
+        until(&handle, |state| state.ready);
+        handle.command(Command::Refresh).unwrap();
+        let first = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first.0.key, "a");
+        assert_eq!(first.1.unwrap().preview, "First answer");
+        handle.command(Command::Refresh).unwrap();
+        let started = until(&handle, |state| state.busy);
+        assert!(started.notification_content(crate::notifications::Kind::Succeeded).preview.is_empty());
+        handle.command(Command::Refresh).unwrap();
+        until(&handle, |state| state.notification_content(crate::notifications::Kind::Succeeded).preview == "Second answer");
+        handle.command(Command::Refresh).unwrap();
+        let second = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(second.0.key, "b");
+        assert_eq!(second.1.unwrap().preview, "Second answer");
+        handle.command(Command::Refresh).unwrap();
+        let reset = until(&handle, |state| state.detail == "Exact preview reset");
+        assert!(reset.notification_content(crate::notifications::Kind::Succeeded).preview.is_empty());
+        assert!(reset.notification_content(crate::notifications::Kind::Waiting).preview.is_empty());
+        handle.close_until(Instant::now() + Duration::from_secs(5)).unwrap();
     }
 
     #[test]
