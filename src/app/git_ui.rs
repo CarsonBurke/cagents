@@ -475,7 +475,9 @@ impl Cagents {
                     self.refresh_ui.git.changed(project, change);
                 }
                 if let Some(key) = reload {
-                    return Task::batch([self.reload_source_control(&key), self.start_git_reads()]);
+                    document_tasks.push(self.reload_source_control(&key));
+                    document_tasks.push(self.start_git_reads());
+                    return Task::batch(document_tasks);
                 }
             }
             Action::Read {
@@ -994,6 +996,92 @@ mod tests {
             worktrees,
             heads: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn bound_watcher_reload_delivers_reserved_document_and_comparison_tasks() {
+        const TEST: &str = "app::git_ui::tests::bound_watcher_reload_delivers_reserved_document_and_comparison_tasks";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        use cosmic::iced::futures::StreamExt;
+        use crate::repository::{DiffBasis, Oid, RepoPath, ValidatedRefName};
+        async fn finish(app: &mut Cagents, task: Task<Message>) -> (usize, usize, usize) {
+            let mut pending = vec![task];
+            let mut observed = (0, 0, 0);
+            let mut remaining = 128;
+            while let Some(task) = pending.pop() {
+                assert!(remaining > 0, "returned task chain must settle"); remaining -= 1;
+                if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                            match &message {
+                                Message::Repository(RepositoryAction::DiskMetadata { .. }) => observed.0 += 1,
+                                Message::Repository(RepositoryAction::BranchBasisRefreshed { .. }) => observed.1 += 1,
+                                Message::SourceControlLoaded { .. } => observed.2 += 1,
+                                _ => {}
+                            }
+                            pending.push(app.update(message));
+                        }
+                    }
+                }
+            }
+            observed
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |args: &[&str]| {
+            let command = crate::repository::CommandSpec::new("git").cwd(root)
+                .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"])
+                .args(args.iter().copied());
+            crate::git_watch::tests::run_fixture_command(crate::git_watch::tests::isolated_fixture_command(command)).stdout
+        };
+        git(&["init", "--template=", "-b", "main"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(root.join("file.rs"), "before\n").unwrap();
+        git(&["add", "file.rs"]); git(&["commit", "-m", "fixture"]);
+        let head = Oid::parse_object(String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap().trim()).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.lsp = crate::lsp::LspManager::new(Vec::new());
+        app.cards.clear();
+        app.sidebar_model = sidebar::tests::panel_model();
+        let source = app.sidebar_model.source_control.as_mut().unwrap();
+        source.key.canonical_path = root.to_path_buf();
+        let key = source.key.clone();
+        let row = app.sidebar_model.projects.iter_mut().find(|project| project.id == key.project_id).unwrap()
+            .worktrees.iter_mut().find(|row| row.id == key.worktree_id).unwrap();
+        row.path = root.to_path_buf();
+        app.active_workspace = Some(root.to_path_buf());
+        let view = crate::model::RepositoryView { project: key.project_id, repository: root.join(".git"), worktree: root.to_path_buf(), selected_file: None };
+        let editor = CardId::new();
+        let mut runtime = RepositoryRuntime::new(view.clone()); runtime.set_auto_save(false);
+        let load = runtime.open_file_location(editor, "file.rs".into(), 0, 0, 0);
+        app.cards.insert(editor, CardRuntime::Repository(Box::new(runtime)));
+        finish(&mut app, repository_task(load)).await;
+        let comparison = CardId::new();
+        let mut runtime = RepositoryRuntime::new(view);
+        let load = runtime.update(RepositoryAction::OpenCommittedFile { card: comparison, path: RepoPath::parse("file.rs").unwrap(), old_path: None,
+            basis: DiffBasis::MergeBaseToHead { base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(), head: head.clone(), merge_base: head } });
+        app.cards.insert(comparison, CardRuntime::Repository(Box::new(runtime)));
+        finish(&mut app, repository_task(load)).await;
+        fs::write(root.join("file.rs"), "outside edit\n").unwrap();
+        app.refresh_ui.git.monitor = Some(git_watch::Monitor::queued_fixture(BTreeMap::from([(key.project_id,
+            git_watch::Change { worktrees: [key.worktree_id].into(), metadata: true, ..Default::default() })])));
+        let returned = app.update_git(Action::Changed);
+        assert!(app.refresh_ui.source_cancel.is_some(), "exercise the bound-panel early return");
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&editor) else { panic!("editor mounted"); };
+        assert!(cosmic::iced::runtime::task::into_stream(runtime.refresh_open_document(editor)).is_none(), "watcher reserved document probe");
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&comparison) else { panic!("comparison mounted"); };
+        assert!(runtime.comparison_refresh_pending(), "watcher reserved branch reader");
+        let (documents, comparisons, snapshots) = finish(&mut app, returned).await;
+        assert_eq!((documents, comparisons, snapshots), (1, 1, 1), "the actual Changed return must deliver every reserved task");
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&editor) else { panic!("editor mounted"); };
+        assert_eq!(runtime.editor_text().as_deref(), Some("outside edit\n"));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&comparison) else { panic!("comparison mounted"); };
+        assert!(!runtime.comparison_refresh_pending(), "delivered branch callback releases its slot");
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&editor) else { panic!("editor mounted"); };
+        let next = runtime.refresh_open_document(editor);
+        let again = finish(&mut app, repository_task(next)).await;
+        assert_eq!(again.0, 1, "delivered metadata callback releases and delivers the next probe");
     }
 
     #[test]
