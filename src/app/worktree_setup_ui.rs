@@ -53,7 +53,7 @@ impl Drop for State {
 
 impl State {
     fn has_authorized_run(&self, session: &TerminalSession) -> bool {
-        session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID").and_then(|value| value.parse().ok())
+        session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID").and_then(|value| value.parse::<OperationId>().ok())
             .is_some_and(|run| self.authorized_runs.lock().expect("setup launch authorization lock").contains(&run))
     }
     pub(super) fn authorized_run(&self, session: &TerminalSession) -> Option<OperationId> {
