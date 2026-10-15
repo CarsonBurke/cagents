@@ -459,8 +459,9 @@ mod tests {
             element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut tail);
             assert!(!tail.duplicate, "nested axes must have distinct IDs");
             assert!(tail.horizontal_travel > 10000.0, "long line needs real native horizontal travel");
-            assert!(tail.glyphs.iter().any(|glyph| glyph.x >= -1.0 && glyph.x + glyph.width <= 401.0),
-                "tail glyph must be accessible inside the local viewport: {:?}", tail.glyphs);
+            assert!(tail.glyphs.iter().any(|glyph| glyph.x >= -1.0 && glyph.x + glyph.width <= 401.0
+                && glyph.y >= -1.0 && glyph.y + glyph.height <= node.size().height + 1.0),
+                "tail glyph must be accessible on both axes inside {:?}: {:?}", node.size(), tail.glyphs);
         }
     }
 
