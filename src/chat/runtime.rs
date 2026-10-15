@@ -2618,7 +2618,7 @@ fn provider_exit_diagnostic(
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
         .collect::<String>();
     let output = output[output.ceil_char_boundary(output.len().saturating_sub(64 * 1024))..].to_owned();
-    let lower = output.to_lowercase();
+    let lower = format!("{output} {}",super::protocol::preview(error.as_bytes(),1024)).to_lowercase();
     let hint = if lower.contains("unauthorized")
         || lower.contains("authentication")
         || lower.contains("api key")
@@ -2626,6 +2626,8 @@ fn provider_exit_diagnostic(
         " Sign in again, then restart the session."
     } else if lower.contains("rate limit") || lower.contains("too many requests") {
         " Wait briefly, then restart the session."
+    } else if lower.contains("not found") || lower.contains("no such file or directory") {
+        " Install or configure the provider executable, then restart the session."
     } else if lower.contains("out of memory") || lower.contains("cannot allocate memory") || {
         use std::os::unix::process::ExitStatusExt;
         status.is_some_and(|status| status.signal() == Some(9))
@@ -3575,6 +3577,8 @@ mod tests {
         assert!(!diagnostic.summary.contains('\x1b'));
         assert!(!diagnostic.output.contains('\x1b'));
         assert!(diagnostic.output.len() > diagnostic.summary.len());
+        let missing=provider_exit_diagnostic(None,"Provider executable not found","");assert!(missing.summary.contains("Install or configure"));
+        let killed=provider_exit_diagnostic(Some(std::process::ExitStatus::from_raw(9)),"socket closed","");assert!(killed.summary.contains("signal 9") && killed.summary.contains("Free memory"));
     }
 
     #[test]
