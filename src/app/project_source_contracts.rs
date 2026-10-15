@@ -109,6 +109,20 @@ async fn scripted_client_actual_project_callbacks_publish_and_refresh_the_same_r
     assert_eq!(app.project_creation_generation(project), Some(1), "ordinary read advances no original logical lifetime");
     assert!(app.project_creation_source(project).is_some());
     assert_eq!(peer.events().iter().filter(|event| **event == Event::Prepared).count(), 1);
+
+    // Actual attachment installs the SAME prebuilt identity before its first
+    // load task is polled. This checks custody, not Editable/file-effect admission.
+    let card = CardId::new();
+    let view = RepositoryView { project, repository: app.sidebar_model.project(project).unwrap().repository.clone(),
+        worktree: refreshed.source.repository().to_owned(), selected_file: None };
+    let initial_load = app.attach_repository_pane(card, view);
+    let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!("registered pane must attach"); };
+    assert!(runtime.retained_filesystem_roots().iter().any(|root| Arc::ptr_eq(root, &original)),
+        "new runtime must hold the published original Root before its first load");
+    assert_eq!(peer.events().iter().filter(|event| **event == Event::Prepared).count(), 1,
+        "pure initial handoff must not enroll a second lease");
+    drop(initial_load);
+    app.cards.remove(&card);
     app.retire_project_creation_source(project);
     drop(registered);
     drop(refreshed);

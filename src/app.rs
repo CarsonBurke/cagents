@@ -9956,6 +9956,10 @@ impl Cagents {
             RepositoryRuntime::new(view)
         };
         self.configure_repository_recovery_endpoint(&mut runtime);
+        if let Err(error) = self.install_published_repository_editor_root(&mut runtime) {
+            self.cards.insert(card, CardRuntime::Failed(error));
+            return Task::none();
+        }
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_editor_font(
             crate::terminal::monospace_font(self.settings.editor_font_family()),

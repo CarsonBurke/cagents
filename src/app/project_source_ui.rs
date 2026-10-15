@@ -5,6 +5,23 @@ use crate::edited_root_admission::{AdmissionPhase, AdmissionTicket};
 use project_source_admission::RegisteredProjectSource;
 
 impl Cagents {
+    /// Install only the worker-built identity for this same published checkout.
+    /// Linked roots have their own admission path; a project-primary lease must
+    /// never substitute for them. This performs no filesystem or client calls.
+    pub(super) fn install_published_repository_editor_root(
+        &self,
+        runtime: &mut RepositoryRuntime,
+    ) -> Result<(), String> {
+        let Some(registered) = self.retained_registered_project_source(runtime.descriptor.project)
+        else { return Ok(()); };
+        if registered.source.repository() != runtime.descriptor.worktree {
+            return Ok(());
+        }
+        runtime.set_original_editor_root(registered.editor_root).map_err(|_| {
+            "The original project root is retiring or already installed. Reopen this pane after the project reloads.".into()
+        })
+    }
+
     pub(super) fn registered_project_source_is_current(registered: &RegisteredProjectSource) -> bool {
         let Ok(admitted) = registered.source.edited_root_admission() else { return false; };
         let Some(editor_admitted) = registered.editor_root.retained_admission() else { return false; };
