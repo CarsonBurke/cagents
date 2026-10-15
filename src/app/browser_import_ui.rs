@@ -25,23 +25,36 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         drop(app.update(Message::BrowserImport(Action::Open)));
         let focus = app.update(Message::BrowserImport(Action::Open));
-        assert_eq!(super::super::tests::focused_element(app.browser_import_dialog().unwrap(),focus),Some(widget::Id::new("dialog.browser-import.cancel")));
-        let escape = || Message::KeyEvent { event:keyboard::Event::KeyPressed {
-            key:keyboard::Key::Named(keyboard::key::Named::Escape),modified_key:keyboard::Key::Named(keyboard::key::Named::Escape),
-            physical_key:keyboard::key::Physical::Code(keyboard::key::Code::Escape),location:keyboard::Location::Standard,
-            modifiers:keyboard::Modifiers::empty(),text:None,repeat:false,
-        },captured:false };
+        assert_eq!(
+            super::super::tests::focused_element(app.browser_import_dialog().unwrap(), focus),
+            Some(widget::Id::new("dialog.browser-import.cancel"))
+        );
+        let escape = || Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        };
         drop(app.update(escape()));
         assert!(!app.browser_import.open());
         drop(app.update(Message::BrowserImport(Action::Open)));
-        app.browser_import.phase=Phase::Scanning;
+        app.browser_import.phase = Phase::Scanning;
         drop(app.update(escape()));
         assert!(app.browser_import.confirm_cancel);
         assert!(!app.browser_import.cancel.load(Ordering::Relaxed));
         drop(app.update(escape()));
         assert!(!app.browser_import.confirm_cancel);
         assert!(app.browser_import.busy());
-        assert!(!app.browser_import.cancel.load(Ordering::Relaxed),"Escape from Stop import keeps the current scan");
+        assert!(
+            !app.browser_import.cancel.load(Ordering::Relaxed),
+            "Escape from Stop import keeps the current scan"
+        );
     }
 
     #[test]
@@ -174,7 +187,11 @@ impl State {
         !matches!(self.phase, Phase::Closed)
     }
     pub(super) fn escape_action(&self) -> Action {
-        if self.confirm_cancel { Action::KeepWorking } else { Action::Cancel }
+        if self.confirm_cancel {
+            Action::KeepWorking
+        } else {
+            Action::Cancel
+        }
     }
     fn busy(&self) -> bool {
         matches!(
@@ -213,7 +230,10 @@ impl Cagents {
                     // public OpenBrowser message after mounting the intro
                     // would be rejected by the modal input fence.
                     return self.add_browser(Url::parse("about:blank").unwrap()).chain(
-                        iced::widget::operation::focus(widget::Id::new("dialog.browser-import.cancel")).map(cosmic::Action::App)
+                        iced::widget::operation::focus(widget::Id::new(
+                            "dialog.browser-import.cancel",
+                        ))
+                        .map(cosmic::Action::App),
                     );
                 }
             }
@@ -491,7 +511,8 @@ impl Cagents {
             _ => {}
         }
         if focus_cancel && self.browser_import.open() {
-            iced::widget::operation::focus(widget::Id::new("dialog.browser-import.cancel")).map(cosmic::Action::App)
+            iced::widget::operation::focus(widget::Id::new("dialog.browser-import.cancel"))
+                .map(cosmic::Action::App)
         } else {
             Task::none()
         }
@@ -508,19 +529,24 @@ impl Cagents {
             let cancel = matches!(action, Action::Cancel | Action::KeepWorking);
             let button = if matches!(action, Action::ConfirmCancel) {
                 crate::ui_controls::button::destructive(label)
-            } else { crate::ui_controls::button::secondary(label) };
+            } else {
+                crate::ui_controls::button::secondary(label)
+            };
             let button = button.on_press(message(action));
-            if cancel {button.id(widget::Id::new("dialog.browser-import.cancel")).into()}
-            else {button.into()}
+            if cancel {
+                button
+                    .id(widget::Id::new("dialog.browser-import.cancel"))
+                    .into()
+            } else {
+                button.into()
+            }
         };
         if state.confirm_cancel {
             content.push(notice_body("Stop this import? A scan may be waiting for the desktop keyring. Cookies already written into the in-app browser remain there."));
-            content.push(
-                super::dialog_ui::confirmation_actions(
-                    button("Keep going", Action::KeepWorking),
-                    button("Stop import", Action::ConfirmCancel),
-                ),
-            );
+            content.push(super::dialog_ui::confirmation_actions(
+                button("Keep going", Action::KeepWorking),
+                button("Stop import", Action::ConfirmCancel),
+            ));
         } else {
             match &state.phase {
                 Phase::Intro => {

@@ -792,7 +792,10 @@ mod tests {
             session: source.clone(),
             result: Ok(CompletedCloseOutcome::Active(proof.clone())),
         });
-        assert_eq!(super::super::tests::focused_element(app.terminal_close_dialog().unwrap(),opening),Some(widget::Id::new("dialog.terminal-close.cancel")));
+        assert_eq!(
+            super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), opening),
+            Some(widget::Id::new("dialog.terminal-close.cancel"))
+        );
         assert!(app.terminal_close_dialog().is_some());
         assert!(app.card_state(card).unwrap().existence.is_open());
         let _ = app.update(Message::ConfirmTerminalClose);

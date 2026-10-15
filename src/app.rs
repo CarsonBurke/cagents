@@ -11272,8 +11272,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -16813,8 +16816,10 @@ impl Application for Cagents {
                 .into(),
             );
             let dismiss = controls.remove(0);
-            rows.push(dialog_ui::confirmation_actions(dismiss,
-                widget::row::with_children(controls).spacing(space::S)));
+            rows.push(dialog_ui::confirmation_actions(
+                dismiss,
+                widget::row::with_children(controls).spacing(space::S),
+            ));
 
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
@@ -16933,25 +16938,21 @@ impl Application for Cagents {
                     .into(),
             );
         }
-        rows.push(
-            dialog_ui::confirmation_actions(
-                crate::ui_controls::button::secondary("Cancel")
-                    .on_press(Message::CancelDialog),
-                crate::ui_controls::button::primary("Create")
-                    .on_press_maybe(
-                        (!head.is_empty()
-                            && !base.is_empty()
-                            && !dialog.title.trim().is_empty()
-                            && dialog.retry_confirmation != Some(false)
-                            && self
-                                .github_availability
-                                .get(&dialog.project_id)
-                                .and_then(GitHubAvailability::repository_key)
-                                == Some(&dialog.repository))
-                        .then_some(Message::SubmitPullRequest),
-                    ),
+        rows.push(dialog_ui::confirmation_actions(
+            crate::ui_controls::button::secondary("Cancel").on_press(Message::CancelDialog),
+            crate::ui_controls::button::primary("Create").on_press_maybe(
+                (!head.is_empty()
+                    && !base.is_empty()
+                    && !dialog.title.trim().is_empty()
+                    && dialog.retry_confirmation != Some(false)
+                    && self
+                        .github_availability
+                        .get(&dialog.project_id)
+                        .and_then(GitHubAvailability::repository_key)
+                        == Some(&dialog.repository))
+                .then_some(Message::SubmitPullRequest),
             ),
-        );
+        ));
         Some(dialog_ui::overlay(
             dialog_ui::surface(
                 widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(
@@ -20823,11 +20824,15 @@ mod tests {
     fn pull_request_single_line_fields_submit_on_enter() {
         let mut app = context_inspector_test_app(false);
         let dialog = pull_request_test_dialog();
-        authorize_pull_request_test(&mut app,&dialog);
-        app.pull_request_dialog=Some(dialog);
-        for id in [pull_request_dialog_focus_id(),widget::Id::new("dialog.pull-request.head"),widget::Id::new("dialog.pull-request.base")] {
-            let message = dialog_ui::tests::enter_control(app.dialog().unwrap(),id);
-            assert!(matches!(message,Message::SubmitPullRequest));
+        authorize_pull_request_test(&mut app, &dialog);
+        app.pull_request_dialog = Some(dialog);
+        for id in [
+            pull_request_dialog_focus_id(),
+            widget::Id::new("dialog.pull-request.head"),
+            widget::Id::new("dialog.pull-request.base"),
+        ] {
+            let message = dialog_ui::tests::enter_control(app.dialog().unwrap(), id);
+            assert!(matches!(message, Message::SubmitPullRequest));
         }
     }
 
@@ -21136,16 +21141,21 @@ mod tests {
 
     #[test]
     fn dirty_editor_confirmation_starts_on_cancel_and_enter_preserves_edits() {
-        let (mut app,card) = editing_repository_app();
+        let (mut app, card) = editing_repository_app();
         let opening = app.update(Message::CloseCard(card));
-        let cancel = dirty_close_control_id(card,DirtyCloseControl::Cancel);
-        assert_eq!(focused_element(app.dialog().unwrap(),opening),Some(cancel.clone()));
-        let message = dialog_ui::tests::enter_control(app.dialog().unwrap(),cancel);
-        assert!(matches!(message,Message::CancelRepositoryClose));
+        let cancel = dirty_close_control_id(card, DirtyCloseControl::Cancel);
+        assert_eq!(
+            focused_element(app.dialog().unwrap(), opening),
+            Some(cancel.clone())
+        );
+        let message = dialog_ui::tests::enter_control(app.dialog().unwrap(), cancel);
+        assert!(matches!(message, Message::CancelRepositoryClose));
         drop(app.update(message));
         assert!(app.dirty_repository_close.is_none());
         assert!(app.card_state(card).unwrap().existence.is_open());
-        assert!(matches!(&app.cards[&card],CardRuntime::Repository(runtime) if runtime.is_dirty() && !runtime.is_saving()));
+        assert!(
+            matches!(&app.cards[&card],CardRuntime::Repository(runtime) if runtime.is_dirty() && !runtime.is_saving())
+        );
     }
 
     #[test]
@@ -26894,11 +26904,20 @@ mod tests {
     #[test]
     fn discard_confirmation_starts_on_cancel_and_enter_does_not_admit_a_mutation() {
         let mut app = context_inspector_test_app(false);
-        let opening = app.update(Message::Sidebar(SidebarAction::RequestDiscard {key:discard_key(),request:discard_request(false)}));
+        let opening = app.update(Message::Sidebar(SidebarAction::RequestDiscard {
+            key: discard_key(),
+            request: discard_request(false),
+        }));
         let cancel = sidebar::discard_cancel_id();
-        assert_eq!(focused_element(app.dialog().unwrap(),opening),Some(cancel.clone()));
-        let message = dialog_ui::tests::enter_control(app.dialog().unwrap(),cancel);
-        assert!(matches!(message,Message::Sidebar(SidebarAction::CancelDiscard)));
+        assert_eq!(
+            focused_element(app.dialog().unwrap(), opening),
+            Some(cancel.clone())
+        );
+        let message = dialog_ui::tests::enter_control(app.dialog().unwrap(), cancel);
+        assert!(matches!(
+            message,
+            Message::Sidebar(SidebarAction::CancelDiscard)
+        ));
         drop(app.update(message));
         assert!(app.sidebar_state.pending_discard().is_none());
         assert!(app.source_control_mutations.is_empty());

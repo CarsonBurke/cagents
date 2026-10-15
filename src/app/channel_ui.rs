@@ -790,7 +790,10 @@ impl Cagents {
             super::notice_body(match dialog.chats {
                 0 => format!("Delete \"{}\" from this workspace?", dialog.title),
                 1 => format!("Delete \"{}\" and close its conversation?", dialog.title),
-                chats => format!("Delete \"{}\" and close its {chats} conversations?", dialog.title),
+                chats => format!(
+                    "Delete \"{}\" and close its {chats} conversations?",
+                    dialog.title
+                ),
             }),
         ];
         if let Some(failure) = &dialog.failure {
@@ -964,26 +967,44 @@ mod tests {
 
     #[test]
     fn deletion_opens_on_cancel_and_enter_or_escape_keeps_the_channel_and_cards() {
-        for enter in [false,true] {
+        for enter in [false, true] {
             let (mut app, channel, _survivor, card) = channel_with_a_conversation();
             let original = app.card_state(card).unwrap().clone();
             let opening = app.handle_channel_ui(Action::Delete(channel));
-            assert_eq!(super::super::tests::focused_element(app.channel_dialog_view().unwrap(),opening),Some(widget::Id::new("dialog.channel.close")));
+            assert_eq!(
+                super::super::tests::focused_element(app.channel_dialog_view().unwrap(), opening),
+                Some(widget::Id::new("dialog.channel.close"))
+            );
             let cancel = if enter {
-                let message = super::super::dialog_ui::tests::enter_control(app.channel_dialog_view().unwrap(),State::focus_target());
-                assert!(matches!(message,Message::ChannelUi(Action::Dismiss)));
+                let message = super::super::dialog_ui::tests::enter_control(
+                    app.channel_dialog_view().unwrap(),
+                    State::focus_target(),
+                );
+                assert!(matches!(message, Message::ChannelUi(Action::Dismiss)));
                 message
             } else {
-                Message::KeyEvent { event:keyboard::Event::KeyPressed {
-                    key:keyboard::Key::Named(keyboard::key::Named::Escape),modified_key:keyboard::Key::Named(keyboard::key::Named::Escape),
-                    physical_key:keyboard::key::Physical::Code(keyboard::key::Code::Escape),location:keyboard::Location::Standard,
-                    modifiers:keyboard::Modifiers::empty(),text:None,repeat:false,
-                },captured:false }
+                Message::KeyEvent {
+                    event: keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    },
+                    captured: false,
+                }
             };
             drop(app.update(cancel));
             assert!(!app.channel_ui.modal_open());
-            assert!(app.durable.channels.iter().any(|current|current.id==channel));
-            assert_eq!(app.card_state(card),Some(&original));
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .any(|current| current.id == channel)
+            );
+            assert_eq!(app.card_state(card), Some(&original));
             assert!(!app.channel_ui.deletion_running());
         }
     }
