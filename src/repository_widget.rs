@@ -8369,7 +8369,7 @@ impl RepositoryRuntime {
             }
             RepositoryAction::ToggleDiffWhitespace { card } => {
                 self.set_diff_ignore_whitespace(!self.diff_ignore_whitespace);
-                self.ensure_current_diff(card)
+                self.refresh_diff_preferences(card)
             }
             RepositoryAction::SelectDiffRow {
                 identity,

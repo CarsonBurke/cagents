@@ -143,6 +143,23 @@ mod tests {
         assert!(iced::runtime::task::into_stream(runtime.update(RepositoryAction::CompareDisk { card })).is_none(), "unchanged ready comparison needs no duplicate work");
     }
     #[tokio::test]
+    async fn actual_whitespace_toggle_rebuilds_the_displayed_disk_comparison() {
+        let card = CardId::new(); let mut runtime = fixture(card);
+        runtime.set_editor_font(Font::with_name("Iosevka"), 16.0);
+        let task = runtime.update(RepositoryAction::CompareDisk { card });
+        drop(runtime.update(completion(task).await));
+        let previous = runtime.disk_comparison_applied.as_ref().unwrap();
+        assert!(!previous.ignore_whitespace); assert_eq!(previous.font, Font::with_name("Iosevka"));
+        // Ceditor uses this shared reducer, without ADE's special settings arm.
+        let task = runtime.update(RepositoryAction::ToggleDiffWhitespace { card });
+        assert!(runtime.diff_ignore_whitespace);
+        assert!(runtime.disk_comparison_job.as_ref().unwrap().key.ignore_whitespace);
+        drop(runtime.update(completion(task).await));
+        assert!(runtime.disk_comparison_applied.as_ref().unwrap().ignore_whitespace);
+        assert!(matches!(runtime.disk_comparison, Some(DiffState::Ready(RenderedDiff::Text { .. }, _))));
+    }
+
+    #[tokio::test]
     async fn failed_owned_comparison_can_retry_unchanged_sources_with_a_new_worker() {
         let card = CardId::new(); let mut runtime = fixture(card);
         let task = runtime.update(RepositoryAction::CompareDisk { card });
