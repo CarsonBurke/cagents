@@ -205,3 +205,62 @@ fn combined_close_retained_lifecycle_attempted_return_stays_unknown_until_exact_
     f.host.lock().unwrap().validate_terminal_handoff_receipt(&receipt).unwrap();
     returned.shutdown().unwrap();
 }
+
+#[test]
+fn combined_close_retained_lifecycle_real_created_pair_stays_held_until_exact_console_retry() {
+    if owning_close_isolated("combined_close_retained_lifecycle_real_created_pair_stays_held_until_exact_console_retry").is_some() {return;}
+    let (host,mut request,path)=fixture();
+    let mut cleanup=BoundCloseCleanup {host:host.clone(),attempted:false,notifications:None,lease:None};
+    let root=path.parent().unwrap();
+    {
+        use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
+        let marker=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC).open(root.join("combined-close-owner.json")).unwrap();
+        serde_json::to_writer(marker,&serde_json::json!({"root":root.canonicalize().unwrap(),"uid":std::fs::metadata(root).unwrap().uid()})).unwrap();
+    }
+    let program=root.join("bin/codex");
+    std::fs::write(&program,include_str!("../../../tests/fixtures/combined-close-codex.py")).unwrap();
+    std::fs::set_permissions(&program,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let proof=host.lock().unwrap().proof().clone();
+    cleanup.lease=Some(crate::daemon::HostLease::acquire(&crate::daemon::RuntimePaths::discover().unwrap(),&proof).unwrap());
+    cleanup.notifications=Some(crate::host::notifications::Broker::start(&host,crate::notifications::Application::Cagents).unwrap());
+    host.lock().unwrap().notifications=Some(cleanup.notifications.as_ref().unwrap().handle());
+    host.lock().unwrap().enable_holder_recovery();
+    let Destination::New(spec)=&mut request.destination else {unreachable!()};
+    spec.provider=Provider::Codex;spec.model=Some("fixture-model".into());spec.reasoning_effort=Some("low".into());
+    let accepted=submit(&host,&Authority::default(),request).unwrap();
+    let run=settled(&host,accepted.run.id);assert_eq!(run.state,State::Succeeded,"{run:?}");
+    let agent=registry(&host).unwrap().lock().unwrap().agent(accepted.agent.id).unwrap();
+    let id=agent.session.as_ref().unwrap().id();
+    let handle=host.lock().unwrap().chats[&id].handle.clone();
+    assert!(handle.actor_identity().is_none());assert!(handle.provider_process().is_none(),"genuine Local Codex childNone");
+    let binding=super::super::chat::source_binding::owning_binding_for_test(&host,id).unwrap();
+    super::super::chat::process(&host,1,crate::terminal_ipc::ClientRequest::ChatAttach {session:binding.source.clone()}).unwrap();
+    let recipe=crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:vec![],
+        working_directory:root.join("project"),environment:Default::default(),unset_environment:Default::default()};
+    // Actual shared production pairing body after the already-validated recipe
+    // boundary; /bin/cat proves ownership/publication, not installed CLI UX.
+    let interrupted=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _=super::super::chat::owning_console_for_test(&host,1,binding.clone(),recipe.clone(),|| {
+            panic!("test interruption after actual helper/pair source publication");
+        });
+    }));
+    assert!(interrupted.is_err());
+    let phase=super::super::chat::source_binding::pending_claim_for_test(&host,&binding).expect("real pending pair operation");
+    assert!(phase.0.is_some()&&!phase.1);
+    let pair=host.lock().unwrap().chats[&id].paired_terminal.as_ref().unwrap().clone();
+    assert!(pair.holder_identity().unwrap().root.is_current());
+    let error=super::super::chat::process(&host,1,crate::terminal_ipc::ClientRequest::ChatClose {chat_id:id}).unwrap_err();
+    assert!(error.message.contains("attempted or paired terminal ownership"),"{error:?}");
+    assert_eq!(super::super::chat::source_binding::pending_claim_for_test(&host,&binding),Some(phase));
+    assert!(!handle.is_completed());assert!(pair.holder_identity().unwrap().root.is_current());
+    assert_eq!(registry(&host).unwrap().lock().unwrap().agent_run(run.id).unwrap(),run);
+    let response=super::super::chat::owning_console_for_test(&host,1,binding.clone(),recipe,|| {}).unwrap();
+    let crate::terminal_ipc::ServerResponse::ChatTerminal {receipt,..}=response else {panic!("original pair receipt required");};
+    assert_eq!(receipt.terminal.execution_instance,pair.execution_instance());
+    assert!(super::super::chat::source_binding::pending_claim_for_test(&host,&binding).is_none());
+    assert!(host.lock().unwrap().chats[&id].paired_terminal.as_ref().unwrap().same_worker(&pair));
+    assert_eq!(std::fs::read_to_string(root.join("codex-processes.jsonl")).unwrap().lines().count(),1);
+    pair.shutdown().unwrap();
+    cleanup.finish();
+}

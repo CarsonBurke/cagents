@@ -6612,3 +6612,18 @@ done
         handle.close().unwrap();
     }
 }
+
+/// Test-only retry through the SAME production captured console operation. It
+/// authenticates Pending/owner/instance in the actual caller, never clears it.
+#[cfg(test)]
+pub(in crate::host) fn owning_console_for_test(host: &SharedHost, client: ClientId,
+    expected: crate::terminal_ipc::ChatSourceBinding, recipe: crate::model::LaunchRecipe,
+    after_source: impl FnOnce()) -> Result<ServerResponse, ProtocolError> {
+    let id=expected.source.id;
+    let transition=restart::transition_gate(host,id);
+    let _guard=transition.lock().unwrap();
+    let (handle,source)={let state=host.lock().unwrap();
+        let record=attached(&state,client,id)?;
+        (record.handle.clone(),record.session.clone())};
+    codex_terminal_view_captured(host,client,id,&handle,source,recipe,Some(expected),after_source)
+}
