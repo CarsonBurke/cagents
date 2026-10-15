@@ -421,6 +421,7 @@ pub(super) fn notice(runtime:&Runtime)->Option<Element<'static,Message>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::ToolStatus;
     fn source_epoch(revision:u64)->SourceEpoch {SourceEpoch {incarnation:uuid::Uuid::from_u128(1),revision}}
     fn text(id:&str,body:&str)->Arc<chat::Item> {
         Arc::new(chat::Item {id:id.into(),role:chat::Role::Assistant,started_at:Some(10),at:Some(20),

@@ -534,6 +534,7 @@ pub(super) fn patch_ready(runtime:&mut Runtime,key:&chat::cache::SourceKey,index
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::{ChangeKind,FileChange,ToolStatus};
     fn epoch(revision:u64)->chat::cache::SourceEpoch {chat::cache::SourceEpoch {incarnation:uuid::Uuid::from_u128(1),revision}}
     fn fixture(text:&str)->Arc<Manifest> {
         Arc::new(Manifest {source:chat::cache::SourceKey {agent_id:None,source_id:"opaque:native-part:looks-like-a-suffix".into()},
@@ -701,6 +702,35 @@ mod tests {
         assert!(restored.restore(uncharged).is_err(),"equal bytes do not prove a decoded lease");
         drop(captured);state.clear();assert!(weak.upgrade().is_some(),"actual restored owner remains charged");
         restored.clear();assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn mounted_detail_tree_retires_copy_and_patch_controls_on_collapse_and_epoch_change() {
+        use iced::advanced::{Layout,layout,widget::Tree};
+        let text="@@ -1 +1 @@\n-before\n+after\nLAST_PATCH_ANCHOR";let page=fixture(text);
+        let (mut state,raw,expanded)=open(&page,"late-native-part");let request=state.entries[&page.source].patch_requests[&0];
+        assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,text).await)));
+        let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
+        let handle=Arc::new(ClientHandle::fixture(session.clone(),(*raw).clone()));
+        let mut runtime=Runtime::new(Target {card:CardId::new(),generation:1},session,Connection::Live(handle),true,crate::settings::EditorSyntaxTheme::default());
+        runtime.logical_changes=state;runtime.expanded=expanded;
+        let renderer=crate::app::tests::headless_renderer();
+        let labels=|element:&mut Element<'static,Message>,tree:&mut Tree| {
+            tree.diff(element.as_widget_mut());
+            let node=element.as_widget_mut().layout(tree,&renderer,&layout::Limits::new(iced::Size::ZERO,iced::Size::new(600.0,600.0)));
+            let nodes=element.as_widget().a11y_nodes(Layout::new(&node),tree,iced::mouse::Cursor::Unavailable);
+            nodes.root().iter().chain(nodes.children()).filter_map(|node|node.node().label().map(str::to_owned)).collect::<Vec<_>>()
+        };
+        let mut element=detail(&runtime,&page.source.source_id).unwrap();let mut tree=Tree::new(&element);
+        assert!(labels(&mut element,&mut tree).iter().any(|label|label=="Copy patch"));
+        runtime.logical_changes.toggle_file(&page.source.source_id,0);
+        let mut element=detail(&runtime,&page.source.source_id).unwrap();
+        assert!(!labels(&mut element,&mut tree).iter().any(|label|label=="Copy patch"));
+        let mut changed=(*page).clone();changed.epoch.incarnation=uuid::Uuid::from_u128(44);
+        runtime.logical_changes.project(self::raw(&changed,"late-native-part"),None,&runtime.expanded,false);
+        let mut element=detail(&runtime,&page.source.source_id).unwrap();
+        assert!(!labels(&mut element,&mut tree).iter().any(|label|label=="Copy patch"));
+        assert!(runtime.logical_changes.copy_patch(&page.source.source_id,0).is_none());
     }
 
 }
