@@ -194,6 +194,7 @@ struct Inner {
     pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     commands: crossbeam_channel::Sender<CommandRequest>,
+    session_stop: Arc<Mutex<Option<CommandRequest>>>,
     urgent_commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
@@ -482,6 +483,7 @@ impl LocalHandle {
         nonblocking(&wake)?;
         nonblocking(&reader)?;
         let (commands, incoming) = crossbeam_channel::bounded(64);
+        let session_stop=Arc::new(Mutex::new(None));
         let (urgent_commands, urgent_incoming) = crossbeam_channel::bounded(1);
         let state = Arc::new(Mutex::new(Snapshot {
             session_id,
@@ -526,6 +528,7 @@ impl LocalHandle {
             pinned_directory: pinned_directory.clone(),
             provider_process: provider_process.clone(),
             commands,
+            session_stop:session_stop.clone(),
             urgent_commands,
             wake: Mutex::new(wake),
             state: state.clone(),
@@ -588,6 +591,7 @@ impl LocalHandle {
                     stop,
                     incoming,
                     urgent_incoming,
+                    session_stop,
                     wake: reader,
                     notify,
                     output: Vec::new(),
@@ -1018,12 +1022,19 @@ impl LocalHandle {
     /// Fence one actor lifetime after explicit consent to stop all its work.
     /// Cleanup is separate and must run outside global control admission.
     pub(crate) fn fence_session_stop_until(&self, actor_id: uuid::Uuid, deadline: Instant) -> Result<(), String> {
-        let observed = self.close_observation();
-        if observed.actor_id != actor_id {
+        if Instant::now() >= deadline {return Err("Session stop budget expired; no cleanup is confirmed".into());}
+        // A deadline-bearing owner command must not hydrate Snapshot or wait
+        // behind publication/diagnostic metadata. Contention preserves ownership.
+        let (observed_id,unobserved)=match self.0.close_state.try_lock() {
+            Ok(close)=>(close.actor_id,close.unobserved_native),
+            Err(std::sync::TryLockError::Poisoned(p))=>{let close=p.into_inner();(close.actor_id,close.unobserved_native)},
+            Err(std::sync::TryLockError::WouldBlock)=>return Err("Provider identity is being updated; retain its owner and retry session stop".into()),
+        };
+        if observed_id != actor_id {
             return Err("The provider actor was replaced; its replacement was preserved".into());
         }
-        if observed.completed || self.0.stop.load(Ordering::Acquire) {
-            return if observed.owns_work && self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native {
+        if self.is_completed() || self.0.stop.load(Ordering::Acquire) {
+            return if unobserved {
                 Err("Retained provider ownership must be reattached before session stop".into())
             } else { Ok(()) };
         }
@@ -1032,8 +1043,17 @@ impl LocalHandle {
         }
         if Instant::now() >= deadline {return Err("Session stop budget expired; no cleanup is confirmed".into());}
         let (reply, response) = crossbeam_channel::bounded(1);
-        self.0.commands.try_send((ActorCommand::StopSession {actor_id}, reply))
-            .map_err(|error| format!("Session stop could not be admitted: {error}"))?;
+        {
+            let mut pending=match self.0.session_stop.try_lock() {
+                Ok(pending)=>pending,
+                Err(std::sync::TryLockError::Poisoned(p))=>p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock)=>return Err("Session stop admission is busy; retain its owner and retry".into()),
+            };
+            if pending.is_some() {return Err("A session stop is already pending; retain its owner and refresh".into());}
+            // Whole-session consent includes queued work and bypasses stdin
+            // backpressure. One bounded owner slot cannot accumulate requests.
+            *pending=Some((ActorCommand::StopSession {actor_id},reply));
+        }
         match self.0.wake.try_lock() {
             Ok(mut wake) => { let _ = wake.write(&[1]); },
             Err(std::sync::TryLockError::Poisoned(p)) => { let _ = p.into_inner().write(&[1]); },
@@ -2205,6 +2225,7 @@ struct Actor {
     stop: Arc<AtomicBool>,
     incoming: crossbeam_channel::Receiver<CommandRequest>,
     urgent_incoming: crossbeam_channel::Receiver<CommandRequest>,
+    session_stop: Arc<Mutex<Option<CommandRequest>>>,
     wake: UnixStream,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     output: Vec<u8>,
@@ -2708,7 +2729,8 @@ impl Actor {
             // queued write: a provider that reads stdin only between turns keeps
             // `pending` non-empty for the whole turn, and refusing to drain there left
             // UI commands unacknowledged until the caller's 10 second timeout.
-            let request = self.urgent_incoming.try_recv().ok().or_else(|| {
+            let priority=self.session_stop.lock().unwrap_or_else(|p|p.into_inner()).take();
+            let request=priority.or_else(||self.urgent_incoming.try_recv().ok()).or_else(|| {
                 (self.queued <= QUEUE_BACKPRESSURE)
                     .then(|| self.incoming.try_recv().ok())
                     .flatten()

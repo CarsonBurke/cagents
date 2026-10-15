@@ -2020,7 +2020,7 @@ impl Server {
             }
             "fence_session_stop" => {
                 let (actor_id,millis)=decode!((uuid::Uuid,u64));
-                if actor_id!=self.identity.instance || self.actor.close_observation().actor_id!=actor_id {
+                if actor_id!=self.identity.instance {
                     return Err("The provider actor was replaced; its replacement was preserved".into());
                 }
                 // Helper ownership survives daemon/proxy replacement. Retain
@@ -2477,7 +2477,7 @@ mod tests {
                 _directory: None,
                 mailbox_seal: None,
                 closed_snapshot: None,
-            session_stopping: false,
+                session_stopping: false,
             },
             _root: root,
         }
@@ -2759,6 +2759,27 @@ done"#;
         // Read/ACK pathways remain available for two-phase durable cleanup.
         assert!(invoke(server,"outbox_unacked",Value::Null).is_ok());
         assert!(invoke(server,"input_receipts",json!([Vec::<InputIdentity>::new()])).is_ok());
+    }
+
+    #[test]
+    fn session_stop_metadata_contention_respects_local_and_helper_deadlines() {
+        // Snapshot publication and diagnostics must never be prerequisites for
+        // admitting this identity-only command. An expired budget touches none.
+        let mut fixture=resident_fixture();
+        let actor=fixture.server.actor.clone();let actor_id=fixture.server.identity.instance;
+        let state=actor.0.state.lock().unwrap();
+        let failure=actor.0.failure.lock().unwrap();
+        let close=actor.0.close_state.lock().unwrap();
+        let started=Instant::now();
+        assert!(actor.fence_session_stop_until(actor_id,started).is_err());
+        assert!(started.elapsed()<Duration::from_secs(1));
+        let started=Instant::now();
+        let error=fixture.server.invoke(Invocation {proof:fixture.server.proof.clone(),epoch:Some(fixture.server.epoch),method:"fence_session_stop".into(),args:json!([actor_id,20])}).unwrap_err();
+        assert!(error.contains("identity is being updated"));
+        assert!(started.elapsed()<Duration::from_secs(1),"helper must not block behind close/publication metadata");
+        assert!(!actor.0.stop.load(Ordering::Acquire));
+        drop(close);drop(failure);drop(state);
+        actor.fence_session_stop_until(actor_id,Instant::now()+Duration::from_secs(1)).unwrap();
     }
 
     #[test]
