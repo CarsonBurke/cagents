@@ -197,6 +197,7 @@ fn consume(
     if retain {
         return Ok(true);
     }
+    crate::chat::runtime::remove_actor_final_snapshot(&receipt.record)?;
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

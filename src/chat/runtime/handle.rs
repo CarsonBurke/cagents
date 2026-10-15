@@ -71,7 +71,7 @@ impl Handle {
     pub(crate) fn usage(&self)->chat::Usage {match &self.0 {Owner::Local(local)=>local.usage(),Owner::Remote(remote)=>remote.state().usage.clone()}}
     pub(crate) fn retained_runs(&self)->Vec<crate::model::RunId> {match &self.0 {Owner::Local(_)=>Vec::new(),Owner::Remote(remote)=>remote.state().retained_runs.clone()}}
     pub(crate) fn attachment_snapshot(&self)->Snapshot {match &self.0 {Owner::Local(local)=>local.snapshot(None).expect("unconditional local snapshot"),Owner::Remote(remote)=>remote.attachment_snapshot()}}
-    pub fn snapshot(&self,after:Option<u64>)->Option<Snapshot> {match &self.0 {Owner::Local(local)=>local.snapshot(after),Owner::Remote(remote)=>remote.call("snapshot",serde_json::json!([after])).ok().flatten()}}
+    pub fn snapshot(&self,after:Option<u64>)->Option<Snapshot> {match &self.0 {Owner::Local(local)=>local.snapshot(after),Owner::Remote(remote)=>remote.snapshot(after)}}
     pub(crate) fn presentation(&self,chat_id:crate::model::TerminalId,after:Option<u64>)->Option<crate::terminal_ipc::ServerResponse> {match &self.0 {Owner::Local(local)=>local.presentation(chat_id,after),Owner::Remote(remote)=>remote.call("presentation",serde_json::json!([chat_id,after])).ok().flatten()}}
     pub fn session_id(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.session_id(),Owner::Remote(remote)=>remote.state().session_id.clone()}}
     pub(crate) fn confirmed_session_id(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.confirmed_session_id(),Owner::Remote(remote)=>remote.state().confirmed_session.clone()}}
@@ -80,7 +80,7 @@ impl Handle {
     pub(crate) fn recovery_environment_matches(&self,environment:&BTreeMap<String,String>)->bool {match &self.0 {Owner::Local(local)=>local.recovery_environment_matches(environment),Owner::Remote(remote)=>remote.recovery_environment_matches(environment)}}
     pub fn is_completed(&self)->bool {match &self.0 {Owner::Local(local)=>local.is_completed(),Owner::Remote(remote)=>remote.state().completed}}
     pub fn failure(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.failure(),Owner::Remote(remote)=>remote.state().failure.clone()}}
-    pub fn owns_work(&self)->bool {match &self.0 {Owner::Local(local)=>local.owns_work(),Owner::Remote(remote)=>remote.state().owns_work}}
+    pub fn owns_work(&self)->bool {match &self.0 {Owner::Local(local)=>local.owns_work(),Owner::Remote(remote)=>remote.owns_work()}}
     pub(crate) fn activity(&self)->crate::agent::ActivityState {match &self.0 {Owner::Local(local)=>local.activity(),Owner::Remote(remote)=>remote.state().activity}}
     pub(crate) fn update_activity(&self)->(bool,bool) {match &self.0 {Owner::Local(local)=>local.update_activity(),Owner::Remote(remote)=>{let state=remote.state();(state.working||state.waiting||!state.requests.is_empty(),state.ready)}}}
     pub(crate) fn is_idle(&self)->bool {match &self.0 {Owner::Local(local)=>local.is_idle(),Owner::Remote(remote)=>remote.state().idle}}
