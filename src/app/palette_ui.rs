@@ -2688,7 +2688,7 @@ impl Cagents {
                 };
                 self.update(Message::TerminalReviewMode {
                     card,
-                    terminal: handle.terminal_id(),
+                    terminal: handle.attachment_id(),
                     active: self.terminal_review_card != Some(card),
                 })
             }
