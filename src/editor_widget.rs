@@ -113,7 +113,7 @@ impl SearchSnapshot {
     /// any native mutation. Higher ranges can then be applied first.
     pub(crate) fn replacement_edits(
         &self,
-        matches: impl IntoIterator<Item=impl std::borrow::Borrow<(Position,Position)>>,
+        matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
         query: &str,
         replacement: &str,
         options: crate::editor_search::FindOptions,
@@ -121,11 +121,11 @@ impl SearchSnapshot {
     ) -> Result<Vec<(Position, Position, String)>, String> {
         let replacement =
             crate::editor_search::Replacement::new(query, replacement, options, preserve)?;
-        let matches=matches.into_iter();
+        let matches = matches.into_iter();
         let mut edits = Vec::with_capacity(matches.size_hint().0);
         let mut copied = 0;
         for item in matches {
-            let &(start,end)=std::borrow::Borrow::borrow(&item);
+            let &(start, end) = std::borrow::Borrow::borrow(&item);
             if start.line != end.line {
                 return Err("A search match crosses a line boundary.".into());
             }
@@ -155,7 +155,7 @@ impl SearchSnapshot {
 
     pub(crate) fn replace_matches_with(
         &self,
-        matches: impl IntoIterator<Item=impl std::borrow::Borrow<(Position,Position)>>,
+        matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
         query: &str,
         replacement: &str,
         options: crate::editor_search::FindOptions,
@@ -165,24 +165,42 @@ impl SearchSnapshot {
             crate::editor_search::Replacement::new(query, replacement, options, preserve)?;
         let text = self.source.text();
         let mut result = String::with_capacity(text.len());
-        let mut copied=0;
-        let mut cached_line:Option<(usize,Line<'_>,usize)>=None;
+        let mut copied = 0;
+        let mut cached_line: Option<(usize, Line<'_>, usize)> = None;
         for item in matches {
-            let &(start,end)=std::borrow::Borrow::borrow(&item);
-            if start.line!=end.line { return Err("A search match crosses a line boundary.".into()); }
-            if cached_line.as_ref().is_none_or(|(number,_,_)|*number!=start.line) {
-                let line=self.source.line(start.line).ok_or("The selected match is outside the document.")?;
-                let offset=self.source.byte_offset(Position {line:start.line,column:0}).ok_or("Invalid search position.")?;
-                cached_line=Some((start.line,line,offset));
+            let &(start, end) = std::borrow::Borrow::borrow(&item);
+            if start.line != end.line {
+                return Err("A search match crosses a line boundary.".into());
             }
-            let (_,line,offset)=cached_line.as_ref().unwrap();
-            line.text.get(start.column..end.column).ok_or("Invalid search position.")?;
-            let from=offset+start.column;
-            let to=offset+end.column;
-            if to<from || from<copied { return Err("Search matches overlap.".into()); }
+            if cached_line
+                .as_ref()
+                .is_none_or(|(number, _, _)| *number != start.line)
+            {
+                let line = self
+                    .source
+                    .line(start.line)
+                    .ok_or("The selected match is outside the document.")?;
+                let offset = self
+                    .source
+                    .byte_offset(Position {
+                        line: start.line,
+                        column: 0,
+                    })
+                    .ok_or("Invalid search position.")?;
+                cached_line = Some((start.line, line, offset));
+            }
+            let (_, line, offset) = cached_line.as_ref().unwrap();
+            line.text
+                .get(start.column..end.column)
+                .ok_or("Invalid search position.")?;
+            let from = offset + start.column;
+            let to = offset + end.column;
+            if to < from || from < copied {
+                return Err("Search matches overlap.".into());
+            }
             result.push_str(text.get(copied..from).ok_or("Invalid search position.")?);
-            replacement.append(&line.text,start.column,end.column,&mut result)?;
-            copied=to;
+            replacement.append(&line.text, start.column, end.column, &mut result)?;
+            copied = to;
         }
         result.push_str(text.get(copied..).ok_or("Invalid search position.")?);
         Ok(result)
@@ -191,14 +209,14 @@ impl SearchSnapshot {
     /// Build a replacement in source order: each source byte is copied once.
     pub(crate) fn replace_matches(
         &self,
-        matches: impl IntoIterator<Item=impl std::borrow::Borrow<(Position,Position)>>,
+        matches: impl IntoIterator<Item = impl std::borrow::Borrow<(Position, Position)>>,
         replacement: &str,
     ) -> Option<String> {
         let text = self.source.text();
         let mut result = String::with_capacity(text.len());
         let mut copied = 0;
         for item in matches {
-            let &(start,end)=std::borrow::Borrow::borrow(&item);
+            let &(start, end) = std::borrow::Borrow::borrow(&item);
             let start = self.source.byte_offset(start)?;
             let end = self.source.byte_offset(end)?;
             if end < start || start < copied {
@@ -214,11 +232,21 @@ impl SearchSnapshot {
 }
 
 pub(crate) fn find_in_lines<T: AsRef<str>>(
-    lines: impl Iterator<Item=T>, query:&str, cancelled:impl Fn()->bool,
-)->Option<MatchIndex> {
-    let mut matches=MatchBuilder::default();
-    visit_matches(lines,query,cancelled,|line,_,start,end|matches.push(Position {line,column:start},Position {line,column:end}))
-        .then(||matches.finish())
+    lines: impl Iterator<Item = T>,
+    query: &str,
+    cancelled: impl Fn() -> bool,
+) -> Option<MatchIndex> {
+    let mut matches = MatchBuilder::default();
+    visit_matches(lines, query, cancelled, |line, _, start, end| {
+        matches.push(
+            Position {
+                line,
+                column: start,
+            },
+            Position { line, column: end },
+        )
+    })
+    .then(|| matches.finish())
 }
 
 pub(crate) fn visit_matches<T: AsRef<str>>(
@@ -251,7 +279,7 @@ pub(crate) fn visit_matches<T: AsRef<str>>(
                 if index % 1024 == 0 && cancelled() {
                     return false;
                 }
-                emit(line,text,offset,offset+query.len());
+                emit(line, text, offset, offset + query.len());
             }
             continue;
         }
@@ -264,9 +292,9 @@ pub(crate) fn visit_matches<T: AsRef<str>>(
             boundaries.resize(folded.len(), None);
             // NonZero's niche keeps each optional source boundary one
             // machine word, rather than a separate usize plus discriminant.
-            boundaries[start] = std::num::NonZeroUsize::new(offset+1);
+            boundaries[start] = std::num::NonZeroUsize::new(offset + 1);
         }
-        boundaries.push(std::num::NonZeroUsize::new(text.len()+1));
+        boundaries.push(std::num::NonZeroUsize::new(text.len() + 1));
         let mut cursor = 0;
         let mut candidates = 0;
         while cursor + query.len() <= folded.len() {
@@ -286,7 +314,7 @@ pub(crate) fn visit_matches<T: AsRef<str>>(
             let offset = cursor + found;
             let end = offset + query.len();
             if let (Some(start), Some(end_column)) = (boundaries[offset], boundaries[end]) {
-                emit(line,text,start.get()-1,end_column.get()-1);
+                emit(line, text, start.get() - 1, end_column.get() - 1);
                 cursor = end;
             } else {
                 // Rejected partial case-fold expansions must not consume a
@@ -2690,23 +2718,37 @@ where
         }
 
         let horizontal = Vector::new(internal.horizontal_translation(), 0.0);
-        if let Some(matches)=self.find_matches.filter(|matches|!matches.is_empty()) {
+        if let Some(matches) = self.find_matches.filter(|matches| !matches.is_empty()) {
             for run in internal.editor.buffer().layout_runs() {
                 for glyph in run.glyphs {
-                    let rect=Rectangle::new(
-                        Point::new(text_bounds.x+horizontal.x+glyph.x,text_bounds.y+run.line_top),
-                        Size::new(glyph.w,run.line_height),
+                    let rect = Rectangle::new(
+                        Point::new(
+                            text_bounds.x + horizontal.x + glyph.x,
+                            text_bounds.y + run.line_top,
+                        ),
+                        Size::new(glyph.w, run.line_height),
                     );
-                    let Some(bounds)=text_bounds.intersection(&rect) else { continue; };
+                    let Some(bounds) = text_bounds.intersection(&rect) else {
+                        continue;
+                    };
                     // Seek by the actual glyph's source bytes, including bidi
                     // and ligatures. Match density outside this glyph cannot
                     // multiply its paint work or create one quad per hit.
-                    let (first,overlapping)=matches.visible(run.line_i,glyph.start,glyph.end);
-                    if overlapping.len()==0 { continue; }
-                    let current=self.current_match>=first && self.current_match-first<overlapping.len();
-                    let mut color=style.selection;
-                    color.a*=if current {0.55} else {0.18};
-                    renderer.fill_quad(renderer::Quad {bounds,..Default::default()},color);
+                    let (first, overlapping) = matches.visible(run.line_i, glyph.start, glyph.end);
+                    if overlapping.len() == 0 {
+                        continue;
+                    }
+                    let current = self.current_match >= first
+                        && self.current_match - first < overlapping.len();
+                    let mut color = style.selection;
+                    color.a *= if current { 0.55 } else { 0.18 };
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds,
+                            ..Default::default()
+                        },
+                        color,
+                    );
                 }
             }
         }
@@ -4079,59 +4121,114 @@ mod tests {
 
     #[test]
     fn compact_search_keeps_unicode_regex_scope_and_zero_width_replacements_complete() {
-        let text="é1 λ22\nσ333";
-        let snapshot=SearchSnapshot {source:TextSnapshot::from_lines([
-            ("é1 λ22",LineEnding::Lf,"\n"),("σ333",LineEnding::None,"")
-        ])};
-        let options=crate::editor_search::FindOptions {regex:true,..Default::default()};
-        let query=r"(\p{L})(\d+)";
-        let matches=snapshot.find_matches_with(query,options,||false).unwrap().unwrap();
-        assert_eq!(matches.len(),3);
-        assert_eq!(snapshot.replace_matches_with(&matches,query,"$2:$1",options,false).unwrap(),"1:é 22:λ\n333:σ");
-        let scoped=matches.scoped(Some((Position {line:0,column:4},Position {line:1,column:5})));
-        assert_eq!(scoped.len(),2);
-        assert_eq!(scoped.allocation_id(),matches.allocation_id());
-        assert_eq!(snapshot.replace_matches_with(&scoped,query,"$2:$1",options,false).unwrap(),"é1 22:λ\n333:σ");
-        assert_eq!(snapshot.source.text().as_ref(),text);
-        let single=SearchSnapshot {source:TextSnapshot::from_lines([("aλ b",LineEnding::None,"")])};
-        let empty=single.find_matches_with(r"\b",options,||false).unwrap().unwrap();
-        assert_eq!(empty.len(),4);
-        assert_eq!(single.replace_matches_with(&empty,r"\b","|",options,false).unwrap(),"|aλ| |b|");
+        let text = "é1 λ22\nσ333";
+        let snapshot = SearchSnapshot {
+            source: TextSnapshot::from_lines([
+                ("é1 λ22", LineEnding::Lf, "\n"),
+                ("σ333", LineEnding::None, ""),
+            ]),
+        };
+        let options = crate::editor_search::FindOptions {
+            regex: true,
+            ..Default::default()
+        };
+        let query = r"(\p{L})(\d+)";
+        let matches = snapshot
+            .find_matches_with(query, options, || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(matches.len(), 3);
+        assert_eq!(
+            snapshot
+                .replace_matches_with(&matches, query, "$2:$1", options, false)
+                .unwrap(),
+            "1:é 22:λ\n333:σ"
+        );
+        let scoped = matches.scoped(Some((
+            Position { line: 0, column: 4 },
+            Position { line: 1, column: 5 },
+        )));
+        assert_eq!(scoped.len(), 2);
+        assert_eq!(scoped.allocation_id(), matches.allocation_id());
+        assert_eq!(
+            snapshot
+                .replace_matches_with(&scoped, query, "$2:$1", options, false)
+                .unwrap(),
+            "é1 22:λ\n333:σ"
+        );
+        assert_eq!(snapshot.source.text().as_ref(), text);
+        let single = SearchSnapshot {
+            source: TextSnapshot::from_lines([("aλ b", LineEnding::None, "")]),
+        };
+        let empty = single
+            .find_matches_with(r"\b", options, || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.len(), 4);
+        assert_eq!(
+            single
+                .replace_matches_with(&empty, r"\b", "|", options, false)
+                .unwrap(),
+            "|aλ| |b|"
+        );
     }
 
     #[test]
     #[ignore = "explicit dense8MiB match allocation/paint-query/replacement benchmark"]
     fn benchmark_dense_eight_mib_complete_matches_and_visible_queries() {
-        use crate::editor_search::{FindOptions,find_in_lines};
-        const BYTES:usize=8*1024*1024;
-        for irregular in [false,true] {
-            let text=if irregular {format!("{}{}","aλ".repeat(BYTES/3),"a".repeat(BYTES%3))} else {"a".repeat(BYTES)};
-            assert_eq!(text.len(),BYTES);
-            let options=FindOptions {regex:irregular,..Default::default()};
-            let query=if irregular {"."} else {"a"};
-            let expected=if irregular {2*(BYTES/3)+BYTES%3} else {BYTES};
-            let started=Instant::now();
-            let matches=find_in_lines(std::iter::once(text.as_str()),query,options,||false).unwrap().unwrap();
-            let search_time=started.elapsed();
-            assert_eq!(matches.len(),expected);
-            let retained=matches.retained_bytes();
-            assert!(retained<if irregular {6*BYTES} else {1024});
+        use crate::editor_search::{FindOptions, find_in_lines};
+        const BYTES: usize = 8 * 1024 * 1024;
+        for irregular in [false, true] {
+            let text = if irregular {
+                format!("{}{}", "aλ".repeat(BYTES / 3), "a".repeat(BYTES % 3))
+            } else {
+                "a".repeat(BYTES)
+            };
+            assert_eq!(text.len(), BYTES);
+            let options = FindOptions {
+                regex: irregular,
+                ..Default::default()
+            };
+            let query = if irregular { "." } else { "a" };
+            let expected = if irregular {
+                2 * (BYTES / 3) + BYTES % 3
+            } else {
+                BYTES
+            };
+            let started = Instant::now();
+            let matches = find_in_lines(std::iter::once(text.as_str()), query, options, || false)
+                .unwrap()
+                .unwrap();
+            let search_time = started.elapsed();
+            assert_eq!(matches.len(), expected);
+            let retained = matches.retained_bytes();
+            assert!(retained < if irregular { 6 * BYTES } else { 1024 });
             MatchIndex::take_query_runs();
-            let paint_started=Instant::now();
-            for column in BYTES/2..BYTES/2+80 {
-                let (_first,hits)=matches.visible(0,column,column+1);
-                assert!(hits.len()<=2);
+            let paint_started = Instant::now();
+            for column in BYTES / 2..BYTES / 2 + 80 {
+                let (_first, hits) = matches.visible(0, column, column + 1);
+                assert!(hits.len() <= 2);
             }
-            let query_time=paint_started.elapsed();
-            let decoded=MatchIndex::take_query_runs();
-            assert!(decoded<400_000,"eighty visible glyph queries must not walk millions of matches");
-            let snapshot=SearchSnapshot {source:TextSnapshot::from_lines([(text.as_str(),LineEnding::None,"")])};
-            let replace_started=Instant::now();
-            let replaced=snapshot.replace_matches_with(&matches,query,"b",options,false).unwrap();
-            let replace_time=replace_started.elapsed();
-            assert_eq!(replaced.len(),expected);
-            assert!(replaced.bytes().all(|byte|byte==b'b'));
-            eprintln!("find8MiB irregular={irregular} matches={expected} retained_index_bytes={retained} prior_pair_payload_bytes={} query_decoded_runs={decoded} search={search_time:?} visible80={query_time:?} replace_all={replace_time:?}; native glyph-layout traversal and processRSS are separate",expected*std::mem::size_of::<(Position,Position)>());
+            let query_time = paint_started.elapsed();
+            let decoded = MatchIndex::take_query_runs();
+            assert!(
+                decoded < 400_000,
+                "eighty visible glyph queries must not walk millions of matches"
+            );
+            let snapshot = SearchSnapshot {
+                source: TextSnapshot::from_lines([(text.as_str(), LineEnding::None, "")]),
+            };
+            let replace_started = Instant::now();
+            let replaced = snapshot
+                .replace_matches_with(&matches, query, "b", options, false)
+                .unwrap();
+            let replace_time = replace_started.elapsed();
+            assert_eq!(replaced.len(), expected);
+            assert!(replaced.bytes().all(|byte| byte == b'b'));
+            eprintln!(
+                "find8MiB irregular={irregular} matches={expected} retained_index_bytes={retained} prior_pair_payload_bytes={} query_decoded_runs={decoded} search={search_time:?} visible80={query_time:?} replace_all={replace_time:?}; native glyph-layout traversal and processRSS are separate",
+                expected * std::mem::size_of::<(Position, Position)>()
+            );
         }
     }
 

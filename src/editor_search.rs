@@ -49,57 +49,100 @@ pub fn find_in_lines<T: AsRef<str>>(
     options: FindOptions,
     cancelled: impl Fn() -> bool,
 ) -> Result<Option<MatchIndex>, String> {
-    if query.is_empty() { return Ok(Some(MatchIndex::default())); }
-    let mut matches=MatchBuilder::default();
+    if query.is_empty() {
+        return Ok(Some(MatchIndex::default()));
+    }
+    let mut matches = MatchBuilder::default();
     if !options.case_sensitive && !options.regex {
-        let complete=text_editor::visit_matches(lines,query,cancelled,|line,text,start,end| {
-            if !options.whole_word || whole_word(text,start,end) {
-                matches.push(Position {line,column:start},Position {line,column:end});
-            }
-        });
-        return Ok(complete.then(||matches.finish()));
+        let complete =
+            text_editor::visit_matches(lines, query, cancelled, |line, text, start, end| {
+                if !options.whole_word || whole_word(text, start, end) {
+                    matches.push(
+                        Position {
+                            line,
+                            column: start,
+                        },
+                        Position { line, column: end },
+                    );
+                }
+            });
+        return Ok(complete.then(|| matches.finish()));
     }
     let regex = options.regex.then(|| pattern(query, options)).transpose()?;
     for (line, text) in lines.enumerate() {
-        if cancelled() { return Ok(None); }
+        if cancelled() {
+            return Ok(None);
+        }
         let text = text.as_ref();
-        let spans: Box<dyn Iterator<Item=(usize,usize)>+'_> = if let Some(regex)=&regex {
-            Box::new(regex.find_iter(text).map(|found|(found.start(),found.end())))
+        let spans: Box<dyn Iterator<Item = (usize, usize)> + '_> = if let Some(regex) = &regex {
+            Box::new(
+                regex
+                    .find_iter(text)
+                    .map(|found| (found.start(), found.end())),
+            )
         } else {
-            Box::new(text.match_indices(query).map(|(start,_)|(start,start+query.len())))
+            Box::new(
+                text.match_indices(query)
+                    .map(|(start, _)| (start, start + query.len())),
+            )
         };
-        for (index,(start,end)) in spans.enumerate() {
-            if index%1024==0 && cancelled() { return Ok(None); }
-            if options.whole_word && !options.regex && !whole_word(text,start,end) { continue; }
-            matches.push(Position {line,column:start},Position {line,column:end});
+        for (index, (start, end)) in spans.enumerate() {
+            if index % 1024 == 0 && cancelled() {
+                return Ok(None);
+            }
+            if options.whole_word && !options.regex && !whole_word(text, start, end) {
+                continue;
+            }
+            matches.push(
+                Position {
+                    line,
+                    column: start,
+                },
+                Position { line, column: end },
+            );
         }
     }
     Ok(Some(matches.finish()))
 }
 
 /// Plain replacements preserve the matched word's all-upper, all-lower or title case.
-pub fn preserve_case(matched:&str,replacement:&str)->String {
-    let mut result=String::with_capacity(replacement.len());
-    append_preserve_case(matched,replacement,&mut result);
+pub fn preserve_case(matched: &str, replacement: &str) -> String {
+    let mut result = String::with_capacity(replacement.len());
+    append_preserve_case(matched, replacement, &mut result);
     result
 }
 
-fn append_preserve_case(matched:&str,replacement:&str,result:&mut String) {
-    let mut letters=matched.chars().filter(|character|character.is_alphabetic());
-    let Some(first)=letters.next() else { result.push_str(replacement);return; };
-    let (mut upper,mut lower,mut title)=(first.is_uppercase(),first.is_lowercase(),first.is_uppercase());
+fn append_preserve_case(matched: &str, replacement: &str, result: &mut String) {
+    let mut letters = matched
+        .chars()
+        .filter(|character| character.is_alphabetic());
+    let Some(first) = letters.next() else {
+        result.push_str(replacement);
+        return;
+    };
+    let (mut upper, mut lower, mut title) = (
+        first.is_uppercase(),
+        first.is_lowercase(),
+        first.is_uppercase(),
+    );
     for letter in letters {
         upper &= letter.is_uppercase();
         lower &= letter.is_lowercase();
         title &= letter.is_lowercase();
     }
-    if upper { result.extend(replacement.chars().flat_map(char::to_uppercase)); }
-    else if lower { result.extend(replacement.chars().flat_map(char::to_lowercase)); }
-    else if title {
-        let mut characters=replacement.chars();
-        if let Some(first)=characters.next() { result.extend(first.to_uppercase()); }
+    if upper {
+        result.extend(replacement.chars().flat_map(char::to_uppercase));
+    } else if lower {
+        result.extend(replacement.chars().flat_map(char::to_lowercase));
+    } else if title {
+        let mut characters = replacement.chars();
+        if let Some(first) = characters.next() {
+            result.extend(first.to_uppercase());
+        }
         result.extend(characters.flat_map(char::to_lowercase));
-    } else { result.push_str(replacement); }
+    } else {
+        result.push_str(replacement);
+    }
 }
 
 pub struct Replacement<'a> {
@@ -122,27 +165,45 @@ impl<'a> Replacement<'a> {
         })
     }
 
-    pub fn expand(&self,line:&str,start:usize,end:usize)->Result<String,String> {
-        let mut result=String::new();
-        self.append(line,start,end,&mut result)?;
+    pub fn expand(&self, line: &str, start: usize, end: usize) -> Result<String, String> {
+        let mut result = String::new();
+        self.append(line, start, end, &mut result)?;
         Ok(result)
     }
 
     /// Replace All streams directly into one output; it does not allocate a
     /// temporary replacement String or letter Vec for every occurrence.
-    pub fn append(&self,line:&str,start:usize,end:usize,result:&mut String)->Result<(),String> {
-        if let Some(regex)=&self.regex {
-            let captures=regex.captures_at(line,start).filter(|captures|captures.get(0).is_some_and(|found|found.start()==start&&found.end()==end))
-                .ok_or_else(||"The selected match changed; search again before replacing.".to_owned())?;
-            captures.expand(self.text,result);
+    pub fn append(
+        &self,
+        line: &str,
+        start: usize,
+        end: usize,
+        result: &mut String,
+    ) -> Result<(), String> {
+        if let Some(regex) = &self.regex {
+            let captures = regex
+                .captures_at(line, start)
+                .filter(|captures| {
+                    captures
+                        .get(0)
+                        .is_some_and(|found| found.start() == start && found.end() == end)
+                })
+                .ok_or_else(|| {
+                    "The selected match changed; search again before replacing.".to_owned()
+                })?;
+            captures.expand(self.text, result);
         } else {
-            let matched=line.get(start..end).ok_or_else(||"The selected match is outside the current line.".to_owned())?;
-            if self.preserve { append_preserve_case(matched,self.text,result); }
-            else { result.push_str(self.text); }
+            let matched = line
+                .get(start..end)
+                .ok_or_else(|| "The selected match is outside the current line.".to_owned())?;
+            if self.preserve {
+                append_preserve_case(matched, self.text, result);
+            } else {
+                result.push_str(self.text);
+            }
         }
         Ok(())
     }
-
 }
 
 pub fn replacement(
@@ -212,14 +273,22 @@ mod tests {
 
     #[test]
     fn compact_dense_enumeration_cancellation_never_returns_a_partial_count() {
-        let text="a".repeat(200_000);
-        for options in [FindOptions::default(),FindOptions {regex:true,..Default::default()}] {
-            let calls=std::cell::Cell::new(0);
-            let result=find_in_lines(std::iter::once(text.as_str()),"a",options,|| {
-                calls.set(calls.get()+1);calls.get()==3
-            }).unwrap();
+        let text = "a".repeat(200_000);
+        for options in [
+            FindOptions::default(),
+            FindOptions {
+                regex: true,
+                ..Default::default()
+            },
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let result = find_in_lines(std::iter::once(text.as_str()), "a", options, || {
+                calls.set(calls.get() + 1);
+                calls.get() == 3
+            })
+            .unwrap();
             assert!(result.is_none());
-            assert_eq!(calls.get(),3);
+            assert_eq!(calls.get(), 3);
         }
     }
 

@@ -1835,14 +1835,19 @@ fn visible_diff_rows(rows: &RowOffsets, viewport: ListViewport) -> VisibleRows {
 
 type FindScope = ((usize, usize), (usize, usize));
 
-fn scoped_matches(
-    matches: &mut text_editor::MatchIndex,
-    scope: Option<FindScope>,
-) {
-    *matches=matches.scoped(scope.map(|(first,last)|(
-        text_editor::Position {line:first.0,column:first.1},
-        text_editor::Position {line:last.0,column:last.1},
-    )));
+fn scoped_matches(matches: &mut text_editor::MatchIndex, scope: Option<FindScope>) {
+    *matches = matches.scoped(scope.map(|(first, last)| {
+        (
+            text_editor::Position {
+                line: first.0,
+                column: first.1,
+            },
+            text_editor::Position {
+                line: last.0,
+                column: last.1,
+            },
+        )
+    }));
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -3128,7 +3133,10 @@ impl RepositoryRuntime {
             query: query.to_owned(),
         };
         if self.find_cache.as_ref() != Some(&key) {
-            self.find_matches = document.content.find_matches_with(query,Default::default()).ok()?;
+            self.find_matches = document
+                .content
+                .find_matches_with(query, Default::default())
+                .ok()?;
             self.find_cache = Some(key);
         }
         self.select_cached_match(occurrence)
@@ -3146,7 +3154,10 @@ impl RepositoryRuntime {
                 .perform(text_editor::Action::ClearSelection);
             return None;
         }
-        let (start, end) = self.find_matches.get(occurrence % total).expect("current find occurrence");
+        let (start, end) = self
+            .find_matches
+            .get(occurrence % total)
+            .expect("current find occurrence");
         document.content.move_to(text_editor::Cursor {
             position: end,
             selection: Some(start),
@@ -3537,7 +3548,8 @@ impl RepositoryRuntime {
             origin = origin.min((anchor.line, anchor.column));
         }
         origin = self.find_origin.unwrap_or(origin);
-        self.find_matches.partition_point(|(start,_)|(start.line,start.column)<origin)
+        self.find_matches
+            .partition_point(|(start, _)| (start.line, start.column) < origin)
     }
 
     /// Applies a completion's edits to the open buffer.
@@ -6056,7 +6068,10 @@ impl RepositoryRuntime {
                         protocols.push(protocol);
                     }
                 } else {
-                    let (start, end) = self.find_matches.get(self.find_index).expect("current find occurrence");
+                    let (start, end) = self
+                        .find_matches
+                        .get(self.find_index)
+                        .expect("current find occurrence");
                     let replacement = document.content.with_line(start.line, |line, _| {
                         crate::editor_search::replacement(
                             line,
@@ -18434,29 +18449,43 @@ mod tests {
 
     #[test]
     fn compact_dense_find_preserves_all_occurrences_wraps_and_one_undo_replace_all() {
-        let card=CardId::new();
-        let text="a".repeat(16*1024);
-        let (mut runtime,_)=RepositoryRuntime::open_fixture(card,"dense.txt",&text);
-        drop(runtime.update(RepositoryAction::OpenFind {card}));
-        drop(runtime.update(RepositoryAction::FindQueryChanged {card,query:"a".into()}));
-        assert_eq!(runtime.find_total,text.len());
-        assert!(runtime.find_matches.retained_bytes()<1024);
-        let allocation=runtime.find_matches.allocation_id();
-        drop(runtime.update(RepositoryAction::FindPrevious {card}));
-        assert_eq!(runtime.find_index,text.len()-1);
-        assert_eq!(runtime.find_matches.get(runtime.find_index).unwrap().0.column,text.len()-1);
-        drop(runtime.update(RepositoryAction::FindNext {card}));
-        assert_eq!(runtime.find_index,0);
-        assert_eq!(runtime.find_matches.allocation_id(),allocation);
-        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {card,query:"b".into()}));
-        drop(runtime.update(RepositoryAction::ReplaceMatch {card,all:true}));
-        assert_eq!(buffer_text(&runtime),"b".repeat(text.len()));
-        assert_eq!(runtime.find_total,0);
-        drop(runtime.update(RepositoryAction::Undo {card}));
-        assert_eq!(buffer_text(&runtime),text);
-        assert_eq!(runtime.find_total,text.len());
-        drop(runtime.update(RepositoryAction::Redo {card}));
-        assert_eq!(buffer_text(&runtime),"b".repeat(text.len()));
+        let card = CardId::new();
+        let text = "a".repeat(16 * 1024);
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "dense.txt", &text);
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "a".into(),
+        }));
+        assert_eq!(runtime.find_total, text.len());
+        assert!(runtime.find_matches.retained_bytes() < 1024);
+        let allocation = runtime.find_matches.allocation_id();
+        drop(runtime.update(RepositoryAction::FindPrevious { card }));
+        assert_eq!(runtime.find_index, text.len() - 1);
+        assert_eq!(
+            runtime
+                .find_matches
+                .get(runtime.find_index)
+                .unwrap()
+                .0
+                .column,
+            text.len() - 1
+        );
+        drop(runtime.update(RepositoryAction::FindNext { card }));
+        assert_eq!(runtime.find_index, 0);
+        assert_eq!(runtime.find_matches.allocation_id(), allocation);
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "b".into(),
+        }));
+        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        assert_eq!(buffer_text(&runtime), "b".repeat(text.len()));
+        assert_eq!(runtime.find_total, 0);
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), text);
+        assert_eq!(runtime.find_total, text.len());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(buffer_text(&runtime), "b".repeat(text.len()));
     }
 
     #[test]
