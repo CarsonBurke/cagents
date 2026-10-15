@@ -11302,11 +11302,28 @@ impl Cagents {
             .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
             .map(|card| card.id)
             .collect::<HashSet<_>>();
+        let targets = self.cards.keys().map(|id| (*id, workspace_visible && visible_cards.contains(id))).collect();
+        self.set_workspace_surface_targets_visible(targets);
+    }
+
+    fn workspace_visibility_retry_targets(&self) -> Vec<(CardId, bool)> {
+        let mut targets = self.notices.condition_targets("workspace-session-visibility");
+        targets.extend(self.notices.entries.iter()
+            .filter(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility"))
+            .flat_map(|entry| entry.notice.targets.iter().copied()));
+        targets.sort();
+        targets.dedup();
+        let workspace_visible = self.workspace_surfaces_visible();
+        targets.into_iter().map(|id| (id, workspace_visible
+            && self.workspace.visibility(id) == Some(VisibilityClass::Visible))).collect()
+    }
+
+    fn set_workspace_surface_targets_visible(&mut self, targets: Vec<(CardId, bool)>) {
         let mut session_failures = Vec::new();
         #[cfg(feature = "integrated-browser")]
         let mut browser_failures = Vec::new();
-        for (id, runtime) in &mut self.cards {
-            let visible = workspace_visible && visible_cards.contains(id);
+        for (id, visible) in targets {
+            let Some(runtime) = self.cards.get_mut(&id) else { continue; };
             let result = match runtime {
                 CardRuntime::Terminal(surface) => if visible {
                     surface.reveal()
@@ -11318,7 +11335,7 @@ impl Cagents {
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => {
                     if let Err(error) = browser.handle.set_visible(visible) {
-                        browser_failures.push((*id, error.to_string()));
+                        browser_failures.push((id, error.to_string()));
                     }
                     Ok(())
                 }
@@ -11332,7 +11349,7 @@ impl Cagents {
                 | CardRuntime::Automations => Ok(()),
             };
             if let Err(error) = result {
-                session_failures.push((*id, error));
+                session_failures.push((id, error));
             }
         }
         self.notices.workspace_visibility_result(session_failures);
@@ -16677,7 +16694,10 @@ impl Application for Cagents {
         {
             // Transport health and attachment completion are reasons to retry,
             // not proof that this particular view accepted its update.
-            self.set_workspace_surfaces_visible(self.workspace_surfaces_visible());
+            // Camera events retry only the failed views. They must never
+            // enqueue another visibility command for every healthy terminal.
+            let targets = self.workspace_visibility_retry_targets();
+            self.set_workspace_surface_targets_visible(targets);
         }
         if let Some(notice) = self.status.take()
             && !crate::daemon_health::replaces_notice(&notice.message)
@@ -20240,6 +20260,23 @@ mod tests {
         assert_eq!(entry.id, id);
         assert!(entry.details_open);
         assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn visibility_retry_selects_only_affected_cards_even_with_many_healthy_runtimes() {
+        let mut app = context_inspector_test_app(false);
+        let affected = CardId::new();
+        let browser = CardId::new();
+        for _ in 0..1000 { app.cards.insert(CardId::new(), CardRuntime::Loading); }
+        app.cards.insert(affected, CardRuntime::Loading);
+        app.cards.insert(browser, CardRuntime::Loading);
+        app.notices.workspace_visibility_result(vec![(affected, "closed".into())]);
+        app.notices.record(TransientNotice::warning("Browser failed")
+            .key("workspace-browser-visibility").targets([browser]));
+        let targets = app.workspace_visibility_retry_targets();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().any(|(id, _)| *id == affected));
+        assert!(targets.iter().any(|(id, _)| *id == browser));
     }
 
     #[test]
