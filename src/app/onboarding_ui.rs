@@ -95,6 +95,18 @@ fn clone_failure_detail(error: &crate::process::ProcessFailure) -> String {
     error.reported_detail()
 }
 
+fn execute_clone(
+    command: &CommandSpec,
+    cancellation: &CancellationToken,
+    destination: PathBuf,
+) -> Result<PathBuf, String> {
+    SystemProcessExecutor
+        .execute(command, cancellation)
+        .and_then(|output| output.require_success(&command.program))
+        .map(|_| destination)
+        .map_err(|error| clone_failure_detail(&error))
+}
+
 impl Cagents {
     fn onboarding_workspace_rows(&self) -> Vec<WorkspaceSwitcherRow> {
         let actions = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
@@ -417,10 +429,7 @@ impl Cagents {
                 dialog.error = None;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        SystemProcessExecutor
-                            .execute(&command, &cancellation)
-                            .map(|_| destination)
-                            .map_err(|error| clone_failure_detail(&error))
+                        execute_clone(&command, &cancellation, destination)
                     })
                     .await
                     .map_err(|error| error.to_string())
@@ -713,13 +722,35 @@ mod tests {
             .unwrap()
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null");
-        assert!(
-            SystemProcessExecutor
-                .execute(&command, &cancellation)
-                .unwrap()
-                .success
+        assert_eq!(
+            execute_clone(&command, &cancellation, destination.clone()).unwrap(),
+            destination
         );
         assert!(destination.join(".git").is_dir());
+    }
+
+    #[test]
+    fn failed_clone_keeps_the_form_open_without_opening_a_project() {
+        let fixture = tempfile::tempdir().unwrap();
+        let destination = fixture.path().join("new-project");
+        let missing_source = fixture.path().join("missing-source.git");
+        let command = clone_command(missing_source.to_str().unwrap(), &destination)
+            .unwrap()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let _ = app.update_onboarding(Action::Clone);
+        let dialog = app.chrome_ui.clone_repository.as_mut().unwrap();
+        dialog.running = true;
+        let id = dialog.id;
+        let result = execute_clone(&command, &dialog.cancellation, destination.clone());
+        assert!(result.as_ref().unwrap_err().contains("fatal:"));
+        let _ = app.update_onboarding(Action::Finished { id, result });
+        let dialog = app.chrome_ui.clone_repository.as_ref().unwrap();
+        assert!(!dialog.running);
+        assert!(dialog.error.as_ref().unwrap().contains("fatal:"));
+        assert!(app.sidebar_model.projects.is_empty());
+        assert!(!destination.exists());
     }
 
     #[test]
