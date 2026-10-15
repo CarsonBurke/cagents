@@ -1,5 +1,6 @@
 //! Fresh worktree deletion evidence shared by manual and automatic removal.
 use super::*;
+use std::collections::HashSet;
 
 const DISPOSABLE_CONFIG: &str = "cagents.cleanupDisposableDirectories";
 
@@ -102,7 +103,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         fingerprint.update(value.to_le_bytes());
                     }
                 }
-                Err(_) if !worktree.join(path.as_os_str()).exists() => fingerprint.update(b"missing"),
+                Err(error) if error.is_not_found() => fingerprint.update(b"missing"),
                 Err(error) => return Err(ValidationError::Io(error.to_string()).into()),
             }
         }
@@ -123,8 +124,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     pub fn rescue_detached_worktree(&self, worktree: &Path, observed: &WorktreeSafetySnapshot, cancellation: &CancellationToken) -> Result<String, RepositoryError> {
         let head = observed.head_oid.as_deref().ok_or_else(|| ValidationError::InvalidBase("Detached worktree has no commit".into()))?;
         let current = self.worktree_safety(worktree, cancellation)?;
-        if current.head_oid != observed.head_oid || current.branch.is_some() {
-            return Err(ValidationError::InvalidBase("Worktree HEAD changed; review its safety again".into()).into());
+        if &current != observed || current.branch.is_some() {
+            return Err(ValidationError::InvalidBase("Worktree contents or HEAD changed; review its safety again".into()).into());
         }
         let branch = format!("rescue/{}", &head[..12.min(head.len())]);
         self.run_checked(&self.git_mutation(worktree, ["branch", "--", &branch, head]), cancellation)?;
@@ -199,6 +200,12 @@ mod tests {
         assert_eq!(fresh.untracked, 1);
         assert_eq!(fresh.notable_ignored.len(), 1);
         assert_eq!(fresh.files_to_discard(), 2);
+        fs::remove_file(worktree.join("new file")).unwrap();
+        fs::write(worktree.join("replacement file"), "new").unwrap();
+        let replaced = service.worktree_safety(&worktree, &cancel).unwrap();
+        assert_eq!(fresh.files_to_discard(), replaced.files_to_discard());
+        assert_ne!(fresh.fingerprint, replaced.fingerprint);
+        fs::rename(worktree.join("replacement file"), worktree.join("new file")).unwrap();
         git(&worktree, &["add", "new file"]);
         git(&worktree, &["commit", "-m", "local work"]);
         assert_eq!(service.worktree_safety(&worktree, &cancel).unwrap().unpushed_commits, 1);
@@ -207,6 +214,10 @@ mod tests {
         let detached = service.worktree_safety(&worktree, &cancel).unwrap();
         assert!(detached.branch.is_none());
         assert_eq!(detached.detached_only_commits, 1);
+        fs::write(worktree.join("late untracked"), "preserve").unwrap();
+        assert!(service.rescue_detached_worktree(&worktree, &detached, &cancel).is_err());
+        assert!(git(&repository, &["for-each-ref", "--format=%(refname)", "refs/heads/rescue/"]).is_empty());
+        fs::remove_file(worktree.join("late untracked")).unwrap();
         let rescue = service.rescue_detached_worktree(&worktree, &detached, &cancel).unwrap();
         assert!(rescue.starts_with("rescue/"));
         assert_eq!(service.worktree_safety(&worktree, &cancel).unwrap().detached_only_commits, 0);
