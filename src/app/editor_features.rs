@@ -537,6 +537,8 @@ pub(super) struct State {
     signature_requests: HashMap<CardId, (LspRequestId, LspPosition)>,
     preview: Option<Preview>,
     publication: Option<Publication>,
+    pub(super) location_history: crate::editor_locations::History,
+    pub(super) jump_origins: HashMap<CardId, crate::editor_locations::Location>,
 }
 
 impl State {
@@ -546,7 +548,7 @@ impl State {
 }
 
 impl Cagents {
-    pub(super) fn open_lsp_source_tab(&mut self, mut view: RepositoryView, path: PathBuf, at: LspPosition, coordinates: LspCoordinates, external: bool) -> Task<Message> {
+    pub(super) fn open_lsp_source_tab(&mut self, mut view: RepositoryView, path: PathBuf, at: LspPosition, coordinates: LspCoordinates, external: bool, origin: Option<crate::editor_locations::Location>) -> Task<Message> {
         if crate::device::is_remote() { return Task::none(); }
         let existing = self.cards.iter().find_map(|(card, runtime)| match runtime {
             CardRuntime::Repository(runtime) if runtime.descriptor.worktree == view.worktree
@@ -555,13 +557,16 @@ impl Cagents {
             _ => None,
         });
         if let Some(card) = existing {
+            if let Some(origin) = origin { self.editor_features.jump_origins.insert(card, origin); }
             let update = self.workspace.focus(card).unwrap_or_else(|_| ViewportUpdate::unchanged());
             let focus = self.apply_viewport(update, true, false);
-            if self.lsp_document(card).is_none() {
+            if self.capture_editor_location(card).is_none() {
                 self.lsp_pending_jumps.insert(card, PendingLspJump { path, at, coordinates });
                 return focus;
             }
-            return Task::batch([focus, self.jump_to_lsp_location(card, path, at, coordinates)]);
+            let jump = self.jump_to_lsp_location(card, path, at, coordinates);
+            self.complete_cross_card_jump(card);
+            return Task::batch([focus, jump]);
         }
         view.selected_file = if external { None } else { path.strip_prefix(&view.worktree).ok().map(Path::to_path_buf) };
         if !external && view.selected_file.is_none() { return Task::none(); }
@@ -576,6 +581,7 @@ impl Cagents {
         self.register_channel_card(card);
         if external { self.retain_local_pane(card); }
         self.lsp_pending_jumps.insert(card, PendingLspJump { path, at, coordinates });
+        if let Some(origin) = origin { self.editor_features.jump_origins.insert(card, origin); }
         let load = self.attach_repository_pane(card, view);
         let index = self.workspace.cards().len();
         let update = self.workspace.add_card(WorkspaceCard::new(card, title, CardWidth::Fraction(self.settings.default_native_pane_fraction)).expect("source tab has a valid width"), index, true)

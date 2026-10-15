@@ -42,6 +42,8 @@ pub mod document_render;
 #[cfg(feature = "ui")]
 pub mod editor;
 #[cfg(feature = "ui")]
+pub mod editor_locations;
+#[cfg(feature = "ui")]
 pub(crate) mod editor_history;
 #[cfg(feature = "ui")]
 pub(crate) mod editor_workspace_edit;

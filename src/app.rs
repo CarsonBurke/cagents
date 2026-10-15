@@ -10393,6 +10393,7 @@ impl Cagents {
             return Task::none();
         };
         if jump.path != path {
+            self.editor_features.jump_origins.remove(&card);
             return Task::none();
         }
         let at = match jump.coordinates {
@@ -10415,12 +10416,15 @@ impl Cagents {
                         self.status = Some(TransientNotice::warning(format!(
                             "opened the file, but could not place the caret: {error}"
                         )));
+                        self.editor_features.jump_origins.remove(&card);
                         return Task::none();
                     }
                 }
             }
         };
-        self.move_lsp_caret(card, at)
+        let focus = self.move_lsp_caret(card, at);
+        self.complete_cross_card_jump(card);
+        if self.modal_is_open() || self.workspace.focused() != Some(card) { Task::none() } else { focus }
     }
 
     /// Places the caret and gives the editor the keyboard.
@@ -10707,6 +10711,34 @@ impl Cagents {
         }
     }
 
+    fn capture_editor_location(&self, card: CardId) -> Option<crate::editor_locations::Location> {
+        let CardRuntime::Repository(runtime) = self.cards.get(&card)? else { return None; };
+        Some(crate::editor_locations::Location { card, source: runtime.source_tab_path()?, anchor: runtime.editor_navigation_anchor()? })
+    }
+
+    fn complete_cross_card_jump(&mut self, card: CardId) {
+        let Some(origin) = self.editor_features.jump_origins.remove(&card) else { return; };
+        if self.workspace.focused() != Some(card) { return; }
+        if let Some(target) = self.capture_editor_location(card) {
+            if origin.card != target.card { self.editor_features.location_history.record_jump(origin, target); }
+        }
+    }
+
+    fn navigate_cross_card_location(&mut self, card: CardId, forward: bool) -> Option<Task<Message>> {
+        if self.workspace.focused() != Some(card) { return None; }
+        let from = self.capture_editor_location(card)?;
+        let target = self.editor_features.location_history.peek(forward, |entry| {
+            matches!(self.cards.get(&entry.card), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&entry.source)
+                && runtime.editor_navigation_anchor().is_some() && !runtime.is_saving())
+        })?;
+        if !self.editor_features.location_history.navigate(from, &target) { return None; }
+        let CardRuntime::Repository(runtime) = self.cards.get_mut(&target.location.card)? else { return None; };
+        if !runtime.restore_editor_navigation_anchor(target.location.anchor) { return None; }
+        let focus = repository_task(runtime.focus_editor(target.location.card));
+        let update = self.workspace.focus(target.location.card).unwrap_or_else(|_| ViewportUpdate::unchanged());
+        Some(Task::batch([focus, self.apply_viewport(update, true, false)]))
+    }
+
     fn jump_to_lsp_location(
         &mut self,
         card: CardId,
@@ -10714,33 +10746,18 @@ impl Cagents {
         at: LspPosition,
         coordinates: LspCoordinates,
     ) -> Task<Message> {
-        let open_path = self
-            .lsp_contexts
-            .get(&card)
-            .and_then(|state| state.path.clone());
-        if open_path.as_deref() == Some(path.as_path()) {
-            // Already the open buffer, so the column is placeable now. A
-            // `Utf16` location for the open file cannot occur - the manager
-            // converts against every document it holds - but it is refused
-            // rather than trusted, because placing protocol code units as
-            // scalars silently lands the caret in the wrong column.
-            return match coordinates {
-                LspCoordinates::Scalar => self.move_lsp_caret(card, at),
-                LspCoordinates::Utf16 => {
-                    let Some(doc) = self.lsp_document(card) else {
-                        return Task::none();
-                    };
-                    match self.lsp.scalar_position(doc, at) {
-                        Ok(at) => return self.move_lsp_caret(card, at),
-                        Err(error) => {
-                            self.status = Some(TransientNotice::warning(format!(
-                                "could not place the caret: {error}"
-                            )));
-                        }
-                    }
-                    Task::none()
-                }
+        let open_path = self.capture_editor_location(card).map(|location| location.source);
+        if open_path.as_ref() == Some(&path) {
+            let moved = match self.cards.get_mut(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime.move_cursor_to_coordinates(at, coordinates),
+                _ => false,
             };
+            if !moved {
+                self.status = Some(TransientNotice::warning("The source position is no longer valid"));
+                return Task::none();
+            }
+            return if self.modal_is_open() || self.workspace.focused() != Some(card) { Task::none() }
+                else { match self.cards.get(&card) { Some(CardRuntime::Repository(runtime)) => repository_task(runtime.focus_editor(card)), _ => Task::none() } };
         }
         let (view, read_only, dirty) = match self.cards.get(&card) {
             Some(CardRuntime::Repository(runtime)) => (runtime.descriptor.clone(), runtime.is_read_only_source(), runtime.blocks_navigation()),
@@ -10748,7 +10765,8 @@ impl Cagents {
         };
         let relative = path.strip_prefix(&view.worktree).ok().map(Path::to_path_buf);
         if relative.is_none() || read_only || dirty {
-            return self.open_lsp_source_tab(view, path, at, coordinates, relative.is_none());
+            let origin = self.capture_editor_location(card);
+            return self.open_lsp_source_tab(view, path, at, coordinates, relative.is_none(), origin);
         }
         let relative = relative.unwrap();
         self.lsp_pending_jumps.insert(card, PendingLspJump { path, at, coordinates });
@@ -13941,6 +13959,14 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::MarkdownLink { card, uri }) => {
                 self.open_document_link(Some(card), &uri)
+            }
+            Message::Repository(RepositoryAction::NavigateLocation { card, forward }) => {
+                if self.modal_is_open() { return Task::none(); }
+                if let Some(task) = self.navigate_cross_card_location(card, forward) { return task; }
+                match self.cards.get_mut(&card) {
+                    Some(CardRuntime::Repository(runtime)) => repository_task(runtime.update(RepositoryAction::NavigateLocation { card, forward })),
+                    _ => Task::none(),
+                }
             }
             Message::Repository(RepositoryAction::Language { card, action }) => {
                 self.update_editor_lsp(card, action)
@@ -23970,6 +23996,43 @@ mod tests {
             )),
         );
         card
+    }
+
+    #[test]
+    fn cross_card_source_history_restores_dirty_origin_and_readonly_target_native_anchors() {
+        let (mut app, origin) = editing_repository_app();
+        let (mut origin_runtime, _) = RepositoryRuntime::open_fixture(origin, "origin.rs", "origin α\nsecond\n");
+        origin_runtime.set_auto_save(false);
+        drop(origin_runtime.update(RepositoryAction::EditorAction { card: origin, action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert('!')) }));
+        let origin_anchor = crate::model::EditorNavigation { caret: crate::model::EditorPosition { line: 1, column: 3 }, selection: Some(crate::model::EditorPosition { line: 0, column: 2 }), scroll_line: 1, scroll_vertical: 3.0, scroll_horizontal: 4.0 };
+        assert!(origin_runtime.restore_editor_navigation_anchor(origin_anchor));
+        app.cards.insert(origin, CardRuntime::Repository(Box::new(origin_runtime)));
+        let from = app.capture_editor_location(origin).unwrap();
+        let target = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(target, "stdlib.rs", "a😀éX\n");
+        runtime.set_external_source("/dependencies/stdlib.rs".into());
+        assert!(runtime.move_cursor_to_coordinates(LspPosition::new(0, 4), LspCoordinates::Utf16));
+        let target_anchor = runtime.editor_navigation_anchor().unwrap();
+        let view = runtime.descriptor.clone();
+        app.cards.insert(target, CardRuntime::Repository(Box::new(runtime)));
+        Arc::make_mut(&mut app.durable).cards.push(CardState { id: target, generation: 0, title: "Std source".into(), width_fraction: 0.7, existence: Existence::Open, exposure: Exposure::Visible, residency: Residency::Hot, kind: CardKind::Repository(view) });
+        app.workspace.add_card(WorkspaceCard::new(target, "Std source", CardWidth::Fraction(0.7)).unwrap(), 1, true).unwrap();
+        app.editor_features.jump_origins.insert(target, from);
+        app.complete_cross_card_jump(target);
+        drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false })));
+        assert_eq!(app.workspace.focused(), Some(origin));
+        assert_eq!(app.capture_editor_location(origin).unwrap().anchor, origin_anchor);
+        assert!(matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty()));
+        drop(app.update(Message::Repository(RepositoryAction::NavigateLocation { card: origin, forward: true })));
+        assert_eq!(app.workspace.focused(), Some(target));
+        assert_eq!(app.capture_editor_location(target).unwrap().anchor, target_anchor);
+        assert!(matches!(app.cards.get(&target), Some(CardRuntime::Repository(runtime)) if runtime.is_read_only_source() && runtime.editor_text().as_deref() == Some("a😀éX\n")));
+        // Reusing the old card for another file never authorizes history to
+        // replace its current buffer or restore an anchor from another source.
+        let (other, _) = RepositoryRuntime::open_fixture(origin, "unrelated.rs", "keep this buffer");
+        app.cards.insert(origin, CardRuntime::Repository(Box::new(other)));
+        assert!(app.navigate_cross_card_location(target, false).is_none());
+        assert_eq!(app.workspace.focused(), Some(target));
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub(super) struct Origin {
 }
 
 pub(super) struct Results { origin: Origin, kind: LocationKind, items: Vec<LspLocation>, withheld: usize }
-struct PendingJump { path: PathBuf, at: LspPosition, coordinates: LspCoordinates, epoch: u64 }
+struct PendingJump { path: PathBuf, at: LspPosition, coordinates: LspCoordinates, epoch: u64, origin: Option<cagents::editor_locations::Location> }
 
 #[derive(Default)]
 pub(super) struct State {
@@ -53,6 +53,7 @@ pub(super) struct State {
     jumps: HashMap<CardId, PendingJump>,
     pub(super) resolving: HashMap<CardId, (LspRequestId, u64)>,
     next_resolution: u64,
+    history: cagents::editor_locations::History,
 }
 
 impl State {
@@ -160,6 +161,7 @@ impl Editor {
     fn open_navigation_target(&mut self, origin: CardId, resolved: Resolved) -> Task<Message> {
         let Some(tab) = self.tab(origin) else { return Task::none(); };
         let root = tab.runtime.descriptor.worktree.clone();
+        let origin_location = self.capture_editor_location(origin);
         let existing = self.tabs.iter().find(|tab| tab.runtime.source_tab_path().as_ref() == Some(&resolved.path)
             && tab.runtime.is_read_only_source() == resolved.external).map(|tab| tab.id);
         let mut tasks = Vec::new();
@@ -176,7 +178,7 @@ impl Editor {
         };
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
         self.active = Some(target);
-        self.lsp_navigation.jumps.insert(target, PendingJump { path: resolved.path, at: resolved.at, coordinates: resolved.coordinates, epoch: self.selection_epoch });
+        self.lsp_navigation.jumps.insert(target, PendingJump { path: resolved.path, at: resolved.at, coordinates: resolved.coordinates, epoch: self.selection_epoch, origin: origin_location });
         tasks.push(self.finish_navigation_jump(target));
         Task::batch(tasks)
     }
@@ -195,7 +197,32 @@ impl Editor {
         if !tab.runtime.move_cursor_to_coordinates(jump.at, jump.coordinates) {
             self.notice = Some("The source position is no longer valid.".into()); return Task::none();
         }
-        if may_focus { tab.runtime.focus_editor(card).map(cosmic::Action::App) } else { Task::none() }
+        let focus = if may_focus { tab.runtime.focus_editor(card).map(cosmic::Action::App) } else { Task::none() };
+        if let Some(origin) = jump.origin && let Some(target) = self.capture_editor_location(card) {
+            if origin.card != target.card { self.lsp_navigation.history.record_jump(origin, target); }
+        }
+        focus
+    }
+
+    fn capture_editor_location(&self, card: CardId) -> Option<cagents::editor_locations::Location> {
+        let tab = self.tab(card)?;
+        Some(cagents::editor_locations::Location { card, source: tab.runtime.source_tab_path()?, anchor: tab.runtime.editor_navigation_anchor()? })
+    }
+
+    pub(super) fn navigate_cross_card_location(&mut self, card: CardId, forward: bool) -> Option<Task<Message>> {
+        if self.modal_open() || self.exiting || self.active != Some(card) { return None; }
+        let from = self.capture_editor_location(card)?;
+        let target = self.lsp_navigation.history.peek(forward, |entry| {
+            self.tab(entry.card).is_some_and(|tab| tab.runtime.source_tab_path().as_ref() == Some(&entry.source)
+                && tab.runtime.editor_navigation_anchor().is_some() && !tab.runtime.is_saving())
+        })?;
+        if !self.lsp_navigation.history.navigate(from, &target) { return None; }
+        let tab = self.tab_mut(target.location.card)?;
+        if !tab.runtime.restore_editor_navigation_anchor(target.location.anchor) { return None; }
+        let focus = tab.runtime.focus_editor(target.location.card).map(cosmic::Action::App);
+        self.active = Some(target.location.card);
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        Some(focus)
     }
 
     pub(super) fn navigation_results_view(&self, card: CardId) -> Option<Element<'_, Message>> {
@@ -300,12 +327,47 @@ mod tests {
     }
 
     #[test]
+    fn native_navigation_messages_round_trip_dirty_and_readonly_source_tabs() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "origin α\nsecond\n").unwrap();
+        let path = external.path().join("std.rs");
+        std::fs::write(&path, "a😀éX\n").unwrap();
+        let mut app = editor();
+        let origin = open_file(&mut app, root.path(), "main.rs");
+        app.tab_mut(origin).unwrap().runtime.set_auto_save(false);
+        let task = app.update(Message::Repository(RepositoryAction::EditorAction { card: origin, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('!')) }));
+        run_tasks(&mut app, task);
+        let anchor = cagents::model::EditorNavigation { caret: cagents::model::EditorPosition { line: 1, column: 3 }, selection: Some(cagents::model::EditorPosition { line: 0, column: 2 }), scroll_line: 1, scroll_vertical: 3.0, scroll_horizontal: 4.0 };
+        assert!(app.tab_mut(origin).unwrap().runtime.restore_editor_navigation_anchor(anchor));
+        let original_text = app.tab(origin).unwrap().runtime.editor_text();
+        let task = app.open_navigation_target(origin, Resolved { path: path.clone(), external: true, at: LspPosition::new(0, 4), coordinates: LspCoordinates::Utf16 });
+        run_tasks(&mut app, task);
+        let target = app.active.unwrap();
+        let target_anchor = app.capture_editor_location(target).unwrap().anchor;
+        let task = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: target, forward: false }));
+        run_tasks(&mut app, task);
+        assert_eq!(app.active, Some(origin));
+        assert_eq!(app.capture_editor_location(origin).unwrap().anchor, anchor);
+        assert_eq!(app.tab(origin).unwrap().runtime.editor_text(), original_text);
+        assert!(app.tab(origin).unwrap().runtime.is_dirty());
+        let task = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: origin, forward: true }));
+        run_tasks(&mut app, task);
+        assert_eq!(app.active, Some(target));
+        assert_eq!(app.capture_editor_location(target).unwrap().anchor, target_anchor);
+        assert!(app.tab(target).unwrap().runtime.is_read_only_source());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "a😀éX\n");
+        app.remove_tab(origin);
+        assert!(app.navigate_cross_card_location(target, false).is_none());
+    }
+
+    #[test]
     fn loaded_navigation_applies_position_without_focusing_behind_a_modal() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "a😀éX\n").unwrap();
         let mut app = editor();
         let card = open_file(&mut app, root.path(), "main.rs");
-        app.lsp_navigation.jumps.insert(card, PendingJump { path: root.path().join("main.rs"), at: LspPosition::new(0, 4), coordinates: LspCoordinates::Utf16, epoch: app.selection_epoch });
+        app.lsp_navigation.jumps.insert(card, PendingJump { path: root.path().join("main.rs"), at: LspPosition::new(0, 4), coordinates: LspCoordinates::Utf16, epoch: app.selection_epoch, origin: None });
         app.settings_open = true;
         let task = app.finish_navigation_jump(card);
         assert!(iced::runtime::task::into_stream(task).is_none());

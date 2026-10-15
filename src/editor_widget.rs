@@ -273,6 +273,7 @@ where
     popup_at: Option<Position>,
     on_hover: Option<Box<dyn Fn(Option<Position>) -> Message + 'a>>,
     on_definition: Option<Box<dyn Fn(Position) -> Message + 'a>>,
+    on_navigation: Option<Box<dyn Fn(bool) -> Message + 'a>>,
     on_code_action: Option<Box<dyn Fn(Position) -> Message + 'a>>,
     code_action_lines: &'a [usize],
     code_action_available: Option<Position>,
@@ -314,6 +315,7 @@ where
             popup_at: None,
             on_hover: None,
             on_definition: None,
+            on_navigation: None,
             on_code_action: None,
             code_action_lines: &[],
             code_action_available: None,
@@ -431,6 +433,12 @@ where
         None
     }
 
+    /// Receives mouse Back/Forward only while this native editor owns focus.
+    pub fn on_navigation(mut self, callback: impl Fn(bool) -> Message + 'a) -> Self {
+        self.on_navigation = Some(Box::new(callback));
+        self
+    }
+
     /// Sets the [`Font`] of the [`TextEditor`].
     ///
     /// [`Font`]: text::Renderer::Font
@@ -485,6 +493,7 @@ where
             popup_at: self.popup_at,
             on_hover: self.on_hover,
             on_definition: self.on_definition,
+            on_navigation: self.on_navigation,
             on_code_action: self.on_code_action,
             code_action_lines: self.code_action_lines,
             code_action_available: self.code_action_available,
@@ -2059,6 +2068,11 @@ where
                 state.modifiers = keyboard::Modifiers::default();
             }
             _ => {}
+        }
+        if let Event::Mouse(mouse::Event::ButtonPressed(button @ (mouse::Button::Back | mouse::Button::Forward))) = event
+            && cursor.is_over(layout.bounds()) && state.focus.is_some()
+            && let Some(callback) = &self.on_navigation {
+                shell.publish(callback(*button == mouse::Button::Forward)); shell.capture_event(); return;
         }
         if !geometry.scrollable {
             state.scrollbar_grab = None;

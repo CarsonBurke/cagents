@@ -3416,6 +3416,11 @@ impl Application for Editor {
                 Message::Repository(RepositoryAction::Review { card, action }) => {
                     self.handle_review(card, action)
                 }
+                Message::Repository(RepositoryAction::NavigateLocation { card, forward }) => {
+                    if self.modal_open() { return Task::none(); }
+                    if let Some(task) = self.navigate_cross_card_location(card, forward) { return task; }
+                    self.tab_mut(card).map_or_else(Task::none, |tab| repository_task(tab.runtime.update(RepositoryAction::NavigateLocation { card, forward })))
+                }
                 Message::Navigation(action) => self.update_navigation(action),
                 Message::Repository(RepositoryAction::Language { card, action: action @ (repository_widget::EditorLspAction::Definition(_) | repository_widget::EditorLspAction::References) }) => self.request_navigation(card, action),
                 Message::Repository(action) => {

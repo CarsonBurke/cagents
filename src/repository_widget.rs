@@ -639,6 +639,7 @@ pub enum RepositoryAction {
     OpenFind {
         card: CardId,
     },
+    NavigateLocation { card: CardId, forward: bool },
     CloseFind {
         card: CardId,
     },
@@ -732,6 +733,7 @@ impl RepositoryAction {
             | Self::MarkdownDue { card, .. }
             | Self::MarkdownLink { card, .. }
             | Self::OpenFind { card }
+            | Self::NavigateLocation { card, .. }
             | Self::CloseFind { card }
             | Self::FindQueryChanged { card, .. }
             | Self::FindNext { card }
@@ -3168,6 +3170,26 @@ impl RepositoryRuntime {
             }
         };
         self.move_cursor_to(at)
+    }
+
+    /// Window-local navigation captures native byte positions and viewport
+    /// without copying the document or touching its undo history.
+    pub fn editor_navigation_anchor(&self) -> Option<crate::model::EditorNavigation> {
+        self.navigation()?.editor
+    }
+
+    pub fn restore_editor_navigation_anchor(&mut self, anchor: crate::model::EditorNavigation) -> bool {
+        if self.workspace_edit_pending() { return false; }
+        let DocumentState::Editable(document) = &mut self.document else { return false; };
+        document.history.seal();
+        let position = |position: crate::model::EditorPosition| text_editor::Position { line: position.line, column: position.column };
+        document.content.set_cursor(text_editor::Cursor { position: position(anchor.caret), selection: anchor.selection.map(position) });
+        let scroll = text_editor::ScrollPosition { line: anchor.scroll_line, vertical: anchor.scroll_vertical, horizontal: anchor.scroll_horizontal };
+        document.content.restore_scroll_position(scroll);
+        self.viewports.editor = scroll;
+        self.source_surface = SourceSurface::Editor;
+        self.markdown_mode = MarkdownMode::Edit;
+        true
     }
 
     /// Marks the editor as search-owned: document edits are ignored while the
@@ -6094,6 +6116,7 @@ impl RepositoryRuntime {
                 before,
                 result,
             } => self.finish_working_diff(identity, revision, ticket, before, result),
+            RepositoryAction::NavigateLocation { .. } => Task::none(),
             RepositoryAction::OpenFind { card } => self.open_find(card),
             RepositoryAction::CloseFind { card } => self.close_find(card),
             RepositoryAction::FindQueryChanged { query, .. } => {
@@ -8801,6 +8824,7 @@ fn editable_document_view<'a>(
                 ),
                 |highlight, _theme: &cosmic::Theme| highlight.to_format(),
             )
+            .on_navigation(move |forward| RepositoryAction::NavigateLocation { card, forward })
             .font(runtime.editor_font)
             .find_matches(
                 if runtime.find_open {
@@ -8878,6 +8902,13 @@ fn editable_document_view<'a>(
                     iced::widget::text_editor::Status::Focused { .. }
                 ) {
                     return text_editor::default_bindings(press);
+                }
+                if press.modifiers.alt() && !press.modifiers.control() && !press.modifiers.shift() && !press.modifiers.logo() {
+                    match press.key {
+                        Key::Named(Named::ArrowLeft) => return Some(text_editor::Binding::Custom(RepositoryAction::NavigateLocation { card, forward: false })),
+                        Key::Named(Named::ArrowRight) => return Some(text_editor::Binding::Custom(RepositoryAction::NavigateLocation { card, forward: true })),
+                        _ => {}
+                    }
                 }
                 let action = match &press.key {
                     Key::Character(character)
