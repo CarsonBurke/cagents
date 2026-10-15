@@ -1040,7 +1040,8 @@ where
 
     /// Performs an [`Action`] on the [`Content`].
     pub fn perform(&mut self, mut action: Action) {
-        if action.is_edit() { let internal = self.0.get_mut(); internal.cursor_metrics = None; internal.bracket_match = None; }
+        if !matches!(action, Action::Scroll { .. }) { self.0.get_mut().cursor_metrics = None; }
+        if action.is_edit() { self.0.get_mut().bracket_match = None; }
         match action {
             Action::Edit(Edit::Insert(character)) if self.smart_insert(character) => return,
             Action::Edit(Edit::Indent) => { self.indent(false); return; }
@@ -1093,16 +1094,15 @@ where
         if let Some((cached, metrics)) = internal.cursor_metrics && cached == cursor { return metrics; }
         let lines = &internal.editor.buffer().lines;
         let column = lines.get(cursor.position.line).map_or(0, |line| line.text()[..cursor.position.column.min(line.text().len())].chars().count());
-        let selected = cursor.selection.map_or(0, |anchor| {
-            let (start, end) = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) { (anchor, cursor.position) } else { (cursor.position, anchor) };
-            if start == end { return internal.editor.copy().map_or(0, |text| text.chars().count()); }
+        let selected = internal.editor.selection_bounds().map_or(0, |(start, end)| {
             let mut count = 0;
             for line in start.line..=end.line {
                 if let Some(text) = lines.get(line) {
                     let from = if line == start.line { start.column.min(text.text().len()) } else { 0 };
                     let to = if line == end.line { end.column.min(text.text().len()) } else { text.text().len() };
                     count += text.text()[from..to].chars().count();
-                    if line < end.line { count += text.ending().as_str().chars().count(); }
+                    // Native copy normalizes every selected line separator to LF.
+                    if line < end.line { count += 1; }
                 }
             }
             count
@@ -1375,6 +1375,7 @@ where
     /// Moves the current cursor to reflect the given one.
     pub fn move_to(&mut self, cursor: Cursor) {
         let internal = self.0.get_mut();
+        internal.cursor_metrics = None;
         internal.pending_scroll = None;
         internal.reveal_horizontal = true;
 
@@ -5477,6 +5478,22 @@ mod tests {
         assert_eq!(content.cursor_metrics(), (2, 2, 3));
         assert_eq!(content.cursor_metrics(), (2, 2, 3));
         content.perform_edit(Edit::Insert('b')).unwrap(); assert_eq!(content.cursor_metrics().2, 0);
+    }
+
+    #[test]
+    fn selected_character_counts_follow_expanded_native_word_and_line_extents() {
+        for selection in [Action::SelectWord, Action::SelectLine] {
+            let mut content: Content = Content::with_text("alpha beta\r\ngamma delta\n");
+            content.set_cursor(Cursor { position: Position { line: 0, column: 7 }, selection: None });
+            content.perform(selection);
+            assert_eq!(content.cursor_metrics().2, content.selection().unwrap().chars().count());
+            content.perform(Action::Select(Motion::DocumentEnd));
+            assert_eq!(content.cursor_metrics().2, content.selection().unwrap().chars().count());
+            // Selecting a different native kind at unchanged raw cursor/anchor
+            // must not reuse metrics for the previous kind.
+            content.perform(Action::SelectLine);
+            assert_eq!(content.cursor_metrics().2, content.selection().unwrap().chars().count());
+        }
     }
 
     #[test]

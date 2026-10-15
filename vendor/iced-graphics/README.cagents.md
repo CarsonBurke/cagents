@@ -3,3 +3,6 @@ The standalone manifest preserves that workspace's versions and features.
 Local addition: text::Editor::set_tab_width forwards to cosmic-text's native
 buffer, invalidating selection geometry and line highlighting. This lets the
 application change tab stops without rewriting source bytes or hit-test columns.
+
+Local addition: text::Editor::selection_bounds exposes native expanded word/line
+selection positions without allocating or normalizing a selected-text copy.

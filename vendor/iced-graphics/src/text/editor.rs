@@ -37,6 +37,14 @@ impl Editor {
         buffer_from_editor(&self.internal().editor)
     }
 
+    /// Returns the expanded source extent of normal, word or line selection.
+    pub fn selection_bounds(&self) -> Option<(Position, Position)> {
+        self.internal().editor.selection_bounds().map(|(start, end)| (
+            Position { line: start.line, column: start.index },
+            Position { line: end.line, column: end.index },
+        ))
+    }
+
     /// Changes native tab stops while retaining text, selection and scroll.
     pub fn set_tab_width(&mut self, width: u16) {
         if width == 0 || self.buffer().tab_width() == width { return; }
