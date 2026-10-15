@@ -59,6 +59,9 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
     // Refuse a degraded installed store before even reconciling an exact
     // startup owner, adopting a holder or requesting provider teardown.
     super::super::agent_execution::retirement_registry(host)?;
+    if super::bound_close::close_unattempted(host, source)?.is_some() {
+        return Ok(());
+    }
     if retained_actor::reconcile_startup(host, source)? {
         return Ok(());
     }
@@ -80,7 +83,7 @@ pub(in crate::host) fn close_with_presentation(host: &SharedHost,
     close_retained_inner(host, source, false, Some((origin, target)))
 }
 
-fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
+pub(super) fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
     consent: Option<(&crate::agent_execution::Origin, &crate::agent_execution::PresentationCloseTarget)>) -> Result<(), String> {
     super::super::agent_execution::retirement_registry(host)?;
     if let Some((origin, target)) = consent {
@@ -417,7 +420,7 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
 /// The caller may be an authenticated old alias, while the agent already
 /// retains the adopted descriptor. Authenticate and preflight the same CURRENT
 /// source set that retirement will use, before adoption or Release changes it.
-fn preflight_current_retirements(
+pub(super) fn preflight_current_retirements(
     host: &SharedHost,
     caller: &Session,
     owner: &registry::Record,

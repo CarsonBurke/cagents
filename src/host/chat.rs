@@ -1,6 +1,7 @@
 use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
+mod bound_close;
 mod execution_directory;
 mod handoff_budget;
 mod native_cleanup;
@@ -3729,6 +3730,11 @@ fn process_inner(
                 result
             };
             super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
+            if bound_close::close_unattempted(host, &source).map_err(unavailable)?.is_some() {
+                let snapshot = handle.snapshot(None).ok_or_else(|| unavailable(
+                    "The exact original owner closed, but its final transcript is unavailable"))?;
+                return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
+            }
             handle.close_for_resume().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The provider stopped but its exact final transcript could not be read; retry the retained close receipt"))?;
             let (retained, pending_cleanup) = {
