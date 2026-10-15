@@ -779,6 +779,27 @@ impl TerminalHandle {
         config: TerminalConfig,
         wake: impl Fn(TerminalWake) + Send + Sync + 'static,
     ) -> Result<Self, TerminalStartError> {
+        Self::spawn_observed(session, config, wake, None)
+    }
+
+    pub(crate) fn spawn_for_attempt(
+        session: TerminalSession,
+        config: TerminalConfig,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+        attempt: &super::startup::AttemptRun,
+    ) -> Result<Self, TerminalStartError> {
+        if config.adoption.is_some() {
+            return Err(TerminalStartError::Worker("A new start attempt cannot adopt a different original owner".into()));
+        }
+        Self::spawn_observed(session, config, wake, Some(attempt.observer()))
+    }
+
+    fn spawn_observed(
+        session: TerminalSession,
+        config: TerminalConfig,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+        startup: Option<super::startup::StartObserver>,
+    ) -> Result<Self, TerminalStartError> {
         let reservation = joins::reserve().map_err(TerminalStartError::Worker)?;
         let (command_tx, command_rx) = command_channel(config.command_capacity);
         // Semantic events are lossless and independent from visual wakes. They
@@ -792,14 +813,27 @@ impl TerminalHandle {
         published.join_reservation.set(reservation).expect("a new worker has exactly one cleanup reservation");
         let worker_published = Arc::clone(&published);
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        if let Some(startup) = &startup { startup.worker_admitted(published.execution_instance); }
+        let worker_startup = startup.clone();
 
         let worker = thread::Builder::new()
             .name(format!("terminal-{:?}", session.id))
             .spawn(move || {
                 let completion = Arc::clone(&worker_published);
-                let result = Worker::start(session, config, command_rx, event_tx, worker_published);
+                let result = Worker::start_observed(session, config, command_rx, event_tx, worker_published, worker_startup.clone());
+                // This receipt follows a returned Worker::start frame. A panic
+                // cannot certify pre-effect failure while another thread starts.
+                if let Some(startup) = &worker_startup { startup.worker_start_finished(); }
                 match result {
                     Ok(worker) => {
+                        #[cfg(test)]
+                        if worker_startup.as_ref().is_some_and(|startup| startup.lose_start_reply()) {
+                            // The real worker/Holder exists, but its actual
+                            // startup result channel closes without a reply.
+                            drop(startup_tx);
+                            worker.run();
+                            return;
+                        }
                         let _ = startup_tx.send(Ok(()));
                         worker.run();
                     }
@@ -809,17 +843,24 @@ impl TerminalHandle {
                     }
                 }
             })
-            .map_err(|error| TerminalStartError::Worker(error.to_string()))?;
+            .map_err(|error| {
+                if let Some(startup) = &startup { startup.worker_start_finished(); }
+                TerminalStartError::Worker(error.to_string())
+            })?;
 
         match startup_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                inner: Arc::new(HandleInner {
-                    commands: command_tx,
-                    events: event_rx,
-                    published,
-                    worker: Arc::new(Mutex::new(Some(worker))),
-                }),
-            }),
+            Ok(Ok(())) => {
+                let handle = Self {
+                    inner: Arc::new(HandleInner {
+                        commands: command_tx,
+                        events: event_rx,
+                        published,
+                        worker: Arc::new(Mutex::new(Some(worker))),
+                    }),
+                };
+                if let Some(startup) = &startup { startup.worker_created(handle.clone()); }
+                Ok(handle)
+            },
             Ok(Err(error)) => {
                 let slot = Arc::new(Mutex::new(Some(worker)));
                 let _ = joins::join_until(&slot, &published, std::time::Instant::now() + WORKER_JOIN_TIMEOUT, true, true);
@@ -1363,6 +1404,10 @@ impl TerminalHandle {
         holder::release::completed(self)
     }
 
+    pub(crate) fn reconcile_start_attempt(attempt: super::TerminalStartAttempt) -> Result<(), String> {
+        holder::release::start_attempt(attempt)
+    }
+
     pub(crate) fn release_completed_holder_until(&self, deadline: std::time::Instant) -> Result<(), String> {
         if std::time::Instant::now() >= deadline {return Err("Terminal family cleanup deadline expired; its exact owner remains retained".into());}
         let mut retained = self.inner.published.retained_holder.try_lock()
@@ -1749,6 +1794,17 @@ impl Worker {
         events: Sender<TerminalEvent>,
         published: Arc<PublishedState>,
     ) -> Result<Self, String> {
+        Self::start_observed(session, config, commands, events, published, None)
+    }
+
+    fn start_observed(
+        session: TerminalSession,
+        config: TerminalConfig,
+        commands: Receiver<Command>,
+        events: Sender<TerminalEvent>,
+        published: Arc<PublishedState>,
+        startup: Option<super::startup::StartObserver>,
+    ) -> Result<Self, String> {
         let current_size = TerminalSize {
             columns: config.columns.max(1),
             rows: config.rows.max(1),
@@ -1896,13 +1952,14 @@ impl Worker {
                     command.env("PATH", path);
                 }
                 (
-                    holder::spawn_recoverable_with_authority(
+                    holder::spawn_recoverable_with_start_attempt(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
                         config.execution_directory.clone(),
                         config.setup_execution_lease.clone(),
+                        startup,
                     )?,
                     Vec::new(),
                 )

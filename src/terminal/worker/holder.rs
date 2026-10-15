@@ -238,6 +238,14 @@ pub(super) fn spawn_recoverable_with_authority(
     command: CommandBuilder, size: PtySize, exits: Sender<ChildExit>, recovery: Option<Recovery>,
     directory: Option<std::sync::Arc<File>>, setup_lease: Option<std::sync::Arc<File>>,
 ) -> Result<Held,String> {
+    spawn_recoverable_with_start_attempt(command, size, exits, recovery, directory, setup_lease, None)
+}
+
+pub(super) fn spawn_recoverable_with_start_attempt(
+    command: CommandBuilder, size: PtySize, exits: Sender<ChildExit>, recovery: Option<Recovery>,
+    directory: Option<std::sync::Arc<File>>, setup_lease: Option<std::sync::Arc<File>>,
+    startup: Option<crate::terminal::startup::StartObserver>,
+) -> Result<Held,String> {
     let cleanup_source = recovery.as_ref().map(|recovery|
         registry::cleanup::SourceReceipt::capture(&recovery.source)).transpose()?;
     if let Some(directory) = &directory {
@@ -292,6 +300,9 @@ pub(super) fn spawn_recoverable_with_authority(
         }
         Err(error) => return Err(format!("Reserve terminal holder cleanup: {error}")),
     };
+    // This monotonic cut precedes fork. Any error after it is Unknown until
+    // this exact holder proves family cleanup, never inferred from an error.
+    if let Some(startup) = &startup { startup.before_helper_spawn(); }
     let process = process
         .spawn()
         .map_err(|error| format!("start terminal holder: {error}"))?;
@@ -299,6 +310,7 @@ pub(super) fn spawn_recoverable_with_authority(
     // The holder is this daemon's unreaped child until `Holder` reaps it.
     let pidfd = open_pidfd(process.id() as libc::pid_t);
     let mut holder = Holder::new(control, Some(OwnedChild { child: process, reservation: child_reaping }));
+    holder.startup = startup;
     let registered_id = recovery.as_ref().map(|recovery| recovery.source.id);
     holder.registered = recovery.is_some();
     holder.cleanup_source = cleanup_source;
@@ -365,6 +377,9 @@ pub(super) fn spawn_recoverable_with_authority(
         }
         holder.record = Some(record);
     }
+    if let (Some(startup), Some(record), Some(source), Some(pidfd)) = (
+        holder.startup.as_ref(), holder.record.as_ref(), holder.cleanup_source.as_ref(), holder.pidfd.as_ref(),
+    ) { startup.holder(record, source, pidfd); }
     watched(holder, pid, descriptors, None, exits)
 }
 
@@ -648,6 +663,7 @@ pub(super) struct Holder {
     cleanup_acknowledged: bool,
     record: Option<Record>,
     cleanup_source: Option<registry::cleanup::SourceReceipt>,
+    startup: Option<crate::terminal::startup::StartObserver>,
 }
 
 impl Holder {
@@ -727,6 +743,9 @@ impl Holder {
         }
         self.detached = true;
         drop(self.release.take());
+        // Reached only after exact v5 CleanupProved (or its strict durable
+        // receipt) AND this held helper pidfd's positive exit observation.
+        if let Some(startup) = &self.startup { startup.family_settled(); }
         Ok(())
     }
 
@@ -818,6 +837,7 @@ impl Holder {
             cleanup_acknowledged: false,
             record: None,
             cleanup_source: None,
+            startup: None,
         }
     }
 
@@ -913,6 +933,7 @@ impl Drop for Holder {
                         detached:false, adoption_pending:false, registered:self.registered, screen_lost:self.screen_lost,
                         cleanup_proved:self.cleanup_proved, release_requested:self.release_requested,
                         cleanup_acknowledged:self.cleanup_acknowledged, record:self.record.take(), cleanup_source:self.cleanup_source.take(),
+                        startup:self.startup.take(),
                     };
                     release::request(task);
                 }

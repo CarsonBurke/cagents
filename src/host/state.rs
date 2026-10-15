@@ -3633,10 +3633,17 @@ pub(super) fn spawn_terminal_view_owned(
     )
 }
 
-/// Start a new terminal only in the independently verified operational
-/// directory captured before its native predecessor is stopped. The FD stays
-/// execution-only; it must never replace the original actor's issued recipe.
-pub(super) fn spawn_terminal_view_owned_at_directory(
+/// Failure retains the one exact attempt, including its original worker or
+/// asynchronous Holder cleanup owner. Its message is never cleanup authority.
+#[derive(Debug)]
+pub(super) struct TerminalStartFailure {
+    pub(super) error: ProtocolError,
+    pub(super) attempt: crate::terminal::TerminalStartAttempt,
+}
+
+/// The caller retains `attempt` before invoking this function. Reusing it can
+/// never fork a second helper; recover its exact published tuple or disposition.
+pub(super) fn spawn_terminal_view_owned_at_directory_attempt(
     shared: &SharedHost,
     client_id: ClientId,
     session: TerminalSession,
@@ -3644,7 +3651,30 @@ pub(super) fn spawn_terminal_view_owned_at_directory(
     execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     paired: bool,
     context: Arc<crate::chat::protocol::ExecutionContext>,
-) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    attempt: &crate::terminal::TerminalStartAttempt,
+) -> Result<(TerminalDescriptor, TerminalHandle), TerminalStartFailure> {
+    let failed = |error| TerminalStartFailure { error, attempt: attempt.clone() };
+    let run = attempt.begin(&session).map_err(|message| failed(ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable, message, false,
+    )))?;
+    let result = (|| {
+        let directory = terminal_start_directory(&context)?;
+        let (descriptor, handle) = start_terminal_view_owned_attempt(
+            shared, client_id, session, options, execution_environment, paired,
+            None, None, None, Some(directory), Some(&run),
+        )?;
+        run.publish(descriptor.clone(), handle.clone()).map_err(|message| ProtocolError::new(
+            ProtocolErrorCode::Internal, message, false,
+        ))?;
+        Ok((descriptor, handle))
+    })();
+    drop(run);
+    result.map_err(failed)
+}
+
+fn terminal_start_directory(
+    context: &crate::chat::protocol::ExecutionContext,
+) -> Result<Arc<std::fs::File>, ProtocolError> {
     use std::os::unix::fs::MetadataExt;
     let directory = context.directory_descriptor().ok_or_else(|| {
         ProtocolError::new(
@@ -3667,6 +3697,21 @@ pub(super) fn spawn_terminal_view_owned_at_directory(
             false,
         ));
     }
+    Ok(directory)
+}
+
+/// Start only in the verified operational directory captured before the
+/// native predecessor stops. Its FD never changes the immutable issued recipe.
+pub(super) fn spawn_terminal_view_owned_at_directory(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+    context: Arc<crate::chat::protocol::ExecutionContext>,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    let directory = terminal_start_directory(&context)?;
     start_terminal_view_owned(
         shared,
         client_id,
@@ -3715,12 +3760,31 @@ fn start_terminal_view_owned(
     client_id: ClientId,
     session: TerminalSession,
     options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+    adoption: Option<std::path::PathBuf>,
+    previous: Option<crate::terminal::holder::Recovery>,
+    pending_pane: Option<crate::model::CardId>,
+    execution_directory: Option<Arc<std::fs::File>>,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    start_terminal_view_owned_attempt(
+        shared, client_id, session, options, execution_environment, paired,
+        adoption, previous, pending_pane, execution_directory, None,
+    )
+}
+
+fn start_terminal_view_owned_attempt(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
     mut execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     paired: bool,
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
     pending_pane: Option<crate::model::CardId>,
     execution_directory: Option<Arc<std::fs::File>>,
+    attempt: Option<&crate::terminal::TerminalStartRun>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
@@ -3877,9 +3941,14 @@ fn start_terminal_view_owned(
         holder_recovery,
         ..TerminalConfig::default()
     };
-    let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
+    let wake = move |wake: crate::terminal::TerminalWake| {
         broadcast_redraw(&weak, terminal_id, wake.generation);
-    }) {
+    };
+    let started = match attempt {
+        Some(attempt) => TerminalHandle::spawn_for_attempt(session.clone(), config, wake, attempt),
+        None => TerminalHandle::spawn(session.clone(), config, wake),
+    };
+    let handle = match started {
         Ok(handle) => handle,
         Err(error) => {
             shared
@@ -4349,6 +4418,9 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
 mod native_upgrade_tests;
 #[cfg(test)]
 mod strict_upgrade_tests;
+
+#[cfg(test)]
+mod terminal_start_attempt_tests;
 
 #[cfg(test)]
 mod tests {

@@ -16,6 +16,10 @@ mod widget;
 pub(crate) use widget::monospace_font;
 #[cfg(feature = "host")]
 mod worker;
+#[cfg(feature = "host")]
+mod startup;
+#[cfg(feature = "host")]
+pub(crate) use startup::{TerminalStartAttempt, TerminalStartDisposition, AttemptRun as TerminalStartRun};
 
 /// The holder may take this long to report a newly spawned process. Keep the
 /// UI's attachment wait longer than this bound.
