@@ -157,6 +157,18 @@ mod tests {
     }
 
     #[test]
+    fn a_selected_target_still_loading_is_not_treated_as_an_unopened_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn old() {}\n").unwrap();
+        let mut app = app();
+        let card = buffer(&mut app, root.path(), "a.rs", "fn old() {}\n");
+        if let CardRuntime::Repository(runtime) = app.cards.get_mut(&card).unwrap() { drop(runtime.update(RepositoryAction::Reload { card })); }
+        let source = root.path().join("a.rs");
+        assert!(app.editor_open_files().iter().any(|(id, path)| *id == card && path == &source));
+        assert!(app.capture_workspace_edit_targets(&[source]).is_err());
+    }
+
+    #[test]
     fn opening_another_target_after_preview_refuses_before_any_buffer_or_disk_write() {
         let root = tempfile::tempdir().unwrap();
         let original = "fn old() {}\n";
@@ -710,16 +722,15 @@ impl Cagents {
         let mut captured = 0usize;
         for runtime in self.cards.values() {
             if let CardRuntime::Repository(runtime) = runtime {
-                if runtime.workspace_edit_source().is_some_and(|path| paths.contains(&path)) {
+                if runtime.workspace_edit_candidate_source().is_some_and(|path| paths.contains(&path)) {
                     captured = captured.saturating_add(runtime.workspace_edit_snapshot_size());
                     if captured > 64 * 1024 * 1024 { return Err("The open buffers exceed the 64 MiB preview budget".into()); }
-                    if let Some((path, snapshot)) = runtime.workspace_edit_snapshot() {
+                    let Some((path, snapshot)) = runtime.workspace_edit_snapshot() else { return Err("Wait for the selected target to finish loading, or close its read-only view, before applying edits".into()); };
                         if let Some(previous) = open.insert(path, snapshot.clone()) {
                             if previous.text != snapshot.text || previous.version != snapshot.version || previous.writable != snapshot.writable {
                                 return Err("Two open views of the same file disagree".into());
                             }
                         }
-                    }
                 }
             }
         }
@@ -728,7 +739,7 @@ impl Cagents {
 
     fn editor_open_files(&self) -> Vec<(CardId, PathBuf)> {
         let mut files = self.cards.iter().filter_map(|(card, runtime)| {
-            if let CardRuntime::Repository(runtime) = runtime { Some((*card, runtime.workspace_edit_source()?)) } else { None }
+            if let CardRuntime::Repository(runtime) = runtime { Some((*card, runtime.workspace_edit_candidate_source()?)) } else { None }
         }).collect::<Vec<_>>();
         files.sort_by_key(|(card, _)| card.to_string());
         files
@@ -746,7 +757,7 @@ impl Cagents {
         let mut failure = None;
         for (card, runtime) in &mut self.cards {
             if let CardRuntime::Repository(runtime) = runtime {
-                if let Some(path) = runtime.workspace_edit_source() {
+                if let Some(path) = runtime.workspace_edit_candidate_source() {
                     // The planner records canonical target names. Matching the
                     // selected source uses the original path captured below;
                     // descriptor-relative aliases are reconciled by the worker.

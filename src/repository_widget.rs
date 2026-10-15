@@ -3865,6 +3865,12 @@ impl RepositoryRuntime {
         Some(self.descriptor.worktree.join(&document.source))
     }
 
+    /// Includes pending and read-only selected files so a workspace edit cannot
+    /// classify a mounted file as unopened while its async read is completing.
+    pub fn workspace_edit_candidate_source(&self) -> Option<PathBuf> {
+        self.workspace_edit_source().or_else(|| self.selected.as_ref().map(|file| self.descriptor.worktree.join(&file.path)))
+    }
+
     pub fn workspace_edit_snapshot_size(&self) -> usize {
         match &self.document { DocumentState::Editable(document) => document.content.text_len(), _ => 0 }
     }
@@ -4899,6 +4905,7 @@ impl RepositoryRuntime {
     }
 
     fn update_inner(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
+        if self.workspace_edit_pending() && matches!(&action, RepositoryAction::FileLoaded { .. }) { return Task::none(); }
         if matches!(
             &action,
             RepositoryAction::Save { .. }
