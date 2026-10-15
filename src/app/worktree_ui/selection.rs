@@ -100,6 +100,7 @@ struct Prepared {
     canonical: Vec<(PathBuf, PathBuf)>,
     guard: Option<crate::worktree_cleanup::Protection>,
     resume: Option<placement::Resolved>,
+    additional_guards: Vec<crate::worktree_cleanup::Protection>,
 }
 
 #[derive(Clone)]
@@ -403,7 +404,7 @@ impl Cagents {
         + 'static,
     ) -> Task<Message> {
         self.prepare_worktree_selection_receipt(generation, path, create, intent, epoch, move |path| {
-            prepare(path).map(|(path, canonical, guard)| Prepared { path, canonical, guard, resume: None })
+            prepare(path).map(|(path, canonical, guard)| Prepared { path, canonical, guard, resume: None, additional_guards: Vec::new() })
         })
     }
 
@@ -531,7 +532,15 @@ impl Cagents {
             ));
             return self.abandon_worktree_selection(intent);
         }
+        if let Intent::ResumePlacement { entry, .. } = &intent
+            && self.refuse_in_deleting_worktree(&entry.session.launch.recipe.working_directory)
+        {
+            return self.abandon_worktree_selection(intent);
+        }
         self.worktree_protections.install_prepared(prepared.guard);
+        for guard in prepared.additional_guards {
+            self.worktree_protections.install_prepared(Some(guard));
+        }
         self.worktree_protection_sync.invalidate();
         self.worktree_owner_paths
             .install_prepared(prepared.canonical);

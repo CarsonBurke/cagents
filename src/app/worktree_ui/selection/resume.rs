@@ -25,11 +25,28 @@ fn prepare_resume(
     let (resolved, canonical) = read()?;
     watch.register(&canonical);
     let guard = protect(&resolved.physical_root).map_err(|error| error.to_string())?;
+    // Filing in B never replaces the immutable executable cwd A. Protect both
+    // before exposure; acquire() also holds containing Git-worktree ancestors.
+    let mut additional_guards = Vec::new();
+    if let Some((_, launch)) = canonical.iter().find(|(path, _)| path == recorded)
+        && launch != &resolved.physical_root
+        && let Some(guard) = protect(launch).map_err(|error| error.to_string())?
+    {
+        additional_guards.push(guard);
+    }
     let final_paths = read()?;
     if final_paths != (resolved.clone(), canonical.clone()) {
         return Err("The conversation's project changed while acquiring its protection. Resume it again.".into());
     }
-    Ok(Prepared { path: resolved.root.clone(), canonical, guard, resume: Some(resolved) })
+    Ok(Prepared { path: resolved.root.clone(), canonical, guard, resume: Some(resolved), additional_guards })
+}
+
+/// Remote paths belong to the selected SSH host. Lexical metadata is the
+/// authority here; local filesystem state cannot qualify a remote path.
+fn prepare_remote_resume(recorded: &Path, snapshot: &placement::Snapshot) -> Result<Prepared, String> {
+    let canonical = snapshot.required_paths(recorded).into_iter().map(|path| (path.clone(), path)).collect::<Vec<_>>();
+    let resolved = placement::resolve(recorded, false, snapshot, &canonical, true)?;
+    Ok(Prepared { path: resolved.root.clone(), canonical, guard: None, resume: Some(resolved), additional_guards: Vec::new() })
 }
 
 impl Cagents {
@@ -41,7 +58,12 @@ impl Cagents {
         replace: Option<CardId>,
     ) -> Task<Message> {
         let cancelled = self.cancel_worktree_selection();
-        self.worktree_owner_paths.invalidate_watched();
+        let remote = crate::device::is_remote();
+        if !remote {
+            self.worktree_owner_paths.invalidate_watched();
+        }
+        // Incorporate discovered/restored root metadata before snapshotting.
+        self.refresh_worktree_owners(None);
         let snapshot = placement::Snapshot::capture(self, entry.card, &entry.session);
         let recorded = entry.session.launch.recipe.working_directory.clone();
         self.worktree_selection.additional_paths = snapshot.required_paths(&recorded).into_iter().collect();
@@ -50,7 +72,7 @@ impl Cagents {
         let generation = self.worktree_selection.generation;
         self.worktree_selection.pending = true;
         let watch = self.worktree_owner_paths.watch.clone();
-        let allow_missing = entry.session.launch.needs_read_only_history();
+        let launch = entry.session.launch.clone();
         let worker_snapshot = snapshot.clone();
         let local_window = crate::instance::window_is_initialized() && !crate::device::is_remote();
         #[cfg(test)]
@@ -61,8 +83,12 @@ impl Cagents {
         let canonicalize_calls = self.worktree_selection.canonicalize_calls.clone();
         let prepare = self.prepare_worktree_selection_receipt(
             generation, recorded, false, Intent::ResumePlacement { entry, replace, snapshot }, epoch,
-            move |recorded| prepare_resume(
-                &recorded, allow_missing, &worker_snapshot, &watch,
+            move |recorded| {
+                if remote {
+                    return prepare_remote_resume(&recorded, &worker_snapshot);
+                }
+                prepare_resume(
+                &recorded, launch.needs_read_only_history(), &worker_snapshot, &watch,
                 |path| {
                     #[cfg(test)]
                     if let Some(calls) = &canonicalize_calls {
@@ -79,7 +105,7 @@ impl Cagents {
                     }
                     crate::worktree_cleanup::protect(path)?.ok_or_else(|| std::io::Error::other("local conversation protection became unavailable")).map(Some)
                 },
-            ),
+            )},
         );
         Task::batch([cancelled, prepare])
     }
@@ -207,4 +233,51 @@ mod tests {
         assert!(app.durable.cards.iter().any(|card| matches!(&card.kind,
             CardKind::Chat(session) if session.launch == original)));
     }
+    #[test]
+    fn resumed_fallback_filing_protects_independent_launch_worktree_before_exposure() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let launch_root = directory.path().join("issued-root");
+        let recorded = launch_root.join("nested");
+        let filing = directory.path().join("filing");
+        std::fs::create_dir_all(&recorded).unwrap();
+        std::fs::create_dir_all(launch_root.join(".git")).unwrap();
+        std::fs::create_dir_all(&filing).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.known_worktree_roots.clear();
+        app.active_workspace = Some(filing.clone());
+        Arc::make_mut(&mut app.durable).active_channel = None;
+        let entry = entry(&recorded);
+        let scope = placement::Snapshot::capture(&app, entry.card, &entry.session);
+        let watch = owner_watch::Monitor::default();
+        let prepared = prepare_resume(&recorded, false, &scope, &watch, Path::canonicalize, Path::is_dir,
+            |path| crate::worktree_cleanup::fixture_protection(runtime.path(), path, false).map(Some)).unwrap();
+        assert_eq!(prepared.resume.as_ref().unwrap().destination, placement::Destination::Worktree(filing.clone()));
+        for path in [&launch_root, &filing] {
+            assert!(matches!(crate::worktree_cleanup::fixture_protection(runtime.path(), path, true),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        }
+        drop(prepared);
+        for path in [&launch_root, &filing] {
+            assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), path, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn remote_resume_uses_host_lexical_ownership_without_local_filesystem_authority() {
+        let recorded = PathBuf::from("/remote-host-only-cagents-ownership/linked/nested");
+        let owner = PathBuf::from("/remote-host-only-cagents-ownership/linked");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.known_worktree_roots.clear();
+        app.known_worktree_roots.insert(owner.clone());
+        let entry = entry(&recorded);
+        let scope = placement::Snapshot::capture(&app, entry.card, &entry.session);
+        let prepared = prepare_remote_resume(&recorded, &scope).unwrap();
+        assert_eq!(prepared.path, owner);
+        assert_eq!(prepared.resume.as_ref().unwrap().physical_root, owner);
+        assert!(prepared.canonical.iter().all(|(lexical, physical)| lexical == physical));
+        assert!(prepared.guard.is_none());
+        assert!(prepared.additional_guards.is_empty());
+    }
+
 }
