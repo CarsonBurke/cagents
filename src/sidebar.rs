@@ -5297,17 +5297,12 @@ fn unreachable_project<'a>(
     RowInteraction::group(header, details.into(), sticky_viewport)
 }
 
-fn project_view<'a>(
-    project: &FilteredProject<'a>,
-    expanded: bool,
-    compact: bool,
-    selection: Option<SidebarSelection>,
-    modal_open: bool,
-    sticky_viewport: row_interaction::StickyViewport,
-) -> Element<'static, SidebarAction> {
-    let normal=project_view_inner(project,expanded,compact,selection,modal_open,sticky_viewport);
-    let entity=project.project;
-    let Some(reason)=entity.location_repair.as_ref().filter(|_|!entity.missing) else {return normal};
+fn project_location_repair(
+    entity:&SidebarProject,
+    compact:bool,
+    modal_open:bool,
+)->Option<Element<'static,SidebarAction>> {
+    let Some(reason)=entity.location_repair.as_ref().filter(|_|!entity.missing) else {return None};
     let action=|action|gated(SidebarAction::RecoverProject {project_id:entity.id,action},modal_open || entity.reloading && action!=ProjectRecoveryAction::Details);
     let repair:Element<'static,SidebarAction>=if compact {
         crate::ui_controls::icon_button(Icon::Warning,format!("{}: original checkout needs Locate; another checkout remains available",entity.name))
@@ -5324,10 +5319,10 @@ fn project_view<'a>(
         if entity.missing_details {repair=repair.push(design::caption(reason.clone()).wrapping(cosmic::iced::widget::text::Wrapping::Word));}
         widget::container(repair).padding([space::XS,space::S]).width(Length::Fill).into()
     };
-    widget::column::with_children(vec![normal,repair]).width(Length::Fill).into()
+    Some(repair)
 }
 
-fn project_view_inner<'a>(
+fn project_view<'a>(
     project: &FilteredProject<'a>,
     expanded: bool,
     compact: bool,
@@ -5470,7 +5465,8 @@ fn project_view_inner<'a>(
         project.state,
         !modal_open,
     );
-    let mut column = widget::column::with_capacity(worktree_count + 2);
+    let mut column = widget::column::with_capacity(worktree_count + 3);
+    if let Some(repair)=project_location_repair(entity,false,modal_open) {column=column.push(repair);}
     for row in operation_rows(entity, modal_open) {
         column = column.push(row);
     }
@@ -5619,7 +5615,8 @@ fn compact_project<'a>(
     // The rail's rows are one fixed width, so they start where the header
     // above them starts. Centring them instead would move every row sideways
     // whenever the reserved rail changed the content box's width.
-    let mut column = widget::column::with_capacity(project.worktrees.len() + 1).width(Length::Fill);
+    let mut column = widget::column::with_capacity(project.worktrees.len() + 2).width(Length::Fill);
+    if let Some(repair)=project_location_repair(entity,true,modal_open) {column=column.push(repair);}
     for row in compact_operation_rows(entity, modal_open) {
         column = column.push(row);
     }
