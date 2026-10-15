@@ -2084,30 +2084,15 @@ fn close_sessions_in_scope(
             continue;
         }
         let id = terminal.session.id;
-        let result = if matches!(
-            terminal.session.continuity,
-            TerminalContinuity::Exited { .. }
-                | TerminalContinuity::RelaunchAvailable {
-                    last_exit: Some(_),
-                    ..
-                }
-        ) {
-            client
-                .release_completed_terminal(terminal.session, true)
-                .map_err(|error| error.to_string())
-                .and_then(|outcome| match outcome {
-                    crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
-                    other => Err(format!("terminal {id} did not confirm close: {other:?}")),
-                })
-        } else {
-            client
-                .close_terminal_source_checked(terminal.session, terminal.execution_instance, true)
-                .map_err(|error| error.to_string())
-                .and_then(|outcome| match outcome {
-                    crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
-                    other => Err(format!("terminal {id} did not confirm close: {other:?}")),
-                })
-        };
+        // Completed workers also need their captured worker UUID: a same-ID,
+        // same-recipe replacement may finish before this request arrives.
+        let result = client
+            .close_terminal_source_checked(terminal.session, terminal.execution_instance, true)
+            .map_err(|error| error.to_string())
+            .and_then(|outcome| match outcome {
+                crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
+                other => Err(format!("terminal {id} did not confirm close: {other:?}")),
+            });
         if let Err(error) = result {
             // Another window or a natural exit may have won the race. Query a
             // fresh connection; a failed request can desynchronize this one.
