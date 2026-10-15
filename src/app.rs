@@ -16413,7 +16413,7 @@ impl Application for Cagents {
                 let previous_path = configuration.environment.get("PATH").cloned();
                 cosmic::task::future(async move {
                     let search = if previous_path.is_none() {
-                        crate::account::probe::search_path().await
+                        crate::account::probe::refresh_search_path().await
                     } else {
                         None
                     };

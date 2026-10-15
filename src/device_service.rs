@@ -1315,7 +1315,7 @@ fn accounts() -> Result<Reply, String> {
     .map(|provider| {
         (
             provider,
-            probe::find_executable(provider.executable(), search_path.as_deref()).is_some(),
+            probe::Cli::discover(provider, search_path.as_deref()).is_ok(),
         )
     })
     .collect();
@@ -1401,7 +1401,6 @@ fn update_accounts(expected_revision: u64, proposal: serde_json::Value) -> Resul
 #[cfg(feature = "host")]
 fn account_login(account: crate::account::Account) -> Result<Reply, String> {
     use crate::account::{home::Homes, probe, registry::Store};
-    use crate::agent::Provider;
     let homes = Homes::installation();
     let registry = Store::installation()
         .map(|store| store.load())
@@ -1415,49 +1414,12 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
             registered.id() == account.id() && registered.resolved_home() == account.resolved_home()
         })
         .ok_or("account is not registered on this device")?;
-    let arguments = match account.provider {
-        Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
-        Provider::Codex => vec!["login".into(), "--device-auth".into()],
-        Provider::Omp => return Err("open an Omp terminal on this device and use /login".into()),
-    };
     let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
+        .enable_all().build().map_err(|error| error.to_string())?;
     let search_path = runtime.block_on(probe::search_path());
-    let program = probe::find_executable(account.provider.executable(), search_path.as_deref())
-        .ok_or_else(|| {
-            format!(
-                "{} is not installed on this device",
-                account.provider.label()
-            )
-        })?;
-    let mut environment = std::collections::BTreeMap::new();
-    if let (Some(variable), Some(home)) = (
-        crate::account::home_variable(account.provider),
-        account.resolved_home(),
-    ) {
-        environment.insert(variable.to_owned(), home.display().to_string());
-    }
-    if let Some(path) = search_path.and_then(|path| path.into_string().ok()) {
-        environment.insert("PATH".into(), path);
-    }
-    Ok(Reply::Login(crate::model::LaunchRecipe {
-        program: program
-            .into_os_string()
-            .into_string()
-            .map_err(|_| "provider executable is not UTF-8")?,
-        arguments,
-        working_directory: std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or("remote HOME is unavailable")?,
-        environment,
-        unset_environment: account
-            .credential_overrides()
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect(),
-    }))
+    let cli = probe::Cli::discover(account.provider, search_path.as_deref())?;
+    Ok(Reply::Login(cli.login_recipe(&account,
+        std::env::var_os("HOME").map(PathBuf::from).ok_or("Remote HOME is unavailable")?, true)?))
 }
 
 #[cfg(feature = "host")]

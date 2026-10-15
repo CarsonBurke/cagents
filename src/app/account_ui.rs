@@ -908,7 +908,7 @@ pub enum Action {
         id: AccountId,
         provider: Provider,
         device: bool,
-        program: Result<PathBuf, String>,
+        program: Result<probe::Cli, String>,
     },
     /// The registry was read again, as another window may have changed it.
     RegistryLoaded(Result<Registry, String>),
@@ -932,7 +932,7 @@ pub enum Action {
     HomeReady {
         provider: Provider,
         device: bool,
-        result: Result<(uuid::Uuid, PathBuf, PathBuf), String>,
+        result: Result<(uuid::Uuid, PathBuf, probe::Cli), String>,
     },
     LoginTick,
     LoginCallbackBlocked(uuid::Uuid),
@@ -1063,7 +1063,7 @@ fn provider_installations(search_path: Option<&std::ffi::OsStr>) -> BTreeMap<Pro
         .map(|provider| {
             (
                 provider,
-                probe::find_executable(provider.executable(), search_path).is_some(),
+                probe::Cli::discover(provider, search_path).is_ok(),
             )
         })
         .collect()
@@ -1426,44 +1426,21 @@ fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'stati
 ///
 /// `auth` and `login` are account management, which the launch recognizer
 /// does not take for an agent conversation.
-fn login_launch(
-    account: &Account,
-    program: &Path,
-    home: PathBuf,
-    device: bool,
-) -> Option<LaunchRecipe> {
-    let command = login_arguments(account.provider, device)?;
-    let mut environment = BTreeMap::new();
-    if let (Some(variable), Some(account_home)) = (
-        account::home_variable(account.provider),
-        account.resolved_home(),
-    ) {
-        environment.insert(variable.to_owned(), account_home.display().to_string());
-    }
-    // The CLI was found on the search path the reader's shell sets up, and
-    // runs with it, as the probes run it.
-    if let Some(path) = probe::shell_search_path().and_then(|path| path.to_str()) {
-        environment.insert("PATH".into(), path.to_owned());
-    }
-    Some(LaunchRecipe {
-        unset_environment: account
-            .credential_overrides()
-            .iter()
-            .map(|name| (*name).into())
-            .collect(),
-        program: program.to_str()?.to_owned(),
-        arguments: command
-            .iter()
-            .map(|argument| (*argument).to_owned())
-            .collect(),
-        working_directory: home,
-        environment,
-    })
+#[cfg(test)]
+fn login_launch(account: &Account, program: &Path, home: PathBuf, device: bool) -> Option<LaunchRecipe> {
+    probe::Cli { program: program.into(), configuration: Default::default() }
+        .login_recipe(account, home, device).ok()
 }
 
 /// Whether `recipe` runs a provider's sign-in, as [`login_launch`] builds
 /// it or as a reader types it.
 pub(super) fn is_sign_in(recipe: &LaunchRecipe) -> bool {
+    // This marker preserves UI classification after a pin/argument change;
+    // its presence never authorizes provider reads or home cleanup.
+    if recipe.environment.get(account::SIGN_IN_MARKER).is_some_and(|provider|
+        Account::PROVIDERS.iter().any(|candidate| candidate.executable() == provider)) {
+        return true;
+    }
     let program = Path::new(&recipe.program)
         .file_name()
         .and_then(|name| name.to_str())
@@ -3077,10 +3054,7 @@ impl Cagents {
                 if account.provider == Provider::Codex && !device {
                     browser_login_available()?;
                 }
-                probe::find_executable(account.provider.executable(), search_path.as_deref())
-                    .ok_or_else(|| {
-                        format!("{} is not installed", probe::cli_name(account.provider))
-                    })
+                probe::Cli::discover(account.provider, search_path.as_deref())
             })
             .await
             .map_err(|error| error.to_string())
@@ -3100,7 +3074,7 @@ impl Cagents {
         id: &AccountId,
         _provider: Provider,
         device: bool,
-        program: Result<PathBuf, String>,
+        program: Result<probe::Cli, String>,
     ) -> Task<Message> {
         let program = match program {
             Ok(program) => Some(program),
@@ -3123,7 +3097,7 @@ impl Cagents {
         let launch = program
             .zip(std::env::var_os("HOME"))
             .and_then(|(program, home)| {
-                login_launch(&state.account, &program, PathBuf::from(home), device)
+                program.login_recipe(&state.account, PathBuf::from(home), device).ok()
             });
         let Some(launch) = launch else {
             self.status = Some(TransientNotice::error(format!(
@@ -3460,8 +3434,7 @@ impl Cagents {
                 if provider == Provider::Codex && !device {
                     browser_login_available()?;
                 }
-                let program = probe::find_executable(provider.executable(), search_path.as_deref())
-                    .ok_or_else(|| format!("{} is not installed", probe::cli_name(provider)))?;
+                let program = probe::Cli::discover(provider, search_path.as_deref())?;
                 let system = Account::system(provider).resolved_home();
                 let create = || homes.create_with_config(provider, system.as_deref(), codex_config);
                 let (key, home) = match &store {
@@ -3486,7 +3459,7 @@ impl Cagents {
         &mut self,
         provider: Provider,
         device: bool,
-        result: Result<(uuid::Uuid, PathBuf, PathBuf), String>,
+        result: Result<(uuid::Uuid, PathBuf, probe::Cli), String>,
     ) -> Task<Message> {
         if provider == Provider::Codex && !device {
             self.account_ui.browser_preparing = false;
@@ -3503,7 +3476,7 @@ impl Cagents {
         };
         let account = Account::managed(provider, key, home.clone());
         let launch = std::env::var_os("HOME").and_then(|reader_home| {
-            login_launch(&account, &program, PathBuf::from(reader_home), device)
+            program.login_recipe(&account, PathBuf::from(reader_home), device).ok()
         });
         let Some(launch) = launch else {
             self.status = Some(TransientNotice::error(format!(
@@ -5596,6 +5569,28 @@ mod tests {
             );
             assert!(is_sign_in(&launch));
         }
+    }
+
+    #[test]
+    fn configured_sign_in_wrappers_remain_classified_after_settings_change() {
+        let account = Account::managed(Provider::Codex, uuid::Uuid::new_v4(), "/fixture/account-home".into());
+        let cli = probe::Cli {
+            program: "/fixture/custom-wrapper".into(),
+            configuration: crate::settings::AgentLaunchSettings {
+                arguments: vec!["--fixture-prefix".into()],
+                environment: BTreeMap::from([("PATH".into(), "/fixture/tools".into())]),
+                ..Default::default()
+            },
+        };
+        let recipe = cli.login_recipe(&account, "/fixture/reader-home".into(), true).unwrap();
+        assert_eq!(recipe.arguments, ["--fixture-prefix", "login", "--device-auth"]);
+        assert!(is_sign_in(&recipe));
+        let mut replacement = cli.clone(); replacement.program = "/fixture/new-wrapper".into(); replacement.configuration.arguments.clear();
+        assert_ne!(replacement.program, recipe.program);
+        assert_eq!(recipe.program, "/fixture/custom-wrapper");
+        assert_eq!(recipe.environment.get("CODEX_HOME").map(String::as_str), Some("/fixture/account-home"));
+        assert!(is_sign_in(&recipe), "recorded classification never rereads current settings");
+        assert!(!is_sign_in(&LaunchRecipe { environment: BTreeMap::new(), ..recipe }));
     }
 
     #[test]

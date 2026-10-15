@@ -115,8 +115,7 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
                 return Err("Omp manages its own logins".into());
             }
             let search = runtime.block_on(probe::search_path());
-            let program = probe::find_executable(provider.executable(), search.as_deref())
-                .ok_or("The provider CLI is not installed on this device")?;
+            let cli = probe::Cli::discover(provider, search.as_deref())?;
             let system = Account::system(provider).resolved_home();
             let (key, home) = store
                 .create_pending(&homes, provider, now, || {
@@ -132,7 +131,7 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
                 })
                 .map_err(|error| error.to_string())?;
             let account = Account::managed(provider, key, home.clone());
-            let recipe = match login_recipe(&account, program) {
+            let recipe = match login_recipe(&account, cli) {
                 Ok(recipe) => recipe,
                 Err(error) => {
                     // A launch recipe failure must not strand an unused home
@@ -309,37 +308,8 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
 }
 
 #[cfg(feature = "host")]
-fn login_recipe(
-    account: &super::Account,
-    program: std::path::PathBuf,
-) -> Result<crate::model::LaunchRecipe, String> {
-    let mut environment = std::collections::BTreeMap::new();
-    if let (Some(variable), Some(home)) = (
-        super::home_variable(account.provider),
-        account.resolved_home(),
-    ) {
-        environment.insert(variable.into(), home.display().to_string());
-    }
-    if let Some(path) = super::probe::shell_search_path().and_then(|path| path.to_str()) {
-        environment.insert("PATH".into(), path.into());
-    }
-    Ok(crate::model::LaunchRecipe {
-        program: program.to_str().ok_or("Provider path is not UTF-8")?.into(),
-        arguments: match account.provider {
-            Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
-            Provider::Codex => vec!["login".into(), "--device-auth".into()],
-            Provider::Omp => return Err("Omp manages its own sign-in".into()),
-        },
-        working_directory: std::env::var_os("HOME")
-            .ok_or("Remote HOME is unavailable")?
-            .into(),
-        environment,
-        unset_environment: account
-            .credential_overrides()
-            .iter()
-            .map(|name| (*name).into())
-            .collect(),
-    })
+fn login_recipe(account: &super::Account, cli: super::probe::Cli) -> Result<crate::model::LaunchRecipe, String> {
+    cli.login_recipe(account, std::env::var_os("HOME").ok_or("Remote HOME is unavailable")?.into(), true)
 }
 
 #[cfg(test)]
