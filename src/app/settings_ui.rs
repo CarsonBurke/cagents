@@ -1232,19 +1232,14 @@ fn keyboard_groups<'a>(
         widget::button::text("Filter by pressed key").on_press(Message::Palette(palette_ui::Action::FilterKey)).into(),
         widget::button::text("Conflicts").on_press(Message::SettingsSearchChanged("conflicts".into())).into(),
     ]).spacing(space::S).into()).label_in_control()]).compact()];
+    let shortcut_values = draft.keyboard_shortcuts.shortcut_values();
     for group in ["Panes", "Navigation", "Chat", "Review", "Editor"] {
         let mut rows: Vec<_> = SettingsField::SHORTCUTS
             .into_iter()
             .filter(|field| shortcut_group(*field) == group)
             .map(|field| {
                 let action = field.shortcut_action().expect("shortcut field");
-                let value = draft
-                    .keyboard_shortcuts
-                    .shortcut_values()
-                    .into_iter()
-                    .find(|(candidate, _)| *candidate == action)
-                    .expect("registered draft")
-                    .1;
+                let value = shortcut_values.iter().find(|(candidate, _)| *candidate == action).expect("registered draft").1;
                 shortcut_input(
                     field.label(),
                     value,
@@ -1300,7 +1295,7 @@ fn shortcut_input<'a>(
         .position(|candidate| *candidate == field)
         .expect("shortcut index");
     let chords = settings::parse_chords(value);
-    let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
+    let default = settings::format_chords(workspace_widget::default_shortcut_keys(action));
     let source = if value == default { "Default" } else { "User" };
     let mut controls: Vec<Element<'a, Message>> = chords
         .iter()
