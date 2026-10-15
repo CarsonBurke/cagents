@@ -20,6 +20,40 @@ impl Drop for SetupReservation {
     fn drop(&mut self) {ACTIVE.lock().unwrap_or_else(|poison|poison.into_inner()).remove(&self.path);}
 }
 
+fn verified_report(service:&Service,row:&crate::persistence::PendingOperation,common:&Path,record:&WorktreeRecord,cancel:&CancellationToken)->Result<WorktreeOperationReport,String> {
+    let report=service.worktree_setup_creation_from_row(row).map_err(|error|error.to_string())?;
+    let request=report.request.as_ref().ok_or("The setup receipt has no request")?;
+    let saved_common=serde_json::from_value::<PathBuf>(row.payload["common_dir"].clone()).map_err(|error|error.to_string())?;
+    let saved_admin=serde_json::from_value::<PathBuf>(row.payload["admin_dir"].clone()).map_err(|error|error.to_string())?;
+    let admin=service.git_dir(&record.path,cancel).map_err(|error|error.to_string())?;
+    if saved_common.as_path()!=common||saved_admin!=admin||record.branch.as_deref()!=Some(request.branch.full_ref().as_str()) {
+        return Err("The worktree's creation ownership changed; no setup was resumed".into());
+    }
+    Ok(report)
+}
+
+/// One repository inventory query discovers durable intents even if a crash
+/// preceded terminal publication. Config/trust and filesystem copies are not
+/// read here; the explicit Review action reloads those separately.
+pub(super) fn list(service:&Service,store:&crate::persistence::StateStore,repository:&Path,cancel:&CancellationToken)->Result<Reply,String> {
+    let common=service.common_dir(repository,cancel).map_err(|error|error.to_string())?;
+    let records=service.list_worktrees(repository,cancel).map_err(|error|error.to_string())?;
+    let records=records.iter().filter(|record|!record.bare).map(|record|(record.path.clone(),record)).collect::<std::collections::BTreeMap<_,_>>();
+    let mut intents=Vec::new();let mut warnings=Vec::new();
+    for row in store.journaled_worktree_operations().map_err(|error|error.to_string())? {
+        if row.status!=PendingOperationStatus::Applied||row.action!="create"||row.entity_kind!="worktree_creation"||row.payload["request"]["setup_intent"].is_null() {continue;}
+        let Some(record)=serde_json::from_value::<PathBuf>(row.payload["request"]["destination"].clone()).ok().and_then(|path|records.get(&path).copied()) else {continue;};
+        match verified_report(service,&row,&common,record,cancel) {
+            Ok(report)=>if let Some(intent)=report.request.as_ref().and_then(|request|request.setup_intent.as_ref()) {
+                intents.push(SetupReceipt {path:record.path.clone(),creation_id:report.operation_id,intent:serde_json::to_string(intent).map_err(|error|error.to_string())?});
+            },
+            Err(error)=>warnings.push(format!("Could not verify retained setup for {}: {error}",record.path.display())),
+        }
+    }
+    intents.sort_by(|left,right|left.path.cmp(&right.path));
+    Ok(Reply::SetupIntents {intents,warnings})
+}
+
 /// Match a settled receipt to the currently registered checkout and admin dir.
 /// A malformed unrelated row cannot hide a valid receipt for another worktree.
 pub(super) fn report(service:&Service,store:&crate::persistence::StateStore,repository:&Path,path:&Path,cancel:&CancellationToken)->Result<(WorktreeOperationReport,PathBuf),String> {
@@ -29,19 +63,13 @@ pub(super) fn report(service:&Service,store:&crate::persistence::StateStore,repo
     let record=records.iter().find(|record|record.path==path&&!record.bare).ok_or("The setup checkout is no longer registered")?;
     let primary=records.first().filter(|record|!record.bare).map(|record|record.path.clone()).ok_or("Setup needs a primary checkout")?;
     let common=service.common_dir(repository,cancel).map_err(|error|error.to_string())?;
-    let admin=service.git_dir(&path,cancel).map_err(|error|error.to_string())?;
     let mut matches=Vec::new();
     for row in store.journaled_worktree_operations().map_err(|error|error.to_string())? {
         if row.status!=PendingOperationStatus::Applied||row.action!="create"||row.entity_kind!="worktree_creation" {continue;}
         let destination=serde_json::from_value::<PathBuf>(row.payload["request"]["destination"].clone()).ok();
         if destination.as_ref()!=Some(&path) {continue;}
-        let report=service.worktree_setup_creation(store,row.id).map_err(|error|error.to_string())?.ok_or("The creation receipt disappeared")?;
+        let report=verified_report(service,&row,&common,record,cancel)?;
         let request=report.request.as_ref().ok_or("The setup receipt has no request")?;
-        let saved_common=serde_json::from_value::<PathBuf>(row.payload["common_dir"].clone()).map_err(|error|error.to_string())?;
-        let saved_admin=serde_json::from_value::<PathBuf>(row.payload["admin_dir"].clone()).map_err(|error|error.to_string())?;
-        if saved_common!=common||saved_admin!=admin||record.branch.as_deref()!=Some(request.branch.full_ref().as_str()) {
-            return Err("The worktree's creation ownership changed; no setup was resumed".into());
-        }
         if request.setup_intent.is_some() {matches.push(report);}
     }
     if matches.len()!=1 {return Err("No unique daemon-owned setup intent is available for this checkout; review its original creation client".into());}

@@ -60,6 +60,16 @@ fn settled_setup_journal(operation: &PendingOperation) -> Result<WorktreeJournal
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// Verify metadata from an already loaded journal snapshot. Bulk readers
+    /// avoid one database query per receipt; explicit effects still use CAS.
+    pub fn worktree_setup_creation_from_row(
+        &self,
+        operation: &PendingOperation,
+    ) -> Result<WorktreeOperationReport, StoreError> {
+        let journal=settled_setup_journal(operation)?;
+        Ok(journal.report(operation.created_at_unix_ms))
+    }
+
     /// Read one settled creation without reconciling or executing effects.
     /// Missing rows return None; unsupported or identity-mismatched rows fail
     /// closed. Callers still verify current checkout identity before resuming.
@@ -71,8 +81,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let Some(operation) = store.journaled_worktree_operation(creation_id)? else {
             return Ok(None);
         };
-        let journal = settled_setup_journal(&operation)?;
-        Ok(Some(journal.report(operation.created_at_unix_ms)))
+        self.worktree_setup_creation_from_row(&operation).map(Some)
     }
 
     /// Update metadata on a settled creation without reconciling or executing

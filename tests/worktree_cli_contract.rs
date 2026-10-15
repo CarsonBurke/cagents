@@ -283,10 +283,21 @@ fn daemon_setup_recovery_requires_fresh_review_and_retains_each_explicit_run() {
     let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
     let mut client=cagents::control::ControlClient::connect(&socket).unwrap();
     let repository=project.join(".git");
+    // Install the exact durable state of a crash after copies completed but
+    // before terminal publication. No pending pane/marker exists to discover.
+    let crash_intent=WorktreeSetupIntent {primary:Some(project.clone()),plan:Some(plan.clone()),skip:false,run_id:Some(OperationId::new()),copy_done:true};
+    let journal=fixture.root.path().join("data").join(cagents::instance::STORAGE_NAME).join("worktree-operations.sqlite3");
+    let connection=rusqlite::Connection::open(journal).unwrap();
+    assert_eq!(connection.execute("UPDATE pending_operations SET payload_json=json_set(payload_json,'$.request.setup_intent',json(?1)) WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?2",rusqlite::params![serde_json::to_string(&crash_intent).unwrap(),path.to_str().unwrap()]).unwrap(),1);
+    drop(connection);
+    let device_service::Reply::Worktree(Reply::SetupIntents {intents,warnings})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntents {repository:repository.clone()}}).unwrap() else {panic!("wrong setup inventory")};
+    assert!(warnings.is_empty(),"{warnings:?}");assert_eq!(intents.len(),1);assert_eq!(intents[0].path,path);
+    assert_eq!(serde_json::from_str::<WorktreeSetupIntent>(&intents[0].intent).unwrap(),crash_intent);
+    assert!(client.list().unwrap().is_empty(),"inventory must discover the retained run without a marker terminal");
     let device_service::Reply::Worktree(Reply::SetupIntent {intent,current_plan,plan_error,trusted,active,primary,..})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntent {repository:repository.clone(),path:path.clone()}}).unwrap() else {panic!("wrong recovery metadata")};
     assert_eq!(primary,project);assert!(!trusted);assert!(!active);assert!(plan_error.is_none());
     assert_eq!(serde_json::from_str::<Value>(&current_plan.unwrap()).unwrap()["fingerprint"],plan.fingerprint);
-    let prior:WorktreeSetupIntent=serde_json::from_str(&intent).unwrap();assert!(prior.skip);
+    let prior:WorktreeSetupIntent=serde_json::from_str(&intent).unwrap();assert_eq!(prior,crash_intent);
     let resume=|run, fingerprint,trust,skip|device_service::Operation::Worktree {operation:Operation::ResumeSetup {repository:repository.clone(),path:path.clone(),expected_run_id:run,expected_plan_fingerprint:fingerprint,trust,skip}};
     assert!(client.device_operation(resume(prior.run_id,Some(plan.fingerprint.clone()),false,false)).is_err());
     assert!(client.device_operation(resume(Some(OperationId::new()),Some(plan.fingerprint.clone()),true,false)).is_err());
