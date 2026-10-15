@@ -47,8 +47,8 @@ impl ClipboardTarget {
     /// destroy the pending original generation's permission request.
     pub(super) fn stale(&self, surface: &crate::terminal::TerminalSurface) -> bool {
         surface.terminal_id()!=self.terminal
-            || surface.execution_instance().is_some_and(|worker| worker!=self.worker)
-            || surface.host_proof().is_some_and(|proof| proof!=self.proof)
+            || surface.execution_instance().filter(|worker| !worker.is_nil()).is_some_and(|worker| worker!=self.worker)
+            || surface.host_proof().filter(crate::model::HostSessionProof::is_complete).is_some_and(|proof| proof!=self.proof)
     }
 }
 
@@ -230,6 +230,23 @@ mod tests {
             clipboard_actions(app.handle_terminal_find(confirm_clipboard(&app, card, true)))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn remembered_allow_does_not_grant_a_same_id_successor_worker_clipboard_access() {
+        let (mut app,card,_peer)=clipboard_app("clipboard-worker-permission");
+        app.settings.terminal_clipboard_write=crate::settings::TerminalClipboardWritePolicy::Ask;
+        drop(app.handle_terminal_clipboard_write(card,false,"first".into()));
+        let original=app.terminal_clipboard.as_ref().unwrap().1.clone();
+        let allow=confirm_clipboard(&app,card,true);
+        assert_eq!(clipboard_actions(app.handle_terminal_find(allow)).len(),1);
+        let replacement=clipboard_peer(original.terminal,uuid::Uuid::new_v4());
+        app.cards.insert(card,CardRuntime::Terminal(replacement.surface()));
+        assert!(clipboard_actions(app.handle_terminal_clipboard_write(card,false,"successor".into())).is_empty());
+        let pending=app.terminal_clipboard.as_ref().expect("a new worker must request its own permission");
+        assert_eq!(pending.1.terminal,original.terminal);
+        assert_ne!(pending.1.worker,original.worker);
+        assert_eq!(pending.1.proof,original.proof,"worker fence is independent of daemon identity");
     }
 
     #[test]
