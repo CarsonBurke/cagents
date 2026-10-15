@@ -1880,6 +1880,17 @@ mod tests {
                 })
                 .unwrap()
         }
+        fn thread_cpu_ns() -> u128 {
+            // Linux reports the calling test thread's scheduled CPU time in
+            // nanoseconds, independently of time waiting on disk or scheduling.
+            std::fs::read_to_string("/proc/thread-self/schedstat")
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
         for append in [false, true] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let mut store = Store::at(directory.path().into()).unwrap();
@@ -1890,7 +1901,12 @@ mod tests {
                 serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"bench","name":"Write","input":{}}}),
             ] {
                 for event in adapter.receive(stream(event)).unwrap().events {
-                    store.apply(event).unwrap();
+                    // The old full-item pipeline predates original-call
+                    // capture. Mixing its deliberate delta omission with a
+                    // modern open capture would make the later seal invalid.
+                    if append || !matches!(event, Event::RawToolCapture(_)) {
+                        store.apply(event).unwrap();
+                    }
                 }
             }
             let mut item = Item {
@@ -1911,6 +1927,7 @@ mod tests {
             let source = payload.to_string();
             assert_eq!(source.len(), 1024 * 1024);
             let io_before = written_bytes();
+            let cpu_before = thread_cpu_ns();
             let started = std::time::Instant::now();
             let mut submitted_bytes = 0usize;
             for chunk in source.as_bytes().chunks(50) {
@@ -1936,6 +1953,7 @@ mod tests {
             store.flush_input().unwrap();
             let stream_io_written = written_bytes() - io_before;
             let stream_duration = started.elapsed();
+            let stream_cpu_ns = thread_cpu_ns() - cpu_before;
             let (bytes, chunks): (usize, usize) = store
                 .db
                 .query_row(
@@ -1954,12 +1972,18 @@ mod tests {
                 .unwrap()
                 .events
             {
-                store.apply(event).unwrap();
+                // The append lane includes the full modern sealing and
+                // authoritative classification cost; the legacy lane retains
+                // exactly its old full-item storage behavior.
+                if append || !matches!(event, Event::RawToolCapture(_)) {
+                    store.apply(event).unwrap();
+                }
             }
             store.flush_input().unwrap();
             let total_io_written = written_bytes() - io_before;
+            let total_cpu_ns = thread_cpu_ns() - cpu_before;
             println!(
-                "append={append} stream_duration_ms={} total_duration_ms={} delta_body_bytes_submitted={submitted_bytes} stream_syscall_write_bytes={stream_io_written} total_syscall_write_bytes={total_io_written} streamed_body_bytes={bytes} streamed_chunks={chunks}",
+                "append={append} stream_duration_ms={} total_duration_ms={} delta_body_bytes_submitted={submitted_bytes} stream_syscall_write_bytes={stream_io_written} total_syscall_write_bytes={total_io_written} streamed_body_bytes={bytes} streamed_chunks={chunks} stream_thread_cpu_ns={stream_cpu_ns} total_thread_cpu_ns={total_cpu_ns}",
                 stream_duration.as_millis(),
                 started.elapsed().as_millis()
             );
