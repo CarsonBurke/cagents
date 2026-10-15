@@ -7,6 +7,13 @@ pub(super) struct PendingReader {
     request: OperationId,
     view: RepositoryView,
     binding: git_binding::Binding,
+    open: Option<InitialOpen>,
+}
+
+#[derive(Clone, Debug)]
+enum InitialOpen {
+    Action(Box<RepositoryAction>),
+    SourceLocation { path: PathBuf, line: usize },
 }
 
 impl Cagents {
@@ -15,6 +22,24 @@ impl Cagents {
     pub(super) fn forget_repository_reader(&mut self, card: CardId) {
         self.refresh_ui.pane_readers.remove(&card);
         self.refresh_ui.pane_reader_keys.remove(&card);
+    }
+
+    /// Only original read/navigation intent can wait for initialization.
+    /// Git commands, captured controls and arbitrary editor edits never do.
+    pub(super) fn defer_initial_repository_open(&mut self, action: &RepositoryAction) -> bool {
+        if !matches!(action, RepositoryAction::OpenWorkingDiff { .. }
+            | RepositoryAction::OpenCommittedFile { .. }
+            | RepositoryAction::OpenFileFromBrowser { .. }
+            | RepositoryAction::OpenLocation { .. }) { return false; }
+        let Some(pending) = self.refresh_ui.pane_readers.get_mut(&action.card()) else { return false; };
+        pending.open = Some(InitialOpen::Action(Box::new(action.clone())));
+        true
+    }
+
+    pub(super) fn defer_initial_source_location(&mut self, card: CardId, path: PathBuf, line: usize) {
+        if let Some(pending) = self.refresh_ui.pane_readers.get_mut(&card) {
+            pending.open = Some(InitialOpen::SourceLocation { path, line });
+        }
     }
 
     pub(super) fn repository_view_key(&self, view: &RepositoryView) -> Option<ActiveWorktreeKey> {
@@ -53,7 +78,7 @@ impl Cagents {
             .or_else(|| self.pending_runtime_git_binding(&key))
             .unwrap_or_else(|| git_binding::Binding::new(key));
         let request = OperationId::new();
-        self.refresh_ui.pane_readers.insert(card, PendingReader { request, view, binding: binding.clone() });
+        self.refresh_ui.pane_readers.insert(card, PendingReader { request, view, binding: binding.clone(), open: None });
         self.refresh_ui.pane_reader_keys.remove(&card);
         self.cards.insert(card, CardRuntime::Loading);
         cosmic::task::future(async move {
@@ -75,6 +100,7 @@ impl Cagents {
         };
         let view = pending.view.clone();
         let original = pending.binding.id;
+        let open = pending.open.clone();
         self.refresh_ui.pane_readers.remove(&card);
         if self.exit.is_some()
             || !matches!(self.cards.get(&card), Some(CardRuntime::Loading))
@@ -94,7 +120,15 @@ impl Cagents {
             Ok(binding) if binding.id == original && binding.key.project_id == view.project
                 && self.repository_view_key(&view).as_ref() == Some(&binding.key)
                 && binding.read_source.as_ref().is_some_and(GitReadSource::is_available) => {
-                self.attach_repository_pane_with_source(card, view, binding.read_source)
+                let load = self.attach_repository_pane_with_source(card, view, binding.read_source);
+                let navigate = match (self.cards.get_mut(&card), open) {
+                    (Some(CardRuntime::Repository(runtime)), Some(InitialOpen::Action(action))) =>
+                        repository_task(runtime.update(*action)),
+                    (Some(CardRuntime::Repository(runtime)), Some(InitialOpen::SourceLocation { path, line })) =>
+                        repository_task(runtime.open_source_file_location(card, path, line)),
+                    _ => Task::none(),
+                };
+                Task::batch([load, navigate, self.drain_lsp_intents(card)])
             }
             Ok(_) => {
                 self.cards.insert(card, CardRuntime::Failed("The original Git reader changed. Reload the project and reopen this pane.".into()));
@@ -326,6 +360,37 @@ mod tests {
         let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!() };
         assert_ne!(runtime.git_read_source().unwrap().id(), failed_actor);
         assert!(runtime.git_read_source().unwrap().is_available());
+    }
+
+    #[tokio::test]
+    async fn first_working_diff_navigation_survives_a_held_reader_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        git_binding::tests::init(directory.path(), "original\n");
+        let (source_app, key) = git_binding::tests::app_for(directory.path());
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_model = source_app.sidebar_model;
+        let view = RepositoryView { project: key.project_id, repository: directory.path().to_owned(),
+            worktree: directory.path().to_owned(), selected_file: None };
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(view.clone());
+        app.refresh_ui.source_binding = Some(git_binding::Binding::new(key));
+        let opening = app.attach_repository_pane(card, view);
+        let held = worker(opening).await;
+        drop(app.update(Message::Repository(RepositoryAction::OpenWorkingDiff {
+            card, file: repository_widget::RepositoryFile { path: "file.txt".into(), staged: true, ..Default::default() },
+            basis: DiffBasis::HeadToIndex,
+        })));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(app.refresh_ui.pane_readers.get(&card).unwrap().open.is_some());
+        // Arbitrary user commands are not replayed through this read-only slot.
+        drop(app.update(Message::Repository(RepositoryAction::StageSelected { card, stage: true })));
+        assert!(app.source_control_mutations.is_empty());
+        drop(app.update(held));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else { panic!() };
+        assert!(runtime.shows_diff());
+        assert_eq!(runtime.selected_diff_basis(), &DiffBasis::HeadToIndex);
+        assert_eq!(runtime.selected_path(), Some(Path::new("file.txt")));
     }
 
     #[test]

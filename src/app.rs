@@ -18943,6 +18943,8 @@ impl Application for Cagents {
                         identity.path,
                         line,
                     )));
+                } else {
+                    self.defer_initial_source_location(destination, identity.path, line);
                 }
                 if let Ok(update) = self.workspace.focus(destination) {
                     tasks.push(self.apply_viewport(update, true, false));
@@ -19146,6 +19148,7 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
+                if self.defer_initial_repository_open(&action) { return Task::none(); }
                 if matches!(&action, RepositoryAction::Save { overwrite: false, .. }) {
                     if let Some(task) = self.maybe_format_before_save(card) { return task; }
                 }
