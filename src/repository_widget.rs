@@ -1879,8 +1879,14 @@ impl Drop for FindJob {
 
 /// Immutable replacement work prepared from one exact Find revision. The
 /// payload is opaque and shared so delivery does not copy a large output.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreparedFindReplacement(Arc<String>);
+
+impl std::fmt::Debug for PreparedFindReplacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedFindReplacement").field("bytes", &self.0.len()).finish()
+    }
+}
 
 struct FindReplacementJob {
     key: FindKey,
@@ -3522,7 +3528,7 @@ impl RepositoryRuntime {
     }
 
     fn replace_find_matches(&mut self, card: CardId, all: bool, prepared: Option<PreparedFindReplacement>) -> Task<RepositoryAction> {
-        if self.is_saving() || self.find_cache.as_ref() != self.wanted_find().as_ref() {
+        if !self.editable_surface_visible() || self.is_saving() || self.find_cache.as_ref() != self.wanted_find().as_ref() {
             return Task::none();
         }
         if prepared.is_none() {
@@ -18217,6 +18223,53 @@ mod tests {
             "zzalpha\n",
             "closing find preserves the caret after edits"
         );
+    }
+
+    #[test]
+    #[ignore = "explicit complete 8MiB worker admission/planning/native publication benchmark"]
+    fn benchmark_dense_eight_mib_replace_worker_and_native_publication() {
+        const BYTES: usize = 8 * 1024 * 1024;
+        for irregular in [false, true] {
+            let original = if irregular { format!("{}{}", "aλ".repeat(BYTES / 3), "a".repeat(BYTES % 3)) } else { "a".repeat(BYTES) };
+            assert_eq!(original.len(), BYTES);
+            let count = if irregular { 2 * (BYTES / 3) + BYTES % 3 } else { BYTES };
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "dense.txt", &original);
+            update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
+            if irregular { update_find_settled(&mut runtime, RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::Regex, enabled: true }); }
+            update_find_settled(&mut runtime, RepositoryAction::FindQueryChanged { card, query: if irregular { "." } else { "a" }.into() });
+            assert_eq!(runtime.find_total, count);
+            update_find_settled(&mut runtime, RepositoryAction::ReplaceQueryChanged { card, query: "b".into() });
+            text_editor::take_text_call_count();
+            let started = Instant::now();
+            let planning = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
+            let admission = started.elapsed();
+            assert!(runtime.find_replacement.is_some());
+            assert_eq!(text_editor::take_text_call_count(), 0);
+            let started = Instant::now();
+            let prepared = find_output(planning);
+            let worker_wait = started.elapsed();
+            let started = Instant::now();
+            let refresh = runtime.update(prepared);
+            let publication = started.elapsed();
+            let output = buffer_text(&runtime);
+            assert_eq!(output.len(), count);
+            assert!(output.bytes().all(|byte| byte == b'b'));
+            settle_find_tasks(&mut runtime, refresh);
+            assert_eq!(runtime.find_total, 0);
+            let started = Instant::now();
+            let refresh = runtime.update(RepositoryAction::Undo { card });
+            let undo_update = started.elapsed();
+            assert_eq!(buffer_text(&runtime), original);
+            settle_find_tasks(&mut runtime, refresh);
+            assert_eq!(runtime.find_total, count);
+            let started = Instant::now();
+            let refresh = runtime.update(RepositoryAction::Redo { card });
+            let redo_update = started.elapsed();
+            assert_eq!(buffer_text(&runtime), output);
+            settle_find_tasks(&mut runtime, refresh);
+            eprintln!("find8MiB_worker irregular={irregular} input_bytes={BYTES} matches={count} output_bytes={} admission={admission:?} worker_wait={worker_wait:?} native_publication_update={publication:?} undo_update={undo_update:?} redo_update={redo_update:?}; headless native content/update only, no glyph layout/render or application RSS", output.len());
+        }
     }
 
     #[test]
