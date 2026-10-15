@@ -447,7 +447,16 @@ impl RemoteActor {
         Ok(())
     }
     pub fn finish_close(&self)->Result<(),String> {
-        match self.call::<()>("retire",Value::Null) {Ok(())=>Ok(()),Err(error)=>if chat::native_holder::actor_close_proved(&self.0.identity.record,&self.0.proof)? {Ok(())}else {Err(error)}}
+        if let Err(error)=self.call::<()>("retire",Value::Null) {
+            if !final_snapshot::retirement_proved(&self.0.identity,&self.0.proof)? {return Err(error);}
+            return Ok(());
+        }
+        let deadline=Instant::now()+Duration::from_secs(5);
+        loop {
+            if final_snapshot::retirement_proved(&self.0.identity,&self.0.proof)? {return Ok(());}
+            if Instant::now()>=deadline {return Err("Final outcomes are acknowledged, but exact helper retirement has not completed; retain its cleanup owner".into());}
+            thread::sleep(Duration::from_millis(10));
+        }
     }
     pub fn close(&self)->Result<(),String> {self.close_method("close",Value::Null)}
 }
@@ -693,13 +702,18 @@ impl Server {
             "close_if_idle"=>{let (generation,)=decode!((u64,));if self.closed_snapshot.is_none() {self.actor.close_if_idle(generation)?;reap_orphans()?;self.finish_inputs();}value!(self.publish_close()?)},
             "close"=>{if self.closed_snapshot.is_none() {self.actor.close()?;reap_orphans()?;self.finish_inputs();}value!(self.publish_close()?)},
             "retire"=>{
-                if self.closed_snapshot.is_none() {return Err("Stop the exact retained provider before retiring its helper".into());}
-                let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
-                if self.installed && (journal.latest()?!=journal.acknowledged()? || journal.continuity_loss()?.as_ref().is_some_and(|loss|!loss.acknowledged)) {return Err("Final retained outcomes must be durably acknowledged before helper retirement".into());}
+                self.check_retirement()?;
+                final_snapshot::publish_retirement(&self.identity,&self.proof)?;
                 Ok(Value::Null)
             },
             _=>Err("Unknown retained actor method/version".into()),
         }
+    }
+    fn check_retirement(&self)->Result<(),String> {
+        if self.closed_snapshot.is_none() {return Err("Stop the exact retained provider before retiring its helper".into());}
+        let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
+        if self.installed && (journal.latest()?!=journal.acknowledged()? || journal.continuity_loss()?.as_ref().is_some_and(|loss|!loss.acknowledged)) {return Err("Final retained outcomes must be durably acknowledged before helper retirement".into());}
+        Ok(())
     }
     fn publish_close(&mut self)->Result<ClosePublication,String> {
         let snapshot=if let Some(snapshot)=&self.closed_snapshot {snapshot.as_ref().clone()}else {
@@ -890,14 +904,13 @@ done"#;
         let mut fixture=resident_fixture();let server=&mut fixture.server;
         server.actor.close().unwrap();server.closed_snapshot=Some(Arc::new(server.actor.snapshot(None).unwrap()));
         server.journal.lock().unwrap().append(&Update::Attention(crate::notifications::Evidence {key:"final-turn".into(),kind:crate::notifications::Kind::Succeeded})).unwrap();
-        let retire=||Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"retire".into(),args:Value::Null};
-        let request=retire();assert!(server.invoke(request).is_err());
+        assert!(server.check_retirement().is_err());
         assert_eq!(server.journal.lock().unwrap().page(0).unwrap().len(),1,"provider teardown must not discard the uncommitted final outcome");
         server.journal.lock().unwrap().ack(1).unwrap();
         server.journal.lock().unwrap().record_loss("fixture loss").unwrap();
-        let request=Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"retire".into(),args:Value::Null};assert!(server.invoke(request).is_err());
+        assert!(server.check_retirement().is_err());
         let id=server.journal.lock().unwrap().continuity_loss().unwrap().unwrap().id;server.journal.lock().unwrap().ack_loss(id).unwrap();
-        let request=Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"retire".into(),args:Value::Null};assert!(server.invoke(request).is_ok());
+        assert!(server.check_retirement().is_ok());
     }
     #[test]
     fn input_refusal_and_storage_failure_publish_new_resident_revisions() {
@@ -924,6 +937,13 @@ done"#;
         assert!(!first.ready);assert_ne!(first.changed,fixture.server.revision());
         let response=fixture.server.invoke(Invocation {proof:fixture.server.proof.clone(),epoch:Some(fixture.server.epoch),method:"state".into(),args:json!([first.changed])}).unwrap();
         let next:Option<Resident>=serde_json::from_value(response).unwrap();assert!(next.unwrap().ready,"the next real state RPC must fetch the raced Ready transition");
+    }
+    #[test]
+    fn live_helper_retirement_refusal_is_not_a_successful_cleanup() {
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();let socket=root.path().join("rpc.sock");
+        let listener=UnixListener::bind(&socket).unwrap();let mut actor=RemoteActor::fixture();Arc::get_mut(&mut actor.0).unwrap().socket=socket;
+        let peer=thread::spawn(move|| {let (control,_)=listener.accept().unwrap();let request:Invocation=receive(&control,TIMEOUT).unwrap();assert_eq!(request.method,"retire");send(&control,&Err::<Value,_>("Final retained outcomes must be durably acknowledged before helper retirement".to_owned()),TIMEOUT).unwrap();});
+        let error=actor.finish_close().unwrap_err();peer.join().unwrap();assert!(error.contains("durably acknowledged"));assert!(actor.identity().record.holder.is_current());
     }
     #[test]
     fn proved_close_wins_over_delayed_live_metadata_and_disconnection_publications() {

@@ -30,8 +30,25 @@ pub(super) fn read(identity:&ActorIdentity,proof:&HostSessionProof)->Result<Snap
     if &receipt.identity!=identity || &receipt.proof!=proof {return Err("Final retained snapshot belongs to another actor or attachment".into());}
     Ok(receipt.snapshot)
 }
+#[derive(Serialize,Deserialize)]
+struct Retirement {protocol:u32,semantic_acknowledged:bool,identity:ActorIdentity,proof:HostSessionProof}
+fn retirement_path(record:&Record)->Result<PathBuf,String> {Ok(path(record)?.with_extension("retired"))}
+pub(super) fn publish_retirement(identity:&ActorIdentity,proof:&HostSessionProof)->Result<(),String> {
+    let bytes=serde_json::to_vec(&Retirement {protocol:PROTOCOL,semantic_acknowledged:true,identity:identity.clone(),proof:proof.clone()}).map_err(|error|error.to_string())?;
+    save_at(&retirement_path(&identity.record)?,&bytes)
+}
+pub(super) fn retirement_proved(identity:&ActorIdentity,proof:&HostSessionProof)->Result<bool,String> {
+    if identity.record.holder.is_current() {return Ok(false);}
+    let file=match crate::secure_file::open_existing_private_file(&retirement_path(&identity.record)?) {Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(false),Err(error)=>return Err(error.to_string())};
+    let mut bytes=Vec::new();file.take(8193).read_to_end(&mut bytes).map_err(|error|error.to_string())?;
+    if bytes.len()>8192 {return Err("Retained semantic retirement proof is oversized".into());}
+    let receipt:Retirement=serde_json::from_slice(&bytes).map_err(|error|error.to_string())?;
+    if receipt.protocol!=PROTOCOL || !receipt.semantic_acknowledged || &receipt.identity!=identity || &receipt.proof!=proof {return Err("Retained semantic retirement receipt belongs to another actor or attachment".into());}
+    Ok(!registry::retirement_pending(&identity.record).map_err(|error|error.to_string())?)
+}
 pub(crate) fn remove(record:&Record)->Result<(),String> {
     let path=path(record)?;
+    match std::fs::remove_file(retirement_path(record)?) {Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(error.to_string())}
     match std::fs::remove_file(&path) {Ok(())=>File::open(path.parent().ok_or("Missing final snapshot directory")?).and_then(|file|file.sync_all()).map_err(|error|error.to_string()),Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(()),Err(error)=>Err(error.to_string())}
 }
 
