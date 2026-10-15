@@ -5023,6 +5023,7 @@ mod tests {
         fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
             runtime(app, target).view(
                 None,
+                None,
                 false,
                 true,
                 &app.settings.keyboard_shortcuts,

@@ -90,7 +90,7 @@ impl Cagents {
         )
     }
 
-    pub(super) fn reconcile_ready_draft_setup(&mut self) {
+    pub(in crate::app) fn reconcile_ready_draft_setup(&mut self) {
         let recovered = self
             .cards
             .iter()
@@ -119,7 +119,7 @@ impl Cagents {
 
     /// Reconsider only untouched automatic placeholders. Typing, explicit model
     /// or account selection, and issued conversations never change underneath a user.
-    pub(super) fn reconcile_usable_default_chats(&mut self) -> Task<Message> {
+    pub(in crate::app) fn reconcile_usable_default_chats(&mut self) -> Task<Message> {
         let replacements = self
             .chat_ui
             .default_chats

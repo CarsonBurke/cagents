@@ -352,6 +352,7 @@ impl Pane {
         let clock = Instant::now();
         let element = self.runtime.view(
             None,
+            None,
             false,
             true,
             &self.shortcuts,
