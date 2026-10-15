@@ -915,6 +915,8 @@ pub struct AppSettings {
     /// Maximum admitted servers; active documents are never evicted.
     #[serde(default = "default_lsp_max_sessions")]
     pub lsp_max_sessions: usize,
+    #[serde(default)]
+    pub editor_replace_preserve_case: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -926,6 +928,8 @@ pub struct AppSettings {
     /// header would read as a key inside that table.
     #[serde(default = "default_language_servers")]
     pub language_servers: Vec<LanguageServerSettings>,
+    #[serde(default)]
+    pub editor_find_options: EditorFindOptions,
     #[serde(default, deserialize_with = "deserialize_keyboard_shortcuts")]
     pub keyboard_shortcuts: KeyboardShortcuts,
     #[serde(default)]
@@ -984,6 +988,8 @@ impl Default for AppSettings {
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
             lsp_idle_timeout_seconds: default_lsp_idle_timeout(),
             lsp_max_sessions: default_lsp_max_sessions(),
+            editor_find_options: EditorFindOptions::default(),
+            editor_replace_preserve_case: false,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
@@ -995,6 +1001,15 @@ fn default_lsp_idle_timeout() -> u64 {
 }
 fn default_lsp_max_sessions() -> usize {
     8
+}
+
+/// Persisted matching preferences shared by editor find surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorFindOptions {
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub whole_word: bool,
 }
 
 /// One language a server handles, and the file extensions that select it.
@@ -2853,6 +2868,25 @@ mod tests {
             };
             assert!(settings.validate().is_err());
         }
+    }
+
+    #[test]
+    fn editor_find_options_round_trip_with_disabled_language_servers() {
+        let settings = AppSettings {
+            language_servers: Vec::new(),
+            editor_find_options: EditorFindOptions {
+                case_sensitive: true,
+                regex: true,
+                whole_word: true,
+            },
+            editor_replace_preserve_case: true,
+            ..AppSettings::default()
+        };
+        let serialized = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&serialized).unwrap();
+        assert!(restored.language_servers.is_empty());
+        assert_eq!(restored.editor_find_options, settings.editor_find_options);
+        assert!(restored.editor_replace_preserve_case);
     }
 
     #[test]

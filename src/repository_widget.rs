@@ -621,8 +621,7 @@ pub enum RepositoryAction {
     },
     /// Mounts the find bar over the open buffer and hands it the keyboard.
     ///
-    /// Find is a strip, not a modal: it holds the editor in search mode so
-    /// the buffer cannot be typed into behind it, and nothing else.
+    /// Find keeps the buffer editable; clicks return keyboard focus to it.
     OpenFind {
         card: CardId,
     },
@@ -632,6 +631,19 @@ pub enum RepositoryAction {
     FindQueryChanged {
         card: CardId,
         query: String,
+    },
+    FindOptionsChanged {
+        card: CardId,
+        option: crate::ui_controls::FindOption,
+        enabled: bool,
+    },
+    FindSelectionChanged {
+        card: CardId,
+        enabled: bool,
+    },
+    PreserveCaseChanged {
+        card: CardId,
+        enabled: bool,
     },
     FindNext {
         card: CardId,
@@ -646,7 +658,12 @@ pub enum RepositoryAction {
     FindLoaded {
         card: CardId,
         ticket: uuid::Uuid,
-        result: Result<Option<Vec<(text_editor::Position, text_editor::Position)>>, String>,
+        result: Result<Option<text_editor::MatchIndex>, String>,
+    },
+    FindReplacementLoaded {
+        card: CardId,
+        ticket: uuid::Uuid,
+        result: Result<Option<PreparedFindReplacement>, String>,
     },
     ReplaceQueryChanged {
         card: CardId,
@@ -721,10 +738,14 @@ impl RepositoryAction {
             | Self::OpenFind { card }
             | Self::CloseFind { card }
             | Self::FindQueryChanged { card, .. }
+            | Self::FindOptionsChanged { card, .. }
+            | Self::FindSelectionChanged { card, .. }
+            | Self::PreserveCaseChanged { card, .. }
             | Self::FindNext { card }
             | Self::FindPrevious { card }
             | Self::FindInputFocus { card, .. }
             | Self::FindLoaded { card, .. }
+            | Self::FindReplacementLoaded { card, .. }
             | Self::ReplaceQueryChanged { card, .. }
             | Self::ToggleReplace { card }
             | Self::ReplaceMatch { card, .. }
@@ -1860,8 +1881,27 @@ fn visible_diff_rows(rows: &RowOffsets, viewport: ListViewport) -> VisibleRows {
     }
 }
 
+type FindScope = ((usize, usize), (usize, usize));
+
+fn scoped_matches(matches: &mut text_editor::MatchIndex, scope: Option<FindScope>) {
+    *matches = matches.scoped(scope.map(|(first, last)| {
+        (
+            text_editor::Position {
+                line: first.0,
+                column: first.1,
+            },
+            text_editor::Position {
+                line: last.0,
+                column: last.1,
+            },
+        )
+    }));
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct FindKey {
+    options: crate::editor_search::FindOptions,
+    selection: Option<FindScope>,
     generation: u64,
     revision: u64,
     query: String,
@@ -1874,6 +1914,33 @@ struct FindJob {
 }
 
 impl Drop for FindJob {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+/// Immutable replacement work prepared from one exact Find revision. The
+/// payload is opaque and shared so delivery does not copy a large output.
+#[derive(Clone)]
+pub struct PreparedFindReplacement(Arc<String>);
+
+impl std::fmt::Debug for PreparedFindReplacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedFindReplacement")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
+struct FindReplacementJob {
+    key: FindKey,
+    replacement: String,
+    preserve_case: bool,
+    ticket: uuid::Uuid,
+    cancellation: CancellationToken,
+}
+
+impl Drop for FindReplacementJob {
     fn drop(&mut self) {
         self.cancellation.cancel();
     }
@@ -1934,6 +2001,13 @@ pub struct RepositoryRuntime {
     find_open: bool,
     /// The find bar's query exactly as the user typed it.
     find_query: String,
+    find_options: crate::editor_search::FindOptions,
+    find_selection: Option<FindScope>,
+    /// Captured scope coordinates belong only to this native buffer revision.
+    find_selection_revision: Option<u64>,
+    find_selection_candidate: Option<FindScope>,
+    find_select_on_finish: bool,
+    replace_preserve_case: bool,
     /// Which occurrence of [`RepositoryRuntime::find_query`] is selected, and
     /// how many there are.
     ///
@@ -1949,10 +2023,13 @@ pub struct RepositoryRuntime {
     replace_open: bool,
     replace_query: String,
     toolbar_overflow_open: bool,
-    find_matches: Vec<(text_editor::Position, text_editor::Position)>,
+    find_matches: text_editor::MatchIndex,
     find_cache: Option<FindKey>,
     find_snapshot: Option<(u64, u64, Arc<text_editor::SearchSnapshot>)>,
     find_active: Option<FindJob>,
+    find_replacement: Option<FindReplacementJob>,
+    #[cfg(test)]
+    find_replacement_pause: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     find_origin: Option<(usize, usize)>,
     find_error: Option<String>,
     /// One entry per comparison this selection has been asked for.
@@ -2126,16 +2203,25 @@ impl RepositoryRuntime {
             editor_font_size: 14.0,
             find_open: false,
             find_query: String::new(),
+            find_options: crate::editor_search::FindOptions::default(),
+            find_selection: None,
+            find_selection_revision: None,
+            find_selection_candidate: None,
+            find_select_on_finish: false,
+            replace_preserve_case: false,
             find_index: 0,
             find_total: 0,
             find_input_focused: false,
             replace_open: false,
             replace_query: String::new(),
             toolbar_overflow_open: false,
-            find_matches: Vec::new(),
+            find_matches: text_editor::MatchIndex::default(),
             find_cache: None,
             find_snapshot: None,
             find_active: None,
+            find_replacement: None,
+            #[cfg(test)]
+            find_replacement_pause: None,
             find_origin: None,
             find_error: None,
             document: DocumentState::None,
@@ -3113,10 +3199,36 @@ impl RepositoryRuntime {
         });
         true
     }
-    /// Marks the editor as search-owned: document edits are ignored while the
-    /// native viewport continues to accept scrolling actions.
+    /// Keep the search focus policy while allowing normal buffer editing.
     pub fn set_search_mode(&mut self, enabled: bool) {
         self.search_mode = enabled;
+    }
+
+    pub fn set_find_preferences(
+        &mut self,
+        options: crate::editor_search::FindOptions,
+        preserve_case: bool,
+    ) {
+        self.replace_preserve_case = preserve_case;
+        if self.find_options != options {
+            self.find_options = options;
+            self.refresh_find_matches();
+        }
+    }
+
+    pub fn find_preferences(&self) -> (crate::editor_search::FindOptions, bool) {
+        (self.find_options, self.replace_preserve_case)
+    }
+
+    fn current_selection_scope(&self) -> Option<FindScope> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        let cursor = document.content.selected_cursor();
+        let anchor = cursor.selection?;
+        let first = (anchor.line, anchor.column);
+        let last = (cursor.position.line, cursor.position.column);
+        (first != last).then(|| (first.min(last), first.max(last)))
     }
 
     /// Selects one case-insensitive occurrence in the open buffer and returns
@@ -3126,12 +3238,17 @@ impl RepositoryRuntime {
             return None;
         };
         let key = FindKey {
+            options: crate::editor_search::FindOptions::default(),
+            selection: None,
             generation: self.generation,
             revision: document.revision,
             query: query.to_owned(),
         };
         if self.find_cache.as_ref() != Some(&key) {
-            self.find_matches = document.content.find_matches(query);
+            self.find_matches = document
+                .content
+                .find_matches_with(query, Default::default())
+                .ok()?;
             self.find_cache = Some(key);
         }
         self.select_cached_match(occurrence)
@@ -3149,7 +3266,10 @@ impl RepositoryRuntime {
                 .perform(text_editor::Action::ClearSelection);
             return None;
         }
-        let (start, end) = self.find_matches[occurrence % total];
+        let (start, end) = self
+            .find_matches
+            .get(occurrence % total)
+            .expect("current find occurrence");
         document.content.move_to(text_editor::Cursor {
             position: end,
             selection: Some(start),
@@ -3241,12 +3361,16 @@ impl RepositoryRuntime {
         if !self.editable_surface_visible() {
             return Task::none();
         }
+        if self.find_open {
+            return iced::widget::operation::focus(find_focus_id(card));
+        }
         if let Some(selection) = self.selected_text()
             && !selection.trim().is_empty()
             && !selection.contains('\n')
         {
             self.find_query = selection;
         }
+        self.find_selection_candidate = self.current_selection_scope();
         self.find_open = true;
         self.set_search_mode(true);
         if let DocumentState::Editable(document) = &self.document {
@@ -3275,12 +3399,7 @@ impl RepositoryRuntime {
         self.focus_editor(card)
     }
 
-    /// Drops the find strip and the search-mode hold that came with it.
-    ///
-    /// Every exit from find goes through here. `search_mode` refuses every
-    /// editor action that is not a scroll, so a strip that closes without
-    /// releasing it leaves a buffer that silently swallows the user's
-    /// keystrokes and looks, from the outside, simply broken.
+    /// Drops the strip and its transient match/selection state.
     fn clear_find(&mut self) {
         self.find_open = false;
         self.find_query.clear();
@@ -3292,7 +3411,14 @@ impl RepositoryRuntime {
         self.find_snapshot = None;
         self.find_origin = None;
         self.find_error = None;
+        self.find_selection = None;
+        self.find_selection_revision = None;
+        self.find_selection_candidate = None;
+        self.find_select_on_finish = false;
         if let Some(active) = &self.find_active {
+            active.cancellation.cancel();
+        }
+        if let Some(active) = &self.find_replacement {
             active.cancellation.cancel();
         }
         self.set_search_mode(false);
@@ -3306,6 +3432,7 @@ impl RepositoryRuntime {
             // Keep the requested occurrence while a revision is re-searched;
             // an empty pending result is not a completed zero-match search.
             self.find_index = occurrence;
+            self.find_select_on_finish = true;
             return;
         }
         let total = self.select_cached_match(occurrence);
@@ -3328,14 +3455,17 @@ impl RepositoryRuntime {
             return None;
         };
         self.find_open.then(|| FindKey {
+            options: self.find_options,
+            selection: self.find_selection,
             generation: self.generation,
             revision: document.revision,
             query: self.find_query.clone(),
         })
     }
 
-    /// Small files search immediately. Larger files clear stale highlights and
-    /// let `find_task` scan a reusable immutable snapshot off the update thread.
+    /// Small literal searches complete immediately. Regex and larger buffers
+    /// scan a reusable immutable snapshot off the update thread, preserving
+    /// the engine's greedy semantics rather than enabling earliest-match mode.
     fn prepare_find_matches(&mut self) {
         let Some(wanted) = self.wanted_find() else {
             return;
@@ -3354,13 +3484,32 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             return;
         };
-        document
-            .content
-            .perform(text_editor::Action::ClearSelection);
+        if wanted.selection.is_some() && self.find_selection_revision != Some(document.revision) {
+            // Native edits, Undo, completion and other transactions can all
+            // move a captured span. Never reinterpret its old coordinates as
+            // a different region or widen replacement to the whole file.
+            self.find_selection_candidate = None;
+            self.find_error = Some(
+                "The captured selection changed. Select a new range and turn Selection off and on to search it.".into(),
+            );
+            self.find_cache = Some(wanted);
+            return;
+        }
         if wanted.query.is_empty()
-            || (document.content.line_count() <= 2048 && document.content.text_len() <= 64 * 1024)
+            || (!wanted.options.regex
+                && document.content.line_count() <= 2048
+                && document.content.text_len() <= 64 * 1024)
         {
-            self.find_matches = document.content.find_matches(&wanted.query);
+            match document
+                .content
+                .find_matches_with(&wanted.query, wanted.options)
+            {
+                Ok(mut matches) => {
+                    scoped_matches(&mut matches, wanted.selection);
+                    self.find_matches = matches;
+                }
+                Err(error) => self.find_error = Some(error),
+            }
             self.find_cache = Some(wanted);
         }
     }
@@ -3403,10 +3552,18 @@ impl RepositoryRuntime {
         });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                snapshot.find_matches(&key.query, || cancellation.is_cancelled())
+                snapshot
+                    .find_matches_with(&key.query, key.options, || cancellation.is_cancelled())
+                    .map(|result| {
+                        result.map(|mut matches| {
+                            scoped_matches(&mut matches, key.selection);
+                            matches
+                        })
+                    })
             })
             .await
-            .map_err(|error| format!("Find worker failed: {error}"));
+            .map_err(|error| format!("Find worker failed: {error}"))
+            .and_then(std::convert::identity);
             RepositoryAction::FindLoaded {
                 card,
                 ticket,
@@ -3418,7 +3575,7 @@ impl RepositoryRuntime {
     fn finish_find(
         &mut self,
         ticket: uuid::Uuid,
-        result: Result<Option<Vec<(text_editor::Position, text_editor::Position)>>, String>,
+        result: Result<Option<text_editor::MatchIndex>, String>,
     ) {
         if self
             .find_active
@@ -3443,7 +3600,250 @@ impl RepositoryRuntime {
             self.find_index
         };
         self.find_origin = None;
-        self.select_find_match(occurrence);
+        if std::mem::take(&mut self.find_select_on_finish) {
+            self.select_find_match(occurrence);
+        } else {
+            self.find_total = self.find_matches.len();
+            self.find_index = self.find_index.min(self.find_total.saturating_sub(1));
+        }
+    }
+
+    fn replace_find_matches(
+        &mut self,
+        card: CardId,
+        all: bool,
+        prepared: Option<PreparedFindReplacement>,
+    ) -> Task<RepositoryAction> {
+        if !self.editable_surface_visible()
+            || self.is_saving()
+            || self.find_cache.as_ref() != self.wanted_find().as_ref()
+        {
+            return Task::none();
+        }
+        if prepared.is_none() {
+            if self.find_replacement.is_some() {
+                return Task::none();
+            }
+            if all
+                && self.find_matches.len() > 256
+                && matches!(&self.document, DocumentState::Editable(document) if document.content.text_len() > 64 * 1024)
+            {
+                return self.prepare_find_replacement(card);
+            }
+        }
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Task::none();
+        };
+        if self.find_matches.is_empty() {
+            return Task::none();
+        }
+        let mut protocols = Vec::new();
+        if all && self.find_matches.len() <= 256 && document.content.text_len() > 64 * 1024 {
+            // Keep sparse fixes in a large file undoable without
+            // retaining unchanged megabytes as a whole-file paste.
+            // Dense replacement retains the single-splice path below.
+            let snapshot = document.content.search_snapshot();
+            let replacements = match snapshot.replacement_edits(
+                &self.find_matches,
+                &self.find_query,
+                &self.replace_query,
+                self.find_options,
+                self.replace_preserve_case,
+            ) {
+                Ok(edits) => edits,
+                Err(error) => {
+                    self.find_error = Some(error);
+                    return Task::none();
+                }
+            };
+            let before = document.content.cursor();
+            let mut changes = Vec::with_capacity(replacements.len());
+            for (start, end, inserted) in replacements.into_iter().rev() {
+                let trailing_cr = trailing_carriage_return(&document.content).is_some();
+                if let Some(change) = document
+                    .content
+                    .replace_range_recorded(start, end, &inserted)
+                {
+                    protocols.push(
+                        if trailing_cr || trailing_carriage_return(&document.content).is_some() {
+                            None
+                        } else {
+                            protocol_edit(&document.content, &change)
+                        },
+                    );
+                    changes.push(change);
+                }
+            }
+            if !changes.is_empty() {
+                document.history.record_group(
+                    changes,
+                    before,
+                    document.content.cursor(),
+                    Instant::now(),
+                );
+                document.text_changed();
+            }
+        } else if all {
+            let snapshot = document.content.search_snapshot();
+            let text = if let Some(prepared) = prepared {
+                prepared.0
+            } else {
+                match snapshot.replace_matches_with(
+                    &self.find_matches,
+                    &self.find_query,
+                    &self.replace_query,
+                    self.find_options,
+                    self.replace_preserve_case,
+                ) {
+                    Ok(text) => Arc::new(text),
+                    Err(error) => {
+                        self.find_error = Some(error);
+                        return Task::none();
+                    }
+                }
+            };
+            document.content.perform(text_editor::Action::SelectAll);
+            if let Applied::Changed(protocol) =
+                document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(text)))
+            {
+                protocols.push(protocol);
+            }
+        } else {
+            let (start, end) = self
+                .find_matches
+                .get(self.find_index)
+                .expect("current find occurrence");
+            let replacement = document.content.with_line(start.line, |line, _| {
+                crate::editor_search::replacement(
+                    line,
+                    start.column,
+                    end.column,
+                    &self.find_query,
+                    &self.replace_query,
+                    self.find_options,
+                    self.replace_preserve_case,
+                )
+            });
+            let replacement = match replacement {
+                Some(Ok(replacement)) => replacement,
+                _ => {
+                    self.find_error = Some("The selected match changed; search again.".into());
+                    return Task::none();
+                }
+            };
+            document.content.move_to(text_editor::Cursor {
+                position: end,
+                selection: Some(start),
+            });
+            if let Applied::Changed(protocol) = document.apply(text_editor::Action::Edit(
+                text_editor::Edit::Paste(Arc::new(replacement)),
+            )) {
+                protocols.push(protocol);
+            }
+        }
+        let mut protocols = protocols.into_iter();
+        let Some(first) = protocols.next() else {
+            return Task::none();
+        };
+        self.push_lsp_change(first);
+        if self.pending_lsp_change.is_some() {
+            for protocol in protocols {
+                self.append_lsp_edit(protocol);
+            }
+        }
+        self.markdown_task(card)
+    }
+
+    fn replacement_is_current(&self, active: &FindReplacementJob) -> bool {
+        !active.cancellation.is_cancelled()
+            && self.wanted_find().as_ref() == Some(&active.key)
+            && self.find_cache.as_ref() == Some(&active.key)
+            && self.replace_query == active.replacement
+            && self.replace_preserve_case == active.preserve_case
+            && self.editable_surface_visible()
+            && !self.is_saving()
+    }
+
+    fn prepare_find_replacement(&mut self, card: CardId) -> Task<RepositoryAction> {
+        let Some(key) = self.wanted_find() else {
+            return Task::none();
+        };
+        let DocumentState::Editable(document) = &self.document else {
+            return Task::none();
+        };
+        let snapshot = document.content.search_snapshot();
+        let matches = self.find_matches.clone();
+        let replacement = self.replace_query.clone();
+        let preserve_case = self.replace_preserve_case;
+        let ticket = uuid::Uuid::new_v4();
+        let cancellation = CancellationToken::new();
+        self.find_replacement = Some(FindReplacementJob {
+            key: key.clone(),
+            replacement: replacement.clone(),
+            preserve_case,
+            ticket,
+            cancellation: cancellation.clone(),
+        });
+        #[cfg(test)]
+        let pause = self.find_replacement_pause.take();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some((entered, release)) = pause {
+                    let _ = entered.send(());
+                    release
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .map_err(|_| "Replacement fixture pause expired.".to_string())?;
+                }
+                let result = snapshot.replace_matches_with_cancellation(
+                    &matches,
+                    &key.query,
+                    &replacement,
+                    key.options,
+                    preserve_case,
+                    || cancellation.is_cancelled(),
+                );
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                result.map(|text| Some(PreparedFindReplacement(Arc::new(text))))
+            })
+            .await
+            .map_err(|error| format!("Replacement worker failed: {error}"))
+            .and_then(std::convert::identity);
+            RepositoryAction::FindReplacementLoaded {
+                card,
+                ticket,
+                result,
+            }
+        })
+    }
+
+    fn finish_find_replacement(
+        &mut self,
+        card: CardId,
+        ticket: uuid::Uuid,
+        result: Result<Option<PreparedFindReplacement>, String>,
+    ) -> Task<RepositoryAction> {
+        if self
+            .find_replacement
+            .as_ref()
+            .is_none_or(|active| active.ticket != ticket)
+        {
+            return Task::none();
+        }
+        let active = self.find_replacement.take().unwrap();
+        if !self.replacement_is_current(&active) {
+            return Task::none();
+        }
+        match result {
+            Ok(Some(prepared)) => self.replace_find_matches(card, true, Some(prepared)),
+            Ok(None) => Task::none(),
+            Err(error) => {
+                self.find_error = Some(error);
+                Task::none()
+            }
+        }
     }
 
     /// Renews the cached count after something changed the buffer under an
@@ -3455,7 +3855,12 @@ impl RepositoryRuntime {
         if !self.find_open {
             return;
         }
-        self.select_find_match(self.find_index);
+        self.find_select_on_finish = false;
+        self.prepare_find_matches();
+        self.find_total = self.find_matches.len();
+        if self.find_cache.as_ref() == self.wanted_find().as_ref() {
+            self.find_index = self.find_index.min(self.find_total.saturating_sub(1));
+        }
     }
 
     /// Steps to the next or previous occurrence.
@@ -3500,9 +3905,7 @@ impl RepositoryRuntime {
         }
         origin = self.find_origin.unwrap_or(origin);
         self.find_matches
-            .iter()
-            .take_while(|(start, _)| (start.line, start.column) < origin)
-            .count()
+            .partition_point(|(start, _)| (start.line, start.column) < origin)
     }
 
     /// Applies a completion's edits to the open buffer.
@@ -4003,6 +4406,10 @@ impl RepositoryRuntime {
             return;
         };
         self.pending_lsp_change = Some(version);
+        self.append_lsp_edit(edit);
+    }
+
+    fn append_lsp_edit(&mut self, edit: Option<LspTextEdit>) {
         match edit {
             Some(edit) => self.lsp_edits.push(edit),
             // One indescribable edit poisons the batch: every later range is
@@ -4016,9 +4423,8 @@ impl RepositoryRuntime {
 
     /// Undoes or redoes one step in the open buffer.
     fn step_history(&mut self, card: CardId, redo: bool) -> Task<RepositoryAction> {
-        // The same gates as typing: a history step is an edit, and find
-        // holds the buffer read-only while it is open.
-        if self.search_mode || self.source_surface != SourceSurface::Editor {
+        // A history step edits the mounted source buffer, including while Find is open.
+        if self.source_surface != SourceSurface::Editor {
             return Task::none();
         }
         let DocumentState::Editable(document) = &mut self.document else {
@@ -4764,6 +5170,11 @@ impl RepositoryRuntime {
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
         let card = action.card();
         let task = self.update_inner(action);
+        if let Some(active) = &self.find_replacement
+            && !self.replacement_is_current(active)
+        {
+            active.cancellation.cancel();
+        }
         Task::batch([task, self.find_task(card)])
     }
 
@@ -5251,9 +5662,6 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::EditorAction { card, action } => {
-                if self.search_mode && !matches!(action, text_editor::Action::Scroll { .. }) {
-                    return Task::none();
-                }
                 // No buffer is mounted outside Edit, so an action arriving
                 // from any other surface is a stale message about a surface
                 // that has already been replaced.
@@ -5263,6 +5671,10 @@ impl RepositoryRuntime {
                 if !matches!(action, text_editor::Action::Scroll { .. }) {
                     self.dismiss_editor_results();
                 }
+                let moved = !matches!(
+                    action,
+                    text_editor::Action::Edit(_) | text_editor::Action::Scroll { .. }
+                );
                 let applied = match &mut self.document {
                     DocumentState::Editable(document) => document.apply(action),
                     _ => Applied::Unchanged,
@@ -5276,7 +5688,12 @@ impl RepositoryRuntime {
                         self.push_lsp_change(edit);
                         self.markdown_task(card)
                     }
-                    Applied::Unchanged => Task::none(),
+                    Applied::Unchanged => {
+                        if self.find_open && moved {
+                            self.find_selection_candidate = self.current_selection_scope();
+                        }
+                        Task::none()
+                    }
                 }
             }
             RepositoryAction::Language { card, action } => {
@@ -5882,7 +6299,44 @@ impl RepositoryRuntime {
                 // A new query knows nothing of where the last one had got
                 // to, so it starts at its own first occurrence.
                 self.find_index = 0;
-                self.refresh_find_matches();
+                self.select_find_match(0);
+                Task::none()
+            }
+            RepositoryAction::FindOptionsChanged {
+                option, enabled, ..
+            } => {
+                match option {
+                    crate::ui_controls::FindOption::CaseSensitive => {
+                        self.find_options.case_sensitive = enabled
+                    }
+                    crate::ui_controls::FindOption::Regex => self.find_options.regex = enabled,
+                    crate::ui_controls::FindOption::WholeWord => {
+                        self.find_options.whole_word = enabled
+                    }
+                }
+                self.select_find_match(0);
+                Task::none()
+            }
+            RepositoryAction::FindSelectionChanged { enabled, .. } => {
+                self.find_selection = enabled
+                    .then(|| {
+                        self.find_selection_candidate
+                            .or_else(|| self.current_selection_scope())
+                    })
+                    .flatten();
+                self.find_selection_revision =
+                    self.find_selection.and_then(|_| match &self.document {
+                        DocumentState::Editable(document) => Some(document.revision),
+                        _ => None,
+                    });
+                // Recapturing the same coordinates after a change must also
+                // replace a cached stale-scope refusal for this revision.
+                self.find_cache = None;
+                self.select_find_match(0);
+                Task::none()
+            }
+            RepositoryAction::PreserveCaseChanged { enabled, .. } => {
+                self.replace_preserve_case = enabled;
                 Task::none()
             }
             RepositoryAction::FindNext { .. } => {
@@ -5910,39 +6364,13 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ReplaceMatch { card, all } => {
-                if self.is_saving() {
-                    return Task::none();
-                }
-                let DocumentState::Editable(document) = &mut self.document else {
-                    return Task::none();
-                };
-                if self.find_matches.is_empty() {
-                    return Task::none();
-                }
-                if all {
-                    let snapshot = document.content.search_snapshot();
-                    let Some(text) =
-                        snapshot.replace_matches(&self.find_matches, &self.replace_query)
-                    else {
-                        return Task::none();
-                    };
-                    document.content.perform(text_editor::Action::SelectAll);
-                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
-                        Arc::new(text),
-                    )));
-                } else {
-                    let (start, end) = self.find_matches[self.find_index];
-                    document.content.move_to(text_editor::Cursor {
-                        position: end,
-                        selection: Some(start),
-                    });
-                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
-                        Arc::new(self.replace_query.clone()),
-                    )));
-                }
-                self.push_lsp_change(None);
-                self.markdown_task(card)
+                self.replace_find_matches(card, all, None)
             }
+            RepositoryAction::FindReplacementLoaded {
+                card,
+                ticket,
+                result,
+            } => self.finish_find_replacement(card, ticket, result),
             RepositoryAction::ToggleToolbarOverflow { .. } => {
                 self.toolbar_overflow_open = !self.toolbar_overflow_open;
                 Task::none()
@@ -7986,8 +8414,8 @@ fn find_strip<'a>(
     // not searched for anything and says nothing rather than "No results".
     if !runtime.find_query.is_empty() {
         row.push(
-            crate::design::caption(if let Some(error) = &runtime.find_error {
-                error.clone()
+            crate::design::caption(if runtime.find_error.is_some() {
+                "Invalid expression".into()
             } else if runtime.find_cache.as_ref() != runtime.wanted_find().as_ref() {
                 "Searching…".to_owned()
             } else if matched {
@@ -8026,6 +8454,49 @@ fn find_strip<'a>(
         .align_y(Alignment::Center)
         .width(Length::Fill);
     let mut strips: Vec<Element<'a, RepositoryAction>> = vec![find.into()];
+    let mut options = vec![crate::ui_controls::find_options(
+        runtime.find_options.case_sensitive,
+        runtime.find_options.regex,
+        runtime.find_options.whole_word,
+        true,
+        move |option, enabled| RepositoryAction::FindOptionsChanged {
+            card,
+            option,
+            enabled,
+        },
+    )];
+    let selection_enabled =
+        runtime.find_selection.is_some() || runtime.find_selection_candidate.is_some();
+    let mut selection =
+        crate::ui_controls::field::checkbox(runtime.find_selection.is_some()).label("Selection");
+    if selection_enabled {
+        selection = selection
+            .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled });
+    }
+    options.push(
+        crate::interaction::tooltip(selection, "Search the selection captured when enabled").into(),
+    );
+    strips.push(
+        widget::row::with_children(options)
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into(),
+    );
+    if let Some(error) = &runtime.find_error {
+        strips.push(
+            widget::text::body(format!("Find: {error}"))
+                .size(12)
+                .class(cosmic::theme::Text::Custom(crate::design::destructive_text))
+                .into(),
+        );
+    }
+    if runtime.find_replacement.is_some() {
+        strips.push(
+            widget::text::body("Preparing replacements… You can keep editing to cancel.")
+                .size(12)
+                .into(),
+        );
+    }
     if runtime.replace_open {
         strips.push(
             widget::row::with_children(vec![
@@ -8033,15 +8504,30 @@ fn find_strip<'a>(
                     .on_input(move |query| RepositoryAction::ReplaceQueryChanged { card, query })
                     .width(Length::Fill)
                     .into(),
+                {
+                    let mut preserve =
+                        crate::ui_controls::field::checkbox(runtime.replace_preserve_case)
+                            .label("Preserve case");
+                    if !runtime.find_options.regex {
+                        preserve = preserve.on_toggle(move |enabled| {
+                            RepositoryAction::PreserveCaseChanged { card, enabled }
+                        });
+                    }
+                    crate::interaction::tooltip(
+                        preserve,
+                        "Keep each matched word's upper, lower or title case (plain text)",
+                    )
+                    .into()
+                },
                 crate::ui_controls::button::secondary("Replace")
                     .on_press_maybe(
-                        (matched && !runtime.is_saving())
+                        (matched && !runtime.is_saving() && runtime.find_replacement.is_none())
                             .then_some(RepositoryAction::ReplaceMatch { card, all: false }),
                     )
                     .into(),
                 crate::ui_controls::button::secondary("Replace all")
                     .on_press_maybe(
-                        (matched && !runtime.is_saving())
+                        (matched && !runtime.is_saving() && runtime.find_replacement.is_none())
                             .then_some(RepositoryAction::ReplaceMatch { card, all: true }),
                     )
                     .into(),
@@ -8579,11 +9065,7 @@ fn editable_document_view<'a>(
             )
             .font(runtime.editor_font)
             .find_matches(
-                if runtime.find_open {
-                    &runtime.find_matches
-                } else {
-                    &[]
-                },
+                runtime.find_open.then_some(&runtime.find_matches),
                 runtime.find_index,
             )
             .size(runtime.editor_font_size)
@@ -16161,7 +16643,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_waits_while_find_holds_the_buffer() {
+    fn undo_and_redo_work_while_find_stays_open() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha\n");
         drop(runtime.update(RepositoryAction::EditorAction {
@@ -16170,10 +16652,11 @@ mod tests {
         }));
         drop(runtime.update(RepositoryAction::OpenFind { card }));
         drop(runtime.update(RepositoryAction::Undo { card }));
-        assert_eq!(buffer_text(&runtime), "zalpha\n");
-        drop(runtime.update(RepositoryAction::CloseFind { card }));
-        drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(buffer_text(&runtime), "alpha\n");
+        assert!(runtime.find_is_open());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(buffer_text(&runtime), "zalpha\n");
+        assert!(runtime.find_is_open());
     }
 
     #[test]
@@ -17917,7 +18400,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_find_releases_the_buffer_it_was_holding_read_only() {
+    fn find_stays_editable_and_closing_it_preserves_the_caret() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha\n");
         drop(runtime.update(RepositoryAction::OpenFind { card }));
@@ -17932,8 +18415,8 @@ mod tests {
         };
         assert_eq!(
             document.content.text(),
-            "alpha\n",
-            "find holds the buffer read-only while it is open"
+            "zalpha\n",
+            "find leaves the buffer editable while it is open"
         );
 
         drop(runtime.update(RepositoryAction::CloseFind { card }));
@@ -17947,10 +18430,88 @@ mod tests {
         };
         assert_eq!(
             document.content.text(),
-            "zalpha\n",
-            "a closed find bar that left search mode on would swallow every keystroke that \
-             followed it"
+            "zzalpha\n",
+            "closing find preserves the caret after edits"
         );
+    }
+
+    #[test]
+    #[ignore = "explicit complete 8MiB worker admission/planning/native publication benchmark"]
+    fn benchmark_dense_eight_mib_replace_worker_and_native_publication() {
+        const BYTES: usize = 8 * 1024 * 1024;
+        for irregular in [false, true] {
+            let original = if irregular {
+                format!("{}{}", "aλ".repeat(BYTES / 3), "a".repeat(BYTES % 3))
+            } else {
+                "a".repeat(BYTES)
+            };
+            assert_eq!(original.len(), BYTES);
+            let count = if irregular {
+                2 * (BYTES / 3) + BYTES % 3
+            } else {
+                BYTES
+            };
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "dense.txt", &original);
+            update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
+            if irregular {
+                update_find_settled(
+                    &mut runtime,
+                    RepositoryAction::FindOptionsChanged {
+                        card,
+                        option: crate::ui_controls::FindOption::Regex,
+                        enabled: true,
+                    },
+                );
+            }
+            update_find_settled(
+                &mut runtime,
+                RepositoryAction::FindQueryChanged {
+                    card,
+                    query: if irregular { "." } else { "a" }.into(),
+                },
+            );
+            assert_eq!(runtime.find_total, count);
+            update_find_settled(
+                &mut runtime,
+                RepositoryAction::ReplaceQueryChanged {
+                    card,
+                    query: "b".into(),
+                },
+            );
+            text_editor::take_text_call_count();
+            let started = Instant::now();
+            let planning = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
+            let admission = started.elapsed();
+            assert!(runtime.find_replacement.is_some());
+            assert_eq!(text_editor::take_text_call_count(), 0);
+            let started = Instant::now();
+            let prepared = find_output(planning);
+            let worker_wait = started.elapsed();
+            let started = Instant::now();
+            let refresh = runtime.update(prepared);
+            let publication = started.elapsed();
+            let output = buffer_text(&runtime);
+            assert_eq!(output.len(), count);
+            assert!(output.bytes().all(|byte| byte == b'b'));
+            settle_find_tasks(&mut runtime, refresh);
+            assert_eq!(runtime.find_total, if irregular { count } else { 0 });
+            let started = Instant::now();
+            let refresh = runtime.update(RepositoryAction::Undo { card });
+            let undo_update = started.elapsed();
+            assert_eq!(buffer_text(&runtime), original);
+            settle_find_tasks(&mut runtime, refresh);
+            assert_eq!(runtime.find_total, count);
+            let started = Instant::now();
+            let refresh = runtime.update(RepositoryAction::Redo { card });
+            let redo_update = started.elapsed();
+            assert_eq!(buffer_text(&runtime), output);
+            settle_find_tasks(&mut runtime, refresh);
+            eprintln!(
+                "find8MiB_worker irregular={irregular} input_bytes={BYTES} matches={count} output_bytes={} admission={admission:?} worker_wait={worker_wait:?} native_publication_update={publication:?} undo_update={undo_update:?} redo_update={redo_update:?}; headless native content/update only, no glyph layout/render or application RSS",
+                output.len()
+            );
+        }
     }
 
     #[test]
@@ -17960,33 +18521,345 @@ mod tests {
         let original = "token\r\n".repeat(100_000);
         let replaced = "replacement\r\n".repeat(100_000);
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "large.txt", &original);
-        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
         let scan = runtime.update(RepositoryAction::FindQueryChanged {
             card,
             query: "token".into(),
         });
-        drop(runtime.update(find_output(scan)));
+        update_find_settled(&mut runtime, find_output(scan));
         assert_eq!(runtime.find_total, 100_000);
-        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
-            card,
-            query: "replacement".into(),
-        }));
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: "replacement".into(),
+            },
+        );
         let started = std::time::Instant::now();
-        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceMatch { card, all: true },
+        );
         let replace_elapsed = started.elapsed();
         assert_eq!(buffer_text(&runtime), replaced);
-        drop(runtime.update(RepositoryAction::CloseFind { card }));
+        update_find_settled(&mut runtime, RepositoryAction::CloseFind { card });
         let started = std::time::Instant::now();
-        drop(runtime.update(RepositoryAction::Undo { card }));
+        update_find_settled(&mut runtime, RepositoryAction::Undo { card });
         let undo_elapsed = started.elapsed();
         assert_eq!(buffer_text(&runtime), original);
         let started = std::time::Instant::now();
-        drop(runtime.update(RepositoryAction::Redo { card }));
+        update_find_settled(&mut runtime, RepositoryAction::Redo { card });
         let redo_elapsed = started.elapsed();
         assert_eq!(buffer_text(&runtime), replaced);
         eprintln!(
             "100k matches complete Replace All: {replace_elapsed:?}; undo: {undo_elapsed:?}; redo: {redo_elapsed:?} (unoptimized test profile, excludes layout)"
         );
+    }
+
+    #[test]
+    fn find_edits_refresh_counts_without_moving_the_editing_caret() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha alpha");
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        }));
+        assert_eq!(runtime.find_total, 2);
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            // Native move_to(None) preserves an existing selection. A click
+            // places a fresh caret, so replace the selected Find match here.
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: 0,
+                    column: 11,
+                },
+                selection: None,
+            });
+            assert!(document.content.selection().is_none());
+        }
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        assert_eq!(buffer_text(&runtime), "alpha alphax");
+        // Literal search still matches a prefix until whole-word is enabled.
+        assert_eq!(runtime.find_total, 2);
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 12)));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::WholeWord,
+            enabled: true,
+        }));
+        assert_eq!(runtime.find_total, 1);
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.find_total, 2);
+        assert!(runtime.find_is_open());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.find_total, 1);
+    }
+
+    #[test]
+    fn find_options_scope_and_invalid_patterns_are_applied_to_current_revision() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "alpha ALPHA alpha_beta alpha");
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            document.content.move_to(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: 0,
+                    column: 11,
+                },
+                selection: Some(text_editor::Position { line: 0, column: 0 }),
+            });
+        }
+        update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: "alpha".into(),
+            },
+        );
+        assert_eq!(runtime.find_total, 4);
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindSelectionChanged {
+                card,
+                enabled: true,
+            },
+        );
+        assert_eq!(runtime.find_total, 2);
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::CaseSensitive,
+                enabled: true,
+            },
+        );
+        assert_eq!(runtime.find_total, 1);
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindSelectionChanged {
+                card,
+                enabled: false,
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::WholeWord,
+                enabled: true,
+            },
+        );
+        assert_eq!(runtime.find_total, 2);
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::Regex,
+                enabled: true,
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: "[".into(),
+            },
+        );
+        assert_eq!(runtime.find_total, 0);
+        assert!(runtime.find_error.is_some());
+    }
+
+    #[test]
+    fn find_selection_refuses_moved_scope_after_edits_and_history_until_recaptured() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "foo foo foo");
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            document.content.move_to(text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 7 },
+                selection: Some(text_editor::Position { line: 0, column: 4 }),
+            });
+        }
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: true,
+        }));
+        assert_eq!(runtime.find_total, 1);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::DocumentStart),
+        }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("xxxx".into()))),
+        }));
+        assert_eq!(buffer_text(&runtime), "xxxxfoo foo foo");
+        assert_eq!(runtime.find_total, 0);
+        assert!(
+            runtime
+                .find_error
+                .as_deref()
+                .unwrap()
+                .contains("captured selection changed")
+        );
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "bar".into(),
+        }));
+        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        assert_eq!(
+            buffer_text(&runtime),
+            "xxxxfoo foo foo",
+            "stale scope must never replace a different occurrence"
+        );
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "foo foo foo");
+        assert_eq!(
+            runtime.find_total, 0,
+            "Undo does not silently recapture coordinates"
+        );
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(buffer_text(&runtime), "xxxxfoo foo foo");
+        assert_eq!(runtime.find_total, 0);
+        // Deliberate native selection and toggle recaptures the new middle
+        // occurrence, even though a global query selection moves the caret.
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::DocumentStart),
+        }));
+        for _ in 0..8 {
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Move(text_editor::Motion::Right),
+            }));
+        }
+        for _ in 0..3 {
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Select(text_editor::Motion::Right),
+            }));
+        }
+        drop(runtime.update(RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: false,
+        }));
+        drop(runtime.update(RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: true,
+        }));
+        assert_eq!(runtime.find_total, 1);
+        assert!(runtime.find_error.is_none());
+        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        assert_eq!(buffer_text(&runtime), "xxxxfoo bar foo");
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "xxxxfoo foo foo");
+    }
+
+    #[test]
+    fn sparse_replace_all_near_editable_limit_retains_one_small_undo_transaction() {
+        let card = CardId::new();
+        let middle = format!("{}\n", "x".repeat(127)).repeat(65_535);
+        let original = format!("target\n{middle}target\n");
+        let expected = original.replace("target", "value");
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "large.txt", &original);
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        let scan = runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "target".into(),
+        });
+        drop(runtime.update(find_output(scan)));
+        assert_eq!(runtime.find_total, 2);
+        let previous_version = lsp_version(&runtime);
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "value".into(),
+        }));
+        let scan = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
+        drop(runtime.update(find_output(scan)));
+        assert_eq!(buffer_text(&runtime), expected);
+        assert_eq!(lsp_version(&runtime), previous_version + 1);
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!()
+        };
+        assert!(document.history.can_undo());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), original);
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(buffer_text(&runtime), expected);
+    }
+
+    #[test]
+    fn regex_capture_replace_all_and_preserve_case_are_each_one_undo_step() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "call1 call2");
+        update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::Regex,
+                enabled: true,
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: r"call(\d)".into(),
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: "item$1".into(),
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceMatch { card, all: true },
+        );
+        assert_eq!(buffer_text(&runtime), "item1 item2");
+        update_find_settled(&mut runtime, RepositoryAction::Undo { card });
+        assert_eq!(buffer_text(&runtime), "call1 call2");
+        assert!(runtime.find_is_open());
+
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "word Word WORD wOrd");
+        update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: "word".into(),
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: "value".into(),
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::PreserveCaseChanged {
+                card,
+                enabled: true,
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceMatch { card, all: true },
+        );
+        assert_eq!(buffer_text(&runtime), "value Value VALUE value");
+        update_find_settled(&mut runtime, RepositoryAction::Undo { card });
+        assert_eq!(buffer_text(&runtime), "word Word WORD wOrd");
     }
 
     #[test]
@@ -18020,6 +18893,255 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_preserve_case_keeps_greek_context_and_one_undo() {
+        for replacement in ["ΟΣ", "ΟΣ\u{301}"] {
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "greek.txt", "foo foo");
+            drop(runtime.update(RepositoryAction::OpenFind { card }));
+            drop(runtime.update(RepositoryAction::FindQueryChanged {
+                card,
+                query: "foo".into(),
+            }));
+            drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: replacement.into(),
+            }));
+            drop(runtime.update(RepositoryAction::PreserveCaseChanged {
+                card,
+                enabled: true,
+            }));
+            drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+            let expected = replacement.to_lowercase();
+            assert_eq!(buffer_text(&runtime), format!("{expected} {expected}"));
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(buffer_text(&runtime), "foo foo");
+            drop(runtime.update(RepositoryAction::Redo { card }));
+            assert_eq!(buffer_text(&runtime), format!("{expected} {expected}"));
+        }
+    }
+
+    #[test]
+    fn compact_dense_find_preserves_all_occurrences_wraps_and_one_undo_replace_all() {
+        let card = CardId::new();
+        let text = "a".repeat(16 * 1024);
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "dense.txt", &text);
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "a".into(),
+        }));
+        assert_eq!(runtime.find_total, text.len());
+        assert!(runtime.find_matches.retained_bytes() < 1024);
+        let allocation = runtime.find_matches.allocation_id();
+        drop(runtime.update(RepositoryAction::FindPrevious { card }));
+        assert_eq!(runtime.find_index, text.len() - 1);
+        assert_eq!(
+            runtime
+                .find_matches
+                .get(runtime.find_index)
+                .unwrap()
+                .0
+                .column,
+            text.len() - 1
+        );
+        drop(runtime.update(RepositoryAction::FindNext { card }));
+        assert_eq!(runtime.find_index, 0);
+        assert_eq!(runtime.find_matches.allocation_id(), allocation);
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "b".into(),
+        }));
+        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        assert_eq!(buffer_text(&runtime), "b".repeat(text.len()));
+        assert_eq!(runtime.find_total, 0);
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), text);
+        assert_eq!(runtime.find_total, text.len());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(buffer_text(&runtime), "b".repeat(text.len()));
+    }
+
+    fn large_unicode_replacement_fixture() -> (CardId, RepositoryRuntime, String) {
+        let card = CardId::new();
+        let original = "λa𝄞\r\n".repeat(10_000);
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "unicode.txt", &original);
+        update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::Regex,
+                enabled: true,
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: "λ(a)𝄞".into(),
+            },
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: "$1β".into(),
+            },
+        );
+        assert_eq!(runtime.find_total, 10_000);
+        (card, runtime, original)
+    }
+
+    #[test]
+    fn large_replace_planning_keeps_edits_live_and_rejects_obsolete_output() {
+        let (card, mut runtime, original) = large_unicode_replacement_fixture();
+        use cosmic::iced::futures::{FutureExt, StreamExt};
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        runtime.find_replacement_pause = Some((entered_tx, release_rx));
+        text_editor::take_text_call_count();
+        let held = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
+        assert!(runtime.find_replacement.is_some());
+        assert_eq!(
+            text_editor::take_text_call_count(),
+            0,
+            "admission must capture immutable lines without serializing on UI"
+        );
+        assert_eq!(buffer_text(&runtime), original);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut stream = iced::runtime::task::into_stream(held).unwrap();
+        let admitted = Instant::now();
+        executor.block_on(std::future::poll_fn(|cx| {
+            assert!(stream.next().poll_unpin(cx).is_pending());
+            if entered_rx.try_recv().is_ok() {
+                return std::task::Poll::Ready(());
+            }
+            assert!(admitted.elapsed() < std::time::Duration::from_secs(5));
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }));
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 0 },
+                selection: None,
+            });
+        }
+        let edited = runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('z')),
+        });
+        assert!(
+            runtime
+                .find_replacement
+                .as_ref()
+                .unwrap()
+                .cancellation
+                .is_cancelled()
+        );
+        release_tx.send(()).unwrap();
+        let iced::runtime::Action::Output(callback) = executor.block_on(stream.next()).unwrap()
+        else {
+            panic!("replacement completion");
+        };
+        assert!(matches!(
+            &callback,
+            RepositoryAction::FindReplacementLoaded {
+                result: Ok(None),
+                ..
+            }
+        ));
+        drop(runtime.update(callback));
+        settle_find_tasks(&mut runtime, edited);
+        assert_eq!(buffer_text(&runtime), format!("z{original}"));
+        assert!(runtime.find_replacement.is_none());
+        update_find_settled(&mut runtime, RepositoryAction::Undo { card });
+        assert_eq!(buffer_text(&runtime), original);
+    }
+
+    #[test]
+    fn prepared_replace_result_is_revision_and_intent_fenced_and_one_unicode_undo() {
+        let (card, mut runtime, original) = large_unicode_replacement_fixture();
+        let task = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
+        let obsolete = find_output(task);
+        assert_eq!(
+            buffer_text(&runtime),
+            original,
+            "worker completion alone cannot mutate native state"
+        );
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::ReplaceQueryChanged {
+                card,
+                query: "$1γ".into(),
+            },
+        );
+        drop(runtime.update(obsolete));
+        assert_eq!(
+            buffer_text(&runtime),
+            original,
+            "already-completed output retains its original replacement intent"
+        );
+        let task = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
+        assert_eq!(buffer_text(&runtime), original);
+        settle_find_tasks(&mut runtime, task);
+        let expected = "aγ\r\n".repeat(10_000);
+        assert_eq!(buffer_text(&runtime), expected);
+        assert!(runtime.find_replacement.is_none());
+        update_find_settled(&mut runtime, RepositoryAction::Undo { card });
+        assert_eq!(buffer_text(&runtime), original);
+        update_find_settled(&mut runtime, RepositoryAction::Redo { card });
+        assert_eq!(buffer_text(&runtime), expected);
+    }
+
+    #[test]
+    fn closed_or_replaced_runtime_rejects_prepared_replace_callback() {
+        let (card, mut runtime, original) = large_unicode_replacement_fixture();
+        let task = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
+        let callback = find_output(task);
+        update_find_settled(&mut runtime, RepositoryAction::CloseFind { card });
+        drop(runtime.update(callback.clone()));
+        assert_eq!(buffer_text(&runtime), original);
+        assert!(runtime.find_replacement.is_none());
+        let (mut successor, _) = RepositoryRuntime::open_fixture(card, "unicode.txt", &original);
+        drop(successor.update(callback));
+        assert_eq!(buffer_text(&successor), original);
+    }
+
+    #[test]
+    fn even_small_regex_search_runs_off_update_thread_without_changing_greedy_matches() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "regex.txt", "AAAA");
+        update_find_settled(&mut runtime, RepositoryAction::OpenFind { card });
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindOptionsChanged {
+                card,
+                option: crate::ui_controls::FindOption::Regex,
+                enabled: true,
+            },
+        );
+        let task = runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "A.*|A".into(),
+        });
+        assert_eq!(runtime.find_total, 0);
+        assert!(runtime.find_active.is_some());
+        settle_find_tasks(&mut runtime, task);
+        assert_eq!(runtime.find_total, 1);
+        assert_eq!(runtime.find_matches.get(0).unwrap().1.column, 4);
+        update_find_settled(
+            &mut runtime,
+            RepositoryAction::FindQueryChanged {
+                card,
+                query: ".*[^A-Z]|[A-Z]".into(),
+            },
+        );
+        assert_eq!(runtime.find_total, 4);
+    }
+
+    #[test]
     fn find_navigation_reuses_cached_match_storage_and_open_starts_from_selection() {
         let card = CardId::new();
         let (mut runtime, _) =
@@ -18027,14 +19149,44 @@ mod tests {
         assert_eq!(runtime.select_text_match("alpha", 1), Some(3));
         drop(runtime.update(RepositoryAction::OpenFind { card }));
         assert_eq!(runtime.find_index, 1);
-        let cached = runtime.find_matches.as_ptr();
+        let cached = runtime.find_matches.allocation_id();
         for _ in 0..100 {
             drop(runtime.update(RepositoryAction::FindNext { card }));
-            assert_eq!(runtime.find_matches.as_ptr(), cached);
+            assert_eq!(runtime.find_matches.allocation_id(), cached);
             drop(runtime.update(RepositoryAction::FindPrevious { card }));
-            assert_eq!(runtime.find_matches.as_ptr(), cached);
+            assert_eq!(runtime.find_matches.allocation_id(), cached);
             assert_eq!(runtime.find_index, 1);
         }
+    }
+
+    fn settle_find_tasks(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut pending = vec![task];
+                while let Some(task) = pending.pop() {
+                    let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                        continue;
+                    };
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(action) = action {
+                            assert!(matches!(
+                                &action,
+                                RepositoryAction::FindLoaded { .. }
+                                    | RepositoryAction::FindReplacementLoaded { .. }
+                            ));
+                            pending.push(runtime.update(action));
+                        }
+                    }
+                }
+            });
+    }
+
+    fn update_find_settled(runtime: &mut RepositoryRuntime, action: RepositoryAction) {
+        let task = runtime.update(action);
+        settle_find_tasks(runtime, task);
     }
 
     fn find_output(task: Task<RepositoryAction>) -> RepositoryAction {
@@ -18087,9 +19239,9 @@ mod tests {
         assert_eq!(runtime.find_total, 0);
         drop(runtime.update(find_output(latest)));
         assert_eq!(runtime.find_total, 3000);
-        let cached = runtime.find_matches.as_ptr();
+        let cached = runtime.find_matches.allocation_id();
         drop(runtime.update(RepositoryAction::FindNext { card }));
-        assert_eq!(runtime.find_matches.as_ptr(), cached);
+        assert_eq!(runtime.find_matches.allocation_id(), cached);
         assert!(runtime.find_active.is_none());
 
         let DocumentState::Editable(document) = &mut runtime.document else {
@@ -18184,7 +19336,7 @@ mod tests {
 
         drop(replacement.update(find_output(current)));
         assert_eq!(replacement.find_total, 3000);
-        assert_eq!(replacement.find_matches[0].0.column, 6);
+        assert_eq!(replacement.find_matches.get(0).unwrap().0.column, 6);
         assert!(replacement.find_active.is_none());
     }
 
@@ -18255,7 +19407,20 @@ mod tests {
         let DocumentState::Editable(document) = &runtime.document else {
             unreachable!();
         };
-        assert_eq!(document.content.selection().as_deref(), Some("alpha"));
+        assert_eq!(document.content.cursor().position.column, 17);
+        assert!(
+            document.content.selection().is_none(),
+            "refreshing matches preserves the clamped editing caret instead of selecting another occurrence"
+        );
+        drop(runtime.update(RepositoryAction::FindNext { card }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!();
+        };
+        assert_eq!(
+            document.content.selection().as_deref(),
+            Some("alpha"),
+            "explicit Find navigation still selects the next occurrence"
+        );
     }
 
     #[test]
