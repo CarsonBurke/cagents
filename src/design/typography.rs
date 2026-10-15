@@ -13,6 +13,71 @@ use cosmic::{
 
 use super::{GRID_UNIT, RADIUS_XS, accent_color, muted_text, raised, space};
 
+#[derive(Clone, Copy)]
+struct Typography {
+    interface_font: Font,
+    interface_size: f32,
+    chat_font: Font,
+    chat_size: f32,
+    revision: u64,
+}
+
+thread_local! {
+    static REQUEST: std::cell::RefCell<Option<(String, f32, String, f32)>> = const { std::cell::RefCell::new(None) };
+    static TYPOGRAPHY: std::cell::Cell<Typography> = std::cell::Cell::new(Typography {
+        interface_font: Font::DEFAULT,
+        interface_size: TEXT_BODY,
+        chat_font: Font::DEFAULT,
+        chat_size: TEXT_PROSE,
+        revision: 0,
+    });
+}
+
+/// Apply the active window's typography before building its widget tree. The
+/// configuration lives on the UI thread, so font reads do not lock per label.
+pub fn configure_typography(interface: &str, interface_size: f32, chat: &str, chat_size: f32) {
+    let changed = REQUEST.with(|request| {
+        let mut request = request.borrow_mut();
+        if request.as_ref().is_some_and(|current| current.0 == interface && current.1 == interface_size && current.2 == chat && current.3 == chat_size) {
+            return false;
+        }
+        *request = Some((interface.to_owned(), interface_size, chat.to_owned(), chat_size));
+        true
+    });
+    if !changed { return; }
+    let installed = |family: &str| installed_font_families(false).iter().find(|name| name.eq_ignore_ascii_case(family.trim()));
+    let font_for = |family: &str, fallback: Font| installed(family).map_or(fallback, |name| crate::terminal::monospace_font(name));
+    static DESKTOP: std::sync::LazyLock<cosmic::config::FontConfig> = std::sync::LazyLock::new(cosmic::config::interface_font);
+    let interface_font = font_for(interface, Font::from(DESKTOP.clone()));
+    let chat_font = font_for(chat, interface_font);
+    TYPOGRAPHY.with(|active| {
+        let current = active.get();
+        if (current.interface_font, current.interface_size, current.chat_font, current.chat_size) != (interface_font, interface_size, chat_font, chat_size) {
+            // Update this process's toolkit theme without writing desktop preferences.
+            cosmic::config::COSMIC_TK.write().unwrap_or_else(|error| error.into_inner()).interface_font.family = installed(interface).cloned().unwrap_or_else(|| DESKTOP.family.clone());
+            active.set(Typography { interface_font, interface_size, chat_font, chat_size, revision: current.revision.wrapping_add(1) });
+        }
+    });
+}
+
+/// Installed families are immutable for the running process, as is iced's font database.
+pub fn installed_font_families(monospace: bool) -> &'static Vec<String> {
+    fn discover(monospace: bool) -> Vec<String> {
+        let fonts = cosmic::iced::advanced::graphics::text::font_system().read().unwrap_or_else(|error| error.into_inner());
+        let mut names: Vec<_> = fonts.db().faces().filter(|face| !monospace || face.monospaced).flat_map(|face| face.families.iter().map(|(name, _)| name.clone())).collect();
+        names.sort_unstable(); names.dedup(); names
+    }
+    static ALL: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| discover(false));
+    static MONOSPACE: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| discover(true));
+    if monospace { &MONOSPACE } else { &ALL }
+}
+
+pub fn interface_font() -> Font { TYPOGRAPHY.with(|active| active.get().interface_font) }
+pub fn interface_size() -> f32 { TYPOGRAPHY.with(|active| active.get().interface_size) }
+pub fn chat_font() -> Font { TYPOGRAPHY.with(|active| active.get().chat_font) }
+pub fn chat_size() -> f32 { TYPOGRAPHY.with(|active| active.get().chat_size) }
+pub fn typography_revision() -> u64 { TYPOGRAPHY.with(|active| active.get().revision) }
+
 /// The size of nearly everything in the shell: rows, controls, labels.
 pub const TEXT_BODY: f32 = 13.0;
 /// Prose that is read at length - an agent's answers and the draft being
@@ -47,25 +112,27 @@ type ShellText<'a> = Text<'a, Theme, Renderer>;
 fn weighted(weight: Weight) -> Font {
     Font {
         weight,
-        ..cosmic::font::default()
+        ..interface_font()
     }
 }
 
 pub fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::body(text)
-        .size(TEXT_BODY)
-        .line_height(LineHeight::Absolute(LINE_BODY.into()))
+        .font(interface_font())
+        .size(interface_size())
+        .line_height(LineHeight::Absolute((interface_size() + 5.0).into()))
 }
 
 pub fn caption<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::caption(text)
-        .size(TEXT_CAPTION)
+        .font(interface_font())
+        .size(interface_size() * TEXT_CAPTION / TEXT_BODY)
         .class(cosmic::theme::Text::Custom(muted_text))
 }
 
 /// Body text at medium weight: a pane's heading, a row's name, a button's label.
 pub fn heading<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
-    body(text).size(TEXT_HEADING).font(heading_font())
+    body(text).font(heading_font())
 }
 
 /// The face of [`heading`], for a widget that cannot be built from it.
@@ -76,8 +143,8 @@ pub fn heading_font() -> Font {
 /// The name of a dialog, a form or a section of a page.
 pub fn title<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::body(text)
-        .size(TEXT_TITLE)
-        .line_height(LineHeight::Absolute(LINE_TITLE.into()))
+        .size(interface_size() * TEXT_TITLE / TEXT_BODY)
+        .line_height(LineHeight::Absolute((interface_size() * LINE_TITLE / TEXT_BODY).into()))
         .font(title_font())
 }
 
@@ -92,19 +159,21 @@ pub fn title_font() -> Font {
 /// The name of a whole page or an otherwise empty pane.
 pub fn display<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::body(text)
-        .size(TEXT_DISPLAY)
-        .line_height(LineHeight::Absolute(26.0.into()))
+        .size(interface_size() * TEXT_DISPLAY / TEXT_BODY)
+        .line_height(LineHeight::Absolute((interface_size() * 26.0 / TEXT_BODY).into()))
         .font(weighted(Weight::Bold))
 }
 
 /// Markdown shares the shell's semantic palette and a compact heading scale.
 pub fn markdown_settings(theme: &Theme, size: f32) -> cosmic::widget::markdown::Settings {
     use cosmic::{iced, widget::markdown};
+    let size = size * chat_size() / TEXT_PROSE;
     let mut style = markdown::Style::from(if theme.theme_type.is_dark() {
         iced::Theme::Dark
     } else {
         iced::Theme::Light
     });
+    style.font = chat_font();
     style.link_color = accent_color(theme);
     style.inline_code_color = theme.cosmic().background(false).on.into();
     style.inline_code_highlight.background = raised(theme).into();
@@ -119,5 +188,37 @@ pub fn markdown_settings(theme: &Theme, size: f32) -> cosmic::widget::markdown::
         code_size: size.into(),
         spacing: space::S.into(),
         ..markdown::Settings::with_text_size(size, style)
+    }
+}
+
+#[cfg(test)]
+mod settings_typography_tests {
+    use super::*;
+
+    #[test]
+    fn interface_and_chat_preferences_reach_rendered_text_and_markdown() {
+        use cosmic::iced::{Size, advanced::{layout, widget::Tree}};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        configure_typography("", 13.0, "", 14.0);
+        let height = || {
+            let mut label: cosmic::Element<'_, ()> = body("Workbench label").into();
+            let mut tree = Tree::new(label.as_widget());
+            label.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(600.0, 100.0))).size().height
+        };
+        let before = height();
+        let revision = typography_revision();
+        configure_typography("DejaVu Sans Mono", 18.0, "DejaVu Serif", 21.0);
+        assert!(height() > before);
+        assert_eq!(interface_font().family, cosmic::iced::font::Family::Name("DejaVu Sans Mono"));
+        let markdown = markdown_settings(&Theme::dark(), TEXT_PROSE);
+        assert_eq!(markdown.text_size.0, 21.0);
+        assert_eq!(markdown.style.font.family, cosmic::iced::font::Family::Name("DejaVu Serif"));
+        assert!(typography_revision() > revision, "retained transcripts must refresh");
+        configure_typography("", 13.0, "", 14.0);
+        let desktop = interface_font();
+        configure_typography("Cagents Missing Font Fixture", 13.0, "Cagents Missing Font Fixture", 14.0);
+        assert_eq!(interface_font(), desktop);
+        assert_eq!(chat_font(), desktop);
+        configure_typography("", 13.0, "", 14.0);
     }
 }
