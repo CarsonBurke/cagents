@@ -622,9 +622,19 @@ pub enum RepositoryAction {
         card: CardId,
         query: String,
     },
-    FindOptionsChanged { card: CardId, option: crate::ui_controls::FindOption, enabled: bool },
-    FindSelectionChanged { card: CardId, enabled: bool },
-    PreserveCaseChanged { card: CardId, enabled: bool },
+    FindOptionsChanged {
+        card: CardId,
+        option: crate::ui_controls::FindOption,
+        enabled: bool,
+    },
+    FindSelectionChanged {
+        card: CardId,
+        enabled: bool,
+    },
+    PreserveCaseChanged {
+        card: CardId,
+        enabled: bool,
+    },
     FindNext {
         card: CardId,
     },
@@ -1825,9 +1835,14 @@ fn visible_diff_rows(rows: &RowOffsets, viewport: ListViewport) -> VisibleRows {
 
 type FindScope = ((usize, usize), (usize, usize));
 
-fn scoped_matches(matches: &mut Vec<(text_editor::Position, text_editor::Position)>, scope: Option<FindScope>) {
+fn scoped_matches(
+    matches: &mut Vec<(text_editor::Position, text_editor::Position)>,
+    scope: Option<FindScope>,
+) {
     if let Some((first, last)) = scope {
-        matches.retain(|(start, end)| (start.line, start.column) >= first && (end.line, end.column) <= last);
+        matches.retain(|(start, end)| {
+            (start.line, start.column) >= first && (end.line, end.column) <= last
+        });
     }
 }
 
@@ -3070,7 +3085,11 @@ impl RepositoryRuntime {
         self.search_mode = enabled;
     }
 
-    pub fn set_find_preferences(&mut self, options: crate::editor_search::FindOptions, preserve_case: bool) {
+    pub fn set_find_preferences(
+        &mut self,
+        options: crate::editor_search::FindOptions,
+        preserve_case: bool,
+    ) {
         self.replace_preserve_case = preserve_case;
         if self.find_options != options {
             self.find_options = options;
@@ -3083,7 +3102,9 @@ impl RepositoryRuntime {
     }
 
     fn current_selection_scope(&self) -> Option<FindScope> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
         let cursor = document.content.selected_cursor();
         let anchor = cursor.selection?;
         let first = (anchor.line, anchor.column);
@@ -3215,7 +3236,9 @@ impl RepositoryRuntime {
         if !self.editable_surface_visible() {
             return Task::none();
         }
-        if self.find_open { return iced::widget::operation::focus(find_focus_id(card)); }
+        if self.find_open {
+            return iced::widget::operation::focus(find_focus_id(card));
+        }
         if let Some(selection) = self.selected_text()
             && !selection.trim().is_empty()
             && !selection.contains('\n')
@@ -3334,7 +3357,10 @@ impl RepositoryRuntime {
         if wanted.query.is_empty()
             || (document.content.line_count() <= 2048 && document.content.text_len() <= 64 * 1024)
         {
-            match document.content.find_matches_with(&wanted.query, wanted.options) {
+            match document
+                .content
+                .find_matches_with(&wanted.query, wanted.options)
+            {
                 Ok(mut matches) => {
                     scoped_matches(&mut matches, wanted.selection);
                     self.find_matches = matches;
@@ -3383,8 +3409,14 @@ impl RepositoryRuntime {
         });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                snapshot.find_matches_with(&key.query, key.options, || cancellation.is_cancelled())
-                    .map(|result| result.map(|mut matches| { scoped_matches(&mut matches, key.selection); matches }))
+                snapshot
+                    .find_matches_with(&key.query, key.options, || cancellation.is_cancelled())
+                    .map(|result| {
+                        result.map(|mut matches| {
+                            scoped_matches(&mut matches, key.selection);
+                            matches
+                        })
+                    })
             })
             .await
             .map_err(|error| format!("Find worker failed: {error}"))
@@ -3997,7 +4029,7 @@ impl RepositoryRuntime {
         self.append_lsp_edit(edit);
     }
 
-    fn append_lsp_edit(&mut self,edit:Option<LspTextEdit>){
+    fn append_lsp_edit(&mut self, edit: Option<LspTextEdit>) {
         match edit {
             Some(edit) => self.lsp_edits.push(edit),
             // One indescribable edit poisons the batch: every later range is
@@ -5244,7 +5276,10 @@ impl RepositoryRuntime {
                 if !matches!(action, text_editor::Action::Scroll { .. }) {
                     self.dismiss_editor_results();
                 }
-                let moved = !matches!(action, text_editor::Action::Edit(_) | text_editor::Action::Scroll { .. });
+                let moved = !matches!(
+                    action,
+                    text_editor::Action::Edit(_) | text_editor::Action::Scroll { .. }
+                );
                 let applied = match &mut self.document {
                     DocumentState::Editable(document) => document.apply(action),
                     _ => Applied::Unchanged,
@@ -5259,9 +5294,11 @@ impl RepositoryRuntime {
                         self.markdown_task(card)
                     }
                     Applied::Unchanged => {
-                        if self.find_open && moved { self.find_selection_candidate = self.current_selection_scope(); }
+                        if self.find_open && moved {
+                            self.find_selection_candidate = self.current_selection_scope();
+                        }
                         Task::none()
-                    },
+                    }
                 }
             }
             RepositoryAction::Language { action, .. } => {
@@ -5866,17 +5903,28 @@ impl RepositoryRuntime {
                 self.select_find_match(0);
                 Task::none()
             }
-            RepositoryAction::FindOptionsChanged { option, enabled, .. } => {
+            RepositoryAction::FindOptionsChanged {
+                option, enabled, ..
+            } => {
                 match option {
-                    crate::ui_controls::FindOption::CaseSensitive => self.find_options.case_sensitive = enabled,
+                    crate::ui_controls::FindOption::CaseSensitive => {
+                        self.find_options.case_sensitive = enabled
+                    }
                     crate::ui_controls::FindOption::Regex => self.find_options.regex = enabled,
-                    crate::ui_controls::FindOption::WholeWord => self.find_options.whole_word = enabled,
+                    crate::ui_controls::FindOption::WholeWord => {
+                        self.find_options.whole_word = enabled
+                    }
                 }
                 self.select_find_match(0);
                 Task::none()
             }
             RepositoryAction::FindSelectionChanged { enabled, .. } => {
-                self.find_selection = enabled.then(|| self.find_selection_candidate.or_else(|| self.current_selection_scope())).flatten();
+                self.find_selection = enabled
+                    .then(|| {
+                        self.find_selection_candidate
+                            .or_else(|| self.current_selection_scope())
+                    })
+                    .flatten();
                 self.select_find_match(0);
                 Task::none()
             }
@@ -5918,51 +5966,117 @@ impl RepositoryRuntime {
                 if self.find_matches.is_empty() {
                     return Task::none();
                 }
-                let mut protocols=Vec::new();
-                if all && self.find_matches.len()<=256 && document.content.text_len()>64*1024 {
+                let mut protocols = Vec::new();
+                if all && self.find_matches.len() <= 256 && document.content.text_len() > 64 * 1024
+                {
                     // Keep sparse fixes in a large file undoable without
                     // retaining unchanged megabytes as a whole-file paste.
                     // Dense replacement retains the single-splice path below.
-                    let snapshot=document.content.search_snapshot();
-                    let replacements=match snapshot.replacement_edits(&self.find_matches,&self.find_query,&self.replace_query,self.find_options,self.replace_preserve_case){Ok(edits)=>edits,Err(error)=>{self.find_error=Some(error);return Task::none();}};
-                    let before=document.content.cursor();let mut changes=Vec::with_capacity(replacements.len());
-                    for (start,end,inserted) in replacements.into_iter().rev(){
-                        let trailing_cr=trailing_carriage_return(&document.content).is_some();
-                        if let Some(change)=document.content.replace_range_recorded(start,end,&inserted){
-                            protocols.push(if trailing_cr||trailing_carriage_return(&document.content).is_some(){None}else{protocol_edit(&document.content,&change)});
+                    let snapshot = document.content.search_snapshot();
+                    let replacements = match snapshot.replacement_edits(
+                        &self.find_matches,
+                        &self.find_query,
+                        &self.replace_query,
+                        self.find_options,
+                        self.replace_preserve_case,
+                    ) {
+                        Ok(edits) => edits,
+                        Err(error) => {
+                            self.find_error = Some(error);
+                            return Task::none();
+                        }
+                    };
+                    let before = document.content.cursor();
+                    let mut changes = Vec::with_capacity(replacements.len());
+                    for (start, end, inserted) in replacements.into_iter().rev() {
+                        let trailing_cr = trailing_carriage_return(&document.content).is_some();
+                        if let Some(change) = document
+                            .content
+                            .replace_range_recorded(start, end, &inserted)
+                        {
+                            protocols.push(
+                                if trailing_cr
+                                    || trailing_carriage_return(&document.content).is_some()
+                                {
+                                    None
+                                } else {
+                                    protocol_edit(&document.content, &change)
+                                },
+                            );
                             changes.push(change);
                         }
                     }
-                    if !changes.is_empty(){document.history.record_group(changes,before,document.content.cursor(),Instant::now());document.text_changed();}
+                    if !changes.is_empty() {
+                        document.history.record_group(
+                            changes,
+                            before,
+                            document.content.cursor(),
+                            Instant::now(),
+                        );
+                        document.text_changed();
+                    }
                 } else if all {
                     let snapshot = document.content.search_snapshot();
-                    let text = match snapshot.replace_matches_with(&self.find_matches, &self.find_query,
-                        &self.replace_query, self.find_options, self.replace_preserve_case) {
+                    let text = match snapshot.replace_matches_with(
+                        &self.find_matches,
+                        &self.find_query,
+                        &self.replace_query,
+                        self.find_options,
+                        self.replace_preserve_case,
+                    ) {
                         Ok(text) => text,
-                        Err(error) => { self.find_error = Some(error); return Task::none(); }
+                        Err(error) => {
+                            self.find_error = Some(error);
+                            return Task::none();
+                        }
                     };
                     document.content.perform(text_editor::Action::SelectAll);
-                    if let Applied::Changed(protocol)=document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text)))){protocols.push(protocol);}
+                    if let Applied::Changed(protocol) = document.apply(text_editor::Action::Edit(
+                        text_editor::Edit::Paste(Arc::new(text)),
+                    )) {
+                        protocols.push(protocol);
+                    }
                 } else {
                     let (start, end) = self.find_matches[self.find_index];
                     let replacement = document.content.with_line(start.line, |line, _| {
-                        crate::editor_search::replacement(line, start.column, end.column, &self.find_query,
-                            &self.replace_query, self.find_options, self.replace_preserve_case)
+                        crate::editor_search::replacement(
+                            line,
+                            start.column,
+                            end.column,
+                            &self.find_query,
+                            &self.replace_query,
+                            self.find_options,
+                            self.replace_preserve_case,
+                        )
                     });
                     let replacement = match replacement {
                         Some(Ok(replacement)) => replacement,
-                        _ => { self.find_error = Some("The selected match changed; search again.".into()); return Task::none(); }
+                        _ => {
+                            self.find_error =
+                                Some("The selected match changed; search again.".into());
+                            return Task::none();
+                        }
                     };
                     document.content.move_to(text_editor::Cursor {
                         position: end,
                         selection: Some(start),
                     });
-                    if let Applied::Changed(protocol)=document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(replacement)))){protocols.push(protocol);}
+                    if let Applied::Changed(protocol) = document.apply(text_editor::Action::Edit(
+                        text_editor::Edit::Paste(Arc::new(replacement)),
+                    )) {
+                        protocols.push(protocol);
+                    }
                 }
-                let mut protocols=protocols.into_iter();
-                let Some(first)=protocols.next() else{return Task::none();};
+                let mut protocols = protocols.into_iter();
+                let Some(first) = protocols.next() else {
+                    return Task::none();
+                };
                 self.push_lsp_change(first);
-                if self.pending_lsp_change.is_some(){for protocol in protocols {self.append_lsp_edit(protocol);}}
+                if self.pending_lsp_change.is_some() {
+                    for protocol in protocols {
+                        self.append_lsp_edit(protocol);
+                    }
+                }
                 self.markdown_task(card)
             }
             RepositoryAction::ToggleToolbarOverflow { .. } => {
@@ -8048,17 +8162,41 @@ fn find_strip<'a>(
         .align_y(Alignment::Center)
         .width(Length::Fill);
     let mut strips: Vec<Element<'a, RepositoryAction>> = vec![find.into()];
-    let mut options = vec![crate::ui_controls::find_options(runtime.find_options.case_sensitive, runtime.find_options.regex,
-        runtime.find_options.whole_word, true,
-        move |option, enabled| RepositoryAction::FindOptionsChanged { card, option, enabled })];
-    let selection_enabled = runtime.find_selection.is_some() || runtime.find_selection_candidate.is_some();
-    let mut selection = crate::ui_controls::field::checkbox(runtime.find_selection.is_some()).label("Selection");
-    if selection_enabled { selection = selection.on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled }); }
-    options.push(crate::interaction::tooltip(selection, "Search the selection captured when enabled").into());
-    strips.push(widget::row::with_children(options).spacing(space::S).align_y(Alignment::Center).into());
+    let mut options = vec![crate::ui_controls::find_options(
+        runtime.find_options.case_sensitive,
+        runtime.find_options.regex,
+        runtime.find_options.whole_word,
+        true,
+        move |option, enabled| RepositoryAction::FindOptionsChanged {
+            card,
+            option,
+            enabled,
+        },
+    )];
+    let selection_enabled =
+        runtime.find_selection.is_some() || runtime.find_selection_candidate.is_some();
+    let mut selection =
+        crate::ui_controls::field::checkbox(runtime.find_selection.is_some()).label("Selection");
+    if selection_enabled {
+        selection = selection
+            .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled });
+    }
+    options.push(
+        crate::interaction::tooltip(selection, "Search the selection captured when enabled").into(),
+    );
+    strips.push(
+        widget::row::with_children(options)
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into(),
+    );
     if let Some(error) = &runtime.find_error {
-        strips.push(widget::text::body(format!("Invalid expression: {error}")).size(12)
-            .class(cosmic::theme::Text::Custom(crate::design::destructive_text)).into());
+        strips.push(
+            widget::text::body(format!("Invalid expression: {error}"))
+                .size(12)
+                .class(cosmic::theme::Text::Custom(crate::design::destructive_text))
+                .into(),
+        );
     }
     if runtime.replace_open {
         strips.push(
@@ -8068,9 +8206,19 @@ fn find_strip<'a>(
                     .width(Length::Fill)
                     .into(),
                 {
-                    let mut preserve = crate::ui_controls::field::checkbox(runtime.replace_preserve_case).label("Preserve case");
-                    if !runtime.find_options.regex { preserve = preserve.on_toggle(move |enabled| RepositoryAction::PreserveCaseChanged { card, enabled }); }
-                    crate::interaction::tooltip(preserve, "Keep each matched word's upper, lower or title case (plain text)").into()
+                    let mut preserve =
+                        crate::ui_controls::field::checkbox(runtime.replace_preserve_case)
+                            .label("Preserve case");
+                    if !runtime.find_options.regex {
+                        preserve = preserve.on_toggle(move |enabled| {
+                            RepositoryAction::PreserveCaseChanged { card, enabled }
+                        });
+                    }
+                    crate::interaction::tooltip(
+                        preserve,
+                        "Keep each matched word's upper, lower or title case (plain text)",
+                    )
+                    .into()
                 },
                 crate::ui_controls::button::secondary("Replace")
                     .on_press_maybe(
@@ -17983,17 +18131,33 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha alpha");
         drop(runtime.update(RepositoryAction::OpenFind { card }));
-        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "alpha".into() }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        }));
         assert_eq!(runtime.find_total, 2);
         if let DocumentState::Editable(document) = &mut runtime.document {
-            document.content.move_to(text_editor::Cursor { position: text_editor::Position { line: 0, column: 11 }, selection: None });
+            document.content.move_to(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: 0,
+                    column: 11,
+                },
+                selection: None,
+            });
         }
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
         assert_eq!(buffer_text(&runtime), "alpha alphax");
         // Literal search still matches a prefix until whole-word is enabled.
         assert_eq!(runtime.find_total, 2);
         assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 12)));
-        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::WholeWord, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::WholeWord,
+            enabled: true,
+        }));
         assert_eq!(runtime.find_total, 1);
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(runtime.find_total, 2);
@@ -18005,41 +18169,88 @@ mod tests {
     #[test]
     fn find_options_scope_and_invalid_patterns_are_applied_to_current_revision() {
         let card = CardId::new();
-        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha ALPHA alpha_beta alpha");
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "alpha ALPHA alpha_beta alpha");
         if let DocumentState::Editable(document) = &mut runtime.document {
-            document.content.move_to(text_editor::Cursor { position: text_editor::Position { line: 0, column: 11 }, selection: Some(text_editor::Position { line: 0, column: 0 }) });
+            document.content.move_to(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: 0,
+                    column: 11,
+                },
+                selection: Some(text_editor::Position { line: 0, column: 0 }),
+            });
         }
         drop(runtime.update(RepositoryAction::OpenFind { card }));
-        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "alpha".into() }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        }));
         assert_eq!(runtime.find_total, 4);
-        drop(runtime.update(RepositoryAction::FindSelectionChanged { card, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: true,
+        }));
         assert_eq!(runtime.find_total, 2);
-        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::CaseSensitive, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::CaseSensitive,
+            enabled: true,
+        }));
         assert_eq!(runtime.find_total, 1);
-        drop(runtime.update(RepositoryAction::FindSelectionChanged { card, enabled: false }));
-        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::WholeWord, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: false,
+        }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::WholeWord,
+            enabled: true,
+        }));
         assert_eq!(runtime.find_total, 2);
-        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::Regex, enabled: true }));
-        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "[".into() }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::Regex,
+            enabled: true,
+        }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "[".into(),
+        }));
         assert_eq!(runtime.find_total, 0);
         assert!(runtime.find_error.is_some());
     }
 
     #[test]
-    fn sparse_replace_all_near_editable_limit_retains_one_small_undo_transaction(){
-        let card=CardId::new();
-        let middle=format!("{}\n","x".repeat(127)).repeat(65_535);
-        let original=format!("target\n{middle}target\n");let expected=original.replace("target","value");
-        let (mut runtime,_)=RepositoryRuntime::open_fixture(card,"large.txt",&original);
-        drop(runtime.update(RepositoryAction::OpenFind{card}));
-        let scan=runtime.update(RepositoryAction::FindQueryChanged{card,query:"target".into()});drop(runtime.update(find_output(scan)));
-        assert_eq!(runtime.find_total,2);let previous_version=lsp_version(&runtime);
-        drop(runtime.update(RepositoryAction::ReplaceQueryChanged{card,query:"value".into()}));
-        let scan=runtime.update(RepositoryAction::ReplaceMatch{card,all:true});drop(runtime.update(find_output(scan)));
-        assert_eq!(buffer_text(&runtime),expected);assert_eq!(lsp_version(&runtime),previous_version+1);
-        let DocumentState::Editable(document)=&runtime.document else{unreachable!()};assert!(document.history.can_undo());
-        drop(runtime.update(RepositoryAction::Undo{card}));assert_eq!(buffer_text(&runtime),original);
-        drop(runtime.update(RepositoryAction::Redo{card}));assert_eq!(buffer_text(&runtime),expected);
+    fn sparse_replace_all_near_editable_limit_retains_one_small_undo_transaction() {
+        let card = CardId::new();
+        let middle = format!("{}\n", "x".repeat(127)).repeat(65_535);
+        let original = format!("target\n{middle}target\n");
+        let expected = original.replace("target", "value");
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "large.txt", &original);
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        let scan = runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "target".into(),
+        });
+        drop(runtime.update(find_output(scan)));
+        assert_eq!(runtime.find_total, 2);
+        let previous_version = lsp_version(&runtime);
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "value".into(),
+        }));
+        let scan = runtime.update(RepositoryAction::ReplaceMatch { card, all: true });
+        drop(runtime.update(find_output(scan)));
+        assert_eq!(buffer_text(&runtime), expected);
+        assert_eq!(lsp_version(&runtime), previous_version + 1);
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!()
+        };
+        assert!(document.history.can_undo());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), original);
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(buffer_text(&runtime), expected);
     }
 
     #[test]
@@ -18047,20 +18258,40 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "call1 call2");
         drop(runtime.update(RepositoryAction::OpenFind { card }));
-        drop(runtime.update(RepositoryAction::FindOptionsChanged { card, option: crate::ui_controls::FindOption::Regex, enabled: true }));
-        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: r"call(\d)".into() }));
-        drop(runtime.update(RepositoryAction::ReplaceQueryChanged { card, query: "item$1".into() }));
+        drop(runtime.update(RepositoryAction::FindOptionsChanged {
+            card,
+            option: crate::ui_controls::FindOption::Regex,
+            enabled: true,
+        }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: r"call(\d)".into(),
+        }));
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "item$1".into(),
+        }));
         drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
         assert_eq!(buffer_text(&runtime), "item1 item2");
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(buffer_text(&runtime), "call1 call2");
         assert!(runtime.find_is_open());
 
-        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "word Word WORD wOrd");
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "word Word WORD wOrd");
         drop(runtime.update(RepositoryAction::OpenFind { card }));
-        drop(runtime.update(RepositoryAction::FindQueryChanged { card, query: "word".into() }));
-        drop(runtime.update(RepositoryAction::ReplaceQueryChanged { card, query: "value".into() }));
-        drop(runtime.update(RepositoryAction::PreserveCaseChanged { card, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "word".into(),
+        }));
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "value".into(),
+        }));
+        drop(runtime.update(RepositoryAction::PreserveCaseChanged {
+            card,
+            enabled: true,
+        }));
         drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
         assert_eq!(buffer_text(&runtime), "value Value VALUE value");
         drop(runtime.update(RepositoryAction::Undo { card }));

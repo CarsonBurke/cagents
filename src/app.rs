@@ -6045,7 +6045,10 @@ impl Cagents {
             self.settings.editor_font_size(),
         );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-        runtime.set_find_preferences(self.settings.editor_find_options, self.settings.editor_replace_preserve_case);
+        runtime.set_find_preferences(
+            self.settings.editor_find_options,
+            self.settings.editor_replace_preserve_case,
+        );
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         PullRequestPane {
@@ -6770,7 +6773,10 @@ impl Cagents {
             self.settings.editor_font_size(),
         );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-        runtime.set_find_preferences(self.settings.editor_find_options, self.settings.editor_replace_preserve_case);
+        runtime.set_find_preferences(
+            self.settings.editor_find_options,
+            self.settings.editor_replace_preserve_case,
+        );
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
@@ -11274,8 +11280,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -12528,12 +12537,19 @@ impl Cagents {
             }
         }
         if previous.editor_find_options != self.settings.editor_find_options
-            || previous.editor_replace_preserve_case != self.settings.editor_replace_preserve_case {
+            || previous.editor_replace_preserve_case != self.settings.editor_replace_preserve_case
+        {
             for runtime in self.cards.values_mut() {
                 match runtime {
-                    CardRuntime::Repository(runtime) => runtime.set_find_preferences(self.settings.editor_find_options, self.settings.editor_replace_preserve_case),
-                    CardRuntime::PullRequests(pane) => pane.runtime.set_find_preferences(self.settings.editor_find_options, self.settings.editor_replace_preserve_case),
-                    _ => {},
+                    CardRuntime::Repository(runtime) => runtime.set_find_preferences(
+                        self.settings.editor_find_options,
+                        self.settings.editor_replace_preserve_case,
+                    ),
+                    CardRuntime::PullRequests(pane) => pane.runtime.set_find_preferences(
+                        self.settings.editor_find_options,
+                        self.settings.editor_replace_preserve_case,
+                    ),
+                    _ => {}
                 }
             }
         }
@@ -13960,8 +13976,11 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
-                let find_preferences_changed = matches!(&action,
-                    RepositoryAction::FindOptionsChanged { .. } | RepositoryAction::PreserveCaseChanged { .. });
+                let find_preferences_changed = matches!(
+                    &action,
+                    RepositoryAction::FindOptionsChanged { .. }
+                        | RepositoryAction::PreserveCaseChanged { .. }
+                );
                 let completion_character = match &action {
                     RepositoryAction::EditorAction {
                         action:
@@ -14013,7 +14032,9 @@ impl Application for Cagents {
                 if find_preferences_changed {
                     let preferences = match self.cards.get(&card) {
                         Some(CardRuntime::Repository(runtime)) => Some(runtime.find_preferences()),
-                        Some(CardRuntime::PullRequests(pane)) => Some(pane.runtime.find_preferences()),
+                        Some(CardRuntime::PullRequests(pane)) => {
+                            Some(pane.runtime.find_preferences())
+                        }
                         _ => None,
                     };
                     if let Some((options, preserve)) = preferences {
@@ -14021,9 +14042,13 @@ impl Application for Cagents {
                         self.settings.editor_replace_preserve_case = preserve;
                         for runtime in self.cards.values_mut() {
                             match runtime {
-                                CardRuntime::Repository(runtime) => runtime.set_find_preferences(options, preserve),
-                                CardRuntime::PullRequests(pane) => pane.runtime.set_find_preferences(options, preserve),
-                                _ => {},
+                                CardRuntime::Repository(runtime) => {
+                                    runtime.set_find_preferences(options, preserve)
+                                }
+                                CardRuntime::PullRequests(pane) => {
+                                    pane.runtime.set_find_preferences(options, preserve)
+                                }
+                                _ => {}
                             }
                         }
                         tasks.push(self.save_settings_task(false));
@@ -15964,13 +15989,20 @@ impl Application for Cagents {
                     }
                 }
                 if let keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::F3), modifiers, ..
+                    key: keyboard::Key::Named(keyboard::key::Named::F3),
+                    modifiers,
+                    ..
                 } = &event
-                    && !modifiers.control() && !modifiers.alt() && !modifiers.logo()
-                    && let Some(card) = self.focused_repository_card_with_find() {
+                    && !modifiers.control()
+                    && !modifiers.alt()
+                    && !modifiers.logo()
+                    && let Some(card) = self.focused_repository_card_with_find()
+                {
                     return cosmic::task::message(Message::Repository(if modifiers.shift() {
                         RepositoryAction::FindPrevious { card }
-                    } else { RepositoryAction::FindNext { card } }));
+                    } else {
+                        RepositoryAction::FindNext { card }
+                    }));
                 }
                 if let keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Enter),

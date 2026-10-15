@@ -2824,9 +2824,16 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 mod tests {
     #[test]
     fn editor_find_options_round_trip_with_disabled_language_servers() {
-        let settings = AppSettings { language_servers: Vec::new(),
-            editor_find_options: EditorFindOptions { case_sensitive: true, regex: true, whole_word: true },
-            editor_replace_preserve_case: true, ..AppSettings::default() };
+        let settings = AppSettings {
+            language_servers: Vec::new(),
+            editor_find_options: EditorFindOptions {
+                case_sensitive: true,
+                regex: true,
+                whole_word: true,
+            },
+            editor_replace_preserve_case: true,
+            ..AppSettings::default()
+        };
         let serialized = toml::to_string(&settings).unwrap();
         let restored: AppSettings = toml::from_str(&serialized).unwrap();
         assert!(restored.language_servers.is_empty());
