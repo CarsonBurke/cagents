@@ -7306,6 +7306,52 @@ impl Cagents {
         }
     }
 
+    fn focus_attention_card(&mut self, id: CardId) -> Task<Message> {
+        if self.exit.is_some() || self.workspace_inputs_blocked()
+            || self.focused_repository_is_saving()
+            || self.update_prepared
+        {
+            return Task::none();
+        }
+        let Some(card) = self
+            .card_state(id)
+            .filter(|card| card.existence.is_open())
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&id))
+            .map(|channel| channel.id);
+        let scope = if let Some(channel) = channel {
+            self.select_channel(channel)
+        } else {
+            let directory = self.unchanneled_card_worktree(&card).map(Path::to_path_buf);
+            directory.map_or_else(Task::none, |directory| {
+                self.select_worktree(directory, false)
+            })
+        };
+        let focus = self.focus_workspace_card(id);
+        // Attention belongs to the native parent. Reveal its transcript before
+        // acknowledging it, but only after navigation has actually succeeded.
+        let (transcript, read) = if self.workspace.focused() == Some(id) {
+            let parent = match self.cards.get(&id) {
+                Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
+                _ => None,
+            };
+            let transcript = parent.map_or_else(Task::none, |target| {
+                self.handle_chat_ui(chat_ui::Action::SelectSubagent(target, None))
+            });
+            (transcript, self.mark_cards_read(vec![id]))
+        } else {
+            (Task::none(), Task::none())
+        };
+        Task::batch([scope, focus, transcript, read])
+    }
+
     fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
         let tasks: Vec<_> = cards.into_iter().map(|card| {
             self.sidebar_state.acknowledge_agent_update(card);
@@ -13153,6 +13199,11 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let attention_scope_changed = matches!(&message,
+            Message::RepositoryLoaded { result: Ok(_), .. }
+            | Message::DeviceProjectLoaded { result: Ok(_), .. }
+            | Message::AttachedWorktreePrsResolved { .. }
+            | Message::GitUi(_));
         // Preserve the existing dispatch layout while every return converges
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
@@ -16521,9 +16572,11 @@ impl Application for Cagents {
             terminal_probes,
         ])
             })();
+        if attention_scope_changed { self.notification_ui.scope_changed(); }
+        let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
-        Task::batch([task, visibility])
+        Task::batch([task, activation, visibility])
     }
 
     fn subscription(&self) -> Subscription<Message> {
