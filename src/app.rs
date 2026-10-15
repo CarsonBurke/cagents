@@ -273,6 +273,9 @@ impl NoticeSeverity {
 struct TransientNotice {
     severity: NoticeSeverity,
     message: String,
+    key: Option<String>,
+    details: Option<String>,
+    targets: Vec<CardId>,
 }
 
 /// Notices retained for review. Bounded because nothing else bounds them: the
@@ -287,6 +290,8 @@ struct LoggedNotice {
     /// Repeats of an identical message collapse onto one entry rather than
     /// flooding the log; a failing poll would otherwise evict everything else.
     repeats: u32,
+    expires_at: Option<Instant>,
+    details_open: bool,
 }
 
 /// The shell's notice history: a bounded ring plus the identity counter that
@@ -298,7 +303,36 @@ struct NoticeLog {
 }
 
 impl NoticeLog {
+    fn resolve(&mut self, key: &str) {
+        self.entries
+            .retain(|entry| entry.notice.key.as_deref() != Some(key));
+    }
+
+    fn resolve_target(&mut self, key: &str, card: CardId) {
+        self.entries.retain_mut(|entry| {
+            if entry.notice.key.as_deref() != Some(key) {
+                return true;
+            }
+            entry.notice.targets.retain(|target| *target != card);
+            !entry.notice.targets.is_empty()
+        });
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.entries
+            .retain(|entry| entry.expires_at.is_none_or(|expiry| expiry > now));
+    }
+
     fn record(&mut self, notice: TransientNotice) {
+        self.record_at(notice, Instant::now());
+    }
+
+    fn record_at(&mut self, notice: TransientNotice, now: Instant) {
+        let expires_at =
+            (notice.severity == NoticeSeverity::Success).then(|| now + Duration::from_secs(6));
+        if let Some(key) = notice.key.as_deref() {
+            self.resolve(key);
+        }
         // Scanning the whole log rather than only its tail is what makes
         // deduplication survive interleaving: a poll that raises two failures
         // in turn would otherwise alternate them forever and fill the log with
@@ -307,6 +341,7 @@ impl NoticeLog {
         if let Some(index) = self.entries.iter().position(|entry| entry.notice == notice) {
             let mut entry = self.entries.remove(index).expect("index came from the log");
             entry.repeats = entry.repeats.saturating_add(1);
+            entry.expires_at = expires_at;
             self.entries.push_back(entry);
             return;
         }
@@ -315,9 +350,20 @@ impl NoticeLog {
             id: self.next_id,
             notice,
             repeats: 1,
+            expires_at,
+            details_open: false,
         });
         while self.entries.len() > NOTICE_LOG_CAPACITY {
-            self.entries.pop_front();
+            // Short-lived success traffic must not hide an unresolved failure.
+            // Within one severity, evict the oldest entry to keep the log bounded.
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.notice.severity)
+                .map(|(index, _)| index)
+                .expect("an overflowing notice log is nonempty");
+            self.entries.remove(oldest);
         }
     }
 
@@ -331,9 +377,8 @@ impl NoticeLog {
 
     /// Newest first: the log reads downward from the most recent event.
     ///
-    /// Nothing retires on a timer. A notice the user never saw is worse than
-    /// one that waits: the header carries the severity until it is dismissed,
-    /// and capacity is what bounds the log.
+    /// Successes retire after a short acknowledgement; failures remain until
+    /// the owning operation resolves them or the user dismisses them.
     fn recent(&self) -> impl Iterator<Item = &LoggedNotice> {
         self.entries.iter().rev()
     }
@@ -457,7 +502,25 @@ impl TransientNotice {
         Self {
             severity,
             message: message.into(),
+            key: None,
+            details: None,
+            targets: Vec::new(),
         }
+    }
+
+    fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    fn details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
+    }
+
+    fn targets(mut self, targets: impl IntoIterator<Item = CardId>) -> Self {
+        self.targets = targets.into_iter().collect();
+        self
     }
 
     fn success(message: impl Into<String>) -> Self {
@@ -2622,7 +2685,9 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::PullRequestUi(
                 pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
             )
-            | Message::ChromeUi(chrome_ui::Action::Launch(_))
+            | Message::ChromeUi(
+                chrome_ui::Action::Launch(_) | chrome_ui::Action::FocusNoticeCard(_)
+            )
             | Message::FocusCard(_)
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
@@ -4348,6 +4413,8 @@ pub enum Message {
     DismissStatus,
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
+    ToggleNoticeDetails(u64),
+    ExpireNotices(Instant),
     DismissAllNotices,
 }
 
@@ -11272,8 +11339,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -16241,6 +16311,9 @@ impl Application for Cagents {
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DaemonHealth(health) => {
+                if !health.unavailable() {
+                    self.notices.resolve("daemon-connectivity");
+                }
                 self.daemon_health_ui.health = health;
                 if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
                 {
@@ -16262,6 +16335,16 @@ impl Application for Cagents {
                 // after the Dismiss all control that held focus is gone.
                 let reconciled = self.reconcile_notice_popup();
                 Task::batch([reconciled, self.refocus_notices()])
+            }
+            Message::ExpireNotices(now) => {
+                self.notices.expire(now);
+                self.reconcile_notice_popup()
+            }
+            Message::ToggleNoticeDetails(id) => {
+                if let Some(entry) = self.notices.entries.iter_mut().find(|entry| entry.id == id) {
+                    entry.details_open = !entry.details_open;
+                }
+                Task::none()
             }
             Message::DismissNotice(id) => {
                 self.notices.dismiss(id);
@@ -16499,6 +16582,16 @@ impl Application for Cagents {
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
+            if self
+                .notices
+                .entries
+                .iter()
+                .any(|entry| entry.expires_at.is_some())
+            {
+                iced::time::every(Duration::from_secs(1)).map(Message::ExpireNotices)
+            } else {
+                Subscription::none()
+            },
             self.chat_subscription(),
             self.notification_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
@@ -19867,6 +19960,93 @@ mod tests {
     /// and capacity is the only thing bounding it: the shell raises notices
     /// from a per-poll path, so a repeating failure must not evict the history.
     #[test]
+    fn keyed_notices_replace_and_resolve_failures() {
+        let mut log = NoticeLog::default();
+        log.record(TransientNotice::error("Could not reopen").key("chat:1"));
+        log.record(TransientNotice::error("Try again").key("chat:1"));
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.recent().next().unwrap().notice.message, "Try again");
+        log.record(TransientNotice::success("Reopened").key("chat:1"));
+        assert_eq!(log.severity(), Some(NoticeSeverity::Success));
+        log.resolve("chat:1");
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn unkeyed_notices_keep_distinct_object_details() {
+        let mut log = NoticeLog::default();
+        log.record(
+            TransientNotice::warning("Interrupted")
+                .details("first")
+                .targets([CardId::new()]),
+        );
+        log.record(
+            TransientNotice::warning("Interrupted")
+                .details("second")
+                .targets([CardId::new()]),
+        );
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn keyed_notice_targets_resolve_individually() {
+        let first = CardId::new();
+        let second = CardId::new();
+        let mut log = NoticeLog::default();
+        log.record(
+            TransientNotice::warning("Some turns were interrupted")
+                .key("daemon-interrupted-turns")
+                .targets([first, second]),
+        );
+        log.resolve_target("daemon-interrupted-turns", first);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.recent().next().unwrap().notice.targets, [second]);
+        log.resolve_target("daemon-interrupted-turns", second);
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn successes_expire_and_errors_remain() {
+        let mut log = NoticeLog::default();
+        let now = Instant::now();
+        log.record_at(TransientNotice::success("Account added"), now);
+        log.record_at(TransientNotice::error("Could not reopen"), now);
+        log.expire(now + Duration::from_secs(7));
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+    }
+
+    #[test]
+    fn success_notice_flood_preserves_unresolved_errors_and_warnings() {
+        let mut log = NoticeLog::default();
+        let now = Instant::now();
+        log.record_at(
+            TransientNotice::error("Still disconnected").key("error"),
+            now,
+        );
+        log.record_at(
+            TransientNotice::warning("Turn interrupted").key("warning"),
+            now,
+        );
+        for index in 0..NOTICE_LOG_CAPACITY * 2 {
+            log.record_at(
+                TransientNotice::success(format!("Information {index}")),
+                now,
+            );
+            assert!(log.len() <= NOTICE_LOG_CAPACITY);
+        }
+        log.expire(now + Duration::from_secs(7));
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+        for key in ["error", "warning"] {
+            assert!(
+                log.recent()
+                    .any(|entry| entry.notice.key.as_deref() == Some(key))
+            );
+        }
+    }
+
+    #[test]
     fn the_notice_log_collapses_repeats_and_bounds_itself() {
         let mut log = NoticeLog::default();
         for message in ["first failure", "second failure"] {
@@ -19897,12 +20077,25 @@ mod tests {
         log.dismiss(newest);
         assert_eq!(log.len(), 1);
 
-        // Distinct messages past capacity drop the oldest, never grow.
+        // Lower-severity traffic stays bounded without hiding an unresolved error.
         for index in 0..NOTICE_LOG_CAPACITY * 2 {
             log.record(TransientNotice::warning(format!("failure {index}")));
         }
         assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
-        // The surviving error was evicted, so the header must stop claiming one.
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+        let error = log
+            .recent()
+            .find(|entry| entry.notice.message == "first failure")
+            .expect("warning traffic must preserve the unresolved error")
+            .id;
+        assert!(
+            !log.recent()
+                .any(|entry| entry.notice.message == "failure 0")
+        );
+        assert!(log.recent().any(
+            |entry| entry.notice.message == format!("failure {}", NOTICE_LOG_CAPACITY * 2 - 1)
+        ));
+        log.dismiss(error);
         assert_eq!(log.severity(), Some(NoticeSeverity::Warning));
 
         log.clear();
