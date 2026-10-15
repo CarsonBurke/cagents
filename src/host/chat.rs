@@ -2080,16 +2080,7 @@ fn recover_account(
             ));
         }
     }
-    // Check all other writers before touching either history or stopping the
-    // source. The final start guard is too late to protect a live target's files.
-    {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        ensure_account_handoff_unowned(&state, &source, &replacement)?;
-    }
-    let mut reservation = None;
-    let mut current_options = None;
-    if let Some(generation) = idle_generation {
-        if !explicit
+    if automatic && !explicit
             && source
                 .launch
                 .recipe
@@ -2100,6 +2091,31 @@ fn recover_account(
         {
             return Err(error("This conversation has an explicitly pinned account"));
         }
+    // Check all other writers before touching either history or stopping the
+    // source. The final start guard is too late to protect a live target's files.
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_account_handoff_unowned(&state, &source, &replacement)?;
+    }
+    let source_handle = host.lock().unwrap_or_else(|p| p.into_inner())
+        .chats.get(&source.id).map(|record| record.handle.clone());
+    // Keep the original approved directory pinned before stopping its actor or
+    // copying history. The successor's issued recipe remains immutable.
+    let operational_directory = if let Some(handle) = &source_handle {
+        Some(super::session_locations::verified_chat_directory(host, &source, handle)
+            .map_err(unavailable)?)
+    } else {
+        let registry = super::agent_execution::registry(host).map_err(unavailable)?;
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry.session_location(&crate::agent_execution::HostedSession::Chat(source.clone()))
+            .map_err(unavailable)?.is_some() {
+            return Err(unavailable("The saved conversation has an operational directory binding but its original provider directory pin is unavailable. Reattach its original provider or continue in a new conversation explicitly."));
+        }
+        None
+    };
+    let mut reservation = None;
+    let mut current_options = source_handle.as_ref().and_then(Handle::completed_account_options);
+    if let Some(generation) = idle_generation {
         let handle = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             validate_proof(source.proof.as_ref(), state.proof())?;
@@ -2199,15 +2215,12 @@ fn recover_account(
     // the source reservation before starting its successor, whose exact
     // conversation ID intentionally matches it.
     drop(reservation.take());
-    start(
-        host,
-        client,
-        replacement.clone(),
-        None,
-        false,
-        None,
-        execution_environment,
-    )?;
+    if let Some((directory, context)) = operational_directory {
+        start_at_execution_directory(host, client, replacement.clone(), execution_environment,
+            context, &directory)?;
+    } else {
+        start(host, client, replacement.clone(), None, false, None, execution_environment)?;
+    }
     let handle = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -4411,14 +4424,26 @@ for line in sys.stdin:
     struct Echo(bool);
     #[test]
     fn automatic_handoff_fences_idle_state_and_confirms_the_same_conversation() {
-        handoff_contract(false);
+        handoff_contract(false, false, false, false);
     }
     #[test]
     fn explicit_handoff_accepts_a_pinned_account_and_records_a_transcript_notice() {
-        handoff_contract(true);
+        handoff_contract(true, false, false, false);
     }
 
-    fn handoff_contract(explicit: bool) {
+    #[test]
+    fn relocated_account_handoff_retains_the_approved_inode_and_issued_recipe() {
+        for completed in [false, true] {
+            handoff_contract(true, true, completed, false);
+        }
+    }
+
+    #[test]
+    fn completed_account_handoff_refuses_a_replaced_operational_directory() {
+        handoff_contract(true, true, true, true);
+    }
+
+    fn handoff_contract(explicit: bool, moved: bool, completed: bool, replaced: bool) {
         use std::os::unix::fs::PermissionsExt;
         struct Idle;
         impl Adapter for Idle {
@@ -4452,7 +4477,8 @@ for line in sys.stdin:
             }
         }
         let directory = tempfile::tempdir().unwrap();
-        let cwd = directory.path().canonicalize().unwrap();
+        let cwd = directory.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
         let provider = directory.path().join(if explicit {
             "provider-wrapper"
         } else {
@@ -4532,7 +4558,11 @@ done
         }
         let mut process_recipe = source.launch.recipe.clone();
         process_recipe.program = "/bin/cat".into();
-        let spec = ProcessSpec::from(&process_recipe);
+        let mut spec = ProcessSpec::from(&process_recipe);
+        let context = Arc::new(chat::protocol::ExecutionContext::new(Some(Arc::new(
+            std::fs::File::open(&process_recipe.working_directory).unwrap()))));
+        let identity = context.directory_identity().unwrap().unwrap();
+        spec.execution = Some(context);
         let mut initial = Step {
             writes: vec![json!({"ready": true})],
             events: vec![
@@ -4553,8 +4583,28 @@ done
             |_| {},
         )
         .unwrap();
+        let mut registry = super::super::model::Registry::at(&directory.path().join("workspace.sqlite3")).unwrap();
+        registry.apply(&crate::workspace_model::ModelEdit::OpenProject {
+            repository: source.launch.recipe.working_directory.clone(), name: "Account project".into(),
+            kind: crate::model::ProjectKind::Folder,
+        }).unwrap();
+        registry.apply(&crate::workspace_model::ModelEdit::SeedView {
+            scope: crate::workspace_model::Scope::Worktree {
+                repository: source.launch.recipe.working_directory.clone(),
+                path: source.launch.recipe.working_directory.clone(),
+            },
+            panes: vec![crate::workspace_model::views::Pane {
+                id: crate::model::CardId::new(), title: "Account fixture".into(), user_title: None,
+                pending_terminal_start: false, width_fraction: 0.5,
+                kind: crate::model::CardKind::Chat(source.clone()),
+                scope: Some(source.launch.recipe.working_directory.clone()),
+            }], closed: Vec::new(),
+        }).unwrap();
+        registry.bind_session_location(&crate::agent_execution::HostedSession::Chat(source.clone()),
+            None, &source.launch.recipe.working_directory, identity).unwrap();
         {
             let mut state = host.lock().unwrap();
+            state.install_model(registry);
             state.register_client(1);
             state.chats.insert(
                 source.id,
@@ -4702,12 +4752,53 @@ done
         );
         assert!(!handle.is_completed());
         assert!(host.lock().unwrap().chat_spawning.is_empty());
+        let mut actual_directory = source.launch.recipe.working_directory.clone();
+        if moved {
+            let moved_directory = directory.path().join("moved-project");
+            std::fs::rename(&actual_directory, &moved_directory).unwrap();
+            std::fs::create_dir(&actual_directory).unwrap();
+            let failure = recover_account(&host, 1, source.clone(), replacement.clone(),
+                Some(generation), true, Default::default()).unwrap_err();
+            assert!(failure.message.contains("directory"), "{}", failure.message);
+            assert!(!handle.is_completed(), "an unapproved path must not close the source");
+            assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
+            let response = super::super::client::process_request(&host, 1,
+                ClientRequest::EditWorkspaceModel { edit: crate::workspace_model::ModelEdit::RelocateProject {
+                    relocation: crate::project_recovery::Relocation {
+                        repository: actual_directory.clone(), destination: moved_directory.clone(),
+                        old_root: actual_directory.clone(), new_root: moved_directory.clone(),
+                    },
+                }}).unwrap().0;
+            let ServerResponse::WorkspaceModel { model } = response else { panic!("Locate model reply"); };
+            assert!(model.session_location_refusals.is_empty());
+            actual_directory = moved_directory;
+            generation = handle.account_switch_generation().unwrap().unwrap();
+        }
+        if completed {
+            handle.close().unwrap();
+            let record = host.lock().unwrap().chats.remove(&source.id).unwrap();
+            let failure = recover_account(&host, 1, source.clone(), replacement.clone(),
+                None, true, Default::default()).unwrap_err();
+            assert!(failure.message.contains("directory pin is unavailable"), "{}", failure.message);
+            assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
+            host.lock().unwrap().chats.insert(source.id, record);
+        }
+        if replaced {
+            std::fs::rename(&actual_directory, directory.path().join("retired-project")).unwrap();
+            std::fs::create_dir(&actual_directory).unwrap();
+            let failure = recover_account(&host, 1, source.clone(), replacement,
+                None, true, Default::default()).unwrap_err();
+            assert!(failure.message.contains("directory"), "{}", failure.message);
+            assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
+            assert_eq!(std::fs::read(&transcript).unwrap(), b"{}\n");
+            return;
+        }
         let response = recover_account(
             &host,
             1,
             source.clone(),
             replacement.clone(),
-            Some(generation),
+            (!completed).then_some(generation),
             explicit,
             Default::default(),
         )
@@ -4717,6 +4808,12 @@ done
         };
         assert_eq!(session.launch.session_id.as_deref(), Some(conversation));
         assert_eq!(snapshot.session_id.as_deref(), Some(conversation));
+        let successor = host.lock().unwrap().chats[&session.id].handle.clone();
+        let proof = successor.capture_execution_directory(&actual_directory).unwrap();
+        assert_eq!(proof.identity, identity);
+        assert_eq!(session.launch.recipe.working_directory, source.launch.recipe.working_directory,
+            "operational relocation must not rewrite the issued account-switch recipe");
+
         if explicit {
             assert_eq!(
                 snapshot.selected_model.as_deref(),
