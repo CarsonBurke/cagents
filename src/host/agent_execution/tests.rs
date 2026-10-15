@@ -1104,7 +1104,7 @@ fn retained_old_alias_preflights_current_agent_before_real_holder_release() {
     let context = Arc::new(ExecutionContext::new(Some(Arc::new(
         std::fs::File::open(directory).unwrap(),
     ))));
-    let process = ProcessSpec {
+    let process_spec = ProcessSpec {
         execution: Some(context.clone()),
         messages: None,
         transport: TransportSpec::OwnedUnixWebSocket { socket },
@@ -1114,7 +1114,7 @@ fn retained_old_alias_preflights_current_agent_before_real_holder_release() {
         environment: Default::default(),
         unset_environment: Default::default(),
     };
-    let mut holder = chat::native_holder::spawn(process, original.clone()).unwrap();
+    let mut holder = chat::native_holder::spawn(process_spec, original.clone()).unwrap();
     context.installed();
     let owner = holders::evidence(
         &holders::socket(&holders::directory(Kind::Native).unwrap(), id),
