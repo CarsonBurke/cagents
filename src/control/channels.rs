@@ -58,8 +58,15 @@ fn find_pane<'a>(
     // A native agent may also have a separately saved console. An agent
     // handle names its canonical display when present; a shared session ID
     // still requires an explicit pane ID if it names several saved surfaces.
-    let canonical = agents.first().map(|agent| CardId::from_uuid(agent.id.as_uuid()))
-        .filter(|id| model.views.iter().any(|view| view.panes.iter().any(|pane| pane.id == *id)));
+    let canonical = agents
+        .first()
+        .map(|agent| CardId::from_uuid(agent.id.as_uuid()))
+        .filter(|id| {
+            model
+                .views
+                .iter()
+                .any(|view| view.panes.iter().any(|pane| pane.id == *id))
+        });
     let target = target.as_str();
     let mut matches = model.views.iter().flat_map(|view| {
         let agents = &agents;
@@ -68,16 +75,17 @@ fn find_pane<'a>(
             (pane.id.to_string() == target
                 || session.is_some_and(|id| id.to_string() == target)
                 || agents.iter().any(|agent| {
-                    canonical.is_none_or(|id| pane.id == id) && session.is_some_and(|id| {
-                        agent
-                            .session
-                            .as_ref()
-                            .is_some_and(|session| session.id() == id)
-                            || agent
-                                .console
+                    canonical.is_none_or(|id| pane.id == id)
+                        && session.is_some_and(|id| {
+                            agent
+                                .session
                                 .as_ref()
-                                .is_some_and(|console| console.id == id)
-                    })
+                                .is_some_and(|session| session.id() == id)
+                                || agent
+                                    .console
+                                    .as_ref()
+                                    .is_some_and(|console| console.id == id)
+                        })
                 }))
             .then_some((view, pane))
         })
@@ -349,25 +357,46 @@ mod tests {
     fn agent_handles_choose_the_canonical_pane_without_claiming_its_console() {
         let (mut model, mut canonical, _) = fixture();
         canonical.id = CardId::from_uuid(model.agents[0].id.as_uuid());
-        let CardKind::Terminal(terminal) = &canonical.kind else { unreachable!() };
-        let console = Pane { id: CardId::new(), ..canonical.clone() };
+        let CardKind::Terminal(terminal) = &canonical.kind else {
+            unreachable!()
+        };
+        let console = Pane {
+            id: CardId::new(),
+            ..canonical.clone()
+        };
         canonical.kind = CardKind::Chat(crate::chat::Session {
             id: terminal.id,
-            launch: crate::chat::Launch { provider: Provider::Claude, recipe: terminal.launch.clone(), session_id: None },
+            launch: crate::chat::Launch {
+                provider: Provider::Claude,
+                recipe: terminal.launch.clone(),
+                session_id: None,
+            },
             proof: terminal.continuity.live_proof(),
             terminal: Some(terminal.clone()),
             owned_codex_listener: None,
             native_continuity: Default::default(),
         });
-        let CardKind::Chat(session) = &canonical.kind else { unreachable!() };
+        let CardKind::Chat(session) = &canonical.kind else {
+            unreachable!()
+        };
         model.agents[0].session = Some(HostedSession::Chat(session.clone()));
         model.agents[0].console = session.terminal.clone();
         model.views[0].panes = vec![canonical.clone(), console.clone()];
-        for handle in ["worker".into(), model.agents[0].id.to_string(), model.agents[0].id.to_string()[..8].to_owned()] {
+        for handle in [
+            "worker".into(),
+            model.agents[0].id.to_string(),
+            model.agents[0].id.to_string()[..8].to_owned(),
+        ] {
             assert_eq!(find_pane(&model, &handle).unwrap().1, &canonical);
         }
-        assert_eq!(find_pane(&model, &session.id.to_string()).unwrap_err().kind, "ambiguous");
-        assert_eq!(find_pane(&model, &console.id.to_string()).unwrap().1, &console);
+        assert_eq!(
+            find_pane(&model, &session.id.to_string()).unwrap_err().kind,
+            "ambiguous"
+        );
+        assert_eq!(
+            find_pane(&model, &console.id.to_string()).unwrap().1,
+            &console
+        );
     }
 
     fn envelope(request_id: u64, message: ServerMessage) -> ServerEnvelope {
