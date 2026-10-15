@@ -20263,6 +20263,39 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "integrated-browser")]
+    fn browser_only_visibility_failure_retries_the_real_handle_and_clears_only_its_warning() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let url = Url::parse("https://example.com/visibility").unwrap();
+        app.card_state_mut(card).unwrap().kind = browser_kind(url.as_str());
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        let handle = BrowserHandle::fixture();
+        handle.mailbox.mark_engine_gone();
+        app.cards.insert(card, CardRuntime::Browser(BrowserRuntime {
+            handle, ime: None, lifecycle: BrowserLifecycle::Visible,
+            address: BrowserAddress::location(&url), address_focused: false,
+            address_error: false, progress_phase: 0.0, load_state: None,
+        }));
+        app.set_workspace_surfaces_visible(true);
+        assert!(app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility")));
+        assert!(app.notices.condition("workspace-session-visibility").is_none());
+        let interrupted = CardId::new();
+        app.notices.record(TransientNotice::warning("Interrupted")
+            .key("daemon-interrupted-turns").targets([interrupted]));
+        let Some(CardRuntime::Browser(browser)) = app.cards.get_mut(&card) else { panic!("browser runtime"); };
+        browser.handle = BrowserHandle::fixture();
+        // The real application's healthy-event footer must call the replacement
+        // BrowserHandle, not merely drop the warning on a global health signal.
+        drop(app.update(Message::DaemonHealth(crate::daemon_health::State::Responsive)));
+        assert!(!app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("workspace-browser-visibility")));
+        assert_eq!(app.notices.condition_targets("daemon-interrupted-turns"), [interrupted]);
+        let Some(CardRuntime::Browser(browser)) = app.cards.get(&card) else { panic!("browser runtime"); };
+        assert!(browser.handle.mailbox.drain_coalesced().residency.is_some(), "actual browser mailbox accepted the visibility reapply");
+    }
+
+    #[test]
     fn visibility_retry_selects_only_affected_cards_even_with_many_healthy_runtimes() {
         let mut app = context_inspector_test_app(false);
         let affected = CardId::new();
