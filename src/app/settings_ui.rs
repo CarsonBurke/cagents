@@ -160,29 +160,43 @@ fn default_account_choice<'a>(
             "Automatic uses a signed-in plan and switches when its allowance runs out. Choosing an account pins new conversations and terminals; project choices take precedence.",
         ),
     };
-    let selected = Some(
-        choices
-            .iter()
-            .position(|choice| choice.selected)
-            .map_or(0, |index| index + 1),
-    );
-    let labels =
-        std::iter::once("Automatic — use another signed-in plan when exhausted".to_owned())
-            .chain(choices.iter().map(|choice| choice.label.clone()))
-            .collect::<Vec<_>>();
-    let ids = std::iter::once(None)
-        .chain(choices.iter().map(|choice| Some(choice.id.clone())))
-        .collect::<Vec<_>>();
+    let automatic = !choices.iter().any(|choice| choice.selected);
+    let mut buttons = vec![
+        crate::ui_controls::button::secondary(if automatic {
+            "✓ Automatic — use another signed-in plan when exhausted"
+        } else {
+            "Automatic — use another signed-in plan when exhausted"
+        })
+        .on_press(Message::AccountUi(account_ui::Action::SetAutomatic(
+            provider,
+        )))
+        .into(),
+    ];
+    for choice in choices {
+        let label = if choice.selected {
+            format!("✓ {}", choice.label)
+        } else {
+            choice.label.clone()
+        };
+        let mut row =
+            vec![
+                crate::ui_controls::button::secondary(label)
+                    .on_press_maybe(choice.blocked.is_none().then(|| {
+                        Message::AccountUi(account_ui::Action::SetDefault(choice.id.clone()))
+                    }))
+                    .into(),
+            ];
+        if let Some(reason) = &choice.blocked {
+            row.push(design::caption(reason.clone()).into());
+        }
+        buttons.push(widget::column::with_children(row).spacing(space::XS).into());
+    }
     setting_field(
         label,
         detail,
-        crate::ui_controls::field::select(labels, selected, move |index| {
-            Message::AccountUi(match &ids[index] {
-                Some(id) => account_ui::Action::SetDefault(id.clone()),
-                None => account_ui::Action::SetAutomatic(provider),
-            })
-        })
-        .into(),
+        widget::column::with_children(buttons)
+            .spacing(space::S)
+            .into(),
     )
 }
 
@@ -367,6 +381,13 @@ fn settings_category_controls<'a>(
                 .filter(|(_, choices)| !choices.is_empty())
                 .map(|(provider, choices)| default_account_choice(*provider, choices))
                 .collect();
+            settings.push(setting_field(
+                "Omp",
+                "Managed by Omp. Omp chooses and rotates its own accounts.",
+                crate::ui_controls::button::secondary("Omp account documentation")
+                    .on_press(Message::AccountUi(account_ui::Action::Documentation))
+                    .into(),
+            ));
             settings.push(setting_field(
                 "Manage accounts",
                 "Add, rename, sign in to or remove accounts, and compare what each has left.",
@@ -1601,4 +1622,25 @@ fn shortcut_input<'a>(
             .spacing(space::XS)
             .into(),
     )
+}
+
+#[cfg(test)]
+mod account_acceptance_tests {
+    use super::*;
+    #[test]
+    fn conflicted_default_is_visible_and_does_not_emit_a_selection() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let provider = crate::agent::Provider::Claude;
+        let id = app.account_ui.add_managed_fixture(provider, 609);
+        app.account_ui.set_fixture_login_for_test(&id, "changed@example.test");
+        let choices = app.default_account_choices();
+        let choices = &choices.iter().find(|(actual, _)| *actual == provider).unwrap().1;
+        let choice = choices.iter().find(|choice| choice.id == id).unwrap();
+        let reason = choice.blocked.as_ref().expect("changed login must disable the default").clone();
+        let label = choice.label.clone();
+        let element = settings_group("Default accounts", "", vec![default_account_choice(provider, choices)]).view("Accounts", "").unwrap();
+        let (rendered, messages) = account_ui::acceptance_support::inspect(element, Some(&label));
+        assert!(rendered.0.iter().any(|(text, _)| text.contains(&reason)));
+        assert!(!messages.into_iter().any(|message| matches!(message, Message::AccountUi(account_ui::Action::SetDefault(actual)) if actual == id)));
+    }
 }

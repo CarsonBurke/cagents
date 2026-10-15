@@ -139,12 +139,20 @@ pub enum ReturnRefused {
 
 #[derive(Clone)]
 pub enum Action {
+    AutomaticRefreshed(
+        Target,
+        u64,
+        Result<crate::device_service::AccountSnapshot, String>,
+    ),
     /// Points a draft at a model of any provider, or at a provider's default
     /// model where none is named.
     DraftModel(Target, Provider, Option<String>),
     /// Points a draft at another account of its provider.
     ChooseAccount(Target, AccountId),
     RecoverAccount(CardId, AccountId),
+    ContinueOnAccount(Target, AccountId),
+    CancelAccountSwitch(Target),
+    QueuedAccountGeneration(Target, AccountId, Result<Option<u64>, String>),
     /// Installed skills read without starting the draft's provider.
     DraftSkills(Target, chat::Launch, Vec<chat::Skill>),
     /// Opens or closes the account choice.
@@ -315,6 +323,8 @@ impl Action {
                 | Self::UpgradeCommitted(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
+                | Self::AutomaticRefreshed(..)
+                | Self::QueuedAccountGeneration(..)
                 | Self::CommandFinished(..)
                 | Self::ChangesLoaded(..)
                 | Self::ChangedFileResolved(..)
@@ -360,6 +370,8 @@ impl Action {
             Self::Composer(target, action) if action.is_edit() => Some(*target),
             Self::DraftModel(target, _, _)
             | Self::ChooseAccount(target, _)
+            | Self::ContinueOnAccount(target, _)
+            | Self::CancelAccountSwitch(target)
             | Self::AccountPicker(target, _)
             | Self::Reconnect(target)
             | Self::SignIn(target, _)
@@ -1533,6 +1545,10 @@ pub(super) struct Runtime {
     /// Clipboard reads and image writes still destined for this draft.
     pastes_pending: usize,
     image_pastes_saving: usize,
+    routing_refresh: bool,
+    account_switch_checking: bool,
+    pending_account_switch: Option<(AccountId, String)>,
+    account_switch_fallback: Option<(AccountId, String)>,
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: bool,
     expanded: HashSet<String>,
@@ -2101,6 +2117,10 @@ impl Runtime {
             thumbnails: thumbnails::Cache::default(),
             pastes_pending: 0,
             image_pastes_saving: 0,
+            routing_refresh: false,
+            account_switch_checking: false,
+            pending_account_switch: None,
+            account_switch_fallback: None,
             submit_after_paste: None,
             attachment_chooser_pending: false,
             expanded: HashSet::new(),
@@ -2986,7 +3006,14 @@ fn fresh_chat_session(
     automatic: bool,
     configuration: &settings::AgentLaunchSettings,
 ) -> Result<chat::Session, String> {
-    let mut session = chat::fresh_session_configured(provider, id, working_directory, account, configuration, Default::default())?;
+    let mut session = chat::fresh_session_configured(
+        provider,
+        id,
+        working_directory,
+        account,
+        configuration,
+        Default::default(),
+    )?;
     if automatic {
         session
             .launch
@@ -3014,7 +3041,10 @@ fn draft_snapshot(
             attachments: true,
             model_selection: true,
             reasoning_selection: true,
-            permission_modes: settings::agents::permission_modes(provider).iter().map(|mode| (*mode).into()).collect(),
+            permission_modes: settings::agents::permission_modes(provider)
+                .iter()
+                .map(|mode| (*mode).into())
+                .collect(),
             skill_reach: match provider {
                 Provider::Codex => chat::SkillReach::Anywhere,
                 Provider::Claude => chat::SkillReach::Leading,
@@ -3272,7 +3302,7 @@ impl Cagents {
         let target = runtime.target;
         let action = match command {
             GlobalShortcut::ChatAccount
-                if runtime.choosing()
+                if !runtime.attachment_chooser_pending
                     && self
                         .chat_accounts(
                             runtime.session.launch.provider,
@@ -3582,7 +3612,12 @@ impl Cagents {
         };
         let account = self.default_account_for_directory(provider, &directory);
         let automatic = self.automatic_accounts_for_directory(provider, &directory);
-        let configuration = self.settings.agents.get(settings::agents::provider_key(provider)).cloned().unwrap_or_default();
+        let configuration = self
+            .settings
+            .agents
+            .get(settings::agents::provider_key(provider))
+            .cloned()
+            .unwrap_or_default();
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -3625,8 +3660,15 @@ impl Cagents {
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
         }
-        let launch = moved.as_mut().map_or(&mut runtime.session.launch, |session| &mut session.launch);
-        settings::agents::set_model_options(&mut launch.recipe.arguments, provider, snapshot.selected_model.as_deref(), snapshot.reasoning.as_deref());
+        let launch = moved
+            .as_mut()
+            .map_or(&mut runtime.session.launch, |session| &mut session.launch);
+        settings::agents::set_model_options(
+            &mut launch.recipe.arguments,
+            provider,
+            snapshot.selected_model.as_deref(),
+            snapshot.reasoning.as_deref(),
+        );
         runtime.snapshot = Arc::new(snapshot);
         runtime.completion.restart(true);
         if let Some(session) = &moved {
@@ -3681,9 +3723,16 @@ impl Cagents {
             .get(&provider)
             .cloned()
             .map_or((None, None), |(model, reasoning)| (Some(model), reasoning));
-        let configured = self.settings.agents.get(settings::agents::provider_key(provider));
-        let model = configured.and_then(|settings| settings.model.clone()).or(model);
-        let reasoning = configured.and_then(|settings| settings.effort.clone()).or(reasoning);
+        let configured = self
+            .settings
+            .agents
+            .get(settings::agents::provider_key(provider));
+        let model = configured
+            .and_then(|settings| settings.model.clone())
+            .or(model);
+        let reasoning = configured
+            .and_then(|settings| settings.effort.clone())
+            .or(reasoning);
         draft_snapshot(provider, models, model, reasoning)
     }
 
@@ -3702,15 +3751,64 @@ impl Cagents {
 
     /// Points a draft at account `id` of its own provider.
     fn choose_chat_account(&mut self, target: Target, id: AccountId) -> Task<Message> {
+        if self.chat_start_pending(target.card) {
+            return Task::none();
+        }
         let Some(account) = self.known_account(&id) else {
             return Task::none();
         };
-        let configuration = self.settings.agents.get(settings::agents::provider_key(account.provider)).cloned().unwrap_or_default();
+        let configuration = self
+            .settings
+            .agents
+            .get(settings::agents::provider_key(account.provider))
+            .cloned()
+            .unwrap_or_default();
+        let account_name = self
+            .account_ui
+            .account(&id)
+            .map(|state| self.account_ui.display_name(state))
+            .unwrap_or_else(|| id.to_string());
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
         runtime.account_picker = false;
-        if !runtime.choosing() || account.provider != runtime.session.launch.provider {
+        if account.provider != runtime.session.launch.provider {
+            return Task::none();
+        }
+        if !runtime.is_draft() {
+            if runtime.attachment_chooser_pending {
+                return Task::none();
+            }
+            if account::home_variable(account.provider).is_some_and(|variable| {
+                runtime
+                    .session
+                    .launch
+                    .recipe
+                    .environment
+                    .get(variable)
+                    .map(std::path::PathBuf::from)
+                    == account.resolved_home()
+            }) {
+                runtime.pending_account_switch = None;
+                runtime.account_switch_fallback = None;
+                return Task::none();
+            }
+            runtime.account_switch_fallback = Some((id.clone(), account_name.clone()));
+            if runtime.snapshot.busy
+                || runtime.snapshot.waiting
+                || runtime.pending.is_some()
+                || !runtime.snapshot.requests.is_empty()
+                || !runtime.snapshot.queued_messages.is_empty()
+                || !runtime.followups.is_empty()
+            {
+                runtime.pending_account_switch = Some((id, account_name));
+                return Task::none();
+            }
+            let generation = (!runtime.disconnected && !runtime.snapshot.exited)
+                .then_some(runtime.snapshot.generation);
+            return self.change_chat_account(target.card, id, generation, None, true);
+        }
+        if !runtime.choosing() {
             return Task::none();
         }
         let mut session = match fresh_chat_session(
@@ -3746,8 +3844,130 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
+    fn probe_queued_account_switch(&mut self, target: Target) -> Task<Message> {
+        if self.chat_start_pending(target.card)
+            || !matches!(
+                self.card_state(target.card).map(|card| &card.kind),
+                Some(CardKind::Chat(_))
+            )
+        {
+            return Task::none();
+        }
+        let runtime = match self.cards.get_mut(&target.card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime),
+            _ => self.chat_ui.parked.get_mut(&target.card),
+        };
+        let Some(runtime) = runtime.filter(|runtime| runtime.target == target) else {
+            return Task::none();
+        };
+        if runtime.account_switch_checking
+            || runtime.pending.is_some()
+            || !runtime.followups.is_empty()
+        {
+            return Task::none();
+        }
+        let Some((id, _)) = &runtime.pending_account_switch else {
+            return Task::none();
+        };
+        let id = id.clone();
+        let source = runtime.session.clone();
+        runtime.account_switch_checking = true;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let socket =
+                    crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+                crate::control::ControlClient::connect(&socket)
+                    .map_err(|error| error.to_string())?
+                    .account_switch_generation(source)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::ChatUi(Action::QueuedAccountGeneration(target, id, result))
+        })
+    }
+
+    /// Explicit cache-loss fallback opens a new draft beside the original.
+    /// The original transcript and unsent message remain available for reference.
+    fn continue_on_account(&mut self, target: Target, id: AccountId) -> Task<Message> {
+        let Some(account) = self.known_account(&id) else {
+            return Task::none();
+        };
+        let configuration = self
+            .settings
+            .agents
+            .get(settings::agents::provider_key(account.provider))
+            .cloned()
+            .unwrap_or_default();
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if runtime
+            .account_switch_fallback
+            .as_ref()
+            .map(|(account, _)| account)
+            != Some(&id)
+            || runtime.snapshot.busy
+            || runtime.pending.is_some()
+        {
+            return Task::none();
+        }
+        let mut excerpt = Vec::new();
+        let mut bytes = 0;
+        for item in runtime.snapshot.items.iter().rev() {
+            if let ItemContent::Text {
+                text,
+                thinking: false,
+                ..
+            } = &item.content
+            {
+                let available = 64 * 1024usize - bytes;
+                if available == 0 {
+                    break;
+                }
+                let mut start = text.len().saturating_sub(available);
+                while !text.is_char_boundary(start) {
+                    start += 1;
+                }
+                excerpt.push(format!("{:?}: {}", item.role, &text[start..]));
+                bytes += text.len() - start;
+            }
+        }
+        excerpt.reverse();
+        let seed = format!(
+            "Continue this work in a new conversation. The previous provider cache is unavailable. The following is a bounded recent transcript excerpt; refer to the original conversation for omitted history.\n\n{}\n\nUnsent request:\n{}",
+            excerpt.join("\n\n"),
+            runtime.composer.text()
+        );
+        let attachments = runtime.attachments.clone();
+        let directory = runtime.session.launch.recipe.working_directory.clone();
+        let fresh = match fresh_chat_session(
+            account.provider,
+            TerminalId::new(),
+            directory,
+            &account,
+            false,
+            &configuration,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                runtime.error = Some(error);
+                return Task::none();
+            }
+        };
+        let insert = self.insert_chat_card(fresh, Some(target.card), None);
+        if let Some(card) = self.workspace.focused()
+            && let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card)
+        {
+            runtime.replace_draft(text_editor::Content::with_text(&seed));
+            runtime.replace_attachments(attachments);
+        }
+        insert
+    }
+
     fn recover_chat_account(&mut self, card: CardId, id: AccountId) -> Task<Message> {
-        self.change_chat_account(card, id, None, None)
+        self.change_chat_account(card, id, None, None, true)
     }
 
     fn automatic_chat_account(
@@ -3809,8 +4029,9 @@ impl Cagents {
         id: AccountId,
         generation: Option<u64>,
         submit: Option<(u64, PromptMode)>,
+        explicit: bool,
     ) -> Task<Message> {
-        if (generation.is_none() && !self.chat_ui.removed_accounts.contains(&card))
+        if (!explicit && generation.is_none() && !self.chat_ui.removed_accounts.contains(&card))
             || self.chat_start_pending(card)
         {
             return Task::none();
@@ -3860,6 +4081,13 @@ impl Cagents {
                 .environment
                 .insert(variable.into(), home.into());
         }
+        if explicit {
+            replacement
+                .launch
+                .recipe
+                .environment
+                .remove(account::routing::AUTOMATIC_MARKER);
+        }
         if !chat::is_account_recovery(&source, &replacement) {
             return Task::none();
         }
@@ -3885,11 +4113,23 @@ impl Cagents {
                         let wake = move |wake| {
                             let _ = sender.try_send((target, wake));
                         };
-                        match generation {
-                            Some(generation) => {
-                                ClientHandle::switch_account(source, replacement, generation, wake)
+                        if explicit {
+                            ClientHandle::switch_account_explicit(
+                                source,
+                                replacement,
+                                generation,
+                                wake,
+                            )
+                        } else {
+                            match generation {
+                                Some(generation) => ClientHandle::switch_account(
+                                    source,
+                                    replacement,
+                                    generation,
+                                    wake,
+                                ),
+                                None => ClientHandle::recover_account(source, replacement, wake),
                             }
-                            None => ClientHandle::recover_account(source, replacement, wake),
                         }
                         .map(Arc::new)
                     },
@@ -4350,7 +4590,10 @@ impl Cagents {
             working_directory.clone(),
             &account,
             automatic,
-            self.settings.agents.get(settings::agents::provider_key(provider)).unwrap_or(&settings::AgentLaunchSettings::default()),
+            self.settings
+                .agents
+                .get(settings::agents::provider_key(provider))
+                .unwrap_or(&settings::AgentLaunchSettings::default()),
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -5762,7 +6005,18 @@ impl Cagents {
             }
             _ => None,
         };
+        let queued_target = match &action {
+            Action::Wake(target, Wake::Changed | Wake::Observed | Wake::Activity)
+            | Action::CommandFinished(target, _, _) => Some(*target),
+            _ => None,
+        };
         let task = self.handle_chat_ui_inner(action);
+        let task = Task::batch([
+            task,
+            queued_target.map_or_else(Task::none, |target| {
+                self.probe_queued_account_switch(target)
+            }),
+        ]);
         if let Some(target) = restore
             && let Some(runtime) = self.chat_runtime_mut(target)
             && !runtime.account_picker
@@ -5818,7 +6072,55 @@ impl Cagents {
             Action::ChooseAccount(target, id) => {
                 return self.choose_chat_account(target, id);
             }
+            Action::QueuedAccountGeneration(target, id, result) => {
+                let runtime = match self.cards.get_mut(&target.card) {
+                    Some(CardRuntime::Chat(runtime)) => Some(runtime),
+                    _ => self.chat_ui.parked.get_mut(&target.card),
+                };
+                let Some(runtime) = runtime.filter(|runtime| runtime.target == target) else {
+                    return Task::none();
+                };
+                runtime.account_switch_checking = false;
+                if runtime
+                    .pending_account_switch
+                    .as_ref()
+                    .map(|(account, _)| account)
+                    != Some(&id)
+                {
+                    return self.probe_queued_account_switch(target);
+                }
+                let generation = match result {
+                    Ok(Some(generation)) => generation,
+                    Ok(None) => return Task::none(),
+                    Err(error) => {
+                        runtime.error = Some(error);
+                        return Task::none();
+                    }
+                };
+                // Keep the choice until confirmed Ready. A proved busy
+                // admission refusal has no effects and must preserve intent.
+                // A queued switch may complete while its pane is parked. Move
+                // ownership, not focus or visibility, into the normal recovery
+                // path; Ready updates this exact hidden runtime in place.
+                if let Some(runtime) = self.chat_ui.parked.remove(&target.card) {
+                    self.cards.insert(target.card, CardRuntime::Chat(runtime));
+                }
+                return self.change_chat_account(target.card, id, Some(generation), None, true);
+            }
             Action::RecoverAccount(card, id) => return self.recover_chat_account(card, id),
+            Action::ContinueOnAccount(target, id) => return self.continue_on_account(target, id),
+            Action::CancelAccountSwitch(target) => {
+                // Once admitted, a provider ownership transfer may already
+                // have side effects. Only the waiting intent can be canceled.
+                if self.chat_start_pending(target.card) {
+                    return Task::none();
+                }
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.pending_account_switch = None;
+                    runtime.account_switch_fallback = None;
+                }
+                return Task::none();
+            }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
@@ -5829,11 +6131,14 @@ impl Cagents {
                 }
             }
             Action::AccountPicker(target, open) => {
+                if open && self.chat_start_pending(target.card) {
+                    return Task::none();
+                }
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
-                    runtime.account_picker = open && runtime.choosing();
+                    runtime.account_picker = open && !runtime.attachment_chooser_pending;
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
@@ -6118,6 +6423,27 @@ impl Cagents {
                     return Task::none();
                 }
                 match result {
+                    Err(failure)
+                        if failure.recovery == chat::Recovery::AccountSwitchBusy
+                            && account_source.is_some() =>
+                    {
+                        let runtime = match self.cards.get_mut(&target.card) {
+                            Some(CardRuntime::Chat(runtime)) => Some(runtime),
+                            _ => self.chat_ui.parked.get_mut(&target.card),
+                        };
+                        let Some(runtime) = runtime else {
+                            return Task::none();
+                        };
+                        runtime.pending_account_switch = runtime.account_switch_fallback.clone();
+                        runtime.account_switch_checking = false;
+                        runtime.error = None;
+                        let original = runtime.target;
+                        // Drain semantic activity suppressed while the admission
+                        // request was pending, then ask for a fresh idle proof.
+                        // Busy returns None; later activity will wake one retry.
+                        self.reread_chat_activity(original);
+                        return self.probe_queued_account_switch(original);
+                    }
                     Ok(handle) => {
                         if let Some((source, resolved)) = handle.upgrade_recovery() {
                             let replacement = handle.session();
@@ -6236,6 +6562,9 @@ impl Cagents {
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
                             runtime.account_picker = false;
+                            runtime.account_switch_fallback = None;
+                            runtime.pending_account_switch = None;
+                            runtime.account_switch_checking = false;
                             runtime.reasoning_picker = false;
                             runtime.session = session.clone();
                             runtime.disconnected = false;
@@ -6370,6 +6699,15 @@ impl Cagents {
                         ]);
                     }
                     Err(failure) => {
+                        // Only the typed proved pre-admission refusal retains
+                        // queued intent. Timeouts and ambiguous handoffs never retry.
+                        if account_source.is_some()
+                            && let Some(CardRuntime::Chat(runtime)) =
+                                self.cards.get_mut(&target.card)
+                        {
+                            runtime.pending_account_switch = None;
+                            runtime.account_switch_checking = false;
+                        }
                         let terminal_switch = matches!(
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Terminal(_))
@@ -6923,6 +7261,38 @@ impl Cagents {
                     }
                 }
             }
+            Action::AutomaticRefreshed(target, revision, result) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                runtime.routing_refresh = false;
+                if runtime.revision != revision {
+                    return Task::none();
+                }
+                let snapshot = match result {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        runtime.error =
+                            Some(format!("Could not refresh alternate accounts: {error}"));
+                        return Task::none();
+                    }
+                };
+                let adopted =
+                    self.update_account_ui(super::account_ui::Action::RemoteLoaded(Ok(snapshot)));
+                if self
+                    .automatic_chat_account(target, PromptMode::Send)
+                    .is_some()
+                {
+                    return Task::batch([
+                        adopted,
+                        self.handle_chat_ui(Action::Submit(target, PromptMode::Send)),
+                    ]);
+                }
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.error = Some("No alternate account has fresh signed-in allowance. Your message is still unsent; sign in or refresh Accounts and try again.".into());
+                }
+                return adopted;
+            }
             Action::Submit(target, mode) => {
                 if let Some((account, generation, revision)) =
                     self.automatic_chat_account(target, mode)
@@ -6949,11 +7319,71 @@ impl Cagents {
                         account.id(),
                         generation,
                         Some((revision, mode)),
+                        false,
                     );
+                }
+                let refresh = if mode == PromptMode::Send {
+                    self.cards.get(&target.card).and_then(|card| match card {
+                        CardRuntime::Chat(runtime)
+                            if runtime.target == target
+                                && !runtime.routing_refresh
+                                && !runtime.snapshot.busy
+                                && runtime.pending.is_none()
+                                && runtime
+                                    .session
+                                    .launch
+                                    .recipe
+                                    .environment
+                                    .get(account::routing::AUTOMATIC_MARKER)
+                                    .map(String::as_str)
+                                    == Some("1") =>
+                        {
+                            let id = self.chat_account(
+                                runtime.session.launch.provider,
+                                &runtime.session.launch.recipe,
+                            )?;
+                            let current = self.account_ui.account(&id)?;
+                            current.snapshot.as_ref().filter(|snapshot| {
+                                account::routing::needs_alternate_for(
+                                    &current.account,
+                                    snapshot,
+                                    now_ms(),
+                                )
+                            })?;
+                            Some((id, runtime.revision))
+                        }
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
+                if let Some((id, revision)) = refresh {
+                    if let Some(runtime) = self.chat_runtime_mut(target) {
+                        runtime.routing_refresh = true;
+                    }
+                    return cosmic::task::future(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            match crate::device_service::request(
+                                crate::device_service::Operation::AccountRoute { id },
+                            )? {
+                                crate::device_service::Reply::Accounts(value) => {
+                                    serde_json::from_value(value).map_err(|error| error.to_string())
+                                }
+                                _ => Err("The daemon did not return refreshed accounts".into()),
+                            }
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
+                        Message::ChatUi(Action::AutomaticRefreshed(target, revision, result))
+                    });
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if runtime.routing_refresh {
+                    return Task::none();
+                }
                 if matches!(
                     slash_invocation(&runtime.composer.text(), &runtime.snapshot),
                     Some(SlashInvocation::PermissionsArguments)
@@ -7328,7 +7758,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7423,7 +7854,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -11154,17 +11586,183 @@ mod tests {
     }
 
     #[test]
+    fn queued_account_switch_uses_daemon_generation_for_hidden_and_parked_panes() {
+        for parked in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 445);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+            let _ = app.choose_chat_account(target, alternate.clone());
+            app.chat_runtime_mut(target).unwrap().show(false);
+            let _other = draft_chat(&mut app);
+            let focus = app.workspace.focused();
+            let handle = chat_runtime(&app, card).handle().unwrap().clone();
+            let mut authoritative = (*handle.snapshot()).clone();
+            authoritative.busy = false;
+            authoritative.generation = 77;
+            handle.publish_snapshot_for_test(authoritative);
+            assert!(
+                chat_runtime(&app, card).snapshot.busy,
+                "presentation intentionally stays stale"
+            );
+            if parked {
+                let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+                    panic!("chat runtime")
+                };
+                app.chat_ui.parked.insert(card, runtime);
+            }
+            let _ = app.probe_queued_account_switch(target);
+            let _ = app.handle_chat_ui(Action::QueuedAccountGeneration(
+                target,
+                alternate.clone(),
+                Ok(Some(77)),
+            ));
+            assert!(
+                app.chat_ui.attempt(card).is_some(),
+                "hidden ownership must reach the idle fence"
+            );
+            assert!(
+                !app.chat_ui.parked.contains_key(&card),
+                "Ready has one exact runtime to update"
+            );
+            assert_eq!(
+                app.workspace.focused(),
+                focus,
+                "a queued switch must not select its pane or scope"
+            );
+            assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn proved_busy_account_switch_retains_choice_but_uncertain_failure_does_not_retry() {
+        for proved_busy in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 446);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let source = chat_runtime(&app, card).session.clone();
+            Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+            drop(app.choose_chat_account(target, alternate.clone()));
+            drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+                target,
+                alternate.clone(),
+                Ok(Some(77)),
+            )));
+            let attempt = chat_runtime_attempt(&app, card);
+            let current = app
+                .chat_account(Provider::Codex, &source.launch.recipe)
+                .unwrap();
+            drop(app.handle_chat_ui(Action::CancelAccountSwitch(target)));
+            drop(app.choose_chat_account(target, current));
+            assert_eq!(
+                chat_runtime(&app, card)
+                    .pending_account_switch
+                    .as_ref()
+                    .map(|(id, _)| id),
+                Some(&alternate),
+                "an admitted transfer cannot be presented as canceled by stale UI actions"
+            );
+            assert_eq!(chat_runtime_attempt(&app, card), attempt);
+            answer_start(
+                &mut app,
+                attempt,
+                Err(chat::StartFailure {
+                    message: "fixture admission outcome".into(),
+                    recovery: if proved_busy {
+                        chat::Recovery::AccountSwitchBusy
+                    } else {
+                        chat::Recovery::Retry
+                    },
+                }),
+            );
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.session, source);
+            assert_eq!(
+                runtime.pending_account_switch.as_ref().map(|(id, _)| id),
+                proved_busy.then_some(&alternate)
+            );
+            if proved_busy {
+                assert!(runtime.connected());
+                assert!(!app.chat_ui.removed_accounts.contains(&card));
+                let current = app
+                    .chat_account(Provider::Codex, &source.launch.recipe)
+                    .unwrap();
+                drop(app.choose_chat_account(target, current));
+                assert!(chat_runtime(&app, card).pending_account_switch.is_none());
+            } else {
+                assert!(runtime.disconnected);
+                assert!(runtime.account_switch_fallback.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn choosing_the_current_account_cancels_a_busy_switch_and_fallback_keeps_original() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 444);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let source = chat_runtime(&app, card).session.clone();
+        let current = app
+            .chat_account(Provider::Codex, &source.launch.recipe)
+            .unwrap();
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+        let _ = app.choose_chat_account(target, alternate.clone());
+        assert_eq!(
+            chat_runtime(&app, card)
+                .pending_account_switch
+                .as_ref()
+                .map(|(id, _)| id),
+            Some(&alternate)
+        );
+        let _ = app.choose_chat_account(target, current);
+        assert!(chat_runtime(&app, card).pending_account_switch.is_none());
+        assert!(chat_runtime(&app, card).account_switch_fallback.is_none());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).busy = false;
+        runtime.account_switch_fallback = Some((alternate.clone(), "Alternate".into()));
+        runtime.replace_draft(text_editor::Content::with_text("continue fixture work"));
+        runtime.attach(["/fixture/unsent-account-context.png".into()]);
+        let _ = app.continue_on_account(target, alternate);
+        assert_eq!(chat_runtime(&app, card).session, source);
+        let new_card = app.workspace.focused().unwrap();
+        assert_ne!(new_card, card);
+        assert!(chat_runtime(&app, new_card).is_draft());
+        assert_eq!(chat_runtime(&app, new_card).attachments, chat_runtime(&app, card).attachments);
+        assert_eq!(paths(&chat_runtime(&app, new_card).attachments), [Path::new("/fixture/unsent-account-context.png")]);
+        assert!(
+            chat_runtime(&app, new_card)
+                .composer
+                .text()
+                .contains("continue fixture work")
+        );
+        assert!(
+            chat_runtime(&app, new_card)
+                .composer
+                .text()
+                .contains("provider cache is unavailable")
+        );
+    }
+
+    #[test]
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11183,7 +11781,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
@@ -13519,20 +14120,55 @@ mod tests {
 
     #[test]
     fn agents_controls_repair_invalid_siblings_one_field_at_a_time() {
-        let mut current = AppSettings { default_shell: Some("/missing/shell".into()), agents: std::collections::BTreeMap::from([
-            ("claude".into(), settings::AgentLaunchSettings { executable: Some("/missing/claude".into()), environment: std::collections::BTreeMap::from([("CLAUDE_CONFIG_DIR".into(), "forbidden".into())]), permission_mode: Some("plan".into()), ..Default::default() }),
-            ("codex".into(), settings::AgentLaunchSettings { executable: Some("/missing/codex".into()), ..Default::default() }),
-        ]), ..Default::default() };
+        let mut current = AppSettings {
+            default_shell: Some("/missing/shell".into()),
+            agents: std::collections::BTreeMap::from([
+                (
+                    "claude".into(),
+                    settings::AgentLaunchSettings {
+                        executable: Some("/missing/claude".into()),
+                        environment: std::collections::BTreeMap::from([(
+                            "CLAUDE_CONFIG_DIR".into(),
+                            "forbidden".into(),
+                        )]),
+                        permission_mode: Some("plan".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "codex".into(),
+                    settings::AgentLaunchSettings {
+                        executable: Some("/missing/codex".into()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
         for (field, value) in [
-            (SettingsField::Agent(Provider::Claude, AgentSetting::Executable), "/bin/sh"),
-            (SettingsField::Agent(Provider::Codex, AgentSetting::Executable), "/bin/sh"),
+            (
+                SettingsField::Agent(Provider::Claude, AgentSetting::Executable),
+                "/bin/sh",
+            ),
+            (
+                SettingsField::Agent(Provider::Codex, AgentSetting::Executable),
+                "/bin/sh",
+            ),
             (SettingsField::DefaultShell, "/bin/sh"),
-            (SettingsField::Agent(Provider::Claude, AgentSetting::Environment), "[]"),
+            (
+                SettingsField::Agent(Provider::Claude, AgentSetting::Environment),
+                "[]",
+            ),
         ] {
-            let SettingsDecision::Persist(next) = settings_update(&current, field, value) else { panic!("repair {field:?} must not reject invalid siblings") };
+            let SettingsDecision::Persist(next) = settings_update(&current, field, value) else {
+                panic!("repair {field:?} must not reject invalid siblings")
+            };
             current = next;
         }
-        assert_eq!(current.agents["claude"].permission_mode.as_deref(), Some("plan"));
+        assert_eq!(
+            current.agents["claude"].permission_mode.as_deref(),
+            Some("plan")
+        );
         current.validate().unwrap();
     }
 
@@ -13540,28 +14176,60 @@ mod tests {
     fn new_draft_uses_provider_defaults_and_keeps_composer_choices_local() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        app.settings.agents.insert("claude".into(), settings::AgentLaunchSettings {
-            executable: Some("/bin/sh".into()), model: Some("configured-model".into()), effort: Some("low".into()), permission_mode: Some("plan".into()), ..Default::default()
-        });
+        app.settings.agents.insert(
+            "claude".into(),
+            settings::AgentLaunchSettings {
+                executable: Some("/bin/sh".into()),
+                model: Some("configured-model".into()),
+                effort: Some("low".into()),
+                permission_mode: Some("plan".into()),
+                ..Default::default()
+            },
+        );
         drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
         let card = app.workspace.focused().unwrap();
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.session.launch.recipe.program, "/bin/sh");
-        assert_eq!(runtime.snapshot.selected_model.as_deref(), Some("configured-model"));
+        assert_eq!(
+            runtime.snapshot.selected_model.as_deref(),
+            Some("configured-model")
+        );
         assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("low"));
         assert_eq!(runtime.snapshot.permission_mode.as_deref(), Some("plan"));
         let target = runtime.target;
         drop(app.choose_draft_model(target, Provider::Claude, Some("conversation-model".into())));
-        assert_eq!(chat_runtime(&app, card).snapshot.selected_model.as_deref(), Some("conversation-model"));
+        assert_eq!(
+            chat_runtime(&app, card).snapshot.selected_model.as_deref(),
+            Some("conversation-model")
+        );
         // Dropping the returned task starts no provider, while the prepared
         // recipe must already contain the per-conversation override.
         drop(app.start_chat_draft(target));
-        assert!(chat_runtime(&app, card).session.launch.recipe.arguments.windows(2).any(|pair| pair == ["--model", "conversation-model"]));
-        assert!(!chat_runtime(&app, card).session.launch.recipe.arguments.iter().any(|argument| argument == "configured-model"));
+        assert!(
+            chat_runtime(&app, card)
+                .session
+                .launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--model", "conversation-model"])
+        );
+        assert!(
+            !chat_runtime(&app, card)
+                .session
+                .launch
+                .recipe
+                .arguments
+                .iter()
+                .any(|argument| argument == "configured-model")
+        );
         drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
         let next = app.workspace.focused().unwrap();
         assert_ne!(next, card);
-        assert_eq!(chat_runtime(&app, next).snapshot.selected_model.as_deref(), Some("configured-model"));
+        assert_eq!(
+            chat_runtime(&app, next).snapshot.selected_model.as_deref(),
+            Some("configured-model")
+        );
     }
 
     #[test]
@@ -13731,12 +14399,12 @@ mod tests {
         assert_eq!(flushed(&app), stored);
     }
 
-    /// A conversation that has begun keeps its account.
+    /// A started conversation retains its source until exact handoff confirmation.
     #[test]
-    fn a_begun_chat_cannot_change_account() {
+    fn a_started_chat_account_picker_starts_a_fenced_handoff() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let managed = app.account_ui.add_managed_fixture(Provider::Codex, 22);
-        let card = live_chat(&mut app, Some("thread"));
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = match app.cards.get_mut(&card) {
             Some(CardRuntime::Chat(runtime)) => {
                 Arc::make_mut(&mut runtime.snapshot).items.push(
@@ -13753,6 +14421,7 @@ mod tests {
             }
             _ => unreachable!(),
         };
+        let original = chat_runtime(&app, card).session.clone();
         let _ = app.update(Message::ChatUi(Action::AccountPicker(target, true)));
         let _ = app.update(Message::ChatUi(Action::ChooseAccount(target, managed)));
         assert!(!app.chat_ui.phases.values().any(|phase| matches!(
@@ -13765,6 +14434,12 @@ mod tests {
         assert!(
             !matches!(app.chat_ui.phases.get(&target.card), Some(Phase::Closing { target: active, .. }) if *active == target)
         );
+        let attempt = app
+            .chat_ui
+            .attempt(card)
+            .expect("started chats offer explicit account switching");
+        assert_eq!(attempt.recovery.as_ref().unwrap().source, original);
+        assert_eq!(chat_runtime(&app, card).session, original);
         match app.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => assert!(!runtime.account_picker),
             _ => unreachable!(),

@@ -89,11 +89,23 @@ Device windows read quota and account configuration from their selected
 daemon, save account preferences there, and run sign-in on that device.
 Remote Codex sign-in uses its device-code flow, so browser consent can finish
 on the desktop without forwarding localhost callbacks. Adding, linking and
-removing managed accounts operates on the daemon's device. Linked paths are
+archiving, moving and deleting managed accounts operates on the daemon's device. Linked paths are
 entered as device paths; `~/` expands to the device user's home. The daemon
 refuses removal while that home still belongs to a live hosted terminal,
 sign-in or conversation. Linked homes are forgotten without deleting their
-files. Pending sign-ins survive a window restart and are verified on the
+files. The same daemon guard applies to local windows, including idle hosted
+conversations and panes open on that home. **Archive** is the default removal
+action: the provider signs out, the account is hidden from routing, and all
+transcripts and files remain on disk. Link that home again to restore it.
+The dialog counts saved conversations and offers **Move conversations to … and
+archive** to copy every provider transcript to another account of the same
+provider before sign-out. Divergent history is never overwritten. Saved
+conversation descriptors keep their original home until an explicit account
+switch confirms the same conversation on the replacement. **Delete files
+permanently** is a separate action requiring the account name; it deletes the
+home's conversations and caches and cannot be undone.
+
+Pending sign-ins survive a window restart and are verified on the
 device before joining its account list.
 
 New Claude homes receive a one-time copy of `settings.json` and user-scoped
@@ -133,3 +145,24 @@ Provider references checked against the installed CLI versions:
 - [Claude settings and configuration locations](https://code.claude.com/docs/en/settings)
 - [Claude user-scoped MCP configuration](https://code.claude.com/docs/en/mcp)
 - [Codex 0.157.1 keyring storage implementation](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/login/src/auth/storage.rs)
+
+
+Started native conversations also expose the account picker. An explicit choice
+pins the conversation to the replacement account. When a turn, approval or
+queued message still owns work, the change waits for idle and shows “Switches
+to … after this turn”. At the idle boundary the daemon fences the exact actor,
+copies only its confirmed transcript and requires the same provider conversation
+identity before saving the replacement. A system transcript notice records the
+switch. If the transcript cannot be transferred, **Continue on … as a new
+conversation (cache lost)** opens a separate draft seeded with a bounded recent
+transcript excerpt and the unsent request; the original conversation is retained.
+The draft is editable and is not sent automatically.
+
+Automatic routing is maintained by the daemon while hosted agents exist,
+independent of window focus. Candidate accounts are probed at most once per
+30 minutes plus up to one minute of jitter. On exhaustion, stale alternatives
+are refreshed within one 12-second deadline before the send reports no available
+account. Windows adopt newer daemon snapshots from the shared cache before
+scheduling their own focused display refreshes.
+
+Provider history moves retain Codex plain and compressed rollout files, including earlier rollout versions referenced by a conversation. The displayed count is distinct provider conversation IDs. A conflicting plain/compressed representation on the destination is refused before copying. Archived homes retain the existing explicit saved-conversation resume behavior; they stay excluded from automatic routing and may require signing in again or choosing another account.
