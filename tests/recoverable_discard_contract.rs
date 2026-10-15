@@ -418,3 +418,110 @@ fn local_discard_undo_preserves_replaced_desktop_trash_directory() {
     );
     assert_eq!(fs::read(root.join("new")).unwrap(), b"original untracked");
 }
+
+#[test]
+fn local_tracked_undo_refuses_parent_moved_during_actual_blob_materialization() {
+    const NAME: &str = "local_tracked_undo_refuses_parent_moved_during_actual_blob_materialization";
+    if isolated(NAME, false) {
+        return;
+    }
+    use cagents::process::{ProcessFailure, ProcessOutput};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct MoveParent {
+        source: PathBuf,
+        moved: PathBuf,
+        armed: AtomicBool,
+    }
+    impl ProcessExecutor for MoveParent {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancel: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            if command.arguments.iter().any(|arg| arg == "cat-file")
+                && self.armed.swap(false, Ordering::SeqCst)
+            {
+                fs::rename(self.source.join("nested"), &self.moved).unwrap();
+                fs::create_dir(self.source.join("nested")).unwrap();
+                fs::write(
+                    self.source.join("nested/file"),
+                    b"foreign replacement parent\n",
+                )
+                .unwrap();
+            }
+            SystemProcessExecutor.execute(command, cancel)
+        }
+    }
+    let root = setup();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("nested/file"), b"index base\n").unwrap();
+    git(&root, &["add", "nested/file"]);
+    git(&root, &["commit", "-qm", "nested base"]);
+    fs::write(root.join("nested/file"), b"precious nested original\n").unwrap();
+    let moved = root.with_extension("moved-parent");
+    let executor = Arc::new(MoveParent {
+        source: root.clone(),
+        moved: moved.clone(),
+        armed: AtomicBool::new(false),
+    });
+    let service = RepositoryService::new("git", executor.clone())
+        .with_worktree_authority(WorktreeAuthority::capture(&root).unwrap())
+        .unwrap();
+    let result = service
+        .discard_recoverable(
+            &request(&root, &["nested/file"], &[]),
+            &CancellationToken::new(),
+            &[root.clone()],
+        )
+        .unwrap();
+    applied(&result.outcome);
+    executor.armed.store(true, Ordering::SeqCst);
+    let undo = service
+        .undo_discard(&result.recovery, &CancellationToken::new())
+        .unwrap();
+    assert!(
+        matches!(undo, MutationOutcome::NotApplied { .. }),
+        "{undo:?}"
+    );
+    assert_eq!(
+        fs::read(root.join("nested/file")).unwrap(),
+        b"foreign replacement parent\n"
+    );
+    assert_eq!(fs::read(moved.join("file")).unwrap(), b"index base\n");
+    assert_eq!(result.recovery.remaining_paths(), 1);
+    assert!(result.recovery.live_recovery.needs_resolution());
+    // Explicitly resolve this fixture's retained private materialization; no
+    // production cleanup adopts diagnostic pathnames or the lookalike parent.
+    for candidate in fs::read_dir(root.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".cagents-undo-")
+        })
+    {
+        assert_eq!(
+            fs::read(candidate.join("restored-blob")).unwrap(),
+            b"precious nested original\n"
+        );
+        fs::remove_file(candidate.join("restored-blob")).unwrap();
+    }
+    service
+        .resolve_discard_recovery(&result.recovery, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(result.recovery.remaining_paths(), 1);
+    fs::remove_file(root.join("nested/file")).unwrap();
+    fs::remove_dir(root.join("nested")).unwrap();
+    fs::rename(&moved, root.join("nested")).unwrap();
+    applied(
+        &service
+            .undo_discard(&result.recovery, &CancellationToken::new())
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read(root.join("nested/file")).unwrap(),
+        b"precious nested original\n"
+    );
+}
