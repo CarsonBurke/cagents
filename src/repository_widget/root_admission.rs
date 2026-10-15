@@ -458,6 +458,11 @@ mod tests {
         assert!(peer.events().is_empty());
         finish(&mut runtime, task).await;
         assert_eq!(runtime.editor_text().as_deref(), Some("original"));
+        let source = runtime.retained_editor_root_admissions().pop().unwrap();
+        let source_root = source.retained_root();
+        runtime.set_original_editor_root(source).unwrap();
+        assert!(Arc::ptr_eq(&source_root, &runtime.retained_original_editor_root().unwrap().retained_root()), "sibling inheritance clones the actual original descriptor");
+        drop(source_root);
         let task = runtime.open_file(card, "other.txt".into());
         finish(&mut runtime, task).await;
         assert_eq!(runtime.editor_text().as_deref(), Some("second"));

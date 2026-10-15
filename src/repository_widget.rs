@@ -3876,6 +3876,15 @@ impl RepositoryRuntime {
         Ok(())
     }
 
+    /// Pure clone for a genuine sibling tab inheriting this original Source.
+    /// A closed admission cannot initialize a new tab from an old pathname.
+    pub fn retained_original_editor_root(&self) -> Option<crate::editor::FileRootIdentity> {
+        self.original_editor_root
+            .as_ref()
+            .filter(|root| root.has_active_admission())
+            .cloned()
+    }
+
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
         if let Some(path) = self.external_source.clone() {
             self.files = FileListState::Ready(Vec::new());
