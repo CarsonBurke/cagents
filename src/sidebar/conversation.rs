@@ -53,7 +53,6 @@ impl Rows {
         if self.0.as_ref() != entries.as_slice() { self.0 = entries.into(); }
     }
     pub fn entries(&self) -> &[Entry] { &self.0 }
-    pub fn identity(&self) -> usize { Arc::as_ptr(&self.0) as *const Entry as usize }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +144,21 @@ mod tests {
             assert_eq!(actual, rows.iter().map(|row| row.target.card()).collect::<Vec<_>>());
         }
     }
+    #[test]
+    fn sidebar_end_retained_menu_key_owns_original_rows_across_unviewed_source_replacements() {
+        let mut rows = Rows::default(); rows.update(vec![row(1)]);
+        let original = Arc::downgrade(&rows.0);
+        // Native MenuItems retains this owned key across application updates.
+        // It must keep A alive even if B and C arrive before the next diff.
+        let native_key = (ChannelId::new(), rows.clone());
+        rows.update(vec![row(2)]);
+        rows.update(vec![row(3)]);
+        assert!(original.upgrade().is_some());
+        assert_ne!(native_key.1, rows);
+        drop(native_key);
+        assert!(original.upgrade().is_none());
+    }
+
     #[test]
     fn sidebar_end_snapshot_identity_changes_only_for_label_or_source_changes() {
         let original = row(1);

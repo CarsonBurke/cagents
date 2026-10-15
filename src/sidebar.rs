@@ -7240,7 +7240,7 @@ fn channel_context_controls_with_conversations<'a>(
 ) -> Element<'static, SidebarAction> {
     use widget::menu::{Item, items};
     let selection_count = selection_rows.as_ref().map(|rows| rows.len().max(1));
-    let identity = (channel_id, MenuSelectionIdentity(selection_rows.clone()), conversations.identity());
+    let identity = (channel_id, MenuSelectionIdentity(selection_rows.clone()), conversations.clone());
     if modal_open || selection_count.is_none() { return content.into(); }
     let shortcuts = shortcuts.clone();
     crate::interaction::context_menu_lazy_keyed(content, identity, move || {
@@ -7767,7 +7767,7 @@ fn context_controls_with_conversations<'a>(
         worktree_id,
         MenuSelectionIdentity(selection_rows.clone()),
         editors.generation(),
-        conversations.identity(),
+        conversations.clone(),
     );
     let shortcuts = Arc::clone(shortcuts);
     if modal_open || selection_count.is_none() {
