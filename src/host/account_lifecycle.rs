@@ -734,7 +734,13 @@ pub(crate) mod tests {
             });(ready_rx,release_tx,worker)
         };
         ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        let refused=ensure_paths(&host,[alias]).is_err();let unrelated=ensure_paths(&host,[root.path().join("other")]).is_ok();
+        let recipe=crate::model::LaunchRecipe { program:"/bin/false".into(),arguments:vec![],working_directory:root.path().to_owned(),
+            environment:BTreeMap::from([("HOME".into(),root.path().display().to_string()),("CLAUDE_CONFIG_DIR".into(),alias.display().to_string())]),unset_environment:Default::default() };
+        let terminal=crate::model::TerminalSession {id:crate::model::TerminalId::new(),owned_codex_listener:None,recovery_origin:None,predecessor:None,
+            continuity:crate::model::TerminalContinuity::RelaunchAvailable {recipe:recipe.clone(),last_exit:None},launch:recipe,transcript_path:None,resume_hint:None};
+        let refused=super::super::client::process_request(&host,1,crate::terminal_ipc::ClientRequest::Spawn {session:terminal,options:Default::default()})
+            .unwrap_err().message.contains("account home is being changed");
+        let unrelated=ensure_paths(&host,[root.path().join("other")]).is_ok();
         let gate=host.lock().unwrap().control_gate.clone();let reader=gate.try_read().is_ok();
         let moved=root.path().join("moved");std::fs::rename(&target,&moved).unwrap();let moved_refused=ensure_paths(&host,[moved.clone()]).is_err();std::fs::rename(&moved,&target).unwrap();
         let _=release_tx.send(());let result=worker.join().unwrap().unwrap();
@@ -767,4 +773,20 @@ pub(crate) mod tests {
         assert!(ensure_launch_at_directory(&host,root.path(),&BTreeMap::from([("HOME".into(),"relative".into())]),&BTreeSet::new(),false,Some(&directory)).is_err());
         drop(reservation);ensure_launch(&host,root.path(),&BTreeMap::new(),&BTreeSet::new(),false).unwrap();
     }
+    #[test]
+    fn resumed_history_raw_unset_selector_refuses_before_constructor_reads() {
+        let root=tempfile::tempdir().unwrap();let homes=Homes::at(root.path().join("homes"));let store=Store::at(root.path().join("registry"));let host=host();
+        let selected=root.path().join("selected");std::fs::create_dir(&selected).unwrap();
+        let _reservation=Reservation::test_install(&host,&[Account::linked(Provider::Claude,uuid::Uuid::new_v4(),selected.clone())],store,&homes).unwrap();
+        let session=crate::chat::Session {id:crate::model::TerminalId::new(),native_continuity:Default::default(),owned_codex_listener:None,proof:None,terminal:None,
+            launch:crate::chat::Launch {provider:Provider::Claude,session_id:Some(uuid::Uuid::new_v4().to_string()),recipe:crate::model::LaunchRecipe {
+                program:"/does-not-exist/claude".into(),arguments:vec![],working_directory:root.path().to_owned(),
+                environment:BTreeMap::from([("HOME".into(),root.path().display().to_string()),("CLAUDE_CONFIG_DIR".into(),selected.display().to_string())]),
+                unset_environment:BTreeSet::from(["CLAUDE_CONFIG_DIR".into()]),
+            }}};
+        let failure=super::super::client::process_request(&host,1,crate::terminal_ipc::ClientRequest::ChatStart {session,source:None,terminate_source:false,execution_environment:Default::default()}).unwrap_err();
+        assert!(failure.message.contains("account home is being changed"),"{}",failure.message);
+        assert!(host.lock().unwrap().chats.is_empty());assert!(host.lock().unwrap().chat_spawning.is_empty());assert!(std::fs::read_dir(selected).unwrap().next().is_none());
+    }
+
 }
