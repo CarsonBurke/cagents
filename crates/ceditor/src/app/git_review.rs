@@ -282,13 +282,17 @@ impl Editor {
         // Physical disappearance refuses effects, but must still settle the
         // exact logical request that reserved this tab's mutation/read slot.
         if !self.git_review_bound(origin.card, &origin.key) { return Task::none(); }
-        if root_identity(&origin.key.canonical_path) != Some(origin.root_identity) {
+        let root_unavailable = root_identity(&origin.key.canonical_path) != Some(origin.root_identity);
+        if root_unavailable {
             let error = "The original worktree directory was replaced; reopen it before retrying.".to_owned();
             match &mut action {
                 Action::AmendLoaded { result, .. } => *result = Err(error),
                 Action::HistoryLoaded { result, .. } => *result = Err(error),
                 Action::CommitLoaded { result, .. } => *result = Err(error),
-                Action::Committed { result, .. } => *result = Err(error),
+                // A settled commit result is a fact about its captured worker.
+                // Losing the displayed path afterward cannot turn Created into
+                // failure or discard its known outcome.
+                Action::Committed { .. } => {},
             }
         }
         match action {
@@ -324,7 +328,8 @@ impl Editor {
                 let tab = self.tab_mut(origin.card).unwrap();
                 if tab.git_review.submitted_revision != Some(revision) { return Task::none(); }
                 tab.git_review.submitted_revision = None;
-                let notice = match result {
+                let created = matches!(&result, Ok(CommitOutcome::Created { .. }));
+                let mut notice = match result {
                     Ok(CommitOutcome::Created { warnings, .. }) => {
                         self.tab_mut(origin.card).unwrap().navigation.clear_submitted_commit(&origin.key, revision);
                         (!warnings.is_empty()).then(|| warnings.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
@@ -333,6 +338,11 @@ impl Editor {
                     Ok(CommitOutcome::OutcomeUnknown { failure, .. }) => Some(format!("Commit outcome is uncertain: {failure}")),
                     Err(error) => Some(error),
                 };
+                if root_unavailable {
+                    let warning = if created { "Commit created in the captured worktree; its original directory is now unavailable. Reopen the worktree to inspect it." }
+                        else { "The original worktree directory is now unavailable. Reopen it before retrying." };
+                    notice = Some(notice.map_or_else(|| warning.to_owned(), |notice| format!("{notice}\n{warning}")));
+                }
                 for tab in &mut self.tabs { if tab.runtime.descriptor.worktree == origin.key.canonical_path { if let Some(source) = tab.sidebar.source_control.as_mut() { source.set_error(notice.clone()); } } }
                 let prior = self.notice.clone();
                 let task = self.finish_mutation(origin.card, notice);
@@ -615,6 +625,26 @@ mod tests {
             }
             assert_eq!(git(&destination, &["rev-list", "--count", "HEAD"]), "1");
         }
+    }
+
+    #[test]
+    fn standalone_known_created_commit_remains_created_after_original_root_disappears() {
+        let directory = git_fixture(); let root = directory.path(); let parked = tempfile::tempdir().unwrap();
+        let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+        sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: origin.key.clone(), message: "Captured successful commit".into() });
+        let revision = app.tab(card).unwrap().navigation.submitted_commit_revision(&origin.key, "Captured successful commit", false).unwrap();
+        assert!(app.begin_mutation(card, MutationKind::Commit).is_some());
+        app.tab_mut(card).unwrap().git_review.submitted_revision = Some(revision);
+        // Materialize the known successful worker outcome before delaying its
+        // delivery and moving the directory away.
+        git(root, &["commit", "--allow-empty", "-m", "Captured successful commit"]);
+        let oid = Oid::parse_object(git(root, &["rev-parse", "HEAD"])).unwrap();
+        let destination = parked.path().join("original"); std::fs::rename(root, &destination).unwrap();
+        drop(app.update(Message::GitReview(Action::Committed { origin, revision, result: Ok(CommitOutcome::Created { oid, warnings: Vec::new() }) })));
+        assert!(app.tab(card).unwrap().mutation.is_none());
+        assert!(app.tab(card).unwrap().navigation.commit_message().is_empty());
+        assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("Commit created") && notice.contains("unavailable")), "{:?}", app.notice);
+        assert_eq!(git(&destination, &["log", "-1", "--format=%s"]), "Captured successful commit");
     }
 
     #[test]
