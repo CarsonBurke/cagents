@@ -487,6 +487,7 @@ exec /usr/bin/git "$@"
             }
             let output = child.wait_with_output().unwrap();
             assert!(output.status.success(), "{mode}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"), "{mode}: child did not execute its owning regression: {output:?}");
         }
     }
 
@@ -744,6 +745,7 @@ exec /usr/bin/git "$@"
             }
             let output = child.wait_with_output().unwrap();
             assert!(output.status.success(), "{mode}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"), "{mode}: child did not execute its owning regression: {output:?}");
         }
     }
 
@@ -793,4 +795,26 @@ exec /usr/bin/git "$@"
             assert_eq!(git(&linked, &["symbolic-ref", "HEAD"]), "refs/heads/linked");
         }
     }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn registered_head_fences_accept_separate_checkout_without_configured_backlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "-q", "-b", "main", "--separate-git-dir", "metadata", "checkout"]);
+        let checkout = root.join("checkout");
+        let metadata = root.join("metadata");
+        fs::write(checkout.join("file"), "base").unwrap();
+        git(&checkout, &["add", "file"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+        git(&checkout, &["branch", "topic"]);
+        let oid = git(&checkout, &["rev-parse", "refs/heads/topic"]);
+        delete_branch_checked_at(&checkout, "topic", true, Some(&oid), &CancellationToken::new()).unwrap();
+        git(&checkout, &["branch", "topic"]);
+        let unknown = delete_branch_checked_at(&metadata, "topic", true, Some(&oid), &CancellationToken::new());
+        assert!(unknown.is_err(), "metadata without a primary backlink must not guess a checkout");
+        assert_eq!(git(&checkout, &["rev-parse", "refs/heads/topic"]), oid);
+        assert_eq!(git(&checkout, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    }
+
 }

@@ -141,6 +141,7 @@ impl RegisteredHeads {
         let common = service.common_dir(repository, cancel).map_err(io)?;
         let common = NamedRoot::new(Root::open(&common).map_err(io)?)?;
         let records = service.list_worktrees(repository, cancel).map_err(io)?;
+        let source = service.git_dir(repository, cancel).map_err(io)?;
         let mut result = Self {
             roots: vec![common],
             files: vec![],
@@ -232,14 +233,18 @@ impl RegisteredHeads {
             // physical checkout and exact forward locator to our held common.
             let mut record = record.clone();
             if record.path == common_path {
-                let configured = service
-                    .configured_primary_worktree(repository, cancel)
-                    .map_err(io)?;
+                let configured = if source == common_path {
+                    // An actual primary checkout needs no core.worktree. Ask
+                    // only this invocation, whose private metadata is common;
+                    // metadata-only invocations without a backlink refuse.
+                    service.invocation_worktree(repository, cancel).map_err(io)?
+                } else {
+                    service.configured_primary_worktree(repository, cancel).map_err(io)?
+                };
                 record.path = fs::canonicalize(common_path.join(configured)).map_err(io)?;
             }
             result.associate(&record, 0)?;
         }
-        let source = service.git_dir(repository, cancel).map_err(io)?;
         result.source_admin = result
             .heads
             .iter()
