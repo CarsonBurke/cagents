@@ -2574,12 +2574,8 @@ impl Runtime {
                 anchor.as_deref() != current_anchor || !chat::requires_sign_in(provider, message)
             });
         }
-        let mut turns = turns;
-        if snapshot.outcome.is_some() && (!snapshot.is_working() || snapshot.exited) {
-            for turn in &mut turns {
-                turn.running = false;
-            }
-        }
+        // Foreground cleanup is authoritative per item. A parent terminal
+        // outcome alone must not retire still-running unbound/background work.
         self.turns = turns;
         reconcile_disclosure(&mut self.opened, &self.turns);
         if snapshot.error != self.snapshot.error

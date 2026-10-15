@@ -5029,6 +5029,10 @@ mod tests {
         snapshot.busy = false;
         snapshot.finished_at = Some(42);
         snapshot.outcome = Some(crate::agent::ActivityOutcome::Cancelled);
+        // The producer has confirmed cleanup of this exact foreground tool.
+        if let ItemContent::Command { status, .. } = &mut Arc::make_mut(&mut snapshot.items[0]).content {
+            *status = chat::ToolStatus::Stopped;
+        }
         handle.replace_snapshot_for_test(snapshot);
         runtime.refresh();
         assert!(runtime.turns.iter().all(|turn| !turn.running));
@@ -5178,6 +5182,52 @@ mod tests {
         assert!(Arc::ptr_eq(&projection, &runtime.snapshot.turn_outcomes));
         assert!(!runtime.turn_outcome_markers.contains_key("part-A2"));
         assert!(runtime.turn_outcome_markers.contains_key("part-B"), "role correction changes user preference without changing any item ID");
+    }
+
+    #[test]
+    fn attention_exact_foreground_status_stops_only_its_old_turn_and_preserves_busy_and_background_work() {
+        use chat::turn_outcomes::{TurnIdentity, TurnIdentityKind, TurnOutcome, TurnOutcomeProjection, VisibleTurnOutcome};
+        let user = |id: &str| chat::Item { id: id.into(), role: chat::Role::User, started_at: Some(1000), at: Some(1000),
+            content: ItemContent::Text { text: id.into(), thinking: false, phase: chat::Phase::Final } };
+        let tool = |id: &str| chat::Item { id: id.into(), role: chat::Role::Assistant, started_at: Some(1000), at: Some(2000),
+            content: ItemContent::Command { label: id.into(), command: "sleep 600".into(), working_directory: "/project".into(),
+                action: chat::CommandAction::Run, status: chat::ToolStatus::Running, exit_code: None, duration_ms: None, output: String::new() } };
+        let items = [user("input-A"), tool("tool-A"), user("unknown-owner"), tool("background-control"), user("input-B"), tool("tool-B")];
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.session_id = Some("proved-session".into());
+        snapshot.turn_generation = 2;
+        snapshot.busy = true;
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone()); runtime.refresh();
+        assert!(runtime.turns.iter().all(|turn| turn.running));
+        // EndItems/producer cleanup supplies this exact terminal tool status.
+        // The UI does not infer tool ownership from the preceding user bubble.
+        if let ItemContent::Command { status, .. } = &mut Arc::make_mut(&mut snapshot.items[1]).content { *status = chat::ToolStatus::Stopped; }
+        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection { revision: 1, complete: true, records: vec![VisibleTurnOutcome {
+            outcome: TurnOutcome { identity: TurnIdentity { session_id: "proved-session".into(), kind: TurnIdentityKind::AcceptedInput, id: "confirmed-A".into() },
+                outcome: crate::agent::ActivityOutcome::Cancelled, finished_at: 3000 }, item_ids: vec!["input-A".into(), "tool-A".into()],
+        }] });
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone()); runtime.refresh();
+        let glyph = |runtime: &Runtime, id: &str| runtime.turns.iter().find(|turn| turn.steps.iter()
+            .any(|placed| runtime.snapshot.items[placed.index].id == id)).unwrap().glyph();
+        assert_eq!(glyph(&runtime, "tool-A"), Some(chat::ToolStatus::Stopped));
+        assert_eq!(glyph(&runtime, "tool-B"), Some(chat::ToolStatus::Running));
+        assert_eq!(glyph(&runtime, "background-control"), Some(chat::ToolStatus::Running));
+        assert!(runtime.turn_outcome_markers["input-A"].label.starts_with("Cancelled"));
+        assert!(runtime.snapshot.outcome.is_none());
+        assert!(runtime.snapshot.busy);
+        if let ItemContent::Command { status, .. } = &mut Arc::make_mut(&mut snapshot.items[5]).content { *status = chat::ToolStatus::Succeeded; }
+        snapshot.busy = false;
+        snapshot.finished_at = Some(4000);
+        snapshot.outcome = Some(crate::agent::ActivityOutcome::Succeeded);
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot); runtime.refresh();
+        assert_eq!(glyph(&runtime, "tool-A"), Some(chat::ToolStatus::Stopped));
+        assert_eq!(glyph(&runtime, "tool-B"), Some(chat::ToolStatus::Succeeded));
+        assert_eq!(glyph(&runtime, "background-control"), Some(chat::ToolStatus::Running),
+            "a terminal current scalar never proves an unbound/background task stopped");
     }
 
     #[test]
