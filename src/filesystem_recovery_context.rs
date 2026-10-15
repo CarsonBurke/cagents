@@ -201,9 +201,17 @@ mod tests {
         let outside = Arc::new(Root::open(&outside_path).unwrap());
         // An isolated static observation suffices for inspecting placement,
         // but does not provide the owned enrollment needed before effects.
-        let placement = RecoveryPlacement::acquire(outside, source.clone(), Arc::from([source.clone()]),
-            RecoveryRegistryCheck::new(Arc::new(|| Ok(())), 0)).unwrap();
-        let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false).unwrap()));
+        let placement = RecoveryPlacement::acquire(
+            outside,
+            source.clone(),
+            Arc::from([source.clone()]),
+            RecoveryRegistryCheck::new(Arc::new(|| Ok(())), 0),
+        )
+        .unwrap();
+        let protection = Arc::new(Some(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false)
+                .unwrap(),
+        ));
         let context = FilesystemRecoveryContext::new(&source, protection, placement).unwrap();
         assert!(context.reserve_directory().is_err());
         assert!(std::fs::read_dir(outside_path).unwrap().next().is_none());

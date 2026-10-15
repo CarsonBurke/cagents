@@ -17,9 +17,18 @@ mod publication;
 pub enum SavedEntry {
     Absent,
     Trashed,
-    Unavailable { reason: String },
-    Blob { oid: Oid, mode: u32, bytes: u64, access: SavedFileAccess },
-    Symlink { target: PathBuf },
+    Unavailable {
+        reason: String,
+    },
+    Blob {
+        oid: Oid,
+        mode: u32,
+        bytes: u64,
+        access: SavedFileAccess,
+    },
+    Symlink {
+        target: PathBuf,
+    },
 }
 
 // Opaque, inert metadata authenticated on the original backup FD. Keeping
@@ -33,34 +42,59 @@ pub struct SavedFileAccess {
     acl: Option<Arc<[u8]>>,
 }
 fn access_version(metadata: &fs::Metadata) -> ((u64, u64, u64, i64, i64, i64, i64), u32, u32, u32) {
-    (metadata_version(metadata), metadata.mode(), metadata.uid(), metadata.gid())
+    (
+        metadata_version(metadata),
+        metadata.mode(),
+        metadata.uid(),
+        metadata.gid(),
+    )
 }
 impl SavedFileAccess {
     fn capture(file: &fs::File) -> Result<Self, String> {
         let before = file.metadata().map_err(|error| error.to_string())?;
         let acl = fs_safety::capture_access_acl(file).map_err(|error| error.to_string())?;
-        if acl.as_ref().is_some_and(|bytes| bytes.len() > MAX_ACCESS_ACL_BYTES) {
-            return Err("The original access ACL exceeds the bounded recovery metadata limit".into());
+        if acl
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > MAX_ACCESS_ACL_BYTES)
+        {
+            return Err(
+                "The original access ACL exceeds the bounded recovery metadata limit".into(),
+            );
         }
         let after = file.metadata().map_err(|error| error.to_string())?;
         if !before.is_file() || access_version(&before) != access_version(&after) {
             return Err("The original file access policy changed while being backed up".into());
         }
-        Ok(Self { uid: before.uid(), gid: before.gid(), acl: acl.map(Arc::from) })
+        Ok(Self {
+            uid: before.uid(),
+            gid: before.gid(),
+            acl: acl.map(Arc::from),
+        })
     }
     fn verify(&self, file: &fs::File) -> Result<(), String> {
         let before = file.metadata().map_err(|error| error.to_string())?;
         if (before.uid(), before.gid()) != (self.uid, self.gid)
-            || fs_safety::capture_access_acl(file).map_err(|error| error.to_string())?.as_deref() != self.acl.as_deref()
-            || access_version(&before) != access_version(&file.metadata().map_err(|error| error.to_string())?) {
-            return Err("The recovery file's original ownership or access ACL could not be preserved".into());
+            || fs_safety::capture_access_acl(file)
+                .map_err(|error| error.to_string())?
+                .as_deref()
+                != self.acl.as_deref()
+            || access_version(&before)
+                != access_version(&file.metadata().map_err(|error| error.to_string())?)
+        {
+            return Err(
+                "The recovery file's original ownership or access ACL could not be preserved"
+                    .into(),
+            );
         }
         Ok(())
     }
     fn install(&self, file: &fs::File, mode: u32) -> Result<(), String> {
-        fs_safety::restore_ownership(file, self.uid, self.gid).map_err(|error| error.to_string())?;
-        file.set_permissions(fs::Permissions::from_mode(mode)).map_err(|error| error.to_string())?;
-        fs_safety::restore_access_acl(file, self.acl.as_deref()).map_err(|error| error.to_string())?;
+        fs_safety::restore_ownership(file, self.uid, self.gid)
+            .map_err(|error| error.to_string())?;
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|error| error.to_string())?;
+        fs_safety::restore_access_acl(file, self.acl.as_deref())
+            .map_err(|error| error.to_string())?;
         self.verify(file)?;
         if file.metadata().map_err(|error| error.to_string())?.mode() & 0o7777 != mode & 0o7777 {
             return Err("The kernel did not preserve the original recovery mode after ownership/access restoration".into());

@@ -315,7 +315,11 @@ fn prepare_recovery_directory_using<T: Send + 'static>(
     ) -> Result<DirectoryCreation, DirectoryCreateError>,
 ) -> Result<RecoveryDirectory<T>, RecoveryDirectoryError> {
     let (context, slot) = admission.into_parts();
-    let reserved = ReservedDirectoryOwner { owner, context, slot };
+    let reserved = ReservedDirectoryOwner {
+        owner,
+        context,
+        slot,
+    };
     if components(Path::new(leaf)).is_none_or(|parts| parts.len() != 1) {
         return Err(RecoveryDirectoryError::Rejected(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -354,7 +358,11 @@ fn prepare_recovery_directory_using<T: Send + 'static>(
             let cause = io::Error::other(format!(
                 "Recovery holding has no creation authority: {reason}"
             ));
-            let ReservedDirectoryOwner { owner, context, slot } = reserved;
+            let ReservedDirectoryOwner {
+                owner,
+                context,
+                slot,
+            } = reserved;
             let recovery = slot.retain("Unverified recovery holding was left untouched".into(), move || {
                 // Preserve the observed Root and the original domain obligation.
                 // No automatic deletion/chmod or later ownership conversion.
@@ -372,7 +380,11 @@ fn prepare_recovery_directory_using<T: Send + 'static>(
             let Some(mut preparation) = error.take_recovery() else {
                 return Err(RecoveryDirectoryError::Rejected(cause));
             };
-            let ReservedDirectoryOwner { owner, context, slot } = reserved;
+            let ReservedDirectoryOwner {
+                owner,
+                context,
+                slot,
+            } = reserved;
             let recovery = slot.retain(
                 "Private holding staging requires retained cleanup".into(),
                 move || {
@@ -385,7 +397,11 @@ fn prepare_recovery_directory_using<T: Send + 'static>(
             return Err(RecoveryDirectoryError::Retained { cause, recovery });
         }
     };
-    let ReservedDirectoryOwner { owner, context, slot } = reserved;
+    let ReservedDirectoryOwner {
+        owner,
+        context,
+        slot,
+    } = reserved;
     let mut pending = PendingDirectory {
         publication,
         owner,
@@ -686,7 +702,9 @@ mod tests {
         _runtime: tempfile::TempDir,
     }
     impl RecoveryRegistrationLease for UnknownEnrollment {
-        fn validate(&self) -> io::Result<()> { Ok(()) }
+        fn validate(&self) -> io::Result<()> {
+            Ok(())
+        }
         fn begin_payload_creation(&self) -> io::Result<Arc<dyn Send + Sync>> {
             // This complete isolated test topology grants only counted owned
             // creation admission. Sealing blocks new work, never old cleanup.
@@ -700,7 +718,9 @@ mod tests {
                 .expect("bounded fixture admission");
             Ok(Arc::new(UnknownCreationGuard(self.creation.clone())))
         }
-        fn descriptor_budget(&self) -> usize { 1 }
+        fn descriptor_budget(&self) -> usize {
+            1
+        }
         fn register_payload(&self, root: &Root) -> io::Result<()> {
             let mut held = self.payload.lock().unwrap();
             if let Some(original) = held.as_ref() {
@@ -736,10 +756,20 @@ mod tests {
         let parent = Arc::new(Root::open(outside.path()).unwrap());
         // Complete isolated topology; the owned lease deliberately records the
         // real original Root BEFORE returning unknown, as a daemon handoff can.
-        let registry = Arc::new(UnknownEnrollment { creation: Arc::default(), attempts: std::sync::atomic::AtomicUsize::new(0),
-            payload: std::sync::Mutex::new(None), _outside: outside, _runtime: runtime });
-        let placement = RecoveryPlacement::acquire(parent.clone(), source.clone(), Arc::from([source.clone()]),
-            RecoveryRegistryCheck::from_lease(registry.clone())).unwrap();
+        let registry = Arc::new(UnknownEnrollment {
+            creation: Arc::default(),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            payload: std::sync::Mutex::new(None),
+            _outside: outside,
+            _runtime: runtime,
+        });
+        let placement = RecoveryPlacement::acquire(
+            parent.clone(),
+            source.clone(),
+            Arc::from([source.clone()]),
+            RecoveryRegistryCheck::from_lease(registry.clone()),
+        )
+        .unwrap();
         let context = FilesystemRecoveryContext::new(&source, protection, placement).unwrap();
         let error = prepare_recovery_directory(
             context.reserve_directory().unwrap(),
@@ -748,17 +778,42 @@ mod tests {
         )
         .unwrap_err();
         let recovery = error.recovery().unwrap();
-        assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert_eq!(registry.creation.lock().unwrap().in_flight, 1);
         registry.creation.lock().unwrap().sealed = true;
-        assert!(context.reserve_directory().is_err(), "retirement refuses new mkdir admission");
-        assert!(recovery.retry().is_err()); assert!(!recovery.is_resolved());
-        assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(parent.path().join("holding").is_dir(), "unknown enrollment must not remove H");
-        assert_eq!(registry.creation.lock().unwrap().in_flight, 1, "same-slot uncertain recovery retains creation admission");
-        recovery.retry().unwrap(); assert!(recovery.is_resolved());
-        assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert_eq!(registry.creation.lock().unwrap().in_flight, 0, "positive retry cleanup releases the final original slot guard");
+        assert!(
+            context.reserve_directory().is_err(),
+            "retirement refuses new mkdir admission"
+        );
+        assert!(recovery.retry().is_err());
+        assert!(!recovery.is_resolved());
+        assert_eq!(
+            registry.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(
+            parent.path().join("holding").is_dir(),
+            "unknown enrollment must not remove H"
+        );
+        assert_eq!(
+            registry.creation.lock().unwrap().in_flight,
+            1,
+            "same-slot uncertain recovery retains creation admission"
+        );
+        recovery.retry().unwrap();
+        assert!(recovery.is_resolved());
+        assert_eq!(
+            registry.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        assert_eq!(
+            registry.creation.lock().unwrap().in_flight,
+            0,
+            "positive retry cleanup releases the final original slot guard"
+        );
         assert!(names(&parent).is_empty());
     }
 
@@ -934,7 +989,8 @@ mod tests {
                 )
                 .unwrap(),
             ));
-            let context = FilesystemRecoveryContext::new(&source_root, protection, placement).unwrap();
+            let context =
+                FilesystemRecoveryContext::new(&source_root, protection, placement).unwrap();
             fs::write(source.path().join("original"), b"retained original").unwrap();
             let file = Arc::new(fs::File::open(source.path().join("original")).unwrap());
             let weak = Arc::downgrade(&file);
