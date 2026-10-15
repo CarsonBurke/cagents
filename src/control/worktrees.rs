@@ -109,9 +109,17 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
             ("worktree.list",json!({"schema_version":1,"worktrees":worktrees}),human)
         }
         Reply::BranchDeleted {..}|Reply::BranchDeleteRefused {..}=>return Err(AppError::new("protocol","Unexpected branch-deletion response")),
+        Reply::StaleLock {..}=>return Err(AppError::new("protocol","Unexpected stale-lock response")),
         Reply::ResolvedProject {..}=>return Err(AppError::new("protocol","Unexpected project-ID response")),
         Reply::Inspected {..}=>return Err(AppError::new("protocol","Unexpected worktree inspection response")),
-        Reply::Removed {path,branch_deleted}=>("worktree.remove",json!({"schema_version":1,"path":path,"branch_deleted":branch_deleted}),format!("Removed {}{}",path.display(),branch_deleted.map(|branch|format!(" and branch {branch}")).unwrap_or_default())),
+        Reply::Removed {path,branch_deleted,warnings,branch_error}=> {
+            let data=json!({"schema_version":1,"path":path,"branch_deleted":branch_deleted,"warnings":warnings,"branch_error":branch_error});
+            if let Some(error)=branch_error {return Err(AppError {kind:"worktree_branch",message:error,details:Some(data)});}
+            let mut human=format!("Removed {}{}",path.display(),branch_deleted.map(|branch|format!(" and branch {branch}")).unwrap_or_default());
+            for warning in warnings {human.push_str(&format!("\nWarning: {warning}"));}
+            ("worktree.remove",data,human)
+        }
+
     };
     Ok(CommandOutput {command,data,human})
 }

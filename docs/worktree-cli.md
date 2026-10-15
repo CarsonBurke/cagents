@@ -43,7 +43,9 @@ object has `schema_version: 1`:
 - `worktree.create`: `worktree`, `warnings` (strings), `setup` (null or
   `{ command, terminal, error }`), and `agent` when requested and accepted.
 - `worktree.list`: `worktrees` (array of entries).
-- `worktree.remove`: `path`, `branch_deleted` (null when retained).
+- `worktree.remove`: `path`, `branch_deleted` (null when retained), `warnings` (strings), and
+  `branch_error` (null unless the requested safe branch deletion failed).
+  A branch error returns non-zero with these committed removal details.
 
 A worktree entry contains `path`, `branch` (short name or null), `head_oid`,
 `primary`, `detached`, `locked`, `dirty`, `ahead`, `behind`, and `live_sessions`

@@ -22,6 +22,7 @@ pub enum Operation {
         expected_fingerprint: Option<String>,
     },
     Inspect { repository:PathBuf, path:PathBuf },
+    StaleLock { repository:PathBuf, path:PathBuf, unlock:bool },
     SetDisposableIgnoredDirectories { repository:PathBuf, path:PathBuf, directories:Vec<String> },
     DeleteBranch { repository:PathBuf, branch:String, force:bool, expected_oid:Option<String> },
 }
@@ -34,11 +35,12 @@ impl Operation {
             | Self::List { repository }
             | Self::Remove { repository, .. }
             | Self::Inspect { repository, .. }
+            | Self::StaleLock { repository, .. }
             | Self::SetDisposableIgnoredDirectories { repository, .. }
             | Self::DeleteBranch {repository,..} => Some(repository),
         }
     }
-    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::Inspect { .. } | Self::ResolveProject { .. }) }
+    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::Inspect { .. } | Self::ResolveProject { .. } | Self::StaleLock {unlock:false,..}) }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +63,8 @@ pub enum Reply {
     ResolvedProject {repository:PathBuf},
     Created { worktree: Entry, warnings: Vec<String>, setup: Option<Setup> },
     Listed { worktrees: Vec<Entry> },
-    Removed { path: PathBuf, branch_deleted: Option<String> },
+    Removed { path: PathBuf, branch_deleted: Option<String>, warnings:Vec<String>, branch_error:Option<String> },
+    StaleLock {unlocked:bool},
     /// Repository snapshots keep their byte-exact path schema without pulling
     /// the daemon's Git/SQLite implementation into the control CLI.
     Inspected { snapshot:String, disposable_ignored_directories:Vec<String> },

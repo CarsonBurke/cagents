@@ -464,7 +464,7 @@ pub(super) fn process_request(
                 operation: crate::device_service::Operation::AccountLifecycle { .. }
             }
             | ClientRequest::DeviceOperation {
-                operation: crate::device_service::Operation::Worktree { operation: crate::worktree_control::Operation::Remove { .. } | crate::worktree_control::Operation::DeleteBranch { .. } }
+                operation: crate::device_service::Operation::Worktree { operation: crate::worktree_control::Operation::Remove { .. } | crate::worktree_control::Operation::DeleteBranch { .. } | crate::worktree_control::Operation::StaleLock {unlock:true,..} }
             }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));

@@ -113,16 +113,29 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
             let command=if force&&safety.files_to_discard()>0 { command.arg("--force") } else {command};
             let command=command.arg("--").arg(&record.path).timeout(std::time::Duration::from_secs(30));
             SystemProcessExecutor.execute(&command,&cancellation).and_then(|output|output.require_success(&command.program)).map_err(|error|error.reported_detail())?;
-            crate::repository::release_deleted_worktree_creations(&store,&removed)
-                .map_err(|failures|format!("Worktree was removed, but its creation receipt could not be retired: {}",failures.into_iter().map(|error|error.to_string()).collect::<Vec<_>>().join("; ")))?;
+            let mut warnings=Vec::new();
+            if let Err(failures)=crate::repository::release_deleted_worktree_creations(&store,&removed) {
+                warnings.push(format!("Worktree was removed, but its creation receipt could not be retired: {}",failures.into_iter().map(|error|error.to_string()).collect::<Vec<_>>().join("; ")));
+            }
+            let mut branch_error=None;
             let branch_deleted=if delete {
                 if let Some(branch)=&record.branch {
-                    delete_branch(&repository,branch.strip_prefix("refs/heads/").unwrap_or(branch),false,&cancellation).map_err(|error|format!("Worktree was removed, but its branch was retained: {error}"))?;
-                    Some(branch.strip_prefix("refs/heads/").unwrap_or(branch).to_owned())
+                    let branch=branch.strip_prefix("refs/heads/").unwrap_or(branch);
+                    match delete_branch(&repository,branch,false,&cancellation) {
+                        Ok(())=>Some(branch.to_owned()),
+                        Err(error)=> {branch_error=Some(format!("Worktree was removed, but its branch was retained: {error}"));None}
+                    }
                 } else {None}
             } else {None};
-            Ok(Reply::Removed {path:record.path.clone(),branch_deleted})
+            Ok(Reply::Removed {path:record.path.clone(),branch_deleted,warnings,branch_error})
         }
+        Operation::StaleLock {repository,path,unlock} => {
+            same_repository(&service,&repository,&path,&cancellation)?;
+            if unlock {service.unlock_stale_worktree(&store,&repository,&path,&cancellation)?;}
+            else {service.stale_worktree_lock(&store,&repository,&path,&cancellation)?;}
+            Ok(Reply::StaleLock {unlocked:unlock})
+        }
+
         Operation::DeleteBranch {repository,branch,force,expected_oid} => {
             if force&&expected_oid.is_none() {
                 return Ok(Reply::BranchDeleteRefused {failure:BranchDeleteFailure {kind:BranchDeleteFailureKind::Other,detail:"Force deletion requires the branch commit shown in confirmation".into()}});
