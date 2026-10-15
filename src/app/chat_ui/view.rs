@@ -6178,6 +6178,19 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_conversation_releases_catalog_and_selection_contexts() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
+        let (catalog, _) = runtime.selection_document();
+        let backing = Arc::downgrade(&catalog);
+        assert!(catalog.retained_plain_bytes() > 0);
+        drop(catalog);
+        runtime.forget_transcript();
+        assert!(runtime.selection_document.borrow().is_none());
+        assert!(runtime.selection_bookmarks.borrow().is_empty());
+        assert!(backing.upgrade().is_none(), "no orphan logical plaintext owner survives reset");
+    }
+
+    #[test]
     fn notice_projection_keeps_exact_visible_newlines() {
         for body in ["short", "short\n", "short\n\n"] {
             assert_eq!(visible_notice_body(body, false), body);

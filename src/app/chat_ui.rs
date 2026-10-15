@@ -2179,6 +2179,8 @@ impl Runtime {
         self.scroll = view::Scroll::default();
         self.observed_scroll.borrow_mut().clear();
         self.scroll_memory.clear();
+        self.selection_document.get_mut().take();
+        self.selection_bookmarks.get_mut().clear();
         self.asked_after.clear();
         self.asked.clear();
         self.find_disclosure = find::Disclosure::default();
@@ -2434,6 +2436,8 @@ impl Runtime {
         self.subagent_scroll
             .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
         self.observed_scroll.borrow_mut().retain(|id, _| id.as_ref().is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id)));
+        self.selection_bookmarks.get_mut().retain(|id, _| id.as_ref().is_none_or(|id| snapshot.subagents.iter().any(|agent| &agent.id == id)));
+        self.scroll_memory.retain_children(&snapshot.subagents);
         self.settle_recalls(&snapshot);
         self.taken_back.retain(|id| {
             snapshot
