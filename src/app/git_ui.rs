@@ -3491,7 +3491,7 @@ mod tests {
             if !failed_metadata {
                 assert_eq!(row.operation, Some(GitOperationKind::Merge));
                 assert!(row.status_tooltip_for_test().contains("Merge in progress"));
-            } else { assert!(row.status_tooltip_for_test().contains("operation metadata unavailable")); }
+            } else { assert!(row.status_tooltip_for_test().contains("Git operation unavailable")); }
             let entry = &app.refresh_ui.git.entries[&key.project_id];
             assert_eq!(entry.generation, 9);
             assert_eq!(entry.snapshot.worktrees.len(), 1, "duplicate presentation does not replace watcher ownership");
