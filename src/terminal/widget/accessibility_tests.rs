@@ -809,7 +809,7 @@ fn scoped_native_root_and_stable_focus_handoff_share_the_operation_identity() {
         let mut tree = widget_tree(&widget);
         operation::Focusable::unfocus(tree.state.downcast_mut::<WidgetState>());
         let node = layout::Node::new(Size::new(640.0, 320.0));
-        let mut focus = operation::focus(parent);
+        let mut focus = operation::focusable::focus::<()>(parent);
         widget.operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
         assert!(operation::Focusable::is_focused(tree.state.downcast_ref::<WidgetState>()));
         let mut observed = Focused::default();
@@ -1910,7 +1910,7 @@ impl HeldKeyWidget {
         assert!(reviewing(&self._tree));
         // The actual winit native focus path operates first. Its next tree
         // publication can observe the new focus before the A11y event update.
-        let mut unfocus = operation::unfocus();
+        let mut unfocus = operation::focusable::unfocus::<()>();
         self._widget.operate(&mut self._tree, Layout::new(&node), &self._renderer, &mut unfocus);
         let _ = self._widget.a11y_nodes(Layout::new(&node), &self._tree, mouse::Cursor::Unavailable);
         assert!(!reviewing(&self._tree));
