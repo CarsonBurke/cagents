@@ -1040,6 +1040,7 @@ impl Cagents {
             }
             project.channels.truncate(index);
         }
+        self.refresh_sidebar_conversations();
     }
 }
 

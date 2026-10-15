@@ -32,3 +32,141 @@ impl std::fmt::Debug for ConversationEndTarget {
             .finish_non_exhaustive()
     }
 }
+
+
+/// Captured parameters are cached with their navigation row, never reconstructed
+/// from a CardId after the user activates an old menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub title: String,
+    pub target: Arc<ConversationEndTarget>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Rows(Arc<[Entry]>);
+impl PartialEq for Rows {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for Rows {}
+impl Rows {
+    pub(crate) fn update(&mut self, entries: Vec<Entry>) {
+        if self.0.as_ref() != entries.as_slice() { self.0 = entries.into(); }
+    }
+    pub fn entries(&self) -> &[Entry] { &self.0 }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EndCommand<'a>(&'a Arc<ConversationEndTarget>);
+impl cosmic::widget::menu::Action for EndCommand<'_> {
+    type Message = super::SidebarAction;
+    fn message(&self) -> Self::Message {
+        super::commands::registered(super::SidebarAction::EndConversation(Arc::clone(self.0)))
+    }
+}
+
+/// Native menus construct their tree only when opened. Bound each folder's
+/// fanout, preserve durable order, and retain every conversation at any scale.
+/// Total construction is linear in this one scope, not in the entire workspace.
+const MENU_FANOUT: usize = 24;
+fn entries(rows: &[Entry], offset: usize) -> Vec<cosmic::widget::menu::Item<EndCommand<'_>, String>> {
+    use cosmic::widget::menu::Item;
+    if rows.len() <= MENU_FANOUT {
+        return rows.iter().enumerate().map(|(index, row)| Item::Button(format!("{}. {}", offset + index + 1, row.title), None, EndCommand(&row.target))).collect();
+    }
+    let mut chunk = MENU_FANOUT;
+    while rows.len().div_ceil(chunk) > MENU_FANOUT { chunk = chunk.saturating_mul(MENU_FANOUT); }
+    rows.chunks(chunk).enumerate().map(|(index, group)| {
+        let start = offset + index * chunk;
+        Item::Folder(format!("Conversations {}–{}", start + 1, start + group.len()), entries(group, start))
+    }).collect()
+}
+
+pub(super) fn append_menu(
+    menu: &mut Vec<cosmic::widget::menu::Tree<super::SidebarAction>>,
+    rows: &Rows,
+    _shortcuts: &crate::settings::KeyboardShortcuts,
+) {
+    if rows.0.is_empty() { return; }
+    use cosmic::widget::menu::{Item, items};
+    // One registered template serves every captured parameter, but its
+    // generic keyboard binding addresses the focused conversation. Assigning
+    // that one chord to all parameterized entries would misleadingly choose
+    // an arbitrary last row. These captured targets have no implicit chord.
+    menu.extend(items(&std::collections::HashMap::new(), vec![Item::Divider, Item::Folder(
+        super::commands::label(crate::workspace_widget::GlobalShortcut::EndConversation).to_owned(),
+        entries(&rows.0, 0),
+    )]));
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::widget::menu::Item;
+
+    fn row(index: usize) -> Entry {
+        let session = crate::chat::Session {
+            id: crate::model::TerminalId::new(), proof: None, terminal: None, owned_codex_listener: None,
+            native_continuity: Default::default(), launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex, session_id: Some(format!("conversation-{index}")),
+                recipe: crate::model::LaunchRecipe { program: "codex".into(), arguments: Vec::new(),
+                    working_directory: "/fixture".into(), environment: Default::default(), unset_environment: Default::default() },
+            },
+        };
+        Entry { title: format!("Conversation {index}"), target: Arc::new(ConversationEndTarget {
+            card: CardId::new(), registry: uuid::Uuid::new_v4(),
+            issued: Arc::new(session.clone()), observed: Arc::new(session),
+            channel: None, channel_project: None, worktree: None,
+            shared_scope: None, shared_repository: None, shared_worktree: None,
+        }) }
+    }
+    fn collect(items: &[Item<EndCommand<'_>, String>], out: &mut Vec<CardId>) {
+        assert!(items.len() <= MENU_FANOUT);
+        for item in items {
+            match item {
+                Item::Folder(_, children) => collect(children, out),
+                Item::Button(_, _, command) => {
+                    let super::super::SidebarAction::RunCommand { command: template, action } = cosmic::widget::menu::Action::message(command) else { panic!("registered template"); };
+                    assert_eq!(template, crate::workspace_widget::GlobalShortcut::EndConversation);
+                    let super::super::SidebarAction::EndConversation(target) = *action else { panic!("source-bound parameter"); };
+                    out.push(target.card());
+                }
+                _ => panic!("only bounded folders and captured conversation actions"),
+            }
+        }
+    }
+    #[test]
+    fn sidebar_end_submenus_bound_fanout_without_dropping_or_retargeting_hidden_rows() {
+        for count in [0, 1, 24, 25, 576, 577] {
+            let rows: Vec<_> = (0..count).map(row).collect();
+            let mut actual = Vec::new();
+            collect(&entries(&rows, 0), &mut actual);
+            assert_eq!(actual, rows.iter().map(|row| row.target.card()).collect::<Vec<_>>());
+        }
+    }
+    #[test]
+    fn sidebar_end_retained_menu_key_owns_original_rows_across_unviewed_source_replacements() {
+        let mut rows = Rows::default(); rows.update(vec![row(1)]);
+        let original = Arc::downgrade(&rows.0);
+        // Native MenuItems retains this owned key across application updates.
+        // It must keep A alive even if B and C arrive before the next diff.
+        let native_key = (ChannelId::new(), rows.clone());
+        rows.update(vec![row(2)]);
+        rows.update(vec![row(3)]);
+        assert!(original.upgrade().is_some());
+        assert_ne!(native_key.1, rows);
+        drop(native_key);
+        assert!(original.upgrade().is_none());
+    }
+
+    #[test]
+    fn sidebar_end_snapshot_identity_changes_only_for_label_or_source_changes() {
+        let original = row(1);
+        let mut rows = Rows::default(); rows.update(vec![original.clone()]);
+        let captured = rows.clone();
+        rows.update(vec![original.clone()]); assert_eq!(rows, captured);
+        let mut renamed = original.clone(); renamed.title = "Renamed conversation".into();
+        rows.update(vec![renamed]); assert_ne!(rows, captured);
+        assert_eq!(captured.entries(), &[original]);
+    }
+}

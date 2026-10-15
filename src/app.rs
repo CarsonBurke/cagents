@@ -49,6 +49,7 @@ mod settings_ui;
 mod settings_watch;
 mod shared_views;
 mod sidebar_selection_ui;
+mod sidebar_conversations;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
@@ -20067,6 +20068,7 @@ impl Application for Cagents {
                     }
                     SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
                     SidebarAction::RunBound { .. } | SidebarAction::RunCommand { .. } | SidebarAction::RunChangeCommand { .. } | SidebarAction::RunChangeGroup { .. } => unreachable!("registered commands are validated before dispatch"),
+                    SidebarAction::EndConversation(target) => self.request_conversation_end(target),
                     SidebarAction::DeleteRows(rows) => {
                         if rows.len() == 1 {
                             self.delete_sidebar_row(rows[0])
@@ -22087,21 +22089,21 @@ impl Application for Cagents {
                             };
                             self.run_workspace_command(command, modifiers)
                         }
-                    None => {
-                        // The subscription also reports the native text
-                        // control's captured press and ignored release. Only
-                        // after every local/global handler declined the event
-                        // can an ordinary character be projection-neutral.
-                        // Modified chords and non-character keys stay
-                        // conservative; a bound bare character took Some above.
-                        if matches!(&event,
-                            keyboard::Event::KeyPressed { key: keyboard::Key::Character(_), modifiers, .. }
-                            | keyboard::Event::KeyReleased { key: keyboard::Key::Character(_), modifiers, .. }
-                            if !modifiers.control() && !modifiers.alt() && !modifiers.logo()) {
-                            projection_neutral = true;
-                        }
-                        Task::none()
-                    },
+                        None => {
+                            // The subscription also reports the native text
+                            // control's captured press and ignored release. Only
+                            // after every local/global handler declined the event
+                            // can an ordinary character be projection-neutral.
+                            // Modified chords and non-character keys stay
+                            // conservative; a bound bare character took Some above.
+                            if matches!(&event,
+                                keyboard::Event::KeyPressed { key: keyboard::Key::Character(_), modifiers, .. }
+                                | keyboard::Event::KeyReleased { key: keyboard::Key::Character(_), modifiers, .. }
+                                if !modifiers.control() && !modifiers.alt() && !modifiers.logo()) {
+                                projection_neutral = true;
+                            }
+                            Task::none()
+                        },
 
                     }
                 })();

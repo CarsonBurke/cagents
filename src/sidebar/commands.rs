@@ -241,6 +241,7 @@ pub fn command_id(action: &SidebarAction) -> Option<Command> {
     }
     Some(match action {
         SidebarAction::CreateProjectWorktree(target) => target.command(),
+        SidebarAction::EndConversation(_) => Command::EndConversation,
         SidebarAction::HistoryCommand { command, .. } => history_command_id(*command),
         SidebarAction::ProjectCommand {
             worktree_id,
