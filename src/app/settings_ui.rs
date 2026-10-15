@@ -1601,13 +1601,22 @@ mod tests {
 
     #[test]
     fn keyboard_page_renders_project_content_search_and_records_its_actual_field() {
-        use iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::{Operation, Tree}};
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout, mouse,
+            widget::{Operation, Tree},
+        };
         use iced::{Event, Rectangle, Size};
         struct Controls(Vec<Rectangle>);
         impl Operation for Controls {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
-            fn focusable(&mut self, _: Option<&widget::Id>, bounds: Rectangle,
-                _: &mut dyn iced::advanced::widget::operation::Focusable) {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
                 self.0.push(bounds);
             }
         }
@@ -1621,27 +1630,53 @@ mod tests {
         };
         // Query the actual Keyboard page groups, rather than reconstructing a
         // shortcut row from metadata: an omitted manual row yields no result.
-        let mut groups = settings_category_controls(SettingsCategory::Keyboard, &app.settings_draft, &context)
-            .into_iter().filter_map(|group| group.view("Keyboard", "Search in selected project"));
-        let mut element = groups.next().expect("Keyboard page must expose project content search");
+        let mut groups =
+            settings_category_controls(SettingsCategory::Keyboard, &app.settings_draft, &context)
+                .into_iter()
+                .filter_map(|group| group.view("Keyboard", "Search in selected project"));
+        let mut element = groups
+            .next()
+            .expect("Keyboard page must expose project content search");
         assert!(groups.next().is_none());
         let renderer = super::super::tests::headless_renderer();
         let mut tree = Tree::new(element.as_widget());
         let viewport = Rectangle::with_size(Size::new(800.0, 900.0));
-        let node = element.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(Size::ZERO, viewport.size()));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
         let mut controls = Controls(Vec::new());
-        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut controls);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut controls);
         let mut messages = Vec::new();
         for bounds in controls.0 {
             let cursor = mouse::Cursor::Available(bounds.center());
-            for event in [mouse::Event::ButtonPressed(mouse::Button::Left), mouse::Event::ButtonReleased(mouse::Button::Left)] {
-                element.as_widget_mut().update(&mut tree, &Event::Mouse(event), Layout::new(&node),
-                    cursor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Mouse(event),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
             }
         }
-        assert!(messages.iter().any(|message| matches!(message,
-            Message::Palette(palette_ui::Action::Record(SettingsField::ShortcutSearchInProject)))),
-            "the rendered row must record this exact command's field");
+        assert!(
+            messages.iter().any(|message| matches!(
+                message,
+                Message::Palette(palette_ui::Action::Record(
+                    SettingsField::ShortcutSearchInProject
+                ))
+            )),
+            "the rendered row must record this exact command's field"
+        );
     }
 }
