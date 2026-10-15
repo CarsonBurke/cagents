@@ -94,18 +94,18 @@ impl State {
             Action::Body(action)=>{if action.is_edit(){self.completion.edited=true;}self.completion.body.perform(action);}
             Action::Merge=>{
                 let Some(data)=self.completion.data.as_ref()else{return ActionTask::none();};
-                if data.merge_blocked.is_some() || self.context.as_ref().is_none_or(|context|context.pending.is_some() || context.head_oid != data.head_oid) || self.discussion.composer.is_some(){return ActionTask::none();}
+                if data.merge_blocked.is_some() || self.context.as_ref().is_none_or(|context|context.pending.is_some() || context.head_oid != data.head_oid) || self.discussion.has_local_work(){return ActionTask::none();}
                 let Some(method)=self.completion.method()else{return ActionTask::none();};
                 return self.mutate_completion(ReviewControlMutation::Merge{method,title:self.completion.title.clone(),body:self.completion.body.text(),expected_head:data.head_oid.clone()});
             }
             Action::Cleanup=>{
                 let (Some(data),Some(target))=(&self.completion.data,&self.target)else{return ActionTask::none();};
-                if !data.merged||data.head_oid!=target.pull_request.head_ref_oid||self.completion.blocker().is_some(){return ActionTask::none();}
+                if !data.merged||data.head_oid!=target.pull_request.head_ref_oid||self.completion.blocker().is_some()||self.discussion.has_local_work(){return ActionTask::none();}
                 if let (Some(repository),Ok(head))=(target.pull_request.head_repository_key(),Oid::parse(data.head_oid.clone())){
                     self.effects.push(Effect::CleanupMergedHead(CleanupHead{repository,branch:target.pull_request.head_ref_name.clone(),head}));
                 }
             }
-            Action::AutoMerge(enabled)=>{if enabled && (self.context.as_ref().is_none_or(|context|context.pending.is_some()||self.completion.data.as_ref().is_none_or(|data|data.head_oid!=context.head_oid))||self.discussion.composer.is_some()){return ActionTask::none();}let method=if enabled{let Some(method)=self.completion.method()else{return ActionTask::none();};method}else{self.completion.method().unwrap_or(MergeMethod::Merge)};return self.mutate_completion(ReviewControlMutation::AutoMerge{method,enabled});}
+            Action::AutoMerge(enabled)=>{if enabled && (self.context.as_ref().is_none_or(|context|context.pending.is_some()||self.completion.data.as_ref().is_none_or(|data|data.head_oid!=context.head_oid))||self.discussion.has_local_work()){return ActionTask::none();}let method=if enabled{let Some(method)=self.completion.method()else{return ActionTask::none();};method}else{self.completion.method().unwrap_or(MergeMethod::Merge)};return self.mutate_completion(ReviewControlMutation::AutoMerge{method,enabled});}
             Action::Draft(draft)=>return self.mutate_completion(ReviewControlMutation::Draft(draft)),
             Action::Reviewers=>{self.completion.reviewers_open=!self.completion.reviewers_open;if self.completion.reviewers_open{return self.load_reviewer_candidates(false);}}
             Action::TeamTab(teams)=>{self.completion.teams=teams;self.completion.query.clear();self.completion.next=None;self.completion.cancellation.cancel();self.completion.candidates_loading=false;return self.load_reviewer_candidates(false);}
@@ -238,7 +238,7 @@ impl State {
                 rows.push(widget::row::with_children(vec![crate::ui_controls::button::primary("Save published comment").on_press_maybe((enabled&&(editor.review||!editor.content.text().trim().is_empty())).then_some(Action::SavePublished)).into(),crate::ui_controls::button::secondary("Cancel edit").on_press_maybe((!modal_open&&!state.busy).then_some(Action::CancelPublished)).into()]).spacing(space::S).into());
             }
             if data.merged{
-                rows.push(crate::ui_controls::button::secondary("Clean up merged worktree and branch…").on_press_maybe((enabled&&self.target.as_ref().is_some_and(|target|target.pull_request.head_repository_key().is_some())).then_some(Action::Cleanup)).into());
+                rows.push(crate::ui_controls::button::secondary("Clean up merged worktree and branch…").on_press_maybe((enabled&&!self.discussion.has_local_work()&&self.target.as_ref().is_some_and(|target|target.pull_request.head_repository_key().is_some())).then_some(Action::Cleanup)).into());
             }
             if let Some(reason)=&data.merge_blocked{rows.push(design::caption(reason).into());}
             if !data.allowed_methods.is_empty(){rows.push(crate::ui_controls::field::select(&data.allowed_methods,Some(state.method),Action::Method).into());}
@@ -246,7 +246,7 @@ impl State {
                 rows.push(crate::ui_controls::field::text("Commit title",&state.title).on_input(Action::Title).into());
                 let mut body=text_editor::TextEditor::new(&state.body).height(Length::Fixed(96.0));if enabled{body=body.on_action(Action::Body);}rows.push(body.into());
             }
-            let pending=self.context.as_ref().is_none_or(|context|context.pending.is_some()||context.head_oid!=data.head_oid)||self.discussion.composer.is_some();
+            let pending=self.context.as_ref().is_none_or(|context|context.pending.is_some()||context.head_oid!=data.head_oid)||self.discussion.has_local_work();
             if pending{rows.push(design::caption("Submit or discard your pending review before merging.").into());}
             rows.push(crate::ui_controls::button::secondary("Merge pull request").on_press_maybe((enabled&&!pending&&data.merge_blocked.is_none()&&state.method().is_some()&&(state.method()==Some(MergeMethod::Rebase)||!state.title.trim().is_empty())).then_some(Action::Merge)).into());
             if data.auto_merge_enabled{rows.push(crate::ui_controls::button::secondary("Disable auto-merge").on_press_maybe((enabled&&data.can_disable_auto_merge).then_some(Action::AutoMerge(false))).into());}
