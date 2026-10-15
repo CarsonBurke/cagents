@@ -792,6 +792,8 @@ pub struct SidebarWorktree {
     pub dirty: Option<DirtyState>,
     pub operation: Option<crate::repository::GitOperationKind>,
     pub untracked_omitted: bool,
+    /// Read failures preserve last-known counts without presenting them as current.
+    pub status_error: Option<String>,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
@@ -853,6 +855,7 @@ impl SidebarWorktree {
             dirty,
             operation: None,
             untracked_omitted: false,
+            status_error: None,
             ahead,
             behind,
             created_at_unix_ms: None,
@@ -931,6 +934,14 @@ impl SidebarWorktree {
         }
     }
 
+    pub fn apply_status_error(&mut self, error: Option<&str>) {
+        let error = error.map(|error| error.chars().take(512).collect::<String>());
+        if self.status_error != error {
+            self.status_error = error;
+            self.refresh_status_chrome();
+        }
+    }
+
     /// Apply each authoritative read, including the transition back to clean.
     pub fn apply_status(&mut self, status: &StatusSnapshot) {
         let (ahead, behind) = match &status.tracking {
@@ -945,13 +956,15 @@ impl SidebarWorktree {
         if status.untracked_omitted && !untracked_omitted {
             dirty.untracked = self.dirty.as_ref().map_or(0, |known| known.untracked);
         }
-        if self.untracked_omitted == untracked_omitted
+        if self.status_error.is_none()
+            && self.untracked_omitted == untracked_omitted
             && self.dirty.as_ref() == Some(&dirty)
             && self.ahead == ahead
             && self.behind == behind
         {
             return;
         }
+        self.status_error = None;
         self.dirty = Some(dirty);
         self.untracked_omitted = untracked_omitted;
         self.ahead = ahead;
@@ -1009,6 +1022,22 @@ impl SidebarWorktree {
         }
     }
 
+    fn status_description(&self) -> String {
+        let mut status = status_summary(self.detached, self.locked, self.dirty.as_ref(),
+            self.untracked_omitted, self.ahead, self.behind);
+        if let Some(operation) = self.operation {
+            status.push_str(&format!(", {} in progress", operation.label()));
+        }
+        if let Some(error) = &self.status_error {
+            status = if self.dirty.is_some() {
+                format!("Git status unavailable: {error}. Last known: {status}")
+            } else {
+                format!("Git status unavailable: {error}")
+            };
+        }
+        status
+    }
+
     fn refresh_status_chrome(&mut self) {
         let label = worktree_display_name(&self.path, self.branch.as_deref(), self.detached);
         if label != self.chrome.label.as_ref() {
@@ -1032,14 +1061,7 @@ impl SidebarWorktree {
                     )
                     .into_boxed_str()
                 });
-        let mut status = status_summary(
-            self.detached,
-            self.locked,
-            self.dirty.as_ref(),
-            self.untracked_omitted,
-            self.ahead,
-            self.behind,
-        );
+        let mut status = self.status_description();
         if let Some(operation) = self.operation {
             let operation_label = format!("{} in progress", operation.label());
             if let Some(label) = self.chrome.dirty_badge.as_mut() {
@@ -1047,7 +1069,9 @@ impl SidebarWorktree {
             } else {
                 self.chrome.dirty_badge = Some(operation_label.clone().into_boxed_str());
             }
-            status.push_str(&format!(", {operation_label}"));
+        }
+        if self.status_error.is_some() {
+            self.chrome.dirty_badge = Some(status.clone().into_boxed_str());
         }
         if let Some(pr) = &self.chrome.pull_request {
             use std::fmt::Write as _;
@@ -5870,18 +5894,8 @@ fn compact_project_identity(
             "\n{}{}: {}",
             if selected { "Selected " } else { "" },
             worktree.label(),
-            status_summary(
-                worktree.detached,
-                worktree.locked,
-                worktree.dirty.as_ref(),
-                worktree.untracked_omitted,
-                worktree.ahead,
-                worktree.behind
-            )
+            worktree.status_description()
         );
-        if let Some(operation) = worktree.operation {
-            let _ = write!(description, ", {} in progress", operation.label());
-        }
         if let Some(attention) = summaries
             .get(&worktree.id)
             .and_then(|summary| summary.state)
@@ -6618,6 +6632,7 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
 /// expanded row keeps checks as a durable badge of their own, after the
 /// reserved slot.
 fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
+    if worktree.status_error.is_some() { return Icon::Warning; }
     if worktree
         .dirty
         .as_ref()
@@ -6637,6 +6652,7 @@ fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
 }
 
 fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
+    if worktree.status_error.is_some() { return BadgeTone::Warning; }
     if worktree
         .dirty
         .as_ref()
@@ -6772,7 +6788,9 @@ fn worktree_view<'a>(
             } else {
                 count.to_string()
             };
-            let count = if let Some(operation) = worktree.operation {
+            let count = if worktree.status_error.is_some() {
+                "?".to_owned()
+            } else if let Some(operation) = worktree.operation {
                 format!("{} · {count}", operation.label())
             } else {
                 count
@@ -12153,6 +12171,24 @@ pub(crate) mod tests {
         assert_eq!(row.dirty.as_ref().unwrap().untracked, 0);
         assert!(row.chrome.tooltip.contains("No changes"));
         assert!(row.chrome.dirty_badge.is_none());
+    }
+
+    #[test]
+    fn failed_status_marks_cached_clean_as_last_known_and_identical_success_clears_it() {
+        let mut row = SidebarWorktree::new(WorktreeId::new(), "/repo".into(), Some("main".into()),
+            false, false, Some(DirtyState::default()), None, None);
+        row.apply_status_error(Some("index unavailable"));
+        assert!(matches!(worktree_change_icon(&row), Icon::Warning));
+        assert!(matches!(worktree_change_tone(&row), BadgeTone::Warning));
+        assert!(row.chrome.dirty_badge.as_deref().unwrap().contains("Git status unavailable"));
+        assert!(row.chrome.tooltip.contains("Last known: No changes"));
+        assert!(row.chrome.accessible_name.contains("Git status unavailable"));
+        assert!(row.status_description().contains("index unavailable"), "compact hover uses the same availability");
+        row.apply_status(&StatusSnapshot::default());
+        assert!(row.status_error.is_none(), "even an identical successful clean read clears error provenance");
+        assert!(row.chrome.dirty_badge.is_none());
+        assert!(!row.chrome.tooltip.contains("Git status unavailable"));
+        assert!(row.chrome.tooltip.contains("No changes"));
     }
 
     #[test]
