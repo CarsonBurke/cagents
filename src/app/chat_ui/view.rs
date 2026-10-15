@@ -1173,7 +1173,7 @@ impl Runtime {
                         .width(Length::Fill)
                         .into(),
                     design::heading(Self::native_child_status(agent))
-                        .size(design::TEXT_CAPTION)
+                        .size(design::scaled_interface_size(design::TEXT_CAPTION))
                         .into(),
                 ])
                 .spacing(step::GAP_S)
@@ -1858,7 +1858,7 @@ impl Runtime {
         let placeholder = suggestion.map_or(placeholder, |suggestion| suggestion.text.as_str());
         let suggestion_hint: Element<'_, Message> = if suggestion.is_some() {
             widget::text("Tab to use suggestion")
-                .size(design::TEXT_CAPTION)
+                .size(design::scaled_interface_size(design::TEXT_CAPTION))
                 .into()
         } else {
             iced::widget::Space::new().height(0).into()
@@ -2179,7 +2179,7 @@ impl Runtime {
                 } else {
                     state.to_owned()
                 })
-                .size(design::TEXT_CAPTION)
+                .size(design::scaled_interface_size(design::TEXT_CAPTION))
                 .class(
                     if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none() {
                         cosmic::theme::Text::Custom(design::warning_text)
@@ -4253,7 +4253,7 @@ fn field_view<'a>(
         )))
         .name(field.label.as_str())
         .secure(field.secret)
-        .size(design::TEXT_BODY)
+        .size(design::interface_size())
         .on_input_maybe(available.then_some(move |value| {
             action(Action::Field(
                 target,

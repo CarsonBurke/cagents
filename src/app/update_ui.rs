@@ -266,9 +266,9 @@ impl Cagents {
         let preview = &confirmation.preview;
         let title: Element<'_, Message> =
             widget::selectable_text(format!("Update to {}?", preview.candidate.version))
-                .size(design::TEXT_TITLE)
+                .size(design::scaled_interface_size(design::TEXT_TITLE))
                 .line_height(iced::widget::text::LineHeight::Absolute(
-                    design::LINE_TITLE.into(),
+                    design::scaled_interface_size(design::LINE_TITLE).into(),
                 ))
                 .font(design::title_font())
                 .width(Length::Fill)
@@ -290,7 +290,8 @@ impl Cagents {
             if let Some(attention) = attention_summary(daemon) {
                 body.push(
                     widget::selectable_text(attention)
-                        .size(design::TEXT_BODY)
+                        .font(design::interface_font())
+                        .size(design::interface_size())
                         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                         .width(Length::Fill)
                         .class(cosmic::theme::Text::Custom(design::warning_text))
@@ -377,7 +378,7 @@ impl Cagents {
         use crate::update::impact::Disposition;
         let mut header = vec![
             widget::selectable_text(session.title.as_str())
-                .size(design::TEXT_HEADING)
+                .size(design::interface_size())
                 .font(design::heading_font())
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                 .width(Length::Fill)
