@@ -2189,7 +2189,7 @@ impl RepositoryRuntime {
     pub fn is_read_only_source(&self) -> bool { self.external_source.is_some() }
 
     pub fn source_tab_path(&self) -> Option<PathBuf> {
-        self.external_source.clone().or_else(|| self.descriptor.selected_file.as_ref().map(|path| self.descriptor.worktree.join(path))).or_else(|| self.workspace_edit_source())
+        self.external_source.clone().or_else(|| self.workspace_edit_source()).or_else(|| self.descriptor.selected_file.as_ref().map(|path| self.descriptor.worktree.join(path)))
     }
 
 
@@ -10886,6 +10886,21 @@ mod tests {
         assert!(runtime.language.signature.is_some());
         drop(runtime.update(RepositoryAction::Language { card, action: EditorLspAction::Dismiss }));
         assert!(runtime.language.signature.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_loaded_alias_reports_the_actual_source_identity_for_tab_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("real.rs"), "source\n").unwrap();
+        std::os::unix::fs::symlink("real.rs", root.path().join("alias.rs")).unwrap();
+        let card = CardId::new();
+        let view = RepositoryView { project: crate::model::ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: Some("alias.rs".into()) };
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        let task = runtime.open_file_location(card, "alias.rs".into(), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(runtime.editor_text().as_deref(), Some("source\n"));
+        assert_eq!(runtime.source_tab_path(), Some(root.path().join("real.rs")));
     }
 
     #[tokio::test]
