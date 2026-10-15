@@ -120,6 +120,79 @@ pub(super) fn view(state: &State) -> Element<'_, Message> {
 mod tests {
     use super::*;
 
+    fn first_message(task: Task<Message>) -> Message {
+        use cosmic::iced::futures::StreamExt;
+        let mut stream = cosmic::iced::runtime::task::into_stream(task).expect("credential task");
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+            while let Some(action) = stream.next().await {
+                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                    return message;
+                }
+            }
+            panic!("credential task produced no result")
+        })
+    }
+
+    #[test]
+    fn store_and_remove_use_keyring_without_serializing_or_logging_the_key() {
+        const CHILD: &str = "CAGENTS_LINEAR_UI_FIXTURE_CHILD";
+        const NAME: &str = "app::account_ui::linear::tests::store_and_remove_use_keyring_without_serializing_or_logging_the_key";
+        if std::env::var_os(CHILD).is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = PathBuf::from(std::env::var_os("LINEAR_UI_FIXTURE").unwrap());
+            let key = "fixture-linear-ui-private-key";
+            let mut state = State::default();
+            let _ = update(&mut state, Action::Secret(Secret(key.into())));
+            let task = update(&mut state, Action::Store);
+            assert!(state.secret.0.is_empty(), "the draft must clear as saving begins");
+            let message = first_message(task);
+            assert!(!format!("{message:?}").contains(key), "save result must not log the key");
+            let Message::AccountUi(super::super::Action::Linear(action)) = message else { panic!("wrong save result") };
+            let _ = update(&mut state, action);
+            assert!(state.busy.is_none());
+            assert!(state.status.as_deref().unwrap().contains("saved"));
+            assert!(std::fs::read_to_string(root.join("vault")).unwrap().trim_end() == key);
+            assert_eq!(std::fs::metadata(root.join("vault")).unwrap().permissions().mode() & 0o077, 0);
+            assert!(!toml::to_string(&AppSettings::default()).unwrap().contains(key));
+            assert!(!std::fs::read_to_string(root.join("argv")).unwrap().contains(key));
+            let task = update(&mut state, Action::Remove);
+            let message = first_message(task);
+            assert!(!format!("{message:?}").contains(key));
+            let Message::AccountUi(super::super::Action::Linear(action)) = message else { panic!("wrong remove result") };
+            let _ = update(&mut state, action);
+            assert!(state.busy.is_none());
+            assert!(state.status.as_deref().unwrap().contains("removed"));
+            assert!(!root.join("vault").exists());
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let helper = bin.join("secret-tool");
+        std::fs::write(&helper, r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$LINEAR_UI_FIXTURE/argv"
+case "$1" in
+  store) umask 077; cat > "$LINEAR_UI_FIXTURE/vault" ;;
+  clear) rm -f -- "$LINEAR_UI_FIXTURE/vault" ;;
+  lookup) test -f "$LINEAR_UI_FIXTURE/vault" && cat "$LINEAR_UI_FIXTURE/vault" ;;
+  *) exit 2 ;;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("LINEAR_UI_FIXTURE", fixture.path())
+            .env("HOME", fixture.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output().unwrap();
+        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "isolated fixture test must actually run");
+    }
+
     #[test]
     fn key_input_is_redacted_and_never_enters_settings() {
         let mut state = State::default();
