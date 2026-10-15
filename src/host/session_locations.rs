@@ -1682,17 +1682,19 @@ mod tests {
         assert_eq!(fixture.source.launch.recipe.working_directory, fixture.old);
         let marker = fixture.moved.join("handoff.marker");
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !marker.exists() {
+        loop {
+            // Shell redirection creates the path before writing pwd's bytes.
+            // Readiness requires the complete expected output, not existence.
+            if std::fs::read_to_string(&marker).is_ok_and(|value|
+                value.trim() == fixture.moved.to_str().unwrap()) {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
-                "terminal handoff did not run in its pinned directory"
+                "terminal handoff did not publish its complete pinned directory"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            std::fs::read_to_string(marker).unwrap().trim(),
-            fixture.moved.to_str().unwrap()
-        );
         assert!(!fixture.old.join("handoff.marker").exists());
         assert!(!replacement_owner.0.is_completed());
     }
