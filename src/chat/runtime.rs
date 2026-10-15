@@ -4059,6 +4059,8 @@ mod tests {
                 let events=match command {
                     Command::Compact=>vec![Event::TurnStarted,Event::Status {busy:true,detail:"Compacting".into()}],
                     Command::SetFastMode{..}=>vec![Event::TurnFinished {key:None,outcome:crate::notifications::Kind::Succeeded},Event::Status {busy:false,detail:"Ready".into()}],
+                    Command::SetModel{..}=>vec![Event::Compaction {active:true},Event::Status {busy:true,detail:"Compacting".into()}],
+                    Command::SetPermissionMode{..}=>vec![Event::Compaction {active:false},Event::Status {busy:false,detail:"Ready".into()}],
                     _=>return Err("Unexpected prompt compact fixture command".into()),
                 };
                 Ok(Step {events,..Default::default()})
@@ -4074,6 +4076,15 @@ mod tests {
         handle.command(Command::Compact).unwrap();
         assert_eq!(handle.close_observation().activity,ActivityState::Working);
         handle.command(Command::SetFastMode {enabled:true}).unwrap();
+        let completed=handle.close_observation();
+        assert_eq!(completed.activity,ActivityState::Idle);
+        handle.command(Command::SetModel {model:"maintenance".into(),reasoning:None}).unwrap();
+        let first=handle.close_observation();
+        handle.command(Command::SetModel {model:"next maintenance boundary".into(),reasoning:None}).unwrap();
+        let second=handle.close_observation();
+        assert!(second.close_revision>first.close_revision,"every explicit maintenance start invalidates old consent, including consecutive starts");
+        assert!(handle.close_if_revision(first.close_revision).is_err());
+        handle.command(Command::SetPermissionMode {mode:"manual".into()}).unwrap();
         let completed=handle.close_observation();
         assert_eq!(completed.activity,ActivityState::Idle);
         handle.close_if_revision(completed.close_revision).unwrap();
