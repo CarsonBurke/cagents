@@ -2108,6 +2108,8 @@ pub enum Event {
     /// An explicit maintenance boundary, separate from prompt completion.
     /// A generic idle status cannot release accepted prompt admission.
     Compaction { active: bool },
+    /// Delayed results notify their original turn without settling current work.
+    PastTurnFinished {key:Option<String>,outcome:crate::notifications::Kind},
 }
 
 #[cfg(test)]
