@@ -25,9 +25,15 @@ pub struct CreationRetention {
 }
 
 impl CreationRetention {
-    pub fn operation(&self) -> OperationId { self.operation }
-    pub fn generation(&self) -> u64 { self.generation }
-    pub fn source(&self) -> &WorktreeAuthority { &self.source }
+    pub fn operation(&self) -> OperationId {
+        self.operation
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn source(&self) -> &WorktreeAuthority {
+        &self.source
+    }
     #[cfg(test)]
     pub(super) fn session_weak(&self) -> std::sync::Weak<creation_authority::CreationSession> {
         Arc::downgrade(&self._session)
@@ -56,11 +62,21 @@ pub(crate) struct SettledCreationRoots {
 }
 
 impl SettledCreatedWorktree {
-    pub fn operation(&self) -> OperationId { self.operation }
-    pub fn generation(&self) -> u64 { self.generation }
-    pub fn record(&self) -> &WorktreeRecord { &self.record }
-    pub fn source(&self) -> &WorktreeAuthority { &self.source }
-    pub fn destination(&self) -> &WorktreeAuthority { &self.destination }
+    pub fn operation(&self) -> OperationId {
+        self.operation
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn record(&self) -> &WorktreeRecord {
+        &self.record
+    }
+    pub fn source(&self) -> &WorktreeAuthority {
+        &self.source
+    }
+    pub fn destination(&self) -> &WorktreeAuthority {
+        &self.destination
+    }
     pub fn matches_outcome(&self, outcome: &WorktreeCreationOutcome) -> bool {
         matches!(outcome, WorktreeCreationOutcome::Created { worktree, .. } if *worktree == self.record)
     }
@@ -72,9 +88,13 @@ impl SettledCreatedWorktree {
     }
     pub(crate) fn transport_roots(&self) -> Result<SettledCreationRoots, RepositoryError> {
         self.validate()?;
-        Ok(SettledCreationRoots { operation: self.operation, generation: self.generation,
-            record: self.record.clone(), source: self.source.retained_roots()?,
-            destination: self.destination.retained_roots()? })
+        Ok(SettledCreationRoots {
+            operation: self.operation,
+            generation: self.generation,
+            record: self.record.clone(),
+            source: self.source.retained_roots()?,
+            destination: self.destination.retained_roots()?,
+        })
     }
 }
 
@@ -86,23 +106,52 @@ pub(super) struct ActiveCreated {
     record: WorktreeRecord,
 }
 impl ActiveCreated {
-    pub(super) fn new(operation: OperationId, generation: u64,
-        source: WorktreeAuthority, destination: WorktreeAuthority, record: WorktreeRecord) -> Self {
-        Self { operation, generation, source, destination, record }
+    pub(super) fn new(
+        operation: OperationId,
+        generation: u64,
+        source: WorktreeAuthority,
+        destination: WorktreeAuthority,
+        record: WorktreeRecord,
+    ) -> Self {
+        Self {
+            operation,
+            generation,
+            source,
+            destination,
+            record,
+        }
     }
-    fn settle(self, report: &WorktreeOperationReport, retention: CreationRetention)
-        -> Result<SettledCreatedWorktree, RepositoryError> {
-        let invalid = || ValidationError::Io("The original created-worktree authority did not settle with its exact durable operation".into());
-        let Some(WorktreeCreationOutcome::Created { worktree, .. }) = report.outcome.as_ref() else { return Err(invalid().into()); };
+    fn settle(
+        self,
+        report: &WorktreeOperationReport,
+        retention: CreationRetention,
+    ) -> Result<SettledCreatedWorktree, RepositoryError> {
+        let invalid = || {
+            ValidationError::Io("The original created-worktree authority did not settle with its exact durable operation".into())
+        };
+        let Some(WorktreeCreationOutcome::Created { worktree, .. }) = report.outcome.as_ref()
+        else {
+            return Err(invalid().into());
+        };
         let mut expected = self.record.clone();
         expected.lock = WorktreeLock::default();
-        if expected.created_at_unix_ms.is_none() { expected.created_at_unix_ms = Some(report.created_at_unix_ms); }
-        if *worktree != expected || report.operation_id != self.operation || report.generation != self.generation
+        if expected.created_at_unix_ms.is_none() {
+            expected.created_at_unix_ms = Some(report.created_at_unix_ms);
+        }
+        if *worktree != expected
+            || report.operation_id != self.operation
+            || report.generation != self.generation
             || report.state != WorktreeOperationState::Created
-            || report.request.as_ref().is_none_or(|request| request.operation_id != self.operation
-                || request.repository != self.source.path() || request.destination != self.destination.path())
-            || worktree.path != self.destination.path() || worktree.lock.locked
-        { return Err(invalid().into()); }
+            || report.request.as_ref().is_none_or(|request| {
+                request.operation_id != self.operation
+                    || request.repository != self.source.path()
+                    || request.destination != self.destination.path()
+            })
+            || worktree.path != self.destination.path()
+            || worktree.lock.locked
+        {
+            return Err(invalid().into());
+        }
         self.source.validate()?;
         self.destination.validate()?;
         let (_, admin, _) = self.destination.retained_roots()?;
@@ -110,30 +159,59 @@ impl ActiveCreated {
             Err(error) if error.is_not_found() => {},
             _ => return Err(ValidationError::Io("Created worktree remains locked or its unlock state is unknown; automatic opening was withheld".into()).into()),
         }
-        Ok(SettledCreatedWorktree { operation: self.operation, generation: self.generation,
-            record: worktree.clone(), source: self.source, destination: self.destination,
-            _retention: retention })
+        Ok(SettledCreatedWorktree {
+            operation: self.operation,
+            generation: self.generation,
+            record: worktree.clone(),
+            source: self.source,
+            destination: self.destination,
+            _retention: retention,
+        })
     }
 }
 
 impl RetainedWorktreeCreation {
-    pub fn retention(&self) -> Option<&CreationRetention> { self.retention.as_ref() }
-    pub(super) fn refused(report: WorktreeOperationReport) -> Self {
-        Self { report, created: None, authority_error: None, retention: None }
+    pub fn retention(&self) -> Option<&CreationRetention> {
+        self.retention.as_ref()
     }
-    pub(super) fn from_original(report: WorktreeOperationReport,
-        session: Arc<creation_authority::CreationSession>, source: WorktreeAuthority,
+    pub(super) fn refused(report: WorktreeOperationReport) -> Self {
+        Self {
+            report,
+            created: None,
+            authority_error: None,
+            retention: None,
+        }
+    }
+    pub(super) fn from_original(
+        report: WorktreeOperationReport,
+        session: Arc<creation_authority::CreationSession>,
+        source: WorktreeAuthority,
     ) -> Self {
-        let retention = CreationRetention { operation: report.operation_id,
-            generation: report.generation, source, _session: session.clone() };
-        let candidate = session.pending_settlement.lock().unwrap_or_else(|p|p.into_inner()).take();
+        let retention = CreationRetention {
+            operation: report.operation_id,
+            generation: report.generation,
+            source,
+            _session: session.clone(),
+        };
+        let candidate = session
+            .pending_settlement
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         let (created, authority_error) = if report.state == WorktreeOperationState::Created {
             match candidate.ok_or_else(|| RepositoryError::from(ValidationError::Io("The Created report has no original pre-unlock authority; automatic opening was withheld".into())))
                 .and_then(|candidate: ActiveCreated| candidate.settle(&report, retention.clone())) {
                 Ok(created) => (Some(created), None),
                 Err(error) => (None, Some(error.to_string())),
             }
-        } else { (None, None) };
-        Self { report, created, authority_error, retention: Some(retention) }
+        } else {
+            (None, None)
+        };
+        Self {
+            report,
+            created,
+            authority_error,
+            retention: Some(retention),
+        }
     }
 }
