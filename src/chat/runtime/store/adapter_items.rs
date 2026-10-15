@@ -34,9 +34,7 @@ impl Store {
     fn adapter_item(&mut self,key:&CanonicalItemKey)->Result<Option<Item>,String> {
         self.flush_input()?;self.flush_text()?;
         if key.agent_id.is_some() {
-            // Child tools require their own canonical ingestion namespace.
-            // Returning a 64 KiB window placeholder would corrupt old source.
-            return Err("Original delegated tool source is unavailable; its recorded source was preserved".into());
+            return self.child_adapter_item(key);
         }
         let record=self.db.query_row("SELECT metadata,len0,len1,len2,spans FROM items WHERE id=?1 AND length(metadata)<=?2 AND length(spans)<=?2",params![key.item_id,METADATA_LIMIT],|row|Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Vec<u8>>(4)?))).optional().map_err(|error|error.to_string())?;
         let Some((metadata,len0,len1,len2,spans))=record else {return Ok(None);};
@@ -160,7 +158,7 @@ mod tests {
         let restored=source.read(&CanonicalItemKey::new(None,"large")).unwrap().unwrap();
         assert_eq!(restored.content,item.content);
         assert_eq!(restored.id,item.id);
-        assert!(source.read(&CanonicalItemKey::new(Some("child"),"large")).is_err(),"child identity cannot fall through into the root item");
+        assert!(source.read(&CanonicalItemKey::new(Some("child"),"large")).unwrap().is_none(),"child identity cannot fall through into the root item");
         drop(store);assert!(weak.upgrade().is_none());assert!(source.read(&CanonicalItemKey::new(None,"large")).is_err());
     }
 }
