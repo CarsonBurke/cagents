@@ -211,7 +211,11 @@ impl Fixture {
     // byte-exact payload CAS. SQLite json_set with a struct-serialized fragment
     // would preserve its different field order and fabricate a stale payload.
     fn install_setup_intent(&self, path: &Path, intent: &cagents::repository::WorktreeSetupIntent) {
-        let journal = self.root.path().join("data").join(cagents::instance::STORAGE_NAME)
+        let journal = self
+            .root
+            .path()
+            .join("data")
+            .join(cagents::instance::STORAGE_NAME)
             .join("worktree-operations.sqlite3");
         let connection = rusqlite::Connection::open(journal).unwrap();
         let payload: String = connection.query_row(
@@ -225,8 +229,12 @@ impl Fixture {
     }
     fn error(output: &Output) -> Value {
         assert!(!output.status.success(), "{output:?}");
-        assert!(output.stdout.is_empty(), "JSON errors belong to stderr: {output:?}");
-        serde_json::from_slice(&output.stderr).unwrap_or_else(|error| panic!("Invalid error JSON: {error}: {output:?}"))
+        assert!(
+            output.stdout.is_empty(),
+            "JSON errors belong to stderr: {output:?}"
+        );
+        serde_json::from_slice(&output.stderr)
+            .unwrap_or_else(|error| panic!("Invalid error JSON: {error}: {output:?}"))
     }
     fn release_completed_setup(
         client: &mut cagents::control::ControlClient,
@@ -234,20 +242,33 @@ impl Fixture {
     ) {
         let deadline = Instant::now() + Duration::from_secs(10);
         let completed = loop {
-            let current = client.list().unwrap().into_iter()
+            let current = client
+                .list()
+                .unwrap()
+                .into_iter()
                 .find(|terminal| terminal.session.id == expected.id)
                 .expect("the completed setup terminal remains visible until explicit close");
             assert_eq!(current.session.launch, expected.launch);
-            if matches!(&current.session.continuity,
+            if matches!(
+                &current.session.continuity,
                 cagents::model::TerminalContinuity::Exited { .. }
-                | cagents::model::TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }) {
+                    | cagents::model::TerminalContinuity::RelaunchAvailable {
+                        last_exit: Some(_),
+                        ..
+                    }
+            ) {
                 break current.session;
             }
-            assert!(Instant::now() < deadline, "setup did not reach an ended result before explicit close");
+            assert!(
+                Instant::now() < deadline,
+                "setup did not reach an ended result before explicit close"
+            );
             thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(client.release_completed_terminal(completed, false).unwrap(),
-            cagents::terminal_ipc::TerminalCloseResult::Closed);
+        assert_eq!(
+            client.release_completed_terminal(completed, false).unwrap(),
+            cagents::terminal_ipc::TerminalCloseResult::Closed
+        );
     }
     fn refusal(&self, target: &str, contains: &str) {
         let output = self.output(&["worktree", "remove", target]);
@@ -654,37 +675,82 @@ fn optional_agent_uses_new_worktree_and_waits_for_setup() {
 
 #[test]
 fn project_selector_refuses_distinct_path_and_name_but_preserves_explicit_paths() {
-    let fixture=Fixture::new();
-    let project=fixture.root.path().join("project");
-    let collision=project.join("collision");
+    let fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    let collision = project.join("collision");
     fs::create_dir(&collision).unwrap();
-    fixture.git(&collision,&["init","-q","-b","main"]);
-    fs::write(collision.join("selected"),"selected repository\n").unwrap();
-    fixture.git(&collision,&["add","selected"]);
-    fixture.git(&collision,&["commit","-qm","selected"]);
+    fixture.git(&collision, &["init", "-q", "-b", "main"]);
+    fs::write(collision.join("selected"), "selected repository\n").unwrap();
+    fixture.git(&collision, &["add", "selected"]);
+    fixture.git(&collision, &["commit", "-qm", "selected"]);
     fixture.project_name(Some("collision"));
-    let refused=fixture.output(&["worktree","create","ambiguous-project","--project","collision","--no-setup"]);
+    let refused = fixture.output(&[
+        "worktree",
+        "create",
+        "ambiguous-project",
+        "--project",
+        "collision",
+        "--no-setup",
+    ]);
     assert!(!refused.status.success());
     let error = Fixture::error(&refused);
-    let message=error["error"]["message"].as_str().unwrap();
-    assert!(message.contains("ambiguous"),"{error}");
-    assert!(message.contains(project.join(".git").to_str().unwrap()),"{error}");
-    assert!(message.contains(collision.join(".git").to_str().unwrap()),"{error}");
-    for repository in [&project,&collision] {
-        assert!(fixture.git(repository,&["branch","--list","ambiguous-project"]).trim().is_empty());
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("ambiguous"), "{error}");
+    assert!(
+        message.contains(project.join(".git").to_str().unwrap()),
+        "{error}"
+    );
+    assert!(
+        message.contains(collision.join(".git").to_str().unwrap()),
+        "{error}"
+    );
+    for repository in [&project, &collision] {
+        assert!(
+            fixture
+                .git(repository, &["branch", "--list", "ambiguous-project"])
+                .trim()
+                .is_empty()
+        );
     }
-    let selected=fixture.cli(&["worktree","create","path-choice","--project","./collision","--no-setup"]);
-    let selected_path=Path::new(selected["worktree"]["path"].as_str().unwrap());
-    assert_eq!(selected_path,collision.join("managed/path-choice"));
+    let selected = fixture.cli(&[
+        "worktree",
+        "create",
+        "path-choice",
+        "--project",
+        "./collision",
+        "--no-setup",
+    ]);
+    let selected_path = Path::new(selected["worktree"]["path"].as_str().unwrap());
+    assert_eq!(selected_path, collision.join("managed/path-choice"));
     assert!(selected_path.join("selected").is_file());
     assert!(!selected_path.join("tracked").exists());
-    let named=fixture.cli(&["worktree","create","name-choice","--project",project.to_str().unwrap(),"--no-setup"]);
-    assert_eq!(Path::new(named["worktree"]["path"].as_str().unwrap()),project.join("managed/name-choice"));
+    let named = fixture.cli(&[
+        "worktree",
+        "create",
+        "name-choice",
+        "--project",
+        project.to_str().unwrap(),
+        "--no-setup",
+    ]);
+    assert_eq!(
+        Path::new(named["worktree"]["path"].as_str().unwrap()),
+        project.join("managed/name-choice")
+    );
     // A relative directory inside the named repository is the same authority.
     fs::create_dir(project.join("same-project")).unwrap();
     fixture.project_name(Some("same-project"));
-    let same=fixture.cli(&["worktree","create","same-choice","--project","same-project","--no-setup"]);
-    assert_eq!(Path::new(same["worktree"]["path"].as_str().unwrap()),project.join("managed/same-choice"));
+    let same = fixture.cli(&[
+        "worktree",
+        "create",
+        "same-choice",
+        "--project",
+        "same-project",
+        "--no-setup",
+    ]);
+    assert_eq!(
+        Path::new(same["worktree"]["path"].as_str().unwrap()),
+        project.join("managed/same-choice")
+    );
 }
 
 #[test]
@@ -1395,148 +1461,351 @@ fn superseded_pending_setup_cannot_start_after_an_explicit_skip() {
 
 #[test]
 fn proved_setup_family_cleanup_allows_fresh_reviewed_commands() {
-    use cagents::{device_service, model::{OperationId, TerminalContinuity, TerminalId, TerminalSession}, worktree_control::{Operation, Reply}};
-    let fixture=Fixture::new();
-    let project=fixture.root.path().join("project");
+    use cagents::{
+        device_service,
+        model::{OperationId, TerminalContinuity, TerminalId, TerminalSession},
+        worktree_control::{Operation, Reply},
+    };
+    let fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
     fs::create_dir(project.join(".cagents")).unwrap();
-    fs::write(project.join(".cagents/worktree.toml"),"setup = \"printf reviewed >> setup-runs\"\n").unwrap();
-    let plan=cagents::worktree_setup::load(&project).unwrap().unwrap();
-    cagents::worktree_setup::trust(&project,&plan,&cagents::repository::CancellationToken::new()).unwrap();
-    let created=fixture.cli(&["worktree","create","proved-retry"]);
-    let path=Path::new(created["worktree"]["path"].as_str().unwrap()).to_path_buf();
-    let first:TerminalSession=serde_json::from_value(created["setup"]["terminal"].clone()).unwrap();
-    let first_run:OperationId=created["setup"]["run_id"].as_str().unwrap().parse().unwrap();
-    let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
-    let mut client=cagents::control::ControlClient::connect(&socket).unwrap();
-    let wait_for_exit=|client:&mut cagents::control::ControlClient,id:TerminalId| {
-        let deadline=Instant::now()+Duration::from_secs(10);
+    fs::write(
+        project.join(".cagents/worktree.toml"),
+        "setup = \"printf reviewed >> setup-runs\"\n",
+    )
+    .unwrap();
+    let plan = cagents::worktree_setup::load(&project).unwrap().unwrap();
+    cagents::worktree_setup::trust(
+        &project,
+        &plan,
+        &cagents::repository::CancellationToken::new(),
+    )
+    .unwrap();
+    let created = fixture.cli(&["worktree", "create", "proved-retry"]);
+    let path = Path::new(created["worktree"]["path"].as_str().unwrap()).to_path_buf();
+    let first: TerminalSession =
+        serde_json::from_value(created["setup"]["terminal"].clone()).unwrap();
+    let first_run: OperationId = created["setup"]["run_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let socket = fixture
+        .root
+        .path()
+        .join("run")
+        .join(cagents::instance::RUNTIME_SUBDIRECTORY)
+        .join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client = cagents::control::ControlClient::connect(&socket).unwrap();
+    let wait_for_exit = |client: &mut cagents::control::ControlClient, id: TerminalId| {
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let terminal=client.list().unwrap().into_iter().find(|terminal|terminal.session.id==id).expect("setup retains its exact terminal receipt");
-            let exit=match terminal.session.continuity {
-                TerminalContinuity::Exited{last_exit}=>Some(last_exit),
-                TerminalContinuity::RelaunchAvailable{last_exit,..}=>last_exit,
-                TerminalContinuity::Failed{typed_error,..}=>panic!("setup failed: {typed_error:?}"),
-                _=>None,
+            let terminal = client
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|terminal| terminal.session.id == id)
+                .expect("setup retains its exact terminal receipt");
+            let exit = match terminal.session.continuity {
+                TerminalContinuity::Exited { last_exit } => Some(last_exit),
+                TerminalContinuity::RelaunchAvailable { last_exit, .. } => last_exit,
+                TerminalContinuity::Failed { typed_error, .. } => {
+                    panic!("setup failed: {typed_error:?}")
+                }
+                _ => None,
             };
-            if let Some(exit)=exit {assert_eq!(exit.code,Some(0));assert!(exit.signal.is_none());break;}
-            assert!(Instant::now()<deadline,"setup did not complete");
+            if let Some(exit) = exit {
+                assert_eq!(exit.code, Some(0));
+                assert!(exit.signal.is_none());
+                break;
+            }
+            assert!(Instant::now() < deadline, "setup did not complete");
             thread::sleep(Duration::from_millis(20));
         }
     };
-    wait_for_exit(&mut client,first.id);
-    assert_eq!(fs::read_to_string(path.join("setup-runs")).unwrap(),"reviewed");
-    let resume=|expected_run_id|device_service::Operation::Worktree{operation:Operation::ResumeSetup{
-        repository:project.join(".git"),path:path.clone(),expected_run_id,
-        expected_plan_fingerprint:Some(plan.fingerprint.clone()),trust:false,skip:false,
-    }};
-    assert!(client.device_operation(resume(Some(first_run))).is_err(),"a completed screen still owns its original setup lease until explicit cleanup");
-    assert_eq!(fixture.setup_intent(&path)["run_id"],first_run.to_string());
+    wait_for_exit(&mut client, first.id);
+    assert_eq!(
+        fs::read_to_string(path.join("setup-runs")).unwrap(),
+        "reviewed"
+    );
+    let resume = |expected_run_id| device_service::Operation::Worktree {
+        operation: Operation::ResumeSetup {
+            repository: project.join(".git"),
+            path: path.clone(),
+            expected_run_id,
+            expected_plan_fingerprint: Some(plan.fingerprint.clone()),
+            trust: false,
+            skip: false,
+        },
+    };
+    assert!(
+        client.device_operation(resume(Some(first_run))).is_err(),
+        "a completed screen still owns its original setup lease until explicit cleanup"
+    );
+    assert_eq!(fixture.setup_intent(&path)["run_id"], first_run.to_string());
     Fixture::release_completed_setup(&mut client, &first);
-    let device_service::Reply::Worktree(Reply::SetupPrepared{setup:Some(second),run_id:second_run,warnings,..})=client.device_operation(resume(Some(first_run))).unwrap() else {panic!("wrong reviewed retry result")};
-    assert!(warnings.is_empty(),"{warnings:?}");
-    assert!(second.error.is_none(),"{second:?}");
-    assert_eq!(second.run_id,Some(second_run));
-    assert_ne!(second_run,first_run);
-    let second=second.terminal.unwrap();
-    assert_ne!(second.id,first.id);
-    wait_for_exit(&mut client,second.id);
-    assert_eq!(fs::read_to_string(path.join("setup-runs")).unwrap(),"reviewedreviewed");
-    assert_eq!(fixture.setup_intent(&path)["run_id"],second_run.to_string());
-    assert!(client.device_operation(resume(Some(first_run))).is_err(),"old approval cannot advance the current retry");
-    assert_eq!(fixture.setup_intent(&path)["run_id"],second_run.to_string());
+    let device_service::Reply::Worktree(Reply::SetupPrepared {
+        setup: Some(second),
+        run_id: second_run,
+        warnings,
+        ..
+    }) = client.device_operation(resume(Some(first_run))).unwrap()
+    else {
+        panic!("wrong reviewed retry result")
+    };
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(second.error.is_none(), "{second:?}");
+    assert_eq!(second.run_id, Some(second_run));
+    assert_ne!(second_run, first_run);
+    let second = second.terminal.unwrap();
+    assert_ne!(second.id, first.id);
+    wait_for_exit(&mut client, second.id);
+    assert_eq!(
+        fs::read_to_string(path.join("setup-runs")).unwrap(),
+        "reviewedreviewed"
+    );
+    assert_eq!(
+        fixture.setup_intent(&path)["run_id"],
+        second_run.to_string()
+    );
+    assert!(
+        client.device_operation(resume(Some(first_run))).is_err(),
+        "old approval cannot advance the current retry"
+    );
+    assert_eq!(
+        fixture.setup_intent(&path)["run_id"],
+        second_run.to_string()
+    );
     Fixture::release_completed_setup(&mut client, &second);
 }
 
 #[test]
 fn killed_setup_holder_with_surviving_children_cannot_authorize_resume_after_restart() {
-    use cagents::{device_service, model::OperationId, worktree_control::{Operation, Reply}};
+    use cagents::{
+        device_service,
+        model::OperationId,
+        worktree_control::{Operation, Reply},
+    };
     use std::fs::File;
     use std::os::fd::{AsRawFd, FromRawFd};
     struct Pinned(File);
     impl Pinned {
         fn open(pid: i32, expected_start: u64) -> Self {
-            let current_start=|| {
-                fs::read_to_string(format!("/proc/{pid}/stat")).ok()
-                    .and_then(|stat|stat.rsplit_once(')').and_then(|(_,fields)|fields.split_whitespace().nth(19)).and_then(|value|value.parse::<u64>().ok()))
+            let current_start = || {
+                fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit_once(')')
+                            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+                            .and_then(|value| value.parse::<u64>().ok())
+                    })
             };
-            assert_eq!(current_start(),Some(expected_start),"owned fixture process changed before pidfd capture");
-            let fd=unsafe {libc::syscall(libc::SYS_pidfd_open,pid,0)};
-            assert!(fd>=0,"pin owned fixture process: {}",std::io::Error::last_os_error());
-            let pinned=unsafe {File::from_raw_fd(fd as i32)};
-            assert_eq!(current_start(),Some(expected_start),"owned fixture process changed during pidfd capture");
+            assert_eq!(
+                current_start(),
+                Some(expected_start),
+                "owned fixture process changed before pidfd capture"
+            );
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            assert!(
+                fd >= 0,
+                "pin owned fixture process: {}",
+                std::io::Error::last_os_error()
+            );
+            let pinned = unsafe { File::from_raw_fd(fd as i32) };
+            assert_eq!(
+                current_start(),
+                Some(expected_start),
+                "owned fixture process changed during pidfd capture"
+            );
             Self(pinned)
         }
-        fn signal(&self, signal: i32) {assert_eq!(unsafe {libc::syscall(libc::SYS_pidfd_send_signal,self.0.as_raw_fd(),signal,std::ptr::null::<libc::siginfo_t>(),0)},0);}
+        fn signal(&self, signal: i32) {
+            assert_eq!(
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.0.as_raw_fd(),
+                        signal,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                },
+                0
+            );
+        }
         fn exited(&self, timeout: i32) -> bool {
-            let mut item=libc::pollfd{fd:self.0.as_raw_fd(),events:libc::POLLIN,revents:0};
-            unsafe {libc::poll(&mut item,1,timeout)>0}
+            let mut item = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe { libc::poll(&mut item, 1, timeout) > 0 }
         }
     }
-    impl Drop for Pinned {fn drop(&mut self){let _=unsafe {libc::syscall(libc::SYS_pidfd_send_signal,self.0.as_raw_fd(),libc::SIGKILL,std::ptr::null::<libc::siginfo_t>(),0)};}}
-    let mut fixture=Fixture::new();
-    let project=fixture.root.path().join("project");
+    impl Drop for Pinned {
+        fn drop(&mut self) {
+            let _ = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+        }
+    }
+    let mut fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
     fs::create_dir(project.join(".cagents")).unwrap();
-    let script=r#"import pathlib,subprocess,time
+    let script = r#"import pathlib,subprocess,time
 child=subprocess.Popen(["/usr/bin/python3","-c","import signal,time; signal.signal(signal.SIGHUP,signal.SIG_IGN); time.sleep(600)"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
 start=pathlib.Path(f"/proc/{child.pid}/stat").read_text().rsplit(")",1)[1].split()[19]
 pathlib.Path("survivor").write_text(f"{child.pid} {start}")
 with pathlib.Path("setup-starts").open("a") as output: output.write("started\n")
 time.sleep(600)
 "#;
-    let command=format!("exec /usr/bin/python3 -c '{script}'");
-    let configuration=project.join(".cagents/worktree.toml");
-    fs::write(&configuration,format!("setup = {}\n",serde_json::to_string(&command).unwrap())).unwrap();
-    let plan=cagents::worktree_setup::load(&project).unwrap().unwrap();
-    cagents::worktree_setup::trust(&project,&plan,&cagents::repository::CancellationToken::new()).unwrap();
-    let created=fixture.cli(&["worktree","create","lost-holder"]);
-    let path=std::path::PathBuf::from(created["worktree"]["path"].as_str().unwrap());
-    let terminal=created["setup"]["terminal"]["id"].as_str().unwrap();
-    let run:OperationId=created["setup"]["run_id"].as_str().unwrap().parse().unwrap();
-    let deadline=Instant::now()+Duration::from_secs(10);
+    let command = format!("exec /usr/bin/python3 -c '{script}'");
+    let configuration = project.join(".cagents/worktree.toml");
+    fs::write(
+        &configuration,
+        format!("setup = {}\n", serde_json::to_string(&command).unwrap()),
+    )
+    .unwrap();
+    let plan = cagents::worktree_setup::load(&project).unwrap().unwrap();
+    cagents::worktree_setup::trust(
+        &project,
+        &plan,
+        &cagents::repository::CancellationToken::new(),
+    )
+    .unwrap();
+    let created = fixture.cli(&["worktree", "create", "lost-holder"]);
+    let path = std::path::PathBuf::from(created["worktree"]["path"].as_str().unwrap());
+    let terminal = created["setup"]["terminal"]["id"].as_str().unwrap();
+    let run: OperationId = created["setup"]["run_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !path.join("survivor").exists() || !path.join("setup-starts").exists() {
-        assert!(Instant::now()<deadline,"owned setup did not start: {created}");thread::sleep(Duration::from_millis(10));
+        assert!(
+            Instant::now() < deadline,
+            "owned setup did not start: {created}"
+        );
+        thread::sleep(Duration::from_millis(10));
     }
-    let survivor_identity=fs::read_to_string(path.join("survivor")).unwrap();
-    let mut survivor_fields=survivor_identity.split_whitespace();
-    let survivor=Pinned::open(survivor_fields.next().unwrap().parse().unwrap(),survivor_fields.next().unwrap().parse().unwrap());
-    let runtime=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY);
-    let record:Value=serde_json::from_slice(&fs::read(runtime.join("holders").join(format!("{terminal}.json"))).unwrap()).unwrap();
-    let root=Pinned::open(record["root"]["pid"].as_i64().unwrap() as i32,record["root"]["start"].as_u64().unwrap());
-    let holder=Pinned::open(record["holder"]["pid"].as_i64().unwrap() as i32,record["holder"]["start"].as_u64().unwrap());
+    let survivor_identity = fs::read_to_string(path.join("survivor")).unwrap();
+    let mut survivor_fields = survivor_identity.split_whitespace();
+    let survivor = Pinned::open(
+        survivor_fields.next().unwrap().parse().unwrap(),
+        survivor_fields.next().unwrap().parse().unwrap(),
+    );
+    let runtime = fixture
+        .root
+        .path()
+        .join("run")
+        .join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    let record: Value = serde_json::from_slice(
+        &fs::read(runtime.join("holders").join(format!("{terminal}.json"))).unwrap(),
+    )
+    .unwrap();
+    let root = Pinned::open(
+        record["root"]["pid"].as_i64().unwrap() as i32,
+        record["root"]["start"].as_u64().unwrap(),
+    );
+    let holder = Pinned::open(
+        record["holder"]["pid"].as_i64().unwrap() as i32,
+        record["holder"]["start"].as_u64().unwrap(),
+    );
     holder.signal(libc::SIGKILL);
     assert!(holder.exited(5000));
-    assert!(!survivor.exited(0),"fixture must retain the escaped child after holder loss");
+    assert!(
+        !survivor.exited(0),
+        "fixture must retain the escaped child after holder loss"
+    );
     assert!(!root.exited(0));
-    fixture.daemon.kill().unwrap();fixture.daemon.wait().unwrap();
-    let log=std::fs::OpenOptions::new().create(true).append(true).open(fixture.root.path().join("restarted-daemon.log")).unwrap();
-    fixture.daemon=Fixture::command(fixture.root.path(),Path::new(env!("CARGO_BIN_EXE_cagentsd"))).stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
-    let deadline=Instant::now()+Duration::from_secs(15);
-    while !fixture.output(&["daemon","status"]).status.success() {
-        assert!(fixture.daemon.try_wait().unwrap().is_none(),"restart unexpectedly exited");
-        assert!(Instant::now()<deadline,"restart did not become ready");thread::sleep(Duration::from_millis(20));
+    fixture.daemon.kill().unwrap();
+    fixture.daemon.wait().unwrap();
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(fixture.root.path().join("restarted-daemon.log"))
+        .unwrap();
+    fixture.daemon = Fixture::command(
+        fixture.root.path(),
+        Path::new(env!("CARGO_BIN_EXE_cagentsd")),
+    )
+    .stdout(log.try_clone().unwrap())
+    .stderr(log)
+    .spawn()
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !fixture.output(&["daemon", "status"]).status.success() {
+        assert!(
+            fixture.daemon.try_wait().unwrap().is_none(),
+            "restart unexpectedly exited"
+        );
+        assert!(Instant::now() < deadline, "restart did not become ready");
+        thread::sleep(Duration::from_millis(20));
     }
-    let before=fixture.setup_intent(&path);
-    let mut client=cagents::control::ControlClient::connect(&runtime.join(cagents::terminal_ipc::SOCKET_FILE_NAME)).unwrap();
-    assert!(client.list().unwrap().is_empty(),"restart must demonstrate absence of resident actors, not a live-session refusal");
+    let before = fixture.setup_intent(&path);
+    let mut client = cagents::control::ControlClient::connect(
+        &runtime.join(cagents::terminal_ipc::SOCKET_FILE_NAME),
+    )
+    .unwrap();
+    assert!(
+        client.list().unwrap().is_empty(),
+        "restart must demonstrate absence of resident actors, not a live-session refusal"
+    );
     // A new reviewed plan would copy .env and run a second terminal if the
     // missing holder's free flock were incorrectly accepted as cleanup proof.
-    fs::write(project.join(".env"),"must not be copied\n").unwrap();
-    fs::write(&configuration,"copy = [\".env\"]\nsetup = \"printf duplicate >> setup-starts\"\n").unwrap();
-    let updated=cagents::worktree_setup::load(&project).unwrap().unwrap();
-    for skip in [false,true] {
-        let error=client.device_operation(device_service::Operation::Worktree{operation:Operation::ResumeSetup{
-            repository:project.clone(),path:path.clone(),expected_run_id:Some(run),expected_plan_fingerprint:Some(updated.fingerprint.clone()),trust:true,skip,
-        }}).expect_err("lost holder and surviving tools must keep setup interrupted");
-        assert!(error.to_string().contains("family cleanup"),"{error}");
-        assert_eq!(fixture.setup_intent(&path),before,"refusal cannot advance or skip the current intent");
+    fs::write(project.join(".env"), "must not be copied\n").unwrap();
+    fs::write(
+        &configuration,
+        "copy = [\".env\"]\nsetup = \"printf duplicate >> setup-starts\"\n",
+    )
+    .unwrap();
+    let updated = cagents::worktree_setup::load(&project).unwrap().unwrap();
+    for skip in [false, true] {
+        let error = client
+            .device_operation(device_service::Operation::Worktree {
+                operation: Operation::ResumeSetup {
+                    repository: project.clone(),
+                    path: path.clone(),
+                    expected_run_id: Some(run),
+                    expected_plan_fingerprint: Some(updated.fingerprint.clone()),
+                    trust: true,
+                    skip,
+                },
+            })
+            .expect_err("lost holder and surviving tools must keep setup interrupted");
+        assert!(error.to_string().contains("family cleanup"), "{error}");
+        assert_eq!(
+            fixture.setup_intent(&path),
+            before,
+            "refusal cannot advance or skip the current intent"
+        );
         assert!(!path.join(".env").exists());
-        assert_eq!(fs::read_to_string(path.join("setup-starts")).unwrap(),"started\n");
+        assert_eq!(
+            fs::read_to_string(path.join("setup-starts")).unwrap(),
+            "started\n"
+        );
         assert!(!survivor.exited(0));
     }
-    let device_service::Reply::Worktree(Reply::SetupIntent {intent,..})=client.device_operation(device_service::Operation::Worktree{operation:Operation::SetupIntent{repository:project,path:path.clone()}}).unwrap() else {panic!("wrong retained intent");};
-    assert_eq!(serde_json::from_str::<Value>(&intent).unwrap(),before);
+    let device_service::Reply::Worktree(Reply::SetupIntent { intent, .. }) = client
+        .device_operation(device_service::Operation::Worktree {
+            operation: Operation::SetupIntent {
+                repository: project,
+                path: path.clone(),
+            },
+        })
+        .unwrap()
+    else {
+        panic!("wrong retained intent");
+    };
+    assert_eq!(serde_json::from_str::<Value>(&intent).unwrap(), before);
 }
-
 
 #[test]
 fn edited_pending_setup_cannot_use_a_current_runs_trust_for_a_different_recipe() {
@@ -1544,81 +1813,170 @@ fn edited_pending_setup_cannot_use_a_current_runs_trust_for_a_different_recipe()
         device_service,
         model::{CardId, CardKind, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
         repository::WorktreeSetupIntent,
-        workspace_model::{ModelEdit, views::{Change, Pane, Scope}},
+        workspace_model::{
+            ModelEdit,
+            views::{Change, Pane, Scope},
+        },
         worktree_control::{Operation, Reply},
     };
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     let path = fixture.create("edited-pending");
     fs::create_dir(project.join(".cagents")).unwrap();
-    fs::write(project.join(".cagents/worktree.toml"), "setup = \"printf approved > approved-setup\"\n").unwrap();
+    fs::write(
+        project.join(".cagents/worktree.toml"),
+        "setup = \"printf approved > approved-setup\"\n",
+    )
+    .unwrap();
     let plan = cagents::worktree_setup::load(&project).unwrap().unwrap();
-    cagents::worktree_setup::trust(&project, &plan, &cagents::repository::CancellationToken::new()).unwrap();
+    cagents::worktree_setup::trust(
+        &project,
+        &plan,
+        &cagents::repository::CancellationToken::new(),
+    )
+    .unwrap();
     let command = plan.terminal_command().unwrap();
-    let mut intent: WorktreeSetupIntent = serde_json::from_value(fixture.setup_intent(&path)).unwrap();
-    intent.skip = false; intent.copy_done = true; intent.plan = Some(plan);
+    let mut intent: WorktreeSetupIntent =
+        serde_json::from_value(fixture.setup_intent(&path)).unwrap();
+    intent.skip = false;
+    intent.copy_done = true;
+    intent.plan = Some(plan);
     let run = intent.run_id.unwrap();
     // Model a crash after an approved preparation but before the first child.
     // All creation/registration/generation authority is the real settled receipt.
     fixture.install_setup_intent(&path, &intent);
-    let socket = fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let socket = fixture
+        .root
+        .path()
+        .join("run")
+        .join(cagents::instance::RUNTIME_SUBDIRECTORY)
+        .join(cagents::terminal_ipc::SOCKET_FILE_NAME);
     let mut client = cagents::control::ControlClient::connect(&socket).unwrap();
     let repository = project.join(".git");
-    let device_service::Reply::Worktree(Reply::SetupIntent { creation_id, .. }) = client.device_operation(device_service::Operation::Worktree {
-        operation: Operation::SetupIntent { repository: repository.clone(), path: path.clone() },
-    }).unwrap() else { panic!("wrong setup metadata"); };
+    let device_service::Reply::Worktree(Reply::SetupIntent { creation_id, .. }) = client
+        .device_operation(device_service::Operation::Worktree {
+            operation: Operation::SetupIntent {
+                repository: repository.clone(),
+                path: path.clone(),
+            },
+        })
+        .unwrap()
+    else {
+        panic!("wrong setup metadata");
+    };
     let canonical = LaunchRecipe {
-        program: "/bin/sh".into(), arguments: vec!["-c".into(), command], working_directory: path.clone(),
+        program: "/bin/sh".into(),
+        arguments: vec!["-c".into(), command],
+        working_directory: path.clone(),
         environment: [
             ("CAGENTS_WORKTREE_SETUP".into(), "1".into()),
             ("CAGENTS_WORKTREE_SETUP_ID".into(), run.to_string()),
-            ("CAGENTS_WORKTREE_SETUP_CREATION_ID".into(), creation_id.to_string()),
-        ].into(), unset_environment: Default::default(),
+            (
+                "CAGENTS_WORKTREE_SETUP_CREATION_ID".into(),
+                creation_id.to_string(),
+            ),
+        ]
+        .into(),
+        unset_environment: Default::default(),
     };
     let terminal = TerminalId::new();
     let pane_id = CardId::new();
-    let scope = Scope::Worktree { repository, path: path.clone() };
-    let session = |recipe: LaunchRecipe| TerminalSession {
-        id: terminal, launch: recipe.clone(), transcript_path: None, resume_hint: None,
-        owned_codex_listener: None, recovery_origin: None, predecessor: None,
-        continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None },
+    let scope = Scope::Worktree {
+        repository,
+        path: path.clone(),
     };
-    client.edit_workspace_model(ModelEdit::SeedView {
-        scope: scope.clone(), panes: vec![Pane {
-            id: pane_id, title: "Worktree setup".into(), user_title: None, pending_terminal_start: true,
-            width_fraction: 1.0, kind: CardKind::Terminal(session(canonical.clone())), scope: Some(path.clone()),
-        }], closed: vec![],
-    }).unwrap();
+    let session = |recipe: LaunchRecipe| TerminalSession {
+        id: terminal,
+        launch: recipe.clone(),
+        transcript_path: None,
+        resume_hint: None,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        continuity: TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+    };
+    client
+        .edit_workspace_model(ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![Pane {
+                id: pane_id,
+                title: "Worktree setup".into(),
+                user_title: None,
+                pending_terminal_start: true,
+                width_fraction: 1.0,
+                kind: CardKind::Terminal(session(canonical.clone())),
+                scope: Some(path.clone()),
+            }],
+            closed: vec![],
+        })
+        .unwrap();
     let mut altered = Vec::new();
-    let mut recipe = canonical.clone(); recipe.arguments[1] = "printf unreviewed > unauthorized-setup".into(); altered.push(recipe);
-    let mut recipe = canonical.clone(); recipe.program = "/bin/bash".into(); altered.push(recipe);
-    let mut recipe = canonical.clone(); recipe.environment.insert("ENV".into(), path.join("unreviewed-env").to_string_lossy().into_owned()); altered.push(recipe);
-    let mut recipe = canonical.clone(); recipe.unset_environment.insert("PATH".into()); altered.push(recipe);
-    for (approved, recipe) in altered.into_iter().map(|recipe| (false, recipe)).chain(std::iter::once((true, canonical.clone()))) {
+    let mut recipe = canonical.clone();
+    recipe.arguments[1] = "printf unreviewed > unauthorized-setup".into();
+    altered.push(recipe);
+    let mut recipe = canonical.clone();
+    recipe.program = "/bin/bash".into();
+    altered.push(recipe);
+    let mut recipe = canonical.clone();
+    recipe.environment.insert(
+        "ENV".into(),
+        path.join("unreviewed-env").to_string_lossy().into_owned(),
+    );
+    altered.push(recipe);
+    let mut recipe = canonical.clone();
+    recipe.unset_environment.insert("PATH".into());
+    altered.push(recipe);
+    for (approved, recipe) in altered
+        .into_iter()
+        .map(|recipe| (false, recipe))
+        .chain(std::iter::once((true, canonical.clone())))
+    {
         let model = client.read_workspace_model().unwrap();
         let view = model.views.iter().find(|view| view.scope == scope).unwrap();
-        let before = view.panes.iter().find(|pane| pane.id == pane_id).unwrap().clone();
-        let mut pane = before.clone(); pane.kind = CardKind::Terminal(session(recipe.clone()));
-        client.edit_workspace_model(ModelEdit::ChangeView {
-            scope: scope.clone(), expected_revision: view.revision, operation: uuid::Uuid::new_v4(),
-            change: Change::Update { before, pane },
-        }).unwrap();
+        let before = view
+            .panes
+            .iter()
+            .find(|pane| pane.id == pane_id)
+            .unwrap()
+            .clone();
+        let mut pane = before.clone();
+        pane.kind = CardKind::Terminal(session(recipe.clone()));
+        client
+            .edit_workspace_model(ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: view.revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update { before, pane },
+            })
+            .unwrap();
         let result = client.start_worktree_setup(pane_id, terminal, run, Default::default());
         if approved {
             result.unwrap();
         } else {
             let error = result.unwrap_err();
-            assert!(error.to_string().contains("differs from its reviewed configuration"), "{error:?}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("differs from its reviewed configuration"),
+                "{error:?}"
+            );
             assert!(!path.join("approved-setup").exists());
             assert!(!path.join("unauthorized-setup").exists());
             assert!(client.list().unwrap().is_empty());
-            let current: WorktreeSetupIntent = serde_json::from_value(fixture.setup_intent(&path)).unwrap();
+            let current: WorktreeSetupIntent =
+                serde_json::from_value(fixture.setup_intent(&path)).unwrap();
             assert_eq!(current, intent);
         }
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     while !path.join("approved-setup").exists() {
-        assert!(Instant::now() < deadline, "canonical approved command must still execute");
+        assert!(
+            Instant::now() < deadline,
+            "canonical approved command must still execute"
+        );
         thread::sleep(Duration::from_millis(20));
     }
     assert!(!path.join("unauthorized-setup").exists());
