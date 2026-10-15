@@ -141,6 +141,15 @@ fn combined_close_retained_lifecycle_final_verification_failure_keeps_exact_owne
         assert!(state.chats[&id].handle.same_actor(&f.handle));
         assert!(state.native_closing.contains_key(&id));
     }
+    // The real public replacement producer must not install a same-ID backend
+    // while this exact pending operation still owns its source reservation.
+    // This proves replacement refusal, not an invented reachable successor.
+    let replacement = super::super::chat::process(&f.host,1,
+        crate::terminal_ipc::ClientRequest::ChatAttach {session:f.binding.source.clone()});
+    assert!(replacement.is_err(), "pending native cleanup cannot start a replacement");
+    assert_eq!(f.phase(),Some((original,true)));
+    assert!(f.host.lock().unwrap().chats[&id].handle.same_actor(&f.handle));
+    assert_eq!(std::fs::read_to_string(f.path.with_file_name("spawns")).unwrap().lines().count(),1);
     // Durable model close may ALREADY have committed. This is a retained
     // disposition retry, never a claim that the provider/model rolled back.
     assert_eq!(registry(&f.host).unwrap().lock().unwrap().agent_run(f.run.id).unwrap(),f.run);
