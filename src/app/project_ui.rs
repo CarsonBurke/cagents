@@ -215,7 +215,9 @@ pub enum Action {
 
 impl Cagents {
     pub(super) fn sync_worktree_protections(&mut self) {
-        let mut paths = Vec::new();
+        // Retain the window lease through background preparation and until
+        // its result creates the terminal card, even after a scope switch.
+        let mut paths = self.setup_ui.protected_directories().cloned().collect::<Vec<_>>();
         if let Some(path) = &self.active_workspace {
             paths.push(path.clone());
         }

@@ -22,6 +22,7 @@ impl Drop for State {
 
 impl State {
     pub fn preparing(&self, path: &Path) -> bool { self.pending.contains_key(path) }
+    pub fn protected_directories(&self) -> impl Iterator<Item = &PathBuf> { self.pending.keys() }
     pub fn active(&self) -> bool {
         !self.pending.is_empty() || self.statuses.values().any(|status| *status == WorktreeSetupStatus::Running)
     }
