@@ -393,13 +393,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     generations[index] = snapshot.generation;
                     if input_mode && index == 0 && probe < 30 {
                         if text.contains(&format!("PROBE:{probe}")) {
-                            latencies.push(sent_at.elapsed().as_nanos() as u64);
-                            probe += 1;
-                            if probe == 30 {
+                            if probe == 29 {
                                 if let Some(toggles) = &toggles {
                                     measured_toggle_cycles = Some(toggles.end_measurement()?);
                                 }
                             }
+                            // Capture the final elapsed sample AFTER sealing:
+                            // every counted commit precedes this timestamp,
+                            // including if this consumer is preempted here.
+                            latencies.push(sent_at.elapsed().as_nanos() as u64);
+                            probe += 1;
                             sent_at = Instant::now();
                             handle.input(if probe == 30 {
                                 b"exit\n".to_vec()
@@ -464,7 +467,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::json!({
                 "pane_toggle_cycles": pane_toggles,
                 "pane_toggle_measured_cycles": measured_toggle_cycles,
-                "pane_toggle_measured_window": if input_mode { "first_probe_to_last_echo" } else { "consumer_loop" },
+                "pane_toggle_measured_window": if input_mode { "first_probe_to_last_sample" } else { "consumer_loop" },
                 "schema": "cagents.terminal-workload.v1", "workload": mode, "profile": if cfg!(debug_assertions) { "unoptimized-or-dev" } else { "optimized" },
                 "terminals": count, "consumer": "synthetic_60hz_snapshot_ack", "transport": if socket.is_some() { "daemon_ipc" } else { "in_process" }, "wall_ns": wall_ns,
                 "consumer_process_cpu_ns": cpu_ns().saturating_sub(cpu_start), "output_batches": batches, "resize_exercised": resized,
