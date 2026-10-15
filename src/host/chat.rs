@@ -1177,7 +1177,7 @@ fn start_with_execution(
             "Native restart launch differs from its issued conversation",
         ));
     }
-    let process_launch = &operational_launch;
+    let mut process_launch = operational_launch;
     // Adapter construction can open/index resumed Claude history. Admit the
     // actual operational home before that read, using the same environment
     // overlay/unset policy as the eventual process spec. Explicit read-only
@@ -1192,11 +1192,17 @@ fn start_with_execution(
             source_execution.as_ref(),
         )?;
         ensure_native_account_admission(host, &admission, execution.as_deref())?;
+        // History::open reads the constructor's launch, not the later process
+        // spec. Give it exactly the admitted effective home; a transient or
+        // explicitly unset selection must never index another account's body.
+        // This launch is private execution context, not the issued descriptor.
+        process_launch.recipe.environment = admission.environment;
+        process_launch.recipe.unset_environment = admission.unset_environment;
     }
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
-        chat::protocol::codex::create_with_listener(process_launch, owned_socket)
+        chat::protocol::codex::create_with_listener(&process_launch, owned_socket)
     } else {
-        chat::protocol::create(process_launch)
+        chat::protocol::create(&process_launch)
     }
     .map_err(|message| {
         // Removal may have won after the early check while the adapter
@@ -1224,22 +1230,9 @@ fn start_with_execution(
     ) {
         check_launch_account(&session.launch)?;
     }
-    let sourceless = source.is_none()
-        && !matches!(spec.transport, chat::protocol::TransportSpec::History);
-    // A conversation with no proven source has no proven environment to
-    // preserve, so it starts from the daemon's own native configuration
-    // whether or not it names a stopped terminal. Standalone conversations
-    // also receive transient GUI configuration unavailable to the daemon.
-    // Keep these values in the spec, never the durable session. Selected
-    // configuration overrides daemon defaults; the issued recipe overrides
-    // both. The identical overlay also protects pre-construction admission.
-    apply_native_execution_environment(
-        &mut spec,
-        session.launch.provider,
-        sourceless,
-        &execution_environment.0,
-        source_execution.as_ref(),
-    )?;
+    // The constructor and final process share the one captured environment.
+    // Retain any adapter-specific fields and enforce explicit removals again.
+    spec.remove_unset_environment();
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -3683,6 +3676,63 @@ mod tests {
             assert!(!state.chats.contains_key(&id));
             assert!(!state.chat_spawning.contains_key(&id));
             assert!(!state.issued_chat_ids.contains(&id));
+        }
+        // Inverse case: the effective execution home B is unrelated, but the
+        // immutable recipe still contains A. Neither a transient override nor
+        // an explicit unset may let adapter construction read reserved A.
+        let home_a = root.join("source-home");
+        let config_a = home_a.join(".claude");
+        let home_b = root.join("selected-home");
+        std::fs::create_dir_all(&home_b).unwrap();
+        let slug: String = operational.to_str().unwrap().chars().map(|character| {
+            if character.is_ascii_alphanumeric() { character } else { '-' }
+        }).collect();
+        let saved = config_a.join("projects").join(slug)
+            .join("12345678-1234-4234-8234-123456789abc.jsonl");
+        std::fs::create_dir_all(saved.parent().unwrap()).unwrap();
+        std::fs::write(&saved, "{}\n").unwrap();
+        let source_account = crate::account::Account::linked(Provider::Claude, uuid::Uuid::new_v4(), config_a.clone());
+        let _source_reservation = super::super::account_lifecycle::Reservation::install(&host, &[source_account]).unwrap();
+        use std::os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::ffi::OsStrExt};
+        let notify = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(notify >= 0, "{}", std::io::Error::last_os_error());
+        let notify = unsafe { OwnedFd::from_raw_fd(notify) };
+        let watched = std::ffi::CString::new(saved.as_os_str().as_bytes()).unwrap();
+        assert!(unsafe { libc::inotify_add_watch(notify.as_raw_fd(), watched.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS) } >= 0);
+        for explicit_unset in [false, true] {
+            let mut environment = BTreeMap::from([
+                ("HOME".into(), home_a.display().to_string()),
+                ("CODEX_HOME".into(), root.join("home").display().to_string()),
+            ]);
+            let mut unset = std::collections::BTreeSet::new();
+            let mut selected = BTreeMap::new();
+            if explicit_unset {
+                environment.insert("HOME".into(), home_b.display().to_string());
+                environment.insert("CLAUDE_CONFIG_DIR".into(), config_a.display().to_string());
+                unset.insert("CLAUDE_CONFIG_DIR".into());
+            } else {
+                selected.insert("CLAUDE_CONFIG_DIR".into(), home_b.join(".claude").display().to_string());
+            }
+            let session = Session {
+                id: TerminalId::new(), terminal: None, proof: None,
+                owned_codex_listener: None, native_continuity: Default::default(),
+                launch: chat::Launch { provider: Provider::Claude,
+                    session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
+                    recipe: LaunchRecipe { program: executable.display().to_string(), arguments: Vec::new(),
+                        working_directory: issued.clone(), environment, unset_environment: unset } },
+            };
+            let original = session.clone();
+            let failure = start_at_execution_directory(&host, 1, session,
+                crate::terminal_ipc::ChatExecutionEnvironment(selected), context.clone(), &operational).unwrap_err();
+            assert!(!failure.message.contains("being changed"), "effective B must not inherit A's reservation: {failure:?}");
+            assert!(!marker.exists(), "missing B history must fail before provider startup");
+            let mut events = [0_u8; 4096];
+            let read = unsafe { libc::read(notify.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) };
+            assert_eq!(read, -1, "the reserved A transcript must not be opened or read");
+            assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock);
+            assert!(!host.lock().unwrap().chat_spawning.contains_key(&original.id));
+            assert!(!host.lock().unwrap().chats.contains_key(&original.id));
+            assert_eq!(original.launch.recipe.working_directory, issued);
         }
         // A reused original spelling cannot replace the approved inode.
         let spec = ProcessSpec::from(&LaunchRecipe { program: "/bin/false".into(), arguments: Vec::new(),
