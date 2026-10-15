@@ -2,7 +2,8 @@
 //!
 //! This is the menu adapter for the source-bound End API from modals
 //! 0cd1028c2/e10816e7b/21a916a98. The final application must also compose
-//! 12da0cb31's captured End pipeline and generic removal source65cce.
+//! 12da0cb31's captured End pipeline and generic removal source65cce, plus
+//! 66e77b52b/bdcfc5987 preconfirmation shared-source and filing fences.
 use super::*;
 use crate::sidebar::conversation::{ConversationEndTarget, Entry};
 use crate::workspace_model::views::Scope;
@@ -35,7 +36,7 @@ impl Cagents {
                 Scope::Channel(id) => repositories.get(id).copied().flatten(),
                 Scope::Worktree { repository, .. } => Some(repository.as_path()),
             };
-            for pane in &view.panes { unique(&mut views, pane.id, (view.scope.clone(), repository)); }
+            for pane in &view.panes { unique(&mut views, pane.id, (view.scope.clone(), repository, pane)); }
         }
         let mut cards = HashMap::new();
         for card in &self.durable.cards { unique(&mut cards, card.id, card); }
@@ -47,10 +48,12 @@ impl Cagents {
                 Some(None) => return None,
                 None => (None, None),
             };
-            let (shared_scope, shared_repository) = match views.get(&card.id) {
-                Some(Some((scope, Some(repository)))) => (Some(scope.clone()), Some((*repository).to_path_buf())),
+            let (shared_scope, shared_repository, shared_worktree) = match views.get(&card.id) {
+                Some(Some((scope, Some(repository), pane))) if !pane.pending_terminal_start
+                    && matches!(&pane.kind, CardKind::Chat(current) if terminal_close::same_chat_removal_source(issued, current)) =>
+                        (Some(scope.clone()), Some((*repository).to_path_buf()), pane.scope.clone()),
                 Some(_) => return None,
-                None => (None, None),
+                None => (None, None, None),
             };
             // The shared accessor's descriptor fallback scans durable cards.
             // We already hold that exact descriptor; reserve the accessor for
@@ -62,7 +65,7 @@ impl Cagents {
                 card: card.id, registry: self.workspace_model.identity,
                 issued: Arc::new(issued.clone()), observed: Arc::new(observed),
                 channel, channel_project, worktree: self.durable.card_scopes.get(&card.id).cloned(),
-                shared_scope, shared_repository,
+                shared_scope, shared_repository, shared_worktree,
             }) })
         }).collect()
     }
@@ -217,6 +220,32 @@ mod tests {
         Arc::make_mut(&mut app.durable).channels[0].cards.pop();
         let duplicate = app.card_state(card).unwrap().clone();
         Arc::make_mut(&mut app.durable).cards.push(duplicate);
+        assert!(app.capture_conversation_end_targets().is_empty());
+    }
+}
+
+
+#[cfg(test)]
+mod shared_capture_tests {
+    use super::*;
+    #[test]
+    fn sidebar_end_bulk_source_check_refuses_same_scope_replacement_before_local_adoption() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        drop(app.new_native_chat(crate::agent::Provider::Codex, Some(directory.path().into())));
+        let card = app.workspace.focused().unwrap();
+        let issued = app.card_state(card).unwrap().clone();
+        let pane = crate::workspace_model::views::Pane::from_card(&issued, None).unwrap();
+        app.workspace_model.views.push(crate::workspace_model::views::View {
+            scope: Scope::Worktree { repository: directory.path().into(), path: directory.path().into() },
+            revision: 1, panes: vec![pane], retired: Vec::new(),
+        });
+        assert_eq!(app.capture_conversation_end_targets().len(), 1);
+        let CardKind::Chat(shared) = &mut app.workspace_model.views[0].panes[0].kind else { panic!("shared source"); };
+        shared.launch.session_id = Some("replacement-before-local-adoption".into());
+        assert!(app.capture_conversation_end_targets().is_empty());
+        app.workspace_model.views[0].panes[0].kind = issued.kind;
+        app.workspace_model.views[0].panes[0].pending_terminal_start = true;
         assert!(app.capture_conversation_end_targets().is_empty());
     }
 }

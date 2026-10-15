@@ -14,6 +14,7 @@ pub struct ConversationEndTarget {
     pub(crate) worktree: Option<PathBuf>,
     pub(crate) shared_scope: Option<Scope>,
     pub(crate) shared_repository: Option<PathBuf>,
+    pub(crate) shared_worktree: Option<PathBuf>,
 }
 impl ConversationEndTarget {
     pub fn card(&self) -> CardId { self.card }
@@ -116,7 +117,7 @@ mod tests {
             card: CardId::new(), registry: uuid::Uuid::new_v4(),
             issued: Arc::new(session.clone()), observed: Arc::new(session),
             channel: None, channel_project: None, worktree: None,
-            shared_scope: None, shared_repository: None,
+            shared_scope: None, shared_repository: None, shared_worktree: None,
         }) }
     }
     fn collect(items: &[Item<EndCommand, String>], out: &mut Vec<CardId>) {
