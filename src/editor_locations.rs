@@ -24,11 +24,15 @@ impl History {
         if from.card == to.card && from.source == to.source
             && from.anchor.caret == to.anchor.caret && from.anchor.selection == to.anchor.selection { return; }
         if self.entries.is_empty() { self.entries.push(from); self.current = 0; }
-        else { self.entries[self.current] = from; }
-        self.entries.truncate(self.current + 1);
+        else {
+            self.entries.truncate(self.current + 1);
+            let current = &self.entries[self.current];
+            if current.card == from.card && current.source == from.source { self.entries[self.current] = from; }
+            else { self.entries.push(from); self.current += 1; }
+        }
         self.entries.push(to);
         self.current += 1;
-        if self.entries.len() > 128 { self.entries.remove(0); self.current -= 1; }
+        while self.entries.len() > 128 { self.entries.remove(0); self.current -= 1; }
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -78,6 +82,21 @@ mod tests {
         assert!(history.peek(true, |_| true).is_none());
         assert_eq!(history.peek(false, |_| true).unwrap().location.card, c);
     }
+    #[test]
+    fn a_new_origin_in_another_card_keeps_the_previous_completed_destination() {
+        let a = CardId::new(); let b = CardId::new(); let c = CardId::new(); let d = CardId::new();
+        let mut history = History::default();
+        history.record_jump(location(a, "a", 1), location(b, "b", 2));
+        history.record_jump(location(c, "c", 3), location(d, "d", 4));
+        let c_target = history.peek(false, |_| true).unwrap();
+        assert_eq!(c_target.location.card, c);
+        assert!(history.navigate(location(d, "d", 4), &c_target));
+        let b_target = history.peek(false, |_| true).unwrap();
+        assert_eq!(b_target.location.card, b);
+        assert!(history.navigate(location(c, "c", 3), &b_target));
+        assert_eq!(history.peek(false, |_| true).unwrap().location.card, a);
+    }
+
     #[test]
     fn closed_cards_are_skipped_and_history_is_bounded() {
         let a = CardId::new(); let b = CardId::new(); let c = CardId::new();

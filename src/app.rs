@@ -10319,6 +10319,7 @@ impl Cagents {
         self.close_lsp_document(card);
         self.lsp_contexts.remove(&card);
         self.lsp_pending_jumps.remove(&card);
+        self.editor_features.jump_origins.remove(&card);
     }
 
     fn lsp_document(&self, card: CardId) -> Option<LspDocumentId> {
@@ -10731,9 +10732,19 @@ impl Cagents {
             matches!(self.cards.get(&entry.card), Some(CardRuntime::Repository(runtime)) if runtime.source_tab_path().as_ref() == Some(&entry.source)
                 && runtime.editor_navigation_anchor().is_some() && !runtime.is_saving())
         })?;
-        if !self.editor_features.location_history.navigate(from, &target) { return None; }
-        let CardRuntime::Repository(runtime) = self.cards.get_mut(&target.location.card)? else { return None; };
-        if !runtime.restore_editor_navigation_anchor(target.location.anchor) { return None; }
+        let previous = match self.cards.get_mut(&target.location.card)? {
+            CardRuntime::Repository(runtime) => {
+                let previous = runtime.editor_navigation_anchor()?;
+                if !runtime.restore_editor_navigation_anchor(target.location.anchor) { return None; }
+                previous
+            }
+            _ => return None,
+        };
+        if !self.editor_features.location_history.navigate(from, &target) {
+            if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&target.location.card) { runtime.restore_editor_navigation_anchor(previous); }
+            return None;
+        }
+        let CardRuntime::Repository(runtime) = self.cards.get(&target.location.card)? else { return None; };
         let focus = repository_task(runtime.focus_editor(target.location.card));
         let update = self.workspace.focus(target.location.card).unwrap_or_else(|_| ViewportUpdate::unchanged());
         Some(Task::batch([focus, self.apply_viewport(update, true, false)]))

@@ -216,10 +216,17 @@ impl Editor {
             self.tab(entry.card).is_some_and(|tab| tab.runtime.source_tab_path().as_ref() == Some(&entry.source)
                 && tab.runtime.editor_navigation_anchor().is_some() && !tab.runtime.is_saving())
         })?;
-        if !self.lsp_navigation.history.navigate(from, &target) { return None; }
-        let tab = self.tab_mut(target.location.card)?;
-        if !tab.runtime.restore_editor_navigation_anchor(target.location.anchor) { return None; }
-        let focus = tab.runtime.focus_editor(target.location.card).map(cosmic::Action::App);
+        let previous = {
+            let tab = self.tab_mut(target.location.card)?;
+            let previous = tab.runtime.editor_navigation_anchor()?;
+            if !tab.runtime.restore_editor_navigation_anchor(target.location.anchor) { return None; }
+            previous
+        };
+        if !self.lsp_navigation.history.navigate(from, &target) {
+            if let Some(tab) = self.tab_mut(target.location.card) { tab.runtime.restore_editor_navigation_anchor(previous); }
+            return None;
+        }
+        let focus = self.tab(target.location.card)?.runtime.focus_editor(target.location.card).map(cosmic::Action::App);
         self.active = Some(target.location.card);
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
         Some(focus)
