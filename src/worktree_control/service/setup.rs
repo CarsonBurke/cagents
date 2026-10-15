@@ -125,6 +125,17 @@ pub(super) fn prepare(service:&Service,store:&crate::persistence::StateStore,req
     plan:&crate::worktree_setup::SetupPlan,warnings:&mut Vec<String>,cancel:&CancellationToken,
 )->Option<Setup> {
     let run_id=request.setup_intent.as_ref().and_then(|intent|intent.run_id);
+    let generation=(||->Result<(),String> {
+        let admin=service.git_dir(destination,cancel).map_err(|error|error.to_string())?;
+        if !crate::repository::worktree_setup_marker_matches(&admin,request.operation_id).map_err(|error|error.to_string())? {
+            return Err("The checkout no longer has the original creation generation".into());
+        }
+        Ok(())
+    })();
+    if let Err(error)=generation {
+        let error=format!("Setup was retained without execution because its creation identity could not be verified: {error}");
+        warnings.push(error.clone());return Some(Setup {command:String::new(),run_id,terminal:None,error:Some(error)});
+    }
     match crate::worktree_setup::prepare(primary,destination,plan,false,cancel) {
         Ok(prepared)=> {
             for missing in prepared.missing_patterns {warnings.push(format!("No setup source matched {missing}"));}

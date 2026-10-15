@@ -326,6 +326,7 @@ fn start_worktree_setup(
     path: &std::path::Path,
     command: &str,
     run_id: crate::model::OperationId,
+    creation_id: crate::model::OperationId,
 ) -> Result<crate::model::TerminalSession, ProtocolError> {
     use crate::{
         model::{CardId,CardKind,LaunchRecipe,TerminalContinuity,TerminalId,TerminalSession},
@@ -334,8 +335,9 @@ fn start_worktree_setup(
     let started=crate::chat::now_ms().ok_or_else(||ProtocolError::new(ProtocolErrorCode::Internal,"The setup start time is unavailable",false))?;
     let recipe=LaunchRecipe {
         program:"/bin/sh".into(),arguments:vec!["-c".into(),command.into()],working_directory:path.to_path_buf(),
-        environment:std::collections::BTreeMap::from([("CAGENTS_WORKTREE_SETUP".into(),"1".into()),("CAGENTS_WORKTREE_SETUP_ID".into(),run_id.to_string()),("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(),started.to_string())]),unset_environment:Default::default(),
+        environment:std::collections::BTreeMap::from([("CAGENTS_WORKTREE_SETUP".into(),"1".into()),("CAGENTS_WORKTREE_SETUP_ID".into(),run_id.to_string()),("CAGENTS_WORKTREE_SETUP_CREATION_ID".into(),creation_id.to_string()),("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(),started.to_string())]),unset_environment:Default::default(),
     };
+    super::state::verify_worktree_setup_generation(&recipe)?;
     let session=TerminalSession {id:TerminalId::new(),owned_codex_listener:None,recovery_origin:None,predecessor:None,launch:recipe.clone(),transcript_path:None,resume_hint:None,continuity:TerminalContinuity::RelaunchAvailable {recipe,last_exit:None}};
     let pane=CardId::new();
     {
@@ -501,6 +503,7 @@ pub(super) fn process_request(
             let execution=result.map_err(|message|ProtocolError::new(ProtocolErrorCode::InvalidRequest,message,false))?;
             let mut reply=execution.reply;
             let _setup_reservation=execution.setup_reservation;
+            let setup_creation_id=execution.setup_creation_id;
             let prepared=match &mut reply {
                 crate::worktree_control::Reply::Created {worktree,setup:Some(setup),warnings}=>Some((&worktree.path,setup,warnings)),
                 crate::worktree_control::Reply::SetupPrepared {path,setup:Some(setup),warnings,..}=>Some((&*path,setup,warnings)),
@@ -508,8 +511,8 @@ pub(super) fn process_request(
             };
             if let Some((path,setup,warnings))=prepared {
                 if setup.error.is_none() {
-                    let started=match (repository.as_deref(),setup.run_id) {
-                        (Some(repository),Some(run_id))=>start_worktree_setup(host,repository,path,&setup.command,run_id),
+                    let started=match (repository.as_deref(),setup.run_id,setup_creation_id) {
+                        (Some(repository),Some(run_id),Some(creation_id))=>start_worktree_setup(host,repository,path,&setup.command,run_id,creation_id),
                         _=>Err(ProtocolError::new(ProtocolErrorCode::Internal,"Setup has no retained repository/run identity",false)),
                     };
                     match started {

@@ -3413,6 +3413,22 @@ fn start_terminal_view(
     .map(|(descriptor, _)| descriptor)
 }
 
+/// Run outside HostLock: an explicit run must still name the original checkout
+/// generation immediately before publication and child creation. Retained
+/// recipes without generation evidence never grant fresh execution authority.
+pub(super) fn verify_worktree_setup_generation(recipe:&crate::model::LaunchRecipe)->Result<(),ProtocolError> {
+    let invalid=|detail:String|ProtocolError::new(ProtocolErrorCode::InvalidRequest,detail,false);
+    let creation=recipe.environment.get("CAGENTS_WORKTREE_SETUP_CREATION_ID")
+        .ok_or_else(||invalid("This saved setup has no creation-generation evidence; review its worktree before resuming".into()))?
+        .parse::<crate::model::OperationId>().map_err(|error|invalid(format!("Invalid setup creation identity: {error}")))?;
+    let service=crate::repository::RepositoryService::system("git");
+    let admin=service.git_dir(&recipe.working_directory,&crate::repository::CancellationToken::new()).map_err(|error|invalid(error.to_string()))?;
+    if !crate::repository::worktree_setup_marker_matches(&admin,creation).map_err(|error|invalid(error.to_string()))? {
+        return Err(invalid("This checkout was replaced or its original creation identity is unavailable; no setup was started".into()));
+    }
+    Ok(())
+}
+
 /// Starts a terminal's worker, spawning its process or, given `adoption`,
 /// adopting the one a predecessor daemon's holder waits with there.
 fn start_terminal_view_owned(
@@ -3574,6 +3590,12 @@ fn start_terminal_view_owned(
     } else {
         Default::default()
     };
+    if adoption.is_none()&&crate::upgrade::is_worktree_setup_recipe(&session.launch) {
+        if let Err(error)=verify_worktree_setup_generation(&session.launch) {
+            shared.lock().unwrap_or_else(|poison|poison.into_inner()).cancel_spawn(terminal_id);
+            return Err(error);
+        }
+    }
     let weak = Arc::downgrade(shared);
     let config = TerminalConfig {
         agent_authority,
@@ -4130,10 +4152,13 @@ mod tests {
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
         let repository=directory.path().to_owned();
         let run_id=crate::model::OperationId::new();
+        let creation_id=crate::model::OperationId::new();
+        assert!(std::process::Command::new("git").args(["init","--quiet"]).arg(&repository).status().unwrap().success());
+        fs::write(repository.join(".git/cagents-setup-creation"),format!("{creation_id}\n")).unwrap();
         let launch=crate::model::LaunchRecipe {
             program:"/bin/sh".into(),arguments:vec!["-c".into(),"printf once >> setup-count".into()],
             working_directory:repository.clone(),
-            environment:BTreeMap::from([("CAGENTS_WORKTREE_SETUP".into(),"1".into()),("CAGENTS_WORKTREE_SETUP_ID".into(),run_id.to_string())]),unset_environment:Default::default(),
+            environment:BTreeMap::from([("CAGENTS_WORKTREE_SETUP".into(),"1".into()),("CAGENTS_WORKTREE_SETUP_ID".into(),run_id.to_string()),("CAGENTS_WORKTREE_SETUP_CREATION_ID".into(),creation_id.to_string())]),unset_environment:Default::default(),
         };
         let session=TerminalSession {id:TerminalId::new(),launch:launch.clone(),transcript_path:None,resume_hint:None,owned_codex_listener:None,recovery_origin:None,predecessor:None,continuity:TerminalContinuity::RelaunchAvailable {recipe:launch,last_exit:None}};
         let pane=Pane {id:crate::model::CardId::new(),title:"Worktree setup".into(),user_title:None,pending_terminal_start:true,width_fraction:1.0,scope:Some(repository.clone()),kind:crate::model::CardKind::Terminal(session.clone())};
@@ -4163,7 +4188,9 @@ mod tests {
         // Its marker and pending bit are evidence, not replay permission.
         let restored=make_host("restored.sqlite3");
         assert!(spawn_pending_terminal(&restored,1,pane.id,session.id,options.clone()).is_err());
-        assert!(spawn_terminal(&restored,1,session,options).is_err());
+        assert!(spawn_terminal(&restored,1,session.clone(),options.clone()).is_err());
+        fs::remove_file(repository.join(".git/cagents-setup-creation")).unwrap();
+        assert!(spawn_reviewed_worktree_setup(&restored,1,pane.id,session.id,run_id,options).is_err(),"even explicit stale callbacks must refuse missing generation evidence");
         assert_eq!(fs::read_to_string(directory.path().join("setup-count")).unwrap(),"once");
     }
 

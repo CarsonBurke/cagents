@@ -1,6 +1,6 @@
 mod setup;
 pub(crate) use setup::SetupReservation;
-pub(crate) struct Execution {pub(crate) reply:Reply,pub(crate) setup_reservation:Option<SetupReservation>}
+pub(crate) struct Execution {pub(crate) reply:Reply,pub(crate) setup_reservation:Option<SetupReservation>,pub(crate) setup_creation_id:Option<OperationId>}
 use super::*;
 use crate::{
     model::OperationId,
@@ -43,6 +43,7 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
     }
     let _active=OPERATIONS.read().unwrap_or_else(|poison|poison.into_inner());
     let mut setup_reservation=None;
+    let mut setup_creation_id=None;
     let reply=match operation {
         Operation::ResolveProject {id} => {
             let mut matches=std::collections::BTreeSet::new();
@@ -83,6 +84,7 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
                 });
             }
             setup_reservation=Some(SetupReservation::acquire(&request.destination)?);
+            setup_creation_id=Some(request.operation_id);
             let report=service.create_worktree_journaled_sync(&store,&request,0,&cancellation, |_|{});
             match report.outcome {
                 Some(WorktreeCreationOutcome::Created {worktree,warnings}) if report.state==crate::repository::WorktreeOperationState::Created => {
@@ -176,6 +178,7 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
         Operation::BusySessions {..}|Operation::CloseSessions {..}=>Err("Session census and guarded close require the owning daemon".into()),
         Operation::ResumeSetup {repository,path,expected_run_id,expected_plan_fingerprint,trust,skip}=> {
             let (report,primary)=setup::report(&service,&store,&repository,&path,&cancellation)?;
+            setup_creation_id=Some(report.operation_id);
             let request=report.request.as_ref().expect("validated request");
             setup_reservation=Some(SetupReservation::acquire(&request.destination)?);
             if !live_sessions(&request.destination)?.is_empty() {return Err("Close this worktree's live sessions before resuming interrupted setup".into());}
@@ -183,7 +186,7 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
         }
 
     }?;
-    Ok(Execution {reply,setup_reservation})
+    Ok(Execution {reply,setup_reservation,setup_creation_id})
 }
 
 fn same_repository(service:&Service,repository:&Path,path:&Path,cancel:&CancellationToken)->Result<(),String> {
