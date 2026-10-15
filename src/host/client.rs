@@ -309,6 +309,20 @@ fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
 }
 
+pub(super) fn try_scoped_control_write(
+    gate: &RwLock<()>,
+) -> Result<std::sync::RwLockWriteGuard<'_, ()>, ProtocolError> {
+    match gate.try_write() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Err(ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            "The daemon is finishing another operation. Wait for it and retry.",
+            true,
+        )),
+    }
+}
+
 pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
     if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
         return Err(ProtocolError::new(
@@ -364,6 +378,7 @@ pub(super) fn process_request(
             Ok(prepared) => {
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
+                super::account_lifecycle::ensure_idle(host)?;
                 prepared
                     .remove(|windows| {
                         host.lock()
@@ -382,6 +397,30 @@ pub(super) fn process_request(
             false,
         ));
     }
+    // Install only the physical token under a short writer. Provider and
+    // registry work runs outside global admission while related starts refuse.
+    if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::AccountLifecycle { operation },
+    } = &request
+    {
+        {
+            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+        }
+        let reservation = super::account_lifecycle::Reservation::for_operation(host, operation)?;
+        let value = crate::account::remote::execute_reserved(operation.clone(), &reservation)
+            .map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+        return Ok((
+            ServerResponse::DeviceOperation {
+                reply: crate::device_service::Reply::AccountLifecycle(value),
+            },
+            Vec::new(),
+            false,
+        ));
+    }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
     let exclusive = matches!(
@@ -395,51 +434,54 @@ pub(super) fn process_request(
                 idle_generation: Some(_),
                 ..
             }
-            | ClientRequest::DeviceOperation {
-                operation: crate::device_service::Operation::AccountLifecycle { .. }
-            }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
+    super::account_lifecycle::admit(host, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
-            if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
-                let account =
-                    crate::account::remote::affected_account(operation).map_err(|message| {
-                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
-                    })?;
-                if let Some(account) = account {
-                    let variable = crate::account::home_variable(account.provider).unwrap();
-                    let home = account.resolved_home().unwrap();
-                    let uses = |recipe: &crate::model::LaunchRecipe| {
-                        recipe
-                            .environment
-                            .get(variable)
-                            .is_some_and(|path| std::path::Path::new(path) == home)
-                    };
-                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                    if state
-                        .terminals
-                        .values()
-                        .any(|record| !record.handle.is_completed() && uses(&record.session.launch))
-                        || state.chats.values().any(|record| {
-                            record.handle.owns_work() && uses(&record.session.launch.recipe)
-                        })
-                        || state
-                            .chat_spawning
-                            .values()
-                            .any(|session| uses(&session.launch.recipe))
-                    {
-                        return Err(ProtocolError::new(
-                            ProtocolErrorCode::InvalidRequest,
-                            "This device account still has a live terminal, sign-in or conversation. Close it before changing its account home.",
-                            false,
-                        ));
-                    }
+            match &operation {
+                crate::device_service::Operation::AccountLifecycle { .. } => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Account operations require daemon admission",
+                        false,
+                    ));
                 }
+                crate::device_service::Operation::Skills { launch } => {
+                    super::account_lifecycle::ensure_launch(
+                        host,
+                        &launch.recipe.working_directory,
+                        &launch.recipe.environment,
+                        &Default::default(),
+                        true,
+                    )?;
+                    super::account_lifecycle::ensure_launch(
+                        host,
+                        &launch.recipe.working_directory,
+                        &launch.recipe.environment,
+                        &crate::account::launch_credential_overrides(&launch.recipe),
+                        true,
+                    )?;
+                }
+                crate::device_service::Operation::AccountsUpdate { registry, .. } => {
+                    let proposed = serde_json::from_value(registry.clone()).map_err(|error| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            format!("Invalid account preferences: {error}"),
+                            false,
+                        )
+                    })?;
+                    super::account_lifecycle::ensure_update(host, &proposed)?;
+                }
+                crate::device_service::Operation::AccountLogin { account }
+                | crate::device_service::Operation::AccountProbe { account, .. } => {
+                    super::account_lifecycle::ensure_paths(host, account.resolved_home())?;
+                }
+                _ => {}
             }
             let reply = crate::device_service::execute(operation).map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -1252,6 +1294,9 @@ fn prepare_resume(
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {
+        if super::account_lifecycle::ensure_terminal(host, cursor.terminal_id).is_err() {
+            continue;
+        }
         let (terminal, events) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {
