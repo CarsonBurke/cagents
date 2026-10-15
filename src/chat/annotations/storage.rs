@@ -54,7 +54,9 @@ impl Drop for PendingAttachment {
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= ID_BYTES
 }
-fn account_key(scope: &LaunchAccountScope) -> String {
+/// Namespace identity only; this hash never grants annotation read or purge
+/// authority. Host admission uses the same codec to fence historical writers.
+pub(crate) fn account_key(scope: &LaunchAccountScope) -> String {
     let mut hash = Sha256::new();
     hash.update(postcard::to_stdvec(&scope.provider).expect("provider serialization"));
     hash.update((scope.canonical_home.as_os_str().as_bytes().len() as u64).to_le_bytes());
@@ -114,6 +116,15 @@ pub(crate) fn purge_session(
         return Ok(());
     }
     Store::at(&root, scope, confirmed_session)?.purge_current_session()
+}
+/// Isolated lifecycle fixtures do not issue production retirement permits.
+#[cfg(test)]
+pub(crate) fn purge_account_fixture(scope: &LaunchAccountScope) -> Result<(), String> {
+    purge_account_at(&installation_root()?,scope)
+}
+#[cfg(test)]
+pub(crate) fn purge_registered_fixture(id: &crate::account::AccountId) -> Result<Option<usize>, String> {
+    purge_registered_at(&installation_root()?,id)
 }
 fn purge_account_at(root: &Path, scope: &LaunchAccountScope) -> Result<(), String> {
     scope.revalidate()?;
