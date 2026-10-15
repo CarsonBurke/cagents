@@ -6,6 +6,7 @@ use crate::workspace_widget::GlobalShortcut as Command;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitTarget {
     pub key: ActiveWorktreeKey,
+    pub binding: crate::model::OperationId,
     branch: Option<ValidatedBranchName>,
     upstream: Option<PushTarget>,
 }
@@ -41,6 +42,7 @@ impl GitTarget {
         }
         Some(Self {
             key: source.key.clone(),
+            binding: source.command_binding_id(),
             branch: source.branch.clone(),
             upstream: source.upstream.clone(),
         })
@@ -53,6 +55,7 @@ impl GitTarget {
     ) -> Option<&'a SourceControlModel> {
         let source = model.source_control.as_ref()?;
         (source.key == self.key
+            && source.matches_command_binding(self.binding)
             && state.active_worktree() == Some(&self.key)
             && model.contains_worktree(&self.key)
             && source.branch == self.branch
@@ -76,6 +79,12 @@ impl GitTarget {
     }
 
     pub fn action(
+        &self, model: &SidebarModel, state: &SidebarState, command: Command,
+    ) -> Option<SidebarAction> {
+        self.action_unbound(model, state, command).map(|action| super::commands::bound(self.binding, action))
+    }
+
+    fn action_unbound(
         &self,
         model: &SidebarModel,
         state: &SidebarState,
@@ -171,6 +180,12 @@ impl GitTarget {
     /// Both selector and object identity must still match. Reordering the stash
     /// list never substitutes another entry for the one shown in the picker.
     pub fn stash_action(
+        &self, model: &SidebarModel, state: &SidebarState, command: Command, entry: &crate::repository::StashEntry,
+    ) -> Option<SidebarAction> {
+        self.stash_action_unbound(model, state, command, entry).map(|action| super::commands::bound(self.binding, action))
+    }
+
+    fn stash_action_unbound(
         &self,
         model: &SidebarModel,
         state: &SidebarState,
@@ -279,9 +294,10 @@ mod tests {
         let loaded = "Loaded subject\n\nLoaded body\n";
         assert!(state.load_amend_message(&key, revision, loaded));
         assert!(target.available(&model, &state, Command::GitCommit));
-        let Some(SidebarAction::Commit { key: captured, message, amend }) = target.action(&model, &state, Command::GitCommit) else { panic!("ready commit action"); };
-        assert_eq!(captured, key); assert_eq!(message, loaded); assert!(amend);
-        assert!(state.submitted_commit_revision(&key, &message, amend).is_some());
+        let action = target.action(&model, &state, Command::GitCommit).expect("ready commit action");
+        let SidebarAction::Commit { key: captured, message, amend } = super::commands::bound_payload(&action) else { panic!("ready commit payload"); };
+        assert_eq!(*captured, key); assert_eq!(message, loaded); assert!(*amend);
+        assert!(state.submitted_commit_revision(&key, message, *amend).is_some());
         let current_head = model.source_control.as_mut().unwrap().head_oid.take();
         assert!(!target.available(&model, &state, Command::GitCommit), "staged rows cannot authorize amend without HEAD");
         assert!(target.action(&model, &state, Command::GitCommit).is_none());
@@ -338,7 +354,7 @@ mod tests {
             .retain(|group| group.area != ChangeArea::Conflict);
         let target = GitTarget::capture(&model, &state).unwrap();
         assert!(
-            matches!(target.action(&model, &state, Command::GitFetch), Some(SidebarAction::GitOperation { operation: GitOperation::Fetch { remote, prune: true }, .. }) if remote == "origin")
+            matches!(target.action(&model, &state, Command::GitFetch).as_ref().map(super::commands::bound_payload), Some(SidebarAction::GitOperation { operation: GitOperation::Fetch { remote, prune: true }, .. }) if remote == "origin")
         );
         assert!(
             !target.available(&model, &state, Command::GitCommit),
@@ -349,7 +365,7 @@ mod tests {
             message: "Keep subject and body\n\nDetails".into(),
         });
         assert!(
-            matches!(target.action(&model, &state, Command::GitCommit), Some(SidebarAction::Commit { message, .. }) if message == state.commit_message())
+            matches!(target.action(&model, &state, Command::GitCommit).as_ref().map(super::commands::bound_payload), Some(SidebarAction::Commit { message, .. }) if message == state.commit_message())
         );
         for descriptor in crate::workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
             .iter()
@@ -418,10 +434,10 @@ mod tests {
         model.source_control.as_mut().unwrap().stashes = vec![entry.clone()];
         let target = GitTarget::capture(&model, &state).unwrap();
         assert!(
-            matches!(target.stash_action(&model, &state, Command::GitPopStash, &entry), Some(SidebarAction::GitOperation { operation: GitOperation::StashApply { reference, expected_oid, pop: true }, .. }) if reference == entry.reference && expected_oid == entry.oid)
+            matches!(target.stash_action(&model, &state, Command::GitPopStash, &entry).as_ref().map(super::commands::bound_payload), Some(SidebarAction::GitOperation { operation: GitOperation::StashApply { reference, expected_oid, pop: true }, .. }) if *reference == entry.reference && *expected_oid == entry.oid)
         );
         assert!(
-            matches!(target.stash_action(&model, &state, Command::GitDropStash, &entry), Some(SidebarAction::RequestStashDrop { entry: Some(shown), .. }) if shown == entry)
+            matches!(target.stash_action(&model, &state, Command::GitDropStash, &entry).as_ref().map(super::commands::bound_payload), Some(SidebarAction::RequestStashDrop { entry: Some(shown), .. }) if *shown == entry)
         );
         model.source_control.as_mut().unwrap().stashes[0].oid =
             Oid::parse(&"b".repeat(40)).unwrap();

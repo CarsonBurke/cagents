@@ -1630,7 +1630,7 @@ impl Cagents {
                 if self.sidebar_state.changes_tab() == sidebar::ChangesTab::History {
                     return Some(sidebar::history_row_from_focus_id(source, &widget).map_or(
                         sidebar::commands::CommandTarget::Unavailable,
-                        |row| sidebar::commands::CommandTarget::History { key: source.key.clone(), oid: row.oid.clone(), mainline: row.mainline, message: Arc::clone(&row.message) }));
+                        |row| sidebar::commands::CommandTarget::History { key: source.key.clone(), binding: source.command_binding_id(), oid: row.oid.clone(), mainline: row.mainline, message: Arc::clone(&row.message) }));
                 }
                 let Some(row) = sidebar::change_row_from_focus_id(source, &source.key, &widget)
                 else {
@@ -1638,6 +1638,7 @@ impl Cagents {
                 };
                 Some(sidebar::commands::CommandTarget::Changes {
                     key: source.key.clone(),
+                    binding: source.command_binding_id(),
                     row,
                     selection_revision: self.sidebar_state.change_selection_revision(),
                 })
@@ -1653,6 +1654,7 @@ impl Cagents {
                 };
                 Some(sidebar::commands::CommandTarget::File {
                     key: source.key.clone(),
+                    binding: source.command_binding_id(),
                     path: row.path.clone(),
                 })
             }
@@ -1729,12 +1731,14 @@ impl Cagents {
 
     pub(super) fn run_captured_change_command(
         &mut self,
+        binding: crate::model::OperationId,
         command: Command,
         key: sidebar::ActiveWorktreeKey,
         row: sidebar::ChangeSelectionRow,
         selection_revision: u64,
     ) -> Task<Message> {
         let target = sidebar::commands::CommandTarget::Changes {
+            binding,
             key,
             row,
             selection_revision,

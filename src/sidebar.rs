@@ -2206,6 +2206,9 @@ pub enum FileSearch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceControlModel {
     pub key: ActiveWorktreeKey,
+    /// Logical owner of captured commands, independent of refresh and selection.
+    /// Hosts install their retained actor token before carrying a replacement model.
+    command_binding_id: crate::model::OperationId,
     pub data_state: SidebarDataState,
     /// The checked-out branch as Git named it, and therefore the branch every
     /// mutation this panel offers targets.
@@ -2354,6 +2357,14 @@ fn file_rows_from_tree(entries: Vec<crate::repository::FileTreeEntry>) -> Vec<Fi
 }
 
 impl SourceControlModel {
+    pub fn command_binding_id(&self) -> crate::model::OperationId { self.command_binding_id }
+
+    /// Only the actual owner may carry this token across its own refreshes.
+    /// Equal worktree keys or filesystem names do not establish owner continuity.
+    pub fn set_command_binding_id(&mut self, binding: crate::model::OperationId) { self.command_binding_id = binding; }
+
+    pub fn matches_command_binding(&self, binding: crate::model::OperationId) -> bool { self.command_binding_id == binding }
+
     /// File navigation for a plain folder, without invented Git data.
     pub fn directory(key: ActiveWorktreeKey, paths: &[RepoPath]) -> Self {
         Self::directory_listing(
@@ -2415,6 +2426,7 @@ impl SourceControlModel {
         let chrome = SourceControlChrome::new(&key, None, &[]);
         Self {
             key,
+            command_binding_id: crate::model::OperationId::new(),
             data_state,
             branch: None,
             detached: false,
@@ -2576,6 +2588,7 @@ impl SourceControlModel {
         };
 
         Self {
+            command_binding_id: crate::model::OperationId::new(),
             data_state: SidebarDataState::Ready,
             detached: matches!(snapshot.status.head, HeadState::Detached { .. }),
             head_oid,
@@ -2811,6 +2824,10 @@ impl SourceControlModel {
     /// placeholder, because the rows on screen belong to a worktree nobody is
     /// looking at any more.
     ///
+    /// The owner must set its retained command binding on `next` before calling
+    /// this method. Matching keys or paths alone never carry pending state from
+    /// a replaced actor or a new physical checkout.
+    ///
     /// Neither the mutation nor the failure belongs to a snapshot, so a reload
     /// must not drop them. A push can easily outlive the refresh it triggered,
     /// and a panel rebuilt without its mutation re-enables every command.
@@ -2820,7 +2837,7 @@ impl SourceControlModel {
     /// was asked for at all outlives the walk, and is carried whatever `HEAD`
     /// did.
     pub fn carry_mutation_into(&self, next: &mut Self) {
-        if self.key != next.key {
+        if self.key != next.key || self.command_binding_id != next.command_binding_id {
             return;
         }
         // A freshly supplied host refusal takes precedence over older state;
@@ -4562,6 +4579,7 @@ impl SidebarState {
             | SidebarAction::DeleteRow(_)
             | SidebarAction::DeleteSelectedRows
             | SidebarAction::RunCommand { .. }
+            | SidebarAction::RunBound { .. }
             | SidebarAction::RunChangeCommand { .. }
             | SidebarAction::RunChangeGroup { .. }
             | SidebarAction::DeleteRows(_)
@@ -4595,6 +4613,8 @@ pub enum ChangeGroupCommand {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    /// Original logical owner captured when this source control intent was made.
+    RunBound { binding: crate::model::OperationId, action: Box<SidebarAction> },
     RunChangeGroup {
         key: ActiveWorktreeKey,
         area: ChangeArea,
@@ -7910,6 +7930,7 @@ impl ChangeContextAction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ChangeContextCommand<'a> {
+    binding: crate::model::OperationId,
     key: &'a ActiveWorktreeKey,
     row: &'a ChangeRow,
     selection_revision: u64,
@@ -7920,7 +7941,7 @@ impl widget::menu::Action for ChangeContextCommand<'_> {
     fn message(&self) -> SidebarAction {
         let key = self.key.clone();
         let path = self.row.entry.path.clone();
-        SidebarAction::RunChangeCommand {
+        commands::bound(self.binding, SidebarAction::RunChangeCommand {
             key,
             row: ChangeSelectionRow {
                 area: self.row.entry.area,
@@ -7928,10 +7949,11 @@ impl widget::menu::Action for ChangeContextCommand<'_> {
             },
             selection_revision: self.selection_revision,
             command: self.action.command(),
-        }
+        })
     }
 }
 fn change_context_controls<'a>(
+    binding: crate::model::OperationId,
     content: Element<'a, SidebarAction>,
     key: &'a ActiveWorktreeKey,
     row: &'a ChangeRow,
@@ -7958,6 +7980,7 @@ fn change_context_controls<'a>(
         commands::label(commands::change_command_id(command)).into(),
         None,
         ChangeContextCommand {
+            binding,
             key,
             row,
             selection_revision,
@@ -7973,6 +7996,7 @@ fn change_context_controls<'a>(
         commands::label(ChangeContextAction::Ignore.command()).into(),
         None,
         ChangeContextCommand {
+            binding,
             key,
             row,
             selection_revision,
@@ -7984,6 +8008,7 @@ fn change_context_controls<'a>(
         commands::label(ChangeContextAction::CopyPath.command()).into(),
         None,
         ChangeContextCommand {
+            binding,
             key,
             row,
             selection_revision,
@@ -7995,6 +8020,7 @@ fn change_context_controls<'a>(
         commands::label(ChangeContextAction::Open.command()).into(),
         None,
         ChangeContextCommand {
+            binding,
             key,
             row,
             selection_revision,
@@ -8005,6 +8031,7 @@ fn change_context_controls<'a>(
         commands::label(ChangeContextAction::Reveal.command()).into(),
         None,
         ChangeContextCommand {
+            binding,
             key,
             row,
             selection_revision,
@@ -8017,6 +8044,7 @@ fn change_context_controls<'a>(
             commands::label(commands::change_command_id(ChangeGroupCommand::Discard)).into(),
             None,
             ChangeContextCommand {
+            binding,
                 key,
                 row,
                 selection_revision,
@@ -8035,7 +8063,7 @@ fn change_context_controls<'a>(
     );
     crate::interaction::context_menu_keyed(
         content,
-        (cached_menu_token(&row.chrome.stage_id), selection_revision, mutations_available),
+        (binding, cached_menu_token(&row.chrome.stage_id), selection_revision, mutations_available),
         widget::menu::items(&bindings, entries),
     )
 }
@@ -8068,12 +8096,12 @@ impl SourceControlModel {
 pub enum HistoryCommand { CopySha, CopyMessage, NewWorktree, CreateBranch, Revert, CherryPick }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HistoryContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a CommitRow, command: HistoryCommand }
+struct HistoryContextCommand<'a> { binding: crate::model::OperationId, key: &'a ActiveWorktreeKey, row: &'a CommitRow, command: HistoryCommand }
 
 impl widget::menu::Action for HistoryContextCommand<'_> {
     type Message = SidebarAction;
     fn message(&self) -> SidebarAction {
-        commands::registered(SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message) })
+        commands::registered(commands::bound(self.binding, SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message) }))
     }
 }
 
@@ -8086,7 +8114,7 @@ fn history_context_controls<'a>(
     binding_key: Arc<[Option<widget::menu::KeyBind>; 6]>,
 ) -> Element<'a, SidebarAction> {
     if blocked { return content; }
-    let identity = (worktree, row.chrome.focus_id.clone(), row.mainline, Arc::clone(&row.message), source.mutations_available(), source.busy(), source.history_command_policy_available(HistoryCommand::CopySha), Arc::clone(&binding_key));
+    let identity = (source.command_binding_id(), worktree, row.chrome.focus_id.clone(), row.mainline, Arc::clone(&row.message), source.mutations_available(), source.busy(), source.history_command_policy_available(HistoryCommand::CopySha), Arc::clone(&binding_key));
     crate::interaction::context_menu_lazy_keyed(content, identity, move || {
         let entries = [HistoryCommand::CopySha, HistoryCommand::CopyMessage, HistoryCommand::NewWorktree, HistoryCommand::CreateBranch, HistoryCommand::Revert, HistoryCommand::CherryPick]
             .into_iter().map(|command| {
@@ -8094,7 +8122,7 @@ fn history_context_controls<'a>(
                 let label = if row.mainline.is_some() && matches!(command, HistoryCommand::Revert | HistoryCommand::CherryPick) {
                     format!("{} (first parent)", commands::label(id))
                 } else { commands::label(id).to_owned() };
-                let action = HistoryContextCommand { key: &source.key, row, command };
+                let action = HistoryContextCommand { binding: source.command_binding_id(), key: &source.key, row, command };
                 // Rows come directly from this source; only activation needs a commit lookup.
                 if source.history_command_policy_available(command) {
                     widget::menu::Item::Button(label, None, action)
@@ -8116,11 +8144,13 @@ fn history_context_controls<'a>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileContextCommand<'a> {
     Manage {
+        binding: crate::model::OperationId,
         key: &'a ActiveWorktreeKey,
         path: &'a RepoPath,
         command: FileCommand,
     },
     Editor {
+        binding: crate::model::OperationId,
         key: &'a ActiveWorktreeKey,
         path: &'a RepoPath,
         editor_id: &'a str,
@@ -8131,8 +8161,9 @@ impl widget::menu::Action for FileContextCommand<'_> {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
-        commands::registered(match self {
-            Self::Manage { key, path, command } => SidebarAction::FileCommand {
+        let binding = match self { Self::Manage { binding, .. } | Self::Editor { binding, .. } => *binding };
+        commands::registered(commands::bound(binding, match self {
+            Self::Manage { key, path, command, .. } => SidebarAction::FileCommand {
                 key: (*key).clone(),
                 path: (*path).clone(),
                 command: *command,
@@ -8141,12 +8172,13 @@ impl widget::menu::Action for FileContextCommand<'_> {
                 key,
                 path,
                 editor_id,
+                ..
             } => SidebarAction::OpenFileInEditor {
                 key: (*key).clone(),
                 path: (*path).clone(),
                 editor_id: (*editor_id).to_owned(),
             },
-        })
+        }))
     }
 }
 
@@ -8194,6 +8226,7 @@ fn file_commands(
 /// The right-click menu for one file-tree row. Every row has one: see
 /// [`file_commands`].
 fn file_context_controls<'a>(
+    binding: crate::model::OperationId,
     content: Element<'a, SidebarAction>,
     key: &ActiveWorktreeKey,
     row: &FileRow,
@@ -8221,7 +8254,7 @@ fn file_context_controls<'a>(
         entries.push(widget::menu::Item::Button(
             label.to_owned(),
             Some(icon.handle()),
-            FileContextCommand::Manage { key, path, command },
+            FileContextCommand::Manage { binding, key, path, command },
         ));
     }
     if !row.directory {
@@ -8230,6 +8263,7 @@ fn file_context_controls<'a>(
                 editor.name.clone(),
                 Some(editor_icon(editor)),
                 FileContextCommand::Editor {
+                    binding,
                     key,
                     path,
                     editor_id: &editor.id,
@@ -8247,7 +8281,7 @@ fn file_context_controls<'a>(
     );
     crate::interaction::context_menu_keyed(
         content,
-        (row.chrome.menu_identity, editors.generation()),
+        (binding, row.chrome.menu_identity, editors.generation()),
         widget::menu::items(&bindings, entries),
     )
 }
@@ -9106,6 +9140,22 @@ fn source_control_panel<'a>(
     width: f32,
     shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
+    let binding = source.command_binding_id();
+    source_control_panel_unbound(state, source, worktree, editors, file_management, modal_open, panel, navigation, width, shortcuts).map(move |action| commands::bound(binding, action))
+}
+
+fn source_control_panel_unbound<'a>(
+    state: &'a SidebarState,
+    source: &'a SourceControlModel,
+    worktree: Option<&'a SidebarWorktree>,
+    editors: &'a SidebarEditors,
+    file_management: bool,
+    modal_open: bool,
+    panel: WorktreePanel,
+    navigation: PanelNavigation,
+    width: f32,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+) -> Element<'a, SidebarAction> {
     let chrome = &source.chrome;
     let key = &source.key;
     let view = PanelView::new(panel, navigation, state);
@@ -9616,6 +9666,7 @@ fn files_section<'a>(
             modal_open,
         );
         rows = rows.push(file_context_controls(
+            source.command_binding_id(),
             identity,
             key,
             row,
@@ -10371,6 +10422,7 @@ fn change_row_view<'a>(
         !modal_open,
     );
     let identity = change_context_controls(
+        source.command_binding_id(),
         identity,
         &source.key,
         row,
@@ -14362,6 +14414,7 @@ pub(crate) mod tests {
         let path = repo_path("src/main.rs");
         assert_hint(
             FileContextCommand::Manage {
+                binding: crate::model::OperationId::new(),
                 key: &key,
                 path: &path,
                 command: FileCommand::CopyRelativePath,
@@ -14382,7 +14435,7 @@ pub(crate) mod tests {
             let index = crate::workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().position(|descriptor| descriptor.action == id).unwrap();
             *settings.actions_mut()[index] = vec![chord.into()];
             assert_eq!(commands::history_command(id), Some(command));
-            assert_hint(HistoryContextCommand { key: &key, row: &commit, command }, &settings);
+            assert_hint(HistoryContextCommand { binding: crate::model::OperationId::new(), key: &key, row: &commit, command }, &settings);
         }
         let model = panel_model();
         let source = model.source_control.as_ref().unwrap();
@@ -14403,6 +14456,7 @@ pub(crate) mod tests {
         ] {
             assert_hint(
                 ChangeContextCommand {
+                    binding: source.command_binding_id(),
                     key: &source.key,
                     row,
                     selection_revision: 71,
@@ -14444,6 +14498,7 @@ pub(crate) mod tests {
         let path = repo_path("src/main.rs");
         let bindings = menu_bindings(
             editors.iter().map(|editor| FileContextCommand::Editor {
+                binding: crate::model::OperationId::new(),
                 key: &key,
                 path: &path,
                 editor_id: &editor.id,
@@ -14458,7 +14513,7 @@ pub(crate) mod tests {
             panic!("registered editor");
         };
         assert!(
-            matches!(*intent, SidebarAction::OpenFileInEditor { editor_id, .. } if editor_id == "first")
+            matches!(commands::bound_payload(&intent), SidebarAction::OpenFileInEditor { editor_id, .. } if editor_id == "first")
         );
     }
 
@@ -16342,6 +16397,7 @@ pub(crate) mod tests {
                             .height(32)
                             .into();
                         let mut element = file_context_controls(
+                            crate::model::OperationId::new(),
                             content,
                             &key,
                             row,
@@ -19875,6 +19931,18 @@ pub(crate) mod tests {
 
     fn frame_enter_presses_at_width(
         renderer: &cosmic::Renderer,
+        element: Element<'_, SidebarAction>,
+        width: f32,
+    ) -> Vec<SidebarAction> {
+        frame_enter_bound_presses_at_width(renderer, element, width).into_iter()
+            .map(|action| match action {
+                SidebarAction::RunBound { action, .. } => *action,
+                action => action,
+            }).collect()
+    }
+
+    fn frame_enter_bound_presses_at_width(
+        renderer: &cosmic::Renderer,
         mut element: Element<'_, SidebarAction>,
         width: f32,
     ) -> Vec<SidebarAction> {
@@ -21137,6 +21205,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn same_key_new_owner_does_not_inherit_pending_mutations_or_capability() {
+        let mut old = SourceControlModel::ready(main_key(), &snapshot());
+        old.mutation = Some(MutationKind::Stage);
+        old.set_mutation_unavailable_reason(Some(Arc::from("old host capability")));
+        old.error = Some("old operation failed".into());
+        old.pending_stash_drop = Some(crate::repository::StashEntry {
+            reference: "stash@{0}".into(), oid: oid_of(7), message: "old stash".into(),
+        });
+        for loading in [false, true] {
+            let mut next = if loading { SourceControlModel::loading(main_key()) }
+                else { SourceControlModel::ready(main_key(), &snapshot()) };
+            assert_ne!(old.command_binding_id(), next.command_binding_id());
+            old.carry_mutation_into(&mut next);
+            assert!(next.mutation.is_none());
+            assert!(next.pending_stash_drop.is_none());
+            assert!(next.error.is_none());
+            assert!(next.mutation_unavailable_reason().is_none());
+            next.set_command_binding_id(old.command_binding_id());
+            old.carry_mutation_into(&mut next);
+            assert_eq!(next.mutation, old.mutation);
+            assert_eq!(next.pending_stash_drop, old.pending_stash_drop);
+            assert_eq!(next.mutation_unavailable_reason(), old.mutation_unavailable_reason());
+        }
+    }
+
+    #[test]
+    fn rendered_source_panel_messages_capture_the_actual_model_owner() {
+        let model = panel_model();
+        let state = panel_state(&model);
+        let source = model.source_control.as_ref().unwrap();
+        let renderer = headless_renderer();
+        let messages = frame_enter_bound_presses_at_width(&renderer, git_panel(&model, &state, 380.0, false), 380.0);
+        assert!(!messages.is_empty(), "actual mounted controls must be exercised");
+        for message in messages {
+            let payload = match &message { SidebarAction::RunCommand { action, .. } => action.as_ref(), message => message };
+            assert!(matches!(payload, SidebarAction::RunBound { binding, .. } if *binding == source.command_binding_id()), "unbound panel action: {message:?}");
+        }
+    }
+
+    #[test]
     fn read_only_git_capability_survives_refresh_and_does_not_rebind() {
         let reason: Arc<str> = "Git mutations are unavailable on this host; repository reads remain available.".into();
         let mut original = SourceControlModel::ready(main_key(), &snapshot());
@@ -21144,6 +21252,7 @@ pub(crate) mod tests {
         for loading in [false, true] {
             let mut next = if loading { SourceControlModel::loading(main_key()) }
                 else { SourceControlModel::ready(main_key(), &snapshot()) };
+            next.set_command_binding_id(original.command_binding_id());
             original.carry_mutation_into(&mut next);
             assert_eq!(next.mutation_unavailable_reason(), Some(reason.as_ref()));
             assert!(!next.mutations_available());
@@ -21154,6 +21263,7 @@ pub(crate) mod tests {
             let mut next = if loading { SourceControlModel::loading(main_key()) }
                 else { SourceControlModel::ready(main_key(), &snapshot()) };
             next.set_mutation_unavailable_reason(Some(reason.clone()));
+            next.set_command_binding_id(writable.command_binding_id());
             writable.carry_mutation_into(&mut next);
             assert!(!next.mutations_available(), "new explicit host capability must not be overwritten by old writable state");
         }
@@ -21424,14 +21534,14 @@ pub(crate) mod tests {
         let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
         let row = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![oid_of(1), oid_of(2)], author: identity.clone(), committer: identity, subject: "Merge subject".into(), body: "Body line\n".into() });
         let key = main_key();
-        let action = widget::menu::Action::message(&HistoryContextCommand { key: &key, row: &row, command: HistoryCommand::Revert });
+        let action = widget::menu::Action::message(&HistoryContextCommand { binding: crate::model::OperationId::new(), key: &key, row: &row, command: HistoryCommand::Revert });
         let message = Arc::clone(&row.message);
         drop(row);
         let SidebarAction::RunCommand { command, action } = action else { panic!("registered history command"); };
         assert_eq!(command, crate::workspace_widget::GlobalShortcut::GitHistoryRevert);
-        let SidebarAction::HistoryCommand { oid, mainline, message: captured, .. } = *action else { panic!("expected a history command"); };
-        assert_eq!(oid, oid_of(3));
-        assert_eq!(mainline, Some(1));
+        let SidebarAction::HistoryCommand { oid, mainline, message: captured, .. } = commands::bound_payload(&action) else { panic!("expected a history command"); };
+        assert_eq!(oid, &oid_of(3));
+        assert_eq!(*mainline, Some(1));
         assert_eq!(captured.as_ref(), "Merge subject\n\nBody line\n");
         assert!(Arc::ptr_eq(&captured, &message));
     }
@@ -21505,10 +21615,12 @@ pub(crate) mod tests {
         previous.mark_history_requested();
         let mut same = SourceControlModel::ready(main_key(), &snapshot());
         same.head_oid = previous.head_oid.clone();
+        same.set_command_binding_id(previous.command_binding_id());
         previous.carry_mutation_into(&mut same);
         assert!(same.history_loading);
         let mut moved = SourceControlModel::ready(main_key(), &snapshot());
         moved.head_oid = Some(oid_of(2).as_str().into());
+        moved.set_command_binding_id(previous.command_binding_id());
         previous.carry_mutation_into(&mut moved);
         assert!(!moved.history_requested());
         assert!(moved.wants_history());
@@ -21703,6 +21815,7 @@ mod captured_change_menu_tests {
                 expected.id()
             );
             let intent = ChangeContextCommand {
+                binding: source.command_binding_id(),
                 key: &source.key,
                 row,
                 selection_revision: 71,
@@ -21710,8 +21823,8 @@ mod captured_change_menu_tests {
             }
             .message();
             assert!(
-                matches!(intent, SidebarAction::RunChangeCommand { command, key, row: captured, selection_revision: 71 }
-                if command == expected && key == source.key
+                matches!(commands::bound_payload(&intent), SidebarAction::RunChangeCommand { command, key, row: captured, selection_revision: 71 }
+                if *command == expected && *key == source.key
                     && captured.path == row.entry.path && captured.area == row.entry.area)
             );
         }

@@ -6,6 +6,7 @@ use crate::workspace_widget::GlobalShortcut as Command;
 pub enum CommandTarget {
     History {
         key: ActiveWorktreeKey,
+        binding: crate::model::OperationId,
         oid: Oid,
         mainline: Option<u32>,
         message: Arc<str>,
@@ -15,10 +16,12 @@ pub enum CommandTarget {
     Rows(Vec<SelectionRow>),
     File {
         key: ActiveWorktreeKey,
+        binding: crate::model::OperationId,
         path: RepoPath,
     },
     Changes {
         key: ActiveWorktreeKey,
+        binding: crate::model::OperationId,
         row: ChangeSelectionRow,
         selection_revision: u64,
     },
@@ -29,25 +32,27 @@ pub enum CommandTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupTarget {
     pub key: ActiveWorktreeKey,
+    pub binding: crate::model::OperationId,
     pub selection_revision: u64,
 }
 impl GroupTarget {
     pub fn capture(model: &SidebarModel, state: &SidebarState) -> Option<Self> {
         let source = model.source_control.as_ref()?;
         (state.active_worktree() == Some(&source.key) && model.contains_worktree(&source.key))
-            .then(|| Self { key: source.key.clone(), selection_revision: state.change_selection_revision() })
+            .then(|| Self { key: source.key.clone(), binding: source.command_binding_id(), selection_revision: state.change_selection_revision() })
     }
     pub fn available(&self, model: &SidebarModel, state: &SidebarState, command: Command, modal_open: bool) -> bool {
         let Some((area, command)) = crate::workspace_widget::git_group_command_target(command) else { return false; };
         state.active_worktree() == Some(&self.key)
-            && model.source_control.as_ref().is_some_and(|source| source.key == self.key)
+            && model.source_control.as_ref().is_some_and(|source| source.key == self.key && source.matches_command_binding(self.binding))
             && state.change_selection_revision() == self.selection_revision
             && whole_change_group_available(model, state, area, command, modal_open)
     }
     pub fn action(&self, model: &SidebarModel, state: &SidebarState, command: Command, modal_open: bool) -> Option<SidebarAction> {
         let (area, command) = crate::workspace_widget::git_group_command_target(command)?;
+        if !model.source_control.as_ref()?.matches_command_binding(self.binding) { return None; }
         resolve_captured_change_group(model, state, &self.key, area, command, self.selection_revision, modal_open)?;
-        Some(SidebarAction::RunChangeGroup { key: self.key.clone(), area, command, selection_revision: self.selection_revision })
+        Some(bound(self.binding, SidebarAction::RunChangeGroup { key: self.key.clone(), area, command, selection_revision: self.selection_revision }))
     }
 }
 
@@ -89,6 +94,7 @@ pub const fn history_command(command: Command) -> Option<HistoryCommand> {
 /// Menu parameters remain in their ordinary self-contained sidebar action.
 /// Only the template identity is shared with palette/shortcut registration.
 pub fn command_id(action: &SidebarAction) -> Option<Command> {
+    if let SidebarAction::RunBound { action, .. } = action { return command_id(action); }
     Some(match action {
         SidebarAction::HistoryCommand { command, .. } => history_command_id(*command),
         SidebarAction::ProjectCommand {
@@ -146,6 +152,23 @@ pub fn label(command: Command) -> &'static str {
     crate::workspace_widget::shortcut_descriptor(command).label
 }
 
+/// Preserve a captured owner through asynchronous message dispatch.
+pub fn bound(binding: crate::model::OperationId, action: SidebarAction) -> SidebarAction {
+    match action {
+        // An existing capture is never rebound by a later rendering map.
+        action @ SidebarAction::RunBound { .. } => action,
+        SidebarAction::RunCommand { command, action } => SidebarAction::RunCommand {
+            command, action: Box::new(bound(binding, *action)),
+        },
+        action => SidebarAction::RunBound { binding, action: Box::new(action) },
+    }
+}
+
+/// Read the payload only after independently validating its captured binding.
+pub fn bound_payload(action: &SidebarAction) -> &SidebarAction {
+    match action { SidebarAction::RunBound { action, .. } => action, _ => action }
+}
+
 pub fn registered(action: SidebarAction) -> SidebarAction {
     match command_id(&action) {
         Some(command) => SidebarAction::RunCommand {
@@ -201,9 +224,19 @@ pub fn file_rows(source: &SourceControlModel) -> impl Iterator<Item = &FileRow> 
 
 impl CommandTarget {
     pub fn from_action(action: &SidebarAction) -> Option<Self> {
+        if matches!(action, SidebarAction::RunBound { .. }) { return Self::from_bound_action(action); }
+        Self::from_action_with_binding(action, None)
+    }
+
+    pub fn from_bound_action(action: &SidebarAction) -> Option<Self> {
+        let SidebarAction::RunBound { binding, action } = action else { return None; };
+        Self::from_action_with_binding(action, Some(*binding))
+    }
+
+    fn from_action_with_binding(action: &SidebarAction, binding: Option<crate::model::OperationId>) -> Option<Self> {
         Some(match action {
             SidebarAction::HistoryCommand { key, oid, mainline, message, .. } => Self::History {
-                key: key.clone(), oid: oid.clone(), mainline: *mainline, message: Arc::clone(message),
+                key: key.clone(), binding: binding?, oid: oid.clone(), mainline: *mainline, message: Arc::clone(message),
             },
             SidebarAction::ProjectCommand {
                 project_id,
@@ -227,6 +260,7 @@ impl CommandTarget {
             | SidebarAction::OpenFileInEditor { key, path, .. }
             | SidebarAction::OpenFile { key, path } => Self::File {
                 key: key.clone(),
+                binding: binding?,
                 path: path.clone(),
             },
             _ => return None,
@@ -235,13 +269,16 @@ impl CommandTarget {
 
     /// Validate the template and original parameters without substituting a new target.
     pub fn accepts(&self, model: &SidebarModel, command: Command, action: &SidebarAction) -> bool {
-        if command_id(action) != Some(command) {
+        if command_id(action) != Some(command)
+            || self.binding().is_some_and(|binding| !matches!(action,
+                SidebarAction::RunBound { binding: captured, .. } if *captured == binding))
+        {
             return false;
         }
         let Some(resolved) = self.resolve(model, command) else {
             return false;
         };
-        match (action, &resolved) {
+        match (bound_payload(action), bound_payload(&resolved)) {
             (
                 SidebarAction::ProjectCommand {
                     command: ProjectCommand::OpenEditor(id),
@@ -252,14 +289,28 @@ impl CommandTarget {
             | (
                 SidebarAction::OpenFileInEditor { editor_id: id, .. },
                 SidebarAction::OpenFileInEditor { .. },
-            ) => model.external_editors.iter().any(|editor| editor.id == *id),
+            ) => Self::from_action(action).as_ref() == Some(self)
+                && model.external_editors.iter().any(|editor| editor.id == *id),
             _ => *action == resolved,
         }
     }
 
+    pub fn binding(&self) -> Option<crate::model::OperationId> {
+        match self { Self::History { binding, .. } | Self::File { binding, .. } | Self::Changes { binding, .. } => Some(*binding), _ => None }
+    }
+
+    fn bind_action(&self, action: SidebarAction) -> SidebarAction {
+        match self.binding() { Some(binding) => bound(binding, action), None => action }
+    }
+
     pub fn resolve(&self, model: &SidebarModel, command: Command) -> Option<SidebarAction> {
+        self.resolve_unbound(model, command).map(|action| self.bind_action(action))
+    }
+
+    fn resolve_unbound(&self, model: &SidebarModel, command: Command) -> Option<SidebarAction> {
+        if let Some(binding) = self.binding() { if !model.source_control.as_ref()?.matches_command_binding(binding) { return None; } }
         match self {
-            Self::History { key, oid, mainline, message } => {
+            Self::History { key, oid, mainline, message, .. } => {
                 let source = model.source_control.as_ref()?;
                 let command = history_command(command)?;
                 (source.key == *key && model.contains_worktree(key)
@@ -267,7 +318,7 @@ impl CommandTarget {
                     .then(|| SidebarAction::HistoryCommand { key: key.clone(), oid: oid.clone(), command, mainline: *mainline, message: Arc::clone(message) })
             }
             Self::Unavailable | Self::Changes { .. } => None,
-            Self::File { key, path } => {
+            Self::File { key, path, .. } => {
                 let source = model.source_control.as_ref()?;
                 if source.key != *key
                     || !model.contains_worktree(key)
@@ -399,7 +450,12 @@ impl CommandTarget {
     /// Changes retain a selection generation as well as the worktree and
     /// focused path. Rebinding, clearing or replacing selection cannot retarget
     /// a palette entry that was captured before its search field took focus.
-    pub fn resolve_in(
+    pub fn resolve_in(&self, model: &SidebarModel, state: &SidebarState, command: Command) -> Option<SidebarAction> {
+        if let Some(binding) = self.binding() { if !model.source_control.as_ref()?.matches_command_binding(binding) { return None; } }
+        self.resolve_in_unbound(model, state, command).map(|action| self.bind_action(action))
+    }
+
+    fn resolve_in_unbound(
         &self,
         model: &SidebarModel,
         state: &SidebarState,
@@ -407,15 +463,16 @@ impl CommandTarget {
     ) -> Option<SidebarAction> {
         if let Self::History { key, .. } = self {
             return (state.active_worktree() == Some(key) && state.changes_tab() == ChangesTab::History)
-                .then(|| self.resolve(model, command)).flatten();
+                .then(|| self.resolve_unbound(model, command)).flatten();
         }
         let Self::Changes {
             key,
             row,
             selection_revision,
+            ..
         } = self
         else {
-            return self.resolve(model, command);
+            return self.resolve_unbound(model, command);
         };
         let source = model.source_control.as_ref()?;
         if &source.key != key
@@ -519,7 +576,7 @@ mod tests {
         let source = model.source_control.as_mut().unwrap();
         source.history = vec![row];
         let row = &source.history[0];
-        let target = CommandTarget::History { key: source.key.clone(), oid: row.oid.clone(), mainline: row.mainline, message: Arc::clone(&row.message) };
+        let target = CommandTarget::History { key: source.key.clone(), binding: source.command_binding_id(), oid: row.oid.clone(), mainline: row.mainline, message: Arc::clone(&row.message) };
         let mut state = super::super::tests::panel_state(&model);
         state.changes_tab = ChangesTab::History;
         let commands = [HistoryCommand::CopySha, HistoryCommand::CopyMessage, HistoryCommand::NewWorktree, HistoryCommand::CreateBranch, HistoryCommand::Revert, HistoryCommand::CherryPick];
@@ -553,6 +610,12 @@ mod tests {
         model.source_control.as_mut().unwrap().reloading = true;
         assert!(target.resolve_in(&model, &state, Command::GitHistoryCopySha).is_none());
         model.source_control.as_mut().unwrap().reloading = false;
+        let old_binding = model.source_control.as_ref().unwrap().command_binding_id();
+        model.source_control.as_mut().unwrap().set_command_binding_id(crate::model::OperationId::new());
+        assert!(target.resolve_in(&model, &state, Command::GitHistoryCopySha).is_none(),
+            "same commit and path from a replacement actor do not authorize an old history menu");
+        model.source_control.as_mut().unwrap().set_command_binding_id(old_binding);
+        assert!(target.resolve_in(&model, &state, Command::GitHistoryCopySha).is_some());
         model.source_control.as_mut().unwrap().key.worktree_id = WorktreeId::new();
         assert!(target.resolve_in(&model, &state, Command::GitHistoryCopySha).is_none());
     }
@@ -599,7 +662,7 @@ mod tests {
         let source = model.source_control.as_ref().unwrap();
         let row = file_rows(source).next().unwrap();
         let target = CommandTarget::File {
-            key: source.key.clone(),
+            key: source.key.clone(), binding: source.command_binding_id(),
             path: row.path.clone(),
         };
         assert!(target.resolve(&model, Command::CopyRelativePath).is_some());
@@ -689,12 +752,12 @@ mod change_target_tests {
         };
         state.select_change_rows(row.clone(), SelectionIntent::Toggle, &rows);
         let target = CommandTarget::Changes {
-            key: source.key.clone(),
+            key: source.key.clone(), binding: source.command_binding_id(),
             row,
             selection_revision: state.change_selection_revision(),
         };
         assert!(matches!(
-            target.resolve_in(&model, &state, command),
+            target.resolve_in(&model, &state, command).as_ref().map(bound_payload),
             Some(SidebarAction::InvokeChangeRows { .. })
         ));
         state.select_change_rows(rows[0].clone(), SelectionIntent::Toggle, &rows);
@@ -705,7 +768,7 @@ mod change_target_tests {
             "equal-count replacement cannot retarget a captured command"
         );
         let current = CommandTarget::Changes {
-            key: source.key.clone(),
+            key: source.key.clone(), binding: source.command_binding_id(),
             row: rows[1].clone(),
             selection_revision: state.change_selection_revision(),
         };
@@ -734,7 +797,7 @@ mod change_navigation_target_tests {
         let source = model.source_control.as_ref().unwrap();
         let row = source.group(ChangeArea::Untracked).unwrap().rows()[0].entry.clone();
         let target = CommandTarget::Changes {
-            key: source.key.clone(), row: ChangeSelectionRow { area: row.area, path: row.path },
+            key: source.key.clone(), binding: source.command_binding_id(), row: ChangeSelectionRow { area: row.area, path: row.path },
             selection_revision: state.change_selection_revision(),
         };
         let group = GroupTarget::capture(&model, &state).unwrap();
@@ -765,7 +828,7 @@ mod change_navigation_target_tests {
             .entry
             .clone();
         let target = CommandTarget::Changes {
-            key: source.key.clone(),
+            key: source.key.clone(), binding: source.command_binding_id(),
             row: ChangeSelectionRow {
                 area: row.area,
                 path: row.path.clone(),
@@ -782,10 +845,10 @@ mod change_navigation_target_tests {
                 .resolve_in(&model, &state, command)
                 .expect("live row operation");
             assert_eq!(command_id(&resolved), Some(command));
-            assert!(matches!(resolved,
+            assert!(matches!(bound_payload(&resolved),
                 SidebarAction::OpenFile { key,path } | SidebarAction::RevealChangeInFiles { key,path }
                 | SidebarAction::IgnoreChangePath { key,path } | SidebarAction::FileCommand { key,path,.. }
-                if key==source.key && path==row.path));
+                if *key==source.key && *path==row.path));
         }
         let order = change_selection_order(source, &state);
         state.select_change_rows(order[0].clone(), SelectionIntent::Toggle, &order);
@@ -808,7 +871,7 @@ mod change_navigation_target_tests {
             .next()
             .unwrap();
         let target = CommandTarget::Changes {
-            key: source.key.clone(),
+            key: source.key.clone(), binding: source.command_binding_id(),
             row: ChangeSelectionRow {
                 area: tracked.entry.area,
                 path: tracked.entry.path.clone(),
@@ -835,7 +898,7 @@ mod conflict_command_tests {
             .entry
             .clone();
         let target = CommandTarget::Changes {
-            key: source.key.clone(),
+            key: source.key.clone(), binding: source.command_binding_id(),
             row: ChangeSelectionRow {
                 area: ChangeArea::Conflict,
                 path: entry.path.clone(),
@@ -847,7 +910,7 @@ mod conflict_command_tests {
             (Command::GitAcceptTheirs, false),
         ] {
             assert!(
-                matches!(target.resolve_in(&model, &state, command), Some(SidebarAction::GitOperation { operation: GitOperation::ResolveConflict { path, ours }, .. }) if path == entry.path && ours == expected)
+                matches!(target.resolve_in(&model, &state, command).as_ref().map(bound_payload), Some(SidebarAction::GitOperation { operation: GitOperation::ResolveConflict { path, ours }, .. }) if *path == entry.path && *ours == expected)
             );
         }
         model
@@ -869,5 +932,80 @@ mod conflict_command_tests {
                 .is_none(),
             "a changed selection cannot substitute another conflict"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn same_named_replacement_retires_all_captured_source_targets() {
+        let mut model = super::super::tests::panel_model();
+        let state = super::super::tests::panel_state(&model);
+        let source = model.source_control.as_ref().unwrap();
+        let git = super::super::git_commands::GitTarget::capture(&model, &state).unwrap();
+        let group = GroupTarget::capture(&model, &state).unwrap();
+        let file = CommandTarget::File {
+            key: source.key.clone(), binding: source.command_binding_id(),
+            path: file_rows(source).next().unwrap().path.clone(),
+        };
+        let entry = source.groups().iter().flat_map(|group| group.rows()).next().unwrap();
+        let changes = CommandTarget::Changes {
+            key: source.key.clone(), binding: source.command_binding_id(),
+            row: ChangeSelectionRow { area: entry.entry.area, path: entry.entry.path.clone() },
+            selection_revision: state.change_selection_revision(),
+        };
+        let shown = file.resolve(&model, Command::CopyRelativePath).unwrap();
+        assert_eq!(CommandTarget::from_action(&shown), Some(file.clone()));
+        assert!(git.action(&model, &state, Command::GitRefresh).is_some());
+        assert!(changes.resolve_in(&model, &state, Command::CopyRelativePath).is_some());
+        // Identical keys, paths, rows, branch and selection are insufficient when
+        // the retained actor was replaced (including a physical root replacement).
+        let old = source.command_binding_id();
+        model.source_control.as_mut().unwrap().set_command_binding_id(crate::model::OperationId::new());
+        assert!(git.action(&model, &state, Command::GitRefresh).is_none());
+        assert!(file.resolve(&model, Command::CopyRelativePath).is_none());
+        assert!(changes.resolve_in(&model, &state, Command::CopyRelativePath).is_none());
+        assert!(group.action(&model, &state, Command::GitStageAllUntracked, false).is_none());
+        assert!(!file.accepts(&model, Command::CopyRelativePath, &shown));
+        // Explicit actual-owner continuity, rather than a selection revision or
+        // a key comparison, is the only way a refresh keeps a captured target.
+        model.source_control.as_mut().unwrap().set_command_binding_id(old);
+        assert_eq!(file.resolve(&model, Command::CopyRelativePath), Some(shown));
+        assert!(git.action(&model, &state, Command::GitRefresh).is_some());
+    }
+
+    #[test]
+    fn cached_registered_actions_keep_the_original_capture_and_refuse_raw_source_intent() {
+        let model = super::super::tests::panel_model();
+        let source = model.source_control.as_ref().unwrap();
+        let path = file_rows(source).next().unwrap().path.clone();
+        let raw = SidebarAction::FileCommand { key: source.key.clone(), path, command: FileCommand::CopyRelativePath };
+        assert!(CommandTarget::from_action(&raw).is_none());
+        let original = bound(source.command_binding_id(), raw);
+        let registered = registered(original.clone());
+        let refreshed = bound(crate::model::OperationId::new(), registered);
+        let SidebarAction::RunCommand { action, .. } = refreshed else { panic!("registered template"); };
+        assert_eq!(*action, original, "a fresh render must never rebind a cached menu payload");
+        let target = CommandTarget::from_action(&original).unwrap();
+        let forged = bound(crate::model::OperationId::new(), bound_payload(&original).clone());
+        assert!(!target.accepts(&model, Command::CopyRelativePath, &forged));
+    }
+
+    #[test]
+    fn configured_external_editor_cannot_bypass_binding_or_original_path() {
+        let mut model = super::super::tests::panel_model();
+        model.external_editors = vec![SidebarEditor { id: "editor".into(), name: "Editor".into(), icon: "editor".into() }].into();
+        let source = model.source_control.as_ref().unwrap();
+        let target = CommandTarget::File { key: source.key.clone(), binding: source.command_binding_id(), path: file_rows(source).next().unwrap().path.clone() };
+        let action = target.resolve(&model, Command::OpenInExternalEditor).unwrap();
+        assert!(target.accepts(&model, Command::OpenInExternalEditor, &action));
+        let captured = bound_payload(&action).clone();
+        assert!(!target.accepts(&model, Command::OpenInExternalEditor, &bound(crate::model::OperationId::new(), captured)));
+        let SidebarAction::OpenFileInEditor { key, editor_id, .. } = bound_payload(&action) else { panic!("file editor"); };
+        let changed = bound(source.command_binding_id(), SidebarAction::OpenFileInEditor { key: key.clone(), path: RepoPath::parse("different.rs").unwrap(), editor_id: editor_id.clone() });
+        assert!(!target.accepts(&model, Command::OpenInExternalEditor, &changed));
     }
 }
