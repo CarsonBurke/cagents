@@ -74,6 +74,10 @@ pub(crate) struct Resident {
     /// Missing on legacy helpers: no unknown-thread promotion authority.
     #[serde(default)]
     pub backend_conversation_revision: Option<u64>,
+    /// Revision may revoke authority before frame application succeeds.
+    /// Positive binding requires the new confirmation to have settled too.
+    #[serde(default)]
+    pub backend_confirmation_pending: bool,
     pub provider_process: Option<Process>,
     pub generation: u64,
     pub session_id: Option<String>,
@@ -260,6 +264,7 @@ impl RemoteActor {
         let resident = Resident {
             backend_instance: Some(uuid::Uuid::new_v4()),
             backend_conversation_revision: Some(0),
+            backend_confirmation_pending: false,
             provider_process: Some(process.clone()),
             generation: 1,
             session_id: None,
@@ -766,7 +771,9 @@ impl RemoteActor {
                         let outcome = state.outcome.clone();
                         let activity_changed = activity != old.activity || outcome != old.outcome;
                         let ready = state.ready && !old.ready;
-                        let identity_changed=state.confirmed_session != old.confirmed_session;
+                        let identity_changed=state.confirmed_session != old.confirmed_session
+                            || state.backend_conversation_revision != old.backend_conversation_revision
+                            || state.backend_confirmation_pending != old.backend_confirmation_pending;
                         let outcomes = (state.outbox_latest > state.outbox_ack
                             && state.outbox_latest != old.outbox_latest)
                             || (state.continuity_loss != old.continuity_loss
@@ -1754,7 +1761,8 @@ impl Server {
             .or(outcome);
         Ok(Resident {
             backend_instance: Some(self.actor.backend_instance()),
-            backend_conversation_revision: (backend_thread == confirmed_session).then_some(backend_revision),
+            backend_conversation_revision: Some(backend_revision),
+            backend_confirmation_pending: backend_thread != confirmed_session,
             provider_process,
             generation,
             session_id,

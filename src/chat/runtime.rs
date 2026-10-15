@@ -3384,10 +3384,15 @@ impl Actor {
         // Invalidate historical unknown-thread consent BEFORE any frame work
         // which can publish or fail. Capture all identities, not only the last
         // Session observed by a callback/UI snapshot.
-        {
+        let backend_identity_changed = {
             let mut history = self.backend_conversation.lock().unwrap_or_else(|p| p.into_inner());
+            let previous = history.revision;
             for event in &step.events { history.observe(event); }
-        }
+            previous != history.revision
+        };
+        // Revocation cannot depend on successful Store writes/frame I/O.
+        // Fresh positive proof separately checks that confirmation is coherent.
+        if backend_identity_changed { (self.notify)(Update::Identity); }
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
@@ -3506,7 +3511,7 @@ impl Actor {
                 let _ = reply.send(result);
             }
         }
-        if identity_changed { (self.notify)(Update::Identity); }
+        if identity_changed || backend_identity_changed { (self.notify)(Update::Identity); }
         self.publish_activity();
         Ok(())
     }

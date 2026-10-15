@@ -21,6 +21,7 @@ impl BackendIdentity {
     pub(crate) fn same_backend(&self, other: &Self) -> bool {
         self.helper == other.helper && self.actor == other.actor && self.process == other.process
     }
+    pub(crate) fn conversation_revision(&self) -> u64 { self.conversation_revision }
     pub(crate) fn first_confirmation(&self, other: &Self) -> bool {
         self.same_backend(other) && self.conversation.is_none() && other.conversation.is_some()
             && self.conversation_revision.checked_add(1) == Some(other.conversation_revision)
@@ -264,6 +265,7 @@ impl Handle {
                 let state: Option<super::remote_actor::Resident> =
                     remote.call("state", serde_json::json!([u64::MAX]))?;
                 let state = state.ok_or("Fresh retained backend evidence is unavailable")?;
+                if state.backend_confirmation_pending { return Err("Retained provider confirmation is still transitioning".into()); }
                 Ok(BackendIdentity {
                     helper: Some(remote.identity().instance),
                     actor: state.backend_instance.ok_or("Retained helper has no concrete backend incarnation evidence")?,
@@ -288,6 +290,13 @@ impl Handle {
                 Ok(BackendIdentity { helper: None,
                     actor: local.backend_instance(), process, conversation, conversation_revision })
             }
+        }
+    }
+    /// Cheap resident metadata for producer callbacks, never a helper RPC.
+    pub(crate) fn observed_backend_revision(&self) -> Option<u64> {
+        match &self.0 {
+            Owner::Local(local) => Some(local.backend_confirmation().1),
+            Owner::Remote(remote) => remote.state().backend_conversation_revision,
         }
     }
     pub(crate) fn actor_identity(&self) -> Option<ActorIdentity> {

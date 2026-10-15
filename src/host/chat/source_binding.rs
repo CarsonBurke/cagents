@@ -51,19 +51,21 @@ impl History {
             entry.unresolved = true;
         }
     }
-    pub(super) fn observed(&mut self, id: TerminalId, instance: uuid::Uuid, thread: Option<String>) -> bool {
+    pub(super) fn observed(&mut self, id: TerminalId, instance: uuid::Uuid, thread: Option<String>, revision: Option<u64>) -> bool {
         let Some(entry) = self.entries.get_mut(&id).filter(|e| e.instance == instance) else { return false; };
-        if entry.known.as_ref().is_some_and(|(_, binding, _)| binding.source.launch.session_id != thread) {
-            // Preserve only the private unknown-thread witness for its first
-            // positive learning. A known conversation changed immediately
-            // invalidates receipt authority, even before another UI read.
-            if entry.known.as_ref().is_some_and(|(_, binding, _)| binding.source.launch.session_id.is_some()) {
-                entry.known = None;
-                entry.learned_from = None;
-            }
-            return true;
+        let Some((witness, binding, _)) = &entry.known else { return false; };
+        let changed = binding.source.launch.session_id != thread || revision != Some(witness.conversation_revision());
+        if !changed { return false; }
+        // Exactly one first confirmation may be learned under fresh admission.
+        // Any missing revision, reset, second identity or same-final-thread ABA
+        // revokes old receipts immediately at producer notification.
+        let first = binding.source.launch.session_id.is_none()
+            && witness.conversation_revision().checked_add(1) == revision;
+        if !first {
+            entry.known = None;
+            entry.learned_from = None;
         }
-        false
+        true
     }
     fn invalidate(&mut self, id: TerminalId, instance: uuid::Uuid) -> Result<(), ProtocolError> {
         let entry = self.entries.get_mut(&id).filter(|e| e.instance == instance)
@@ -351,10 +353,13 @@ mod tests {
     impl Drop for Owner { fn drop(&mut self) { let _ = self.0.close(); } }
     fn actor(source: &Session) -> Owner { actor_with(source, Box::new(Idle)) }
     fn actor_with(source: &Session, adapter: Box<dyn Adapter>) -> Owner {
+        actor_with_notify(source, adapter, |_| {})
+    }
+    fn actor_with_notify(source: &Session, adapter: Box<dyn Adapter>, notify: impl Fn(Update) + Send + Sync + 'static) -> Owner {
         let spec = ProcessSpec::from(&source.launch.recipe);
         let mut initial = Step::default();
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, notify).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while handle.provider_process().is_none() { assert!(Instant::now() < deadline); thread::yield_now(); }
         Owner(handle)
@@ -440,6 +445,7 @@ mod tests {
         fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
         fn receive(&mut self, value: serde_json::Value) -> Result<Step, String> {
             let threads: Vec<&str> = if value["thread"] == "batch" { vec!["first", "second"] }
+                else if value["thread"] == "aba" { vec!["second", "first"] }
                 else { vec![value["thread"].as_str().unwrap()] };
             Ok(Step { events: threads.into_iter().map(|id| chat::Event::Session { id: id.into(), title: None }).collect(), ..Step::default() })
         }
@@ -600,6 +606,51 @@ mod tests {
             assert!(state.validate_terminal_handoff_receipt(&pending).is_err(), "eviction never reconstructs an absence stamp");
         }
         assert!(!original.0.is_completed());
+    }
+
+    #[test]
+    fn same_final_conversation_aba_revokes_issued_receipt_without_any_read_refresh() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let source = source(directory.path());
+        let instance = uuid::Uuid::new_v4();
+        let callback_host = Arc::new(Mutex::new(Weak::<HostLock>::new()));
+        let target = callback_host.clone();
+        let id = source.id;
+        let owner = actor_with_notify(&source, Box::new(Learns), move |update| {
+            let weak = target.lock().unwrap().clone();
+            changed_owned(&weak, id, instance, update);
+        });
+        let fixture = BackendFixture::new(source.clone(), owner.0.clone(), instance);
+        *callback_host.lock().unwrap() = Arc::downgrade(&fixture.host);
+        owner.0.command(chat::Command::SetModel { model: "first".into(), reasoning: None }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while owner.0.confirmed_session_id().as_deref() != Some("first") {
+            assert!(Instant::now() < deadline); thread::sleep(Duration::from_millis(2));
+        }
+        let binding = fixture.capture().unwrap();
+        let revision = owner.0.observed_backend_revision().unwrap();
+        let receipt = {
+            let mut state = fixture.host.lock().unwrap();
+            let mut terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(TerminalId::new(), source.launch.recipe.clone(), None);
+            terminal.execution_instance = uuid::Uuid::new_v4();
+            state.published_terminal_workers.observe(terminal.session.id, terminal.execution_instance);
+            let receipt = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source: binding.source.clone(),
+                source_execution_instance: instance, source_binding: binding.clone(), retained_binding: None,
+                terminal_native_epoch: state.native_sources.retain_resource_epoch(terminal.session.id), terminal };
+            state.remember_terminal_handoff(receipt.clone());
+            state.validate_terminal_handoff_receipt(&receipt).unwrap();
+            receipt
+        };
+        owner.0.command(chat::Command::SetModel { model: "aba".into(), reasoning: None }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fixture.validates(&binding) {
+            assert!(Instant::now() < deadline, "actual identity callback must revoke same-final-thread authority without a fresh Read");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(owner.0.confirmed_session_id().as_deref(), Some("first"));
+        assert_eq!(owner.0.observed_backend_revision(), Some(revision + 2));
+        assert!(fixture.host.lock().unwrap().validate_terminal_handoff_receipt(&receipt).is_err());
+        assert!(!owner.0.is_completed());
     }
 
 }

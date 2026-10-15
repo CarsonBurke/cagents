@@ -475,10 +475,10 @@ fn changed_from(
         }
         {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let observed = state.chats.get(&id).map(|r| (r.execution_instance, r.handle.confirmed_session_id()));
-            if let Some((actual_instance, thread)) = observed
+            let observed = state.chats.get(&id).map(|r| (r.execution_instance, r.handle.confirmed_session_id(), r.handle.observed_backend_revision()));
+            if let Some((actual_instance, thread, revision)) = observed
                 && instance.is_none_or(|expected| expected == actual_instance)
-                && state.native_sources.observed(id, actual_instance, thread)
+                && state.native_sources.observed(id, actual_instance, thread, revision)
             {
                 state.chats.get_mut(&id).expect("same lock").source_binding = None;
             }
