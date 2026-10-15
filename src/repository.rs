@@ -10794,9 +10794,9 @@ mod tests {
         assert!(snapshot.remotes.is_empty());
         assert_eq!(snapshot.local_refs.len(), 1);
         let commands = service.executor.commands.lock().unwrap();
-        assert!(commands[1].arguments.contains(&OsString::from("--cached")));
-        assert!(!commands[2].arguments.contains(&OsString::from("--cached")));
-        assert_eq!(commands[3].arguments.last(), Some(&OsString::from("-z")));
+        assert!(commands[2].arguments.contains(&OsString::from("--cached")));
+        assert!(!commands[3].arguments.contains(&OsString::from("--cached")));
+        assert_eq!(commands[4].arguments.last(), Some(&OsString::from("-z")));
     }
 
     #[test]
