@@ -117,6 +117,43 @@ impl Root {
         })
     }
 
+    /// Pin one original creation directory received over an authenticated
+    /// descriptor transport. This LOW-LEVEL import is NOT worktree authority:
+    /// the host must first check its required operation/attempt audience and
+    /// then validate all six original roles, names and Git backlinks together.
+    /// No path is opened here, and no ordinary serialized report can call it.
+    pub(crate) fn from_received_creation_directory(
+        directory: OwnedFd, original_path: PathBuf, expected_identity: (u64, u64),
+    ) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !original_path.is_absolute() || original_path.components().any(|part| matches!(part,
+                std::path::Component::ParentDir)) || directory.as_raw_fd() < 3 {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid received creation directory role"));
+            }
+            // SAFETY: this OwnedFd remains live through both observational calls.
+            let flags = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFL) };
+            let descriptor_flags = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFD) };
+            if flags < 0 || descriptor_flags < 0 { return Err(io::Error::last_os_error()); }
+            if flags & libc::O_PATH != libc::O_PATH || flags & libc::O_DIRECTORY == 0
+                || descriptor_flags & libc::FD_CLOEXEC == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                    "received creation roots must be O_PATH directory descriptors received with CLOEXEC"));
+            }
+            let metadata = metadata_of_descriptor(&directory)?;
+            if !metadata.is_dir() || (metadata.dev(), metadata.ino()) != expected_identity {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "received creation directory identity differs from its original role"));
+            }
+            Ok(Self { directory, path: original_path })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (directory, original_path, expected_identity);
+            Err(io::Error::new(io::ErrorKind::Unsupported, "received strong creation scopes require Linux directory handles"))
+        }
+    }
+
     /// The path this root was opened from, for error messages.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -1240,6 +1277,57 @@ pub(crate) mod tests {
         io::Write,
         os::unix::fs::{MetadataExt, PermissionsExt},
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn received_creation_pin_keeps_original_directory_without_opening_its_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = temp.path().join("original");
+        fs::create_dir(&name).unwrap();
+        fs::write(name.join("value"), b"original").unwrap();
+        let root = Root::open(&name).unwrap();
+        let metadata = root.metadata().unwrap();
+        let descriptor: OwnedFd = root.retained_directory().unwrap().into();
+        drop(root);
+        fs::rename(&name, temp.path().join("parked")).unwrap();
+        fs::create_dir(&name).unwrap();
+        fs::write(name.join("value"), b"replacement").unwrap();
+        let received = Root::from_received_creation_directory(descriptor, name.clone(),
+            (metadata.dev(), metadata.ino())).unwrap();
+        let mut contents = String::new();
+        open_beneath(&received, Path::new("value")).unwrap().read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "original");
+        assert_eq!(fs::read(name.join("value")).unwrap(), b"replacement");
+        // Pinning the object makes no claim that its descriptive name is still
+        // current. The authenticated six-role receiver must reject that name.
+        assert_ne!(fs::metadata(&name).unwrap().ino(), received.metadata().unwrap().ino());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn received_creation_pin_rejects_wrong_identity_access_mode_and_transport_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Root::open(temp.path()).unwrap();
+        let metadata = root.metadata().unwrap();
+        let identity = (metadata.dev(), metadata.ino());
+        let descriptor = || -> OwnedFd { root.retained_directory().unwrap().into() };
+        assert!(Root::from_received_creation_directory(descriptor(), temp.path().to_owned(),
+            (identity.0, identity.1.wrapping_add(1))).is_err());
+        assert!(Root::from_received_creation_directory(descriptor(), PathBuf::from("relative"), identity).is_err());
+        assert!(Root::from_received_creation_directory(descriptor(), temp.path().join("../other"), identity).is_err());
+        let readable: OwnedFd = File::open(temp.path()).unwrap().into();
+        assert!(Root::from_received_creation_directory(readable, temp.path().to_owned(), identity).is_err());
+        let no_cloexec = descriptor();
+        // SAFETY: this exclusively owned descriptor is not shared or spawned.
+        assert_eq!(unsafe { libc::fcntl(no_cloexec.as_raw_fd(), libc::F_SETFD, 0) }, 0);
+        assert!(Root::from_received_creation_directory(no_cloexec, temp.path().to_owned(), identity).is_err());
+        let plain_name = temp.path().join("plain");
+        fs::write(&plain_name, b"file").unwrap();
+        let plain = File::open(&plain_name).unwrap();
+        let plain_metadata = plain.metadata().unwrap();
+        assert!(Root::from_received_creation_directory(plain.into(), plain_name,
+            (plain_metadata.dev(), plain_metadata.ino())).is_err());
+    }
 
     /// Select an actually permitted non-primary group for owned fixtures.
     pub(crate) fn shared_group(file: &File) -> Option<libc::gid_t> {

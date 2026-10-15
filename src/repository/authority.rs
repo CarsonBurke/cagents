@@ -72,7 +72,10 @@ impl WorktreeAuthority {
     /// A creation journal first verifies its owned registration, backlinks and
     /// publication; this constructor additionally verifies the held roots still
     /// match the worktree's named metadata before publishing destination scope.
-    pub(super) fn from_retained_roots(root: fs_safety::Root, git_dir: fs_safety::Root, common_dir: fs_safety::Root) -> Result<Self, RepositoryError> {
+    // Also used by the authenticated created-start receiver AFTER its durable
+    // required-row/operation/audience proof and six descriptor-role checks.
+    // This does not accept a raw descriptor or serialized path report.
+    pub(crate) fn from_retained_roots(root: fs_safety::Root, git_dir: fs_safety::Root, common_dir: fs_safety::Root) -> Result<Self, RepositoryError> {
         let metadata = root.metadata().map_err(|error| ValidationError::Io(error.to_string()))?;
         let (_, child_root) = inherited_directory_scope(&root)?;
         let (_, child_git) = inherited_directory_scope(&git_dir)?;

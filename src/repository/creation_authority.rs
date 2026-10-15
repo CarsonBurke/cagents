@@ -147,6 +147,9 @@ pub(super) struct CreationSession {
     source_roots: [fs_safety::Root; 3],
     plan: DestinationPlan,
     destination: Mutex<Option<Arc<OwnedDestination>>>,
+    // Keep the first genuine administrative roots even on a later failure.
+    created_roots: Mutex<Option<WorktreeAuthority>>,
+    pub(super) pending_settlement: Mutex<Option<super::creation_retention::ActiveCreated>>,
 }
 
 impl fmt::Debug for CreationSession {
@@ -171,7 +174,7 @@ impl CreationSession {
             ancestor: plan.witness.clone(), parent: None, checkout: None, admin: None,
         };
         Ok((Arc::new(Self { source: authority.clone(), source_roots: [root, private, common],
-            plan, destination: Mutex::new(None) }), evidence))
+            plan, destination: Mutex::new(None), created_roots: Mutex::new(None), pending_settlement: Mutex::new(None) }), evidence))
     }
 
     pub(super) fn restore(evidence: &CreationEvidence, request: &CreateWorktreeRequest,
@@ -214,7 +217,7 @@ impl CreationSession {
             _ => return Err(invalid("Creation authority has incomplete destination evidence")),
         };
         Ok(Arc::new(Self { source, source_roots: [root, private, common], plan,
-            destination: Mutex::new(destination) }))
+            destination: Mutex::new(destination), created_roots: Mutex::new(None), pending_settlement: Mutex::new(None) }))
     }
 
     pub(super) fn validate(&self) -> Result<(), RepositoryError> {
@@ -323,6 +326,7 @@ impl CreationSession {
         let authority = WorktreeAuthority::from_retained_roots(
             owned.root.try_clone().map_err(filesystem)?, admin,
             common.try_clone().map_err(filesystem)?)?;
+        self.created_roots.lock().unwrap_or_else(|p|p.into_inner()).get_or_insert_with(|| authority.clone());
         let created = Arc::new(VerifiedCreatedRoot { source: self.clone(), owned,
             authority, admin: admin_witness.clone(), operation: request.operation_id,
             branch: expected_branch, oid: expected_oid.to_owned() });
@@ -405,6 +409,20 @@ impl VerifiedCreatedRoot {
             return Err(invalid("The provisional checkout no longer has its exact detached journal state"));
         }
         Ok((head, locked))
+    }
+
+    pub(super) fn prepare_settlement(&self, generation: u64, record: &WorktreeRecord) -> Result<(), RepositoryError> {
+        self.validate()?;
+        if record.path != self.owned.root.path() || record.branch != self.branch || record.head_oid.as_deref() != Some(self.oid.as_str()) {
+            return Err(invalid("The created record differs from its original verified registration"));
+        }
+        if self.branch.is_none() { return Err(invalid("A detached provisional checkout cannot grant a settled creation capability")); }
+        let active = super::creation_retention::ActiveCreated::new(self.operation, generation,
+            self.source.source_authority()?, self.authority.clone(), record.clone());
+        let mut pending = self.source.pending_settlement.lock().unwrap_or_else(|p|p.into_inner());
+        if pending.is_some() { return Err(invalid("A creation authority transition is already pending")); }
+        *pending = Some(active);
+        Ok(())
     }
 
     pub(super) fn authority(&self) -> Result<WorktreeAuthority, RepositoryError> {
