@@ -29,9 +29,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         } else {
                             self.configured_primary_worktree(repository, cancellation)
                         }
-                    })?
+                    })
             } else {
-                self.configured_primary_worktree(repository, cancellation)?
+                self.configured_primary_worktree(repository, cancellation)
+            };
+            let configured = match configured {
+                Ok(path) => path,
+                // A linked invocation cannot discover a separate primary with
+                // no core.worktree backlink. Its own registered checkout is
+                // still usable; do not invent a primary path for migration.
+                Err(RepositoryError::Process(error)) if error.exit_code == Some(1) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
             };
             common.join(configured)
         } else {
@@ -59,14 +69,49 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<(), RepositoryError> {
         use std::io::Write;
         use std::os::unix::ffi::OsStrExt;
-        let Some(primary) = self.managed_primary_checkout(repository, cancellation)? else {
-            return Ok(());
-        };
         let managed = canonical_managed_directory(managed_root)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
-        let Ok(relative) = managed.strip_prefix(&primary) else {
+        let mut checkout: Option<PathBuf> = None;
+        // A project/device can be opened at a linked checkout, including one
+        // outside the primary. Common exclude patterns are relative to EACH
+        // checkout, so use its own most-specific containing root.
+        for record in self
+            .list_worktrees(repository, cancellation)?
+            .iter()
+            .skip(1)
+        {
+            if record.bare || !managed.starts_with(&record.path) {
+                continue;
+            }
+            if checkout.as_ref().is_none_or(|current| {
+                record.path.components().count() > current.components().count()
+            }) {
+                let candidate = record
+                    .path
+                    .canonicalize()
+                    .map_err(|error| ValidationError::Io(error.to_string()))?;
+                if self.common_dir(&candidate, cancellation)?
+                    != self.common_dir(repository, cancellation)?
+                {
+                    return Err(ValidationError::Io(
+                        "Managed checkout belongs to another repository".into(),
+                    )
+                    .into());
+                }
+                checkout = Some(candidate);
+            }
+        }
+        if checkout.is_none() {
+            checkout = self
+                .managed_primary_checkout(repository, cancellation)?
+                .filter(|path| managed.starts_with(path));
+        }
+        let Some(primary) = checkout else {
             return Ok(());
         };
+        let relative = managed
+            .strip_prefix(&primary)
+            .map_err(|_| ValidationError::DestinationOutsideRoot)?;
         if relative.as_os_str().is_empty() {
             return Err(ValidationError::Io(
                 "The repository root cannot be its managed worktree directory".into(),
@@ -471,7 +516,6 @@ mod tests {
             .unwrap();
         let once = fs::read(metadata.join("info/exclude")).unwrap();
         assert_eq!(once, b"/.worktrees/\n");
-        git(&root, &["config", "core.worktree", root.to_str().unwrap()]);
         let linked = directory.path().join("linked");
         git(
             &root,
@@ -480,7 +524,45 @@ mod tests {
         service
             .ensure_managed_directory_ignored(&linked, &root.join(".worktrees"), &cancel)
             .unwrap();
+        service
+            .ignore_legacy_managed_worktrees(&linked, &cancel)
+            .unwrap();
+        service
+            .ensure_managed_directory_ignored(&linked, &linked.join(".worktrees"), &cancel)
+            .unwrap();
+        git(&root, &["config", "core.worktree", root.to_str().unwrap()]);
+        service
+            .ensure_managed_directory_ignored(&linked, &root.join(".worktrees"), &cancel)
+            .unwrap();
         assert_eq!(fs::read(metadata.join("info/exclude")).unwrap(), once);
+    }
+
+    #[test]
+    fn linked_checkout_uses_its_own_relative_ignore_pattern() {
+        if isolated_git_test(concat!(
+            module_path!(),
+            "::linked_checkout_uses_its_own_relative_ignore_pattern"
+        )) {
+            return;
+        }
+        let (directory, root) = fixture();
+        let linked = directory.path().join("external-linked");
+        git(
+            &root,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let service = RepositoryService::system("git");
+        let cancel = CancellationToken::new();
+        service
+            .ensure_managed_directory_ignored(&linked, &linked.join(".worktrees"), &cancel)
+            .unwrap();
+        assert_eq!(
+            fs::read(root.join(".git/info/exclude")).unwrap(),
+            b"/.worktrees/\n"
+        );
+        fs::create_dir(linked.join(".worktrees")).unwrap();
+        fs::write(linked.join(".worktrees/artifact"), b"keep").unwrap();
+        assert!(git(&linked, &["status", "--porcelain", "-uall"]).is_empty());
     }
 
     #[cfg(feature = "ui")]

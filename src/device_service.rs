@@ -1018,6 +1018,33 @@ mod tests {
         std::fs::remove_file(root.join(".worktrees/dev/untracked")).unwrap();
         invoke(GitOperation::RemoveWorktree { name: "dev".into() }).unwrap();
         assert!(!root.join(".worktrees/dev").exists());
+        // The remote project can itself be an external linked checkout.
+        // Remove the prior rule so this exercises its real policy write.
+        let linked = directory.path().join("external-linked");
+        run(&[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ]);
+        std::fs::write(root.join(".git/info/exclude"), b"").unwrap();
+        execute(Operation::Git {
+            root: linked.clone(),
+            operation: GitOperation::CreateWorktree {
+                name: "nested".into(),
+                branch: "feature/nested".into(),
+            },
+        })
+        .unwrap();
+        assert!(linked.join(".worktrees/nested/-option").exists());
+        assert_eq!(
+            std::fs::read(root.join(".git/info/exclude")).unwrap(),
+            b"/.worktrees/\n"
+        );
+        assert!(
+            matches!(execute(Operation::Git { root: linked, operation: GitOperation::Status }).unwrap(), Reply::Text(text) if !text.contains(".worktrees"))
+        );
         assert!(
             invoke(GitOperation::CreateWorktree {
                 name: "../escape".into(),
