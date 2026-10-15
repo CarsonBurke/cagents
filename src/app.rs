@@ -2670,7 +2670,8 @@ fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
 fn completion_navigates(message: &Message) -> bool {
     matches!(
         message,
-        Message::RepositoryLoaded {
+        Message::PullRequestCheckoutReady { .. }
+            | Message::RepositoryLoaded {
             open_cards: true,
             result: Ok(_),
             ..
