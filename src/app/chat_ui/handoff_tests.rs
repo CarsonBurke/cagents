@@ -196,6 +196,41 @@ fn exact_dead_reader_replay_keeps_end_until_attachment_without_parking_the_dead_
 }
 
 #[test]
+fn dead_reader_cached_pair_requires_the_exact_original_return_receipt() {
+    for corroborated in [false, true] {
+        let (mut app, card, target, mut receipt) = returning();
+        let captured = app.chat_ui.handoff_bindings[&target].clone();
+        let original = captured.handle.as_ref().unwrap().clone();
+        super::tests::request_end_chat(&mut app, card);
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, captured.operation, Err("lost final reply".into())))));
+        let mut cached = captured.binding.clone();
+        cached.backend = uuid::Uuid::new_v4();
+        cached.source.terminal = Some(receipt.terminal.session.clone());
+        original.publish_source_binding_for_test(cached.clone());
+        // Live positive replacement is still a refusal before any request.
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        assert!(app.chat_ui.phases.is_empty());
+        assert_eq!(app.chat_ui.handoff_bindings[&target].operation, captured.operation);
+        original.disconnect_reader_for_test();
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Disconnected("old EOF".into())))));
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let retry = app.chat_ui.handoff_bindings[&target].clone();
+        assert_ne!(retry.operation, captured.operation);
+        assert_eq!(retry.binding, captured.binding, "cached metadata never refreshes the submitted original expected");
+        if corroborated { receipt.retained_binding = Some(cached); }
+        // These injected typed results test the UI's final corroboration gate;
+        // the producer separately exercises the actual fresh control exchange.
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(target, retry.operation, Ok(receipt.clone())))));
+        assert_eq!(matches!(&app.card_state(card).unwrap().kind, CardKind::Terminal(_)), corroborated);
+        assert_eq!(app.terminal_start_in_flight(card), corroborated);
+        assert_eq!(app.chat_ui.handoff_closes.contains_key(&card), corroborated);
+        assert!(!app.chat_has_parked_runtime(card));
+        assert_eq!(app.durable.terminal_handoff_receipts[&receipt.operation].converted, corroborated);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+    }
+}
+
+#[test]
 fn a_new_handle_with_unknown_binding_does_not_receive_the_earlier_return() {
     let (mut app, card, target, receipt) = returning();
     let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("chat"); };

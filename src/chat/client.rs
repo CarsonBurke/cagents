@@ -1521,6 +1521,12 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner()) = None;
     }
 
+    #[cfg(test)]
+    pub(crate) fn publish_source_binding_for_test(&self, binding: crate::terminal_ipc::ChatSourceBinding) {
+        assert!(valid_source_binding(&binding, &self.inner.session, self.inner.execution_instance, &self.inner.proof));
+        *self.inner.source_binding.lock().unwrap_or_else(|p| p.into_inner()) = Some(binding);
+    }
+
     /// Presentation connection liveness only; this is not native backend or
     /// cleanup authority. A successful control replay does not revive this reader.
     pub fn is_connected(&self) -> bool {

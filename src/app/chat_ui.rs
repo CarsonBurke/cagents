@@ -574,9 +574,14 @@ impl CapturedHandoffBinding {
                 && matches!(&state.kind, CardKind::Chat(current)
                     if crate::workspace_model::views::handoff_chat_source_matches(&self.issued, current)))
             && crate::workspace_model::views::handoff_chat_source_matches(&self.binding.source, observed)
-            && handle.source_binding().is_none_or(|current| current.execution_instance == self.binding.execution_instance
+            // A dead reader may have cached this operation's own post-pair
+            // binding before losing its receipt. Only the original expected
+            // binding is sent on replay; the host must corroborate its exact
+            // retained operation, and HandoffFinished checks the full returned
+            // retained_binding before changing this presentation.
+            && (!handle.is_connected() || handle.source_binding().is_none_or(|current| current.execution_instance == self.binding.execution_instance
                 && current.backend == self.binding.backend
-                && crate::workspace_model::views::handoff_chat_source_matches(&self.binding.source, &current.source))
+                && crate::workspace_model::views::handoff_chat_source_matches(&self.binding.source, &current.source)))
     }
 }
 struct HandoffClose {
