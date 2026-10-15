@@ -330,6 +330,7 @@ mod search_tests {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
+    SelectAll,
     Copy,
     CopyOld,
     CopyNew,
@@ -342,6 +343,7 @@ impl Command {
     /// Stable command-registry identity, independent of captured row context.
     pub const fn command_id(self) -> &'static str {
         match self {
+            Self::SelectAll => "diff_select_all",
             Self::Copy => "diff_copy",
             Self::CopyOld => "diff_copy_old",
             Self::CopyNew => "diff_copy_new",

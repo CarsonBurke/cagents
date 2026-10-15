@@ -46,6 +46,9 @@ impl RepositoryRuntime {
     /// Context menus keep their own captured row and side rather than using this
     /// focus-based entry point when a previously opened menu is activated.
     pub fn diff_command_available(&self, id: &str) -> bool {
+        if id == "diff_select_all" {
+            return self.shows_diff() && self.diff_model().is_some_and(|model| model.row_count(self.diff_mode)>0);
+        }
         if self.selected_diff_range().is_none() { return false; }
         let Some(selection) = self.diff_interaction.selection else { return false; };
         let Some(model) = self.diff_model() else { return false; };
@@ -66,10 +69,9 @@ impl RepositoryRuntime {
     /// Capture the same source/layout fence as a row menu at dispatch time.
     pub fn diff_command_action(&self, card: CardId, id: &str) -> Option<RepositoryAction> {
         if !self.diff_command_available(id) { return None; }
-        let selection = self.diff_interaction.selection?;
-        let row = selection.head;
-        let side = selection.side;
+        let (row,side) = self.diff_interaction.selection.map_or((0,Side::New),|selection| (selection.head,selection.side));
         let command = match id {
+            "diff_select_all" => DiffCommand::SelectAll,
             "diff_copy" => DiffCommand::Copy,
             "diff_copy_old" => DiffCommand::CopyOld,
             "diff_copy_new" => DiffCommand::CopyNew,
@@ -224,6 +226,7 @@ impl RepositoryRuntime {
             return Task::none();
         };
         match command {
+            DiffCommand::SelectAll => { self.select_all_diff(); Task::none() }
             DiffCommand::Copy | DiffCommand::CopyOld | DiffCommand::CopyNew => {
                 let Some(selection) = self.diff_interaction.selection else {
                     return Task::none();
@@ -860,9 +863,11 @@ mod tests {
     fn registered_diff_commands_capture_selected_row_and_source_fences() {
         let (mut runtime,card,_) = fixture(DiffMode::Inline);
         assert!(!runtime.diff_command_available("diff_copy"));
+        assert!(runtime.diff_command_available("diff_select_all"));
+        let Some(RepositoryAction::DiffCommand { command:DiffCommand::SelectAll,.. }) = runtime.diff_command_action(card,"diff_select_all") else { panic!("select all works without an existing selection") };
         let row = runtime.diff_model().unwrap().change_starts(DiffMode::Inline)[0];
         runtime.diff_interaction.selection = Some(Selection::new(DiffMode::Inline,Side::Old,row));
-        for id in ["diff_copy","diff_copy_old","diff_copy_new","diff_copy_patch","diff_copy_line_reference","diff_open_in_editor"] {
+        for id in ["diff_select_all","diff_copy","diff_copy_old","diff_copy_new","diff_copy_patch","diff_copy_line_reference","diff_open_in_editor"] {
             assert!(runtime.diff_command_available(id),"{id}");
             let Some(RepositoryAction::DiffCommand { card: actual,generation,revision,mode,sources,command }) = runtime.diff_command_action(card,id) else { panic!("registered command {id}") };
             assert_eq!(actual,card);
