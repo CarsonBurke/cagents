@@ -15,6 +15,10 @@ use std::{
 
 pub(crate) const ROOT_COUNT: usize = 6;
 const PHASE: u8 = 0xc1;
+const CONTROL_WORDS: usize = 16;
+/// Conservative peak delivered descriptors, INCLUDING malformed excess rights.
+/// Header bytes only reduce the actual number; never budget only valid roles.
+pub(crate) const MAX_DELIVERED_DESCRIPTORS: usize = std::mem::size_of::<[usize; CONTROL_WORDS]>() / std::mem::size_of::<i32>();
 // Source checkout/admin/common, then destination checkout/admin/common. No
 // role is inferred from a pathname and this is unrelated to holder rights.
 pub(crate) struct ReceivedRoots<const N: usize>(pub(crate) [File; N]);
@@ -79,7 +83,7 @@ fn send_exact<const N: usize>(
         iov_len: 1,
     };
     // usize storage guarantees cmsghdr alignment; exactly one rights cmsg.
-    let mut control = [0usize; 16];
+    let mut control = [0usize; CONTROL_WORDS];
     let space =
         unsafe { libc::CMSG_SPACE((N * std::mem::size_of::<i32>()) as u32) } as usize;
     if space > std::mem::size_of_val(&control) {
@@ -150,7 +154,7 @@ fn receive_exact<const N: usize>(stream: &UnixStream, phase: u8, deadline: Insta
             iov_base: (&mut byte as *mut u8).cast(),
             iov_len: 1,
         };
-        let mut control = [0usize; 16];
+        let mut control = [0usize; CONTROL_WORDS];
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
@@ -315,7 +319,7 @@ mod tests {
     }
     #[test]
     fn rejected_count_and_truncation_release_every_kernel_queued_right() {
-        for count in [ROOT_COUNT + 1, 40] {
+        for (negative_role,count) in [false,true].into_iter().flat_map(|negative_role|[ROOT_COUNT+1,MAX_DELIVERED_DESCRIPTORS+8].map(|count|(negative_role,count))) {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("queued-lock");
             let owner = File::create(&path).unwrap();
@@ -324,7 +328,7 @@ mod tests {
                 0
             );
             let (client, server) = UnixStream::pair().unwrap();
-            let mut byte = PHASE;
+            let mut byte = if negative_role {0xc4}else{PHASE};
             let mut iov = libc::iovec {
                 iov_base: (&mut byte as *mut u8).cast(),
                 iov_len: 1,
@@ -365,7 +369,7 @@ mod tests {
             );
             assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
             assert_eq!(
-                receive(&server, Instant::now() + Duration::from_secs(1))
+                (if negative_role {negative::receive_edited_root(&server,Instant::now()+Duration::from_secs(1)).map(|_|())} else {receive(&server,Instant::now()+Duration::from_secs(1)).map(|_|())})
                     .err()
                     .unwrap()
                     .kind(),
