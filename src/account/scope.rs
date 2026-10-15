@@ -9,6 +9,7 @@ use super::{AccountId, home::Homes, registry::{Registry, Store}};
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LaunchAccountScope {
     pub provider: Provider,
+    #[serde(with = "crate::selected_file_path::required")]
     pub canonical_home: PathBuf,
     pub device: u64,
     pub inode: u64,

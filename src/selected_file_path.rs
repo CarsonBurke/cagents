@@ -27,6 +27,18 @@ pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
     Option::<OwnedPath>::deserialize(deserializer).map(|path| path.map(|path| path.0))
 }
 
+/// Required paths use the same lossless representation without an option tag.
+/// Reuse the audited codec rather than letting auxiliary metadata require UTF-8.
+pub(crate) mod required {
+    use super::*;
+    pub(crate) fn serialize<S: Serializer>(path: &PathBuf, serializer: S) -> Result<S::Ok,S::Error> {
+        PathRef(path).serialize(serializer)
+    }
+    pub(crate) fn deserialize<'de,D:Deserializer<'de>>(deserializer:D) -> Result<PathBuf,D::Error> {
+        OwnedPath::deserialize(deserializer).map(|path|path.0)
+    }
+}
+
 struct PathRef<'a>(&'a Path);
 impl Serialize for PathRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -233,4 +245,16 @@ mod tests {
         assert!(serde_json::to_vec(&invalid).is_err());
         assert!(postcard::to_allocvec(&invalid).is_err());
     }
+
+    #[test]
+    fn account_home_metadata_preserves_raw_paths_without_breaking_attachment_framing() {
+        let home = crate::account::HomeIdentity { provider: crate::agent::Provider::Claude,
+            canonical_home: PathBuf::from(OsString::from_vec(b"/fixture/profile-\xff".to_vec())),
+            device:1,inode:2,purge_ids:Vec::new() };
+        let json=serde_json::to_vec(&home).unwrap();
+        assert_eq!(serde_json::from_slice::<crate::account::HomeIdentity>(&json).unwrap(),home);
+        let binary=postcard::to_allocvec(&home).unwrap();
+        assert_eq!(postcard::from_bytes::<crate::account::HomeIdentity>(&binary).unwrap(),home);
+    }
+
 }
