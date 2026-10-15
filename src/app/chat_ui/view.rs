@@ -4656,16 +4656,20 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot);
         runtime.refresh();
         let renderer = crate::app::tests::headless_renderer();
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards.insert(target.card, CardRuntime::Chat(Box::new(runtime)));
         for item in [&parent, &child] {
+            let runtime = app.chat_runtime_mut(target).unwrap();
             let expected = runtime.cache[&item.id].stamp.clone().expect("parent and child retain recorded time");
             assert_eq!(expected.0, item.at.unwrap());
-            // Disclosure rebuilds receive the prior cache, without a provider
-            // publication. Its fixed metadata must not disappear on hover.
-            let previous = runtime.cache.remove(&item.id);
-            let mut rebuilt = CachedItem::updated(&item.content, runtime.syntax_theme, previous, true, false, None);
-            rebuilt.item = Some(Arc::new(item.clone()));
-            assert_eq!(rebuilt.stamp.as_ref(), Some(&expected));
-            runtime.cache.insert(item.id.clone(), rebuilt);
+            let before = runtime.snapshot.clone();
+            // Actual disclosure actions rebuild the cache without any new
+            // provider publication. The recorded label stays available.
+            drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert!(Arc::ptr_eq(&before, &runtime.snapshot));
+            assert_eq!(runtime.cache[&item.id].stamp.as_ref(), Some(&expected));
             let mut footer = runtime.message_copy(item);
             let mut tree = Tree::new(footer.as_widget());
             let node = footer.as_widget_mut().layout(&mut tree, &renderer,
@@ -4694,6 +4698,7 @@ mod tests {
         Arc::make_mut(&mut snapshot.items[0]).at = None;
         Arc::make_mut(&mut snapshot.subagents[0].items[0]).at = None;
         handle.publish_snapshot_for_test(snapshot);
+        let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.refresh();
         assert!(runtime.cache[&parent.id].stamp.is_none());
         assert!(runtime.cache[&child.id].stamp.is_none(), "missing recorded time never falls back to the current clock");
