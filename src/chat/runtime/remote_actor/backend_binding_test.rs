@@ -45,7 +45,10 @@ pub(super) fn isolated(exact: &str) -> bool {
     if std::env::var(CHILD).as_deref() == Ok(exact) { return false; }
     let mut evidence = Evidence(Some(tempfile::Builder::new().prefix("cagents-backend-binding-").tempdir_in("/var/tmp").unwrap()));
     let root = evidence.0.as_ref().unwrap().path();
-    for name in ["home", "run", "data", "config", "cache"] { std::fs::create_dir(root.join(name)).unwrap(); }
+    for name in ["home", "run", "data", "config", "cache"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+        std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let log = |name| OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(root.join(name)).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args(["--exact", exact, "--nocapture", "--test-threads=1"]).env_clear().env(CHILD, exact)

@@ -2855,7 +2855,10 @@ fn process_inner(
             )
         }
         ClientRequest::ChatAttach { session } => {
-            if let Some(response) = restart_completed(host, client, &session)? {
+            // process_inner already owns this conversation's transition through
+            // response decoration. Reclaiming it through restart_completed
+            // would reject both live attachments and completed recovery.
+            if let Some(response) = restart::run(host, client, &session, None)? {
                 return Ok(response);
             }
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -4840,6 +4843,29 @@ for line in sys.stdin:
         );
     }
 
+    #[test]
+    fn live_attach_claims_its_lifecycle_once_and_keeps_the_exact_actor() {
+        let (_directory, host, saved) = upgrade_fixture();
+        restore_upgrade(&host, &saved).unwrap();
+        let (session, previous, instance) = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            let record = &state.chats[&saved.source.id];
+            (record.session.clone(), record.handle.clone(), record.execution_instance)
+        };
+        assert!(!previous.is_completed());
+        for _ in 0..2 {
+            let response = process(&host, 1, ClientRequest::ChatAttach { session: session.clone() }).unwrap();
+            assert!(matches!(response, ServerResponse::ChatAttached { execution_instance, .. } if execution_instance == instance));
+            let state = host.lock().unwrap();
+            assert!(state.chats[&session.id].handle.same_actor(&previous));
+            assert_eq!(state.chats[&session.id].execution_instance, instance);
+        }
+        previous.close().unwrap();
+    }
+
+    // The production Attach dispatcher, rather than a direct runtime restart,
+    // must also claim the transition once for a completed actor.
     #[test]
     fn recovery_attach_replaces_completed_actor_once_and_retains_identity() {
         let (_directory, host, saved) = upgrade_fixture();
