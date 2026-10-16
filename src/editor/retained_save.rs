@@ -69,6 +69,19 @@ fn save_file_with_hooks(
     before_publish: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<RetainedSaveOutcome, RetainedSaveError> {
+    save_file_with_read_hook(root, relative_path, text, expected_disk_hash, overwrite, context, || Ok(()), before_publish, sync_parent)
+}
+fn save_file_with_read_hook(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    context: &FilesystemRecoveryContext,
+    after_read: impl FnOnce() -> io::Result<()>,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+) -> Result<RetainedSaveOutcome, RetainedSaveError> {
     validate_repo_path(relative_path).map_err(io_error)?;
     context.validate_for_source(root).map_err(io_error)?;
     let named = Root::open(root.path()).map_err(io_error)?;
@@ -89,6 +102,7 @@ fn save_file_with_hooks(
             return Ok(RetainedSaveOutcome { outcome: SaveOutcome::Conflict { disk_hash }, recovery: None });
         }
     }
+    after_read().map_err(io_error)?;
     let baseline = SaveBaseline::capture(&destination, (!overwrite).then_some(expected_disk_hash))?;
     // The policy captured before hashing must still be the coherent baseline;
     // otherwise an intervening chmod could be accepted and then overwritten.
@@ -850,6 +864,40 @@ mod tests {
         assert!(result.recovery_authority().is_none());
         assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"mine");
         assert_eq!(fs::metadata(directory.path().join("file")).unwrap().mode() & 0o7777, 0o640);
+        assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
+    }
+    #[test]
+    fn chmod_during_hash_read_cannot_be_adopted_then_overwritten_by_old_permissions() {
+        let (directory, root) = fixture();
+        let path = directory.path().join("file");
+        fs::set_permissions(&path, Permissions::from_mode(0o640)).unwrap();
+        let context = fixture_context(&root).unwrap();
+        let result = save_file_with_read_hook(&root, Path::new("file"), "mine", blake3::hash(b"base"), false, &context,
+            || fs::set_permissions(&path, Permissions::from_mode(0o600)), || Ok(()), fs_safety::sync_directory);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().recovery_authority().is_none(), "refusal precedes holding effects");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(fs::read(&path).unwrap(), b"base");
+        assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
+    }
+    #[test]
+    fn moved_nested_parent_cannot_publish_outside_original_root_or_into_lookalike() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let nested = source.join("nested");
+        let moved = directory.path().join("moved-parent");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("file"), b"base").unwrap();
+        let root = Root::open(&source).unwrap();
+        let context = fixture_context(&root).unwrap();
+        let result = save_file_with_hooks(&root, Path::new("nested/file"), "mine", blake3::hash(b"base"), false, &context, || {
+            fs::rename(&nested, &moved)?;
+            fs::create_dir(&nested)?;
+            fs::write(nested.join("file"), b"replacement")
+        }, fs_safety::sync_directory);
+        assert!(result.is_err());
+        assert_eq!(fs::read(moved.join("file")).unwrap(), b"base");
+        assert_eq!(fs::read(nested.join("file")).unwrap(), b"replacement");
         assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
     }
     #[test]
