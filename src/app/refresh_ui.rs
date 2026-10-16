@@ -186,6 +186,9 @@ impl Cagents {
                 }
                 let regained = focused && !self.refresh_ui.focused;
                 self.refresh_ui.focused = focused;
+                if !focused && self.terminal_review_card.is_some() {
+                    self.set_terminal_review_owner(None);
+                }
                 if !regained {
                     return Task::none();
                 }

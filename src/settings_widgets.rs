@@ -16,6 +16,7 @@ pub struct Setting<'a, Message> {
     control: Element<'a, Message>,
     error: Option<&'a str>,
     label_in_control: bool,
+    keywords: String,
 }
 
 impl<'a, Message: Clone + 'a> Setting<'a, Message> {
@@ -32,14 +33,34 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
         self
     }
 
-    fn matches(&self, context: &str, query: &str) -> bool {
-        matches(&format!("{context} {} {}", self.label, self.detail), query)
+    /// Searchable TOML keys, choice labels, captions and current values.
+    pub fn keywords(mut self, keywords: impl AsRef<str>) -> Self {
+        self.keywords.push(' ');
+        self.keywords.push_str(keywords.as_ref());
+        self
     }
 
-    fn view(self) -> Element<'a, Message> {
+    fn matches(&self, context: &str, query: &str) -> bool {
+        matches(
+            &format!("{context} {} {} {}", self.label, self.detail, self.keywords),
+            query,
+        )
+    }
+
+    fn view(self, query: &str) -> Element<'a, Message> {
         let mut children = Vec::new();
         if !self.label_in_control {
-            children.push(design::heading(self.label).into());
+            children.push(if query.trim().is_empty() {
+                design::heading(self.label).into()
+            } else {
+                highlighted(
+                    self.label.to_owned(),
+                    query,
+                    design::heading_font(),
+                    design::TEXT_HEADING,
+                    design::LINE_BODY,
+                )
+            });
         }
         children.push(self.control);
         if let Some(error) = self.error {
@@ -51,17 +72,76 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
                     .into(),
             );
         }
-        children.push(
-            design::caption(self.detail)
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .width(Length::Fill)
-                .into(),
-        );
+        if !self.detail.is_empty() {
+            children.push(
+                design::caption(self.detail)
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
         widget::column::with_children(children)
             .spacing(space::XS)
             .width(Length::Fill)
             .into()
     }
+}
+
+/// Build spans at original UTF-8 boundaries, including non-ASCII text.
+fn highlighted<'a, Message: 'a>(
+    text: String,
+    query: &str,
+    font: iced::Font,
+    size: f32,
+    line_height: f32,
+) -> Element<'a, Message> {
+    iced::widget::rich_text(highlighted_spans(&text, query, font))
+        .size(size)
+        .line_height(iced::widget::text::LineHeight::Absolute(line_height.into()))
+        .width(Length::Fill)
+        .into()
+}
+
+/// The native rich-text builder consumes these exact render properties.
+fn highlighted_spans(
+    text: &str,
+    query: &str,
+    font: iced::Font,
+) -> Vec<iced::widget::text::Span<'static, ()>> {
+    let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut spans = Vec::new();
+    let boundaries: Vec<_> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let mut highlighted = vec![false; text.len()];
+    for (offset, &start) in boundaries.iter().enumerate() {
+        for &end in &boundaries[offset + 1..] {
+            if words
+                .iter()
+                .any(|word| text[start..end].to_lowercase() == *word)
+            {
+                highlighted[start..end].fill(true);
+            }
+        }
+    }
+    for range in boundaries.windows(2) {
+        let span: iced::widget::text::Span<'_, ()> =
+            iced::widget::text::Span::new(text[range[0]..range[1]].to_owned());
+        spans.push(if highlighted[range[0]] {
+            // Title roles already use Bold. Underline distinguishes a match
+            // without changing the role's font size or line box.
+            span.font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..font
+            })
+            .underline(true)
+        } else {
+            span.font(font)
+        });
+    }
+    spans
 }
 
 pub fn matches(text: &str, query: &str) -> bool {
@@ -82,6 +162,7 @@ pub fn field<'a, Message: Clone + 'a>(
         control,
         error: None,
         label_in_control: false,
+        keywords: label.to_lowercase().replace([' ', '-'], "_"),
     }
 }
 
@@ -89,6 +170,7 @@ pub struct Group<'a, Message> {
     title: &'static str,
     detail: &'static str,
     settings: Vec<Setting<'a, Message>>,
+    compact: bool,
 }
 
 pub fn group<'a, Message>(
@@ -100,22 +182,43 @@ pub fn group<'a, Message>(
         title,
         detail,
         settings,
+        compact: false,
     }
 }
 
 impl<'a, Message: Clone + 'a> Group<'a, Message> {
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
+    }
+
+    pub fn breadcrumb(&self, category: &str) -> String {
+        format!("{category} > {}", self.title)
+    }
+
     pub fn view(self, category: &str, query: &str) -> Option<Element<'a, Message>> {
+        let breadcrumb = self.breadcrumb(category);
         let context = format!("{category} {} {}", self.title, self.detail);
         let mut settings: Vec<_> = self
             .settings
             .into_iter()
             .filter(|setting| setting.matches(&context, query))
-            .map(Setting::view)
+            .map(|setting| setting.view(query))
             .collect();
         if settings.is_empty() {
             return None;
         }
-        let mut heading: Vec<Element<'a, Message>> = vec![design::title(self.title).into()];
+        let mut heading: Vec<Element<'a, Message>> = vec![if query.trim().is_empty() {
+            design::title(self.title).into()
+        } else {
+            highlighted(
+                breadcrumb,
+                query,
+                design::title_font(),
+                design::TEXT_TITLE,
+                design::LINE_TITLE,
+            )
+        }];
         if !self.detail.is_empty() {
             heading.push(
                 design::caption(self.detail)
@@ -132,7 +235,7 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         children.append(&mut settings);
         Some(
             widget::column::with_children(children)
-                .spacing(space::L)
+                .spacing(if self.compact { space::XS } else { space::L })
                 .width(Length::Fill)
                 .into(),
         )
@@ -220,6 +323,111 @@ pub fn search_id() -> widget::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_search_preserves_label_and_group_title_line_boxes() {
+        use iced::advanced::{layout, widget::Tree};
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for query in ["", "Font"] {
+            let mut setting =
+                field::<()>("Font", "", widget::Space::new().width(1).height(1).into()).view(query);
+            let mut tree = Tree::new(&setting);
+            let node = setting.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 600.0)),
+            );
+            assert_eq!(node.children()[0].size().height, design::LINE_BODY);
+
+            let mut group = group(
+                "Font",
+                "",
+                vec![field::<()>(
+                    "Font",
+                    "",
+                    widget::Space::new().width(1).height(1).into(),
+                )],
+            )
+            .view("Editor", query)
+            .unwrap();
+            let mut tree = Tree::new(&group);
+            let node = group.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 600.0)),
+            );
+            assert_eq!(
+                node.children()[0].children()[0].size().height,
+                design::LINE_TITLE,
+            );
+        }
+    }
+
+    #[test]
+    fn search_matches_remain_visible_when_the_title_is_already_bold() {
+        for (label, query, matched) in [
+            ("Editor > Font", "editor", "Editor"),
+            ("Editor > naïve fonts", "NAÏVE", "naïve"),
+        ] {
+            let font = design::title_font();
+            assert_eq!(font.weight, iced::font::Weight::Bold);
+            let spans = highlighted_spans(label, query, font);
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.text.as_ref())
+                    .collect::<String>(),
+                label,
+            );
+            assert_eq!(
+                spans
+                    .iter()
+                    .filter(|span| span.underline)
+                    .map(|span| span.text.as_ref())
+                    .collect::<String>(),
+                matched,
+            );
+            assert!(
+                spans.iter().any(|span| !span.underline),
+                "context outside the match keeps its ordinary role",
+            );
+            assert!(spans.iter().all(|span| span.font == Some(font)));
+            assert!(
+                highlighted_spans(label, "", font)
+                    .iter()
+                    .all(|span| !span.underline),
+            );
+        }
+    }
+
+    #[test]
+    fn search_indexes_keys_values_captions_and_current_shortcuts() {
+        let cases = [
+            (
+                "Pane activation",
+                "focus_follows_mouse hover",
+                "focus_follows_mouse",
+            ),
+            ("Color theme", "dracula nord", "dracula"),
+            ("Pane activation", "focus_follows_mouse hover", "hover"),
+            (
+                "New chat",
+                "keyboard_shortcuts.new_native_thread Ctrl+T",
+                "ctrl+t",
+            ),
+        ];
+        for (label, keywords, query) in cases {
+            let setting = field::<()>(label, "", widget::text("").into()).keywords(keywords);
+            assert!(setting.matches("General > Workspace", query), "{query}");
+        }
+    }
+
+    #[test]
+    fn results_carry_category_and_group() {
+        let group = group::<()>("Font", "", vec![]);
+        assert_eq!(group.breadcrumb("Editor"), "Editor > Font");
+    }
+
     #[test]
     fn search_matches_all_words_without_case_sensitivity() {
         assert!(matches("Terminal font family", "FONT terminal"));

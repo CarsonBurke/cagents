@@ -168,6 +168,8 @@ pub enum HostedTerminalStartError {
 #[derive(Default)]
 struct AttachmentState {
     confirmed: bool,
+    connection_live: bool,
+    connection_epoch: u64,
     failure: Option<String>,
 }
 
@@ -611,10 +613,16 @@ impl HostedPublishedState {
     }
 
     fn confirm_attachment(&self) {
-        self.attachment
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .confirmed = true;
+        let mut attachment = self.attachment.lock().unwrap_or_else(|e| e.into_inner());
+        // This is a local socket-attachment epoch, never a worker identity.
+        // Exhaustion refuses future cleanup instead of reusing an old epoch.
+        attachment.connection_epoch = attachment
+            .connection_epoch
+            .checked_add(1)
+            .unwrap_or(u64::MAX);
+        attachment.connection_live = attachment.connection_epoch != u64::MAX;
+        attachment.confirmed = true;
+        drop(attachment);
         self.attachment_changed.notify_all();
     }
 
@@ -674,11 +682,41 @@ impl HostedPublishedState {
     }
 }
 
+/// UI transport command admission, not PTY consumption or worker identity.
+#[derive(Clone, Debug)]
+pub(crate) struct KeyAdmission(Arc<AtomicU8>);
+impl KeyAdmission {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(0)))
+    }
+    fn state(&self) -> u8 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+#[derive(Debug)]
+struct PendingKeyAdmission(KeyAdmission);
+impl Drop for PendingKeyAdmission {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .0
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
 #[derive(Debug)]
 enum ClientCommand {
     Input(Vec<u8>),
     Paste(String, PasteOrigin),
     Key(KeyInput),
+    BoundKey {
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+        predecessor: Option<KeyAdmission>,
+        admitted: Option<KeyAdmission>,
+        completed: Option<Sender<bool>>,
+    },
     Mouse(MouseInput),
     Focus(bool),
     Resize(TerminalSize),
@@ -710,6 +748,7 @@ impl ClientCommand {
             Self::Input(_) => "write terminal input",
             Self::Paste(..) => "paste into terminal",
             Self::Key(_) => "send terminal key",
+            Self::BoundKey { .. } => "send original terminal key",
             Self::Mouse(_) => "send terminal mouse input",
             Self::Focus(_) => "set terminal focus",
             Self::Resize(_) => "resize terminal",
@@ -735,7 +774,9 @@ impl ClientCommand {
                 text,
                 origin,
             },
-            Self::Key(input) => ClientRequest::Key { terminal_id, input },
+            Self::Key(input) | Self::BoundKey { input, .. } => {
+                ClientRequest::Key { terminal_id, input }
+            }
             Self::Mouse(input) => ClientRequest::Mouse { terminal_id, input },
             Self::Focus(focused) => ClientRequest::Focus {
                 terminal_id,
@@ -827,6 +868,10 @@ impl std::fmt::Debug for HostedTerminalHandle {
 }
 
 impl HostedTerminalHandle {
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn connect(
         terminal_id: TerminalId,
         expected_host: Option<HostSessionProof>,
@@ -1034,6 +1079,83 @@ impl HostedTerminalHandle {
         self.try_command(ClientCommand::Key(key))
     }
 
+    pub(crate) fn cleanup_epoch(&self) -> Option<u64> {
+        let attachment = self
+            .inner
+            .published
+            .attachment
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        attachment
+            .connection_live
+            .then_some(attachment.connection_epoch)
+    }
+    /// Bind owned input to the socket captured at its physical down.
+    fn bound_key(
+        &self,
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+        predecessor: Option<KeyAdmission>,
+        admitted: Option<KeyAdmission>,
+        completed: Option<Sender<bool>>,
+    ) -> Result<(), TerminalSendError> {
+        if self.cleanup_epoch() != Some(epoch) || self.proof().as_ref() != Some(&proof) {
+            return Err(TerminalSendError::Closed);
+        }
+        self.try_command(ClientCommand::BoundKey {
+            input,
+            proof,
+            epoch,
+            predecessor,
+            admitted,
+            completed,
+        })
+    }
+    pub(crate) fn tracked_key(
+        &self,
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+    ) -> Result<KeyAdmission, TerminalSendError> {
+        if input.action != super::KeyAction::Press {
+            return Err(TerminalSendError::Closed);
+        }
+        let admitted = KeyAdmission::new();
+        self.bound_key(input, proof, epoch, None, Some(admitted.clone()), None)?;
+        Ok(admitted)
+    }
+    pub(crate) fn repeat_key(
+        &self,
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+        predecessor: KeyAdmission,
+    ) -> Result<(), TerminalSendError> {
+        self.bound_key(input, proof, epoch, Some(predecessor), None, None)
+    }
+    pub(crate) fn cleanup_key(
+        &self,
+        input: KeyInput,
+        proof: HostSessionProof,
+        epoch: u64,
+        predecessor: KeyAdmission,
+    ) -> Result<Receiver<bool>, TerminalSendError> {
+        if input.action != super::KeyAction::Release {
+            return Err(TerminalSendError::Closed);
+        }
+        let (completed, result) = crossbeam_channel::bounded(1);
+        self.bound_key(
+            input,
+            proof,
+            epoch,
+            Some(predecessor),
+            None,
+            Some(completed),
+        )?;
+        Ok(result)
+    }
+
     pub fn mouse(&self, mouse: MouseInput) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Mouse(mouse))
     }
@@ -1175,6 +1297,8 @@ enum PendingRequest {
     Snapshot,
     Acknowledge,
     Command(&'static str),
+    CleanupKey(Sender<bool>),
+    OwnedPress(PendingKeyAdmission),
     Hibernate,
     Shutdown(Sender<()>),
 }
@@ -1591,6 +1715,11 @@ fn client_loop(
             reconnect_started = None;
             reconnect_delay = INITIAL_RECONNECT_DELAY;
         });
+        published
+            .attachment
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connection_live = false;
         published.invalidate_activity();
         let _ = published.observe_agent_activity(&events, None);
         match end {
@@ -1857,6 +1986,7 @@ fn serve_connection(
     let mut pending = BTreeMap::new();
     let mut snapshot_pending = false;
     let mut last_acknowledgement = 0;
+    let mut owned_cleanup_failed = false;
 
     if stop.is_requested() {
         connection.close();
@@ -1944,6 +2074,7 @@ fn serve_connection(
             connection.close();
             return ConnectionEnd::Stop;
         }
+        let mut waiting_for_owned_press = false;
         while pending.len() < MAX_IN_FLIGHT_REQUESTS {
             if stop.is_requested() {
                 connection.close();
@@ -1968,9 +2099,79 @@ fn serve_connection(
                 connection.close();
                 return ConnectionEnd::Stop;
             }
+            if let ClientCommand::BoundKey {
+                proof: original,
+                epoch,
+                predecessor,
+                admitted,
+                completed,
+                ..
+            } = &command
+            {
+                if completed.is_none() && owned_cleanup_failed {
+                    if let Some(admitted) = admitted {
+                        admitted.0.store(2, Ordering::Release);
+                    }
+                    publish_event(events, published, TerminalEvent::Error {
+                        operation: "admit original terminal key",
+                        message: "earlier key cleanup is unconfirmed; new input was not sent on this attachment".into(),
+                    });
+                    continue;
+                }
+                if admitted.is_some()
+                    && pending
+                        .values()
+                        .any(|kind| matches!(kind, PendingRequest::CleanupKey(_)))
+                {
+                    // A queued up is not yet a completed up. Keep this fresh
+                    // physical cycle in FIFO until every earlier cleanup ACK.
+                    *carried = Some(command);
+                    waiting_for_owned_press = true;
+                    break;
+                }
+                let attachment = published
+                    .attachment
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let stale = original != &proof
+                    || !attachment.connection_live
+                    || attachment.connection_epoch != *epoch;
+                drop(attachment);
+                if stale
+                    || predecessor
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.state() == 2)
+                {
+                    if let Some(admitted) = admitted {
+                        admitted.0.store(2, Ordering::Release);
+                    }
+                    if let Some(completed) = completed {
+                        let _ = completed.try_send(false);
+                    }
+                    continue;
+                }
+                if predecessor
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.state() == 0)
+                {
+                    // Retain FIFO while the actual earlier down is unconfirmed;
+                    // later input must not overtake its owned up.
+                    *carried = Some(command);
+                    waiting_for_owned_press = true;
+                    break;
+                }
+            }
             let operation = command.operation();
             let pending_kind = match &command {
                 ClientCommand::Hibernate => PendingRequest::Hibernate,
+                ClientCommand::BoundKey {
+                    completed: Some(completed),
+                    ..
+                } => PendingRequest::CleanupKey(completed.clone()),
+                ClientCommand::BoundKey {
+                    admitted: Some(admitted),
+                    ..
+                } => PendingRequest::OwnedPress(PendingKeyAdmission(admitted.clone())),
                 ClientCommand::ShutdownTerminal(completed) => {
                     PendingRequest::Shutdown(completed.clone())
                 }
@@ -2012,7 +2213,7 @@ fn serve_connection(
             }
         }
 
-        let work = if pending.len() < MAX_IN_FLIGHT_REQUESTS {
+        let work = if !waiting_for_owned_press && pending.len() < MAX_IN_FLIGHT_REQUESTS {
             wait_for_client_work(stop, commands, connection.incoming(), published)
         } else {
             wait_for_server_or_stop(stop, connection.incoming(), published)
@@ -2136,6 +2337,21 @@ fn serve_connection(
                     (PendingRequest::Acknowledge, ServerResponse::Accepted)
                     | (PendingRequest::Command(_), ServerResponse::Accepted) => {}
                     (PendingRequest::Hibernate, ServerResponse::Accepted) => {}
+                    (PendingRequest::OwnedPress(admitted), response) => {
+                        admitted.0.0.store(
+                            if matches!(response, ServerResponse::Accepted) {
+                                1
+                            } else {
+                                2
+                            },
+                            Ordering::Release,
+                        );
+                    }
+                    (PendingRequest::CleanupKey(completed), response) => {
+                        let accepted = matches!(response, ServerResponse::Accepted);
+                        owned_cleanup_failed |= !accepted;
+                        let _ = completed.try_send(accepted);
+                    }
                     (PendingRequest::Shutdown(completed), ServerResponse::Accepted) => {
                         let _ = completed.try_send(());
                     }
@@ -2196,6 +2412,12 @@ fn serve_connection(
                     }
                     Some(PendingRequest::Acknowledge) => "acknowledge hosted terminal redraw",
                     Some(PendingRequest::Hibernate) => "hibernate terminal",
+                    Some(PendingRequest::OwnedPress(_)) => "admit original terminal press",
+                    Some(PendingRequest::CleanupKey(completed)) => {
+                        owned_cleanup_failed = true;
+                        let _ = completed.try_send(false);
+                        "complete original terminal key cleanup"
+                    }
                     Some(PendingRequest::Shutdown(_)) => "shutdown terminal",
                     Some(PendingRequest::Command(operation)) => operation,
                     None => return ConnectionEnd::Retry,

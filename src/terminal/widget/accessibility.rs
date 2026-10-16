@@ -127,10 +127,13 @@ struct ConsumedInputs {
     keys: Vec<keyboard::key::Physical>,
     buttons: Vec<mouse::Button>,
 }
-/// One barrier per application window, shared across mounted cards and retained
-/// while cards unmount. A review key-up must not become input to a new focus.
+/// One window-owned boundary for Review suppression and raw key cleanup.
+/// Original attachments remain owned across native focus changes and unmount.
 #[derive(Clone, Default)]
-pub(crate) struct ReviewInputBarrier(Arc<Mutex<ConsumedInputs>>);
+pub(crate) struct ReviewInputBarrier(
+    Arc<Mutex<ConsumedInputs>>,
+    pub(super) Arc<Mutex<super::key_ownership::OwnedInput>>,
+);
 impl ReviewInputBarrier {
     pub fn owns_keyboard(&self, event: &Event) -> bool {
         let physical = match event {
@@ -145,6 +148,17 @@ impl ReviewInputBarrier {
             .unwrap_or_else(|e| e.into_inner())
             .keys
             .contains(physical)
+    }
+    /// Review-owned ups must be forgotten even if a global dialog or another
+    /// native control consumed them and no terminal was mounted for delivery.
+    pub(crate) fn finish_key_event(&self, event: &Event) {
+        if let Event::Keyboard(keyboard::Event::KeyReleased { physical_key, .. }) = event {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys
+                .retain(|key| key != physical_key);
+        }
     }
     pub fn owns_mouse_release(&self, event: &Event) -> bool {
         let Event::Mouse(mouse::Event::ButtonReleased(button)) = event else {
