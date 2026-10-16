@@ -4546,6 +4546,26 @@ impl LspManager {
             }
         } else { None };
 
+        // SnapshotStore is URI-global, not keyed by discovered session root.
+        // A new marker can choose a different SessionKey at the same URI;
+        // refusing only an exact-key session would still append replacement
+        // bytes to the original URI's snapshots/incarnation. Check every
+        // existing registration before creating a session or touching text.
+        let conflicting_uri = self.documents.values().any(|reference| {
+            if reference.uri.as_ref() != &uri {
+                return false;
+            }
+            let proof = reference.owner.discovered_root.lock().unwrap_or_else(|error| error.into_inner());
+            let existing = match proof.as_ref() {
+                Some(Ok(binding)) => Some(binding.as_ref()),
+                _ => None,
+            };
+            !same_read_scope(existing, read_root.as_deref())
+        });
+        if conflicting_uri {
+            return self.unavailable(doc, "this document URI still belongs to another editor root; close its original buffers before reopening this worktree".into());
+        }
+
         let key = self
             .sessions
             .iter()
@@ -8086,6 +8106,58 @@ mod tests {
             let current = manager.snapshots.latest(&manager.documents[&first].uri).unwrap();
             assert!(Arc::ptr_eq(&current, &original_snapshot));
             assert_eq!(current.full_text().as_ref(), "original");
+            assert_eq!(server.entries("textDocument/didOpen").len(), 1);
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn original_read_root_refuses_changed_marker_key_before_any_uri_or_session_mutation() {
+        block_on(async {
+            let (guard, worktree, _) = original_root_workspace();
+            let member = worktree.join("member");
+            std::fs::create_dir(&member).unwrap();
+            let file = member.join("file.rs");
+            std::fs::write(&file, "original").unwrap();
+            let original = Arc::new(crate::fs_safety::Root::open(&worktree).unwrap());
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let first = LspDocumentId(909);
+            manager.open_snapshot_with_root(first, &file, &worktree, rust_language(), 1, native_source("original"), original);
+            finish_original_root_discovery(&mut manager, &events, first).await;
+            await_ready(&events, first).await;
+            let server = handle_of(&slot).await;
+            server.wait_for("textDocument/didOpen").await;
+            let old_reference = manager.documents[&first].clone();
+            assert_eq!(old_reference.session.root.as_ref(), worktree.as_path());
+            let old_snapshot = manager.snapshots.latest(&old_reference.uri).unwrap();
+            let old_incarnation = manager.document_incarnation(first).unwrap();
+            let old_session = Arc::clone(&manager.sessions[&old_reference.session].retired);
+            std::fs::rename(&worktree, guard.path().join("old-worktree")).unwrap();
+            std::fs::create_dir_all(&member).unwrap();
+            std::fs::write(member.join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::write(&file, "replacement").unwrap();
+            let replacement = Arc::new(crate::fs_safety::Root::open(&worktree).unwrap());
+            let second = LspDocumentId(910);
+            let source = native_source("replacement");
+            manager.open_snapshot_with_root(second, &file, &worktree, rust_language(), 1, source.clone(), replacement);
+            let (ticket, discovered) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { doc, ticket, root } if *doc == second => Some((*ticket, root.clone())),
+                _ => None,
+            }).await;
+            assert_eq!(discovered, member, "the replacement deliberately selects a different session key");
+            assert_ne!(discovered.as_path(), old_reference.session.root.as_ref());
+            assert!(matches!(manager.finish_discovery(second, ticket, discovered), Some(LspStatus::Unavailable { .. })));
+            assert_eq!(manager.sessions.len(), 1, "no replacement transport was even admitted");
+            assert!(Arc::ptr_eq(&manager.sessions[&old_reference.session].retired, &old_session));
+            assert!(!old_session.load(Ordering::Acquire));
+            assert!(!manager.documents.contains_key(&second));
+            assert!(manager.document_incarnation(second).is_none());
+            assert_eq!(manager.document_incarnation(first), Some(old_incarnation));
+            assert!(Arc::ptr_eq(&manager.snapshots.latest(&old_reference.uri).unwrap(), &old_snapshot));
+            assert_eq!(old_snapshot.full_text().as_ref(), "original");
+            assert_eq!(source.serialization_count(), 0);
             assert_eq!(server.entries("textDocument/didOpen").len(), 1);
             manager.begin_shutdown().await;
         });
