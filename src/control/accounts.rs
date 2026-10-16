@@ -1,8 +1,54 @@
 use super::*;
 use crate::account::info::{Query, Report};
+mod reset;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountCommand {
+    /// Inspect actual plan allowance and saved reset credits on one live pane.
+    Allowance {
+        /// Exact native session UUID on the selected device.
+        #[arg(long)]
+        session: TerminalId,
+    },
+    /// Redeem one named provider reset credit under explicit authorization.
+    Redeem {
+        /// Exact native session UUID on the selected device.
+        #[arg(long)]
+        session: TerminalId,
+        /// Actual provider account ID from a fresh allowance inspection.
+        #[arg(long)]
+        provider_account: String,
+        /// Actual backend origin from that same inspection.
+        #[arg(long)]
+        backend_origin: String,
+        /// Exact opaque reset-credit ID; the provider never selects another.
+        #[arg(long)]
+        credit: String,
+        /// Explicitly authorize consuming this one named reset credit.
+        #[arg(long, required = true)]
+        authorize: bool,
+    },
+    /// Watch a live pane's shared allowance without consuming reset credits.
+    Monitor {
+        /// Exact native session UUID on the selected device.
+        #[arg(long)]
+        session: TerminalId,
+        /// Provider-reported used percentage to highlight while observing.
+        #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
+        threshold: u8,
+        /// Seconds between checks; Ctrl-C stops only this monitor.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        interval_seconds: u64,
+        /// Maximum checks before this foreground monitor exits.
+        #[arg(long, default_value_t = 720, value_parser = clap::value_parser!(u32).range(1..=1000000))]
+        checks: u32,
+        /// Requested automatic budget; automatic redemption is currently refused.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=100))]
+        max_redemptions: u16,
+        /// Request automatic redemption (currently refused: admission is unavailable).
+        #[arg(long)]
+        authorize: bool,
+    },
     /// Read caller context and configured account plan allowances without probing.
     Info {
         /// Limit account rows to claude, codex, or omp.
@@ -18,11 +64,14 @@ pub enum AccountCommand {
 }
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
-    let AccountCommand::Info {
-        provider,
-        account,
-        refresh,
-    } = command;
+    let (provider, account, refresh) = match command {
+        AccountCommand::Info {
+            provider,
+            account,
+            refresh,
+        } => (provider, account, refresh),
+        other => return reset::execute(other),
+    };
     let socket = control_daemon_socket()?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
@@ -192,6 +241,56 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from(["cagents", "account", "info", "--provider", "invalid"]).is_err()
+        );
+    }
+    #[test]
+    fn allowance_commands_preserve_global_remote_target_and_require_explicit_redeem_authorization()
+    {
+        let session = TerminalId::new().to_string();
+        let parsed = Cli::try_parse_from([
+            "cagents",
+            "--device",
+            "fw16",
+            "account",
+            "allowance",
+            "--session",
+            &session,
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(parsed.device.as_deref(), Some("fw16"));
+        assert!(matches!(
+            parsed.command,
+            TopCommand::Account {
+                command: AccountCommand::Allowance { .. }
+            }
+        ));
+        let args = [
+            "cagents",
+            "account",
+            "redeem",
+            "--session",
+            &session,
+            "--provider-account",
+            "actual-account",
+            "--backend-origin",
+            "https://chatgpt.com",
+            "--credit",
+            "actual-credit",
+        ];
+        assert!(Cli::try_parse_from(args).is_err());
+        assert!(Cli::try_parse_from(args.into_iter().chain(["--authorize"])).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "cagents",
+                "account",
+                "monitor",
+                "--session",
+                &session,
+                "--threshold",
+                "101"
+            ])
+            .is_err()
         );
     }
     #[test]

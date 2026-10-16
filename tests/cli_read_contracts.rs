@@ -118,6 +118,44 @@ fn every_read_can_skip_daemon_start_through_flag_or_environment() {
 }
 
 #[test]
+fn allowance_reads_and_named_redemption_honor_no_start_without_effects() {
+    let fixture = Fixture::new();
+    const SESSION: &str = "00000000-0000-4000-8000-000000000001";
+    for environment in [false, true] {
+        for args in [
+            vec!["account", "allowance", "--session", SESSION],
+            vec!["account", "monitor", "--session", SESSION, "--checks", "1"],
+            vec![
+                "account",
+                "redeem",
+                "--session",
+                SESSION,
+                "--provider-account",
+                "private-no-start-account",
+                "--backend-origin",
+                "https://chatgpt.com",
+                "--credit",
+                "private-no-start-credit",
+                "--authorize",
+            ],
+        ] {
+            let mut arguments = args;
+            if !environment {
+                arguments.push("--no-start");
+            }
+            let output = fixture.output(&arguments, environment);
+            assert_eq!(output.exit_code, Some(1), "{arguments:?}: {output:?}");
+            let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(value["error"]["kind"], "daemon_not_running", "{value}");
+            assert!(
+                !fixture.root.path().join("spawned").exists(),
+                "allowance commands must not start a daemon: {arguments:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn stopping_an_absent_daemon_twice_succeeds_and_has_a_stable_shape() {
     let fixture = Fixture::new();
     for _ in 0..2 {

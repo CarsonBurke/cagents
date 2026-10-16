@@ -209,6 +209,18 @@ pub struct ServerIdentity {
 pub trait Adapter: Send {
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
+    fn read_allowance(
+        &mut self,
+        _request: crate::account::reset::transport::Read,
+    ) -> Result<Step, String> {
+        Err("This provider transport has no supported read-only allowance/reset-inventory API; no provider command was sent".into())
+    }
+    fn consume_reset_credit(
+        &mut self,
+        _request: crate::account::reset::transport::Consume,
+    ) -> Result<Step, String> {
+        Err("This provider transport has no supported reset-credit redemption path; no credit was consumed".into())
+    }
     /// Whether this exact pending answer refuses work. Providers with opaque
     /// action IDs must inspect their retained decision, never its UI label.
     fn answer_declines(&self, _request_id: &str, action: &str) -> bool {

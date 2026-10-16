@@ -443,6 +443,19 @@ pub(super) fn process_request(
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
+            if let crate::device_service::Operation::AccountAllowance { request } = operation {
+                let report =
+                    super::account_allowance::execute(host, request).map_err(|message| {
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    })?;
+                return Ok((
+                    ServerResponse::DeviceOperation {
+                        reply: crate::device_service::Reply::AccountAllowance(report),
+                    },
+                    Vec::new(),
+                    false,
+                ));
+            }
             match &operation {
                 crate::device_service::Operation::AccountLifecycle { .. } => {
                     return Err(ProtocolError::new(

@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
+mod allowance;
 mod images;
+mod reset_credit;
 
 /// The Codex configuration key for a thread's reasoning effort. A launch
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
@@ -405,6 +407,8 @@ fn create_inner(
 
 #[derive(Clone)]
 enum Pending {
+    Allowance(allowance::Read),
+    ResetCredit(reset_credit::Redemption),
     LoginRecovery {
         failure: String,
         expected: Option<crate::account::Identity>,
@@ -1546,6 +1550,18 @@ impl Adapter for Codex {
         self.call(&mut step, "initialize", json!({"clientInfo":{"name":"cagents","title":"cagents native chat","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), Pending::Initialize)?;
         Ok(step)
     }
+    fn consume_reset_credit(
+        &mut self,
+        request: crate::account::reset::transport::Consume,
+    ) -> Result<Step, String> {
+        reset_credit::start(self, request)
+    }
+    fn read_allowance(
+        &mut self,
+        request: crate::account::reset::transport::Read,
+    ) -> Result<Step, String> {
+        allowance::start(self, request)
+    }
     fn command(&mut self, command: Command) -> Result<Step, String> {
         let mut step = Step::default();
         if !self.ready {
@@ -1698,6 +1714,12 @@ impl Adapter for Codex {
                 .pending
                 .remove(&id)
                 .ok_or("Codex response has an unknown request ID")?;
+            if let Pending::ResetCredit(request) = pending {
+                return reset_credit::receive(self, request, &frame);
+            }
+            if let Pending::Allowance(request) = pending {
+                return allowance::receive(self, request, &frame);
+            }
             if let Pending::ChildRpc {
                 child: id,
                 original_id,
@@ -1854,6 +1876,10 @@ impl Adapter for Codex {
                 .get("result")
                 .ok_or("Codex RPC response is missing result/error")?;
             match pending {
+                Pending::Allowance(request) => return allowance::receive(self, request, &frame),
+                Pending::ResetCredit(request) => {
+                    return reset_credit::receive(self, request, &frame);
+                }
                 Pending::LoginRecovery {
                     failure,
                     expected,
@@ -2880,9 +2906,20 @@ impl Adapter for Codex {
                         .push(Event::AccountUsage(LiveReport::CodexLimits(update)));
                 }
             }
-            "account/updated" => step.events.push(Event::AccountUsage(LiveReport::CodexLogin(
-                account::codex::parse_login_update(params),
-            ))),
+            "account/updated" => {
+                // A login transition invalidates in-flight reads on this
+                // connection. Keep RPC IDs so their late replies are drained.
+                for pending in self.pending.values_mut() {
+                    match pending {
+                        Pending::Allowance(request) => request.invalidated = true,
+                        Pending::ResetCredit(request) => request.invalidated = true,
+                        _ => {}
+                    }
+                }
+                step.events.push(Event::AccountUsage(LiveReport::CodexLogin(
+                    account::codex::parse_login_update(params),
+                )));
+            }
             "item/reasoning/summaryPartAdded" | "thread/compacted" => {}
             // Auxiliary app-server notifications are not transcript data.
             // Unknown item types are shown as tool disclosures and unknown
@@ -4256,6 +4293,289 @@ mod tests {
             ),
             12000
         );
+    }
+
+    fn reset_request() -> (
+        crate::account::reset::transport::Consume,
+        crossbeam_channel::Receiver<Result<crate::account::reset::transport::Consumed, String>>,
+    ) {
+        let (reply, receiver) = crossbeam_channel::bounded(1);
+        let request = crate::account::reset::transport::Consume::fixture(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            crate::account::reset::ProviderAccount {
+                account_id: "actual-account".into(),
+                backend_origin: "https://chatgpt.com".into(),
+            },
+            reply,
+        );
+        (request, receiver)
+    }
+    fn reset_limits(used: u32, count: u32) -> Value {
+        json!({"accountId":"actual-account","rateLimits":{"primary":{"usedPercent":used,"resetsAt":4000000000u64}},
+            "rateLimitResetCredits":{"availableCount":count,"credits":if count>0 {json!([{"id":"actual-credit","resetType":"codexRateLimits","status":"available"}])} else {json!([])}}})
+    }
+    #[test]
+    fn reset_selected_credit_uses_original_key_once_and_requires_fresh_identity_inventory_readback()
+    {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        adapter.turn = Some("preserved-running-turn".into());
+        let (request, receiver) = reset_request();
+        let key = request.key.clone();
+        let mut step = adapter.consume_reset_credit(request).unwrap();
+        for (method, result) in [
+            ("account/read", allowance_account()),
+            ("account/rateLimits/read", reset_limits(96, 1)),
+            (
+                "account/rateLimitResetCredit/consume",
+                json!({"outcome":"reset"}),
+            ),
+            ("account/read", allowance_account()),
+            ("account/rateLimits/read", reset_limits(0, 0)),
+        ] {
+            assert_eq!(step.writes.len(), 1);
+            assert!(step.events.is_empty());
+            assert_eq!(step.writes[0]["method"], method);
+            if method.ends_with("/consume") {
+                assert_eq!(step.writes[0]["params"]["idempotencyKey"], key);
+                assert_eq!(step.writes[0]["params"]["creditId"], "actual-credit");
+            }
+            assert!(receiver.try_recv().is_err());
+            step = adapter
+                .receive(json!({"id":step.writes[0]["id"],"result":result}))
+                .unwrap();
+        }
+        assert!(step.events.is_empty() && step.writes.is_empty());
+        let verified = receiver
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.outcome, crate::account::reset::Outcome::Reset);
+        assert_eq!(verified.allowance.windows[0].used_percent, 0);
+        assert_eq!(verified.allowance.reset_credits.unwrap().available_count, 0);
+        assert!(adapter.busy);
+        assert_eq!(adapter.turn.as_deref(), Some("preserved-running-turn"));
+    }
+    #[test]
+    fn reset_refuses_changed_account_and_login_transition_before_the_consuming_rpc() {
+        for changed_event in [false, true] {
+            let mut adapter = adapter();
+            let (request, receiver) = reset_request();
+            let first = adapter.consume_reset_credit(request).unwrap();
+            let mut account = allowance_account();
+            if changed_event {
+                adapter
+                    .receive(json!({"method":"account/updated","params":{}}))
+                    .unwrap();
+            } else {
+                account["workspaceRouting"]["chatgptAccountId"] = json!("other-account");
+            }
+            let refused = adapter
+                .receive(json!({"id":first.writes[0]["id"],"result":account}))
+                .unwrap();
+            assert!(refused.events.is_empty() && refused.writes.is_empty());
+            assert!(
+                receiver
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .unwrap()
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn reconciled_monitor_attempt_still_refuses_consumption_after_another_session_reset_shared_usage()
+     {
+        let mut adapter = adapter();
+        let (mut request, receiver) = reset_request();
+        request.reconcile = true;
+        request.condition = Some(crate::account::reset::request::Threshold {
+            used_percent: 90,
+            max_age_ms: 30_000,
+        });
+        let first = adapter.consume_reset_credit(request).unwrap();
+        let second = adapter
+            .receive(json!({"id":first.writes[0]["id"],"result":allowance_account()}))
+            .unwrap();
+        let stopped = adapter
+            .receive(json!({"id":second.writes[0]["id"],"result":reset_limits(0,1)}))
+            .unwrap();
+        assert!(stopped.events.is_empty() && stopped.writes.is_empty());
+        let error = receiver
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap()
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("BelowThreshold")
+                && error.contains("earlier uncertain attempt remains unresolved")
+        );
+    }
+    #[test]
+    fn uncertain_reset_reply_cannot_be_replaced_by_a_second_reset_or_inspection_request() {
+        let mut adapter = adapter();
+        let (request, receiver) = reset_request();
+        let first = adapter.consume_reset_credit(request).unwrap();
+        let second = adapter
+            .receive(json!({"id":first.writes[0]["id"],"result":allowance_account()}))
+            .unwrap();
+        let consume = adapter
+            .receive(json!({"id":second.writes[0]["id"],"result":reset_limits(96,1)}))
+            .unwrap();
+        assert_eq!(
+            consume.writes[0]["method"],
+            "account/rateLimitResetCredit/consume"
+        );
+        drop(receiver); // caller lost its response, actor still owns exact RPC
+        let (retry, _) = reset_request();
+        assert!(
+            adapter
+                .consume_reset_credit(retry)
+                .unwrap_err()
+                .contains("still pending")
+        );
+        let (inspect, _) = allowance_request();
+        assert!(
+            adapter
+                .read_allowance(inspect)
+                .unwrap_err()
+                .contains("already in flight")
+        );
+        assert_eq!(adapter.pending.len(), 1);
+    }
+
+    fn allowance_request() -> (
+        crate::account::reset::transport::Read,
+        crossbeam_channel::Receiver<Result<crate::account::reset::Allowance, String>>,
+    ) {
+        let (reply, receiver) = crossbeam_channel::bounded(1);
+        (
+            crate::account::reset::transport::Read {
+                expires: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                reply,
+            },
+            receiver,
+        )
+    }
+    fn allowance_account() -> Value {
+        json!({"account":{"type":"chatgpt","email":"never-used-for-account-binding@example.invalid"},
+            "workspaceRouting":{"chatgptAccountId":"actual-account","backendOrigin":"https://chatgpt.com"}})
+    }
+    #[test]
+    fn allowance_inspection_reads_actual_connection_identity_and_limits_without_touching_active_turn()
+     {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        adapter.turn = Some("still-running".into());
+        let (request, receiver) = allowance_request();
+        let first = adapter.read_allowance(request).unwrap();
+        assert_eq!(first.writes.len(), 1);
+        assert_eq!(first.writes[0]["method"], "account/read");
+        assert_eq!(first.writes[0]["params"]["refreshToken"], false);
+        assert!(first.events.is_empty());
+        let second = adapter
+            .receive(json!({"id":first.writes[0]["id"],"result":allowance_account()}))
+            .unwrap();
+        assert_eq!(second.writes.len(), 1);
+        assert_eq!(second.writes[0]["method"], "account/rateLimits/read");
+        assert!(receiver.try_recv().is_err());
+        let final_step = adapter.receive(json!({"id":second.writes[0]["id"],"result":{
+            "accountId":"actual-account","rateLimits":{"primary":{"usedPercent":94,"resetsAt":4000000000u64}},
+            "rateLimitResetCredits":{"availableCount":1,"credits":[{"id":"actual-credit","resetType":"codexRateLimits","status":"available"}]}}})).unwrap();
+        let reading = receiver
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reading.account.unwrap().account_id, "actual-account");
+        assert_eq!(reading.windows[0].used_percent, 94);
+        assert_eq!(reading.reset_credits.unwrap().available_count, 1);
+        assert!(final_step.writes.is_empty() && final_step.events.is_empty());
+        assert!(adapter.busy);
+        assert_eq!(adapter.turn.as_deref(), Some("still-running"));
+    }
+    #[test]
+    fn expired_unanswered_allowance_read_keeps_one_rpc_and_never_spends_shared_request_budget() {
+        let mut adapter = adapter();
+        let (request, _) = allowance_request();
+        let first = adapter.read_allowance(request).unwrap();
+        for pending in adapter.pending.values_mut() {
+            if let Pending::Allowance(read) = pending {
+                read.expire_for_test();
+            }
+        }
+        for _ in 0..256 {
+            let (request, _) = allowance_request();
+            assert!(
+                adapter
+                    .read_allowance(request)
+                    .unwrap_err()
+                    .contains("already in flight")
+            );
+        }
+        assert_eq!(adapter.pending.len(), 1);
+        // Late original reply is drained under its exact ID and cannot
+        // advance to another request after the original deadline.
+        let late = adapter
+            .receive(json!({"id":first.writes[0]["id"],"result":allowance_account()}))
+            .unwrap();
+        assert!(late.writes.is_empty() && late.events.is_empty());
+        assert!(adapter.pending.is_empty());
+    }
+    #[test]
+    fn allowance_login_transition_and_unavailable_method_return_only_requester_failure() {
+        for login_transition in [false, true] {
+            let mut adapter = adapter();
+            let (request, receiver) = allowance_request();
+            let first = adapter.read_allowance(request).unwrap();
+            if login_transition {
+                adapter
+                    .receive(json!({"method":"account/updated","params":{"authMode":"chatgpt"}}))
+                    .unwrap();
+            }
+            let step = adapter.receive(if login_transition {
+                json!({"id":first.writes[0]["id"],"result":allowance_account()})
+            } else {
+                json!({"id":first.writes[0]["id"],"error":{"code":-32601,"message":"unsupported"}})
+            }).unwrap();
+            let error = receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .unwrap()
+                .unwrap_err();
+            assert!(error.contains(if login_transition {
+                "login changed"
+            } else {
+                "-32601"
+            }));
+            assert!(step.writes.is_empty() && step.events.is_empty());
+            assert!(adapter.ready && !adapter.busy);
+        }
+    }
+    #[test]
+    fn allowance_deadline_and_identity_mismatch_never_send_further_provider_work() {
+        let mut adapter = adapter();
+        let (mut expired, receiver) = allowance_request();
+        expired.expires = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        assert!(
+            adapter
+                .read_allowance(expired)
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(adapter.pending.is_empty());
+        let (request, receiver) = allowance_request();
+        let first = adapter.read_allowance(request).unwrap();
+        let second = adapter
+            .receive(json!({"id":first.writes[0]["id"],"result":allowance_account()}))
+            .unwrap();
+        let final_step = adapter.receive(json!({"id":second.writes[0]["id"],"result":{"accountId":"another-account","rateLimits":{}}})).unwrap();
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .unwrap()
+                .unwrap_err()
+                .contains("account changed")
+        );
+        assert!(final_step.writes.is_empty() && final_step.events.is_empty());
     }
 
     fn adapter() -> Codex {
