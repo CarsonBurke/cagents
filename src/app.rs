@@ -15112,6 +15112,10 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WindowCloseRequested(window) => {
+                if let Some(reason) = self.discard_ui.close_block_reason() {
+                    self.status = Some(TransientNotice::error(reason));
+                    return Task::none();
+                }
                 // libcosmic reports the closed window through this same
                 // request, and a second close must not reopen the exit.
                 if self.exit.is_some() || self.dirty_repository_close.is_some() {
