@@ -232,3 +232,8 @@ Elvish and PowerShell scripts are available with `completions elvish` and
 Automation definition and history pages accept `--limit` from 1 through 100;
 values outside that range are refused. For definitions, pass the last returned
 UUID as `--after` to request the next page.
+
+Linear collection commands use the same plain tables and explicit empty states.
+Their `--json` payloads retain the original API fields and pagination metadata.
+Human pages indicate when more results are available; use `--after` to continue.
+Comments appear in a single table row; use JSON to preserve Markdown line breaks.
