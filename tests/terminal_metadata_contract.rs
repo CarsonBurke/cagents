@@ -249,6 +249,15 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
         control
             .spawn(session, Default::default())
             .map_err(|e| e.to_string())?;
+        // Spawn subscribes this connection to redraw snapshots. Inventory reads
+        // use a fresh transaction, as the actual CLI does; keep strict reply
+        // correlation and require the same original private daemon proof.
+        let original_proof = control.proof().clone();
+        drop(control);
+        let mut control = ControlClient::connect(&socket).map_err(|e| e.to_string())?;
+        if control.proof() != &original_proof {
+            return Err("private daemon changed between spawn and inventory".into());
+        }
         loop {
             let rows = control.list().map_err(|e| e.to_string())?;
             if rows.iter().any(|row| {
