@@ -2017,3 +2017,6 @@ mod tests {
         );
     }
 }
+
+/// Original-root conditional publication with typed retained cleanup results.
+pub mod retained_save;
