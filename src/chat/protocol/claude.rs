@@ -8464,7 +8464,7 @@ mod tests {
                         json!({"type":"control_request","request_id":"question-b","request":{
                         "subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{
                             "question":"Which B migration should I prepare?","header":"Migration",
-                            "options":[{"label":"Keep","description":"Preserve existing"}],"multiSelect":false}]}}}),
+                            "options":[{"label":"Keep","description":"Preserve existing"},{"label":"Replace","description":"Use the new migration"}],"multiSelect":false}]}}}),
                         ack,
                     ],
                     false,
