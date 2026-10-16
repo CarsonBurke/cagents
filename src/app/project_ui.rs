@@ -2,7 +2,7 @@ use super::*;
 use crate::repository::{CommandSpec, ProcessExecutor, RemovedWorktree, SystemProcessExecutor};
 use crate::{
     github::avatar::{self, OwnerKey},
-    model::WorktreeId,
+    model::{ChannelId, WorktreeId},
     sidebar::ProjectCommand,
 };
 
