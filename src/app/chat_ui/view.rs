@@ -7116,6 +7116,27 @@ mod tests {
             &renderer,
             &layout::Limits::new(iced::Size::ZERO, viewport.size()),
         );
+        // The first presented frame reports both transcripts' geometry.
+        // Establish and validate that lifecycle publication before testing
+        // which composer owns keyboard actions, without allowing unrelated
+        // chat messages through the keyboard assertions below.
+        let mut presented = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Window(iced::window::Event::RedrawRequested(std::time::Instant::now())),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut presented),
+            &viewport,
+        );
+        let reported: Vec<_> = presented.iter().map(|message| match message {
+            Message::ChatUi(Action::Scrolled(target, None, _, false)) => *target,
+            _ => panic!("unexpected initial frame message: {message:?}"),
+        }).collect();
+        assert_eq!(reported.len(), 2);
+        assert!(reported.contains(&first.target) && reported.contains(&second.target));
         for (target, expected) in [
             (sidebar, None),
             (
@@ -7177,7 +7198,7 @@ mod tests {
                         ) => Some(*target) == expected,
                         _ => false,
                     }),
-                    "inactive composers and sidebar fields must not publish another chat action"
+                    "inactive composers and sidebar fields must not publish another chat action: {messages:?}"
                 );
             }
         }

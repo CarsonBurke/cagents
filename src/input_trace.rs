@@ -1291,7 +1291,7 @@ mod tests {
     fn focused_native_overlay_owns_ignored_ime_but_leaves_unowned_input_available() {
         use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
-        for kind in ["button", "read-only", "no-handler", "editable", "unfocused"] {
+        for kind in ["button", "editable-on-focus", "no-handler", "editable", "unfocused"] {
             let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
             let trace = InputTrace::default();
             let raw_id = cosmic::iced::widget::Id::unique();
@@ -1302,7 +1302,9 @@ mod tests {
                 focused: raw_focused.clone(),
             });
             let popup: Element<'_, FocusConflictMessage> = match kind {
-                "read-only" => cosmic::widget::text_input("Overlay", "retained")
+                // Cosmic focus explicitly enables editing, even when the
+                // builder initially requests editing(false).
+                "editable-on-focus" => cosmic::widget::text_input("Overlay", "retained")
                     .id(control.clone())
                     .editing(false)
                     .on_input(FocusConflictMessage::Edited)
@@ -1379,7 +1381,7 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            if kind == "editable" {
+            if matches!(kind, "editable" | "editable-on-focus") {
                 assert_eq!(edited.len(), 1, "{messages:?}");
                 assert_eq!(edited[0].matches("ime").count(), 1);
                 assert_eq!(edited[0].replacen("ime", "", 1), "retained");

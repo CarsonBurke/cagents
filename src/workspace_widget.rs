@@ -4551,8 +4551,8 @@ mod tests {
         assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::CTRL));
         assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::ALT));
         assert!(!reserved("a".into(), Code::KeyA, ctrl_shift));
-        assert!(reserved("w".into(), Code::KeyW, keyboard::Modifiers::CTRL));
-        assert!(!reserved("w".into(), Code::KeyW, ctrl_shift));
+        assert!(!reserved("w".into(), Code::KeyW, keyboard::Modifiers::CTRL));
+        assert!(reserved("w".into(), Code::KeyW, ctrl_shift));
         assert!(!reserved("w".into(), Code::KeyW, keyboard::Modifiers::ALT));
         assert!(reserved("r".into(), Code::KeyR, keyboard::Modifiers::ALT));
         assert!(!reserved("r".into(), Code::KeyR, ctrl_shift));

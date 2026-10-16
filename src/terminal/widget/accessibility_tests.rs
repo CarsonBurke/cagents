@@ -407,6 +407,10 @@ fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_
     old_widget.review_revision = 1;
     new_widget.review_active = true;
     new_widget.review_revision = 1;
+    // Apply the actual widget diff, which retires per-native-batch activation
+    // once the App's logical owner projection has changed.
+    old_tree.diff(&mut old_widget as &mut dyn Widget<Message, Theme, Renderer>);
+    new_tree.diff(&mut new_widget as &mut dyn Widget<Message, Theme, Renderer>);
     dispatch(&mut old_widget, &mut old_tree, &renderer, redraw());
     dispatch(&mut new_widget, &mut new_tree, &renderer, redraw());
     let selection = {

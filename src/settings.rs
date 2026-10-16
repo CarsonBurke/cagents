@@ -4935,8 +4935,10 @@ new_thread = "Alt+Shift+G"
         let bindings: Vec<ShortcutBinding> = file["keyboard_shortcuts"]
             .as_table()
             .unwrap()
-            .values()
-            .flat_map(|chords| chords.as_array().unwrap())
+            .iter()
+            // This metadata stores action IDs, not additional chord bindings.
+            .filter(|(name, _)| name.as_str() != "terminal_passthrough_actions")
+            .flat_map(|(_, chords)| chords.as_array().unwrap())
             .map(|chord| parse_shortcut(chord.as_str().unwrap()).unwrap())
             .collect();
         for (index, binding) in bindings.iter().enumerate() {
