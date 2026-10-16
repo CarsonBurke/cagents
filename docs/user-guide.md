@@ -391,9 +391,12 @@ Agents should read them as context and follow only the user's authorized scope.
 When creating a worktree, enter a branch name, a Linear issue ID such as
 `APP-42`, or an `https://linear.app/.../issue/APP-42/title-slug` URL. URLs use
 the issue ID and title slug without fetching Linear metadata. New worktrees go
-under `worktrees/` in the repository by default; Settings accepts an absolute
+under `.worktrees/` in the repository by default; Settings accepts an absolute
 or repository-relative parent, and the creation dialog accepts an explicit
-destination.
+destination. Creation adds a clone-local Git exclude rule when needed, leaving
+tracked `.gitignore` unchanged. Existing worktrees under `worktrees/` stay in
+place and are excluded on the next creation. An explicitly configured parent
+keeps its location.
 
 Worktree creation is journaled: a versioned request and an exclusive mutation
 identity are recorded before any directory or Git effects, and progress stays

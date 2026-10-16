@@ -146,7 +146,10 @@ use crate::{
 /// Version 78 verifies automatic channel-name refreshes against their shared-view owner.
 /// Version 80 carries opt-in semantic notification context and preview privacy.
 /// Version 95 combines conversation-title refreshes with notification context.
-pub const PROTOCOL_VERSION: u16 = 95;
+/// Version 97 preserves version 78 and appends only DeviceOperation::AccountDefault
+/// with its Automatic/account-ID selection; all prior tags and layouts remain.
+/// Version 98 combines notification context with account-default selection.
+pub const PROTOCOL_VERSION: u16 = 98;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
