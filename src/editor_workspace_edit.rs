@@ -63,7 +63,15 @@ pub fn resolve_targets(worktree: PathBuf, documents: Vec<DocumentEdits>, open_pa
     if documents.len() > 512 { return Err("This workspace edit exceeds the 512-file preview limit".into()); }
     let worktree = std::fs::canonicalize(worktree).map_err(|error| error.to_string())?;
     let root = Arc::new(fs_safety::Root::open(&worktree).map_err(|error| error.to_string())?);
+    resolve_targets_at(root, documents, open_paths)
+}
+
+/// Production requests retain the exact root that supplied their open buffer.
+/// A successor directory at the same pathname cannot prepare an A-buffer edit.
+pub fn resolve_targets_at(root: Arc<fs_safety::Root>, documents: Vec<DocumentEdits>, open_paths: Vec<PathBuf>) -> Result<ResolvedTargets, String> {
+    if documents.len() > 512 { return Err("This workspace edit exceeds the 512-file preview limit".into()); }
     verify_root(&root)?;
+    let worktree = root.path().to_owned();
     let mut targets = std::collections::HashSet::new();
     for document in &documents {
         let path = if document.path.is_absolute() { document.path.clone() } else { worktree.join(&document.path) };

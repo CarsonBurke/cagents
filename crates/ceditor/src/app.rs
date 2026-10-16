@@ -47,6 +47,7 @@ const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 mod checkout;
 mod notification_ui;
 mod operation_recovery_ui;
+mod editor_feature_ui;
 
 #[derive(Clone)]
 pub struct Flags {
@@ -208,6 +209,7 @@ pub enum Message {
     SettingsSaved(Result<(), String>),
     FileRevealed(Result<cagents::file_manager::RevealOutcome, String>),
     Lsp(u64, Option<LspEvent>),
+    EditorFeatures(cagents::editor_features::Action),
     OperationRecovery(cagents::operation_recovery::Action),
     Complete,
     Hover,
@@ -507,6 +509,7 @@ pub struct Editor {
     exiting: bool,
     window_focused: bool,
     lsp: LspManager,
+    editor_features: cagents::editor_features::State,
     language_server_assistance: bool,
     next_document: u64,
     operation_recovery: cagents::operation_recovery::Shared,
@@ -1022,6 +1025,10 @@ impl Editor {
     }
 
     fn modal_open(&self) -> bool {
+        self.editor_features.dialog_open() || self.external_feature_modal()
+    }
+
+    fn external_feature_modal(&self) -> bool {
         self.settings_open
             || self.quick_open
             || self.closing.is_some()
@@ -2012,6 +2019,7 @@ impl Editor {
                 LspIntent::Close => self.close_document(id),
             }
         }
+        self.refresh_editor_feature_support();
         Task::batch([autosave, working_diff])
     }
 
@@ -2123,7 +2131,8 @@ impl Editor {
             }
             // Re-enabling assistance waits for these outgoing processes before
             // launching replacements under a new admission cap.
-            let predecessor = self.lsp.begin_shutdown();
+            self.editor_features.cancel_all(&mut self.lsp);
+        let predecessor = self.lsp.begin_shutdown();
             self.lsp = LspManager::new(self.settings.language_servers.clone())
                 .with_lifecycle(
                     self.settings.lsp_idle_timeout_seconds,
@@ -3007,6 +3016,7 @@ impl Application for Editor {
             exiting: false,
             window_focused: false,
             lsp,
+            editor_features: Default::default(),
             language_server_assistance,
             next_document: 1,
             operation_recovery: Default::default(),
@@ -3140,6 +3150,7 @@ impl Application for Editor {
                 if self.quick_open {
                     return self.update(Message::CloseQuickOpen);
                 }
+                if let Some(action) = self.editor_features.escape().filter(|_| !self.external_feature_modal()) { return self.update_editor_features(action); }
                 if self.find_open {
                     return self.update(Message::CloseFind);
                 }
@@ -3347,6 +3358,7 @@ impl Application for Editor {
                 }
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
+                    self.editor_features.cancel_all(&mut self.lsp);
                     if self.operation_recovery_pending() { self.notice = Some("Finish or resolve retained file operations before closing this window.".into()); return Task::none(); }
 
                     if self
@@ -3448,6 +3460,9 @@ impl Application for Editor {
                 }
                 Message::Repository(action) => {
                     self.retain_repository_operation(&action);
+                    if let RepositoryAction::Language { card, action } = &action
+                        && let Some(action) = cagents::editor_features::language_action(*card, action) { return self.update_editor_features(action); }
+                    if let Some(format) = self.editor_format_before_save(&action) { return self.update_editor_features(format); }
                     if matches!(&action, RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. })
                         && !self.prepare_editor_save(action.card()) { return Task::none(); }
 
@@ -3556,6 +3571,9 @@ impl Application for Editor {
                         };
                         return Self::open_external_link(uri);
                     }
+                    let signature_character = match &action {
+                        RepositoryAction::EditorAction { action: EditorAction::Edit(EditorEdit::Insert(character)), .. } => Some(*character), _ => None,
+                    };
                     let find_preferences_changed = matches!(
                         &action,
                         RepositoryAction::FindOptionsChanged { .. }
@@ -3660,6 +3678,12 @@ impl Application for Editor {
                             }
                             tasks.push(self.refresh_snapshot(id, true));
                         }
+                    }
+                    if let Some(character) = signature_character
+                        && let Some(tab) = self.tab(id)
+                        && let Some(doc) = tab.runtime.lsp_document()
+                        && character != ')' && (tab.runtime.signature_visible() || self.lsp.signature_trigger(doc, character)) {
+                        tasks.push(self.update_editor_features(cagents::editor_features::Action::Signature { card: id, trigger: Some(character.to_string()) }));
                     }
                     Task::batch(tasks)
                 }
@@ -4397,11 +4421,13 @@ impl Application for Editor {
                     }
                     self.close_notices()
                 }
+                Message::EditorFeatures(action) => self.update_editor_features(action),
                 Message::Lsp(generation, event) => {
                     if generation != self.lsp.generation() {
                         return Task::none();
                     }
                     if let Some(event) = event {
+                        if self.editor_features.consumes(&event) { return Task::batch([self.update_editor_features(cagents::editor_features::Action::Event(event)), self.lsp_next()]); }
                         if let LspEvent::RootDiscovered { doc, ticket, root } = event {
                             if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
                                 && let Some(error) = language_server_failure(status)
@@ -4425,6 +4451,9 @@ impl Application for Editor {
                             | LspEvent::Progress { doc, .. }
                             | LspEvent::RequestFailed { doc, .. }
                             | LspEvent::DocumentDesynced { doc, .. } => *doc,
+                            LspEvent::PrepareRename { .. } | LspEvent::WorkspaceEdit { .. } | LspEvent::CodeActions { .. }
+                            | LspEvent::CodeActionResolved { .. } | LspEvent::SignatureHelp { .. } | LspEvent::ServerMessage { .. }
+                            | LspEvent::ApplyWorkspaceEdit { .. } | LspEvent::CommandExecuted { .. } => unreachable!("feature events route through their controller"),
                         };
                         let current_version = self.lsp.document_version(doc);
                         if let Some(tab) = self
@@ -4459,6 +4488,7 @@ impl Application for Editor {
                                 _ => {}
                             }
                         }
+                        self.refresh_editor_feature_support();
                         self.lsp_next()
                     } else {
                         Task::none()
@@ -4967,6 +4997,9 @@ impl Application for Editor {
                 dialog_surface(widget::column::with_children(content).spacing(12), 480.0),
                 Message::CancelFileOperation,
             ));
+        }
+        if let Some(content) = self.editor_features.view() {
+            return Some(dialog_overlay(dialog_surface(content.map(Message::EditorFeatures), 1000.0), Message::EditorFeatures(self.editor_features.escape()?)));
         }
         if let Some(id) = self.closing {
             let tab = self.tab(id)?;
@@ -6003,6 +6036,7 @@ mod tests {
             exiting: false,
             window_focused: false,
             lsp: LspManager::new(Vec::new()),
+            editor_features: Default::default(),
             language_server_assistance: false,
             next_document: 1,
             operation_recovery: Default::default(),

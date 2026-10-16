@@ -2435,9 +2435,10 @@ impl RepositoryRuntime {
         self.clear_resolved_operation_recovery();
         self.auto_save_task(card)
     }
-    pub fn retire_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) {
+    pub fn retire_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) -> bool {
         if ticket == self.next_auto_save_ticket && self.accepts_selected(identity)
-            && self.auto_save_pending == Some((identity.generation, revision)) { self.auto_save_pending = None; }
+            && self.auto_save_pending == Some((identity.generation, revision)) && self.auto_save_revision() == Some(revision) { self.auto_save_pending = None; return true; }
+        false
     }
 
     /// Hides workbench launch controls in an independent editor window.
@@ -3298,12 +3299,18 @@ impl RepositoryRuntime {
         Some(document.content.range_change(start, end, "")?.removed)
     }
     pub(crate) fn editor_diagnostics(&self) -> &[crate::lsp::LspDiagnostic] { &self.language.diagnostics }
+    pub(crate) fn editor_feature_writable(&self) -> bool {
+        self.original_read_attested && !self.has_editor_recovery()
+            && matches!(&self.document, DocumentState::Editable(document) if document.active_save.is_none() && document.lsp_version < i32::MAX)
+    }
     pub fn set_editor_feature_support(&mut self, capabilities: &crate::lsp::LspCapabilities) {
+        if !self.editor_feature_writable() { self.language.feature_support = [false; 5]; return; }
         self.language.feature_support = [capabilities.ready && capabilities.rename, capabilities.ready && capabilities.format_document, capabilities.ready && capabilities.format_selection, capabilities.ready && capabilities.code_actions, capabilities.ready && capabilities.signature_help];
     }
     pub(crate) fn set_editor_signature(&mut self, help: Option<crate::lsp::LspSignatureHelp>) {
         self.language.signature = help.filter(|help| help.signatures.get(help.active_signature).is_some());
     }
+    pub fn signature_visible(&self) -> bool { self.language.signature.is_some() }
     pub(crate) fn editor_signature(&self) -> Option<&crate::lsp::LspSignatureHelp> { self.language.signature.as_ref() }
     pub(crate) fn set_workspace_preview(&mut self, path: PathBuf, model: DiffModel) {
         self.files = FileListState::Ready(Vec::new());
@@ -3412,6 +3419,10 @@ impl RepositoryRuntime {
     }
 
     pub fn dismiss_editor_results(&mut self) {
+        self.language.signature = None;
+        self.dismiss_editor_completion_and_hover();
+    }
+    pub fn dismiss_editor_completion_and_hover(&mut self) {
         self.language.completions.clear();
         self.language.hover.clear();
         self.language.hover_diagnostic = None;
@@ -6119,7 +6130,11 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 if !matches!(action, text_editor::Action::Scroll { .. }) {
+                    let signature = self.language.signature.take();
                     self.dismiss_editor_results();
+                    // Retrigger against the new snapshot after the shell has
+                    // drained this edit. A closer or a caret move dismisses it.
+                    if matches!(&action, text_editor::Action::Edit(text_editor::Edit::Insert(character)) if *character != ')') { self.language.signature = signature; }
                 }
                 let moved = !matches!(
                     action,
@@ -8404,6 +8419,10 @@ enum EditorMenuCommand {
     Undo(CardId),
     Redo(CardId),
     Clipboard(CardId, ClipboardOp),
+    Rename(CardId),
+    Format(CardId, bool),
+    CodeActions(CardId),
+    Signature(CardId),
 }
 
 impl widget::menu::Action for EditorMenuCommand {
@@ -8414,6 +8433,10 @@ impl widget::menu::Action for EditorMenuCommand {
             Self::Undo(card) => RepositoryAction::Undo { card },
             Self::Redo(card) => RepositoryAction::Redo { card },
             Self::Clipboard(card, op) => RepositoryAction::Clipboard { card, op },
+            Self::Rename(card) => RepositoryAction::Language { card, action: EditorLspAction::Rename },
+            Self::Format(card, selection) => RepositoryAction::Language { card, action: EditorLspAction::Format { selection } },
+            Self::CodeActions(card) => RepositoryAction::Language { card, action: EditorLspAction::CodeActions },
+            Self::Signature(card) => RepositoryAction::Language { card, action: EditorLspAction::Signature },
         }
     }
 }
@@ -8423,6 +8446,7 @@ impl widget::menu::Action for EditorMenuCommand {
 fn editor_context_menu(
     card: CardId,
     document: &EditorDocument,
+    support: [bool; 5],
 ) -> Vec<widget::menu::Tree<RepositoryAction>> {
     use widget::menu::{Item, KeyBind, key_bind::Modifier};
     let chord = |modifiers: &[Modifier], key: &str| KeyBind {
@@ -8431,6 +8455,11 @@ fn editor_context_menu(
     };
     let ctrl = [Modifier::Ctrl];
     let entries = [
+        ("Rename symbol", EditorMenuCommand::Rename(card), KeyBind { modifiers: vec![], key: iced::keyboard::Key::Named(iced::keyboard::key::Named::F2) }, support[0]),
+        ("Format document", EditorMenuCommand::Format(card, false), chord(&[Modifier::Shift, Modifier::Alt], "f"), support[1]),
+        ("Format selection", EditorMenuCommand::Format(card, true), chord(&[Modifier::Ctrl, Modifier::Alt], "f"), support[2] && document.content.cursor().selection.is_some()),
+        ("Code actions", EditorMenuCommand::CodeActions(card), chord(&ctrl, "."), support[3]),
+        ("Signature help", EditorMenuCommand::Signature(card), chord(&[Modifier::Ctrl, Modifier::Shift], " "), support[4]),
         (
             "Undo",
             EditorMenuCommand::Undo(card),
@@ -9622,7 +9651,12 @@ fn editable_document_view<'a>(
                 ) {
                     return text_editor::default_bindings(press);
                 }
+                let support = runtime.language.feature_support;
                 let action = match &press.key {
+                    Key::Named(Named::F2) if press.modifiers.is_empty() => Some(EditorLspAction::Rename),
+                    Key::Character(character) if character.eq_ignore_ascii_case("f") && press.modifiers.shift() && press.modifiers.alt() && !press.modifiers.control() && !press.modifiers.logo() && support[1] => Some(EditorLspAction::Format { selection: false }),
+                    Key::Character(character) if character.as_str() == "." && press.modifiers.command() && !press.modifiers.shift() && !press.modifiers.alt() && support[3] => Some(EditorLspAction::CodeActions),
+                    Key::Character(character) if character.as_str() == " " && press.modifiers.command() && press.modifiers.shift() && support[4] => Some(EditorLspAction::Signature),
                     Key::Character(character)
                         if character.as_str() == " " && press.modifiers.command() =>
                     {
@@ -9643,7 +9677,7 @@ fn editable_document_view<'a>(
                     Key::Named(Named::Escape)
                         if !runtime.language.completions.is_empty()
                             || !runtime.language.hover.is_empty()
-                            || runtime.language.hover_diagnostic.is_some() =>
+                            || runtime.language.hover_diagnostic.is_some() || runtime.language.signature.is_some() =>
                     {
                         Some(EditorLspAction::Dismiss)
                     }
@@ -9672,9 +9706,19 @@ fn editable_document_view<'a>(
             });
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
-        crate::interaction::context_menu(editor, editor_context_menu(card, document))
+        crate::interaction::context_menu(editor, editor_context_menu(card, document, runtime.language.feature_support))
     };
     // Keep the named editor in the same slot when save warnings appear.
+    if runtime.language.feature_support[3] && !runtime.language.diagnostics.is_empty() {
+        error_rows.push(widget::button::text("Code actions · Ctrl+.").on_press(RepositoryAction::Language { card, action: EditorLspAction::CodeActions }).into());
+    }
+    if let Some(help) = &runtime.language.signature && let Some(signature) = help.signatures.get(help.active_signature) {
+        let label = signature.label.chars().take(4096).collect::<String>();
+        error_rows.push(crate::design::body(label).into());
+        if let Some(parameter) = signature.active_parameter.or(help.active_parameter).and_then(|index| signature.parameters.get(index)) {
+            error_rows.push(crate::design::caption(parameter.label.chars().take(4096).collect::<String>()).into());
+        }
+    }
     let error_slot = widget::column::with_children(error_rows).width(Length::Fill);
     widget::column::with_children([error_slot.into(), content])
         .height(Length::Fill)
