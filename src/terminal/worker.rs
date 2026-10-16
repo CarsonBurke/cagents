@@ -1937,6 +1937,7 @@ impl Worker {
     fn run_to_completion(mut self) -> WorkerCompletion {
         // An adopted terminal's title, set by drawing its screen again.
         self.drain_effects();
+        self.publish_fallback_title();
         if self.visibility == Visibility::Visible {
             self.publish_snapshot(true);
         }
@@ -2829,6 +2830,7 @@ impl Worker {
                     let path = working_directory_path(raw, local_host_name());
                     if let Some(path) = path {
                         self.emit(TerminalEvent::WorkingDirectoryChanged(path));
+                        self.publish_fallback_title();
                     }
                 }
                 Effect::Title(title) => {
@@ -2884,6 +2886,27 @@ impl Worker {
                     }
                 }
             }
+        }
+    }
+
+    /// OSC titles win. Shells that do not publish one still expose the
+    /// foreground command through the PTY owner's existing observation timer.
+    fn publish_fallback_title(&mut self) {
+        if self
+            .terminal
+            .title()
+            .is_ok_and(|title| !title.trim().is_empty())
+        {
+            return;
+        }
+        let group = self.foreground_group();
+        let title = foreground_process_title(group, &self.launch);
+        if self.foreground_group() != group {
+            return;
+        }
+        if title != self.display_title {
+            self.display_title = title.clone();
+            self.emit(TerminalEvent::TitleChanged(title));
         }
     }
 
@@ -3044,6 +3067,7 @@ impl Worker {
             self.foreground_poll = (self.foreground_poll * 2).min(FOREGROUND_POLL_MAX);
         }
         self.refresh_resume_hint(true);
+        self.publish_fallback_title();
         if self.visibility != Visibility::Visible {
             self.foreground_poll = FOREGROUND_POLL_MAX;
         }
@@ -3122,6 +3146,42 @@ impl Worker {
         self.set_agent_activity(None);
         self.emit(TerminalEvent::Error { operation, message });
     }
+}
+
+fn foreground_process_title(group: Option<libc::pid_t>, launch: &LaunchRecipe) -> String {
+    #[cfg(target_os = "linux")]
+    let (process, directory) = match group.filter(|group| *group > 0) {
+        Some(group) => {
+            // The group comes from this PTY's tcgetpgrp. Two bounded reads
+            // avoid a process-tree scan for ordinary shells.
+            let process = std::fs::read_to_string(format!("/proc/{group}/comm"))
+                .ok()
+                .and_then(|name| crate::names::normalize_card_name(name.trim()));
+            (
+                process,
+                std::fs::read_link(format!("/proc/{group}/cwd")).ok(),
+            )
+        }
+        None => (None, None),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (process, directory): (Option<String>, Option<PathBuf>) = {
+        let _ = group;
+        (None, None)
+    };
+    let process = process.unwrap_or_else(|| {
+        std::path::Path::new(&launch.program)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    });
+    let directory = directory.as_deref().unwrap_or(&launch.working_directory);
+    let basename = directory
+        .file_name()
+        .unwrap_or(directory.as_os_str())
+        .to_string_lossy();
+    format!("{process} · {basename}")
 }
 
 fn canonical_agent_title(title: &str, activity: Option<crate::agent::Activity>) -> String {
@@ -4054,6 +4114,37 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn fallback_process_title_uses_launch_when_foreground_is_unavailable() {
+        let mut launch = LaunchRecipe::shell(PathBuf::from("/repo/alpha")).unwrap();
+        launch.program = "/usr/bin/fish".into();
+        assert_eq!(
+            super::foreground_process_title(None, &launch),
+            "fish · alpha"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_process_title_tracks_foreground_process_directory() {
+        use std::os::unix::process::CommandExt;
+        let directory = tempfile::tempdir().unwrap();
+        let foreground_directory = directory.path().join("alpha");
+        std::fs::create_dir(&foreground_directory).unwrap();
+        let mut launch = LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        launch.program = "/bin/false".into();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .current_dir(&foreground_directory)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let title = super::foreground_process_title(Some(child.id() as libc::pid_t), &launch);
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert_eq!(title, "sleep · alpha");
+    }
 
     #[test]
     fn a_second_search_window_cannot_cancel_the_first_windows_query() {
