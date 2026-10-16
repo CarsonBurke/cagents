@@ -76,6 +76,7 @@ fn settled_setup_journal(operation: &PendingOperation) -> Result<WorktreeJournal
         || !journal.effects_started
         || ValidatedBranchName::parse(journal.request.branch.as_str()).is_err()
         || journal.request.base.validate().is_err()
+        || !journal.valid_pr_checkout_evidence()
     {
         return Err(invalid());
     }
@@ -95,6 +96,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Ok(None);
         };
         let journal = settled_setup_journal(&operation)?;
+        self.validate_created_pr_checkout(&journal)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
         Ok(Some(journal.report(operation.created_at_unix_ms)))
     }
 
@@ -114,6 +117,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 StoreError::InvalidState(format!("worktree creation {creation_id} is missing"))
             })?;
         let mut journal = settled_setup_journal(&operation)?;
+        self.validate_created_pr_checkout(&journal)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
         if journal.request.setup_intent.as_ref() != expected {
             return Err(StoreError::InvalidState(format!(
                 "stale setup intent for worktree creation {creation_id}"
@@ -156,6 +161,7 @@ mod tests {
             checkout_completed: true,
             base_oid: Some("a".repeat(40)),
             existing_branch_oid: None,
+            pr_checkout: None,
             admin_dir: Some(common_dir.join("worktrees/topic")),
             outcome: Some(WorktreeCreationOutcome::Created {
                 worktree: WorktreeRecord {

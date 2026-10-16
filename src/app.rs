@@ -26,6 +26,7 @@ mod history_ui;
 mod latency_ui;
 mod notification_ui;
 mod palette_ui;
+mod pr_checkout_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
@@ -2673,17 +2674,21 @@ fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
 fn completion_navigates(message: &Message) -> bool {
     matches!(
         message,
-        Message::RepositoryLoaded {
-            open_cards: true,
-            result: Ok(_),
-            ..
-        } | Message::WorktreeCreated {
-            result: Ok(WorktreeCreationOutcome::Created { .. }),
-            ..
-        } | Message::PullRequestCreated {
-            result: Ok(PullRequestCreationOutcome::Created { .. }),
-            ..
-        }
+        Message::PullRequestCheckoutReady { .. }
+            | Message::RepositoryLoaded {
+                open_cards: true,
+                result: Ok(_),
+                ..
+            }
+            | Message::PrWorktreeCreated { .. }
+            | Message::WorktreeCreated {
+                result: Ok(WorktreeCreationOutcome::Created { .. }),
+                ..
+            }
+            | Message::PullRequestCreated {
+                result: Ok(PullRequestCreationOutcome::Created { .. }),
+                ..
+            }
     )
 }
 
@@ -4275,6 +4280,11 @@ pub enum Message {
         result: Result<crate::repository::WorktreeOperationReport, String>,
     },
     WorktreeOperationsRehydrated(Result<Vec<crate::repository::WorktreeOperationReport>, String>),
+    PrWorktreeCreated {
+        origin: pr_checkout_ui::PrCheckoutOrigin,
+        repository: PathBuf,
+        outcome: WorktreeCreationOutcome,
+    },
     WorktreeCreated {
         project_id: ProjectId,
         repository: PathBuf,
@@ -4329,6 +4339,13 @@ pub enum Message {
     },
     ProjectUi(project_ui::Action),
     PullRequestUi(pull_request_ui::Action),
+    PullRequestCheckoutReady {
+        card: CardId,
+        project: ProjectId,
+        generation: u64,
+        target: pull_request_review::CheckoutTarget,
+        result: Result<pull_request_review::checkout::PreparedCheckout, String>,
+    },
     PullRequestReview {
         card: CardId,
         action: pull_request_review::Action,
@@ -6563,6 +6580,7 @@ impl Cagents {
         let mut selection: Option<Option<u64>> = dismissed_pending.then_some(None);
         let mut links = Vec::new();
         let mut checkout = None;
+        let mut checkout_open = None;
         for effect in pane.review.take_effects() {
             match effect {
                 pull_request_review::Effect::OpenFile {
@@ -6597,6 +6615,7 @@ impl Cagents {
                         .project(&self.sidebar_model)
                         .map(|project| (project, target));
                 }
+                pull_request_review::Effect::OpenCheckout(path) => checkout_open = Some(path),
                 pull_request_review::Effect::SelectionChanged(number) => {
                     selection = Some(number);
                 }
@@ -6613,17 +6632,14 @@ impl Cagents {
         for url in links {
             tasks.push(self.open_clicked_link(url));
         }
-        if let Some((project_id, target)) = checkout {
-            tasks.push(self.open_worktree_dialog(
-                project_id,
-                target.repository.clone(),
-                WorktreeDraft {
-                    base: target.head.as_str().to_owned(),
-                    ..WorktreeDraft::branch(target.suggested_branch())
-                },
-                None,
-            ));
+        if let Some(path) = checkout_open {
+            tasks.push(self.select_worktree(path, false));
         }
+        if let Some((project, target)) = checkout {
+            tasks.push(self.prepare_pr_checkout(card, project, target));
+        }
+        self.cancel_stale_pr_creations();
+        tasks.push(self.complete_closed_projects());
         Task::batch(tasks)
     }
 
@@ -8317,6 +8333,7 @@ impl Cagents {
         // Every focus move converges here, including tab cycling and closing a
         // pane. Also revoke ownership when the terminal runtime is replaced.
         self.reconcile_terminal_review_owner();
+        self.cancel_stale_pr_creations();
         let focus_changed = self.durable.focused != focused;
         let exposure_changed = exposure_update_pending(&self.durable, &update.transitions);
         if focus_changed || exposure_changed {
@@ -13407,6 +13424,7 @@ impl Application for Cagents {
         #[rustfmt::skip]
         let task = (|| {
         self.reconcile_terminal_review_owner();
+        self.cancel_stale_pr_creations();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
         }
@@ -15765,6 +15783,28 @@ impl Application for Cagents {
                 self.restore_worktree_operations(result)
             }
             Message::SubmitWorktree => self.submit_worktree_dialog(),
+            Message::PrWorktreeCreated {
+                origin,
+                repository,
+                outcome,
+            } => {
+                if !self.pr_creation_origin_is_current(&origin) {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "The PR checkout was created after its owning review changed. Its journal result is retained; inspect {} before opening.",
+                        match &outcome {
+                            WorktreeCreationOutcome::Created { worktree, .. } =>
+                                worktree.path.display().to_string(),
+                            _ => repository.display().to_string(),
+                        }
+                    )));
+                    return Task::none();
+                }
+                self.update(Message::WorktreeCreated {
+                    project_id: origin.project,
+                    repository,
+                    result: Ok(outcome),
+                })
+            }
             Message::WorktreeCreated {
                 project_id,
                 repository,
@@ -16370,6 +16410,13 @@ impl Application for Cagents {
             }
             Message::ProjectUi(action) => self.handle_project_action(action),
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
+            Message::PullRequestCheckoutReady {
+                card,
+                project,
+                generation,
+                target,
+                result,
+            } => self.pr_checkout_ready(card, project, generation, target, result),
             Message::PullRequestReview { card, action } => {
                 self.handle_pull_request_review(card, action)
             }
@@ -19041,6 +19088,163 @@ mod tests {
         let _ = app.update(Message::WindowCloseRequested(window));
         assert!(app.dirty_repository_close.is_none());
         assert_eq!(app.exit, closing);
+    }
+
+    #[test]
+    fn prepared_pr_checkout_rechecks_original_branch_source_and_update_admission() {
+        for changed in ["none", "branch", "source", "update"] {
+            let (mut app, project) = pull_request_test_app(&[]);
+            let (card, task) = app.add_pull_requests_card("/repo".into());
+            drop(task);
+            let mut loaded = crate::pull_request_review::tests::loaded(Vec::new(), Vec::new());
+            loaded.pull_request.head_repository =
+                Some(crate::github::GitHubHeadRepository { name: "r".into() });
+            loaded.pull_request.head_repository_owner = Some(crate::github::GitHubActor {
+                login: "o".into(),
+                name: None,
+                is_bot: false,
+            });
+            let mut review = crate::pull_request_review::tests::target(1);
+            review.pull_request = Arc::new(loaded.pull_request.clone());
+            let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+                panic!("review card")
+            };
+            drop(
+                pane.review
+                    .update(pull_request_review::Action::Open(review)),
+            );
+            let generation = pane.review.selection_generation();
+            drop(pane.review.update(pull_request_review::Action::Loaded {
+                generation,
+                load: 1,
+                result: Ok(Arc::new(loaded.clone())),
+            }));
+            drop(pane.review.take_effects());
+            drop(pane.review.update(pull_request_review::Action::Checkout));
+            let effects = pane.review.take_effects();
+            let [pull_request_review::Effect::Checkout(target)] = effects.as_slice() else {
+                panic!("checkout effect")
+            };
+            let target = target.clone();
+            assert_eq!(target.head_ref_name, "feature");
+            assert_eq!(target.head_repository.as_ref().unwrap().owner, "o");
+            if changed == "branch" {
+                loaded.pull_request.head_ref_name = "renamed".into();
+            }
+            if changed == "source" {
+                loaded
+                    .pull_request
+                    .head_repository_owner
+                    .as_mut()
+                    .unwrap()
+                    .login = "other".into();
+            }
+            drop(pane.review.update(pull_request_review::Action::Loaded {
+                generation,
+                load: 1,
+                result: Ok(Arc::new(loaded)),
+            }));
+            // Only forge preparation is substituted. Deliver the original
+            // completed message through the actual App guard and dialog path.
+            let mut prepared = pull_request_review::checkout::prepare(
+                &pull_request_review::CheckoutTarget::read_only(
+                    target.repository.clone(),
+                    target.number,
+                    target.head.clone(),
+                ),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            prepared.branch_input = "origin/feature".into();
+            prepared.base.clear();
+            prepared.creation_consent = Some(
+                crate::repository::PrWorktreeCreationConsent::new(
+                    target.head_repository.clone().unwrap(),
+                    crate::repository::ValidatedBranchName::parse(&target.head_ref_name).unwrap(),
+                    target.head.clone(),
+                    "origin".into(),
+                    true,
+                )
+                .unwrap(),
+            );
+            app.update_prepared = changed == "update";
+            drop(app.update(Message::PullRequestCheckoutReady {
+                card,
+                project,
+                generation,
+                target,
+                result: Ok(prepared),
+            }));
+            assert_eq!(
+                app.worktree_dialog.is_some(),
+                changed == "none",
+                "{changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_pull_request_checkout_fences_actual_window_close_and_update_dispatch() {
+        let mut app = context_inspector_test_app(false);
+        let (card, task) = app.add_pull_requests_card("/fixture".into());
+        drop(task);
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+            panic!("review card")
+        };
+        let ticket = pane.review.fixture_existing_checkout_pending();
+        let generation = pane.review.selection_generation();
+        for message in [Message::CloseCard(card), Message::CloseCardUnasked(card)] {
+            app.notices.clear();
+            drop(app.update(message));
+            assert!(app.cards.contains_key(&card));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.workspace.pending_close().is_none());
+            assert!(
+                app.notices
+                    .recent()
+                    .any(|entry| entry.notice.message.contains("checkout reconciliation"))
+            );
+        }
+        app.workspace.request_close(card).unwrap();
+        drop(app.update(Message::CommitClose(card)));
+        assert!(app.cards.contains_key(&card));
+        assert!(
+            app.workspace.pending_close().is_none(),
+            "a new accepted operation must retire an earlier close reservation without removing the card"
+        );
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        assert!(
+            app.window_update_blocker()
+                .unwrap()
+                .contains("checkout reconciliation")
+        );
+        drop(app.update_update_ui(update_ui::Action::StartApply));
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("checkout reconciliation")
+        );
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert!(app.exit.is_none());
+        assert_eq!(app.core.main_window_id(), Some(window));
+        assert_eq!(app.transient_work_close, Some(window));
+        assert!(app.cards.contains_key(&card));
+        drop(app.update(Message::CancelTransientWorkClose));
+        drop(app.update(Message::PullRequestReview {
+            card,
+            action: pull_request_review::Action::ExistingCheckout(
+                pull_request_review::checkout_ui::Action::Finished {
+                    generation,
+                    ticket,
+                    result: Err("Reconciliation refused; checkout preserved.".into()),
+                },
+            ),
+        }));
+        assert!(app.window_close_transient_blocker().is_none());
+        assert!(app.window_update_blocker().is_none());
     }
 
     #[test]
