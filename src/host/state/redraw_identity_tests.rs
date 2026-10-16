@@ -17,7 +17,10 @@ pub(super) fn session(id: TerminalId) -> TerminalSession {
     TerminalSession {
         id,
         launch: recipe.clone(),
-        continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None },
+        continuity: TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
         owned_codex_listener: None,
         transcript_path: None,
         resume_hint: None,
@@ -41,7 +44,10 @@ fn stream(shared: &SharedHost, id: TerminalId) -> (RenderStreamFixture, Arc<Term
         worker: OnceLock::new(),
     });
     let wake = Arc::clone(&redraw);
-    (RenderStreamFixture::new(move |edge| wake.publish(edge.generation)), redraw)
+    (
+        RenderStreamFixture::new(move |edge| wake.publish(edge.generation)),
+        redraw,
+    )
 }
 
 struct ReleaseOnDrop(crossbeam_channel::Sender<()>);
@@ -63,7 +69,9 @@ fn held_old_completion_and_wake_cannot_advance_or_hide_a_same_id_successor() {
             let mut state = shared.lock().unwrap();
             let delivery = state.register_client(1);
             state.reserve_spawn(id).unwrap();
-            state.finish_spawn(1, session(id), old.handle.clone(), true).unwrap();
+            state
+                .finish_spawn(1, session(id), old.handle.clone(), true)
+                .unwrap();
             delivery
         };
         let (entered, at_cut) = crossbeam_channel::bounded(1);
@@ -86,37 +94,60 @@ fn held_old_completion_and_wake_cannot_advance_or_hide_a_same_id_successor() {
             }
         });
         old.emit(TerminalEvent::Completed {
-            exit_code: 0, signal: None, intentional: false,
+            exit_code: 0,
+            signal: None,
+            intentional: false,
         });
         at_cut.recv_timeout(Duration::from_secs(2)).unwrap();
 
         let (successor, successor_redraw) = stream(&shared, id);
         successor.publish(1);
-        assert!(successor_redraw.worker.set(successor.handle.downgrade()).is_ok());
+        assert!(
+            successor_redraw
+                .worker
+                .set(successor.handle.downgrade())
+                .is_ok()
+        );
         {
             let mut state = shared.lock().unwrap();
             let retired = state.retire_terminal(id).unwrap();
             assert!(retired.handle.same_worker(&old.handle));
             state.reserve_spawn(id).unwrap();
-            state.finish_spawn(1, session(id), successor.handle.clone(), visible).unwrap();
+            state
+                .finish_spawn(1, session(id), successor.handle.clone(), visible)
+                .unwrap();
             assert!(!state.terminals[&id].handle.same_worker(&old.handle));
             assert!(!state.subscriptions.viewports.contains_key(&(1, id)));
         }
         let commands = successor.queued_commands();
         drop(release);
-        assert!(done.recv_timeout(Duration::from_secs(2)).unwrap(), "cut timed out");
+        assert!(
+            done.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "cut timed out"
+        );
         old.publish(101); // Exercise the initial wake path too, with a live old Handle.
         {
             let state = shared.lock().unwrap();
             assert!(!state.subscriptions.viewports.contains_key(&(1, id)));
             assert_eq!(state.terminals[&id].event_sequence, 0);
         }
-        assert_eq!(successor.queued_commands(), commands, "old redraw hid successor");
+        assert_eq!(
+            successor.queued_commands(),
+            commands,
+            "old redraw hid successor"
+        );
         if !visible {
             successor.publish(2);
-            assert_eq!(successor.queued_commands(), commands + 1,
-                "control: the current hidden worker must receive Hide");
-            shared.lock().unwrap().set_visibility(1, id, TerminalVisibility::Visible).unwrap();
+            assert_eq!(
+                successor.queued_commands(),
+                commands + 1,
+                "control: the current hidden worker must receive Hide"
+            );
+            shared
+                .lock()
+                .unwrap()
+                .set_visibility(1, id, TerminalVisibility::Visible)
+                .unwrap();
         }
         successor.publish(3);
         let first_revision = {
@@ -139,8 +170,11 @@ fn held_old_completion_and_wake_cannot_advance_or_hide_a_same_id_successor() {
                 frames.push(snapshot.generation);
             }
         }
-        assert_eq!(frames, [first_revision, first_revision + 1],
-            "old callback must not project successor output with its generation");
+        assert_eq!(
+            frames,
+            [first_revision, first_revision + 1],
+            "old callback must not project successor output with its generation"
+        );
     }
 }
 
@@ -149,22 +183,39 @@ fn unbound_wake_never_borrows_a_resident_worker_and_binding_does_not_retain_it()
     let shared = host();
     let id = TerminalId::new();
     let (resident, resident_redraw) = stream(&shared, id);
-    assert!(resident_redraw.worker.set(resident.handle.downgrade()).is_ok());
+    assert!(
+        resident_redraw
+            .worker
+            .set(resident.handle.downgrade())
+            .is_ok()
+    );
     let delivery = {
         let mut state = shared.lock().unwrap();
         let delivery = state.register_client(1);
         state.reserve_spawn(id).unwrap();
-        state.finish_spawn(1, session(id), resident.handle.clone(), true).unwrap();
+        state
+            .finish_spawn(1, session(id), resident.handle.clone(), true)
+            .unwrap();
         delivery
     };
     let (unbound, _) = stream(&shared, id);
     unbound.publish(200);
-    assert!(!shared.lock().unwrap().subscriptions.viewports.contains_key(&(1, id)));
+    assert!(
+        !shared
+            .lock()
+            .unwrap()
+            .subscriptions
+            .viewports
+            .contains_key(&(1, id))
+    );
     resident.publish(1);
     let weak = resident.handle.downgrade();
     drop(shared.lock().unwrap().retire_terminal(id).unwrap());
     drop(resident);
-    assert!(weak.upgrade().is_none(), "wake binding formed a strong owner cycle");
+    assert!(
+        weak.upgrade().is_none(),
+        "wake binding formed a strong owner cycle"
+    );
     resident_redraw.publish(201); // Expired callback is harmless, not an ID lookup.
     delivery.close_after_drain();
     let mut frames = Vec::new();

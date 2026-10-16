@@ -4158,9 +4158,9 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
 #[cfg(test)]
 mod native_upgrade_tests;
 #[cfg(test)]
-mod strict_upgrade_tests;
-#[cfg(test)]
 mod redraw_identity_tests;
+#[cfg(test)]
+mod strict_upgrade_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5860,9 +5860,14 @@ for line in sys.stdin:
             })
             .collect::<Vec<_>>();
             state.reserve_spawn(terminal_id).unwrap();
-            state.finish_spawn(
-                1, redraw_identity_tests::session(terminal_id), stream.handle.clone(), true,
-            ).unwrap();
+            state
+                .finish_spawn(
+                    1,
+                    redraw_identity_tests::session(terminal_id),
+                    stream.handle.clone(),
+                    true,
+                )
+                .unwrap();
             deliveries
         };
 
