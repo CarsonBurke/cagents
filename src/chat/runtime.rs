@@ -133,6 +133,12 @@ impl Handle {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TitleUnavailable {
+    Busy,
+    Poisoned,
+}
+
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
@@ -1055,6 +1061,18 @@ impl Handle {
             .map(|agent| agent.id.clone())
             .collect()
     }
+    /// A coherent resident naming projection. Never opens the transcript Store,
+    /// pages history or touches the filesystem; safe at host admission points.
+    pub(crate) fn conversation_title(
+        &self,
+    ) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
+        let state = self.0.state.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => TitleUnavailable::Busy,
+            std::sync::TryLockError::Poisoned(_) => TitleUnavailable::Poisoned,
+        })?;
+        Ok((state.session_id.clone(), state.title.clone()))
+    }
+
     /// The provider-reported title, read without loading the transcript.
     pub(crate) fn title(&self) -> Option<String> {
         self.0
@@ -2787,9 +2805,12 @@ fn apply_projected_event(
         Event::Session { id, title } => {
             if state.session_id.as_deref() != Some(id.as_str()) {
                 state.prompt_suggestion = None;
+                state.title = title;
+            } else if title.is_some() {
+                // Identity-only frames carry no new naming information.
+                state.title = title;
             }
             state.session_id = Some(id);
-            state.title = title;
         }
         Event::Plan { steps } => state.plan = steps,
         // About the account rather than the conversation: `step` forwards it
@@ -3341,6 +3362,71 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn notification_title_matches_resident_session_identity_across_metadata_only_frames() {
+        struct Names;
+        impl Adapter for Names {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture uses actual decoded metadata frames".into())
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                let index = frame.as_u64().ok_or("expected fixture frame index")?;
+                let session = |id: &str, title: Option<&str>| Event::Session {
+                    id: id.into(),
+                    title: title.map(str::to_owned),
+                };
+                let mut events = vec![Event::TurnStarted];
+                events.extend(match index {
+                    0 => vec![session("native-a", Some("Provider A"))],
+                    1 => vec![session("native-a", None)],
+                    2 => vec![session("native-b", None)],
+                    3 => vec![
+                        session("native-b", Some("Provider B")),
+                        session("native-b", None),
+                    ],
+                    4 => vec![
+                        Event::Reset {
+                            reason: "Explicit new conversation".into(),
+                        },
+                        session("native-b", None),
+                    ],
+                    _ => return Err("unexpected fixture frame".into()),
+                });
+                events.extend([
+                    Event::TurnSettled,
+                    Event::TurnFinished {
+                        key: Some(format!("completed-{index}")),
+                        outcome: crate::notifications::Kind::Succeeded,
+                    },
+                ]);
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
+            }
+        }
+        // The real Actor/Store callback captures each immutable completion
+        // frame before the next command, then retires its actual cat child.
+        let (receipts, snapshot) = notification_frames_with_snapshot_for_test(
+            Box::new(Names),
+            (0..5).map(|index| serde_json::json!(index)).collect(),
+            false,
+        );
+        assert_eq!(receipts.len(), 5);
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|(_, content)| content.conversation.as_str())
+                .collect::<Vec<_>>(),
+            ["Provider A", "Provider A", "", "Provider B", ""]
+        );
+        assert_eq!(snapshot.session_id.as_deref(), Some("native-b"));
+        assert_eq!(snapshot.title, None);
+    }
+
+    #[test]
     fn notification_local_worker_loss_is_unconfirmed_without_reclassifying_known_provider_failure()
     {
         struct LostTransport {
@@ -3623,6 +3709,95 @@ mod tests {
             handle.failure().is_some(),
             "the transcript I/O failure remains visible independently of provider success"
         );
+    }
+
+    #[test]
+    fn resident_title_admission_refuses_without_waiting_for_the_state_owner() {
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::History,
+            program: "unused-history-reader".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+        let state = handle.0.state.lock().unwrap();
+        let probe = handle.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || sender.send(probe.conversation_title()).unwrap());
+        let outcome = receiver.recv_timeout(Duration::from_millis(250));
+        // Release before joining/asserting: the old blocking implementation
+        // fails the test without stranding its thread or the runtime worker.
+        drop(state);
+        worker.join().unwrap();
+        handle.close().unwrap();
+        assert_eq!(outcome.unwrap(), Err(TitleUnavailable::Busy));
+    }
+
+    #[test]
+    fn identity_only_frames_preserve_a_name_until_actual_session_change_or_reset() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "a".into(),
+                title: Some("Bundle review".into()),
+            },
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "a".into(),
+                title: None,
+            },
+        );
+        assert_eq!(state.title.as_deref(), Some("Bundle review"));
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "b".into(),
+                title: None,
+            },
+        );
+        assert!(state.title.is_none());
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "b".into(),
+                title: Some("New task".into()),
+            },
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Reset {
+                reason: "Reset".into(),
+            },
+        );
+        assert!(state.title.is_none());
     }
 
     #[test]

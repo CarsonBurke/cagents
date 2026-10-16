@@ -143,6 +143,7 @@ fn bounded(text: &str, bytes: usize) -> String {
 /// formatting run after releasing it, independently of transcript storage.
 #[cfg(feature = "host")]
 pub(crate) struct FrameContext {
+    session_id: Option<String>,
     conversation: String,
     error: String,
     preview: Preview,
@@ -151,6 +152,7 @@ pub(crate) struct FrameContext {
 impl FrameContext {
     pub fn capture(state: &Snapshot) -> Self {
         Self {
+            session_id: state.session_id.clone(),
             conversation: presentation::title(state.title.as_deref().unwrap_or_default()),
             error: bounded(state.error.as_deref().unwrap_or_default(), RETAINED_BYTES),
             preview: state.notification_preview.as_ref().clone(),
@@ -183,15 +185,25 @@ impl FrameContext {
                 self.preview.observe(event);
                 self.error.clear();
                 if matches!(event, Event::Reset { .. }) {
+                    self.session_id = None;
                     self.conversation.clear();
                 }
             } else {
                 self.preview.observe(event);
             }
             match event {
-                Event::Session {
-                    title: Some(title), ..
-                } => self.conversation = presentation::title(title),
+                Event::Session { id, title } => {
+                    // Mirror Snapshot's naming boundary: identity-only updates
+                    // preserve this conversation's provider title, while an
+                    // actual session change cannot carry the old name forward.
+                    if self.session_id.as_deref() != Some(id.as_str()) {
+                        self.conversation =
+                            presentation::title(title.as_deref().unwrap_or_default());
+                    } else if let Some(title) = title {
+                        self.conversation = presentation::title(title);
+                    }
+                    self.session_id = Some(id.clone());
+                }
                 Event::Error { message, .. } => self.error = bounded(message, RETAINED_BYTES),
                 Event::TurnFinished { outcome, .. } if contexts < CONTEXTS => {
                     pending.push(*outcome);

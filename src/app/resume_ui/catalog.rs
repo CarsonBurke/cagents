@@ -225,40 +225,46 @@ pub fn find_all(
     })
 }
 
-/// The names Codex keeps for its conversations apart from their
-/// transcripts, by conversation ID, the latest for each.
-pub fn names(seeds: &[chat::Session]) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    let mut roots = HashSet::new();
-    for seed in seeds {
-        if seed.launch.provider != Provider::Codex {
-            continue;
-        }
-        let Some(root) = Provider::Codex.session_root(&seed.launch.recipe) else {
-            continue;
-        };
-        let path = root.join("session_index.jsonl");
-        if !roots.insert(path.clone()) {
-            continue;
-        }
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if let (Some(id), Some(name)) = (
-                value["id"].as_str(),
-                value["thread_name"]
-                    .as_str()
-                    .and_then(crate::account::clean_label),
-            ) {
-                names.insert(id.to_owned(), name);
+/// Codex names by the seed's actual account root and conversation ID. A
+/// copied session ID in another account is a different resume choice. Shared
+/// roots are read once and share their immutable result across seed recipes.
+pub fn names(seeds: &[chat::Session]) -> Vec<Arc<HashMap<String, String>>> {
+    let mut roots = HashMap::<PathBuf, Arc<HashMap<String, String>>>::new();
+    let empty = Arc::new(HashMap::new());
+    seeds
+        .iter()
+        .map(|seed| {
+            if seed.launch.provider != Provider::Codex {
+                return empty.clone();
             }
-        }
-    }
-    names
+            let Some(root) = Provider::Codex.session_root(&seed.launch.recipe) else {
+                return empty.clone();
+            };
+            let path = root.join("session_index.jsonl");
+            roots
+                .entry(path.clone())
+                .or_insert_with(|| {
+                    let mut names = HashMap::new();
+                    if let Ok(file) = std::fs::File::open(&path) {
+                        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+                            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                                continue;
+                            };
+                            if let (Some(id), Some(name)) = (
+                                value["id"].as_str(),
+                                value["thread_name"]
+                                    .as_str()
+                                    .and_then(crate::workspace_model::channel_title),
+                            ) {
+                                names.insert(id.to_owned(), name);
+                            }
+                        }
+                    }
+                    Arc::new(names)
+                })
+                .clone()
+        })
+        .collect()
 }
 
 /// Reads a transcript's identity and title, or `None` for a file that is not
@@ -313,8 +319,12 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
     let answer = |titles: Titles| Header {
         id,
         directory,
-        named: titles.named.is_some() || titles.summary.is_some(),
-        title: titles.named.or(titles.summary).or(prompt),
+        named: titles.named.is_some() || titles.generated.is_some() || titles.summary.is_some(),
+        title: titles
+            .named
+            .or(titles.generated)
+            .or(titles.summary)
+            .or(prompt),
     };
     // Codex keeps a conversation's name apart from it, in [`names`].
     if provider == Provider::Codex {
@@ -347,15 +357,21 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
 struct Titles {
     /// Set by the reader or the provider as the conversation's name.
     named: Option<String>,
+    generated: Option<String>,
     /// A provider's generated account of the conversation.
     summary: Option<String>,
 }
 
 impl Titles {
     fn note(&mut self, value: &Value) {
-        let label = |key: &str| value[key].as_str().and_then(crate::account::clean_label);
+        let label = |key: &str| {
+            value[key]
+                .as_str()
+                .and_then(crate::workspace_model::channel_title)
+        };
         match value["type"].as_str() {
             Some("custom-title") => self.named = label("customTitle").or(self.named.take()),
+            Some("ai-title") => self.generated = label("aiTitle").or(self.generated.take()),
             Some("title") => self.named = label("title").or(self.named.take()),
             Some("session_info") => self.named = label("name").or(self.named.take()),
             Some("summary") => self.summary = label("summary").or(self.summary.take()),
@@ -368,6 +384,7 @@ impl Titles {
 fn holds_title(line: &str) -> bool {
     [
         "\"custom-title\"",
+        "\"ai-title\"",
         "\"type\":\"title\"",
         "\"session_info\"",
         "\"type\":\"summary\"",
@@ -448,21 +465,34 @@ fn prompt_of(provider: Provider, value: &Value) -> Option<String> {
         {
             return value["payload"]["message"]
                 .as_str()
-                .and_then(crate::account::clean_label);
+                .and_then(crate::workspace_model::channel_title_from_prompt);
         }
         _ => return None,
     };
     let content = &message["content"];
-    let text = content.as_str().or_else(|| {
-        content
+    let combined;
+    let text = if let Some(text) = content.as_str() {
+        text
+    } else {
+        combined = content
             .as_array()?
             .iter()
-            .find_map(|part| part["text"].as_str())
-    })?;
+            .take(32)
+            .filter_map(|part| part["text"].as_str())
+            .fold(String::new(), |mut text, part| {
+                let remaining = (32 * 1024usize).saturating_sub(text.len() + 1);
+                if remaining > 0 {
+                    text.push('\n');
+                    text.push_str(&part[..part.floor_char_boundary(remaining.min(part.len()))]);
+                }
+                text
+            });
+        &combined
+    };
     if provider == Provider::Claude {
         return claude_prompt(text);
     }
-    crate::account::clean_label(text)
+    crate::workspace_model::channel_title_from_prompt(text)
 }
 
 /// What a Claude user record asked, as a title: a command with what it was
@@ -475,11 +505,9 @@ fn claude_prompt(text: &str) -> Option<String> {
         let end = start + text[start..].find(&format!("</{name}>"))?;
         Some(text[start..end].trim())
     };
-    if let Some(command) = element("command-name") {
+    if element("command-name").is_some() {
         let args = element("command-args").unwrap_or_default();
-        return (!args.is_empty())
-            .then(|| crate::account::clean_label(&format!("{command} {args}")))
-            .flatten();
+        return crate::workspace_model::channel_title_from_prompt(args);
     }
     let trimmed = text.trim_start();
     if ["<local-command-", "<bash-", "<command-"]
@@ -488,7 +516,7 @@ fn claude_prompt(text: &str) -> Option<String> {
     {
         return None;
     }
-    crate::account::clean_label(text)
+    crate::workspace_model::channel_title_from_prompt(text)
 }
 
 /// The session `found` resumes as: `seed`'s account and launch, with the
@@ -682,6 +710,41 @@ mod tests {
     }
 
     #[test]
+    fn claude_resume_uses_custom_then_generated_name_then_content_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let prompt = json!({"type":"user","sessionId":id,"cwd":"/project","message":{"content":"\"\n> Quoted old context\nReview bundle encryption and performance"}});
+        let ai = json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated encryption audit"});
+        std::fs::write(&path, format!("{prompt}\n{ai}\n")).unwrap();
+        let found = header(Provider::Claude, &path).unwrap();
+        assert_eq!(found.title.as_deref(), Some("Generated encryption audit"));
+        assert!(found.named);
+        let custom =
+            json!({"type":"custom-title","sessionId":id,"customTitle":"My bundle project"});
+        std::fs::write(&path, format!("{prompt}\n{custom}\n{ai}\n")).unwrap();
+        assert_eq!(
+            header(Provider::Claude, &path).unwrap().title.as_deref(),
+            Some("My bundle project")
+        );
+        for title in ["1341", "🔐", "🧑‍💻"] {
+            let custom = json!({"type":"custom-title","sessionId":id,"customTitle":title});
+            std::fs::write(&path, format!("{prompt}\n{custom}\n")).unwrap();
+            let found = header(Provider::Claude, &path).unwrap();
+            assert_eq!(found.title.as_deref(), Some(title));
+            assert!(found.named);
+            assert_eq!(found.title, crate::workspace_model::channel_title(title));
+        }
+        std::fs::write(&path, format!("{prompt}\n")).unwrap();
+        let found = header(Provider::Claude, &path).unwrap();
+        assert_eq!(
+            found.title.as_deref(),
+            Some("Review bundle encryption and performance")
+        );
+        assert!(!found.named);
+    }
+
+    #[test]
     fn a_claude_command_titles_a_conversation_only_by_what_it_asks() {
         let command = |name: &str, args: &str| {
             format!(
@@ -691,7 +754,7 @@ mod tests {
         assert_eq!(claude_prompt(&command("/exit", "")), None);
         assert_eq!(
             claude_prompt(&command("/solve-task", "fix resume")).as_deref(),
-            Some("/solve-task fix resume")
+            Some("fix resume")
         );
         assert_eq!(
             claude_prompt("<local-command-stdout>Bye!</local-command-stdout>"),
@@ -736,7 +799,103 @@ mod tests {
             .concat(),
         )
         .unwrap();
-        assert_eq!(names(&[seed]).get(id).map(String::as_str), Some("Renamed"));
+        assert_eq!(
+            names(&[seed.clone()])[0].get(id).map(String::as_str),
+            Some("Renamed")
+        );
+        for title in [
+            "A".repeat(70),
+            "🔐".repeat(90),
+            "\u{202e}Bundle\nreview\u{2066}".into(),
+        ] {
+            std::fs::write(
+                root.join("session_index.jsonl"),
+                format!("{}\n", json!({"id":id,"thread_name":title})),
+            )
+            .unwrap();
+            assert_eq!(
+                names(&[seed.clone()])[0].get(id).cloned(),
+                crate::workspace_model::channel_title(&title)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_names_stay_with_the_original_account_and_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut seeds = Vec::new();
+        let id = "01a0743a-ccb3-7990-b840-3a0779cca5dd";
+        for (slot, provider) in [Provider::Codex, Provider::Codex, Provider::Claude]
+            .into_iter()
+            .enumerate()
+        {
+            let home = directory.path().join(slot.to_string());
+            std::fs::create_dir_all(&home).unwrap();
+            let account = crate::account::Account {
+                provider,
+                home: crate::account::AccountHome::Linked {
+                    key: uuid::Uuid::new_v4(),
+                    path: home,
+                },
+            };
+            let seed = chat::fresh_session(
+                provider,
+                TerminalId::new(),
+                directory.path().into(),
+                &account,
+            )
+            .unwrap();
+            if provider == Provider::Codex {
+                let root = provider.session_root(&seed.launch.recipe).unwrap();
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(
+                    root.join("session_index.jsonl"),
+                    format!(
+                        "{}\n",
+                        json!({"id":id,"thread_name":format!("Account {slot} title")})
+                    ),
+                )
+                .unwrap();
+            }
+            seeds.push(seed);
+        }
+        seeds.push(seeds[0].clone());
+        let names = names(&seeds);
+        assert_eq!(
+            names[0].get(id).map(String::as_str),
+            Some("Account 0 title")
+        );
+        assert_eq!(
+            names[1].get(id).map(String::as_str),
+            Some("Account 1 title")
+        );
+        assert!(
+            names[2].is_empty(),
+            "Claude cannot borrow a same-ID Codex name"
+        );
+        assert!(
+            Arc::ptr_eq(&names[0], &names[3]),
+            "one account root is read only once"
+        );
+    }
+
+    #[test]
+    fn provider_resume_names_share_live_label_sanitization_and_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let prompt = json!({"type":"user","sessionId":id,"cwd":"/project","message":{"content":"Review encryption performance"}});
+        for title in [
+            "A".repeat(70),
+            "🧑‍💻".repeat(40),
+            "\u{202e}Bundle\nreview\u{2066}".into(),
+        ] {
+            let custom = json!({"type":"custom-title","sessionId":id,"customTitle":title});
+            std::fs::write(&path, format!("{prompt}\n{custom}\n")).unwrap();
+            let found = header(Provider::Claude, &path).unwrap();
+            assert_eq!(found.title, crate::workspace_model::channel_title(&title));
+            assert!(found.named);
+        }
     }
 
     /// The cache answers for a file until it changes.
@@ -758,15 +917,15 @@ mod tests {
             }
         };
         let cache = Cache::default();
-        write("First");
+        write("Review encryption");
         assert_eq!(
             cache.find(Provider::Claude, &candidate()).unwrap().title,
-            "First"
+            "Review encryption"
         );
-        write("Second, longer");
+        write("Review encryption throughput");
         assert_eq!(
             cache.find(Provider::Claude, &candidate()).unwrap().title,
-            "Second, longer"
+            "Review encryption throughput"
         );
     }
 }

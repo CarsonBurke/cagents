@@ -143,9 +143,10 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
+/// Version 78 verifies automatic channel-name refreshes against their shared-view owner.
 /// Version 80 carries opt-in semantic notification context and preview privacy.
-/// Campaign integration assigns the final shared matched-set version.
-pub const PROTOCOL_VERSION: u16 = 80;
+/// Version 95 combines conversation-title refreshes with notification context.
+pub const PROTOCOL_VERSION: u16 = 95;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

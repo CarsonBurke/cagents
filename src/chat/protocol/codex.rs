@@ -4042,6 +4042,55 @@ mod tests {
         }
     }
 
+    /// Official app-server Thread.name and thread/name/updated threadName are
+    /// metadata, not evidence that every thread receives a generated title.
+    #[test]
+    fn supported_thread_names_follow_only_the_exact_codex_conversation() {
+        let mut adapter = adapter();
+        let mut restored = Step::default();
+        adapter.thread_state(&json!({"id":"thread-exact","name":"Encrypted bundle review","status":{"type":"idle"}}), &mut restored).unwrap();
+        assert!(restored.events.iter().any(|event| matches!(event,
+            Event::Session {id, title: Some(title)} if id == "thread-exact" && title == "Encrypted bundle review")));
+        assert!(
+            restored.writes.is_empty(),
+            "reusing a provider name requires no inference request"
+        );
+        let foreign = adapter.receive(json!({"method":"thread/name/updated","params":{"threadId":"other","threadName":"Foreign name"}})).unwrap();
+        assert!(
+            !foreign
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Session { .. }))
+        );
+        for name in [
+            Some("Bundle throughput audit"),
+            Some("My custom bundle review"),
+            Some("1341"),
+            Some("🔐"),
+            None,
+        ] {
+            let mut params = json!({"threadId":"thread-exact"});
+            if let Some(name) = name {
+                params["threadName"] = json!(name);
+            }
+            let update = adapter
+                .receive(json!({"method":"thread/name/updated","params":params}))
+                .unwrap();
+            let names = update
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Session { id, title } => Some((id.as_str(), title.as_deref())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec![("thread-exact", name)]);
+            assert!(update.writes.is_empty());
+        }
+        // Identity-only None preservation is covered at the actual Runtime
+        // boundary, which owns the current displayed name and Reset behavior.
+    }
+
     #[test]
     fn notification_questions_use_real_codex_prompts_and_same_id_revisions() {
         let question = |id: u64, text: &str| {
