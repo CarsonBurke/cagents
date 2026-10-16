@@ -1427,16 +1427,23 @@ fn shortcut_input<'a>(
         }
     }
     let row = widget::row::with_children(vec![
-        // Keep every key chip and its Record/Reset controls usable. Give
-        // the label the remaining width rather than shrinking buttons to zero.
-        design::body(format!("{label}{required}"))
-            .width(Length::Fill)
-            .into(),
-        widget::row::with_children(controls)
-            .spacing(2)
-            .align_y(Alignment::Center)
-            .width(Length::Shrink)
-            .into(),
+        // Reserve the source and Terminal policy columns first. Within
+        // the remaining space, keep key controls at their natural width and
+        // let the label wrap instead of shrinking Record/Reset to zero.
+        widget::row::with_children(vec![
+            design::body(format!("{label}{required}"))
+                .width(Length::Fill)
+                .into(),
+            widget::row::with_children(controls)
+                .spacing(2)
+                .align_y(Alignment::Center)
+                .width(Length::Shrink)
+                .into(),
+        ])
+        .spacing(space::S)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into(),
         design::caption(source).width(64).into(),
         {
             let scope = workspace_widget::shortcut_descriptor(action).scope;
@@ -1636,6 +1643,8 @@ mod keyboard_table_tests {
         struct Controls {
             buttons: Vec<Rectangle>,
             advisory: Option<Rectangle>,
+            source: Option<Rectangle>,
+            terminal: Option<Rectangle>,
         }
         impl Operation for Controls {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -1650,8 +1659,11 @@ mod keyboard_table_tests {
                 self.buttons.push(bounds);
             }
             fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
-                if text == "Reserved while editing text" {
-                    self.advisory = Some(bounds);
+                match text {
+                    "Reserved while editing text" => self.advisory = Some(bounds),
+                    "Default" | "User" => self.source = Some(bounds),
+                    "Terminal" => self.terminal = Some(bounds),
+                    _ => {}
                 }
             }
         }
@@ -1740,6 +1752,53 @@ mod keyboard_table_tests {
                 );
             }
         }
+        // A configured alias list may exceed the available key area. It
+        // must not take the already reserved source and Terminal policy away.
+        let aliases = (b'a'..=b'z')
+            .map(|key| format!("Ctrl+Alt+Shift+{}", char::from(key)))
+            .collect::<Vec<_>>();
+        assert!(
+            aliases
+                .iter()
+                .all(|value| settings::parse_shortcut(value).is_ok())
+        );
+        let value = settings::format_chords(&aliases);
+        let field = SettingsField::ShortcutRenamePane;
+        let row = shortcut_input(
+            field.label(),
+            &value,
+            field,
+            &draft.keyboard_shortcuts,
+            &invalid,
+        );
+        let mut element = settings_group("Keyboard", "", vec![row])
+            .compact()
+            .view("Keyboard", "")
+            .unwrap();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::new(560.0, 0.0), Size::new(560.0, 1000.0)),
+        );
+        let mut controls = Controls::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut controls);
+        let source = controls
+            .source
+            .expect("configured row keeps its source caption");
+        let terminal = controls
+            .terminal
+            .expect("configured row keeps its actual Terminal checkbox");
+        for bounds in [source, terminal] {
+            assert!(bounds.width > 0.0 && bounds.height > 0.0, "{bounds:?}");
+            assert!(
+                bounds.x >= 0.0 && bounds.x + bounds.width <= 560.1,
+                "{bounds:?}"
+            );
+        }
+        assert!(source.x + source.width <= terminal.x + 0.1);
     }
 
     #[test]
