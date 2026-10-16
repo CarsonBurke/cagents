@@ -142,12 +142,11 @@ Use the stable account ID from `cagents account list` on the selected device:
 cagents account remove claude/00000000-0000-4000-8000-000000000001 --yes
 ```
 
-The selected daemon authenticates the caller and applies the same lifecycle
-admission as the Accounts pane. Agent tokens and live home owners cannot remove
+The selected daemon authenticates the caller and applies its existing account
+lifecycle admission. Agent tokens and live home owners cannot remove
 accounts. System accounts cannot be removed. This build also refuses managed
 account file deletion and retains the account and its files. A linked account
 is forgotten without deleting its files. The CLI sends only the account ID,
 never a local home path, and requires `--yes` before contacting the daemon.
 If the response is uncertain, inspect the account list before retrying; removal
 does not retry automatically.
-
