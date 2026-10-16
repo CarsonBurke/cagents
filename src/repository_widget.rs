@@ -446,6 +446,12 @@ pub enum RepositoryAction {
         identity: AsyncIdentity,
         result: Result<LoadedFile, FileIoError>,
     },
+    /// Actual file-worker completion, carrying the root used for the read.
+    FileLoadedAt {
+        identity: AsyncIdentity,
+        root: Option<Arc<crate::fs_safety::Root>>,
+        result: Result<LoadedFile, FileIoError>,
+    },
     /// Turn to a page of the open document, or re-render the current one after
     /// the reader changes how its colors are adapted or how large it is drawn.
     PdfPage {
@@ -732,6 +738,7 @@ impl RepositoryAction {
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
+            | Self::FileLoadedAt { identity, .. }
             | Self::DiagramsRendered { identity, .. }
             | Self::DiffLoaded { identity, .. }
             | Self::WorkingDiffLoaded { identity, .. }
@@ -1840,6 +1847,7 @@ impl Drop for FindJob {
 pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
     worktree_protection: Option<crate::worktree_cleanup::Protection>,
+    original_editor_root: Option<Arc<crate::fs_safety::Root>>,
     directory_only: bool,
     standalone: bool,
     external_editors: Vec<crate::sidebar::SidebarEditor>,
@@ -2062,6 +2070,7 @@ impl RepositoryRuntime {
             directory_only: descriptor.selected_file.is_some(),
             descriptor,
             worktree_protection: None,
+            original_editor_root: None,
             standalone: false,
             external_editors: Vec::new(),
             generation: 0,
@@ -2145,6 +2154,20 @@ impl RepositoryRuntime {
         let mut runtime = Self::new(descriptor);
         runtime.directory_only = true;
         runtime
+    }
+
+    /// Pure handoff of an original reader/creator root. Never replace an
+    /// existing physical scope through a later pathname or sidebar binding.
+    pub fn set_original_editor_root(&mut self, root: Arc<crate::fs_safety::Root>) -> bool {
+        if let Some(original) = &self.original_editor_root {
+            return Arc::ptr_eq(original, &root);
+        }
+        self.original_editor_root = Some(root);
+        true
+    }
+
+    pub fn retained_editor_root(&self) -> Option<Arc<crate::fs_safety::Root>> {
+        self.original_editor_root.clone()
     }
 
     /// Hides workbench launch controls in an independent editor window.
@@ -2813,6 +2836,9 @@ impl RepositoryRuntime {
         if let Err(error) = self.protect_editor_worktree(&view.worktree) {
             self.files = FileListState::Failed(error.to_string());
             return Task::none();
+        }
+        if self.descriptor.worktree != view.worktree {
+            self.original_editor_root = None;
         }
         self.descriptor = view;
         self.retained_viewports.clear();
@@ -4806,6 +4832,20 @@ impl RepositoryRuntime {
                 }
                 self.open_file_entry(card, file)
             }
+            RepositoryAction::FileLoadedAt { identity, root, result } => {
+                if !self.accepts_selected(&identity) {
+                    return Task::none();
+                }
+                if let Some(root) = root
+                    && !self.set_original_editor_root(root)
+                {
+                    return self.update_inner(RepositoryAction::FileLoaded {
+                        identity,
+                        result: Err(FileIoError::Io("The file read belongs to another physical root; reopen the pane".into())),
+                    });
+                }
+                self.update_inner(RepositoryAction::FileLoaded { identity, result })
+            }
             RepositoryAction::FileLoaded { identity, result } => {
                 if !self.accepts_selected(&identity) {
                     return Task::none();
@@ -6140,7 +6180,7 @@ impl RepositoryRuntime {
         self.markdown_mode = MarkdownMode::Edit;
         self.document_tone = pdf_tone(&cosmic::theme::active());
         let identity = self.next_identity(card, path);
-        file_task(identity, self.document_tone)
+        file_task(identity, self.document_tone, self.original_editor_root.clone())
     }
 
     fn diff_mode_index(&self) -> usize {
@@ -6679,15 +6719,28 @@ fn page_edge(theme: &cosmic::Theme) -> cosmic::widget::container::Style {
 }
 
 /// Reads the file, rendering a document's first page with `tone`.
-fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone) -> Task<RepositoryAction> {
+fn file_task(
+    identity: AsyncIdentity,
+    tone: crate::editor::PdfTone,
+    original: Option<Arc<crate::fs_safety::Root>>,
+) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
-        let result = tokio::task::spawn_blocking(move || load_file(&worktree, &path, tone))
-            .await
-            .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")))
-            .and_then(|result| result);
-        RepositoryAction::FileLoaded { identity, result }
+        let (root, result) = tokio::task::spawn_blocking(move || {
+            let root = match original {
+                Some(root) => root,
+                None => match crate::editor::open_read_root(&worktree) {
+                    Ok(root) => Arc::new(root),
+                    Err(error) => return (None, Err(error)),
+                },
+            };
+            let result = crate::editor::load_file_at(&root, &path, tone);
+            (Some(root), result)
+        })
+        .await
+        .unwrap_or_else(|error| (None, Err(FileIoError::Io(format!("file worker failed: {error}")))));
+        RepositoryAction::FileLoadedAt { identity, root, result }
     })
 }
 
@@ -10491,6 +10544,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn file_worker_retains_original_root_across_later_reads_and_rejects_rebinding() {
+        let parent = tempfile::tempdir().unwrap();
+        let named = parent.path().join("checkout");
+        let moved = parent.path().join("original");
+        std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("one"), "original one").unwrap();
+        std::fs::write(named.join("two"), "original two").unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(), repository: named.clone(), worktree: named.clone(), selected_file: None,
+        });
+        let task = runtime.update(RepositoryAction::OpenFile { card, path: "one".into() });
+        finish_navigation_task(&mut runtime, task).await;
+        let original = runtime.retained_editor_root().expect("actual read root");
+        assert_eq!(runtime.editor_text().as_deref(), Some("original one"));
+        std::fs::rename(&named, &moved).unwrap();
+        std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("two"), "replacement two").unwrap();
+        let replacement = Arc::new(crate::fs_safety::Root::open(&named).unwrap());
+        assert!(!runtime.set_original_editor_root(replacement));
+        let task = runtime.update(RepositoryAction::OpenFile { card, path: "two".into() });
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(runtime.editor_text().as_deref(), Some("original two"));
+        assert!(Arc::ptr_eq(&original, &runtime.retained_editor_root().unwrap()));
+        assert_eq!(std::fs::read_to_string(named.join("two")).unwrap(), "replacement two");
     }
 
     #[tokio::test]

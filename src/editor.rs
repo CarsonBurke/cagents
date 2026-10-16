@@ -260,8 +260,22 @@ pub fn load_file(
     relative_path: &Path,
     tone: PdfTone,
 ) -> Result<LoadedFile, FileIoError> {
+    let root = open_read_root(worktree)?;
+    load_file_at(&root, relative_path, tone)
+}
+
+/// Capture the original physical root in the read worker, before reading any
+/// mutable document. Later reads and saves retain this same descriptor.
+pub(crate) fn open_read_root(worktree: &Path) -> Result<Root, FileIoError> {
+    worktree_root(worktree)
+}
+
+pub(crate) fn load_file_at(
+    root: &Root,
+    relative_path: &Path,
+    tone: PdfTone,
+) -> Result<LoadedFile, FileIoError> {
     validate_repo_path(relative_path)?;
-    let root = worktree_root(worktree)?;
     let mut source = relative_path.to_path_buf();
     // The link `source` was reached through, with the target it holds, so a
     // target that turns out to name nothing usable is reported against the
@@ -322,7 +336,7 @@ pub fn load_file(
         reached_through = Some((source, target));
         source = resolved;
     };
-    let content = load_regular_file(&root, worktree, &source, metadata, tone)?;
+    let content = load_regular_file(root, root.path(), &source, metadata, tone)?;
     Ok(LoadedFile { source, content })
 }
 

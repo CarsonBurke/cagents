@@ -801,3 +801,101 @@ fn clean_before_acquire(
         remove_temporary(holding, name, file, baseline).and_then(|()| holding.remove_empty(parent));
     append_cleanup(error, cleanup)
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::filesystem_recovery_context::fixtures::{fixture_context, fixture_context_with_guard};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    struct ResetSync;
+    impl Drop for ResetSync {
+        fn drop(&mut self) { FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.set(false)); }
+    }
+    struct Closed(Arc<AtomicBool>);
+    impl Drop for Closed {
+        fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+    }
+    fn fixture() -> (tempfile::TempDir, Root) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("file"), b"base").unwrap();
+        let root = Root::open(directory.path()).unwrap();
+        (directory, root)
+    }
+    #[test]
+    fn original_root_save_preserves_mode_and_disk_cas() {
+        let (directory, root) = fixture();
+        fs::set_permissions(directory.path().join("file"), Permissions::from_mode(0o640)).unwrap();
+        let context = fixture_context(&root).unwrap();
+        let result = save_file_at(&root, Path::new("file"), "mine", blake3::hash(b"wrong"), false, &context).unwrap();
+        assert!(matches!(result.outcome, SaveOutcome::Conflict { .. }));
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"base");
+        let result = save_file_at(&root, Path::new("file"), "mine", blake3::hash(b"base"), false, &context).unwrap();
+        assert!(matches!(result.outcome, SaveOutcome::Saved { durability: super::super::SaveDurability::Durable, .. }));
+        assert!(result.recovery_authority().is_none());
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"mine");
+        assert_eq!(fs::metadata(directory.path().join("file")).unwrap().mode() & 0o7777, 0o640);
+        assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
+    }
+    #[test]
+    fn original_root_save_refuses_same_name_replacement_before_effects() {
+        let parent = tempfile::tempdir().unwrap();
+        let named = parent.path().join("checkout");
+        let moved = parent.path().join("original");
+        fs::create_dir(&named).unwrap();
+        fs::write(named.join("file"), b"base").unwrap();
+        let root = Root::open(&named).unwrap();
+        let context = fixture_context(&root).unwrap();
+        fs::rename(&named, &moved).unwrap();
+        fs::create_dir(&named).unwrap();
+        fs::write(named.join("file"), b"newer").unwrap();
+        assert!(save_file_at(&root, Path::new("file"), "mine", blake3::hash(b"base"), true, &context).is_err());
+        assert_eq!(fs::read(moved.join("file")).unwrap(), b"base");
+        assert_eq!(fs::read(named.join("file")).unwrap(), b"newer");
+        assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
+    }
+    #[test]
+    fn removed_holding_sync_failure_keeps_original_owner_in_both_outer_results() {
+        for committed in [false, true] {
+            let (directory, root) = fixture();
+            let released = Arc::new(AtomicBool::new(false));
+            let context = fixture_context_with_guard(&root, Closed(released.clone())).unwrap();
+            let outside = context.placement().directory().path().to_owned();
+            FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.set(true));
+            let _reset = ResetSync;
+            let result = save_file_with_hooks(&root, Path::new("file"), "mine", blake3::hash(b"base"), false, &context,
+                || if committed { Ok(()) } else { Err(io::Error::other("prepublication refusal")) }, fs_safety::sync_directory);
+            let authority = match result {
+                Ok(result) if committed => result.recovery_authority().unwrap().clone(),
+                Err(error) if !committed => error.recovery_authority().unwrap().clone(),
+                other => panic!("whole outer typed result required: {other:?}"),
+            };
+            assert!(!FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.get()));
+            assert!(fs::read_dir(&outside).unwrap().next().is_none());
+            drop(context);
+            assert!(!released.load(Ordering::Acquire));
+            assert!(!authority.is_resolved());
+            authority.retry().unwrap();
+            assert!(authority.is_resolved());
+            assert!(released.load(Ordering::Acquire));
+            assert_eq!(fs::read(directory.path().join("file")).unwrap(), if committed { &b"mine"[..] } else { &b"base"[..] });
+        }
+    }
+    #[test]
+    fn saved_executable_runs_while_cleanup_authority_is_still_pending() {
+        use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+        let (directory, root) = fixture();
+        fs::set_permissions(directory.path().join("file"), Permissions::from_mode(0o700)).unwrap();
+        let context = fixture_context(&root).unwrap();
+        FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.set(true));
+        let _reset = ResetSync;
+        let result = save_file_at(&root, Path::new("file"), "#!/bin/sh\nprintf retained-save", blake3::hash(b"base"), false, &context).unwrap();
+        let authority = result.recovery_authority().expect("real pending sync");
+        let output = SystemProcessExecutor.execute(
+            &CommandSpec::new(directory.path().join("file")).timeout(std::time::Duration::from_secs(5)), &CancellationToken::new()).unwrap();
+        assert!(output.success, "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, b"retained-save");
+        assert!(!authority.is_resolved());
+        authority.retry().unwrap();
+    }
+}
