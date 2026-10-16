@@ -58,6 +58,8 @@ fn materialize_snapshots(
     Ok(open)
 }
 
+mod dialog;
+
 type Buffers<'a> = [(CardId, &'a mut RepositoryRuntime)];
 
 #[derive(Debug, Clone)]
@@ -1343,7 +1345,7 @@ impl State {
             .or_else(|| self.preview.as_ref().map(|value| value.ticket))?;
         // A queued mouse release must never inherit the pressed state of a
         // different dialog, even when Cancel and replacement share a frame.
-        Some(iced::widget::keyed_column([(ticket, self.view_unkeyed()?)]).into())
+        Some(dialog::scoped(ticket, self.view_unkeyed()?))
     }
     fn view_unkeyed(&self) -> Option<Element<'_, Action>> {
         if let Some(rename) = &self.rename {

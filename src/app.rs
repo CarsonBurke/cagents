@@ -16543,45 +16543,45 @@ impl Application for Cagents {
             Message::EditorFeatures(action) => self.update_editor_features(action),
             Message::Lsp(event) => {
                 if self.editor_features.consumes(&event) {
-                    return self
-                        .update_editor_features(crate::editor_features::Action::Event(event));
-                }
-                let navigation = if let LspEvent::Locations {
-                    doc,
-                    kind: crate::lsp::LocationKind::Definition,
-                    items,
-                    request,
-                    ..
-                } = &event
-                {
-                    self.lsp_documents.get(doc).copied().and_then(|card| {
-                        let state = self.lsp_contexts.get_mut(&card)?;
-                        if state.editor_navigation != Some(*request) {
-                            return None;
-                        }
-                        state.editor_navigation = None;
-                        Some((card, items.clone()))
-                    })
+                    self.update_editor_features(crate::editor_features::Action::Event(event))
                 } else {
-                    None
-                };
-                self.apply_lsp_event(event);
-                self.refresh_editor_feature_support();
-                if let Some((card, locations)) = navigation {
-                    if locations.len() == 1
-                        && let crate::lsp::LspTarget::Workspace { path } = &locations[0].target
+                    let navigation = if let LspEvent::Locations {
+                        doc,
+                        kind: crate::lsp::LocationKind::Definition,
+                        items,
+                        request,
+                        ..
+                    } = &event
                     {
-                        return self.jump_to_lsp_location(
-                            card,
-                            path.clone(),
-                            locations[0].range.start,
-                            locations[0].coordinates,
-                        );
+                        self.lsp_documents.get(doc).copied().and_then(|card| {
+                            let state = self.lsp_contexts.get_mut(&card)?;
+                            if state.editor_navigation != Some(*request) {
+                                return None;
+                            }
+                            state.editor_navigation = None;
+                            Some((card, items.clone()))
+                        })
+                    } else {
+                        None
+                    };
+                    self.apply_lsp_event(event);
+                    self.refresh_editor_feature_support();
+                    if let Some((card, locations)) = navigation {
+                        if locations.len() == 1
+                            && let crate::lsp::LspTarget::Workspace { path } = &locations[0].target
+                        {
+                            return self.jump_to_lsp_location(
+                                card,
+                                path.clone(),
+                                locations[0].range.start,
+                                locations[0].coordinates,
+                            );
+                        }
+                        self.context_tab = ContextTab::Details;
+                        self.context_inspector_open = true;
                     }
-                    self.context_tab = ContextTab::Details;
-                    self.context_inspector_open = true;
+                    Task::none()
                 }
-                Task::none()
             }
             Message::LanguageServersReaped => self.advance_exit(|exit| exit.servers_reaped = true),
             Message::WindowClosed(window) => self.advance_exit(|exit| {
@@ -28177,7 +28177,11 @@ mod tests {
                         !app.editor_features.pending(),
                         "a command admission would retain its actual Command request"
                     );
-                    assert!(app.status.as_ref().unwrap().message.contains("refused"));
+                    assert!(
+                        app.notices
+                            .recent()
+                            .any(|entry| entry.notice.message.contains("refused"))
+                    );
                     app.lsp.begin_shutdown().await;
                 })
             })
@@ -28405,7 +28409,8 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
-                language_test(async {
+                let renderer = headless_renderer();
+                language_test(async move {
                     use cosmic::iced::{
                         advanced::widget::{Tree, tree},
                         mouse,
@@ -28415,7 +28420,6 @@ mod tests {
                         let events = app.lsp.events();
                         let old =
                             open_language_dialog_for_control(&mut app, card, &events, role).await;
-                        let renderer = headless_renderer();
                         let mut element = app.dialog().unwrap();
                         let mut state = Tree::new(element.as_widget());
                         let (node, bounds) =
@@ -28507,6 +28511,43 @@ mod tests {
                         app.editor_features.cancel_all(&mut app.lsp);
                         app.lsp.begin_shutdown().await;
                     }
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn consecutive_language_errors_reach_the_actual_notice_log_in_their_own_turns() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                language_test(async {
+                    let (mut app, _directory, _) = language_controller_fixture().await;
+                    for message in ["first language failure", "second language failure"] {
+                        drop(app.update(Message::Lsp(LspEvent::ServerMessage {
+                            doc: LspDocumentId(1),
+                            level: crate::lsp::LspMessageLevel::Error,
+                            message: message.into(),
+                        })));
+                        assert!(
+                            app.notices
+                                .recent()
+                                .any(|entry| entry.notice.message == message)
+                        );
+                        assert!(
+                            app.status.is_none(),
+                            "the common postlude must drain the write channel immediately"
+                        );
+                    }
+                    for message in ["first language failure", "second language failure"] {
+                        assert!(
+                            app.notices
+                                .recent()
+                                .any(|entry| entry.notice.message == message)
+                        );
+                    }
+                    app.lsp.begin_shutdown().await;
                 })
             })
             .unwrap()
