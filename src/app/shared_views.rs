@@ -4100,7 +4100,7 @@ mod tests {
         let CardKind::Chat(session) = app.card_state(card).unwrap().kind.clone() else {
             panic!("draft")
         };
-        drop(app.open_chat(card, session, chat::Intent::Start));
+        drop(app.open_chat(card, session, crate::chat::Intent::Start));
         assert_eq!(app.local_view_panes(&Scope::Channel(a))[0].id, card);
     }
     #[test]
