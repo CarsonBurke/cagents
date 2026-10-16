@@ -471,6 +471,11 @@ pub enum RepositoryAction {
         identity: AsyncIdentity,
         result: Result<LoadedFile, FileIoError>,
     },
+    /// Actual file-worker completion, carrying the root used for the read.
+    FileLoadedAt {
+        identity: AsyncIdentity,
+        result: Result<crate::editor::FileRead, FileIoError>,
+    },
     /// Turn to a page of the open document, or re-render the current one after
     /// the reader changes how its colors are adapted or how large it is drawn.
     PdfPage {
@@ -540,6 +545,13 @@ pub enum RepositoryAction {
         revision: u64,
         saved_text: String,
         result: Result<SaveOutcome, FileIoError>,
+    },
+    RetainedSaveFinished {
+        identity: AsyncIdentity,
+        ticket: u64,
+        revision: u64,
+        saved_text: String,
+        result: Result<crate::editor::retained_save::RetainedSaveOutcome, crate::editor::retained_save::RetainedSaveError>,
     },
     Reload {
         card: CardId,
@@ -716,6 +728,18 @@ pub enum ClipboardOp {
 }
 
 impl RepositoryAction {
+    pub fn recovery_authority(&self) -> Option<&crate::recovery_authority::RecoveryAuthority> {
+        match self {
+            Self::RetainedSaveFinished { result, .. } => match result {
+                Ok(outcome) => outcome.recovery_authority(),
+                Err(error) => error.recovery_authority(),
+            },
+            _ => None,
+        }
+    }
+    pub fn recovery_scope(&self) -> Option<&Path> {
+        match self { Self::RetainedSaveFinished { identity, .. } => Some(&identity.worktree), _ => None }
+    }
     pub fn card(&self) -> CardId {
         match self {
             Self::Review { card, .. }
@@ -783,12 +807,14 @@ impl RepositoryAction {
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
+            | Self::FileLoadedAt { identity, .. }
             | Self::DiagramsRendered { identity, .. }
             | Self::DiffLoaded { identity, .. }
             | Self::WorkingDiffLoaded { identity, .. }
             | Self::DiffBasisResolved { identity, .. }
             | Self::AutoSaveDue { identity, .. }
-            | Self::SaveFinished { identity, .. } => identity.card,
+            | Self::SaveFinished { identity, .. }
+            | Self::RetainedSaveFinished { identity, .. } => identity.card,
         }
     }
 }
@@ -850,6 +876,7 @@ struct EditorDocument {
     conflict: bool,
     error: Option<String>,
     durability_warning: Option<String>,
+    cleanup_recovery: Option<crate::recovery_authority::RecoveryAuthority>,
     /// Undo and redo for this buffer. It lives exactly as long as the buffer:
     /// a document loaded afresh starts a history of its own.
     history: History,
@@ -898,6 +925,10 @@ struct SaveTicket {
 }
 
 impl EditorDocument {
+    fn durability_warning(&self) -> Option<&str> {
+        if self.cleanup_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) { None }
+        else { self.durability_warning.as_deref() }
+    }
     fn new(
         path: PathBuf,
         source: PathBuf,
@@ -933,6 +964,7 @@ impl EditorDocument {
             conflict: false,
             error: None,
             durability_warning: None,
+            cleanup_recovery: None,
             history: History::default(),
             #[cfg(test)]
             history_time: None,
@@ -2004,6 +2036,11 @@ impl Drop for FindReplacementJob {
 pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
     worktree_protection: Option<crate::worktree_cleanup::Protection>,
+    original_editor_root: Option<Arc<crate::fs_safety::Root>>,
+    original_read_attested: bool,
+    save_recovery_window: Option<crate::operation_recovery::Shared>,
+    known_checkout_paths: Option<Vec<PathBuf>>,
+    editor_recovery: Option<crate::recovery_authority::RecoveryAuthority>,
     directory_only: bool,
     standalone: bool,
     external_editors: Vec<crate::sidebar::SidebarEditor>,
@@ -2236,6 +2273,11 @@ impl RepositoryRuntime {
             directory_only: descriptor.selected_file.is_some(),
             descriptor,
             worktree_protection: None,
+            original_editor_root: None,
+            original_read_attested: false,
+            save_recovery_window: None,
+            known_checkout_paths: None,
+            editor_recovery: None,
             standalone: false,
             external_editors: Vec::new(),
             generation: 0,
@@ -2328,6 +2370,48 @@ impl RepositoryRuntime {
         let mut runtime = Self::new(descriptor);
         runtime.directory_only = true;
         runtime
+    }
+
+    /// Pure handoff of an original reader/creator root. Never replace an
+    /// existing physical scope through a later pathname or sidebar binding.
+    pub fn set_original_editor_root(&mut self, root: Arc<crate::fs_safety::Root>) -> bool {
+        if let Some(original) = &self.original_editor_root {
+            return Arc::ptr_eq(original, &root);
+        }
+        self.original_editor_root = Some(root);
+        true
+    }
+
+    pub fn retained_editor_root(&self) -> Option<Arc<crate::fs_safety::Root>> {
+        self.original_editor_root.clone()
+    }
+
+    /// Pure window-owned custody and negative checkout census. The worker
+    /// acquires the real original-root cleanup protection before any effect.
+    pub fn configure_save_recovery(&mut self, window: crate::operation_recovery::Shared, known: Vec<PathBuf>) -> bool {
+        if known.len() > 256 || self.save_recovery_window.as_ref().is_some_and(|original| !Arc::ptr_eq(original, &window)) { return false; }
+        self.save_recovery_window = Some(window);
+        self.known_checkout_paths = Some(known);
+        true
+    }
+    pub fn has_editor_recovery(&self) -> bool {
+        self.editor_recovery.as_ref().is_some_and(|authority| !authority.is_resolved())
+    }
+    fn clear_resolved_operation_recovery(&mut self) {
+        if let DocumentState::Editable(document) = &mut self.document
+            && document.cleanup_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) {
+            document.cleanup_recovery = None;
+            document.durability_warning = None;
+        }
+        if self.editor_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) { self.editor_recovery = None; }
+    }
+    pub fn reconcile_operation_recovery(&mut self, card: CardId) -> Task<RepositoryAction> {
+        self.clear_resolved_operation_recovery();
+        self.auto_save_task(card)
+    }
+    pub fn retire_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) {
+        if ticket == self.next_auto_save_ticket && self.accepts_selected(identity)
+            && self.auto_save_pending == Some((identity.generation, revision)) { self.auto_save_pending = None; }
     }
 
     /// Hides workbench launch controls in an independent editor window.
@@ -3005,6 +3089,9 @@ impl RepositoryRuntime {
         if let Err(error) = self.protect_editor_worktree(&view.worktree) {
             self.files = FileListState::Failed(error.to_string());
             return Task::none();
+        }
+        if self.descriptor.worktree != view.worktree {
+            self.original_editor_root = None;
         }
         self.descriptor = view;
         self.retained_viewports.clear();
@@ -5051,7 +5138,7 @@ impl RepositoryRuntime {
     }
 
     pub fn can_save(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none())
+        matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning().is_some()) && document.active_save.is_none())
     }
 
     fn can_discard_edits(&self) -> bool {
@@ -5067,9 +5154,9 @@ impl RepositoryRuntime {
     }
 
     pub fn blocks_navigation(&self) -> bool {
-        self.is_dirty()
+        self.has_editor_recovery() || self.is_dirty()
             || self.is_saving()
-            || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
+            || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning().is_some())
     }
 
     /// Whether abandoning the editor buffer is sufficient to release every
@@ -5083,12 +5170,12 @@ impl RepositoryRuntime {
             DocumentState::Editable(document)
                 if document.dirty
                     && document.active_save.is_none()
-                    && document.durability_warning.is_none()
+                    && document.durability_warning().is_none()
         )
     }
 
     pub fn has_durability_warning(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
+        matches!(&self.document, DocumentState::Editable(document) if document.durability_warning().is_some())
     }
 
     pub fn inspector_context(&self) -> RepositoryInspectorContext {
@@ -5104,7 +5191,7 @@ impl RepositoryRuntime {
             DocumentState::Loading => "Loading",
             DocumentState::Editable(_) if self.is_saving() => "Saving",
             DocumentState::Editable(document) if document.conflict => "Save conflict",
-            DocumentState::Editable(document) if document.durability_warning.is_some() => {
+            DocumentState::Editable(document) if document.durability_warning().is_some() => {
                 "Durability warning"
             }
             DocumentState::Editable(document) if document.error.is_some() => "Save failed",
@@ -5224,7 +5311,7 @@ impl RepositoryRuntime {
             // or navigation, because that disk-state fence stays installed.
             can_discard: self.can_discard_edits(),
             can_reload: conflict
-                || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
+                || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning().is_some())
                 || matches!(&self.document, DocumentState::Failed { .. }),
             can_retry_diff,
             can_show_diff: self.can_show_diff(),
@@ -5284,7 +5371,7 @@ impl RepositoryRuntime {
             DocumentState::Editable(document) => document
                 .error
                 .as_deref()
-                .or(document.durability_warning.as_deref()),
+                .or(document.durability_warning()),
             _ => None,
         }
     }
@@ -5314,7 +5401,7 @@ impl RepositoryRuntime {
                     && document.active_save.is_none()
                     && !document.conflict
                     && document.error.is_none()
-                    && document.durability_warning.is_none() =>
+                    && document.durability_warning().is_none() =>
             {
                 Some(document.revision)
             }
@@ -5360,10 +5447,20 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
+        self.clear_resolved_operation_recovery();
+        if self.has_editor_recovery() { return Task::none(); }
+        let Some(root) = self.original_editor_root.clone().filter(|_| self.original_read_attested) else {
+            if let DocumentState::Editable(document) = &mut self.document { document.error = Some("The original read root is unavailable; reopen this file before saving.".into()); }
+            return Task::none();
+        };
+        let Some((window, known)) = self.save_recovery_window.clone().zip(self.known_checkout_paths.clone()) else {
+            if let DocumentState::Editable(document) = &mut self.document { document.error = Some("File recovery custody is unavailable; the save was refused before changing files.".into()); }
+            return Task::none();
+        };
         let (path, destination, text, disk_hash, revision, history_revision, snapshot_source) =
             match &self.document {
                 DocumentState::Editable(document)
-                    if (document.dirty || document.durability_warning.is_some())
+                    if (document.dirty || document.durability_warning().is_some())
                         && document.active_save.is_none() =>
                 {
                     (
@@ -5378,6 +5475,14 @@ impl RepositoryRuntime {
                 }
                 _ => return Task::none(),
             };
+        let operation = match crate::operation_recovery::begin_operation(&window, self.descriptor.worktree.clone(), root.clone()) {
+            Ok(operation) => operation,
+            Err(error) => {
+                if let DocumentState::Editable(document) = &mut self.document { document.error = Some(error); }
+                return Task::none();
+            }
+        };
+
         // The ticket is about the selected row, which is what a result is
         // matched against; the bytes go where they were read from.
         let identity = self.current_identity(card, path);
@@ -5401,16 +5506,21 @@ impl RepositoryRuntime {
             self.source_surface = SourceSurface::Editor;
             self.markdown_mode = MarkdownMode::Edit;
         }
-        let worktree = identity.worktree.clone();
         let saved_text = text.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                save_file(&worktree, &destination, &text, disk_hash, overwrite)
+                operation.start();
+                let result = crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire(&root, &known)
+                    .map_err(|error| crate::editor::retained_save::RetainedSaveError::Io(error.to_string()))
+                    .and_then(|context| crate::editor::retained_save::save_file_at(&root, &destination, &text, disk_hash, overwrite, &context));
+                let authority = match &result { Ok(outcome) => outcome.recovery_authority(), Err(error) => error.recovery_authority() }.cloned();
+                operation.finish(authority);
+                result
             })
             .await
-            .map_err(|error| FileIoError::Io(format!("save worker failed: {error}")))
+            .map_err(|error| crate::editor::retained_save::RetainedSaveError::Io(format!("save worker failed: {error}")))
             .and_then(|result| result);
-            RepositoryAction::SaveFinished {
+            RepositoryAction::RetainedSaveFinished {
                 identity,
                 ticket: ticket.id,
                 revision,
@@ -5421,6 +5531,13 @@ impl RepositoryRuntime {
     }
 
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
+        self.clear_resolved_operation_recovery();
+        if let Some(authority) = action.recovery_authority().filter(|authority| !authority.is_resolved()) {
+            self.editor_recovery = Some(match self.editor_recovery.take().filter(|old| !old.is_resolved()) {
+                Some(old) => old.combine(authority.clone()),
+                None => authority.clone(),
+            });
+        }
         let card = action.card();
         let task = self.update_inner(action);
         if let Some(active) = &self.find_replacement
@@ -5554,10 +5671,28 @@ impl RepositoryRuntime {
                 }
                 self.open_file_entry(card, file)
             }
+            RepositoryAction::FileLoadedAt { identity, result } => {
+                if !self.accepts_selected(&identity) { return Task::none(); }
+                let result = match result {
+                    Ok(read) if read.worktree() == identity.worktree => {
+                        let (root, result) = read.into_parts();
+                        if !self.set_original_editor_root(root) {
+                            Err(FileIoError::Io("The file read belongs to another physical root; reopen the pane".into()))
+                        } else { result }
+                    }
+                    Ok(_) => Err(FileIoError::Io("The file read belongs to another worktree".into())),
+                    Err(error) => Err(error),
+                };
+                let attested = result.is_ok();
+                let task = self.update_inner(RepositoryAction::FileLoaded { identity, result });
+                self.original_read_attested = attested;
+                task
+            }
             RepositoryAction::FileLoaded { identity, result } => {
                 if !self.accepts_selected(&identity) {
                     return Task::none();
                 }
+                self.original_read_attested = false;
                 let restored_focus = self
                     .restores_editor_navigation(&identity)
                     .then(|| identity.clone());
@@ -5985,6 +6120,16 @@ impl RepositoryRuntime {
                 }
                 self.auto_save_pending = None;
                 self.request_save_inner(identity.card, false, false)
+            }
+            RepositoryAction::RetainedSaveFinished { identity, ticket, revision, saved_text, result } => {
+                let cleanup = result.as_ref().ok().and_then(|outcome| outcome.recovery_authority()).cloned();
+                let owns_snapshot = matches!(&self.document, DocumentState::Editable(document)
+                    if document.active_save.as_ref().is_some_and(|active| active.id == ticket && active.identity == identity && active.revision == revision && active.snapshot == saved_text));
+                let result = result.map(|outcome| outcome.into_parts().0)
+                    .map_err(|error| FileIoError::Io(error.to_string()));
+                let task = self.update_inner(RepositoryAction::SaveFinished { identity, ticket, revision, saved_text, result });
+                if owns_snapshot && let DocumentState::Editable(document) = &mut self.document { document.cleanup_recovery = cleanup; }
+                task
             }
             RepositoryAction::SaveFinished {
                 identity,
@@ -6902,6 +7047,7 @@ impl RepositoryRuntime {
         self.committed_selection = None;
         self.selected = Some(file.clone());
         self.document = DocumentState::Loading;
+        self.original_read_attested = false;
         self.diffs.clear();
         self.basis_resolution = None;
         self.apply_diff_viewport(
@@ -6916,7 +7062,7 @@ impl RepositoryRuntime {
         self.markdown_mode = MarkdownMode::Edit;
         self.document_tone = pdf_tone(&cosmic::theme::active());
         let identity = self.next_identity(card, path);
-        file_task(identity, self.document_tone)
+        file_task(identity, self.document_tone, self.original_editor_root.clone())
     }
 
     fn diff_mode_index(&self) -> usize {
@@ -7455,15 +7601,17 @@ fn page_edge(theme: &cosmic::Theme) -> cosmic::widget::container::Style {
 }
 
 /// Reads the file, rendering a document's first page with `tone`.
-fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone) -> Task<RepositoryAction> {
+fn file_task(
+    identity: AsyncIdentity,
+    tone: crate::editor::PdfTone,
+    original: Option<Arc<crate::fs_safety::Root>>,
+) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
-        let result = tokio::task::spawn_blocking(move || load_file(&worktree, &path, tone))
-            .await
-            .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")))
-            .and_then(|result| result);
-        RepositoryAction::FileLoaded { identity, result }
+        let result = tokio::task::spawn_blocking(move || crate::editor::read_file_at(&worktree, &path, tone, original))
+            .await.map_err(|error| FileIoError::Io(format!("file worker failed: {error}"))).and_then(|result| result);
+        RepositoryAction::FileLoadedAt { identity, result }
     })
 }
 
@@ -9119,7 +9267,7 @@ fn editable_document_view<'a>(
     {
         let mut actions: Vec<Element<'a, RepositoryAction>> =
             vec![crate::design::body(error).width(Length::Fill).into()];
-        if document.conflict || document.durability_warning.is_some() {
+        if document.conflict || document.durability_warning().is_some() {
             actions.push(
                 icon_button(Icon::Refresh, "Reload file from disk")
                     .on_press_maybe(
@@ -9137,7 +9285,7 @@ fn editable_document_view<'a>(
                     }))
                     .into(),
             );
-        } else if document.durability_warning.is_some() {
+        } else if document.durability_warning().is_some() {
             actions.push(
                 icon_button(Icon::Save, "Retry save")
                     .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
@@ -11437,6 +11585,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pure_foreign_root_candidate_cannot_publish_text_or_admit_save() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("file"), "same base").unwrap();
+        std::fs::write(b.path().join("file"), "same base").unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(), repository: a.path().to_owned(), worktree: a.path().to_owned(), selected_file: None,
+        });
+        assert!(runtime.set_original_editor_root(Arc::new(crate::fs_safety::Root::open(b.path()).unwrap())));
+        let task = runtime.update(RepositoryAction::OpenFile { card, path: "file".into() });
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(runtime.editor_text().is_none());
+        assert!(!runtime.take_lsp_intents().iter().any(|intent| matches!(intent, LspIntent::Open { .. })));
+        let window = Default::default();
+        assert!(runtime.configure_save_recovery(window, vec![a.path().to_owned(), b.path().to_owned()]));
+        assert_eq!(runtime.request_save(card, true).units(), 0);
+        assert_eq!(std::fs::read_to_string(a.path().join("file")).unwrap(), "same base");
+        assert_eq!(std::fs::read_to_string(b.path().join("file")).unwrap(), "same base");
+    }
+
+    #[tokio::test]
+    async fn file_worker_retains_original_root_across_later_reads_and_rejects_rebinding() {
+        let parent = tempfile::tempdir().unwrap();
+        let named = parent.path().join("checkout");
+        let moved = parent.path().join("original");
+        std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("one"), "original one").unwrap();
+        std::fs::write(named.join("two"), "original two").unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(), repository: named.clone(), worktree: named.clone(), selected_file: None,
+        });
+        let task = runtime.update(RepositoryAction::OpenFile { card, path: "one".into() });
+        finish_navigation_task(&mut runtime, task).await;
+        let original = runtime.retained_editor_root().expect("actual read root");
+        assert_eq!(runtime.editor_text().as_deref(), Some("original one"));
+        runtime.take_lsp_intents();
+        std::fs::rename(&named, &moved).unwrap();
+        std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("two"), "replacement two").unwrap();
+        let replacement = Arc::new(crate::fs_safety::Root::open(&named).unwrap());
+        assert!(!runtime.set_original_editor_root(replacement));
+        let task = runtime.update(RepositoryAction::OpenFile { card, path: "two".into() });
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(runtime.editor_text().is_none(), "replaced spelling must not publish original text as the replacement's LSP document");
+        assert!(!runtime.take_lsp_intents().iter().any(|intent| matches!(intent, LspIntent::Open { .. })));
+        assert!(Arc::ptr_eq(&original, &runtime.retained_editor_root().unwrap()));
+        assert_eq!(std::fs::read_to_string(named.join("two")).unwrap(), "replacement two");
     }
 
     #[tokio::test]

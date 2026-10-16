@@ -55,6 +55,7 @@ pub mod file_drop;
 pub mod file_icon;
 #[cfg(feature = "ui")]
 pub mod file_manager;
+mod filesystem_recovery_context;
 pub mod fs_safety;
 #[cfg(feature = "ui")]
 pub(crate) mod git_watch;
@@ -90,6 +91,9 @@ pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
+pub mod recovery_authority;
+#[cfg(feature = "ui")]
+pub mod operation_recovery;
 #[cfg(feature = "ui")]
 pub mod reorder;
 #[cfg(any(feature = "ui", feature = "host"))]

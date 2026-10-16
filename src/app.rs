@@ -25,6 +25,7 @@ mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod notification_ui;
+mod operation_recovery_ui;
 mod palette_ui;
 mod project_ui;
 mod pull_request_ui;
@@ -2366,9 +2367,11 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         action,
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::FileLoadedAt { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
+            | RepositoryAction::RetainedSaveFinished { .. }
             // A dropped page render leaves the viewer reading "Rendering
             // page" for a page it will never draw, because the fence that
             // accepts the result is the only thing that clears it.
@@ -4355,6 +4358,7 @@ pub enum Message {
     CancelResetSettings,
     SessionSaveHealthChanged(SessionSaveHealthEvent),
     Lsp(LspEvent),
+    OperationRecovery(crate::operation_recovery::Action),
     LanguageServersReaped,
     RetrySessionSave,
     SessionRecovery(session_recovery::Action),
@@ -4796,6 +4800,8 @@ pub struct Cagents {
     /// the jump waits for the open rather than landing on the wrong column.
     lsp_pending_jumps: HashMap<CardId, PendingLspJump>,
     next_lsp_document: u64,
+    operation_recovery: crate::operation_recovery::Shared,
+
     // A sweep is a full lifecycle reconcile plus a view rebuild, and scrolling
     // requests one per visibility transition, so requests are debounced onto a
     // single in-flight timer. `lifecycle_sweep_deadline` is `Some` exactly when
@@ -11788,6 +11794,11 @@ impl Cagents {
     /// application that spawned it. The wait is bounded by the module's own
     /// reap timeout, so a server that refuses to die cannot hold the exit.
     fn exit_after_language_servers(&mut self) -> Task<Message> {
+        if self.operation_recovery_pending() {
+            self.status = Some(TransientNotice::error("Finish or resolve retained file operations before closing this window."));
+            return Task::none();
+        }
+
         if self.exit.is_some() {
             return Task::none();
         }
@@ -11905,6 +11916,8 @@ impl Cagents {
     }
 
     fn window_close_transient_blocker(&self) -> Option<&'static str> {
+        if self.operation_recovery_pending() { return Some("Finish or resolve retained file operations before closing this window."); }
+
         if let Some(blocker) = self.automation_ui.draft_close_blocker() {
             return Some(blocker);
         }
@@ -12986,6 +12999,7 @@ impl Application for Cagents {
             lsp_contexts: HashMap::new(),
             lsp_pending_jumps: HashMap::new(),
             next_lsp_document: 0,
+            operation_recovery: Default::default(),
             terminal_wake_tx,
             terminal_wake_rx,
             hosted_terminals_rx,
@@ -14065,7 +14079,20 @@ impl Application for Cagents {
                     value,
                 })
             }
+            Message::OperationRecovery(action) => {
+                let task = self.operation_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner).update(action);
+
+                let mut tasks = vec![task.map(Message::OperationRecovery).map(cosmic::Action::App)];
+                for (card, runtime) in &mut self.cards {
+                    if let CardRuntime::Repository(runtime) = runtime { tasks.push(repository_task(runtime.reconcile_operation_recovery(*card))); }
+                }
+                Task::batch(tasks)
+            }
             Message::Repository(action) => {
+                self.retain_repository_operation(&action);
+                if matches!(&action, RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. })
+                    && !self.prepare_editor_save(action.card()) { return Task::none(); }
+
                 if let RepositoryAction::DiffAnnotations {
                     identity,
                     review_revision,
@@ -14095,10 +14122,11 @@ impl Application for Cagents {
                     _ => None,
                 };
                 let basis_resolved = matches!(action, RepositoryAction::DiffBasisResolved { .. });
-                let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
+                let save_finished = matches!(action, RepositoryAction::SaveFinished { .. } | RepositoryAction::RetainedSaveFinished { .. });
                 let saved = matches!(
                     &action,
                     RepositoryAction::SaveFinished { result: Ok(_), .. }
+                        | RepositoryAction::RetainedSaveFinished { result: Ok(_), .. }
                 );
                 // A parked source-control navigation is answered by the very
                 // file list it is waiting on, and only after the card has taken
@@ -15217,7 +15245,9 @@ impl Application for Cagents {
                 session,
                 result,
             } => self.completed_terminal_closed(card, session, result),
-            Message::SaveAndCloseRepository(id) => match self.cards.get_mut(&id) {
+            Message::SaveAndCloseRepository(id) => {
+                if !self.prepare_editor_save(id) { return Task::none(); }
+                match self.cards.get_mut(&id) {
                 Some(CardRuntime::Repository(runtime))
                     if self
                         .dirty_repository_close
@@ -15227,8 +15257,11 @@ impl Application for Cagents {
                     repository_task(runtime.request_save(id, false))
                 }
                 _ => Task::none(),
+                }
             },
-            Message::OverwriteAndCloseRepository(id) => match self.cards.get_mut(&id) {
+            Message::OverwriteAndCloseRepository(id) => {
+                if !self.prepare_editor_save(id) { return Task::none(); }
+                match self.cards.get_mut(&id) {
                 Some(CardRuntime::Repository(runtime))
                     if self
                         .dirty_repository_close
@@ -15238,6 +15271,7 @@ impl Application for Cagents {
                     repository_task(runtime.request_save(id, true))
                 }
                 _ => Task::none(),
+                }
             },
             Message::DiscardAndCloseRepository(id) => {
                 if self
@@ -17511,6 +17545,7 @@ impl Application for Cagents {
             .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
         let surface: Element<'_, Message> = widget::column::with_children(vec![
             surface,
+            self.operation_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner).view().map(Message::OperationRecovery),
             self.daemon_health_banner(),
             self.automation_approval_banner(),
             bar,
@@ -25342,6 +25377,7 @@ mod tests {
             lsp_contexts: HashMap::new(),
             lsp_pending_jumps: HashMap::new(),
             next_lsp_document: 0,
+            operation_recovery: Default::default(),
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,

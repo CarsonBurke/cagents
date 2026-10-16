@@ -46,6 +46,7 @@ const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 
 mod checkout;
 mod notification_ui;
+mod operation_recovery_ui;
 
 #[derive(Clone)]
 pub struct Flags {
@@ -207,6 +208,7 @@ pub enum Message {
     SettingsSaved(Result<(), String>),
     FileRevealed(Result<cagents::file_manager::RevealOutcome, String>),
     Lsp(u64, Option<LspEvent>),
+    OperationRecovery(cagents::operation_recovery::Action),
     Complete,
     Hover,
     Completion(CardId, usize),
@@ -507,6 +509,7 @@ pub struct Editor {
     lsp: LspManager,
     language_server_assistance: bool,
     next_document: u64,
+    operation_recovery: cagents::operation_recovery::Shared,
     restoring_session: bool,
     saved_session: crate::preferences::Session,
     sidebar_open: bool,
@@ -686,6 +689,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectoryListed { .. }
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::FileLoadedAt { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
@@ -693,6 +697,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::FindLoaded { .. }
             | RepositoryAction::FindReplacementLoaded { .. }
             | RepositoryAction::SaveFinished { .. }
+            | RepositoryAction::RetainedSaveFinished { .. }
             | RepositoryAction::PdfPageRendered { .. }
             | RepositoryAction::DiagramsRendered { .. }
             | RepositoryAction::MarkdownDue { .. }
@@ -2087,6 +2092,8 @@ impl Editor {
     }
 
     fn continue_exit(&mut self) -> Task<Message> {
+        if self.operation_recovery_pending() { self.exiting = false; self.notice = Some("Finish or resolve retained file operations before closing this window.".into()); return Task::none(); }
+
         if let Some(tab) = self.tabs.first() {
             return self.request_close(tab.id);
         }
@@ -3015,6 +3022,7 @@ impl Application for Editor {
             lsp,
             language_server_assistance,
             next_document: 1,
+            operation_recovery: Default::default(),
             restoring_session: !startup_paths.is_empty(),
             saved_session,
             sidebar_open,
@@ -3352,6 +3360,8 @@ impl Application for Editor {
                 }
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
+                    if self.operation_recovery_pending() { self.notice = Some("Finish or resolve retained file operations before closing this window.".into()); return Task::none(); }
+
                     if self
                         .checkout_dialog
                         .as_ref()
@@ -3442,7 +3452,18 @@ impl Application for Editor {
                 Message::Repository(RepositoryAction::Review { card, action }) => {
                     self.handle_review(card, action)
                 }
+                Message::OperationRecovery(action) => {
+                    let task = self.operation_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner).update(action);
+
+                    let mut tasks = vec![task.map(Message::OperationRecovery).map(cosmic::Action::App)];
+                    for tab in &mut self.tabs { tasks.push(repository_task(tab.runtime.reconcile_operation_recovery(tab.id))); }
+                    Task::batch(tasks)
+                }
                 Message::Repository(action) => {
+                    self.retain_repository_operation(&action);
+                    if matches!(&action, RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. })
+                        && !self.prepare_editor_save(action.card()) { return Task::none(); }
+
                     if let RepositoryAction::DiffAnnotations {
                         identity,
                         review_revision,
@@ -3556,10 +3577,10 @@ impl Application for Editor {
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
-                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. })
+                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. } | RepositoryAction::FileLoadedAt { .. })
                         && self.active == Some(id)
                         && !self.modal_open();
-                    let saved = matches!(action, RepositoryAction::SaveFinished { .. });
+                    let saved = matches!(action, RepositoryAction::SaveFinished { .. } | RepositoryAction::RetainedSaveFinished { .. });
                     let back_to_files = matches!(action, RepositoryAction::BackToFiles { .. });
                     let Some(tab) = self.tab_mut(id) else {
                         return Task::none();
@@ -4658,6 +4679,8 @@ impl Application for Editor {
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
         body.push(design::horizontal_rule().into());
+        body.push(self.operation_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner).view().map(Message::OperationRecovery));
+
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
             let mut toolbar_controls = Vec::new();
@@ -5995,6 +6018,7 @@ mod tests {
             lsp: LspManager::new(Vec::new()),
             language_server_assistance: false,
             next_document: 1,
+            operation_recovery: Default::default(),
             restoring_session: false,
             saved_session: crate::preferences::Session::default(),
             sidebar_open: true,
