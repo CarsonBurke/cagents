@@ -436,6 +436,57 @@ mod tests {
         }
     }
     #[test]
+    fn discard_inspector_rendered_controls_carry_the_original_snapshot_actor() {
+        use cosmic::iced::{Event, Rectangle, Size, advanced::{Layout, Shell, clipboard, layout, mouse, widget::{Tree, operation}}, keyboard};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_model.source_control.as_ref().unwrap().key.clone();
+        app.discard_ui.select(Some(key));
+        let original = app.discard_ui.source().unwrap().id;
+        app.context_tab = ContextTab::Changes;
+        let renderer = cosmic::Renderer::with_backend(
+            &iced::graphics::Settings::default(), None, Some("tiny-skia"),
+        ).unwrap();
+        let mut element = app.context_panel(None, 380.0);
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(380.0, 4_000.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree, &renderer, &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        fn identities(tree: &Tree, found: &mut Vec<widget::Id>) {
+            found.extend(tree.id.clone());
+            for child in &tree.children { identities(child, found); }
+        }
+        let mut ids = Vec::new();
+        identities(&tree, &mut ids);
+        let enter = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+        });
+        let mut fired = Vec::new();
+        for id in ids {
+            let mut focus = operation::focusable::focus::<()>(id);
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+            element.as_widget_mut().update(
+                &mut tree, &enter, Layout::new(&node), mouse::Cursor::Unavailable,
+                &renderer, &mut clipboard::Null, &mut Shell::new(&mut fired), &viewport,
+            );
+        }
+        assert!(fired.iter().any(|message| matches!(message,
+            Message::SidebarSnapshot { source, action } if *source == original && matches!(&**action,
+                SidebarAction::RequestDiscard { .. } | SidebarAction::ChangeGroup { command: sidebar::ChangeGroupCommand::Discard, .. }
+            )
+        )), "the actual inspector Changes widget must emit an original-source discard command");
+        assert!(!fired.iter().any(|message| matches!(message,
+            Message::Sidebar(SidebarAction::RequestDiscard { .. } | SidebarAction::ChangeGroup { command: sidebar::ChangeGroupCommand::Discard, .. })
+        )), "no destructive inspector command may bypass the source envelope");
+    }
+
+    #[test]
     fn discard_supplied_original_survives_release_and_never_recaptures_on_focus_return() {
         let (temp, original) = source();
         let authority = original.authority.get().unwrap().clone().unwrap();
