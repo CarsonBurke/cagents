@@ -95,6 +95,16 @@ impl Cagents {
                 _ => TransientNotice::success(message),
             });
         }
+        // A due timer may have been consumed while an existing language
+        // dialog refused formatting. Its dirty buffer remains the obligation;
+        // rearm every eligible native timer when that controller settles.
+        if !self.editor_features.pending() {
+            for (card, runtime) in &mut self.cards {
+                if let CardRuntime::Repository(runtime) = runtime {
+                    tasks.push(repository_task(runtime.auto_save_task(*card)));
+                }
+            }
+        }
         self.refresh_editor_feature_support();
         Task::batch(tasks)
     }

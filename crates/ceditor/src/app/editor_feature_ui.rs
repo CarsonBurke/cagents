@@ -11,7 +11,15 @@ impl Editor {
             || self.notices_open
             || self.pending_discard().is_some();
         Admission {
-            writable: !self.exiting,
+            // A committed window exit can still save its exact dirty-close
+            // target. Other requests remain fenced by the closing modal and
+            // the save_after + exact-card admission check.
+            writable: !self.operation_recovery_pending()
+                && (!self.exiting || self.closing.is_some())
+                && !self
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.mutation == Some(MutationKind::Discard)),
             other_modal: upper || self.closing.is_some(),
             close_save: if upper { None } else { self.closing },
         }
@@ -88,6 +96,14 @@ impl Editor {
         }
         for (_, message) in effects.notices {
             self.notice = Some(message);
+        }
+        // A due timer may have been consumed while an existing language
+        // dialog refused formatting. Its dirty buffer remains the obligation;
+        // rearm every eligible native timer when that controller settles.
+        if !self.editor_features.pending() {
+            for tab in &mut self.tabs {
+                tasks.push(repository_task(tab.runtime.auto_save_task(tab.id)));
+            }
         }
         self.refresh_editor_feature_support();
         Task::batch(tasks)

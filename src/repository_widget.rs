@@ -4642,6 +4642,19 @@ impl RepositoryRuntime {
         }
     }
 
+    pub(crate) fn workspace_edit_native_snapshot(
+        &self,
+    ) -> Option<(PathBuf, text_editor::TextSnapshot, i32)> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        Some((
+            self.descriptor.worktree.join(&document.source),
+            document.content.text_snapshot(),
+            document.lsp_version,
+        ))
+    }
+
     pub(crate) fn workspace_edit_snapshot_size(&self) -> usize {
         match &self.document {
             DocumentState::Editable(document) => document.content.text_len(),

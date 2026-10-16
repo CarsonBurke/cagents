@@ -21,6 +21,43 @@ use std::{
     time::Duration,
 };
 
+fn control_id(ticket: u64, control: &str) -> widget::Id {
+    widget::Id::new(format!("editor.language.{ticket}.{control}"))
+}
+
+struct CapturedOpen {
+    path: PathBuf,
+    source: crate::repository_widget::text_editor::TextSnapshot,
+    version: i32,
+    protocol_version: Option<i32>,
+    incarnation: LspDocumentIncarnation,
+}
+/// Complete source text is serialized only inside the preparation worker.
+fn materialize_snapshots(
+    captured: Vec<CapturedOpen>,
+) -> Result<HashMap<PathBuf, workspace::OpenSnapshot>, String> {
+    let mut open = HashMap::<PathBuf, workspace::OpenSnapshot>::new();
+    for captured in captured {
+        let snapshot = workspace::OpenSnapshot {
+            text: captured.source.text(),
+            version: captured.version,
+            protocol_version: captured.protocol_version,
+            protocol_incarnation: Some(captured.incarnation),
+            writable: true,
+        };
+        if let Some(previous) = open.insert(captured.path, snapshot.clone()) {
+            if previous.text != snapshot.text
+                || previous.version != snapshot.version
+                || previous.protocol_version != snapshot.protocol_version
+                || previous.protocol_incarnation != snapshot.protocol_incarnation
+            {
+                return Err("Two open views of the same file disagree".into());
+            }
+        }
+    }
+    Ok(open)
+}
+
 type Buffers<'a> = [(CardId, &'a mut RepositoryRuntime)];
 
 #[derive(Debug, Clone)]
@@ -311,7 +348,7 @@ impl State {
                     && runtime.editor_selection_range() == operation.selection
             })
     }
-    fn reject(operation: &Operation, lsp: &LspManager, reason: &str) {
+    fn reject(operation: &Operation, lsp: &mut LspManager, reason: &str) {
         if let Some(id) = operation.server {
             lsp.respond_workspace_edit(id, false, Some(reason.into()));
         }
@@ -412,8 +449,8 @@ impl State {
         paths: &[PathBuf],
         lsp: &LspManager,
         buffers: &Buffers<'_>,
-    ) -> Result<HashMap<PathBuf, workspace::OpenSnapshot>, String> {
-        let mut open = HashMap::<PathBuf, workspace::OpenSnapshot>::new();
+    ) -> Result<Vec<CapturedOpen>, String> {
+        let mut open = Vec::new();
         let mut bytes = 0usize;
         for (_, runtime) in buffers {
             if !runtime
@@ -429,27 +466,22 @@ impl State {
             if !runtime.editor_feature_writable() {
                 return Err("The target is not a current writable original-root buffer".into());
             }
-            let (path, mut snapshot) = runtime
-                .workspace_edit_snapshot()
+            let (path, source, version) = runtime
+                .workspace_edit_native_snapshot()
                 .ok_or("Wait for the target to finish loading")?;
             let doc = runtime
                 .lsp_document()
                 .ok_or("An open target is not synchronized with its language server")?;
-            snapshot.protocol_version = lsp.document_version(doc);
-            snapshot.protocol_incarnation = lsp.document_incarnation(doc);
-            if snapshot.protocol_incarnation.is_none() {
-                return Err("An edited document was closed or reopened".into());
-            }
-            if let Some(previous) = open.insert(path, snapshot.clone()) {
-                if previous.text != snapshot.text
-                    || previous.version != snapshot.version
-                    || previous.protocol_version != snapshot.protocol_version
-                    || previous.protocol_incarnation != snapshot.protocol_incarnation
-                    || previous.writable != snapshot.writable
-                {
-                    return Err("Two open views of the same file disagree".into());
-                }
-            }
+            let incarnation = lsp
+                .document_incarnation(doc)
+                .ok_or("An edited document was closed or reopened")?;
+            open.push(CapturedOpen {
+                path,
+                source,
+                version,
+                protocol_version: lsp.document_version(doc),
+                incarnation,
+            });
         }
         Ok(open)
     }
@@ -871,7 +903,13 @@ impl State {
                     Ok((targets, open)) => {
                         effects.task = cosmic::task::future(async move {
                             let result = tokio::task::spawn_blocking(move || {
-                                workspace::prepare_resolved(Arc::unwrap_or_clone(targets), &open)
+                                materialize_snapshots(open)
+                                    .and_then(|open| {
+                                        workspace::prepare_resolved(
+                                            Arc::unwrap_or_clone(targets),
+                                            &open,
+                                        )
+                                    })
                                     .map(Arc::new)
                             })
                             .await
@@ -924,6 +962,15 @@ impl State {
                         return effects;
                     }
                 };
+                if !admission.permits(&operation) {
+                    Self::reject(
+                        &operation,
+                        lsp,
+                        "The window changed while preparing the edit",
+                    );
+                    effects.error("The language edit was canceled because another dialog or window operation is active");
+                    return effects;
+                }
                 let needs_preview = operation.kind == LspEditKind::Rename
                     || operation.confirmation
                     || plan.documents.len() > 1
@@ -1137,7 +1184,10 @@ impl State {
                 else {
                     return;
                 };
-                if !Self::choice_current(&operation, lsp, buffers) || self.dialog_open() {
+                if !admission.permits(&operation)
+                    || !Self::choice_current(&operation, lsp, buffers)
+                    || self.dialog_open()
+                {
                     return;
                 }
                 let Some(range) = range else {
@@ -1156,8 +1206,7 @@ impl State {
                         operation,
                         draft,
                     });
-                    effects.task =
-                        iced::widget::operation::focus(widget::Id::new("editor.language.rename"));
+                    effects.task = iced::widget::operation::focus(control_id(ticket, "rename"));
                 }
             }
             LspEvent::WorkspaceEdit {
@@ -1175,7 +1224,7 @@ impl State {
                 let Some(operation) = self.take_request(request, doc, stage) else {
                     return;
                 };
-                if Self::current(&operation, lsp, buffers) {
+                if admission.permits(&operation) && Self::current(&operation, lsp, buffers) {
                     self.prepare(operation, edit, lsp, effects);
                 }
             }
@@ -1187,7 +1236,8 @@ impl State {
                 let Some(operation) = self.take_request(request, doc, RequestKind::Actions) else {
                     return;
                 };
-                if Self::choice_current(&operation, lsp, buffers)
+                if admission.permits(&operation)
+                    && Self::choice_current(&operation, lsp, buffers)
                     && !self.dialog_open()
                     && let Some(ticket) = self.ticket()
                 {
@@ -1202,9 +1252,8 @@ impl State {
                             operation,
                             items,
                         });
-                        effects.task = iced::widget::operation::focus(widget::Id::new(
-                            "editor.language.action.0",
-                        ));
+                        effects.task =
+                            iced::widget::operation::focus(control_id(ticket, "action.0"));
                     }
                 }
             }
@@ -1212,8 +1261,10 @@ impl State {
                 let Some(operation) = self.take_request(request, doc, RequestKind::Resolve) else {
                     return;
                 };
-                if Self::current(&operation, lsp, buffers) {
+                if admission.permits(&operation) && Self::current(&operation, lsp, buffers) {
                     self.action_edit(operation, item, lsp, effects);
+                } else {
+                    effects.error("The resolved action was refused because the window or source changed; request it again");
                 }
             }
             LspEvent::SignatureHelp { request, doc, help } => {
@@ -1284,21 +1335,34 @@ impl State {
     /// Only the bounded list is mounted; source comparisons use the ordinary
     /// virtualized diff renderer rather than materializing one row per line.
     pub fn view(&self) -> Option<Element<'_, Action>> {
+        let ticket = self
+            .rename
+            .as_ref()
+            .map(|value| value.ticket)
+            .or_else(|| self.choices.as_ref().map(|value| value.ticket))
+            .or_else(|| self.preview.as_ref().map(|value| value.ticket))?;
+        // A queued mouse release must never inherit the pressed state of a
+        // different dialog, even when Cancel and replacement share a frame.
+        Some(iced::widget::keyed_column([(ticket, self.view_unkeyed()?)]).into())
+    }
+    fn view_unkeyed(&self) -> Option<Element<'_, Action>> {
         if let Some(rename) = &self.rename {
             let ticket = rename.ticket;
             return Some(
                 widget::column::with_children(vec![
                     widget::text::title3("Rename symbol").into(),
                     widget::text_input("New name", &rename.draft)
-                        .id(widget::Id::new("editor.language.rename"))
+                        .id(control_id(ticket, "rename"))
                         .on_input(move |value| Action::RenameDraft { ticket, value })
                         .on_submit(move |value| Action::RenameSubmit { ticket, value })
                         .into(),
                     widget::row::with_children(vec![
                         widget::button::standard("Cancel")
+                            .id(control_id(ticket, "cancel"))
                             .on_press(Action::Cancel(ticket))
                             .into(),
                         widget::button::suggested("Preview rename")
+                            .id(control_id(ticket, "submit"))
                             .on_press_maybe((!rename.draft.trim().is_empty()).then(|| {
                                 Action::RenameSubmit {
                                     ticket,
@@ -1326,7 +1390,7 @@ impl State {
                         None => item.title.clone(),
                     };
                     widget::button::standard(label)
-                        .id(widget::Id::new(format!("editor.language.action.{index}")))
+                        .id(control_id(ticket, &format!("action.{index}")))
                         .on_press_maybe(
                             item.disabled
                                 .is_none()
@@ -1342,6 +1406,7 @@ impl State {
                         .height(Length::Fixed(360.0))
                         .into(),
                     widget::button::standard("Cancel")
+                        .id(control_id(ticket, "cancel"))
                         .on_press(Action::Cancel(ticket))
                         .into(),
                 ])
@@ -1456,6 +1521,7 @@ impl State {
         rows.push(
             widget::row::with_children(vec![
                 widget::button::standard("Cancel")
+                    .id(control_id(ticket, "cancel"))
                     .on_press_maybe((!preview.validating).then_some(Action::Cancel(ticket)))
                     .into(),
                 widget::button::suggested(if preview.validating {
@@ -1463,6 +1529,7 @@ impl State {
                 } else {
                     "Apply to buffers"
                 })
+                .id(control_id(ticket, "apply"))
                 .on_press_maybe((!preview.validating).then_some(Action::Apply(ticket)))
                 .into(),
             ])
@@ -1638,5 +1705,36 @@ pub(crate) mod tests {
             std::fs::read_to_string(parent.path().join("original/main.rs")).unwrap(),
             "foo"
         );
+    }
+    #[test]
+    fn controller_snapshot_capture_keeps_native_text_off_the_ui_turn() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let card = CardId::new();
+                let fixture = Fixture::new(card).await;
+                let mut runtime = fixture.runtime;
+                let mut manager = fixture.manager;
+                let path = runtime.workspace_edit_candidate_source().unwrap();
+                crate::repository_widget::text_editor::take_text_call_count();
+                let captured =
+                    State::snapshots(&[path.clone()], &manager, &[(card, &mut runtime)]).unwrap();
+                assert_eq!(
+                    crate::repository_widget::text_editor::take_text_call_count(),
+                    0
+                );
+                let open = tokio::task::spawn_blocking(move || materialize_snapshots(captured))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&*open[&path].text, "foo();\n");
+                assert_eq!(
+                    crate::repository_widget::text_editor::take_text_call_count(),
+                    0
+                );
+                manager.begin_shutdown().await;
+            });
     }
 }

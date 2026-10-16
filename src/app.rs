@@ -15350,6 +15350,17 @@ impl Application for Cagents {
                 result,
             } => self.completed_terminal_closed(card, session, result),
             Message::SaveAndCloseRepository(id) => {
+                if self
+                    .dirty_repository_close
+                    .as_ref()
+                    .is_some_and(|close| close.card == id)
+                    && let Some(action) = self.editor_format_before_save(&RepositoryAction::Save {
+                        card: id,
+                        overwrite: false,
+                    })
+                {
+                    return self.update_editor_features(action);
+                }
                 if !self.prepare_editor_save(id) {
                     return Task::none();
                 }
@@ -27985,6 +27996,7 @@ mod tests {
                     LspEvent::PrepareRename { .. }
                         | LspEvent::WorkspaceEdit { .. }
                         | LspEvent::CodeActions { .. }
+                        | LspEvent::CodeActionResolved { .. }
                         | LspEvent::SignatureHelp { .. }
                         | LspEvent::CommandExecuted { .. }
                         | LspEvent::RequestFailed { .. }
@@ -27997,9 +28009,10 @@ mod tests {
         .expect("framed feature response")
     }
     async fn language_controller_fixture() -> (Cagents, tempfile::TempDir, CardId) {
-        let mut app = lsp_test_app();
-        let card = app.workspace.focused().unwrap();
+        let (mut app, card) = editing_repository_app();
         let fixture = crate::editor_features::tests::Fixture::new(card).await;
+        app.card_state_mut(card).unwrap().kind =
+            CardKind::Repository(fixture.runtime.descriptor.clone());
         app.lsp = fixture.manager;
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(fixture.runtime)));
@@ -28130,6 +28143,370 @@ mod tests {
                         "foo();\n"
                     );
                     app.lsp.begin_shutdown().await;
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn held_resolved_command_cannot_cross_the_actual_window_freeze() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                language_test(async {
+                    use crate::editor_features::Action;
+                    let (mut app, _directory, card) = language_controller_fixture().await;
+                    let events = app.lsp.events();
+                    drop(app.update(Message::EditorFeatures(Action::CodeActions(card))));
+                    let event = next_language_event(&events).await;
+                    assert!(matches!(event, LspEvent::CodeActions { .. }));
+                    drop(app.update(Message::Lsp(event)));
+                    let Some(Action::Cancel(ticket)) = app.editor_features.escape() else {
+                        panic!("actual framed choices")
+                    };
+                    drop(app.update(Message::EditorFeatures(Action::ChooseAction {
+                        ticket,
+                        index: 2,
+                    })));
+                    let resolved = next_language_event(&events).await;
+                    assert!(matches!(resolved, LspEvent::CodeActionResolved { .. }));
+                    app.update_prepared = true;
+                    drop(app.update(Message::Lsp(resolved)));
+                    assert!(
+                        !app.editor_features.pending(),
+                        "a command admission would retain its actual Command request"
+                    );
+                    assert!(app.status.as_ref().unwrap().message.contains("refused"));
+                    app.lsp.begin_shutdown().await;
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn pending_rename_reply_keeps_a_newer_upper_dialog_in_control() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                language_test(async {
+                    use crate::editor_features::Action;
+                    let (mut app, _directory, card) = language_controller_fixture().await;
+                    let events = app.lsp.events();
+                    drop(app.update(Message::EditorFeatures(Action::Rename(card))));
+                    let response = next_language_event(&events).await;
+                    app.settings_reset_confirm = true;
+                    let task = app.update(Message::Lsp(response));
+                    assert_eq!(
+                        task.units(),
+                        0,
+                        "late rename must not focus a field behind the upper dialog"
+                    );
+                    assert!(!app.editor_features.dialog_open());
+                    assert!(app.settings_reset_confirm);
+                    app.lsp.begin_shutdown().await;
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn next_language_task_message(task: Task<Message>) -> Message {
+        let mut stream = iced::runtime::task::into_stream(task).expect("actual task");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                return message;
+            }
+        }
+        panic!("expected an actual task message");
+    }
+    #[test]
+    fn dirty_close_save_uses_the_real_format_request_before_any_disk_write() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                language_test(async {
+                    let (mut app, directory, card) = language_controller_fixture().await;
+                    let events = app.lsp.events();
+                    if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) {
+                        runtime.move_cursor_to(LspPosition::new(0, 6));
+                    }
+                    let task = app.update(Message::Repository(RepositoryAction::EditorAction {
+                        card,
+                        action: repository_widget::EditorAction::Edit(
+                            repository_widget::EditorEdit::Insert(' '),
+                        ),
+                    }));
+                    drop(task);
+                    drop(app.update(Message::CloseCard(card)));
+                    assert_eq!(
+                        app.dirty_repository_close.as_ref().map(|close| close.card),
+                        Some(card)
+                    );
+                    let task = app.update(Message::SaveAndCloseRepository(card));
+                    assert_eq!(
+                        task.units(),
+                        0,
+                        "the formatting request is protocol work, not a disk task"
+                    );
+                    let response = next_language_event(&events).await;
+                    assert!(matches!(
+                        response,
+                        LspEvent::WorkspaceEdit {
+                            kind: crate::lsp::LspEditKind::Formatting,
+                            ..
+                        }
+                    ));
+                    let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
+                        unreachable!()
+                    };
+                    assert!(!runtime.is_saving());
+                    assert_eq!(
+                        std::fs::read_to_string(directory.path().join("main.rs")).unwrap(),
+                        "foo();\n"
+                    );
+                    app.editor_features.cancel_all(&mut app.lsp);
+                    app.lsp.begin_shutdown().await;
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn autosave_due_refused_by_language_dialog_is_rearmed_after_actual_cancel() {
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| language_test(async {
+            use crate::editor_features::Action;
+            let (mut app, _directory, card) = language_controller_fixture().await;
+            let events = app.lsp.events();
+            if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) { runtime.move_cursor_to(LspPosition::new(0, 6)); }
+            drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert(' ')) })));
+            let due = if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) { runtime.set_auto_save(true); repository_task(runtime.auto_save_task(card)) } else { unreachable!() };
+            drop(app.update(Message::EditorFeatures(Action::Rename(card))));
+            let reply = next_language_event(&events).await; drop(app.update(Message::Lsp(reply)));
+            let Some(Action::Cancel(dialog)) = app.editor_features.escape() else { panic!("actual rename field") };
+            let message = next_language_task_message(due).await;
+            let Message::Repository(RepositoryAction::AutoSaveDue { ticket: old, revision, .. }) = &message else { panic!("actual autosave due") };
+            let (old, revision) = (*old, *revision);
+            drop(app.update(message));
+            let cancel = app.update(Message::EditorFeatures(Action::Cancel(dialog)));
+            assert!(!app.editor_features.pending());
+            let next = next_language_task_message(cancel).await;
+            assert!(matches!(next, Message::Repository(RepositoryAction::AutoSaveDue { identity, revision: current, ticket }) if identity.card == card && current == revision && ticket > old));
+            app.lsp.begin_shutdown().await;
+        })).unwrap().join().unwrap();
+    }
+    fn language_dialog_frame(
+        element: &mut Element<'_, Message>,
+        tree: &mut cosmic::iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+    ) -> (
+        cosmic::iced::advanced::layout::Node,
+        HashMap<String, cosmic::iced::Rectangle>,
+    ) {
+        use cosmic::iced::advanced::{
+            Layout, layout,
+            widget::{Operation, operation::Focusable},
+        };
+        struct Bounds(HashMap<String, cosmic::iced::Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: cosmic::iced::Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+        }
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(
+                cosmic::iced::Size::ZERO,
+                cosmic::iced::Size::new(1000.0, 900.0),
+            ),
+        );
+        let mut bounds = Bounds(HashMap::new());
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut bounds);
+        (node, bounds.0)
+    }
+
+    fn language_dialog_pointer_event(
+        element: &mut Element<'_, Message>,
+        tree: &mut cosmic::iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        node: &cosmic::iced::advanced::layout::Node,
+        point: cosmic::iced::Point,
+        event: cosmic::iced::mouse::Event,
+    ) -> Vec<Message> {
+        use cosmic::iced::{
+            Event, Rectangle, Size,
+            advanced::{Layout, Shell, clipboard},
+            mouse,
+        };
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            tree,
+            &Event::Mouse(event),
+            Layout::new(node),
+            mouse::Cursor::Available(point),
+            renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &Rectangle::with_size(Size::new(1000.0, 900.0)),
+        );
+        messages
+    }
+
+    async fn open_language_dialog_for_control(
+        app: &mut Cagents,
+        card: CardId,
+        events: &async_channel::Receiver<LspEvent>,
+        role: &str,
+    ) -> u64 {
+        use crate::editor_features::Action;
+        drop(app.update(Message::EditorFeatures(if role == "action.0" {
+            Action::CodeActions(card)
+        } else {
+            Action::Rename(card)
+        })));
+        let response = next_language_event(events).await;
+        drop(app.update(Message::Lsp(response)));
+        let Some(Action::Cancel(ticket)) = app.editor_features.escape() else {
+            panic!("framed dialog")
+        };
+        if role != "apply" {
+            return ticket;
+        }
+        drop(app.update(Message::EditorFeatures(Action::RenameSubmit {
+            ticket,
+            value: "renamed".into(),
+        })));
+        let response = next_language_event(events).await;
+        let task = app.update(Message::Lsp(response));
+        drive_language_tasks(app, task).await;
+        let Some(Action::Cancel(ticket)) = app.editor_features.escape() else {
+            panic!("framed preview")
+        };
+        ticket
+    }
+    #[test]
+    fn native_language_press_cannot_transfer_to_a_new_dialog_without_an_empty_frame() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                language_test(async {
+                    use cosmic::iced::{
+                        advanced::widget::{Tree, tree},
+                        mouse,
+                    };
+                    for role in ["submit", "action.0", "apply"] {
+                        let (mut app, _directory, card) = language_controller_fixture().await;
+                        let events = app.lsp.events();
+                        let old =
+                            open_language_dialog_for_control(&mut app, card, &events, role).await;
+                        let renderer = headless_renderer();
+                        let mut element = app.dialog().unwrap();
+                        let mut state = Tree::new(element.as_widget());
+                        let (node, bounds) =
+                            language_dialog_frame(&mut element, &mut state, &renderer);
+                        let point = bounds[&format!("editor.language.{old}.{role}")].center();
+                        assert!(
+                            language_dialog_pointer_event(
+                                &mut element,
+                                &mut state,
+                                &renderer,
+                                &node,
+                                point,
+                                mouse::Event::ButtonPressed(mouse::Button::Left)
+                            )
+                            .is_empty()
+                        );
+                        drop(element);
+                        let key = keyboard::Key::Named(keyboard::key::Named::Escape);
+                        drop(app.update(Message::KeyEvent {
+                            captured: true,
+                            event: keyboard::Event::KeyPressed {
+                                key: key.clone(),
+                                modified_key: key,
+                                physical_key: keyboard::key::Physical::Code(
+                                    keyboard::key::Code::Escape,
+                                ),
+                                location: keyboard::Location::Standard,
+                                modifiers: keyboard::Modifiers::empty(),
+                                text: None,
+                                repeat: false,
+                            },
+                        }));
+                        assert!(!app.editor_features.dialog_open());
+                        let current =
+                            open_language_dialog_for_control(&mut app, card, &events, role).await;
+                        assert_ne!(old, current);
+                        let mut element = app.dialog().unwrap();
+                        tree::NAMED.with(|named| *named.borrow_mut() = state.take_all_named());
+                        state.diff(element.as_widget_mut());
+                        iced::runtime::user_interface::restore_cached_named_states(&mut state);
+                        tree::NAMED.with(|named| named.borrow_mut().clear());
+                        let (node, bounds) =
+                            language_dialog_frame(&mut element, &mut state, &renderer);
+                        let point = bounds[&format!("editor.language.{current}.{role}")].center();
+                        assert!(
+                            language_dialog_pointer_event(
+                                &mut element,
+                                &mut state,
+                                &renderer,
+                                &node,
+                                point,
+                                mouse::Event::ButtonReleased(mouse::Button::Left)
+                            )
+                            .is_empty()
+                        );
+                        assert!(
+                            language_dialog_pointer_event(
+                                &mut element,
+                                &mut state,
+                                &renderer,
+                                &node,
+                                point,
+                                mouse::Event::ButtonPressed(mouse::Button::Left)
+                            )
+                            .is_empty()
+                        );
+                        let messages = language_dialog_pointer_event(
+                            &mut element,
+                            &mut state,
+                            &renderer,
+                            &node,
+                            point,
+                            mouse::Event::ButtonReleased(mouse::Button::Left),
+                        );
+                        assert!(
+                            messages.iter().any(|message| match message {
+                                Message::EditorFeatures(
+                                    crate::editor_features::Action::RenameSubmit { ticket, .. }
+                                    | crate::editor_features::Action::ChooseAction { ticket, .. },
+                                ) => *ticket == current,
+                                Message::EditorFeatures(crate::editor_features::Action::Apply(
+                                    ticket,
+                                )) => *ticket == current,
+                                _ => false,
+                            }),
+                            "a fresh click must still activate the current control"
+                        );
+                        drop(element);
+                        app.editor_features.cancel_all(&mut app.lsp);
+                        app.lsp.begin_shutdown().await;
+                    }
                 })
             })
             .unwrap()
