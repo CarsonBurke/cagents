@@ -11609,6 +11609,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_lsp_open_intents_keep_each_actual_read_root_after_pane_retarget() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("file.rs"), "fn original_a() {}").unwrap();
+        std::fs::write(b.path().join("file.rs"), "fn original_b() {}").unwrap();
+        let card = CardId::new();
+        let view = |path: &Path| RepositoryView { project: ProjectId::new(), repository: path.to_owned(), worktree: path.to_owned(), selected_file: Some("file.rs".into()) };
+        let mut runtime = RepositoryRuntime::new_directory(view(a.path()));
+        let task = runtime.initial_load(card);
+        finish_navigation_task(&mut runtime, task).await;
+        let original_a = runtime.retained_editor_root().unwrap();
+        let task = runtime.retarget_file(card, view(b.path()));
+        finish_navigation_task(&mut runtime, task).await;
+        let original_b = runtime.retained_editor_root().unwrap();
+        assert!(!Arc::ptr_eq(&original_a, &original_b));
+        assert_eq!(runtime.editor_text().as_deref(), Some("fn original_b() {}"));
+        let intents = runtime.take_lsp_intents();
+        let roots = intents.iter().filter_map(|intent| match intent { LspIntent::Open { root: Some(root), .. } => Some(root), _ => None }).collect::<Vec<_>>();
+        assert_eq!(roots.len(), 2);
+        assert!(Arc::ptr_eq(roots[0], &original_a));
+        assert!(Arc::ptr_eq(roots[1], &original_b));
+        assert!(intents.iter().any(|intent| matches!(intent, LspIntent::Close)));
+    }
+
+    #[tokio::test]
     async fn pure_foreign_root_candidate_cannot_publish_text_or_admit_save() {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
