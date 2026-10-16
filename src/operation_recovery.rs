@@ -20,6 +20,9 @@ struct PendingOperation {
     scope: PathBuf,
     started: bool,
     interrupted: bool,
+    // An unknown worker retains the SAME original read root, not a pathname
+    // recapture. This clone adds no descriptor and grants no cleanup action.
+    _root: Arc<crate::fs_safety::Root>,
 }
 
 /// The window installs this plain custody record before returning a lazy Task.
@@ -29,13 +32,13 @@ pub struct OperationTicket {
     state: Shared,
     id: Option<uuid::Uuid>,
 }
-pub fn begin_operation(state: &Shared, scope: PathBuf) -> Result<OperationTicket, String> {
+pub fn begin_operation(state: &Shared, scope: PathBuf, root: Arc<crate::fs_safety::Root>) -> Result<OperationTicket, String> {
     let mut store = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if store.operations.len() >= 32 || store.blocks(&scope) {
         return Err("Resolve or finish earlier file operations before changing files in this worktree.".into());
     }
     let id = uuid::Uuid::new_v4();
-    store.operations.insert(id, PendingOperation { scope, started: false, interrupted: false });
+    store.operations.insert(id, PendingOperation { scope, started: false, interrupted: false, _root: root });
     Ok(OperationTicket { state: state.clone(), id: Some(id) })
 }
 impl OperationTicket {
@@ -185,11 +188,13 @@ mod tests {
     #[test]
     fn window_custody_precedes_effects_and_typed_result_delivery() {
         let state = Arc::new(Mutex::new(State::default()));
-        let ticket = begin_operation(&state, "/a".into()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = Arc::new(crate::fs_safety::Root::open(directory.path()).unwrap());
+        let ticket = begin_operation(&state, "/a".into(), root.clone()).unwrap();
         assert!(state.lock().unwrap().is_pending());
         drop(ticket);
         assert!(!state.lock().unwrap().is_pending());
-        let ticket = begin_operation(&state, "/a".into()).unwrap();
+        let ticket = begin_operation(&state, "/a".into(), root.clone()).unwrap();
         ticket.start();
         let ready = Arc::new(AtomicBool::new(false));
         let authority = leaf(ready);
@@ -197,7 +202,7 @@ mod tests {
         // No message was delivered. The exact original is already in custody.
         assert_eq!(state.lock().unwrap().authority.as_ref(), Some(&authority));
         assert!(state.lock().unwrap().blocks(Path::new("/a")));
-        let interrupted = begin_operation(&state, "/b".into()).unwrap();
+        let interrupted = begin_operation(&state, "/b".into(), root.clone()).unwrap();
         interrupted.start();
         drop(interrupted);
         assert!(state.lock().unwrap().blocks(Path::new("/b")));

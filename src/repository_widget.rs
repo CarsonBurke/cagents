@@ -850,6 +850,10 @@ struct SaveTicket {
 }
 
 impl EditorDocument {
+    fn durability_warning(&self) -> Option<&str> {
+        if self.cleanup_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) { None }
+        else { self.durability_warning.as_deref() }
+    }
     fn new(
         path: PathBuf,
         source: PathBuf,
@@ -2209,13 +2213,16 @@ impl RepositoryRuntime {
     pub fn has_editor_recovery(&self) -> bool {
         self.editor_recovery.as_ref().is_some_and(|authority| !authority.is_resolved())
     }
-    pub fn reconcile_operation_recovery(&mut self, card: CardId) -> Task<RepositoryAction> {
+    fn clear_resolved_operation_recovery(&mut self) {
         if let DocumentState::Editable(document) = &mut self.document
             && document.cleanup_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) {
             document.cleanup_recovery = None;
             document.durability_warning = None;
         }
         if self.editor_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) { self.editor_recovery = None; }
+    }
+    pub fn reconcile_operation_recovery(&mut self, card: CardId) -> Task<RepositoryAction> {
+        self.clear_resolved_operation_recovery();
         self.auto_save_task(card)
     }
     pub fn retire_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) {
@@ -4393,7 +4400,7 @@ impl RepositoryRuntime {
     }
 
     pub fn can_save(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none())
+        matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning().is_some()) && document.active_save.is_none())
     }
 
     fn can_discard_edits(&self) -> bool {
@@ -4411,7 +4418,7 @@ impl RepositoryRuntime {
     pub fn blocks_navigation(&self) -> bool {
         self.has_editor_recovery() || self.is_dirty()
             || self.is_saving()
-            || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
+            || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning().is_some())
     }
 
     /// Whether abandoning the editor buffer is sufficient to release every
@@ -4425,12 +4432,12 @@ impl RepositoryRuntime {
             DocumentState::Editable(document)
                 if document.dirty
                     && document.active_save.is_none()
-                    && document.durability_warning.is_none()
+                    && document.durability_warning().is_none()
         )
     }
 
     pub fn has_durability_warning(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
+        matches!(&self.document, DocumentState::Editable(document) if document.durability_warning().is_some())
     }
 
     pub fn inspector_context(&self) -> RepositoryInspectorContext {
@@ -4446,7 +4453,7 @@ impl RepositoryRuntime {
             DocumentState::Loading => "Loading",
             DocumentState::Editable(_) if self.is_saving() => "Saving",
             DocumentState::Editable(document) if document.conflict => "Save conflict",
-            DocumentState::Editable(document) if document.durability_warning.is_some() => {
+            DocumentState::Editable(document) if document.durability_warning().is_some() => {
                 "Durability warning"
             }
             DocumentState::Editable(document) if document.error.is_some() => "Save failed",
@@ -4566,7 +4573,7 @@ impl RepositoryRuntime {
             // or navigation, because that disk-state fence stays installed.
             can_discard: self.can_discard_edits(),
             can_reload: conflict
-                || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
+                || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning().is_some())
                 || matches!(&self.document, DocumentState::Failed { .. }),
             can_retry_diff,
             can_show_diff: self.can_show_diff(),
@@ -4626,7 +4633,7 @@ impl RepositoryRuntime {
             DocumentState::Editable(document) => document
                 .error
                 .as_deref()
-                .or(document.durability_warning.as_deref()),
+                .or(document.durability_warning()),
             _ => None,
         }
     }
@@ -4656,7 +4663,7 @@ impl RepositoryRuntime {
                     && document.active_save.is_none()
                     && !document.conflict
                     && document.error.is_none()
-                    && document.durability_warning.is_none() =>
+                    && document.durability_warning().is_none() =>
             {
                 Some(document.revision)
             }
@@ -4702,6 +4709,7 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
+        self.clear_resolved_operation_recovery();
         if self.has_editor_recovery() { return Task::none(); }
         let Some(root) = self.original_editor_root.clone() else {
             if let DocumentState::Editable(document) = &mut self.document { document.error = Some("The original read root is unavailable; reopen this file before saving.".into()); }
@@ -4713,7 +4721,7 @@ impl RepositoryRuntime {
         };
         let (path, destination, text, disk_hash, revision) = match &self.document {
             DocumentState::Editable(document)
-                if (document.dirty || document.durability_warning.is_some())
+                if (document.dirty || document.durability_warning().is_some())
                     && document.active_save.is_none() =>
             {
                 (
@@ -4726,7 +4734,7 @@ impl RepositoryRuntime {
             }
             _ => return Task::none(),
         };
-        let operation = match crate::operation_recovery::begin_operation(&window, self.descriptor.worktree.clone()) {
+        let operation = match crate::operation_recovery::begin_operation(&window, self.descriptor.worktree.clone(), root.clone()) {
             Ok(operation) => operation,
             Err(error) => {
                 if let DocumentState::Editable(document) = &mut self.document { document.error = Some(error); }
@@ -4778,6 +4786,7 @@ impl RepositoryRuntime {
     }
 
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
+        self.clear_resolved_operation_recovery();
         if let Some(authority) = action.recovery_authority().filter(|authority| !authority.is_resolved()) {
             self.editor_recovery = Some(match self.editor_recovery.take().filter(|old| !old.is_resolved()) {
                 Some(old) => old.combine(authority.clone()),
@@ -8432,7 +8441,7 @@ fn editable_document_view<'a>(
     {
         let mut actions: Vec<Element<'a, RepositoryAction>> =
             vec![crate::design::body(error).width(Length::Fill).into()];
-        if document.conflict || document.durability_warning.is_some() {
+        if document.conflict || document.durability_warning().is_some() {
             actions.push(
                 icon_button(Icon::Refresh, "Reload file from disk")
                     .on_press_maybe(
@@ -8450,7 +8459,7 @@ fn editable_document_view<'a>(
                     }))
                     .into(),
             );
-        } else if document.durability_warning.is_some() {
+        } else if document.durability_warning().is_some() {
             actions.push(
                 icon_button(Icon::Save, "Retry save")
                     .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
