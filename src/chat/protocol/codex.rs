@@ -1478,6 +1478,22 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn answer_declines(&self, request_id: &str, action: &str) -> bool {
+        let Some(request) = self.requests.get(request_id) else {
+            return false;
+        };
+        let Some(choice) = request.actions.get(action) else {
+            return false;
+        };
+        match request.kind {
+            RequestKind::Decision | RequestKind::Elicitation => {
+                matches!(choice.as_str(), Some("decline" | "cancel"))
+            }
+            RequestKind::Permissions => action == "deny",
+            RequestKind::Questions => false,
+        }
+    }
+
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
@@ -3884,6 +3900,55 @@ mod tests {
         }
     }
 
+    /// Official app-server Thread.name and thread/name/updated threadName are
+    /// metadata, not evidence that every thread receives a generated title.
+    #[test]
+    fn supported_thread_names_follow_only_the_exact_codex_conversation() {
+        let mut adapter = adapter();
+        let mut restored = Step::default();
+        adapter.thread_state(&json!({"id":"thread-exact","name":"Encrypted bundle review","status":{"type":"idle"}}), &mut restored).unwrap();
+        assert!(restored.events.iter().any(|event| matches!(event,
+            Event::Session {id, title: Some(title)} if id == "thread-exact" && title == "Encrypted bundle review")));
+        assert!(
+            restored.writes.is_empty(),
+            "reusing a provider name requires no inference request"
+        );
+        let foreign = adapter.receive(json!({"method":"thread/name/updated","params":{"threadId":"other","threadName":"Foreign name"}})).unwrap();
+        assert!(
+            !foreign
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Session { .. }))
+        );
+        for name in [
+            Some("Bundle throughput audit"),
+            Some("My custom bundle review"),
+            Some("1341"),
+            Some("🔐"),
+            None,
+        ] {
+            let mut params = json!({"threadId":"thread-exact"});
+            if let Some(name) = name {
+                params["threadName"] = json!(name);
+            }
+            let update = adapter
+                .receive(json!({"method":"thread/name/updated","params":params}))
+                .unwrap();
+            let names = update
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Session { id, title } => Some((id.as_str(), title.as_deref())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec![("thread-exact", name)]);
+            assert!(update.writes.is_empty());
+        }
+        // Identity-only None preservation is covered at the actual Runtime
+        // boundary, which owns the current displayed name and Reset behavior.
+    }
+
     #[test]
     fn attention_requires_explicit_settlement_of_the_bound_thread() {
         use crate::notifications::Kind;
@@ -5735,6 +5800,145 @@ mod tests {
                 .iter()
                 .any(|frame| frame["method"] == "thread/turns/list")
         );
+    }
+
+    /// Exercise the real actor dispatch without a provider subprocess. The
+    /// history transport records protocol writes in memory instead of sending
+    /// them, while retaining Codex's actual pending-decision state machine.
+    #[test]
+    fn settled_indexed_declines_are_checked_on_the_actor_without_authorizing_work() {
+        use crate::chat::runtime::{Handle, preflight};
+        use std::sync::{Arc, Mutex};
+
+        struct Recorded {
+            adapter: Codex,
+            writes: Arc<Mutex<Vec<Value>>>,
+        }
+        impl Adapter for Recorded {
+            fn initialize(&mut self) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn answer_declines(&self, id: &str, action: &str) -> bool {
+                self.adapter.answer_declines(id, action)
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                let mut step = self.adapter.command(command)?;
+                self.writes.lock().unwrap().append(&mut step.writes);
+                Ok(step)
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                self.adapter.receive(frame)
+            }
+        }
+        for decisions in [json!(["accept", "decline"]), json!(["cancel", "accept"])] {
+            let mut adapter = adapter();
+            let run = crate::model::RunId::new();
+            let prompt = adapter
+                .command_for_run(
+                    run,
+                    Command::Prompt {
+                        text: "owned prompt".into(),
+                        attachments: vec![],
+                        mode: PromptMode::Send,
+                    },
+                )
+                .unwrap();
+            let start = prompt
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "turn/start")
+                .unwrap();
+            adapter.receive(json!({"id":start["id"],"result":{"turn":{"id":"owned","status":"inProgress","items":[]}}})).unwrap();
+            let mut child = self::adapter();
+            child.thread = Some("child".into());
+            child.is_child = true;
+            adapter.children.insert("child".into(), Box::new(child));
+            let request = adapter.receive(json!({"id":"pending","method":"item/commandExecution/requestApproval","params":{
+                "threadId":"child","turnId":"child-turn","itemId":"tool","availableDecisions":decisions,"command":"requested"
+            }})).unwrap();
+            let completed = adapter
+                .receive(json!({"method":"turn/completed","params":{
+                    "threadId":"thread-exact","turn":{"id":"owned","status":"completed","items":[]}
+                }}))
+                .unwrap();
+            assert!(completed.events.iter().any(|event| matches!(event,
+                Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded }} if *actual == run)));
+            let id = rpc_id(&json!("pending")).unwrap();
+            let decline_index = decisions
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|v| matches!(v.as_str(), Some("decline" | "cancel")))
+                .unwrap();
+            let decline = format!("decision-{decline_index}");
+            let accept = format!("decision-{}", 1 - decline_index);
+            let directory = tempfile::tempdir().unwrap();
+            let cwd = directory.path().join("approved");
+            std::fs::create_dir(&cwd).unwrap();
+            let context = super::super::ExecutionContext::new(Some(Arc::new(
+                std::fs::File::open(&cwd).unwrap(),
+            )));
+            let spec = ProcessSpec {
+                execution: Some(Arc::new(context)),
+                messages: None,
+                transport: TransportSpec::History,
+                program: "not-launched".into(),
+                arguments: vec![],
+                working_directory: cwd.clone(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            };
+            let mut initial = Step {
+                writes: vec![],
+                events: vec![Event::Ready(true)],
+            };
+            initial.events.extend(prompt.events);
+            initial.events.extend(request.events);
+            initial.events.extend(completed.events);
+            let store = preflight(&spec, &mut initial).unwrap();
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let handle = Handle::start(
+                spec,
+                Box::new(Recorded {
+                    adapter,
+                    writes: writes.clone(),
+                }),
+                initial,
+                store,
+                None,
+                |_| {},
+            )
+            .unwrap();
+            // Command delivery is serialized after the initial snapshot.
+            let answer = |action: String| Command::Answer {
+                request_id: id.clone(),
+                action,
+                answers: vec![],
+            };
+            let refused = handle.decline_answer(answer(accept.clone())).unwrap_err();
+            assert!(refused.contains("only decline"), "{refused}");
+            assert!(
+                handle.decline_answer(answer("decline".into())).is_err(),
+                "literal action was never offered"
+            );
+            assert!(writes.lock().unwrap().is_empty());
+            std::fs::remove_dir(&cwd).unwrap();
+            assert!(
+                handle.command(answer(accept)).is_err(),
+                "authorization still requires its approved directory"
+            );
+            handle.decline_answer(answer(decline.clone())).unwrap();
+            assert!(handle.requests().is_empty());
+            assert_eq!(
+                *writes.lock().unwrap(),
+                vec![json!({"id":"pending","result":{"decision":decisions[decline_index]}})]
+            );
+            assert!(
+                handle.decline_answer(answer(decline)).is_err(),
+                "resolved requests cannot be answered twice"
+            );
+            handle.close().unwrap();
+        }
     }
 
     #[test]

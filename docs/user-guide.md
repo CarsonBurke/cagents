@@ -50,6 +50,14 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to
   reach offscreen panes, or press **Escape** to cancel.
+- Drag a pane's tab title onto a channel in the same project to move it there.
+  Eligible channel rows highlight while dragging. The existing terminal or chat
+  session keeps running; opening the destination channel shows the same pane.
+  The pane stays in its source until the move succeeds. If the destination no
+  longer exists, the source stays open and the app shows the refusal.
+  The tab's context menu also lists eligible channels; with many destinations,
+  **Move to channel…** opens a searchable picker. The command palette lists
+  the focused pane's channel destinations too.
 - Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible while scrolling. The primary worktree stays
   first; **Settings → General → Worktrees** orders the rest by newest, oldest,

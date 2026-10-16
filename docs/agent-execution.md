@@ -72,6 +72,18 @@ If a daemon restart loses proof of an accepted prompt's outcome, the run becomes
 ## Reading context and account budgets
 
 ```sh
+cagents account list
+cagents account list --provider codex --json
+```
+
+`account list` reads active accounts and any retained caller account from the
+selected daemon. Its table shows stable account IDs, names, defaults, current
+caller selection and archived status. JSON projects those metadata fields with
+lowercase provider names; it omits usage bodies and launch recipes. This request
+does not probe a provider CLI. A default marker describes saved preferences,
+not a guarantee that the account is currently available for new work.
+
+```sh
 cagents account info --json
 cagents account info --provider claude --json
 cagents account info --account claude/system --refresh --json
@@ -200,3 +212,41 @@ If the deadline expires before a run’s first status arrives, `agent wait` keep
 any statuses already received and reports the unread IDs in `data.unresolved_runs`.
 Spawn/send retain their durable acceptance when that first status is unavailable.
 No run outcome is invented from missing status evidence.
+
+## Reads without startup
+
+Add the global `--no-start` flag, or set `CAGENTS_NO_START=1`, when a read should
+connect only to an already-running daemon. Missing local and selected-device
+daemons produce a `daemon_not_running` error instead of starting services.
+Transport failures remain errors and are distinguished from daemon absence.
+
+`cagents daemon stop` never starts a daemon. When the selected daemon is absent,
+it exits successfully; JSON output contains `data.state = "already_stopped"`.
+
+## Shell completions
+
+Generate completions from the installed command grammar. This does not contact
+or start a daemon:
+
+```sh
+cagents completions bash > ~/.local/share/bash-completion/completions/cagents
+cagents completions zsh > ~/.zfunc/_cagents
+cagents completions fish > ~/.config/fish/completions/cagents.fish
+```
+
+Create the destination directory first. Bash and fish load their completion files
+through the usual shell setup; add `~/.zfunc` to zsh's `fpath` before `compinit`.
+Elvish and PowerShell scripts are available with `completions elvish` and
+`completions powershell`. Regenerate after upgrading the CLI.
+
+Automation definition and history pages accept `--limit` from 1 through 100;
+values outside that range are refused. For definitions, pass the last returned
+UUID as `--after` to request the next page.
+
+Linear collection commands use the same plain tables and explicit empty states.
+Their `--json` payloads retain the original API fields and pagination metadata.
+Human pages indicate when more results are available; use `--after` to continue.
+Comments appear in a single table row; use JSON to preserve Markdown line breaks.
+
+Session directory tables keep full session IDs, lineage, view and delegation
+context. Session and whoami JSON retain their original directory metadata.
