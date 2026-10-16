@@ -6517,6 +6517,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn capability_queries_share_complete_metadata_and_refresh_readiness() {
+        block_on(async {
+            let (_guard, worktree, file) = workspace();
+            let commands = vec!["fixture.command".to_owned(), "λ::execute_".repeat(256)];
+            let triggers = vec!["(".to_owned(), ",".to_owned(), "λ".to_owned()];
+            let retriggers = vec!["，".to_owned()];
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, json!({
+                "textDocumentSync":2,
+                "executeCommandProvider":{"commands":commands},
+                "signatureHelpProvider":{"triggerCharacters":triggers,"retriggerCharacters":retriggers}
+            }), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(911);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "foo()");
+            let server = handle_of(&slot).await;
+            await_ready(&events, doc).await;
+            server.wait_for("textDocument/didOpen").await;
+            let initial = manager.capabilities(doc);
+            assert!(initial.ready && initial.signature_help);
+            assert_eq!(initial.execute_commands.as_ref(), commands.as_slice());
+            assert_eq!(initial.signature_triggers.as_ref(), triggers.as_slice());
+            assert_eq!(initial.signature_retriggers.as_ref(), retriggers.as_slice());
+            // The same public query is used by automatic signature help and
+            // format-on-save. Repeated queries must not clone list payloads.
+            for _ in 0..32 {
+                let next = manager.capabilities(doc);
+                assert!(next.ready);
+                assert!(Arc::ptr_eq(&initial.execute_commands, &next.execute_commands));
+                assert!(Arc::ptr_eq(&initial.signature_triggers, &next.signature_triggers));
+                assert!(Arc::ptr_eq(&initial.signature_retriggers, &next.signature_retriggers));
+            }
+            let reference = &manager.documents[&doc];
+            manager.sessions[&reference.session].request_retirement();
+            let retired = manager.capabilities(doc);
+            assert!(!retired.ready);
+            assert!(Arc::ptr_eq(&initial.execute_commands, &retired.execute_commands));
+            assert!(Arc::ptr_eq(&initial.signature_triggers, &retired.signature_triggers));
+            assert!(Arc::ptr_eq(&initial.signature_retriggers, &retired.signature_retriggers));
+            assert!(initial.ready, "each query still returns its own current readiness value");
+            manager.begin_shutdown().await;
+            server.wait_for("exit").await;
+            assert!(!manager.capabilities(doc).ready);
+            assert_eq!(initial.execute_commands.as_ref(), commands.as_slice());
+        });
+    }
+
     fn rust_language() -> LspLanguage {
         LspLanguage {
             server_id: "rust-analyzer".to_owned(),
