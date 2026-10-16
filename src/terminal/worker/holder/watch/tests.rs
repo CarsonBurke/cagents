@@ -164,7 +164,10 @@ fn original_control_eof_never_reports_a_still_live_root_as_exited() {
         Err(crossbeam_channel::RecvTimeoutError::Timeout)
     ));
     assert!(stream.stop());
-    assert!(matches!(stream.cleanup.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    assert!(matches!(
+        stream.cleanup.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Disconnected)
+    ));
 }
 
 #[test]
@@ -210,7 +213,10 @@ fn actual_framed_exit_is_published_once_before_detach_ack() {
         "duplicate Exited must not publish twice"
     );
     assert!(stream.stop());
-    assert!(matches!(stream.cleanup.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    assert!(matches!(
+        stream.cleanup.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Disconnected)
+    ));
 }
 
 #[test]
@@ -218,21 +224,64 @@ fn only_cleanup_proved_reaches_the_dedicated_family_receipt_channel() {
     let mut stream = Stream::start();
     for report in [Report::ScreenCached, Report::AdoptionCommitted] {
         stream.send(report);
-        assert_eq!(stream.acknowledgements.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        assert_eq!(
+            stream
+                .acknowledgements
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Ok(())
+        );
         assert!(stream.cleanup.try_recv().is_err());
     }
     stream.send(Report::Exited { wait_status: 0 });
-    assert_eq!(stream.exits.recv_timeout(Duration::from_secs(2)).unwrap().unwrap().exit_code(), 0);
+    assert_eq!(
+        stream
+            .exits
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .exit_code(),
+        0
+    );
     stream.send(Report::Failed("pre-proof barrier".into()));
-    assert_eq!(stream.acknowledgements.recv_timeout(Duration::from_secs(2)).unwrap(), Err("pre-proof barrier".into()));
-    assert!(stream.cleanup.try_recv().is_err(), "ordinary ACK and root exit are not family proof");
+    assert_eq!(
+        stream
+            .acknowledgements
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        Err("pre-proof barrier".into())
+    );
+    assert!(
+        stream.cleanup.try_recv().is_err(),
+        "ordinary ACK and root exit are not family proof"
+    );
 
     stream.send(Report::CleanupProved);
     stream.cleanup.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(matches!(stream.watch.as_ref().unwrap().done.recv_timeout(Duration::from_secs(2)), Err(crossbeam_channel::RecvTimeoutError::Disconnected)));
-    assert!(stream.acknowledgements.try_recv().is_err(), "proof cannot masquerade as an ordinary ACK");
-    assert!(stream.exits.try_recv().is_err(), "proof must not fabricate another root exit");
-    assert!(matches!(stream.cleanup.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)), "proof is published once");
+    assert!(matches!(
+        stream
+            .watch
+            .as_ref()
+            .unwrap()
+            .done
+            .recv_timeout(Duration::from_secs(2)),
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+    ));
+    assert!(
+        stream.acknowledgements.try_recv().is_err(),
+        "proof cannot masquerade as an ordinary ACK"
+    );
+    assert!(
+        stream.exits.try_recv().is_err(),
+        "proof must not fabricate another root exit"
+    );
+    assert!(
+        matches!(
+            stream.cleanup.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ),
+        "proof is published once"
+    );
     assert!(stream.stop());
 }
 
@@ -240,10 +289,28 @@ fn only_cleanup_proved_reaches_the_dedicated_family_receipt_channel() {
 fn root_exit_followed_by_control_eof_never_proves_family_cleanup() {
     let mut stream = Stream::start();
     stream.send(Report::Exited { wait_status: 0 });
-    stream.exits.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+    stream
+        .exits
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
     drop(stream.peer.take());
-    assert!(matches!(stream.watch.as_ref().unwrap().done.recv_timeout(Duration::from_secs(2)), Err(crossbeam_channel::RecvTimeoutError::Disconnected)));
-    assert!(matches!(stream.cleanup.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)), "EOF after a genuine framed root exit is still not the dedicated family report");
+    assert!(matches!(
+        stream
+            .watch
+            .as_ref()
+            .unwrap()
+            .done
+            .recv_timeout(Duration::from_secs(2)),
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+    ));
+    assert!(
+        matches!(
+            stream.cleanup.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ),
+        "EOF after a genuine framed root exit is still not the dedicated family report"
+    );
     assert!(stream.stop());
 }
 
@@ -253,10 +320,16 @@ fn truncated_cleanup_report_is_cancelled_without_publishing_proof() {
     let body = serde_json::to_vec(&Report::CleanupProved).unwrap();
     let mut peer = stream.peer.take().unwrap();
     peer.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
-    peer.write_all(&body[..body.len()-1]).unwrap();
+    peer.write_all(&body[..body.len() - 1]).unwrap();
     drop(peer);
-    assert!(stream.stop(), "original release must finish partial-frame observation");
-    assert!(matches!(stream.cleanup.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    assert!(
+        stream.stop(),
+        "original release must finish partial-frame observation"
+    );
+    assert!(matches!(
+        stream.cleanup.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Disconnected)
+    ));
     assert!(stream.acknowledgements.try_recv().is_err());
     assert!(stream.exits.try_recv().is_err());
 }
@@ -275,5 +348,8 @@ fn oversized_private_report_is_not_root_exit_authority() {
         Err(crossbeam_channel::RecvTimeoutError::Timeout)
     ));
     assert!(stream.stop());
-    assert!(matches!(stream.cleanup.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    assert!(matches!(
+        stream.cleanup.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Disconnected)
+    ));
 }

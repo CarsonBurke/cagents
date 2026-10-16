@@ -37,7 +37,16 @@ impl Watch {
         let (finished, done) = crossbeam_channel::bounded::<()>(0);
         let task = runtime.spawn(async move {
             let _finished = finished;
-            observe(control, root, released, exits, acknowledge, cleanup, reported).await;
+            observe(
+                control,
+                root,
+                released,
+                exits,
+                acknowledge,
+                cleanup,
+                reported,
+            )
+            .await;
         });
         Ok(Self { task, done })
     }
