@@ -60,6 +60,9 @@ pub(super) fn blocked_managed_view_scopes(
 
 #[derive(Default)]
 pub(super) struct State {
+    // Full snapshots advance view/agent authority. Metadata-only folds advance
+    // the outer model sequence without supplying either of these collections.
+    pub(super) snapshot_sequence: u64,
     baseline: HashMap<Scope, Vec<Pane>>,
     initialized: HashSet<Scope>,
     seeding: HashSet<Scope>,
@@ -195,9 +198,7 @@ impl Cagents {
             .get(&operation)
             .filter(|(identity, _)| *identity == self.workspace_model.identity)
             .map(|(_, repository)| repository.clone());
-        if model.sequence >= self.workspace_model.sequence {
-            self.workspace_model = model;
-        }
+        self.install_workspace_model_snapshot(model);
         let Some(index) =
             self.shared_views
                 .pending

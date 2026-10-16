@@ -494,6 +494,27 @@ impl Cagents {
         Task::none()
     }
 
+    /// Keep complete view/agent snapshots ordered independently of observed
+    /// metadata edges. A title/rank/project edge has no replacement pane data.
+    pub(super) fn install_workspace_model_snapshot(&mut self, mut model: WorkspaceModel) -> bool {
+        if model.identity != self.workspace_model.identity
+            || model.sequence >= self.workspace_model.sequence
+        {
+            self.shared_views.snapshot_sequence = model.sequence;
+            self.workspace_model = model;
+            return true;
+        }
+        if model.sequence < self.shared_views.snapshot_sequence {
+            return false;
+        }
+        self.shared_views.snapshot_sequence = model.sequence;
+        // Preserve newer folded metadata, including explicit project/channel
+        // removal, while accepting the complete, newer collection evidence.
+        self.workspace_model.views = std::mem::take(&mut model.views);
+        self.workspace_model.agents = std::mem::take(&mut model.agents);
+        true
+    }
+
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
             ModelUpdate::TitleDeferred(edit) => {
@@ -546,30 +567,25 @@ impl Cagents {
                 let transferred = operation
                     .and_then(|operation| self.shared_views.requested_transfer_card(operation));
                 self.acknowledge_view_edit(scope, operation);
-                if model.sequence >= self.workspace_model.sequence {
-                    self.workspace_model = model;
-                }
+                self.install_workspace_model_snapshot(model);
                 self.retarget_transferred_pane_updates(transferred);
                 self.reconcile_workspace_model()
             }
             ModelUpdate::Connected(model) => {
                 if model.identity == self.workspace_model.identity
-                    && model.sequence < self.workspace_model.sequence
+                    && model.sequence < self.shared_views.snapshot_sequence
                 {
                     return Task::none();
                 }
                 self.join_workspace_model(model.identity);
-                self.workspace_model = model;
+                self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
             ModelUpdate::Read(model) => {
-                if model.identity == self.workspace_model.identity
-                    && model.sequence < self.workspace_model.sequence
-                {
+                if !self.install_workspace_model_snapshot(model) {
                     return Task::none();
                 }
-                self.workspace_model = model;
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
@@ -590,7 +606,7 @@ impl Cagents {
                         .reopening
                         .retain(|_, path| path != &repository);
                 }
-                self.workspace_model = model;
+                self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
@@ -604,12 +620,6 @@ impl Cagents {
                 self.apply_closed_project_tombstones()
             }
             ModelUpdate::Edited { sequence, edit } => {
-                // AgentsChanged carries no snapshot fields. The observer reads
-                // the complete model next; advancing this cache now would label
-                // its old views as newer than an in-flight Insert receipt.
-                if matches!(edit, ModelEdit::AgentsChanged) {
-                    return Task::none();
-                }
                 if sequence <= self.workspace_model.sequence {
                     return Task::none();
                 }
@@ -2112,13 +2122,20 @@ mod tests {
         use crate::agent::Provider;
         use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
         use crate::workspace_model::views::{Change, Scope, View};
-        for (active_target, retired, blocked_before, existing_primary) in [
-            (true, false, false, false),
-            (false, false, false, false),
-            (true, true, false, false),
-            (true, false, true, false),
-            (true, false, false, true),
+        for (active_target, retired, blocked_before, metadata_edge) in [
+            (true, false, false, 0),
+            (false, false, false, 0),
+            (true, true, false, 0),
+            (true, false, true, 0),
+            (true, false, false, 1),
+            (true, false, false, 2),
+            (true, false, false, 3),
+            (true, false, false, 4),
+            (true, false, false, 5),
+            (true, false, false, 6),
+            (true, false, false, 7),
         ] {
+            let existing_primary = metadata_edge != 0;
             let (mut app, project, repository) = app_with_project();
             let active = ChannelId::new();
             let target = if active_target {
@@ -2352,15 +2369,55 @@ mod tests {
                 .apply(&change)
                 .unwrap();
             model.sequence += 1;
-            if existing_primary {
-                // The observer and publisher use distinct connections. A run
-                // edge can arrive after this Insert committed but before its
-                // reply. Its following full Read has not arrived yet.
+            let edge = existing_primary.then(|| match metadata_edge {
+                1 => ModelEdit::AgentsChanged,
+                2 => ModelEdit::RetitleChannel {
+                    id: target,
+                    title: "New manual title".into(),
+                },
+                3 => ModelEdit::SuggestChannelTitle {
+                    id: target,
+                    title: "New provider title".into(),
+                    source: crate::model::ChannelTitleSource::Provider,
+                },
+                4 => ModelEdit::SuggestConversationTitle {
+                    id: target,
+                    card: primary.unwrap(),
+                    expected_revision: model.views[0].revision,
+                    title: "New conversation title".into(),
+                    source: crate::model::ChannelTitleSource::Provider,
+                },
+                5 => ModelEdit::CreateChannel {
+                    id: ChannelId::new(),
+                    repository: agent.spec.target.repository.clone(),
+                    title: "Independent channel".into(),
+                    title_source: Default::default(),
+                },
+                6 => ModelEdit::OpenProject {
+                    repository: "/other/.git".into(),
+                    name: "Other".into(),
+                    kind: ProjectKind::Git,
+                },
+                7 => ModelEdit::ReopenProject {
+                    repository: "/other/.git".into(),
+                    name: "Other".into(),
+                    kind: ProjectKind::Git,
+                },
+                _ => unreachable!(),
+            });
+            if let Some(edit) = &edge {
+                // The observer and publisher use distinct connections. A
+                // metadata edge may arrive before this Insert's own reply.
                 drop(app.apply_workspace_model_update(ModelUpdate::Edited {
                     sequence: model.sequence + 1,
-                    edit: ModelEdit::AgentsChanged,
+                    edit: edit.clone(),
                 }));
             }
+            let newer_metadata = (
+                app.workspace_model.channels.clone(),
+                app.workspace_model.projects.clone(),
+            );
+            let accepted_snapshot = model.clone();
             drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
                 scope: scope.clone(),
                 operation: Some(*operation),
@@ -2372,7 +2429,10 @@ mod tests {
                     vec![primary, card]
                 );
                 assert_eq!(app.workspace.focused(), Some(primary));
-                model.sequence += 1;
+                assert_eq!(app.workspace_model.channels, newer_metadata.0);
+                assert_eq!(app.workspace_model.projects, newer_metadata.1);
+                let next_sequence = model.sequence + 1;
+                model.fold(next_sequence, edge.as_ref().unwrap());
                 drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
                 assert_eq!(
                     app.workspace.order().collect::<Vec<_>>(),
@@ -2392,6 +2452,63 @@ mod tests {
                     .iter()
                     .any(|pane| pane.id == card)
             );
+            if let Some(primary) = primary {
+                // A genuinely newer complete view remains authoritative even
+                // when the original Insert receipt is delivered again.
+                let mut removed = app.workspace_model.clone();
+                removed.sequence += 1;
+                let view = removed
+                    .views
+                    .iter_mut()
+                    .find(|view| view.scope == scope)
+                    .unwrap();
+                view.apply(&Change::Remove { id: card }).unwrap();
+                drop(app.apply_workspace_model_update(ModelUpdate::Read(removed.clone())));
+                drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                    scope: scope.clone(),
+                    operation: Some(*operation),
+                    model: accepted_snapshot,
+                }));
+                assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![primary]);
+                assert!(!app.card_state(card).unwrap().existence.is_open());
+                assert_eq!(app.workspace_model.views, removed.views);
+            }
+        }
+    }
+
+    #[test]
+    fn late_view_snapshot_preserves_observed_channel_and_project_removal() {
+        use crate::workspace_model::views::{Scope, View};
+        for close_project in [false, true] {
+            let (mut app, _, repository) = app_with_project();
+            let channel = ChannelId::new();
+            let mut original = registry(vec![shared(channel, &repository, "Original", 0)]);
+            original.views.push(View::empty(Scope::Channel(channel)));
+            assert!(app.install_workspace_model_snapshot(original.clone()));
+            let edit = if close_project {
+                ModelEdit::CloseProject {
+                    repository: repository.clone(),
+                }
+            } else {
+                ModelEdit::DeleteChannel { id: channel }
+            };
+            let next_sequence = original.sequence + 2;
+            drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+                sequence: next_sequence,
+                edit,
+            }));
+            let metadata = app.workspace_model.clone();
+            original.sequence += 1;
+            original.views[0].revision += 1;
+            assert!(app.install_workspace_model_snapshot(original.clone()));
+            assert_eq!(app.workspace_model.sequence, next_sequence);
+            assert_eq!(app.workspace_model.channels, metadata.channels);
+            assert_eq!(app.workspace_model.projects, metadata.projects);
+            assert_eq!(
+                app.workspace_model.closed_projects,
+                metadata.closed_projects
+            );
+            assert_eq!(app.workspace_model.views, original.views);
         }
     }
 
