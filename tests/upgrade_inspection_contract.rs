@@ -317,18 +317,29 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             .rsplit_once(')')
             .and_then(|(_, fields)| fields.split_whitespace().nth(1))
             .and_then(|value| value.parse::<u32>().ok());
-        let argv = fs::read(format!("/proc/{pid}/cmdline")).map_err(|e| e.to_string())?;
+        if !live(&acquired)
+            || birth(pid)? != original_birth
+            || parent != Some(record.holder.pid)
+            || record.holder.pid <= 1
+            || birth(record.holder.pid)? != record.holder.start.to_string()
+        {
+            return Err("acquired epoch does not belong to the original private holder".into());
+        }
         let mut expected = saved.launch.program.as_bytes().to_vec();
         expected.push(0);
         for argument in &saved.launch.arguments {
             expected.extend_from_slice(argument.as_bytes());
             expected.push(0);
         }
-        if !live(&acquired)
-            || birth(pid)? != original_birth
-            || parent != Some(record.holder.pid)
-            || birth(record.holder.pid)? != record.holder.start.to_string()
-            || fs::read_link(format!("/proc/{pid}/cwd")).map_err(|e| e.to_string())? != root
+        let mut argv = Vec::new();
+        let mut command_line =
+            fs::File::open(format!("/proc/{pid}/cmdline")).map_err(|e| e.to_string())?;
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(&mut command_line, expected.len() as u64 + 1),
+            &mut argv,
+        )
+        .map_err(|e| e.to_string())?;
+        if fs::read_link(format!("/proc/{pid}/cwd")).map_err(|e| e.to_string())? != root
             || argv != expected
             || birth(pid)? != original_birth
             || !live(&acquired)
