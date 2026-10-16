@@ -1,0 +1,195 @@
+//! Exercise the real App confirmation/tasks/receipt consumer in an isolated
+//! process. Desktop Trash and runtime are private to this exact child.
+use super::*;
+use cosmic::Application;
+use std::{
+    fs,
+    io::Read,
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    path::Path,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+use crate::process::{CommandSpec, ProcessExecutor};
+
+fn isolated(name: &str) -> bool {
+    if std::env::var("CAGENTS_DISCARD_CASE").as_deref() == Ok(name) {
+        return false;
+    }
+    let owner = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let runtime = owner.path().join("runtime");
+    let data = owner.path().join("data");
+    let root = owner.path().join("checkout");
+    for dir in [&runtime, &data, &root] {
+        fs::create_dir(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let stdout = owner.path().join("stdout");
+    let stderr = owner.path().join("stderr");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env("CAGENTS_DISCARD_CASE", name)
+        .env("CAGENTS_DISCARD_ROOT", &root)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_DATA_HOME", data)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr).unwrap()));
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Child(command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "discard child timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    fn read(path: &Path) -> String {
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .unwrap()
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(bytes.len() <= 1024 * 1024);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+    let out = read(&stdout);
+    let err = read(&stderr);
+    assert!(status.success(), "{name}: {status}\n{out}\n{err}");
+    assert!(
+        out.contains(&format!("test {name} ... ok")),
+        "missing exact positive test: {out}\n{err}"
+    );
+    assert!(
+        out.contains("test result: ok. 1 passed; 0 failed;"),
+        "zero/incorrect selector: {out}"
+    );
+    true
+}
+
+fn git(root: &Path, arguments: &[&str]) {
+    let command = CommandSpec::new("git").cwd(root).args(arguments.iter().copied())
+        .timeout(Duration::from_secs(10));
+    SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap()
+        .require_success(&command.program).unwrap();
+}
+
+#[test]
+fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_native_trash() {
+    const NAME: &str = "app::discard_ui::actual_tests::discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_native_trash";
+    if isolated(NAME) { return; }
+    let root = PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap());
+    git(&root, &["init", "-q"]);
+    fs::write(root.join("modified"), b"base modified\n").unwrap();
+    fs::write(root.join("deleted"), b"base deleted\n").unwrap();
+    fs::write(root.join("executable"), b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(root.join("executable"), fs::Permissions::from_mode(0o755)).unwrap();
+    git(&root, &["add", "--all"]);
+    git(&root, &["commit", "-qm", "base"]);
+    fs::write(root.join("modified"), b"precious modified\n").unwrap();
+    fs::remove_file(root.join("deleted")).unwrap();
+    fs::write(root.join("executable"), b"#!/bin/sh\nexit 7\n").unwrap();
+    fs::create_dir(root.join("empty-after-discard")).unwrap();
+    let untracked = root.join("empty-after-discard/original file");
+    fs::write(&untracked, b"untracked original\n").unwrap();
+    fs::set_permissions(&untracked, fs::Permissions::from_mode(0o640)).unwrap();
+    let original = fs::metadata(&untracked).unwrap();
+    symlink("literal missing target", root.join("original-link")).unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let key = ActiveWorktreeKey {
+        project_id: crate::model::ProjectId::new(),
+        worktree_id: crate::model::WorktreeId::new(),
+        canonical_path: root.clone(),
+    };
+    app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
+    // Poll the ACTUAL snapshot worker, then its actual reducer, so the source
+    // used by the later confirmation is the authority that produced the rows.
+    let task = app.source_control_snapshot_task(key.clone());
+    let loaded = crate::app::tests::task_app_message(task);
+    assert!(matches!(&loaded, Message::SourceControlLoaded { result: Ok(_), .. }));
+    drop(app.update(loaded));
+    let source = app.discard_ui.source().unwrap().id;
+    let request = DiscardRequest {
+        worktree: root.clone(),
+        tracked: ["modified", "deleted", "executable"].into_iter()
+            .map(|name| crate::repository::PathSelection::new(RepoPath::parse(name).unwrap())).collect(),
+        untracked: ["empty-after-discard/original file", "original-link"].into_iter()
+            .map(|name| RepoPath::parse(name).unwrap()).collect(),
+        confirmed: false,
+    };
+    drop(app.update(Message::SidebarSnapshot {
+        source, action: Box::new(SidebarAction::RequestDiscard { key: key.clone(), request: request.clone() }),
+    }));
+    assert!(app.modal_is_open());
+    let task = app.update(Message::SidebarSnapshot {
+        source, action: Box::new(SidebarAction::ConfirmDiscard {
+            key: key.clone(), request: DiscardRequest { confirmed: true, ..request },
+        }),
+    });
+    assert!(app.discard_ui.has_inflight());
+    assert!(app.discard_ui.close_block_reason().is_some());
+    let slot = app.discard_ui.slots[0].clone();
+    // Navigate before polling the actual mutation worker. The task and already
+    // installed receipt slot retain A; no completion may decorate the new B.
+    let other = ActiveWorktreeKey { worktree_id: crate::model::WorktreeId::new(), canonical_path: root.with_file_name("other"), ..key };
+    app.discard_ui.select(Some(other.clone()));
+    app.sidebar_model.source_control = Some(SourceControlModel::loading(other.clone()));
+    let finished = crate::app::tests::task_app_message(task);
+    assert!(matches!(&finished, Message::DiscardFinished { .. }));
+    assert!(!app.discard_ui.has_inflight());
+    let receipt = slot.0.lock().unwrap().receipt.clone().expect("worker installs receipt before completion");
+    assert_eq!(receipt.remaining_paths(), 5);
+    assert!(!untracked.exists());
+    assert!(!root.join("empty-after-discard").exists());
+    assert_eq!(fs::read(root.join("modified")).unwrap(), b"base modified\n");
+    let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
+    let trash = fs::read_dir(data.join("Trash/files")).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+    assert_eq!(trash.len(), 2);
+    assert!(trash.iter().any(|path| fs::symlink_metadata(path).is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == (original.dev(), original.ino()))));
+    assert_eq!(fs::read_dir(data.join("Trash/info")).unwrap().count(), 2);
+    drop(app.update(finished));
+    assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().key, other);
+    assert!(app.discard_ui.slot(slot.id()).is_some());
+    let undo = app.update(Message::DiscardUndo { id: slot.id(), resolve: false });
+    assert!(app.discard_ui.has_inflight());
+    let undone = crate::app::tests::task_app_message(undo);
+    drop(app.update(undone));
+    assert_eq!(receipt.remaining_paths(), 0);
+    assert!(!receipt.live_recovery.needs_resolution());
+    assert!(!app.discard_ui.has_inflight());
+    assert!(app.discard_ui.slot(slot.id()).is_none());
+    assert_eq!(fs::read(root.join("modified")).unwrap(), b"precious modified\n");
+    assert!(!root.join("deleted").exists());
+    assert_eq!(fs::read(root.join("executable")).unwrap(), b"#!/bin/sh\nexit 7\n");
+    assert_eq!(fs::metadata(root.join("executable")).unwrap().mode() & 0o7777, 0o755);
+    assert_eq!(fs::read(&untracked).unwrap(), b"untracked original\n");
+    let restored = fs::metadata(&untracked).unwrap();
+    assert_eq!((restored.dev(), restored.ino(), restored.mode() & 0o7777), (original.dev(), original.ino(), 0o640));
+    assert_eq!(fs::read_link(root.join("original-link")).unwrap(), PathBuf::from("literal missing target"));
+    assert_eq!(fs::read_dir(data.join("Trash/files")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(data.join("Trash/info")).unwrap().count(), 0);
+    assert!(app.discard_ui.close_block_reason().is_none());
+}
