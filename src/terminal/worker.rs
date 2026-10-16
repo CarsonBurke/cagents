@@ -4618,9 +4618,18 @@ fn theme_scheme(theme: TerminalTheme) -> ColorScheme {
     }
 }
 fn coalesce_scroll_command(
+    command: Command,
+    commands: &Receiver<Command>,
+    carried: &mut Option<Command>,
+) -> Command {
+    coalesce_scroll_command_with(command, commands, carried, || {})
+}
+
+fn coalesce_scroll_command_with(
     mut command: Command,
     commands: &Receiver<Command>,
     carried: &mut Option<Command>,
+    mut folded: impl FnMut(),
 ) -> Command {
     fn delta(command: &Command) -> Option<isize> {
         match command {
@@ -4639,9 +4648,17 @@ fn coalesce_scroll_command(
     let Some(mut value) = delta(&command) else {
         return command;
     };
-    while let Ok(next) = commands.try_recv() {
+    // Returning a folded command's admission credit lets a producer refill
+    // the inbox. Bound this turn to the queue observed at entry so a wheel
+    // flood cannot postpone priority interrupts or PTY output indefinitely.
+    for _ in 0..commands.len() {
+        let Ok(next) = commands.try_recv() else {
+            break;
+        };
         if let Some(next_delta) = delta(&next) {
             value = value.saturating_add(next_delta);
+            drop(next);
+            folded();
         } else {
             *carried = Some(next);
             break;
@@ -5521,6 +5538,8 @@ fn working_directory_path(raw: &str, local_host: Option<&str>) -> Option<PathBuf
 
 #[cfg(test)]
 mod tests {
+
+    include!("worker/bounded_input_tests.rs");
 
     use std::{
         collections::BTreeMap,

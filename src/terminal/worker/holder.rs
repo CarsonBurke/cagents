@@ -999,15 +999,6 @@ impl HeldChild {
 
     /// Whether the root has not been reaped yet. Anything read about its pid
     /// before this answers true was read about the root itself.
-    pub(super) fn shutdown_pidfd(&self) -> Result<File, String> {
-        self.pidfd
-            .try_clone()
-            .map_err(|error| format!("retain child shutdown pidfd: {error}"))
-    }
-
-    /// Hangs the root up, as closing its terminal would. A root that already
-    /// exited counts as hung up; one that ignores the hangup keeps running.
-
     pub(super) fn unreaped(&self) -> bool {
         signal(&self.pidfd, 0).is_ok()
     }
