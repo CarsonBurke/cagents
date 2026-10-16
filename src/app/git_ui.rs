@@ -1617,10 +1617,12 @@ mod tests {
         );
         app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
         app.refresh_ui.source_generation = 7;
+        app.discard_ui.select(Some(key.clone()));
         app
     }
 
     fn bound_status_message(
+        source: super::super::discard_ui::ReadSource,
         key: &ActiveWorktreeKey,
         request: u64,
         snapshot: RepositorySnapshot,
@@ -1631,6 +1633,7 @@ mod tests {
         Message::SourceControlLoaded {
             key: key.clone(),
             request,
+            source,
             result: Ok(SourceControlRead {
                 prepared: Some(Box::new((snapshot, model))),
                 status,
@@ -1894,7 +1897,9 @@ mod tests {
             );
             app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
             app.refresh_ui.source_generation = 7;
+            app.discard_ui.select(Some(key.clone()));
             let bound_message = Message::SourceControlLoaded {
+                source: app.discard_ui.source().expect("fixture read actor").clone(),
                 key: key.clone(),
                 request: 7,
                 result: Ok(SourceControlRead {
@@ -2036,7 +2041,13 @@ mod tests {
                 .unwrap()
                 .plan = Some(Arc::new(baseline_plan));
             app.refresh_ui.git.monitor = Some(git_watch::Monitor::start().unwrap());
-            drop(app.update(bound_status_message(&key, 7, snapshot, read)));
+            drop(app.update(bound_status_message(
+                app.discard_ui.source().unwrap().clone(),
+                &key,
+                7,
+                snapshot,
+                read,
+            )));
             drop(app.update(Message::GitUi(Action::Read {
                 project: project_id,
                 generation: 9,
@@ -2181,7 +2192,13 @@ mod tests {
         app.sidebar_model.projects[0].worktrees[0].pull_request_state =
             Some(sidebar::WorktreePullRequestState::Open);
         let delayed_watch = app.refresh_ui.git.entries[&project].snapshot.clone();
-        drop(app.update(bound_status_message(&key, 7, full, read)));
+        drop(app.update(bound_status_message(
+            app.discard_ui.source().unwrap().clone(),
+            &key,
+            7,
+            full,
+            read,
+        )));
         let row = &app.sidebar_model.projects[0].worktrees[0];
         assert_eq!(row.branch.as_deref(), Some("learned"));
         assert_eq!(
@@ -2227,6 +2244,7 @@ mod tests {
             oid: "a".repeat(40),
         };
         drop(app.update(Message::SourceControlLoaded {
+            source: app.discard_ui.source().expect("fixture read actor").clone(),
             key: key.clone(),
             request: 7,
             result: Ok(SourceControlRead {
@@ -2244,6 +2262,7 @@ mod tests {
             "unchanged proof must not clone/rebuild coverage"
         );
         drop(app.update(Message::SourceControlLoaded {
+            source: app.discard_ui.source().expect("fixture read actor").clone(),
             key: key.clone(),
             request: 7,
             result: Ok(SourceControlRead {
@@ -2456,7 +2475,13 @@ mod tests {
                 generation: 9,
                 result: Ok((watch, None)),
             })));
-            drop(app.update(bound_status_message(&key, request, full, read)));
+            drop(app.update(bound_status_message(
+                app.discard_ui.source().unwrap().clone(),
+                &key,
+                request,
+                full,
+                read,
+            )));
             let model = app.sidebar_model.source_control.as_ref().unwrap();
             assert_eq!(model.data_state, sidebar::SidebarDataState::Ready);
             assert_eq!(
@@ -2515,7 +2540,13 @@ mod tests {
             .snapshot_cached(&root, options, &cancel, &mut cache)
             .unwrap()
             .unwrap();
-        drop(app.update(bound_status_message(&key, 7, full, read)));
+        drop(app.update(bound_status_message(
+            app.discard_ui.source().unwrap().clone(),
+            &key,
+            7,
+            full,
+            read,
+        )));
         let original_rows = app
             .sidebar_model
             .source_control
@@ -2566,6 +2597,7 @@ mod tests {
             "cached proof retains no path listing"
         );
         drop(app.update(Message::SourceControlLoaded {
+            source: app.discard_ui.source().expect("fixture read actor").clone(),
             key: key.clone(),
             request: 7,
             result: Ok(SourceControlRead {
@@ -3724,6 +3756,7 @@ mod tests {
             ));
             drop(app.update(first));
             drop(app.update(Message::SourceControlLoaded {
+                source: app.discard_ui.source().expect("fixture read actor").clone(),
                 key: key.clone(),
                 request: app.refresh_ui.source_generation,
                 result: Err("file enrichment failed after a successful status".into()),

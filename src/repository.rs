@@ -4644,6 +4644,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )))
             }
         })?;
+        let observation_root = self
+            .authority
+            .as_ref()
+            .map(|source| source.anchored_read_path())
+            .unwrap_or_else(|| worktree.to_owned());
         let _git_dir = observation.git_dir;
         let common_dir = observation.common_dir;
         let admin = observation.fingerprint;
@@ -4714,7 +4719,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             remove_fsmonitor_override(&mut command);
             let output = self.run(&command, cancellation)?;
             cache.fsmonitor = if output.success {
-                trusted_fsmonitor(&output.stdout, worktree)
+                trusted_fsmonitor(&output.stdout, &observation_root)
             } else if output.exit_code == Some(1) {
                 None
             } else {
@@ -4747,7 +4752,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .as_ref()
                 .is_none_or(|policy| !policy.reconcile_unchanged)
         {
-            let root = fs_safety::Root::open(worktree).ok();
+            let root = fs_safety::Root::open(&observation_root).ok();
             let mut unchanged = true;
             // Keep the observation pass for a changed snapshot, rather than
             // stat every changed path again before measuring its line counts.
@@ -4761,7 +4766,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             observations_fresh = true;
             let root_unchanged = !options.untracked_files
-                || fs::symlink_metadata(worktree)
+                || fs::symlink_metadata(&observation_root)
                     .ok()
                     .map(|metadata| file_identity(&metadata))
                     == cache.browse_root;
@@ -4785,7 +4790,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .inspect_err(|_| cache.status_attempt_failed = true)?;
         status.untracked_omitted = !options.untracked_changes;
         status.listing_truncated = truncated;
-        let root = fs_safety::Root::open(worktree).ok();
+        let root = fs_safety::Root::open(&observation_root).ok();
         // Capture identities before the readers. A concurrent write after a
         // diff must remain detectable by the next missed-event reconciliation.
         let mut observed = BTreeMap::new();
@@ -4833,7 +4838,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         .into_iter()
                         .flat_map(Path::ancestors)
                     {
-                        let dependency = worktree.join(parent).join(".gitattributes");
+                        let dependency = observation_root.join(parent).join(".gitattributes");
                         if cache.numstat_attributes.contains_key(&dependency) {
                             break;
                         }
@@ -4874,7 +4879,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             &bases,
         )?;
         measure_untracked_cached(
-            worktree,
+            &observation_root,
             &mut status.entries,
             cancellation,
             &mut cache.lines,
@@ -4926,7 +4931,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cache.browse_root = options
             .untracked_files
             .then(|| {
-                fs::symlink_metadata(worktree)
+                fs::symlink_metadata(&observation_root)
                     .ok()
                     .map(|metadata| file_identity(&metadata))
             })
@@ -4952,6 +4957,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<NumstatPolicy, RepositoryError> {
+        let observation_root = self
+            .authority
+            .as_ref()
+            .map(|source| source.anchored_read_path())
+            .unwrap_or_else(|| worktree.to_owned());
         let mut policy = NumstatPolicy {
             attributes: Vec::new(),
             reusable: true,
@@ -5009,7 +5019,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 policy.attributes.push(if path.is_absolute() {
                     path
                 } else {
-                    worktree.join(path)
+                    observation_root.join(path)
                 });
             }
         }
@@ -5040,7 +5050,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     policy.reconcile_unchanged = true;
                     continue;
                 };
-                let origin = worktree.join(bytes_to_path(origin));
+                let origin = observation_root.join(bytes_to_path(origin));
                 let include = bytes_to_path(value);
                 if value.starts_with(b"~") && !value.starts_with(b"~/")
                     || value.starts_with(b"%(prefix)")
@@ -5056,7 +5066,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 } else if include.is_absolute() {
                     include
                 } else {
-                    origin.parent().unwrap_or(worktree).join(include)
+                    origin.parent().unwrap_or(&observation_root).join(include)
                 };
                 policy.attributes.push(include);
             }
@@ -5074,7 +5084,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 continue;
             }
             if let Some(origin) = pair[0].strip_prefix(b"file:") {
-                policy.attributes.push(worktree.join(bytes_to_path(origin)));
+                policy
+                    .attributes
+                    .push(observation_root.join(bytes_to_path(origin)));
             }
         }
         // Nonexistent standard configuration files have no --show-origin row.
@@ -5098,7 +5110,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         for dependency in &mut policy.attributes {
             if dependency.is_relative() {
-                *dependency = worktree.join(&*dependency);
+                *dependency = observation_root.join(&*dependency);
             }
         }
         policy.attributes.sort();
@@ -9851,6 +9863,123 @@ mod tests {
                     .snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
                     .unwrap()
                     .is_some()
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn original_discard_cache_enrichment_stays_on_held_root_during_temporary_name_replacement()
+        {
+            struct SwapAfterStatus {
+                inner: Arc<WorktreeExecutor<IsolatedExecutor>>,
+                root: PathBuf,
+                saved: PathBuf,
+                armed: AtomicBool,
+                swapped: Mutex<bool>,
+            }
+            impl SwapAfterStatus {
+                fn restore(&self) {
+                    let mut swapped = self.swapped.lock().unwrap();
+                    if *swapped {
+                        fs::remove_file(self.root.join("untracked")).unwrap();
+                        fs::remove_dir(&self.root).unwrap();
+                        fs::rename(&self.saved, &self.root).unwrap();
+                        *swapped = false;
+                    }
+                }
+            }
+            impl ProcessExecutor for SwapAfterStatus {
+                fn execute(
+                    &self,
+                    command: &CommandSpec,
+                    cancellation: &CancellationToken,
+                ) -> Result<ProcessOutput, ProcessFailure> {
+                    // Restore before the next original executor validates its
+                    // source. Only the intervening filesystem enrichments see
+                    // the public replacement; Git always reads original A.
+                    self.restore();
+                    let output = self.inner.execute(command, cancellation)?;
+                    if command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "status")
+                        && self.armed.swap(false, Ordering::AcqRel)
+                    {
+                        fs::rename(&self.root, &self.saved).unwrap();
+                        fs::create_dir(&self.root).unwrap();
+                        fs::write(self.root.join("untracked"), "foreign\n".repeat(30)).unwrap();
+                        *self.swapped.lock().unwrap() = true;
+                    }
+                    Ok(output)
+                }
+            }
+            impl Drop for SwapAfterStatus {
+                fn drop(&mut self) {
+                    self.restore();
+                }
+            }
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("checkout");
+            fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]);
+            fs::write(root.join("untracked"), "original\n").unwrap();
+            let authority = WorktreeAuthority::capture(&root).unwrap();
+            let scoped = service()
+                .with_worktree_authority(authority.clone())
+                .unwrap();
+            let executor = Arc::new(SwapAfterStatus {
+                inner: scoped.executor.clone(),
+                root: root.clone(),
+                saved: parent.path().join("original"),
+                armed: AtomicBool::new(false),
+                swapped: Mutex::new(false),
+            });
+            // Same canonical scope/executor; the outer fixture only controls
+            // timing after an actual completed status command.
+            let reader = RepositoryService {
+                git: scoped.git.clone(),
+                executor: executor.clone(),
+                creation_executor: scoped.creation_executor.clone(),
+                authority: scoped.authority.clone(),
+            };
+            let options = SnapshotOptions {
+                untracked_changes: true,
+                untracked_files: true,
+                status_limit: None,
+            };
+            let cancel = CancellationToken::new();
+            let mut cache = SnapshotCache::default();
+            reader
+                .snapshot_cached(&root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            fs::write(root.join("untracked"), "original\nsecond\n").unwrap();
+            let original = fs::metadata(root.join("untracked")).unwrap();
+            executor.armed.store(true, Ordering::Release);
+            let snapshot = reader
+                .snapshot_cached(&root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            authority.validate().unwrap();
+            assert!(!*executor.swapped.lock().unwrap());
+            let entry = snapshot
+                .status
+                .entries
+                .iter()
+                .find(|entry| entry.path == path("untracked"))
+                .unwrap();
+            assert_eq!(
+                entry.added_lines,
+                Some(2),
+                "never the replacement's30 lines"
+            );
+            assert_eq!(
+                cache.observed[&path("untracked")],
+                Some(file_identity(&original))
+            );
+            assert_eq!(
+                fs::read(root.join("untracked")).unwrap(),
+                b"original\nsecond\n"
             );
         }
 

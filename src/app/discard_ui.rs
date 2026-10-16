@@ -56,6 +56,15 @@ impl ReadSource {
             .with_worktree_authority(authority)
             .map_err(|e| e.to_string())
     }
+    pub fn anchored_read_path(&self) -> Result<PathBuf, String> {
+        Ok(self
+            .authority
+            .get()
+            .ok_or("The original source read is not ready")?
+            .as_ref()
+            .map_err(Clone::clone)?
+            .anchored_read_path())
+    }
     pub fn validate_original(&self) -> Result<(), String> {
         self.authority
             .get()

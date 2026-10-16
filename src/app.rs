@@ -11187,6 +11187,12 @@ impl Cagents {
                 // support even where strong recoverable mutation is absent.
                 #[cfg(not(target_os = "linux"))]
                 let service = crate::repository::RepositoryService::system("git");
+                #[cfg(target_os = "linux")]
+                let observation_root = read_source
+                    .anchored_read_path()
+                    .map_err(SourceControlReadFailure::from)?;
+                #[cfg(not(target_os = "linux"))]
+                let observation_root = worktree.clone();
                 let mut cache = cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -11241,14 +11247,14 @@ impl Cagents {
                     snapshot.files.ignored = ignored.ignored;
                     snapshot.files.ignored_directories = ignored.ignored_directories;
                     repository_widget::expand_ignored_directories(
-                        &worktree,
+                        &observation_root,
                         &mut snapshot.files,
                         &expanded,
                         &previous_errors,
                         &cancellation,
                     )
                     .inspect_err(|_| cache.invalidate(false))?;
-                    cache.observe_browse(&worktree, &snapshot.files);
+                    cache.observe_browse(&observation_root, &snapshot.files);
                 }
                 let model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
                 if cancellation.is_cancelled() {
@@ -28158,6 +28164,8 @@ mod tests {
         app.sidebar_model = sidebar::tests::panel_model();
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.discard_ui.select(Some(key.clone()));
+        let source = app.discard_ui.source().unwrap().clone();
         app.active_workspace = Some(key.canonical_path.clone());
         let generation = app.refresh_ui.source_generation;
         let active = CancellationToken::default();
@@ -28186,6 +28194,7 @@ mod tests {
         };
         let model = SourceControlModel::ready(key.clone(), &snapshot);
         let followup = app.update(Message::SourceControlLoaded {
+            source: source.clone(),
             key: key.clone(),
             request: generation,
             result: Ok(SourceControlRead {
@@ -28215,6 +28224,7 @@ mod tests {
         assert!(!active.is_cancelled());
         let next = app.refresh_ui.source_generation;
         drop(app.update(Message::SourceControlLoaded {
+            source: source.clone(),
             key,
             request: next,
             result: Ok(unchanged_source_control_proof()),
@@ -28233,6 +28243,8 @@ mod tests {
             app.sidebar_model = sidebar::tests::panel_model();
             app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
             let key = app.sidebar_state.active_worktree().unwrap().clone();
+            app.discard_ui.select(Some(key.clone()));
+            let source = app.discard_ui.source().unwrap().clone();
             app.active_workspace = Some(key.canonical_path.clone());
             let generation = app.refresh_ui.source_generation;
             app.refresh_ui.source_cancel = Some(CancellationToken::default());
@@ -28243,6 +28255,7 @@ mod tests {
                 Ok(unchanged_source_control_proof())
             };
             let followup = app.update(Message::SourceControlLoaded {
+                source: source.clone(),
                 key,
                 request: generation,
                 result,
@@ -28263,6 +28276,8 @@ mod tests {
         app.sidebar_model = sidebar::tests::panel_model();
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.discard_ui.select(Some(key.clone()));
+        let source = app.discard_ui.source().unwrap().clone();
         app.active_workspace = Some(key.canonical_path.clone());
         let active = CancellationToken::default();
         app.refresh_ui.source_cancel = Some(active.clone());
@@ -28278,6 +28293,7 @@ mod tests {
         assert!(!app.refresh_ui.source_reload_pending);
         assert!(app.refresh_ui.source_cancel.is_none());
         drop(app.update(Message::SourceControlLoaded {
+            source: source.clone(),
             key,
             request: retired,
             result: Ok(unchanged_source_control_proof()),

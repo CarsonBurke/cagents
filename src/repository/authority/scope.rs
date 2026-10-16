@@ -170,6 +170,12 @@ impl WorktreeAuthority {
         descriptor_path(&self.common_dir)
     }
 
+    /// Worker read locator. The caller must retain this original authority
+    /// throughout every use; this never resolves the public checkout name.
+    pub(crate) fn anchored_read_path(&self) -> PathBuf {
+        descriptor_path(&self.root)
+    }
+
     pub(super) fn anchored_path(&self) -> PathBuf {
         // The executor owns the descriptor throughout execute, including any
         // blocking parent-side filesystem work. Child Git uses its own inherited
