@@ -671,17 +671,31 @@ pub(super) fn apply(
             .revision
             .checked_add(1)
             .ok_or("view revision exhausted")?;
-        transaction.execute("INSERT INTO shared_views(scope, revision, panes, retired) VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision, panes=excluded.panes, retired=excluded.retired",
-            params![key(scope)?, view.revision,
-                serde_json::to_string(&view.panes).map_err(|error| error.to_string())?,
-                serde_json::to_string(&view.retired).map_err(|error| error.to_string())?])
-            .map_err(|error| error.to_string())?;
+        write(transaction, &view)?;
     }
     Ok(changed || !existed)
 }
 
 impl Registry {
+    pub(crate) fn title_conversation(
+        &self,
+        id: crate::model::ChannelId,
+        card: crate::model::CardId,
+        revision: u64,
+    ) -> Result<crate::chat::Session, String> {
+        let view = read(&self.db, &Scope::Channel(id))?;
+        if view.revision != revision || view.primary_chat() != Some(card) {
+            return Err("The channel's primary conversation changed".into());
+        }
+        view.panes
+            .into_iter()
+            .find_map(|pane| match pane.kind {
+                crate::model::CardKind::Chat(session) if pane.id == card => Some(session),
+                _ => None,
+            })
+            .ok_or_else(|| "The primary chat is unavailable".into())
+    }
+
     pub(crate) const VIEW_SOURCE_CONFLICT: &'static str = "The pane source changed; refuse stale source intent and rebase presentation on the current pane";
 
     pub(crate) fn view_change_refusal(
@@ -726,6 +740,28 @@ fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, Str
     .transpose()
 }
 fn write(db: &Connection, view: &View) -> Result<(), String> {
+    if let Scope::Channel(id) = &view.scope {
+        let primary = |view: &View| {
+            view.panes.iter().find_map(|pane| match &pane.kind {
+                crate::model::CardKind::Chat(session) => Some((
+                    pane.id,
+                    session.id,
+                    session.launch.provider,
+                    session.launch.session_id.clone(),
+                )),
+                _ => None,
+            })
+        };
+        if primary(&read(db, &view.scope)?) != primary(view) {
+            // A new primary conversation starts a new automatic naming choice.
+            // Manual/legacy names describe the channel and survive all moves.
+            db.execute(
+                "UPDATE channels SET title='', title_source=0 WHERE id=?1 AND title_source<>2",
+                [id.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
     db.execute("INSERT INTO shared_views(scope, revision, panes, retired) VALUES (?1, ?2, ?3, ?4)
         ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision, panes=excluded.panes, retired=excluded.retired",
         params![key(&view.scope)?, view.revision,

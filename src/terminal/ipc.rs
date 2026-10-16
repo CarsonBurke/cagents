@@ -143,10 +143,10 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-/// Isolated version 94 appends only DeviceOperation::AccountDefault and its
-/// Automatic/account-ID selection. Other request, reply and descriptor layouts
-/// remain at version 77; this does not combine other isolated wire additions.
-pub const PROTOCOL_VERSION: u16 = 94;
+/// Version 78 verifies automatic channel-name refreshes against their shared-view owner.
+/// Version 97 preserves version 78 and appends only DeviceOperation::AccountDefault
+/// with its Automatic/account-ID selection; all prior tags and layouts remain.
+pub const PROTOCOL_VERSION: u16 = 97;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
