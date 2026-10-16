@@ -57,8 +57,9 @@ Named windows are scoped to their device; the internal `device-` namespace is re
 **Browse device files…** in the same menu browses remote directories, edits UTF-8 text files up to 512 KiB,
 and runs Git status, unstaged/staged diff, stage, unstage, and commit on the device.
 It can also list worktrees, create a branch and worktree under `.worktrees/`, and
-remove a clean worktree without forcing deletion. `.worktrees/` must be ignored
-in `.gitignore` or `.git/info/exclude` before creation.
+remove a clean worktree without forcing deletion. Creation adds a clone-local
+`/.worktrees/` rule to Git's common `info/exclude` when needed, matching local
+creation without editing tracked `.gitignore`.
 **Use directory** selects the working directory for new remote terminals and
 conversations and publishes the project to the remote daemon. Saves compare the
 loaded content and serialize with other cagents saves; a changed file requires a
