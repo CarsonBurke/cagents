@@ -122,14 +122,14 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
         let (sequence, edit) = client
             .next_workspace_model_edit()
             .map_err(|error| error.to_string())?;
-        // A create's rank is assigned by the registry, so it is not in the edit.
-        // Reading the model afterwards is how an adopting window learns where
-        // the new channel sorts, and it is one request on a connection that is
-        // otherwise idle until the next edge.
+        // View edits and proof-dependent title suggestions need complete
+        // authoritative pane data: the cached view may precede their revision.
+        // Navigation also reads its settled registry ordering.
         if matches!(
             edit,
             ModelEdit::SeedView { .. }
                 | ModelEdit::ChangeView { .. }
+                | ModelEdit::SuggestConversationTitle { .. }
                 | ModelEdit::ReorderNavigation { .. }
                 | ModelEdit::ResetNavigation { .. }
         ) {
@@ -2208,6 +2208,14 @@ mod tests {
                 ));
             }
             let mut model = registry(channels);
+            if existing_primary {
+                model
+                    .channels
+                    .iter_mut()
+                    .find(|channel| channel.id == target)
+                    .unwrap()
+                    .title_source = crate::model::ChannelTitleSource::Prompt;
+            }
             let mut view = View::empty(scope.clone());
             view.revision = 17;
             if retired {
@@ -2369,6 +2377,12 @@ mod tests {
                 .apply(&change)
                 .unwrap();
             model.sequence += 1;
+            model
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .revision += 1;
             let edge = existing_primary.then(|| match metadata_edge {
                 1 => ModelEdit::AgentsChanged,
                 2 => ModelEdit::RetitleChannel {
@@ -2408,10 +2422,18 @@ mod tests {
             if let Some(edit) = &edge {
                 // The observer and publisher use distinct connections. A
                 // metadata edge may arrive before this Insert's own reply.
-                drop(app.apply_workspace_model_update(ModelUpdate::Edited {
-                    sequence: model.sequence + 1,
-                    edit: edit.clone(),
-                }));
+                if matches!(edit, ModelEdit::SuggestConversationTitle { .. }) {
+                    // The real observer reads this proof-dependent edge as a
+                    // complete snapshot, not a fold against its stale view17.
+                    let mut observed = model.clone();
+                    observed.fold(model.sequence + 1, edit);
+                    drop(app.apply_workspace_model_update(ModelUpdate::Read(observed)));
+                } else {
+                    drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+                        sequence: model.sequence + 1,
+                        edit: edit.clone(),
+                    }));
+                }
             }
             let newer_metadata = (
                 app.workspace_model.channels.clone(),
@@ -2431,6 +2453,24 @@ mod tests {
                 assert_eq!(app.workspace.focused(), Some(primary));
                 assert_eq!(app.workspace_model.channels, newer_metadata.0);
                 assert_eq!(app.workspace_model.projects, newer_metadata.1);
+                let expected_title = match metadata_edge {
+                    2 => Some("New manual title"),
+                    3 => Some("New provider title"),
+                    4 => Some("New conversation title"),
+                    _ => None,
+                };
+                if let Some(title) = expected_title {
+                    assert_eq!(app.workspace_model.channel(target).unwrap().title, title);
+                    assert_eq!(
+                        app.durable
+                            .channels
+                            .iter()
+                            .find(|channel| channel.id == target)
+                            .unwrap()
+                            .title,
+                        title
+                    );
+                }
                 let next_sequence = model.sequence + 1;
                 model.fold(next_sequence, edge.as_ref().unwrap());
                 drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
