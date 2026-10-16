@@ -1,5 +1,7 @@
 //! Bounded synchronous process execution shared by UI services and daemon workers.
 
+mod record_capture;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -75,6 +77,8 @@ pub struct CommandSpec {
     pub stdin: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
     pub stdout_limit: usize,
+    /// Opt-in NUL-record prefix capture; drain excess without killing Git.
+    pub stdout_record_limit: Option<usize>,
     pub stderr_limit: usize,
     // Borrowed only during execute; the journal service holds the owning file.
     pub(crate) inherited_lease: Option<i32>,
@@ -93,6 +97,7 @@ impl CommandSpec {
             stdin: None,
             timeout: Some(DEFAULT_COMMAND_TIMEOUT),
             stdout_limit: DEFAULT_STDOUT_LIMIT,
+            stdout_record_limit: None,
             stderr_limit: DEFAULT_STDERR_LIMIT,
             inherited_lease: None,
             inherited_files: Vec::new(),
@@ -202,6 +207,11 @@ impl CommandSpec {
         })?;
         self.stdout_file = Some((InheritedFile(file), max_file_bytes));
         Ok(self)
+    }
+
+    pub fn stdout_record_limit(mut self, records: usize) -> Self {
+        self.stdout_record_limit = Some(records);
+        self
     }
 
     pub fn to_command(&self) -> Command {
@@ -409,6 +419,8 @@ pub struct ProcessOutput {
     pub signal: Option<i32>,
     pub success: bool,
     pub stdout: Vec<u8>,
+    #[serde(default)]
+    pub stdout_truncated: bool,
     pub stderr: Vec<u8>,
 }
 
@@ -419,6 +431,7 @@ impl ProcessOutput {
             signal: exit_signal(&status),
             success: status.success(),
             stdout,
+            stdout_truncated: false,
             stderr,
         }
     }
@@ -682,9 +695,10 @@ impl ProcessExecutor for SystemProcessExecutor {
             let exceeded = Arc::clone(&stdout_exceeded);
             let events = events.clone();
             let limit = spec.stdout_limit;
+            let records = spec.stdout_record_limit;
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
-                let result = read_pipe(stdout, limit, &exceeded, &stop);
+                let result = read_pipe(stdout, limit, &exceeded, &stop, records);
                 let _ = events.send(WaitEvent::Stdout);
                 result
             })
@@ -696,7 +710,7 @@ impl ProcessExecutor for SystemProcessExecutor {
             let limit = spec.stderr_limit;
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
-                let result = read_pipe(stderr, limit, &exceeded, &stop);
+                let result = read_pipe(stderr, limit, &exceeded, &stop, None);
                 let _ = events.send(WaitEvent::Stderr);
                 result
             })
@@ -836,6 +850,7 @@ impl ProcessExecutor for SystemProcessExecutor {
             }
         }
 
+        let stdout_truncated = stdout_read.stdout_truncated;
         let stdout = stdout_read.output;
         let stderr = stderr_read.output;
         if let Some(kind) = terminal_kind {
@@ -892,7 +907,9 @@ impl ProcessExecutor for SystemProcessExecutor {
                 started: true,
             });
         }
-        Ok(ProcessOutput::from_parts(status, stdout, stderr))
+        let mut output = ProcessOutput::from_parts(status, stdout, stderr);
+        output.stdout_truncated = stdout_truncated;
+        Ok(output)
     }
 }
 
@@ -1200,6 +1217,24 @@ fn terminate_process_tree(
 struct PipeRead {
     output: Vec<u8>,
     limit_exceeded: bool,
+    stdout_truncated: bool,
+}
+impl PipeRead {
+    fn finish(
+        output: Vec<u8>,
+        listing: Option<record_capture::NulPrefix>,
+        limit_exceeded: bool,
+    ) -> Self {
+        let (output, stdout_truncated) = match listing {
+            Some(listing) => listing.finish(),
+            None => (output, false),
+        };
+        Self {
+            output,
+            limit_exceeded,
+            stdout_truncated,
+        }
+    }
 }
 
 /// A descriptor pair whose only purpose is to interrupt a thread blocked on a
@@ -1296,17 +1331,22 @@ fn read_pipe(
     limit: usize,
     limit_exceeded: &AtomicBool,
     stop: &OwnedFd,
+    records: Option<usize>,
 ) -> io::Result<PipeRead> {
     set_nonblocking(pipe.as_fd())?;
     let mut output = Vec::with_capacity(limit.min(8 * 1024));
+    let mut listing = records.map(|records| record_capture::NulPrefix::new(records, limit));
     let mut buffer = [0_u8; 8 * 1024];
     loop {
+        // A capped listing deliberately keeps draining. Check cleanup before
+        // EVERY bounded read, even when an escaped writer keeps stdout ready
+        // continuously and the pipe never reports WouldBlock.
+        if !wait_until_ready(pipe.as_fd(), libc::POLLIN, stop.as_fd())? {
+            return Ok(PipeRead::finish(output, listing, false));
+        }
         let read = match pipe.read(&mut buffer) {
             Ok(0) => {
-                return Ok(PipeRead {
-                    output,
-                    limit_exceeded: false,
-                });
+                return Ok(PipeRead::finish(output, listing, false));
             }
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1318,21 +1358,19 @@ fn read_pipe(
                 // this executor's reach — a process the hook chain put in
                 // another session — and the caller is already returning the
                 // failure that explains why the command was abandoned.
-                return Ok(PipeRead {
-                    output,
-                    limit_exceeded: false,
-                });
+                return Ok(PipeRead::finish(output, listing, false));
             }
             Err(error) => return Err(error),
         };
+        if let Some(listing) = &mut listing {
+            listing.push(&buffer[..read]);
+            continue;
+        }
         let remaining = limit.saturating_sub(output.len());
         output.extend_from_slice(&buffer[..read.min(remaining)]);
         if read > remaining {
             limit_exceeded.store(true, Ordering::Release);
-            return Ok(PipeRead {
-                output,
-                limit_exceeded: true,
-            });
+            return Ok(PipeRead::finish(output, listing, true));
         }
     }
 }
@@ -1383,6 +1421,7 @@ fn join_readers(
                 PipeRead {
                     output: Vec::new(),
                     limit_exceeded: false,
+                    stdout_truncated: false,
                 },
                 Some(format!("{name}: {error}")),
             ),
@@ -1390,6 +1429,7 @@ fn join_readers(
                 PipeRead {
                     output: Vec::new(),
                     limit_exceeded: false,
+                    stdout_truncated: false,
                 },
                 Some(format!("{name} reader panicked")),
             ),
@@ -1925,6 +1965,117 @@ sys.exit(7)
         assert!(output.success);
         assert_eq!(output.stdout, b"hello");
         assert_eq!(output.stderr, b"warning");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_always_ready_stdout_observes_cleanup_between_read_turns() {
+        struct AlwaysReady {
+            descriptor: fs::File,
+            stop_writer: Option<OwnedFd>,
+            reads: usize,
+        }
+        impl AsFd for AlwaysReady {
+            fn as_fd(&self) -> BorrowedFd<'_> {
+                self.descriptor.as_fd()
+            }
+        }
+        impl Read for AlwaysReady {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.reads > 3 {
+                    return Err(io::Error::other(
+                        "reader ignored cleanup on continuously ready stdout",
+                    ));
+                }
+                let count = self.descriptor.read(buffer)?;
+                if self.reads == 3 {
+                    drop(self.stop_writer.take());
+                }
+                Ok(count)
+            }
+        }
+        // /dev/zero is always poll-readable. The third read signals cleanup;
+        // a fourth would fail immediately, keeping even the negative oracle
+        // bounded without creating an escaped process.
+        let (stop, writer) = stop_pipe().unwrap();
+        let source = AlwaysReady {
+            descriptor: fs::File::open("/dev/zero").unwrap(),
+            stop_writer: Some(writer),
+            reads: 0,
+        };
+        let exceeded = AtomicBool::new(false);
+        let read = read_pipe(source, 32, &exceeded, &stop, Some(1)).unwrap();
+        assert_eq!(read.output, [0]);
+        assert!(read.stdout_truncated);
+        assert!(!read.limit_exceeded);
+        assert!(!exceeded.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nul_listing_cap_drains_oversized_stdout_without_killing_the_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("listing-finished");
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "head -c 20971520 /dev/zero; printf finished > \"$MARKER\"",
+            ])
+            .env("MARKER", marker.as_os_str())
+            .stdout_record_limit(10_000)
+            .timeout(Duration::from_secs(10));
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        assert!(output.success);
+        assert!(output.stdout_truncated);
+        assert_eq!(output.stdout, vec![0; 10_000]);
+        assert_eq!(std::fs::read(marker).unwrap(), b"finished");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncated_listing_still_obeys_cancellation_and_stderr_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("drained");
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let observed = marker.clone();
+        let canceller = std::thread::spawn(move || {
+            for _ in 0..300 {
+                if observed.exists() {
+                    cancel.cancel();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("listing did not finish draining before cancellation");
+        });
+        let command = CommandSpec::new("/bin/sh")
+            .args([
+                "-c",
+                "head -c 20971520 /dev/zero; printf ready > \"$MARKER\"; sleep 10",
+            ])
+            .env("MARKER", marker.as_os_str())
+            .stdout_record_limit(100)
+            .timeout(Duration::from_secs(5));
+        let failure = SystemProcessExecutor
+            .execute(&command, &cancellation)
+            .unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(failure.kind, ProcessFailureKind::Cancelled);
+        assert_eq!(failure.stdout.len(), 100);
+
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "head -c 4096 /dev/zero; head -c 4096 /dev/zero >&2"])
+            .stdout_record_limit(100)
+            .output_limits(1024, 32);
+        let failure = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::OutputLimit);
+        assert!(failure.message.contains("stderr exceeded"));
     }
 
     #[cfg(unix)]

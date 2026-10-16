@@ -117,7 +117,9 @@ impl NativePreimage {
         &self.path
     }
     pub(super) fn parent(&self) -> &fs_safety::Root {
-        self.parent.as_deref().expect("active original source parent")
+        self.parent
+            .as_deref()
+            .expect("active original source parent")
     }
     /// Only after the original source and both Trash directories are synced.
     /// Payload identity is never reopened or released here.

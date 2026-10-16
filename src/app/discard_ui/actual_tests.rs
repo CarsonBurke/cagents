@@ -1,6 +1,7 @@
 //! Exercise the real App confirmation/tasks/receipt consumer in an isolated
 //! process. Desktop Trash and runtime are private to this exact child.
 use super::*;
+use crate::process::{CommandSpec, ProcessExecutor};
 use cosmic::Application;
 use std::{
     fs,
@@ -10,7 +11,6 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
-use crate::process::{CommandSpec, ProcessExecutor};
 
 fn isolated(name: &str) -> bool {
     if std::env::var("CAGENTS_DISCARD_CASE").as_deref() == Ok(name) {
@@ -91,16 +91,23 @@ fn isolated(name: &str) -> bool {
 }
 
 fn git(root: &Path, arguments: &[&str]) {
-    let command = CommandSpec::new("git").cwd(root).args(arguments.iter().copied())
+    let command = CommandSpec::new("git")
+        .cwd(root)
+        .args(arguments.iter().copied())
         .timeout(Duration::from_secs(10));
-    SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap()
-        .require_success(&command.program).unwrap();
+    SystemProcessExecutor
+        .execute(&command, &CancellationToken::new())
+        .unwrap()
+        .require_success(&command.program)
+        .unwrap();
 }
 
 #[test]
 fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_native_trash() {
     const NAME: &str = "app::discard_ui::actual_tests::discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_native_trash";
-    if isolated(NAME) { return; }
+    if isolated(NAME) {
+        return;
+    }
     let root = PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap());
     git(&root, &["init", "-q"]);
     fs::write(root.join("modified"), b"base modified\n").unwrap();
@@ -129,24 +136,40 @@ fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_
     // used by the later confirmation is the authority that produced the rows.
     let task = app.source_control_snapshot_task(key.clone());
     let loaded = crate::app::tests::task_app_message(task);
-    assert!(matches!(&loaded, Message::SourceControlLoaded { result: Ok(_), .. }));
+    assert!(matches!(
+        &loaded,
+        Message::SourceControlLoaded { result: Ok(_), .. }
+    ));
     drop(app.update(loaded));
     let source = app.discard_ui.source().unwrap().id;
     let request = DiscardRequest {
         worktree: root.clone(),
-        tracked: ["modified", "deleted", "executable"].into_iter()
-            .map(|name| crate::repository::PathSelection::new(RepoPath::parse(name).unwrap())).collect(),
-        untracked: ["empty-after-discard/original file", "original-link"].into_iter()
-            .map(|name| RepoPath::parse(name).unwrap()).collect(),
+        tracked: ["modified", "deleted", "executable"]
+            .into_iter()
+            .map(|name| crate::repository::PathSelection::new(RepoPath::parse(name).unwrap()))
+            .collect(),
+        untracked: ["empty-after-discard/original file", "original-link"]
+            .into_iter()
+            .map(|name| RepoPath::parse(name).unwrap())
+            .collect(),
         confirmed: false,
     };
     drop(app.update(Message::SidebarSnapshot {
-        source, action: Box::new(SidebarAction::RequestDiscard { key: key.clone(), request: request.clone() }),
+        source,
+        action: Box::new(SidebarAction::RequestDiscard {
+            key: key.clone(),
+            request: request.clone(),
+        }),
     }));
     assert!(app.modal_is_open());
     let task = app.update(Message::SidebarSnapshot {
-        source, action: Box::new(SidebarAction::ConfirmDiscard {
-            key: key.clone(), request: DiscardRequest { confirmed: true, ..request },
+        source,
+        action: Box::new(SidebarAction::ConfirmDiscard {
+            key: key.clone(),
+            request: DiscardRequest {
+                confirmed: true,
+                ..request
+            },
         }),
     });
     assert!(app.discard_ui.has_inflight());
@@ -154,27 +177,39 @@ fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_
     let slot = app.discard_ui.slots[0].clone();
     // Navigate before polling the actual mutation worker. The task and already
     // installed receipt slot retain A; no completion may decorate the new B.
-    let other = ActiveWorktreeKey { worktree_id: crate::model::WorktreeId::new(), canonical_path: root.with_file_name("other"), ..key };
+    let other = ActiveWorktreeKey {
+        worktree_id: crate::model::WorktreeId::new(),
+        canonical_path: root.with_file_name("other"),
+        ..key
+    };
     app.discard_ui.select(Some(other.clone()));
     app.sidebar_model.source_control = Some(SourceControlModel::loading(other.clone()));
     let (response, receiver) = std::sync::mpsc::sync_channel(1);
     drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-        action: instance::UiUpdateAction::Prepare, response,
+        action: instance::UiUpdateAction::Prepare,
+        response,
     })));
     assert!(receiver.try_recv().unwrap().starts_with("error:"));
-    assert!(!app.update_prepared, "navigation cannot hide A's worker from updater Prepare");
+    assert!(
+        !app.update_prepared,
+        "navigation cannot hide A's worker from updater Prepare"
+    );
     // Also exercise the actual commit/flush boundaries if a background
     // operation appears after the initial preflight of an update.
     app.update_prepared = true;
     let (response, receiver) = std::sync::mpsc::sync_channel(1);
     drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-        action: instance::UiUpdateAction::Commit, response,
+        action: instance::UiUpdateAction::Commit,
+        response,
     })));
     assert!(receiver.try_recv().unwrap().starts_with("error:"));
     let (response, receiver) = std::sync::mpsc::sync_channel(1);
     drop(app.update(Message::UiUpdateFlushed {
-        generation: app.update_generation, committing: true, response,
-        saved: Err("No settings save in this boundary control".into()), result: Ok(()),
+        generation: app.update_generation,
+        committing: true,
+        response,
+        saved: Err("No settings save in this boundary control".into()),
+        result: Ok(()),
     }));
     assert!(receiver.try_recv().unwrap().starts_with("error:"));
     assert!(!app.update_prepared);
@@ -183,27 +218,61 @@ fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_
     let finished = crate::app::tests::task_app_message(task);
     assert!(matches!(&finished, Message::DiscardFinished { .. }));
     assert!(!app.discard_ui.has_inflight());
-    let receipt = slot.0.lock().unwrap().receipt.clone().expect("worker installs receipt before completion");
+    let receipt = slot
+        .0
+        .lock()
+        .unwrap()
+        .receipt
+        .clone()
+        .expect("worker installs receipt before completion");
     assert_eq!(receipt.remaining_paths(), 5);
     assert!(!untracked.exists());
     assert!(!root.join("empty-after-discard").exists());
     assert_eq!(fs::read(root.join("modified")).unwrap(), b"base modified\n");
     let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
-    let trash = fs::read_dir(data.join("Trash/files")).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+    let trash = fs::read_dir(data.join("Trash/files"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
     assert_eq!(trash.len(), 2);
-    assert!(trash.iter().any(|path| fs::symlink_metadata(path).is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == (original.dev(), original.ino()))));
+    assert!(
+        trash
+            .iter()
+            .any(|path| fs::symlink_metadata(path).is_ok_and(|metadata| (
+                metadata.dev(),
+                metadata.ino()
+            ) == (
+                original.dev(),
+                original.ino()
+            )))
+    );
     assert_eq!(fs::read_dir(data.join("Trash/info")).unwrap().count(), 2);
     drop(app.update(finished));
-    assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().key, other);
+    assert_eq!(
+        app.sidebar_model.source_control.as_ref().unwrap().key,
+        other
+    );
     assert!(app.discard_ui.slot(slot.id()).is_some());
     app.update_prepared = true;
-    drop(app.update(Message::DiscardUndo { id: slot.id(), resolve: false }));
-    drop(app.update(Message::DiscardUndo { id: slot.id(), resolve: true }));
-    assert!(!app.discard_ui.has_inflight(), "prepared update rejects both Undo and Resolve admission");
+    drop(app.update(Message::DiscardUndo {
+        id: slot.id(),
+        resolve: false,
+    }));
+    drop(app.update(Message::DiscardUndo {
+        id: slot.id(),
+        resolve: true,
+    }));
+    assert!(
+        !app.discard_ui.has_inflight(),
+        "prepared update rejects both Undo and Resolve admission"
+    );
     assert_eq!(receipt.remaining_paths(), 5);
     assert!(!untracked.exists());
     app.update_prepared = false;
-    let undo = app.update(Message::DiscardUndo { id: slot.id(), resolve: false });
+    let undo = app.update(Message::DiscardUndo {
+        id: slot.id(),
+        resolve: false,
+    });
     assert!(app.discard_ui.has_inflight());
     let undone = crate::app::tests::task_app_message(undo);
     drop(app.update(undone));
@@ -211,14 +280,29 @@ fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_
     assert!(!receipt.live_recovery.needs_resolution());
     assert!(!app.discard_ui.has_inflight());
     assert!(app.discard_ui.slot(slot.id()).is_none());
-    assert_eq!(fs::read(root.join("modified")).unwrap(), b"precious modified\n");
+    assert_eq!(
+        fs::read(root.join("modified")).unwrap(),
+        b"precious modified\n"
+    );
     assert!(!root.join("deleted").exists());
-    assert_eq!(fs::read(root.join("executable")).unwrap(), b"#!/bin/sh\nexit 7\n");
-    assert_eq!(fs::metadata(root.join("executable")).unwrap().mode() & 0o7777, 0o755);
+    assert_eq!(
+        fs::read(root.join("executable")).unwrap(),
+        b"#!/bin/sh\nexit 7\n"
+    );
+    assert_eq!(
+        fs::metadata(root.join("executable")).unwrap().mode() & 0o7777,
+        0o755
+    );
     assert_eq!(fs::read(&untracked).unwrap(), b"untracked original\n");
     let restored = fs::metadata(&untracked).unwrap();
-    assert_eq!((restored.dev(), restored.ino(), restored.mode() & 0o7777), (original.dev(), original.ino(), 0o640));
-    assert_eq!(fs::read_link(root.join("original-link")).unwrap(), PathBuf::from("literal missing target"));
+    assert_eq!(
+        (restored.dev(), restored.ino(), restored.mode() & 0o7777),
+        (original.dev(), original.ino(), 0o640)
+    );
+    assert_eq!(
+        fs::read_link(root.join("original-link")).unwrap(),
+        PathBuf::from("literal missing target")
+    );
     assert_eq!(fs::read_dir(data.join("Trash/files")).unwrap().count(), 0);
     assert_eq!(fs::read_dir(data.join("Trash/info")).unwrap().count(), 0);
     assert!(app.discard_ui.close_block_reason().is_none());
@@ -227,7 +311,9 @@ fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_
 #[test]
 fn discard_app_partial_undo_preserves_newer_file_and_keeps_remaining_receipt() {
     const NAME: &str = "app::discard_ui::actual_tests::discard_app_partial_undo_preserves_newer_file_and_keeps_remaining_receipt";
-    if isolated(NAME) { return; }
+    if isolated(NAME) {
+        return;
+    }
     let root = PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap());
     git(&root, &["init", "-q"]);
     fs::write(root.join("changed"), b"base\n").unwrap();
@@ -244,21 +330,35 @@ fn discard_app_partial_undo_preserves_newer_file_and_keeps_remaining_receipt() {
     app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
     let task = app.source_control_snapshot_task(key.clone());
     let loaded = crate::app::tests::task_app_message(task);
-    assert!(matches!(&loaded, Message::SourceControlLoaded { result: Ok(_), .. }));
+    assert!(matches!(
+        &loaded,
+        Message::SourceControlLoaded { result: Ok(_), .. }
+    ));
     drop(app.update(loaded));
     let source = app.discard_ui.source().unwrap().id;
     let request = DiscardRequest {
         worktree: root.clone(),
-        tracked: vec![crate::repository::PathSelection::new(RepoPath::parse("changed").unwrap())],
+        tracked: vec![crate::repository::PathSelection::new(
+            RepoPath::parse("changed").unwrap(),
+        )],
         untracked: vec![RepoPath::parse("new file").unwrap()],
         confirmed: false,
     };
     drop(app.update(Message::SidebarSnapshot {
-        source, action: Box::new(SidebarAction::RequestDiscard { key: key.clone(), request: request.clone() }),
+        source,
+        action: Box::new(SidebarAction::RequestDiscard {
+            key: key.clone(),
+            request: request.clone(),
+        }),
     }));
     let task = app.update(Message::SidebarSnapshot {
-        source, action: Box::new(SidebarAction::ConfirmDiscard {
-            key, request: DiscardRequest { confirmed: true, ..request },
+        source,
+        action: Box::new(SidebarAction::ConfirmDiscard {
+            key,
+            request: DiscardRequest {
+                confirmed: true,
+                ..request
+            },
         }),
     });
     let slot = app.discard_ui.slots[0].clone();
@@ -269,20 +369,42 @@ fn discard_app_partial_undo_preserves_newer_file_and_keeps_remaining_receipt() {
     assert_eq!(fs::read(root.join("changed")).unwrap(), b"base\n");
     assert!(!root.join("new file").exists());
     fs::write(root.join("changed"), b"user's newer work\n").unwrap();
-    let task = app.update(Message::DiscardUndo { id: slot.id(), resolve: false });
+    let task = app.update(Message::DiscardUndo {
+        id: slot.id(),
+        resolve: false,
+    });
     let finished = crate::app::tests::task_app_message(task);
-    assert!(matches!(&finished, Message::DiscardFinished { report: Some(report), .. } if report.contains("changed")));
+    assert!(
+        matches!(&finished, Message::DiscardFinished { report: Some(report), .. } if report.contains("changed"))
+    );
     drop(app.update(finished));
-    assert_eq!(fs::read(root.join("changed")).unwrap(), b"user's newer work\n");
-    assert_eq!(fs::read(root.join("new file")).unwrap(), b"new file original\n");
+    assert_eq!(
+        fs::read(root.join("changed")).unwrap(),
+        b"user's newer work\n"
+    );
+    assert_eq!(
+        fs::read(root.join("new file")).unwrap(),
+        b"new file original\n"
+    );
     assert_eq!(receipt.remaining_paths(), 1);
     assert!(receipt.can_undo());
     assert!(app.discard_ui.slot(slot.id()).is_some());
-    let task = app.update(Message::DiscardUndo { id: slot.id(), resolve: false });
+    let task = app.update(Message::DiscardUndo {
+        id: slot.id(),
+        resolve: false,
+    });
     let finished = crate::app::tests::task_app_message(task);
-    assert!(matches!(&finished, Message::DiscardFinished { report: Some(report), .. } if report.contains("changed")));
+    assert!(
+        matches!(&finished, Message::DiscardFinished { report: Some(report), .. } if report.contains("changed"))
+    );
     drop(app.update(finished));
     assert_eq!(receipt.remaining_paths(), 1);
-    assert_eq!(fs::read(root.join("changed")).unwrap(), b"user's newer work\n");
-    assert_eq!(fs::read(root.join("new file")).unwrap(), b"new file original\n");
+    assert_eq!(
+        fs::read(root.join("changed")).unwrap(),
+        b"user's newer work\n"
+    );
+    assert_eq!(
+        fs::read(root.join("new file")).unwrap(),
+        b"new file original\n"
+    );
 }

@@ -144,7 +144,10 @@ impl FilesystemRecoveryContext {
         if !slot.belongs_to(&self.context) {
             return Err(slot);
         }
-        Ok(FilesystemRecoveryReservation { context: self.clone(), slot })
+        Ok(FilesystemRecoveryReservation {
+            context: self.clone(),
+            slot,
+        })
     }
     pub(crate) fn reserve(&self) -> Result<RecoverySlot, String> {
         self.placement

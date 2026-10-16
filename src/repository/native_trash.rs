@@ -257,13 +257,16 @@ fn prepare_in(
         return Ok(None);
     }
     if paths.len() > 128 {
-        return Err("Select at most128 untracked files per recoverable discard; no file was changed".into());
+        return Err(
+            "Select at most128 untracked files per recoverable discard; no file was changed".into(),
+        );
     }
     // Two pins per entry: before effects, source parent+payload; after a
     // fully synced move, original payload+info. The shared Trash root pair
     // adds two. One separate slot covers the active staging transaction.
     let mut slots = Vec::new();
-    for _ in 0..(2 * paths.len() + 2).div_ceil(crate::recovery_authority::MAX_RECOVERY_DESCRIPTORS) {
+    for _ in 0..(2 * paths.len() + 2).div_ceil(crate::recovery_authority::MAX_RECOVERY_DESCRIPTORS)
+    {
         slots.push(context.reserve()?);
     }
     let pins = Arc::new(PinBudget { _slots: slots });
@@ -275,7 +278,10 @@ fn prepare_in(
     let mut prepared = VecDeque::new();
     for path in paths {
         let proof = NativePreimage::capture(root.clone(), path.clone(), cancellation)?;
-        prepared.push_back(Prepared { proof, pins: pins.clone() });
+        prepared.push_back(Prepared {
+            proof,
+            pins: pins.clone(),
+        });
     }
     if !data.is_absolute() {
         return Err("Native Trash data directory must be absolute".into());
@@ -430,7 +436,9 @@ impl Batch {
             return Err("Native Trash original-path metadata exceeds the bounded limit".into());
         }
         let directory = fs_safety::prepare_recovery_directory_with_owner(
-            self.transaction.take().ok_or("Resolve the previous native Trash transaction before continuing")?,
+            self.transaction
+                .take()
+                .ok_or("Resolve the previous native Trash transaction before continuing")?,
             OsStr::new(&format!(".cagents-trash-{}", Uuid::new_v4())),
             || cancellation.is_cancelled(),
             (prepared.proof, prepared.pins),
@@ -442,7 +450,8 @@ impl Batch {
                 cause.to_string()
             }
         })?;
-        let (publication, (preimage, pins), private_metadata, context, slot) = directory.into_parts();
+        let (publication, (preimage, pins), private_metadata, context, slot) =
+            directory.into_parts();
         let mut owner = Owner {
             publication: Some(publication),
             preimage,
@@ -475,8 +484,12 @@ impl Batch {
                 if warning.is_none() {
                     owner.compact_completed();
                     let slot = owner.slot.take().expect("active transaction charge");
-                    self.transaction = Some(owner.context.recycle_directory_slot(slot)
-                        .unwrap_or_else(|_| unreachable!("same original context")));
+                    self.transaction = Some(
+                        owner
+                            .context
+                            .recycle_directory_slot(slot)
+                            .unwrap_or_else(|_| unreachable!("same original context")),
+                    );
                 }
                 let receipt = TrashReceipt {
                     path: path.clone(),
@@ -515,7 +528,11 @@ impl Batch {
 
 fn retain_shared(receipt: &TrashReceipt, live: &LiveDiscardRecovery) {
     let owner = receipt.owner.clone();
-    let slot = owner.lock().unwrap_or_else(|e| e.into_inner()).slot.take()
+    let slot = owner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .slot
+        .take()
         .expect("active transaction charge");
     let authority = slot.retain(
         format!("Native Trash cleanup for {}", receipt.path),
@@ -536,7 +553,10 @@ impl Owner {
         )
     }
     fn holding(&self) -> &fs_safety::Root {
-        self.publication.as_ref().expect("active private holding").directory()
+        self.publication
+            .as_ref()
+            .expect("active private holding")
+            .directory()
     }
     fn validate_native(&self) -> Result<(), String> {
         verify_native_spelling(&self.files)?;
@@ -844,7 +864,8 @@ impl Owner {
                 // the original native entry remains available for Undo.
                 // No payload rename was dispatched by this Undo. Preserve
                 // the settled original version, including ctime.
-                self.preimage.verify_at(&self.files, &self.id, false, &CancellationToken::new())?;
+                self.preimage
+                    .verify_at(&self.files, &self.id, false, &CancellationToken::new())?;
                 self.verify_info(&self.info, &self.info_name, false)?;
                 return self.remove_empty_holding();
             }
@@ -910,7 +931,10 @@ impl Owner {
             self.remove_info()?;
         }
         if self.restored {
-            let target = self.restore_parent.as_ref().unwrap_or_else(|| self.preimage.parent());
+            let target = self
+                .restore_parent
+                .as_ref()
+                .unwrap_or_else(|| self.preimage.parent());
             fs_safety::sync_directory(target).map_err(error)?;
         }
         self.remove_empty_holding()
@@ -1064,7 +1088,7 @@ fn restore_observing(
             owner.compact_completed();
             owner.slot = None;
             Ok(None)
-        },
+        }
         Err(reason) => {
             // Original receipt stays installed in the UI before this task.
             // Retain the actual new holding even when publication is uncertain.
@@ -1072,7 +1096,10 @@ fn restore_observing(
                 .live_recovery
                 .set_uncertain(!owner.restored_verified);
             let shared = receipt.owner.clone();
-            let slot = owner.slot.take().expect("active restore transaction charge");
+            let slot = owner
+                .slot
+                .take()
+                .expect("active restore transaction charge");
             recovery
                 .live_recovery
                 .retain(slot.retain(reason.clone(), move || {
@@ -1124,25 +1151,53 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let root = Arc::new(fs_safety::Root::open(source.path()).unwrap());
-        let paths = (0..128).map(|index| RepoPath::parse(format!("entry-{index}")).unwrap())
+        let paths = (0..128)
+            .map(|index| RepoPath::parse(format!("entry-{index}")).unwrap())
             .collect::<Vec<_>>();
         for path in &paths {
             fs::write(source.path().join(path.as_path()), b"still original").unwrap();
         }
         let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
         let live = LiveDiscardRecovery::default();
-        let occupied = (0..7).map(|_| context.reserve().unwrap()).collect::<Vec<_>>();
-        assert!(prepare_in(root.clone(), &paths, &context, &live,
-            &CancellationToken::new(), data.path().to_owned()).is_err());
+        let occupied = (0..7)
+            .map(|_| context.reserve().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            prepare_in(
+                root.clone(),
+                &paths,
+                &context,
+                &live,
+                &CancellationToken::new(),
+                data.path().to_owned()
+            )
+            .is_err()
+        );
         assert!(!live.needs_resolution());
         assert_eq!(fs::read_dir(data.path()).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(context.placement().directory().path()).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(context.placement().directory().path())
+                .unwrap()
+                .count(),
+            0
+        );
         for path in &paths {
-            assert_eq!(fs::read(source.path().join(path.as_path())).unwrap(), b"still original");
+            assert_eq!(
+                fs::read(source.path().join(path.as_path())).unwrap(),
+                b"still original"
+            );
         }
         drop(occupied);
-        let batch = prepare_in(root, &paths, &context, &live,
-            &CancellationToken::new(), data.path().to_owned()).unwrap().unwrap();
+        let batch = prepare_in(
+            root,
+            &paths,
+            &context,
+            &live,
+            &CancellationToken::new(),
+            data.path().to_owned(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(batch.prepared.len(), 128);
     }
 
@@ -1151,21 +1206,40 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let root = Arc::new(fs_safety::Root::open(source.path()).unwrap());
-        let paths = (0..128).map(|index| RepoPath::parse(format!("entry-{index}")).unwrap())
+        let paths = (0..128)
+            .map(|index| RepoPath::parse(format!("entry-{index}")).unwrap())
             .collect::<Vec<_>>();
-        let originals = paths.iter().enumerate().map(|(index, path)| {
-            fs::write(source.path().join(path.as_path()), format!("original-{index}")).unwrap();
-            fs::symlink_metadata(source.path().join(path.as_path())).unwrap()
-        }).collect::<Vec<_>>();
+        let originals = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                fs::write(
+                    source.path().join(path.as_path()),
+                    format!("original-{index}"),
+                )
+                .unwrap();
+                fs::symlink_metadata(source.path().join(path.as_path())).unwrap()
+            })
+            .collect::<Vec<_>>();
         let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
         let live = LiveDiscardRecovery::default();
-        let mut batch = prepare_in(root.clone(), &paths, &context, &live,
-            &CancellationToken::new(), data.path().to_owned()).unwrap().unwrap();
+        let mut batch = prepare_in(
+            root.clone(),
+            &paths,
+            &context,
+            &live,
+            &CancellationToken::new(),
+            data.path().to_owned(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(batch._pins._slots.len(), 17);
         let pins = Arc::downgrade(&batch._pins);
         let mut receipts = Vec::new();
         for (path, original) in paths.iter().zip(&originals) {
-            let receipt = batch.discard(path, &live, &CancellationToken::new()).unwrap();
+            let receipt = batch
+                .discard(path, &live, &CancellationToken::new())
+                .unwrap();
             assert!(receipt.warning.is_none());
             assert!(batch.transaction.is_some());
             let owner = receipt.owner.lock().unwrap();
@@ -1173,19 +1247,49 @@ mod tests {
             assert!(owner.slot.is_none());
             assert!(!owner.preimage.has_source_parent());
             let actual = owner.preimage.payload().metadata().unwrap();
-            assert_eq!((actual.dev(), actual.ino()), (original.dev(), original.ino()));
-            assert_eq!(owner.info_file.as_ref().unwrap().metadata().unwrap().nlink(), 1);
+            assert_eq!(
+                (actual.dev(), actual.ino()),
+                (original.dev(), original.ino())
+            );
+            assert_eq!(
+                owner
+                    .info_file
+                    .as_ref()
+                    .unwrap()
+                    .metadata()
+                    .unwrap()
+                    .nlink(),
+                1
+            );
             drop(owner);
             receipts.push(receipt);
         }
         assert!(!live.needs_resolution());
-        assert_eq!(fs::read_dir(context.placement().directory().path()).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(data.path().join("Trash/files")).unwrap().count(), 128);
-        assert_eq!(fs::read_dir(data.path().join("Trash/info")).unwrap().count(), 128);
+        assert_eq!(
+            fs::read_dir(context.placement().directory().path())
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(data.path().join("Trash/files"))
+                .unwrap()
+                .count(),
+            128
+        );
+        assert_eq!(
+            fs::read_dir(data.path().join("Trash/info"))
+                .unwrap()
+                .count(),
+            128
+        );
         let clone = receipts[0].clone();
         drop(receipts);
         drop(batch);
-        assert!(pins.upgrade().is_some(), "indexed receipt clone owns the entire shared charge");
+        assert!(
+            pins.upgrade().is_some(),
+            "indexed receipt clone owns the entire shared charge"
+        );
         drop(clone);
         assert!(pins.upgrade().is_none());
     }
@@ -1203,7 +1307,9 @@ mod tests {
                 init = init.env_remove(key);
             }
         }
-        init = init.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null");
+        init = init
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
         base.run_checked(&init, &CancellationToken::new()).unwrap();
         let authority = WorktreeAuthority::capture(source.path()).unwrap();
         let root = authority.retained_worktree_root();
@@ -1226,37 +1332,63 @@ mod tests {
             paths.push(next);
         }
         let mut batch = prepare_in(
-            root.clone(), &paths, &context, &live,
-            &CancellationToken::new(), data.path().to_owned(),
-        ).unwrap();
+            root.clone(),
+            &paths,
+            &context,
+            &live,
+            &CancellationToken::new(),
+            data.path().to_owned(),
+        )
+        .unwrap();
         let mut trashed = Vec::new();
         let pins = Arc::downgrade(&batch.as_ref().unwrap()._pins);
         assert_eq!(pins.upgrade().unwrap()._slots.len(), 17);
         let mut acquired = Vec::new();
-        let outcome = service.discard_recovery_mutation_observing(
-            &DiscardRequest {
-                worktree: source.path().to_owned(), tracked: Vec::new(),
-                untracked: paths.clone(), confirmed: true,
-            },
-            &CancellationToken::new(), &mut trashed, &root, &BTreeMap::new(),
-            &mut batch, &live, &mut |acquired_path| {
-                acquired.push(acquired_path.clone());
-                assert!(!file.exists());
-                writer.write_all_at(b"newer FD edit\n", 0).unwrap();
-                writer.sync_all().unwrap();
-            },
-        ).unwrap();
-        assert!(matches!(outcome, MutationOutcome::OutcomeUnknown { .. }), "{outcome:?}");
+        let outcome = service
+            .discard_recovery_mutation_observing(
+                &DiscardRequest {
+                    worktree: source.path().to_owned(),
+                    tracked: Vec::new(),
+                    untracked: paths.clone(),
+                    confirmed: true,
+                },
+                &CancellationToken::new(),
+                &mut trashed,
+                &root,
+                &BTreeMap::new(),
+                &mut batch,
+                &live,
+                &mut |acquired_path| {
+                    acquired.push(acquired_path.clone());
+                    assert!(!file.exists());
+                    writer.write_all_at(b"newer FD edit\n", 0).unwrap();
+                    writer.sync_all().unwrap();
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, MutationOutcome::OutcomeUnknown { .. }),
+            "{outcome:?}"
+        );
         assert_eq!(acquired, vec![path]);
         assert!(trashed.is_empty());
         assert!(live.needs_resolution());
         assert!(live.is_uncertain());
         assert!(!file.exists());
-        assert_eq!(fs::read(source.path().join(later.as_path())).unwrap(), b"later untouched\n");
+        assert_eq!(
+            fs::read(source.path().join(later.as_path())).unwrap(),
+            b"later untouched\n"
+        );
         assert!(!source.path().join(".git/index.lock").exists());
-        let holding = fs::read_dir(context.placement().directory().path()).unwrap()
+        let holding = fs::read_dir(context.placement().directory().path())
+            .unwrap()
             .map(|entry| entry.unwrap().path())
-            .find(|path| path.file_name().unwrap().as_bytes().starts_with(b".cagents-trash-"))
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b".cagents-trash-")
+            })
             .unwrap();
         let report = match &outcome {
             MutationOutcome::OutcomeUnknown { failure } => failure.to_string(),
@@ -1266,120 +1398,210 @@ mod tests {
         assert!(report.contains("opened spellings"));
         let payload = holding.join("payload");
         let retained = fs::metadata(&payload).unwrap();
-        assert_eq!((retained.dev(), retained.ino()), (original.dev(), original.ino()));
+        assert_eq!(
+            (retained.dev(), retained.ino()),
+            (original.dev(), original.ino())
+        );
         assert_eq!(fs::read(&payload).unwrap(), b"newer FD edit\n");
         drop(batch);
-        assert!(pins.upgrade().is_some(), "active failed entry keeps the full batch pin charge");
+        assert!(
+            pins.upgrade().is_some(),
+            "active failed entry keeps the full batch pin charge"
+        );
         for path in &paths[1..] {
-            assert_eq!(fs::read(source.path().join(path.as_path())).unwrap(), b"later untouched\n");
+            assert_eq!(
+                fs::read(source.path().join(path.as_path())).unwrap(),
+                b"later untouched\n"
+            );
         }
         let retry = live.authority().unwrap();
-        assert!(retry.retry().is_err(), "newer original bytes must not be adopted or rolled back");
+        assert!(
+            retry.retry().is_err(),
+            "newer original bytes must not be adopted or rolled back"
+        );
         assert_eq!(fs::read(&payload).unwrap(), b"newer FD edit\n");
         assert!(!file.exists());
         // Explicit operator disposal of BOTH originals is a supported terminal
         // route; moving or modifying the retained payload is not settlement.
         fs::remove_file(&payload).unwrap();
-        let info = fs::read_dir(data.path().join("Trash/info")).unwrap()
-            .map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+        let info = fs::read_dir(data.path().join("Trash/info"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
         assert_eq!(info.len(), 1);
         fs::remove_file(&info[0]).unwrap();
         retry.retry().unwrap();
         assert!(retry.is_resolved());
-        assert!(pins.upgrade().is_none(), "only actual settlement releases original failed owner and shared charge");
+        assert!(
+            pins.upgrade().is_none(),
+            "only actual settlement releases original failed owner and shared charge"
+        );
         assert!(!holding.exists());
-        assert_eq!(fs::read(source.path().join(later.as_path())).unwrap(), b"later untouched\n");
+        assert_eq!(
+            fs::read(source.path().join(later.as_path())).unwrap(),
+            b"later untouched\n"
+        );
     }
 
     #[test]
     fn native_compact_receipt_resolves_preacquisition_undo_failure_then_retries_same_public_undo() {
         for change_settled_payload_ctime in [false, true] {
-        let source = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let base = RepositoryService::system("git");
-        let mut init = base.git_mutation(source.path(), ["init", "--quiet"]);
-        for (key, _) in std::env::vars_os() {
-            if key.as_bytes().starts_with(b"GIT_") { init = init.env_remove(key); }
-        }
-        init = init.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null");
-        base.run_checked(&init, &CancellationToken::new()).unwrap();
-        let authority = WorktreeAuthority::capture(source.path()).unwrap();
-        let root = authority.retained_worktree_root();
-        let service = base.with_worktree_authority(authority.clone()).unwrap();
-        let file = source.path().join("original");
-        fs::write(&file, b"original native bytes\n").unwrap();
-        let original = fs::metadata(&file).unwrap();
-        let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
-        let live = LiveDiscardRecovery::default();
-        let path = RepoPath::parse("original").unwrap();
-        let mut batch = prepare_in(root.clone(), &[path.clone()], &context, &live,
-            &CancellationToken::new(), data.path().to_owned()).unwrap().unwrap();
-        let receipt = batch.discard(&path, &live, &CancellationToken::new()).unwrap();
-        drop(batch);
-        assert!(!receipt.owner.lock().unwrap().preimage.has_source_parent());
-        let directory = root.metadata().unwrap();
-        let recovery = DiscardRecovery {
-            live_recovery: live,
-            custody: Some(Arc::new(DiscardCustody {
-                git: service.git.clone(), executor: service.creation_executor.clone(),
-                source: authority, context: context.clone(),
-            })),
-            worktree: source.path().to_owned(),
-            worktree_identity: (directory.dev(), directory.ino()),
-            directories: BTreeMap::new(),
-            entries: vec![DiscardRecoveryEntry {
-                path: path.clone(), before: SavedEntry::Trashed, after: SavedEntry::Absent,
-                after_version: None, trash: Some(receipt.clone()),
-            }],
-            expires_unix_ms: u64::MAX,
-        };
-        let failed = restore_observing(&receipt, &recovery, &root, OsStr::new("original"),
-            &CancellationToken::new(), &context,
-            || Err("injected failure after new holding, before native acquisition".into()),
-            || Ok(()));
-        assert!(failed.is_err());
-        assert!(!file.exists());
-        assert!(recovery.live_recovery.needs_resolution());
-        {
-            let owner = receipt.owner.lock().unwrap();
-            assert!(owner.publication.is_some());
-            assert!(owner.restore_parent.is_some());
-            assert!(owner.payload_in_trash);
-            assert!(!owner.preimage.has_source_parent());
-        }
-        if change_settled_payload_ctime {
-            let pin = receipt.owner.lock().unwrap().preimage.payload();
-            let settled = pin.metadata().unwrap();
-            pin.set_permissions(fs::Permissions::from_mode((settled.mode() & 0o7777) ^ 0o100)).unwrap();
-            pin.set_permissions(settled.permissions()).unwrap();
-            let changed = pin.metadata().unwrap();
-            assert_eq!(changed.mode(), settled.mode());
-            assert_ne!((changed.ctime(), changed.ctime_nsec()), (settled.ctime(), settled.ctime_nsec()));
-            for _ in 0..2 {
-                assert!(service.resolve_discard_recovery(&recovery, &CancellationToken::new()).is_err());
-                assert!(receipt.owner.lock().unwrap().preimage.matches_recorded_metadata(&settled));
-                assert_eq!(recovery.remaining_paths(), 1);
-                assert!(recovery.live_recovery.needs_resolution());
-                assert!(!confirmed_restore(&receipt));
-                assert!(!file.exists());
+            let source = tempfile::tempdir().unwrap();
+            let data = tempfile::tempdir().unwrap();
+            let base = RepositoryService::system("git");
+            let mut init = base.git_mutation(source.path(), ["init", "--quiet"]);
+            for (key, _) in std::env::vars_os() {
+                if key.as_bytes().starts_with(b"GIT_") {
+                    init = init.env_remove(key);
+                }
             }
-            continue;
-        }
-        let resolved = service.resolve_discard_recovery(&recovery, &CancellationToken::new()).unwrap();
-        assert_eq!(resolved.remaining_paths, 1);
-        assert!(!recovery.live_recovery.needs_resolution());
-        assert!(!confirmed_restore(&receipt));
-        assert!(!file.exists());
-        assert_eq!(fs::read_dir(data.path().join("Trash/files")).unwrap().count(), 1);
-        assert_eq!(fs::read_dir(context.placement().directory().path()).unwrap().count(), 0);
-        let undo = service.undo_discard(&recovery, &CancellationToken::new()).unwrap();
-        assert!(matches!(undo, MutationOutcome::Applied { .. }), "{undo:?}");
-        assert_eq!(recovery.remaining_paths(), 0);
-        assert_eq!(fs::read(&file).unwrap(), b"original native bytes\n");
-        let restored = fs::metadata(file).unwrap();
-        assert_eq!((restored.dev(), restored.ino()), (original.dev(), original.ino()));
-        assert_eq!(fs::read_dir(data.path().join("Trash/files")).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(data.path().join("Trash/info")).unwrap().count(), 0);
+            init = init
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null");
+            base.run_checked(&init, &CancellationToken::new()).unwrap();
+            let authority = WorktreeAuthority::capture(source.path()).unwrap();
+            let root = authority.retained_worktree_root();
+            let service = base.with_worktree_authority(authority.clone()).unwrap();
+            let file = source.path().join("original");
+            fs::write(&file, b"original native bytes\n").unwrap();
+            let original = fs::metadata(&file).unwrap();
+            let context =
+                crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
+            let live = LiveDiscardRecovery::default();
+            let path = RepoPath::parse("original").unwrap();
+            let mut batch = prepare_in(
+                root.clone(),
+                &[path.clone()],
+                &context,
+                &live,
+                &CancellationToken::new(),
+                data.path().to_owned(),
+            )
+            .unwrap()
+            .unwrap();
+            let receipt = batch
+                .discard(&path, &live, &CancellationToken::new())
+                .unwrap();
+            drop(batch);
+            assert!(!receipt.owner.lock().unwrap().preimage.has_source_parent());
+            let directory = root.metadata().unwrap();
+            let recovery = DiscardRecovery {
+                live_recovery: live,
+                custody: Some(Arc::new(DiscardCustody {
+                    git: service.git.clone(),
+                    executor: service.creation_executor.clone(),
+                    source: authority,
+                    context: context.clone(),
+                })),
+                worktree: source.path().to_owned(),
+                worktree_identity: (directory.dev(), directory.ino()),
+                directories: BTreeMap::new(),
+                entries: vec![DiscardRecoveryEntry {
+                    path: path.clone(),
+                    before: SavedEntry::Trashed,
+                    after: SavedEntry::Absent,
+                    after_version: None,
+                    trash: Some(receipt.clone()),
+                }],
+                expires_unix_ms: u64::MAX,
+            };
+            let failed = restore_observing(
+                &receipt,
+                &recovery,
+                &root,
+                OsStr::new("original"),
+                &CancellationToken::new(),
+                &context,
+                || Err("injected failure after new holding, before native acquisition".into()),
+                || Ok(()),
+            );
+            assert!(failed.is_err());
+            assert!(!file.exists());
+            assert!(recovery.live_recovery.needs_resolution());
+            {
+                let owner = receipt.owner.lock().unwrap();
+                assert!(owner.publication.is_some());
+                assert!(owner.restore_parent.is_some());
+                assert!(owner.payload_in_trash);
+                assert!(!owner.preimage.has_source_parent());
+            }
+            if change_settled_payload_ctime {
+                let pin = receipt.owner.lock().unwrap().preimage.payload();
+                let settled = pin.metadata().unwrap();
+                pin.set_permissions(fs::Permissions::from_mode(
+                    (settled.mode() & 0o7777) ^ 0o100,
+                ))
+                .unwrap();
+                pin.set_permissions(settled.permissions()).unwrap();
+                let changed = pin.metadata().unwrap();
+                assert_eq!(changed.mode(), settled.mode());
+                assert_ne!(
+                    (changed.ctime(), changed.ctime_nsec()),
+                    (settled.ctime(), settled.ctime_nsec())
+                );
+                for _ in 0..2 {
+                    assert!(
+                        service
+                            .resolve_discard_recovery(&recovery, &CancellationToken::new())
+                            .is_err()
+                    );
+                    assert!(
+                        receipt
+                            .owner
+                            .lock()
+                            .unwrap()
+                            .preimage
+                            .matches_recorded_metadata(&settled)
+                    );
+                    assert_eq!(recovery.remaining_paths(), 1);
+                    assert!(recovery.live_recovery.needs_resolution());
+                    assert!(!confirmed_restore(&receipt));
+                    assert!(!file.exists());
+                }
+                continue;
+            }
+            let resolved = service
+                .resolve_discard_recovery(&recovery, &CancellationToken::new())
+                .unwrap();
+            assert_eq!(resolved.remaining_paths, 1);
+            assert!(!recovery.live_recovery.needs_resolution());
+            assert!(!confirmed_restore(&receipt));
+            assert!(!file.exists());
+            assert_eq!(
+                fs::read_dir(data.path().join("Trash/files"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            assert_eq!(
+                fs::read_dir(context.placement().directory().path())
+                    .unwrap()
+                    .count(),
+                0
+            );
+            let undo = service
+                .undo_discard(&recovery, &CancellationToken::new())
+                .unwrap();
+            assert!(matches!(undo, MutationOutcome::Applied { .. }), "{undo:?}");
+            assert_eq!(recovery.remaining_paths(), 0);
+            assert_eq!(fs::read(&file).unwrap(), b"original native bytes\n");
+            let restored = fs::metadata(file).unwrap();
+            assert_eq!(
+                (restored.dev(), restored.ino()),
+                (original.dev(), original.ino())
+            );
+            assert_eq!(
+                fs::read_dir(data.path().join("Trash/files"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert_eq!(
+                fs::read_dir(data.path().join("Trash/info"))
+                    .unwrap()
+                    .count(),
+                0
+            );
         }
     }
 

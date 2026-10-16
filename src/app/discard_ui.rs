@@ -437,11 +437,24 @@ mod tests {
     }
     #[test]
     fn discard_inspector_rendered_controls_carry_the_original_snapshot_actor() {
-        use cosmic::iced::{Event, Rectangle, Size, advanced::{Layout, Shell, clipboard, layout, mouse, widget::{Tree, operation}}, keyboard};
+        use cosmic::iced::{
+            Event, Rectangle, Size,
+            advanced::{
+                Layout, Shell, clipboard, layout, mouse,
+                widget::{Tree, operation},
+            },
+            keyboard,
+        };
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.sidebar_model = sidebar::tests::panel_model();
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
-        let key = app.sidebar_model.source_control.as_ref().unwrap().key.clone();
+        let key = app
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .unwrap()
+            .key
+            .clone();
         app.discard_ui.select(Some(key));
         let original = app.discard_ui.source().unwrap().id;
         app.context_tab = ContextTab::Changes;
@@ -450,28 +463,44 @@ mod tests {
         let mut tree = Tree::new(element.as_widget());
         let viewport = Rectangle::with_size(Size::new(380.0, 4_000.0));
         let node = element.as_widget_mut().layout(
-            &mut tree, &renderer, &layout::Limits::new(Size::ZERO, viewport.size()),
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
         );
         fn identities(tree: &Tree, found: &mut Vec<widget::Id>) {
             found.extend(tree.id.clone());
-            for child in &tree.children { identities(child, found); }
+            for child in &tree.children {
+                identities(child, found);
+            }
         }
         let mut ids = Vec::new();
         identities(&tree, &mut ids);
         let enter = Event::Keyboard(keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(keyboard::key::Named::Enter),
             modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
-            physical_key: keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
             location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
         });
         let mut fired = Vec::new();
         for id in ids {
             let mut focus = operation::focusable::focus::<()>(id);
-            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
             element.as_widget_mut().update(
-                &mut tree, &enter, Layout::new(&node), mouse::Cursor::Unavailable,
-                &renderer, &mut clipboard::Null, &mut Shell::new(&mut fired), &viewport,
+                &mut tree,
+                &enter,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut fired),
+                &viewport,
             );
         }
         assert!(fired.iter().any(|message| matches!(message,
@@ -479,9 +508,19 @@ mod tests {
                 SidebarAction::RequestDiscard { .. } | SidebarAction::ChangeGroup { command: sidebar::ChangeGroupCommand::Discard, .. }
             )
         )), "the actual inspector Changes widget must emit an original-source discard command");
-        assert!(!fired.iter().any(|message| matches!(message,
-            Message::Sidebar(SidebarAction::RequestDiscard { .. } | SidebarAction::ChangeGroup { command: sidebar::ChangeGroupCommand::Discard, .. })
-        )), "no destructive inspector command may bypass the source envelope");
+        assert!(
+            !fired.iter().any(|message| matches!(
+                message,
+                Message::Sidebar(
+                    SidebarAction::RequestDiscard { .. }
+                        | SidebarAction::ChangeGroup {
+                            command: sidebar::ChangeGroupCommand::Discard,
+                            ..
+                        }
+                )
+            )),
+            "no destructive inspector command may bypass the source envelope"
+        );
     }
 
     #[test]
@@ -490,27 +529,52 @@ mod tests {
         let authority = original.authority.get().unwrap().clone().unwrap();
         let mut state = State::default();
         state.active = Some(original.clone());
-        let supplied = state.supply_original(original.key.clone(), authority.clone()).unwrap();
+        let supplied = state
+            .supply_original(original.key.clone(), authority.clone())
+            .unwrap();
         assert_ne!(supplied, original.id);
         state.retire_source();
         assert!(state.source().is_none());
         state.select(Some(original.key.clone()));
         assert_eq!(state.source().unwrap().id, supplied);
-        assert!(state.source().unwrap().authority.get().unwrap().as_ref().unwrap().same_scope(&authority));
+        assert!(
+            state
+                .source()
+                .unwrap()
+                .authority
+                .get()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .same_scope(&authority)
+        );
         assert!(!state.admit_event(original.id));
         state.select(Some(original.key.clone()));
-        assert_eq!(state.source().unwrap().id, supplied, "ordinary refresh keeps the supplied actor");
+        assert_eq!(
+            state.source().unwrap().id,
+            supplied,
+            "ordinary refresh keeps the supplied actor"
+        );
         std::fs::rename(temp.path().join(".git"), temp.path().join("old-git")).unwrap();
         std::fs::create_dir(temp.path().join(".git")).unwrap();
         assert!(state.source().unwrap().read_service().is_err());
         assert!(state.source().unwrap().mutation_service().is_err());
-        let wrong = ActiveWorktreeKey { canonical_path: temp.path().join("other"), ..original.key.clone() };
+        let wrong = ActiveWorktreeKey {
+            canonical_path: temp.path().join("other"),
+            ..original.key.clone()
+        };
         assert!(ReadSource::from_authority(wrong.clone(), authority.clone()).is_err());
-        state.supply_original(original.key.clone(), authority).unwrap();
+        state
+            .supply_original(original.key.clone(), authority)
+            .unwrap();
         state.retire_source();
         state.select(Some(wrong));
         state.select(Some(original.key));
-        assert_ne!(state.source().unwrap().id, supplied, "a different selection consumes no old intake");
+        assert_ne!(
+            state.source().unwrap().id,
+            supplied,
+            "a different selection consumes no old intake"
+        );
         assert!(state.source().unwrap().authority.get().is_none());
     }
 

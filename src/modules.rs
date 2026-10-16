@@ -22,6 +22,8 @@ pub mod automations;
 pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
+#[cfg(feature = "ui")]
+pub(crate) mod change_list;
 pub mod chat;
 pub mod companion;
 pub mod control;
