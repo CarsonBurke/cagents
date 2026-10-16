@@ -1576,6 +1576,12 @@ pub struct FrameCodec {
     payload_length: Option<usize>,
     payload_read: usize,
     maximum: usize,
+    memory_id: u64,
+}
+
+fn next_memory_codec_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl FrameCodec {
@@ -1588,6 +1594,7 @@ impl FrameCodec {
             payload_length: None,
             payload_read: 0,
             maximum,
+            memory_id: next_memory_codec_id(),
         }
     }
 
@@ -1648,6 +1655,7 @@ impl FrameCodec {
         if let Some(started) = started {
             tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_decode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = length);
         }
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(Some(value?))
     }
 
@@ -1667,7 +1675,15 @@ impl FrameCodec {
         }
         writer.write_all(&self.write_buffer)?;
         writer.flush()?;
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(())
+    }
+}
+
+impl Drop for FrameCodec {
+    fn drop(&mut self) {
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id,
+            released = true, read_capacity = 0usize, write_capacity = 0usize);
     }
 }
 

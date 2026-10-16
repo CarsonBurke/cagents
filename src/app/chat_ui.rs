@@ -1215,7 +1215,7 @@ impl CachedItem {
         }
         self.highlight(theme);
         if !growing {
-            self.settle_blocks();
+            self.suspend_continuations();
         }
         self.revision = Self::next_revision();
     }
@@ -1228,6 +1228,14 @@ impl CachedItem {
         {
             self.extend(body, false, theme);
         }
+        self.suspend_continuations();
+    }
+
+    /// The displayed Markdown/spans and their widget identities remain valid.
+    /// Only continuation scratch is shed; a later append reparses its actual
+    /// whole body after the rewriter reports Restart.
+    fn suspend_continuations(&mut self) {
+        self.source.suspend();
         self.settle_blocks();
     }
 
@@ -1296,10 +1304,14 @@ impl CachedItem {
 
     /// Discards the highlighting and does it again in `theme`.
     fn rehighlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        let continuing = self.open.is_some();
         self.preview.rehighlight(theme);
         self.blocks.clear();
         self.open = None;
         self.highlight(theme);
+        if !continuing {
+            self.settle_blocks();
+        }
     }
 
     /// The fence whose info string is `language` and whose text is `code`,
@@ -2765,6 +2777,11 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
+        if !visible {
+            for cached in self.cache.values_mut().chain(self.child_cache.values_mut()) {
+                cached.suspend_continuations();
+            }
+        }
         images::sync(self);
         self.present()
     }
@@ -16950,6 +16967,213 @@ mod tests {
         };
         runtime.attachments.clear();
         assert!(app.chat_switch_ready(card));
+    }
+
+    #[test]
+    fn retheme_preserves_completed_hidden_and_coordinated_continuation_release() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let next = crate::settings::EditorSyntaxTheme::Ocean;
+        let body = "```rust\nlet value = 1;\n```";
+        let code = "let value = 1;\n";
+        let mut finished = CachedItem::new(&text(body), theme);
+        let mut hidden = CachedItem::updated(&text(body), theme, None, false, true, None);
+        hidden.suspend_continuations();
+        let item = chat::Item {
+            id: "coordinated-continuation".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Agent".into(),
+                input: serde_json::json!({"prompt": body, "subagent_type": "Explore"}).to_string(),
+                output: String::new(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        };
+        let coordinated = chat::coordination::recognize(&item, Provider::Claude).unwrap();
+        let mut coordinated =
+            CachedItem::updated(&item.content, theme, None, false, false, Some(coordinated));
+        for cached in [&mut finished, &mut hidden, &mut coordinated] {
+            assert!(!cached.blocks.is_empty());
+            assert!(cached.open.is_none());
+            cached.rehighlight(next);
+            assert!(cached.open.is_none());
+            for block in cached.blocks.values_mut() {
+                assert!(!block.extend(Some("rust"), code));
+            }
+        }
+        // A palette change does not finish a stream that is still visible.
+        let mut live = CachedItem::updated(&text(body), theme, None, false, true, None);
+        assert!(live.open.is_some());
+        live.rehighlight(next);
+        assert!(live.open.is_some());
+        assert!(
+            live.blocks
+                .values_mut()
+                .next()
+                .unwrap()
+                .extend(Some("rust"), code)
+        );
+    }
+
+    #[test]
+    fn hidden_selected_child_resumes_actual_appended_body_after_scratch_release() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("continuation-child"));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let parent = Arc::new(chat::Item {
+            id: "continuation-parent".into(),
+            role: chat::Role::Assistant,
+            content: text(&"p".repeat(256 * 1024)),
+            started_at: None,
+            at: None,
+        });
+        let child = Arc::new(chat::Item {
+            id: "continuation-child-item".into(),
+            role: chat::Role::Assistant,
+            content: text(&"c".repeat(256 * 1024)),
+            started_at: None,
+            at: None,
+        });
+        let mut snapshot = Snapshot {
+            generation: 10,
+            ready: true,
+            busy: true,
+            items: vec![parent.clone()],
+            subagents: vec![chat::Subagent {
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                id: "actual-child".into(),
+                kind: "task".into(),
+                description: String::new(),
+                status: chat::ToolStatus::Running,
+                background: true,
+                items: vec![child.clone()],
+            }],
+            ..Snapshot::default()
+        };
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().show(true);
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("actual-child".into()))));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.cache[&parent.id].source.retained_tail_capacity() >= 256 * 1024);
+        assert!(
+            runtime.child_cache[&child.id]
+                .source
+                .retained_tail_capacity()
+                >= 256 * 1024
+        );
+        let parent_revision = runtime.cache[&parent.id].revision;
+        let child_revision = runtime.child_cache[&child.id].revision;
+        runtime.set_visible(false).unwrap();
+        assert_eq!(runtime.cache[&parent.id].source.retained_tail_capacity(), 0);
+        assert_eq!(
+            runtime.child_cache[&child.id]
+                .source
+                .retained_tail_capacity(),
+            0
+        );
+        assert_eq!(runtime.cache[&parent.id].revision, parent_revision);
+        assert_eq!(runtime.child_cache[&child.id].revision, child_revision);
+        assert_eq!(runtime.child_cache_context.as_deref(), Some("actual-child"));
+        let appended = format!("{}\nnew child tail", "c".repeat(256 * 1024));
+        snapshot.generation += 1;
+        snapshot.subagents[0].items[0] = Arc::new(chat::Item {
+            content: text(&appended),
+            ..(*child).clone()
+        });
+        handle.publish_snapshot_for_test(snapshot.clone());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.show(true);
+        let fresh = CachedItem::new(&text(&appended), runtime.syntax_theme);
+        assert_eq!(shown(&runtime.child_cache[&child.id]), shown(&fresh));
+        assert_eq!(runtime.cache[&parent.id].revision, parent_revision);
+        snapshot.generation += 1;
+        snapshot.subagents[0].status = chat::ToolStatus::Succeeded;
+        handle.publish_snapshot_for_test(snapshot);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        assert_eq!(
+            runtime.child_cache[&child.id]
+                .source
+                .retained_tail_capacity(),
+            0
+        );
+        assert_eq!(shown(&runtime.child_cache[&child.id]), shown(&fresh));
+    }
+
+    #[test]
+    fn finished_prose_releases_rewriter_tail_without_reparsing_unchanged_text() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let content = text(&"x".repeat(512 * 1024));
+        let mut cached = CachedItem::new(&content, theme);
+        assert_eq!(cached.source.retained_tail_capacity(), 0);
+        let revision = cached.revision;
+        let before = shown(&cached);
+        cached.settle(&content, theme);
+        cached.settle(&content, theme);
+        assert_eq!(cached.revision, revision);
+        assert_eq!(shown(&cached), before);
+    }
+
+    #[test]
+    fn suspended_prose_resumes_to_the_same_full_rendering_and_fences() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let start = "Intro\n\n```rust\nlet value = 1;\n";
+        let body = format!("{start}let next = 2;\n```\nUse Vec<Option<α>>");
+        let mut cached = CachedItem::updated(&text(start), theme, None, false, true, None);
+        let displayed = shown(&cached);
+        let revision = cached.revision;
+        let spans: Vec<_> = cached
+            .blocks
+            .iter()
+            .map(|(key, block)| (*key, block.spans(false).clone(), block.spans(true).clone()))
+            .collect();
+        cached.suspend_continuations();
+        assert_eq!(cached.revision, revision);
+        assert_eq!(shown(&cached), displayed);
+        for (key, light, dark) in spans {
+            assert!(Arc::ptr_eq(&light, cached.blocks[&key].spans(false)));
+            assert!(Arc::ptr_eq(&dark, cached.blocks[&key].spans(true)));
+        }
+        cached.extend(&body, false, theme);
+        let fresh = CachedItem::new(&text(&body), theme);
+        assert_eq!(shown(&cached), shown(&fresh));
+        assert_eq!(parsed_codes(&cached), parsed_codes(&fresh));
+        assert_eq!(cached.source.retained_tail_capacity(), 0);
+    }
+
+    #[test]
+    fn hidden_prose_releases_only_continuation_scratch_and_preserves_reader_state() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let content = text(&"x".repeat(512 * 1024));
+        let cached = CachedItem::updated(&content, runtime.syntax_theme, None, false, true, None);
+        assert!(cached.source.retained_tail_capacity() >= 512 * 1024);
+        let revision = cached.revision;
+        runtime.cache.insert("scratch-owner".into(), cached);
+        runtime.composer = text_editor::Content::with_text("unsent reader draft");
+        runtime.find = Some("kept query".into());
+        runtime.selected_subagent = Some("selected child".into());
+        runtime.expanded.insert("scratch-owner".into());
+        runtime.opened.insert("kept turn".into(), true);
+        let snapshot = runtime.snapshot.clone();
+        runtime.set_visible(false).unwrap();
+        runtime.set_visible(false).unwrap();
+        let cached = &runtime.cache["scratch-owner"];
+        assert_eq!(cached.source.retained_tail_capacity(), 0);
+        assert_eq!(cached.revision, revision);
+        assert_eq!(cached.markdown.items().len(), 1);
+        assert!(Arc::ptr_eq(&snapshot, &runtime.snapshot));
+        assert_eq!(runtime.unsent_text(), "unsent reader draft");
+        assert_eq!(runtime.find.as_deref(), Some("kept query"));
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("selected child"));
+        assert!(runtime.expanded.contains("scratch-owner"));
+        assert_eq!(runtime.opened.get("kept turn"), Some(&true));
     }
 
     /// A message that arrives byte by byte must present exactly as one that

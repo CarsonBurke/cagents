@@ -1111,6 +1111,17 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
 }
 
 impl Snapshot {
+    /// Logical body bytes referenced by this owner; Arc-shared payloads are
+    /// not unique heap attribution across owners.
+    pub(crate) fn transcript_bytes(&self) -> usize {
+        self.items
+            .iter()
+            .chain(self.subagents.iter().flat_map(|child| &child.items))
+            .fold(0usize, |bytes, item| {
+                bytes.saturating_add(item.content.byte_len())
+            })
+    }
+
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy

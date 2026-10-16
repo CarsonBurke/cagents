@@ -61,12 +61,18 @@ pub(super) struct Source {
     /// Whether those lines were read as they are only because the answer may
     /// still grow, and so have to be read again once it cannot.
     provisional: bool,
+    /// Continuation was released; the next supplied body must replace the
+    /// parser's prior text rather than append a second copy of its prefix.
+    suspended: bool,
 }
 
 impl Source {
     /// Takes `body`, the answer so far, of which everything up to the bytes
     /// seen last time is unchanged. `open` is whether more may follow.
     pub(super) fn advance(&mut self, body: &str, open: bool) -> Step {
+        if self.suspended {
+            return self.restart(body, open);
+        }
         let Some(rest) = body.get(self.consumed..) else {
             return self.restart(body, open);
         };
@@ -109,6 +115,21 @@ impl Source {
     /// and has to be taken again once the answer is known to have ended.
     pub(super) fn provisional(&self) -> bool {
         self.provisional
+    }
+
+    /// Release potentially large unfinished lines without discarding rendered
+    /// Markdown. Preserve whether finalization still owes the parser bytes.
+    pub(super) fn suspend(&mut self) {
+        *self = Self {
+            provisional: self.provisional,
+            suspended: true,
+            ..Self::default()
+        };
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_tail_capacity(&self) -> usize {
+        self.tail.capacity()
     }
 
     fn restart(&mut self, body: &str, open: bool) -> Step {
@@ -732,6 +753,39 @@ fn line_break(bytes: &[u8]) -> Scan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspended_rewriter_releases_large_tail_and_restarts_exact_whole_body() {
+        let body = "x".repeat(512 * 1024);
+        let mut source = Source::default();
+        assert_eq!(source.advance(&body, true), Step::Append(body.clone()));
+        assert!(source.tail.capacity() >= body.len());
+        source.suspend();
+        source.suspend();
+        assert_eq!(source.tail.capacity(), 0);
+        let next = format!("{body}\ncontinued");
+        assert_eq!(source.advance(&next, false), Step::Restart(rewrite(&next)));
+    }
+
+    #[test]
+    fn suspended_rewriter_preserves_provisional_finalization_at_every_cut() {
+        for body in [
+            "Use Vec<Option<α>> and <https://example.com>",
+            "before\n\n    indented\n    more\n\nafter",
+            "```rust\nlet text = \"α\";\n```\nend",
+            "`one\ntwo` <br /> end",
+        ] {
+            for end in (0..=body.len()).filter(|end| body.is_char_boundary(*end)) {
+                let mut source = Source::default();
+                source.advance(&body[..end], true);
+                let provisional = source.provisional();
+                source.suspend();
+                assert_eq!(source.provisional(), provisional);
+                assert_eq!(source.tail.capacity(), 0);
+                assert_eq!(source.advance(body, false), Step::Restart(rewrite(body)));
+            }
+        }
+    }
 
     /// What the reader loses today, and what the parser is given instead.
     #[test]
