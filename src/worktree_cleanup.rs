@@ -271,6 +271,36 @@ impl std::fmt::Debug for Protection {
 }
 
 impl Protection {
+    /// Independent open descriptions retain shared protection in exec children.
+    /// OwnedLock explicitly unlocks on drop, so duplicating its descriptor would
+    /// let the parent's retirement unlock the child's shared open description.
+    pub(crate) fn retained_child_files(&self) -> io::Result<Vec<std::sync::Arc<std::fs::File>>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let mut files = Vec::new();
+        for lock in &self._locks {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("/proc/self/fd/{}", lock.as_raw_fd()))?;
+            let old = lock.metadata()?;
+            let new = file.metadata()?;
+            if (old.dev(), old.ino()) != (new.dev(), new.ino()) {
+                return Err(io::Error::other("directory protection inode changed"));
+            }
+            // SAFETY: file owns this independent open description. It only
+            // closes on drop; an inherited child keeps its SH lock alive.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            files.push(std::sync::Arc::new(file));
+        }
+        for directory in &self._directories {
+            files.push(std::sync::Arc::new(directory.try_clone()?));
+        }
+        Ok(files)
+    }
+
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
     }
@@ -422,6 +452,12 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
         return Ok(None);
     }
     acquire(&crate::instance::runtime_directory()?, directory, false).map(Some)
+}
+
+/// Local mutations need directory protection even outside an initialized UI.
+/// Callers retain this guard until every inherited operation lease has retired.
+pub(crate) fn protect_operation(directory: &Path) -> io::Result<Protection> {
+    acquire(&crate::instance::runtime_directory()?, directory, false)
 }
 
 #[cfg(test)]
@@ -946,6 +982,60 @@ mod tests {
         )
         .unwrap();
         acquire(runtime.path(), &moved, true).unwrap();
+    }
+
+    #[test]
+    #[cfg(any(feature = "ui", feature = "host"))]
+    fn inherited_shared_protection_outlives_parent_guard_and_directory_replacement() {
+        use std::io::{BufRead, Write};
+        let runtime = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let directory = tree.path().join("checkout");
+        std::fs::create_dir(&directory).unwrap();
+        let parent = acquire(runtime.path(), &directory, false).unwrap();
+        let mut spec = crate::process::CommandSpec::new("/bin/sh")
+            .args(["-c", "printf 'ready\\n'; read -r retired"]);
+        for file in parent.retained_child_files().unwrap() {
+            spec = spec.inherit_file(file).unwrap();
+        }
+        let mut command = spec.to_command();
+        drop(spec);
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(command);
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        drop(parent); // OwnedLock's explicit unlock must not retire child locks.
+        assert!(acquire(runtime.path(), &directory, true).is_err());
+        let moved = tree.path().join("moved");
+        std::fs::rename(&directory, &moved).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert!(acquire(runtime.path(), &directory, true).is_err());
+        assert!(acquire(runtime.path(), &moved, true).is_err());
+        child.stdin.take().unwrap().write_all(b"retire\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(acquire(runtime.path(), &directory, true).is_ok());
+        assert!(acquire(runtime.path(), &moved, true).is_ok());
+    }
+
+    #[test]
+    fn child_shared_protection_never_downgrades_an_exclusive_guard() {
+        let runtime = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let exclusive = acquire(runtime.path(), directory.path(), true).unwrap();
+        assert_eq!(
+            exclusive.retained_child_files().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(acquire(runtime.path(), directory.path(), false).is_err());
+        drop(exclusive);
+        assert!(acquire(runtime.path(), directory.path(), false).is_ok());
     }
 
     #[test]
