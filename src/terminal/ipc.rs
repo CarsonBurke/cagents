@@ -150,7 +150,12 @@ use crate::{
 /// to TerminalDescriptor carriers (Connect/List/Spawn/Attach/TerminalCreated).
 /// Positional postcard peers require the matched layout; serde(default)
 /// preserves older JSON records, not older binary frames.
-pub const PROTOCOL_VERSION: u16 = 96;
+/// Version 97 preserves version 78 and appends only DeviceOperation::AccountDefault
+/// with its Automatic/account-ID selection; all prior tags and layouts remain.
+/// Version 98 combines notification context with account-default selection.
+/// Version 99 preserves version 98 and adds the version 96 terminal-title
+/// descriptor layout, requiring matched positional postcard peers.
+pub const PROTOCOL_VERSION: u16 = 99;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

@@ -5,6 +5,9 @@
 //! executed, which keeps argument handling shell-free and makes every operation
 //! straightforward to test with a fake executor.
 
+mod managed_worktrees;
+#[cfg(test)]
+pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
@@ -3116,6 +3119,11 @@ impl BaseRevision {
 pub struct CreateWorktreeRequest {
     pub repository: PathBuf,
     pub managed_root: PathBuf,
+    /// Directory selected by the resolver for clone-local ignore policy.
+    /// Explicit destination overrides exclude only that checkout; old requests
+    /// without this hint also use the exact destination, never its shared parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_ignore_root: Option<PathBuf>,
     pub destination: PathBuf,
     pub branch: ValidatedBranchName,
     pub base: BaseRevision,
@@ -5711,7 +5719,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         };
         let configured = input.managed_directory.trim();
         let configured = Path::new(if configured.is_empty() {
-            "worktrees/"
+            crate::settings::DEFAULT_MANAGED_WORKTREE_DIRECTORY
         } else {
             configured
         });
@@ -5750,6 +5758,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // Preserve the project identity used to restore operation rows.
             // Only relative destination resolution uses its worktree root.
             repository: input.repository.clone(),
+            managed_ignore_root: Some(if input.destination.trim().is_empty() {
+                managed_root.clone()
+            } else {
+                destination.clone()
+            }),
             managed_root,
             destination,
             branch,
@@ -7881,6 +7894,7 @@ mod tests {
             setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
+            managed_ignore_root: None,
             destination: destination.clone(),
             branch: ValidatedBranchName::parse("feature/safe").unwrap(),
             base: BaseRevision::object_id("a".repeat(40)).unwrap(),
@@ -7912,6 +7926,7 @@ mod tests {
             setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
+            managed_ignore_root: None,
             destination: root.path().join("feature"),
             branch: ValidatedBranchName::parse("feature").unwrap(),
             base: BaseRevision::remote_ref("refs/remotes/origin/main").unwrap(),
@@ -9671,6 +9686,7 @@ mod tests {
                 setup_intent: None,
                 repository: PathBuf::from("/repo"),
                 managed_root: managed.path().to_path_buf(),
+                managed_ignore_root: None,
                 destination: managed.path().join("feature"),
                 branch: ValidatedBranchName::parse("feature").unwrap(),
                 base: BaseRevision::LocalBranch(ValidatedBranchName::parse("main").unwrap()),
@@ -11627,6 +11643,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
+            self.ensure_creation_destination_ignored(&journal.request, cancellation)?;
+            self.ignore_legacy_managed_worktrees(&journal.request.repository, cancellation)?;
             fs::create_dir_all(&journal.request.managed_root)
                 .map_err(|e| ValidationError::Io(e.to_string()))?;
             let plan = self.plan_worktree_creation(&journal.request)?;
@@ -11749,6 +11767,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .map_err(|e| ValidationError::Io(e.to_string()))?;
         request.destination = canonical_future_path(&request.destination)
             .map_err(|e| ValidationError::Io(e.to_string()))?;
+        if let Some(ignore_root) = &mut request.managed_ignore_root {
+            *ignore_root = canonical_future_path(ignore_root)
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            if *ignore_root != request.managed_root && *ignore_root != request.destination {
+                return Err(ValidationError::DestinationOutsideRoot.into());
+            }
+        }
         if !destination_within_managed_root(&request.destination, &request.managed_root) {
             return Err(ValidationError::DestinationOutsideRoot.into());
         }
@@ -12201,6 +12226,7 @@ mod worktree_journal_tests {
                 setup_intent: None,
                 repository,
                 managed_root: root.clone(),
+                managed_ignore_root: None,
                 destination: root.join("feature"),
                 branch: ValidatedBranchName::parse("feature").unwrap(),
                 base: BaseRevision::LocalBranch(ValidatedBranchName::parse("main").unwrap()),
