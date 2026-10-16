@@ -146,10 +146,16 @@ use crate::{
 /// Version 78 verifies automatic channel-name refreshes against their shared-view owner.
 /// Version 80 carries opt-in semantic notification context and preview privacy.
 /// Version 95 combines conversation-title refreshes with notification context.
+/// Version 96 preserves version 95 and appends native terminal title metadata
+/// to TerminalDescriptor carriers (Connect/List/Spawn/Attach/TerminalCreated).
+/// Positional postcard peers require the matched layout; serde(default)
+/// preserves older JSON records, not older binary frames.
 /// Version 97 preserves version 78 and appends only DeviceOperation::AccountDefault
 /// with its Automatic/account-ID selection; all prior tags and layouts remain.
 /// Version 98 combines notification context with account-default selection.
-pub const PROTOCOL_VERSION: u16 = 98;
+/// Version 99 preserves version 98 and adds the version 96 terminal-title
+/// descriptor layout, requiring matched positional postcard peers.
+pub const PROTOCOL_VERSION: u16 = 99;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -158,6 +164,8 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
+/// Maximum scalar values retained in a descriptor's observed terminal title.
+pub const MAX_TERMINAL_TITLE_CHARACTERS: usize = 256;
 /// Production full and browserless builds retain the runtime namespace; a
 /// mismatched daemon is preserved and reported, never automatically replaced.
 pub const SOCKET_FILE_NAME: &str = "cagentsd.sock";
@@ -909,6 +917,10 @@ pub struct TerminalDescriptor {
     pub upgrade_sources: Vec<TerminalSession>,
     #[serde(default)]
     pub upgrade_relaunches: Vec<UpgradeRelaunch>,
+    /// Last observed native terminal title; absent before any title event.
+    /// This display metadata never authorizes process/session recovery.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// Explicitly accepted resume-picker or fresh agent launches, bound to the
@@ -949,6 +961,7 @@ impl TerminalDescriptor {
             agent_activity: None,
             upgrade_sources: Vec::new(),
             upgrade_relaunches: Vec::new(),
+            title: None,
         }
     }
 }
@@ -1913,6 +1926,70 @@ mod tests {
             Some("next frame".into())
         );
         assert_eq!(codec.read::<String>(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn terminal_title_round_trips_through_every_descriptor_carrier() {
+        for title in [
+            None,
+            Some(String::new()),
+            Some("Native terminal 界".to_owned()),
+        ] {
+            let mut terminal = TerminalDescriptor::relaunchable(
+                TerminalId::new(),
+                LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: vec![],
+                    working_directory: "/fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                None,
+            );
+            terminal.title = title.clone();
+            let peer = proof("title-peer", "private-boot", "private-incarnation");
+            for message in [
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: peer.clone(),
+                        resumed: vec![terminal.clone()],
+                    },
+                },
+                ServerMessage::Response {
+                    response: ServerResponse::Listed {
+                        terminals: vec![terminal.clone()],
+                    },
+                },
+                ServerMessage::Response {
+                    response: ServerResponse::Spawned {
+                        terminal: terminal.clone(),
+                    },
+                },
+                ServerMessage::Response {
+                    response: ServerResponse::Attached {
+                        terminal: terminal.clone(),
+                    },
+                },
+                ServerMessage::TerminalCreated {
+                    terminal: terminal.clone(),
+                },
+            ] {
+                let envelope = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(1),
+                    proof: peer.clone(),
+                    message,
+                };
+                let mut bytes = Vec::new();
+                write_frame(&mut bytes, &envelope).unwrap();
+                let decoded: ServerEnvelope = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+                assert_eq!(decoded, envelope);
+            }
+            let mut old_json = serde_json::to_value(&terminal).unwrap();
+            old_json.as_object_mut().unwrap().remove("title");
+            let decoded: TerminalDescriptor = serde_json::from_value(old_json).unwrap();
+            assert_eq!(decoded.title, None, "only JSON omission has a default");
+        }
     }
 
     #[test]
