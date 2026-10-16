@@ -29,6 +29,7 @@ use crate::{
     },
 };
 
+mod configured_window_copy;
 #[cfg(feature = "ui")]
 mod review_cache;
 
@@ -261,6 +262,7 @@ pub struct WorkspaceManifest {
     pub active_channel: Option<ChannelId>,
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
+    pub configured_chat_drafts: HashMap<CardId, crate::chat::ConfiguredChatStart>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
@@ -540,6 +542,14 @@ impl StateStore {
     /// Copies a live store through SQLite's transactionally consistent VACUUM
     /// snapshot. The source is never startup-reconciled or checkpointed here.
     pub fn copy_snapshot(source: &Path, destination: &Path) -> Result<()> {
+        Self::copy_snapshot_prepared(source, destination, |_| Ok(()))
+    }
+
+    fn copy_snapshot_prepared(
+        source: &Path,
+        destination: &Path,
+        prepare: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
         enforce_private_database(source)?;
         let parent = destination
             .parent()
@@ -558,6 +568,7 @@ impl StateStore {
             "VACUUM INTO ?1",
             [temporary.path().to_string_lossy().as_ref()],
         )?;
+        prepare(temporary.path())?;
         temporary.as_file().sync_all()?;
         temporary
             .persist_noclobber(destination)
@@ -613,6 +624,17 @@ impl StateStore {
         boot_id: BootId,
         options: StoreOptions,
     ) -> Result<Self> {
+        Self::open_connection(path.as_ref(), boot_id, options, true)
+    }
+
+    // Only the unpublished New Window copy uses false: applying startup
+    // recovery here would rewrite unrelated issued continuity before launch.
+    fn open_connection(
+        path: &Path,
+        boot_id: BootId,
+        options: StoreOptions,
+        startup: bool,
+    ) -> Result<Self> {
         if boot_id.as_str().is_empty() {
             return Err(StoreError::InvalidState(
                 "current boot ID must not be empty".into(),
@@ -634,7 +656,16 @@ impl StateStore {
         configure_connection(&connection, options.busy_timeout)?;
         enforce_sqlite_sidecars(path)?;
         migrate(&mut connection)?;
-        let recovery = reconcile_startup(&mut connection, &boot_id)?;
+        let recovery = if startup {
+            reconcile_startup(&mut connection, &boot_id)?
+        } else {
+            RecoveryReport {
+                dirty_shutdown: false,
+                boot_changed: false,
+                operations_requiring_reconciliation: 0,
+                terminals_downgraded: 0,
+            }
+        };
         enforce_private_database(path)?;
         enforce_sqlite_sidecars(path)?;
 
@@ -1743,12 +1774,28 @@ impl StateStore {
             active_channel: manifest.active_channel,
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
+            configured_chat_drafts: manifest.configured_chat_drafts,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
             local_only_cards: manifest.local_only_cards,
             pending_terminal_creations: manifest.pending_terminal_creations,
         };
+        // Issued/closed/removed cards cannot retain a fresh-start intent.
+        // Keep malformed metadata on an eligible draft for an explicit UI
+        // refusal rather than silently falling back to its legacy recipe.
+        let fresh: HashSet<_> = state
+            .cards
+            .iter()
+            .filter_map(|card| {
+                (card.existence.is_open()
+                    && matches!(&card.kind, CardKind::Chat(session) if session.is_unstarted()))
+                .then_some(card.id)
+            })
+            .collect();
+        state
+            .configured_chat_drafts
+            .retain(|card, _| fresh.contains(card));
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
         }
@@ -3311,6 +3358,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:configured_chat_drafts"),
+        &to_json(&state.configured_chat_drafts)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
         &to_json(&state.repository_navigation)?,
     )?;
@@ -4356,7 +4408,14 @@ fn replace_terminal_identity_transaction(
 /// What every workspace snapshot has to satisfy before any of it is written.
 pub(crate) fn validate_workspace(state: &WorkspaceState) -> Result<()> {
     let mut ids = BTreeSet::new();
+    let mut fresh = HashMap::new();
     for card in &state.cards {
+        if card.existence.is_open()
+            && let CardKind::Chat(session) = &card.kind
+            && session.is_unstarted()
+        {
+            fresh.insert(card.id, session);
+        }
         if !card.width_fraction.is_finite() || card.width_fraction <= 0.0 {
             return Err(StoreError::InvalidState(format!(
                 "card {} has invalid width fraction {}",
@@ -4369,6 +4428,17 @@ pub(crate) fn validate_workspace(state: &WorkspaceState) -> Result<()> {
                 state.id, card.id
             )));
         }
+    }
+    for (card, intent) in &state.configured_chat_drafts {
+        if !fresh
+            .get(card)
+            .is_some_and(|session| intent.matches_draft(session))
+        {
+            return Err(StoreError::InvalidState(format!(
+                "configured choices do not belong to an open unstarted chat {card}"
+            )));
+        }
+        intent.validate().map_err(StoreError::InvalidState)?;
     }
     if let Some(focused) = state.focused
         && !state
@@ -4650,6 +4720,13 @@ fn load_workspace_manifest_connection(
             &format!("workspace:{id}:navigation:repository_navigation"),
         )?
         .map(|value| from_json("workspace editor navigation", &value))
+        .transpose()?
+        .unwrap_or_default(),
+        configured_chat_drafts: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:configured_chat_drafts"),
+        )?
+        .map(|value| from_json("workspace configured chat drafts", &value))
         .transpose()?
         .unwrap_or_default(),
         chat_drafts: metadata(
@@ -5280,6 +5357,7 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            configured_chat_drafts: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
@@ -6203,6 +6281,71 @@ mod tests {
             serde_json::from_value::<WorkspaceState>(legacy)
                 .unwrap()
                 .workspace_history
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn configured_chat_drafts_round_trip_as_typed_metadata_and_legacy_defaults_empty() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("configured-draft");
+        let database = directory.path().join("draft-choices.sqlite3");
+        let store = StateStore::open(&database, boot_id.clone()).unwrap();
+        let (mut state, mut session) = agent_workspace(crate::agent::Provider::Claude);
+        session.terminal = None;
+        session.launch.session_id = None;
+        session.launch.recipe.arguments.clear();
+        state.cards[0].kind = CardKind::Chat(session.clone());
+        let card = state.cards[0].id;
+        let mut lane = SaveLane::default();
+        lane.save(&store, &state).unwrap();
+        assert!(
+            store
+                .load_workspace(state.id, None)
+                .unwrap()
+                .unwrap()
+                .configured_chat_drafts
+                .is_empty()
+        );
+        let intent = crate::chat::ConfiguredChatStart {
+            id: session.id,
+            provider: session.launch.provider,
+            working_directory: session.launch.recipe.working_directory.clone(),
+            account: "claude/system".parse().unwrap(),
+            model: Some("explicit-model".into()),
+            effort: None,
+            permission_mode: Some("plan".into()),
+            automatic: true,
+        };
+        state.configured_chat_drafts.insert(card, intent.clone());
+        lane.save(&store, &state).unwrap();
+        let reopened = StateStore::open(&database, boot_id).unwrap();
+        let restored = reopened.load_workspace(state.id, None).unwrap().unwrap();
+        assert_eq!(restored.configured_chat_drafts[&card], intent);
+        assert_eq!(
+            reopened
+                .load_workspace_manifest(state.id)
+                .unwrap()
+                .unwrap()
+                .configured_chat_drafts,
+            state.configured_chat_drafts
+        );
+        let mut invalid = state.clone();
+        invalid.configured_chat_drafts.get_mut(&card).unwrap().id = TerminalId::new();
+        assert!(validate_workspace(&invalid).is_err());
+        invalid = state.clone();
+        if let CardKind::Chat(session) = &mut invalid.cards[0].kind {
+            session.launch.session_id = Some("issued-thread".into());
+        }
+        assert!(validate_workspace(&invalid).is_err());
+        state.configured_chat_drafts.clear();
+        lane.save(&store, &state).unwrap();
+        assert!(
+            reopened
+                .load_workspace(state.id, None)
+                .unwrap()
+                .unwrap()
+                .configured_chat_drafts
                 .is_empty()
         );
     }

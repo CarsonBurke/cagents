@@ -1,6 +1,7 @@
 use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
+mod configured_start;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
@@ -705,6 +706,7 @@ fn start(
         execution_environment,
         None,
         None,
+        false,
     )
 }
 
@@ -724,6 +726,7 @@ pub(super) fn start_execution(
         Default::default(),
         Some(context),
         None,
+        false,
     )
 }
 
@@ -751,6 +754,7 @@ fn start_with_execution(
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
+    fresh_only: bool,
 ) -> Result<ServerResponse, ProtocolError> {
     super::account_lifecycle::ensure_launch(
         host,
@@ -827,8 +831,14 @@ fn start_with_execution(
         chat::NativeContinuity::Durable { .. }
     ) || has_native_owner(&session)?
     {
+        if fresh_only {
+            return Err(error(
+                "This conversation identifier has a native owner; explicitly recover it",
+            ));
+        }
         return native_recovery::restore(host, client, &session).map_err(unavailable);
     }
+    let mut preparation = configured_start::StartPreparation::reserve(host, &session, fresh_only)?;
     let reservation_id = session.id;
     let mut source_process = None;
     let mut source_fresh = None;
@@ -1106,6 +1116,10 @@ fn start_with_execution(
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             return Err(unavailable("Daemon is shutting down"));
+        }
+        preparation.release_for_install(&mut state)?;
+        if fresh_only {
+            configured_start::require_fresh_in(&state, session.id)?;
         }
         if state.chat_handoffs.contains_key(&session.id) {
             return Err(error(
@@ -2021,6 +2035,9 @@ fn process_inner(
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
     match request {
+        ClientRequest::ChatStartConfigured { start: intent } => {
+            configured_start::start(host, client, intent)
+        }
         ClientRequest::ChatPrepareResume { source } => {
             let proof = host
                 .lock()
@@ -2359,7 +2376,7 @@ fn process_inner(
             };
             session.launch.session_id = handle.confirmed_session_id();
             let snapshot = handle.snapshot(None).expect("unconditional snapshot");
-            let recipe = session.launch.terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
+            let recipe = session.launch.terminal_recipe_with_current_options(snapshot.selected_model.as_deref(), snapshot.reasoning.as_deref(), snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
                 "Wait for the provider's confirmed exact conversation before returning to terminal",
             ))?;
             if session.launch.provider == Provider::Codex
@@ -2425,7 +2442,11 @@ fn process_inner(
             // shuts down. The final confirmed snapshot wins over launch flags.
             let recipe = session
                 .launch
-                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
+                .terminal_recipe_with_current_options(
+                    snapshot.selected_model.as_deref(),
+                    snapshot.reasoning.as_deref(),
+                    snapshot.permission_mode.as_deref(),
+                )
                 .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
             terminal.launch = recipe.clone();
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
@@ -2921,6 +2942,7 @@ pub(super) fn restore_upgrade(
         Default::default(),
         None,
         restart_launch,
+        false,
     )
     .map_err(|error| error.message)?;
     let id = match response {

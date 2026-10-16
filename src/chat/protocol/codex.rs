@@ -20,7 +20,7 @@ mod images;
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
 /// Codex CLI takes it, and a new thread receives it as a `thread/start`
 /// configuration override.
-pub const REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
+pub const REASONING_EFFORT_KEY: &str = crate::chat::CODEX_REASONING_EFFORT_KEY;
 
 /// The shortest directory suffix that distinguishes one same-name skill from
 /// its peers. A skill can declare a name different from its directory name.

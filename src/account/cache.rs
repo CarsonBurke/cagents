@@ -56,8 +56,10 @@ pub struct Catalog {
     pub observed_at: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Document {
+    #[serde(default)]
+    execution_policy: Option<String>,
     version: u32,
     entries: BTreeMap<String, Entry>,
     /// Added after the first version, which the version does not count: a
@@ -89,6 +91,7 @@ fn readable_catalogs<'de, D: serde::Deserializer<'de>>(
 #[derive(Debug, Clone)]
 pub struct Cache {
     directory: PathBuf,
+    execution_policy: Option<String>,
 }
 
 impl Cache {
@@ -101,7 +104,45 @@ impl Cache {
     pub fn at(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
+            execution_policy: None,
         }
+    }
+
+    /// Account metadata belongs to the captured executable, arguments and
+    /// environment, not to a conversation's model/permission presets. Old
+    /// unqualified cache files remain display history; they cannot answer a
+    /// probe under another execution policy. Only a digest is stored here.
+    pub(crate) fn for_cli(&self, provider: Provider, cli: &super::probe::Cli) -> Self {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::ffi::OsStrExt;
+        let program = cli.program.as_os_str().as_bytes();
+        // PathBuf's JSON serializer rejects non-UTF8 paths; PATH discovery is
+        // byte-preserving. Length framing keeps the byte and UTF8 fields distinct.
+        let configuration =
+            serde_json::to_vec(&(&cli.configuration.arguments, &cli.configuration.environment))
+                .expect("string execution arguments and environment serialize");
+        let digest = Sha256::new()
+            .chain_update(b"cagents-cli-metadata-v1\0")
+            .chain_update((program.len() as u64).to_le_bytes())
+            .chain_update(program)
+            .chain_update((configuration.len() as u64).to_le_bytes())
+            .chain_update(configuration)
+            .finalize();
+        Self {
+            // One bounded document per provider, not one directory per edit.
+            // A writer from another policy may cost a cache hit, never relabel
+            // its metadata as the current policy.
+            directory: self
+                .directory
+                .join("cli-metadata-v1")
+                .join(crate::settings::agents::provider_key(provider)),
+            execution_policy: Some(format!("{digest:x}")),
+        }
+    }
+
+    fn read(&self) -> Option<Document> {
+        read_document(&self.path())
+            .filter(|document| document.execution_policy == self.execution_policy)
     }
 
     fn path(&self) -> PathBuf {
@@ -113,7 +154,7 @@ impl Cache {
     /// stamped in the future is left out: the cache only ever saves a probe,
     /// so losing it costs one.
     pub fn load(&self, now: u64) -> BTreeMap<String, Entry> {
-        read_document(&self.path())
+        self.read()
             .map(|document| {
                 document
                     .entries
@@ -133,8 +174,7 @@ impl Cache {
     pub fn store(&self, key: &str, entry: Entry) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
-        let path = self.path();
-        let mut document = read_document(&path).unwrap_or_default();
+        let mut document = self.read().unwrap_or_default();
         document.version = VERSION;
         if document.entries.get(key).is_some_and(|existing| {
             supersedes(existing.snapshot.observed_at, entry.snapshot.observed_at)
@@ -148,7 +188,7 @@ impl Cache {
     /// The models each provider last listed, as of `now`. Like
     /// [`Cache::load`], a list stamped in the future is left out.
     pub fn catalogs(&self, now: u64) -> BTreeMap<Provider, Catalog> {
-        read_document(&self.path())
+        self.read()
             .map(|document| {
                 document
                     .catalogs
@@ -164,8 +204,7 @@ impl Cache {
     pub fn store_catalog(&self, provider: Provider, catalog: Catalog) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
-        let path = self.path();
-        let mut document = read_document(&path).unwrap_or_default();
+        let mut document = self.read().unwrap_or_default();
         document.version = VERSION;
         if document
             .catalogs
@@ -183,7 +222,6 @@ impl Cache {
     /// a home that moved. A younger one stays, because another window may
     /// have an account this one has not read from the registry yet.
     pub fn prune(&self, keep: &BTreeSet<String>, now: u64) -> io::Result<()> {
-        let path = self.path();
         // Most starts have nothing to forget, and read without the lock.
         let orphaned = |document: &Document| {
             document
@@ -191,11 +229,11 @@ impl Cache {
                 .iter()
                 .any(|(key, entry)| !keep.contains(key) && !current(entry, now))
         };
-        if !read_document(&path).is_some_and(|document| orphaned(&document)) {
+        if !self.read().is_some_and(|document| orphaned(&document)) {
             return Ok(());
         }
         let _lock = self.lock(libc::LOCK_EX)?;
-        let Some(mut document) = read_document(&path).filter(orphaned) else {
+        let Some(mut document) = self.read().filter(orphaned) else {
             return Ok(());
         };
         document
@@ -208,7 +246,9 @@ impl Cache {
     /// temporary sibling and renamed over the original. The caller holds the
     /// lock.
     fn write(&self, document: &Document) -> io::Result<()> {
-        let bytes = serde_json::to_vec(document).map_err(io::Error::other)?;
+        let mut document = document.clone();
+        document.execution_policy = self.execution_policy.clone();
+        let bytes = serde_json::to_vec(&document).map_err(io::Error::other)?;
         if bytes.len() as u64 > MAX_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -299,6 +339,132 @@ mod tests {
             }),
             snapshot,
         }
+    }
+
+    #[test]
+    fn execution_policy_caches_separate_pins_arguments_and_environment_not_presets() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let original = crate::settings::AgentLaunchSettings::default();
+        let cli = |policy: &crate::settings::AgentLaunchSettings| super::super::probe::Cli {
+            program: policy
+                .executable
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/known/claude")),
+            configuration: policy.clone(),
+        };
+        let scope = cache.for_cli(Provider::Claude, &cli(&original));
+        scope.store("claude:/owned", entry(10, "original")).unwrap();
+        scope
+            .store_catalog(Provider::Claude, catalog(10, "original-model"))
+            .unwrap();
+        for changed in [
+            crate::settings::AgentLaunchSettings {
+                executable: Some("/different/claude".into()),
+                ..original.clone()
+            },
+            crate::settings::AgentLaunchSettings {
+                arguments: vec!["--custom".into()],
+                ..original.clone()
+            },
+            crate::settings::AgentLaunchSettings {
+                environment: BTreeMap::from([("PATH".into(), "/different/tools".into())]),
+                ..original.clone()
+            },
+        ] {
+            let changed = cache.for_cli(Provider::Claude, &cli(&changed));
+            assert!(changed.load(100).is_empty());
+            assert!(changed.catalogs(100).is_empty());
+            changed
+                .store("claude:/owned", entry(20, "different"))
+                .unwrap();
+        }
+        let other_binary = super::super::probe::Cli {
+            program: "/different/inherited/claude".into(),
+            configuration: original.clone(),
+        };
+        assert!(
+            cache
+                .for_cli(Provider::Claude, &other_binary)
+                .load(100)
+                .is_empty(),
+            "different inherited PATH resolution is distinct too"
+        );
+        assert!(
+            scope.load(100).is_empty(),
+            "other policies never relabel a cache hit"
+        );
+        scope
+            .store("claude:/owned", entry(30, "original-again"))
+            .unwrap();
+        scope
+            .store_catalog(Provider::Claude, catalog(30, "original-model"))
+            .unwrap();
+        let preset = crate::settings::AgentLaunchSettings {
+            model: Some("different-model".into()),
+            effort: Some("low".into()),
+            permission_mode: Some("plan".into()),
+            ..original.clone()
+        };
+        assert_eq!(
+            cache.for_cli(Provider::Claude, &cli(&preset)).load(100),
+            scope.load(100)
+        );
+        assert_eq!(
+            scope.catalogs(100)[&Provider::Claude].models[0].id,
+            "original-model"
+        );
+        assert!(
+            cache.load(100).is_empty(),
+            "unqualified live cache is distinct"
+        );
+        assert!(
+            cache
+                .for_cli(Provider::Codex, &cli(&original))
+                .load(100)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn non_utf8_discovered_executable_has_exact_cache_identity() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"tools-\xff".to_vec()));
+        let other = directory.path().join("tools-\u{fffd}");
+        for path in [&path, &other] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("claude"), "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path.join("claude"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let cli = |path: &Path| {
+            super::super::probe::Cli::configured(
+                Provider::Claude,
+                Some(path.as_os_str()),
+                Default::default(),
+            )
+            .ok()
+            .expect("real PATH candidate")
+        };
+        let original = cli(&path);
+        assert!(original.program.to_str().is_none());
+        let alias = cli(&other);
+        let cache = Cache::at(directory.path().join("cache"));
+        cache
+            .for_cli(Provider::Claude, &original)
+            .store("claude:/owned", entry(10, "byte path"))
+            .unwrap();
+        assert!(cache.for_cli(Provider::Claude, &alias).load(100).is_empty());
+        assert_eq!(
+            cache.for_cli(Provider::Claude, &original).load(100)["claude:/owned"]
+                .snapshot
+                .detail
+                .as_deref(),
+            Some("byte path")
+        );
     }
 
     #[test]

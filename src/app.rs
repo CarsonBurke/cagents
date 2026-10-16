@@ -2196,11 +2196,12 @@ pub enum SettingsCategory {
     Links,
     Keyboard,
     Accounts,
+    Agents,
     About,
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::General,
         Self::Notifications,
         Self::Appearance,
@@ -2210,6 +2211,7 @@ impl SettingsCategory {
         Self::Links,
         Self::Keyboard,
         Self::Accounts,
+        Self::Agents,
         Self::About,
     ];
 
@@ -2224,6 +2226,7 @@ impl SettingsCategory {
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
             Self::Accounts => "Accounts",
+            Self::Agents => "Agents",
             Self::About => "About",
         }
     }
@@ -2507,8 +2510,10 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         // keystroke aimed at the dialog must not edit a setting behind it.
         | Message::SelectSettingsCategory(_)
         | Message::SettingsSearchChanged(_)
+        | Message::DetectAgentExecutable(_)
         | Message::SettingsChanged { .. }
         | Message::SettingsDraftChanged { .. }
+        | Message::AgentListEdited { .. }
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
@@ -2571,8 +2576,10 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::CancelDialog
                 | Message::SelectSettingsCategory(_)
                 | Message::SettingsSearchChanged(_)
+                | Message::DetectAgentExecutable(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
+                | Message::AgentListEdited { .. }
                 | Message::ResetSettings
                 | Message::ConfirmResetSettings
                 | Message::CancelResetSettings
@@ -2722,7 +2729,42 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentSetting {
+    Model,
+    Effort,
+    PermissionMode,
+    Executable,
+    Arguments,
+    Environment,
+}
+
+impl AgentSetting {
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Effort => "effort",
+            Self::PermissionMode => "permission_mode",
+            Self::Executable => "executable",
+            Self::Arguments => "arguments",
+            Self::Environment => "environment",
+        }
+    }
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Model => "Default model",
+            Self::Effort => "Default effort",
+            Self::PermissionMode => "Default permission mode",
+            Self::Executable => "Executable",
+            Self::Arguments => "Extra arguments",
+            Self::Environment => "Environment",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingsField {
+    Agent(crate::agent::Provider, AgentSetting),
+    DefaultShell,
     Notifications(crate::notifications::Field),
     AppTheme,
     UiScale,
@@ -2852,6 +2894,8 @@ impl SettingsField {
     const fn label(self) -> &'static str {
         use crate::notifications::Field;
         match self {
+            Self::Agent(_, field) => field.label(),
+            Self::DefaultShell => "Default shell",
             Self::Notifications(Field::Enabled) => "System notifications",
             Self::Notifications(Field::Success) => "Successful completion",
             Self::Notifications(Field::Failure) => "Failure or cancellation",
@@ -2942,6 +2986,7 @@ impl SettingsField {
     /// The category whose page holds this setting.
     const fn category(self) -> SettingsCategory {
         match self {
+            Self::Agent(..) | Self::DefaultShell => SettingsCategory::Agents,
             Self::Notifications(_) => SettingsCategory::Notifications,
             Self::AppTheme
             | Self::UiScale
@@ -3127,8 +3172,185 @@ impl ShortcutDraft {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum AgentListEdit {
+    Argument { row: uuid::Uuid, value: String },
+    RemoveArgument(uuid::Uuid),
+    AddArgument,
+    EnvironmentName { row: uuid::Uuid, value: String },
+    EnvironmentValue { row: uuid::Uuid, value: String },
+    RemoveEnvironment(uuid::Uuid),
+    AddEnvironment,
+}
+
+#[derive(Debug, Clone)]
+struct AgentDraft {
+    configuration: settings::AgentLaunchSettings,
+    environment: Vec<(String, String)>,
+    launch_error: Option<String>,
+    executable_unavailable: bool,
+    executable_revision: uuid::Uuid,
+    argument_owner: uuid::Uuid,
+    argument_rows: Vec<uuid::Uuid>,
+    environment_owner: uuid::Uuid,
+    environment_rows: Vec<uuid::Uuid>,
+}
+
+// Row identities fence callbacks, but are not part of the preference value.
+impl PartialEq for AgentDraft {
+    fn eq(&self, other: &Self) -> bool {
+        self.configuration == other.configuration
+            && self.environment == other.environment
+            && self.launch_error == other.launch_error
+            && self.executable_unavailable == other.executable_unavailable
+    }
+}
+impl Eq for AgentDraft {}
+impl Default for AgentDraft {
+    fn default() -> Self {
+        Self::new(settings::AgentLaunchSettings::default(), None)
+    }
+}
+impl AgentDraft {
+    fn new(configuration: settings::AgentLaunchSettings, launch_error: Option<String>) -> Self {
+        let environment: Vec<_> = configuration
+            .environment
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        Self {
+            argument_rows: configuration
+                .arguments
+                .iter()
+                .map(|_| uuid::Uuid::new_v4())
+                .collect(),
+            environment_rows: environment.iter().map(|_| uuid::Uuid::new_v4()).collect(),
+            configuration,
+            environment,
+            launch_error,
+            executable_unavailable: false,
+            executable_revision: uuid::Uuid::new_v4(),
+            argument_owner: uuid::Uuid::new_v4(),
+            environment_owner: uuid::Uuid::new_v4(),
+        }
+    }
+    fn set_arguments(&mut self, arguments: Vec<String>) {
+        if self.argument_rows.len() != arguments.len() {
+            self.argument_owner = uuid::Uuid::new_v4();
+            self.argument_rows = arguments.iter().map(|_| uuid::Uuid::new_v4()).collect();
+        }
+        self.configuration.arguments = arguments;
+    }
+    fn set_environment(&mut self, environment: Vec<(String, String)>) {
+        if self.environment_rows.len() != environment.len() {
+            self.environment_owner = uuid::Uuid::new_v4();
+            self.environment_rows = environment.iter().map(|_| uuid::Uuid::new_v4()).collect();
+        }
+        self.configuration.environment = environment.iter().cloned().collect();
+        self.environment = environment;
+    }
+    /// Apply one emitted row operation against the latest draft. Views capture
+    /// identities, never a whole old list that could replace another row's edit.
+    fn edit_list(
+        &mut self,
+        owner: uuid::Uuid,
+        edit: AgentListEdit,
+    ) -> Option<(AgentSetting, String)> {
+        match edit {
+            AgentListEdit::Argument { row, value } => {
+                if owner != self.argument_owner {
+                    return None;
+                }
+                let index = self.argument_rows.iter().position(|id| *id == row)?;
+                let mut arguments = self.configuration.arguments.clone();
+                *arguments.get_mut(index)? = value;
+                Some((
+                    AgentSetting::Arguments,
+                    serde_json::to_string(&arguments).expect("argument strings serialize"),
+                ))
+            }
+            AgentListEdit::RemoveArgument(row) => {
+                if owner != self.argument_owner {
+                    return None;
+                }
+                let index = self.argument_rows.iter().position(|id| *id == row)?;
+                let mut arguments = self.configuration.arguments.clone();
+                arguments.remove(index);
+                self.argument_rows.remove(index);
+                Some((
+                    AgentSetting::Arguments,
+                    serde_json::to_string(&arguments).expect("argument strings serialize"),
+                ))
+            }
+            AgentListEdit::AddArgument => {
+                if owner != self.argument_owner {
+                    return None;
+                }
+                let mut arguments = self.configuration.arguments.clone();
+                arguments.push(String::new());
+                self.argument_rows.push(uuid::Uuid::new_v4());
+                Some((
+                    AgentSetting::Arguments,
+                    serde_json::to_string(&arguments).expect("argument strings serialize"),
+                ))
+            }
+            edit @ (AgentListEdit::EnvironmentName { .. }
+            | AgentListEdit::EnvironmentValue { .. }) => {
+                if owner != self.environment_owner {
+                    return None;
+                }
+                let (row, value, name) = match edit {
+                    AgentListEdit::EnvironmentName { row, value } => (row, value, true),
+                    AgentListEdit::EnvironmentValue { row, value } => (row, value, false),
+                    _ => unreachable!("matched environment column"),
+                };
+                let index = self.environment_rows.iter().position(|id| *id == row)?;
+                let mut environment = self.environment.clone();
+                let entry = environment.get_mut(index)?;
+                if name {
+                    entry.0 = value;
+                } else {
+                    entry.1 = value;
+                }
+                Some((
+                    AgentSetting::Environment,
+                    serde_json::to_string(&environment).expect("environment strings serialize"),
+                ))
+            }
+            AgentListEdit::RemoveEnvironment(row) => {
+                if owner != self.environment_owner {
+                    return None;
+                }
+                let index = self.environment_rows.iter().position(|id| *id == row)?;
+                let mut environment = self.environment.clone();
+                environment.remove(index);
+                self.environment_rows.remove(index);
+                Some((
+                    AgentSetting::Environment,
+                    serde_json::to_string(&environment).expect("environment strings serialize"),
+                ))
+            }
+            AgentListEdit::AddEnvironment => {
+                if owner != self.environment_owner {
+                    return None;
+                }
+                let mut environment = self.environment.clone();
+                environment.push((String::new(), String::new()));
+                self.environment_rows.push(uuid::Uuid::new_v4());
+                Some((
+                    AgentSetting::Environment,
+                    serde_json::to_string(&environment).expect("environment strings serialize"),
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
+    agents: std::collections::BTreeMap<crate::agent::Provider, AgentDraft>,
+    default_shell: String,
+    default_shell_unavailable: bool,
     notifications: crate::notifications::Preferences,
     app_theme: String,
     ui_scale: String,
@@ -3177,6 +3399,23 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
+            agents: crate::agent::Provider::ALL
+                .into_iter()
+                .map(|provider| {
+                    let configuration = settings
+                        .agents
+                        .get(settings::agents::provider_key(provider))
+                        .cloned()
+                        .unwrap_or_default();
+                    let launch_error = configuration.validate_syntax(provider).err();
+                    (provider, AgentDraft::new(configuration, launch_error))
+                })
+                .collect(),
+            default_shell: settings.default_shell.clone().unwrap_or_default(),
+            default_shell_unavailable: settings
+                .default_shell
+                .as_deref()
+                .is_some_and(|path| !settings::agents::executable_path_syntax(path)),
             notifications: settings.notifications,
             app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
@@ -3239,6 +3478,42 @@ impl SettingsDraft {
 
     fn set(&mut self, field: SettingsField, value: String) {
         match field {
+            SettingsField::DefaultShell => {
+                self.default_shell_unavailable =
+                    !value.is_empty() && !settings::agents::executable_path_syntax(&value);
+                self.default_shell = value;
+            }
+            SettingsField::Agent(provider, field) => {
+                let draft = self.agents.entry(provider).or_default();
+                let optional = |value: String| (!value.is_empty()).then_some(value);
+                match field {
+                    AgentSetting::Model => draft.configuration.model = optional(value),
+                    AgentSetting::Effort => draft.configuration.effort = optional(value),
+                    AgentSetting::PermissionMode => {
+                        draft.configuration.permission_mode = optional(value)
+                    }
+                    AgentSetting::Executable => {
+                        draft.configuration.executable = optional(value);
+                        draft.executable_unavailable = false;
+                    }
+                    AgentSetting::Arguments => {
+                        if let Ok(arguments) = serde_json::from_str(&value) {
+                            draft.set_arguments(arguments);
+                        }
+                    }
+                    AgentSetting::Environment => {
+                        if let Ok(environment) =
+                            serde_json::from_str::<Vec<(String, String)>>(&value)
+                        {
+                            draft.set_environment(environment);
+                        }
+                    }
+                }
+                if matches!(field, AgentSetting::Executable | AgentSetting::Environment) {
+                    draft.executable_revision = uuid::Uuid::new_v4();
+                }
+                draft.launch_error = draft.configuration.validate_syntax(provider).err();
+            }
             SettingsField::Notifications(field) => self.notifications.set(field, value == "true"),
             SettingsField::AppTheme => self.app_theme = value,
             SettingsField::UiScale => self.ui_scale = value,
@@ -3400,14 +3675,81 @@ enum SettingsDecision {
     Persist(AppSettings),
 }
 
+/// Settings and recorded recipes store UTF-8 paths. Refuse a discovery
+/// that cannot round-trip rather than silently selecting a different file.
+fn detected_executable_path(path: PathBuf) -> Result<String, String> {
+    path.into_os_string().into_string().map_err(|_| {
+        "The detected executable path is not valid UTF-8. Choose a path with valid text characters.".to_owned()
+    })
+}
+
 fn settings_update(
     current: &AppSettings,
     field: SettingsField,
     raw_value: &str,
 ) -> SettingsDecision {
+    settings_update_with_availability(current, field, raw_value, true)
+}
+
+fn settings_update_syntax(
+    current: &AppSettings,
+    field: SettingsField,
+    raw_value: &str,
+) -> SettingsDecision {
+    settings_update_with_availability(current, field, raw_value, false)
+}
+
+fn settings_update_with_availability(
+    current: &AppSettings,
+    field: SettingsField,
+    raw_value: &str,
+    availability: bool,
+) -> SettingsDecision {
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::DefaultShell => {
+            next.default_shell = (!value.is_empty()).then(|| value.to_owned());
+            Ok(())
+        }
+        SettingsField::Agent(provider, field) => {
+            let configuration = next
+                .agents
+                .entry(settings::agents::provider_key(provider).into())
+                .or_default();
+            let optional = || (!value.is_empty()).then(|| value.to_owned());
+            match field {
+                AgentSetting::Model => {
+                    configuration.model = optional();
+                    Ok(())
+                }
+                AgentSetting::Effort => {
+                    configuration.effort = optional();
+                    Ok(())
+                }
+                AgentSetting::PermissionMode => {
+                    configuration.permission_mode = optional();
+                    Ok(())
+                }
+                AgentSetting::Executable => {
+                    configuration.executable = optional();
+                    Ok(())
+                }
+                AgentSetting::Arguments => serde_json::from_str(value)
+                    .map(|arguments| configuration.arguments = arguments)
+                    .map_err(|_| "Enter each argument in its own row.".to_owned()),
+                AgentSetting::Environment => serde_json::from_str::<Vec<(String, String)>>(value)
+                    .map_err(|_| "Enter each environment variable in its own row.".to_owned())
+                    .and_then(|entries| {
+                        let mut names = std::collections::HashSet::new();
+                        if entries.iter().any(|(name, _)| !names.insert(name)) {
+                            return Err("Environment variable names must be unique.".into());
+                        }
+                        configuration.environment = entries.into_iter().collect();
+                        Ok(())
+                    }),
+            }
+        }
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
             Ok(())
@@ -3798,7 +4140,12 @@ fn settings_update(
         return SettingsDecision::Invalid(refusal(field, &next).unwrap_or(message));
     }
     let attempted = next.clone();
-    let next = match next.validate() {
+    let validated = if availability {
+        next.validate_transition(current)
+    } else {
+        next.validate_transition_syntax(current)
+    };
+    let next = match validated {
         Ok(next) => next,
         Err(error) => {
             return SettingsDecision::Invalid(
@@ -3823,6 +4170,9 @@ fn settings_update(
 fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
     let label = field.label();
     Some(match field {
+        SettingsField::DefaultShell => {
+            "Default shell must be an absolute path to an executable file.".into()
+        }
         SettingsField::TerminalScrollSize => format!(
             "{label} must be 1–{} lines.",
             settings::MAX_TERMINAL_SCROLL_SIZE
@@ -4309,6 +4659,19 @@ pub enum Message {
     ContextInspector(InspectorAction),
     SelectSettingsCategory(SettingsCategory),
     SettingsSearchChanged(String),
+    DetectAgentExecutable(crate::agent::Provider),
+    AgentExecutableDetected {
+        provider: crate::agent::Provider,
+        revision: uuid::Uuid,
+        previous_executable: Option<String>,
+        previous_path: Option<String>,
+        result: Result<String, String>,
+    },
+    AgentListEdited {
+        provider: crate::agent::Provider,
+        owner: uuid::Uuid,
+        edit: AgentListEdit,
+    },
     SettingsChanged {
         field: SettingsField,
         value: String,
@@ -4321,6 +4684,16 @@ pub enum Message {
     SettingsAutosave {
         field: SettingsField,
         generation: u64,
+    },
+    SettingsPathChecked {
+        field: SettingsField,
+        generation: u64,
+        available: bool,
+    },
+    SettingsPathFeedback {
+        providers: Vec<(crate::agent::Provider, uuid::Uuid, bool)>,
+        shell: String,
+        shell_unavailable: bool,
     },
     ProjectUi(project_ui::Action),
     PullRequestUi(pull_request_ui::Action),
@@ -5747,15 +6120,16 @@ impl Cagents {
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
-        let mut launch = match LaunchRecipe::shell(working_directory.clone()) {
-            Ok(launch) => launch,
-            Err(error) => {
-                self.status = Some(TransientNotice::error(format!(
-                    "could not create terminal: {error}"
-                )));
-                return Task::none();
-            }
-        };
+        let mut launch =
+            match LaunchRecipe::shell_with_settings(working_directory.clone(), &self.settings) {
+                Ok(launch) => launch,
+                Err(error) => {
+                    self.status = Some(TransientNotice::error(format!(
+                        "could not create terminal: {error}"
+                    )));
+                    return Task::none();
+                }
+            };
         if let Some(shell) = crate::device::shell() {
             launch.program = shell.to_owned();
         }
@@ -5913,6 +6287,23 @@ impl Cagents {
             return Self::open_external_url(session.current_url.clone());
         }
         let source_id = source.id;
+        let mut configured = if matches!(&source.kind, CardKind::Chat(session) if session.is_unstarted())
+        {
+            self.persistent_workspace()
+                .configured_chat_drafts
+                .get(&source_id)
+                .cloned()
+        } else {
+            None
+        };
+        if let (Some(start), CardKind::Chat(session)) = (&configured, &source.kind)
+            && (!start.matches_draft(session) || start.validate().is_err())
+        {
+            self.status = Some(TransientNotice::error(
+                "The saved draft choices do not match this conversation. Choose its account again or start a new draft.",
+            ));
+            return Task::none();
+        }
         let user_title = self.chrome_ui.user_titles.get(&source_id).cloned();
         let save_title = user_title.is_some();
         let mut card = source;
@@ -5961,6 +6352,9 @@ impl Cagents {
                 session.launch.session_id = None;
                 session.proof = None;
                 session.terminal = None;
+                if let Some(start) = &mut configured {
+                    start.id = session.id;
+                }
                 card.title = crate::app::chat_ui::chat_card_title(session.launch.provider).into();
             }
             CardKind::Browser(session) => {
@@ -5998,6 +6392,9 @@ impl Cagents {
         };
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
+        if let Some(start) = configured {
+            durable.configured_chat_drafts.insert(id, start);
+        }
         durable.focused = Some(id);
         // The descriptor's directory can be a nested editor directory rather
         // than its containing workspace. Keep the filing across projection.
@@ -7078,6 +7475,12 @@ impl Cagents {
         let unchanged = self.card_state(card).is_some_and(
             |state| matches!(&state.kind, CardKind::Chat(current) if current == &session),
         );
+        let discarded_fresh_choices = !session.is_unstarted()
+            && self.durable.configured_chat_drafts.contains_key(&card)
+            && Arc::make_mut(&mut self.durable)
+                .configured_chat_drafts
+                .remove(&card)
+                .is_some();
         // A successful attachment completes hydration even when the provider
         // has not enriched the already-saved descriptor yet.
         self.lifecycle.remove(card);
@@ -7089,7 +7492,7 @@ impl Cagents {
             state.residency = Residency::Hot;
         }
         if unchanged {
-            return None;
+            return discarded_fresh_choices.then_some(false);
         }
         let conversion = self
             .card_state(card)
@@ -9279,6 +9682,7 @@ impl Cagents {
                 settings_ui::SettingsContext {
                     feedback: self.settings_feedback.as_ref(),
                     invalid: &self.settings_invalid,
+                    agent_models: crate::agent::Provider::ALL.into_iter().map(|provider| (provider, self.account_ui.catalog(provider).map(|catalog| catalog.models.as_slice()).unwrap_or(&[]))).collect(),
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
@@ -12227,10 +12631,10 @@ impl Cagents {
         })
     }
 
-    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) {
+    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) -> bool {
         if saved.generation >= self.settings_ack_generation {
             self.settings_ack_generation = saved.generation;
-            self.settings_base = saved.settings;
+            let previous = std::mem::replace(&mut self.settings_base, saved.settings);
             self.settings_path = Some(saved.path);
             if self
                 .settings_reset_generation
@@ -12238,7 +12642,11 @@ impl Cagents {
             {
                 self.settings_reset_generation = None;
             }
+            // All accepted acknowledgements fence metadata, including a
+            // workspace flush that overtakes an ordinary settings save.
+            return self.invalidate_account_policy(&previous);
         }
+        false
     }
 
     fn save_settings_now(&mut self) -> Result<(), String> {
@@ -12477,6 +12885,10 @@ impl Cagents {
     /// window is about to save on its way out, without the live effects -
     /// lifecycle sweeps, theme changes, editor auto-saves - that applying
     /// them normally triggers, since nothing is left to show them.
+    // Only called by Drop, after the event loop has stopped dispatching to
+    // this window. That shutdown path already performs the blocking final
+    // save; validate each field there so one refused path cannot poison valid
+    // unrelated edits. Active reducers use worker checks instead.
     fn fold_settings_drafts(&mut self) {
         let mut pending: Vec<_> = self.settings_pending.drain().collect();
         pending.sort_by_key(|(_, (generation, _))| *generation);
@@ -12489,10 +12901,82 @@ impl Cagents {
         }
     }
 
+    fn settings_path_feedback(&self) -> Task<Message> {
+        let providers: Vec<_> = self
+            .settings_draft
+            .agents
+            .iter()
+            .map(|(&provider, draft)| {
+                (
+                    provider,
+                    draft.executable_revision,
+                    draft.configuration.executable.clone(),
+                )
+            })
+            .collect();
+        let shell = self.settings_draft.default_shell.clone();
+        cosmic::task::future(async move {
+            tokio::task::spawn_blocking(move || {
+                let providers = providers
+                    .into_iter()
+                    .map(|(provider, revision, path)| {
+                        (
+                            provider,
+                            revision,
+                            path.as_deref()
+                                .is_some_and(|path| !settings::agents::executable_available(path)),
+                        )
+                    })
+                    .collect();
+                let shell_unavailable =
+                    !shell.is_empty() && !settings::agents::executable_available(&shell);
+                Message::SettingsPathFeedback {
+                    providers,
+                    shell,
+                    shell_unavailable,
+                }
+            })
+            .await
+            .unwrap_or_else(|_| Message::SettingsPathFeedback {
+                providers: Vec::new(),
+                shell: String::new(),
+                shell_unavailable: false,
+            })
+        })
+    }
+
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_pending.remove(&field);
         self.settings_draft.set(field, value.clone());
-        match settings_update(&self.settings, field, &value) {
+        if matches!(
+            field,
+            SettingsField::DefaultShell | SettingsField::Agent(_, AgentSetting::Executable)
+        ) {
+            // Keep the edit pending until the filesystem-owning worker returns.
+            // Its generation is replaced by another edit and cleared by reset.
+            self.settings_generation = self.settings_generation.wrapping_add(1);
+            let generation = self.settings_generation;
+            self.settings_pending
+                .insert(field, (generation, value.clone()));
+            self.refresh_settings_feedback();
+            return cosmic::task::future(async move {
+                let available = tokio::task::spawn_blocking(move || {
+                    value.trim().is_empty() || settings::agents::executable_available(value.trim())
+                })
+                .await
+                .unwrap_or(false);
+                Message::SettingsPathChecked {
+                    field,
+                    generation,
+                    available,
+                }
+            });
+        }
+        self.commit_setting_input(field, value)
+    }
+
+    fn commit_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
+        match settings_update_syntax(&self.settings, field, &value) {
             SettingsDecision::Invalid(message) => {
                 self.settings_invalid.insert(field, message);
                 self.refresh_settings_feedback();
@@ -14777,23 +15261,26 @@ impl Application for Cagents {
                 Task::batch([drafts, open])
             }
             Message::NewWindowOpened { saved, result } => {
-                if let Ok(saved) = saved {
-                    self.acknowledge_settings_save(saved);
-                }
+                let refresh = saved.is_ok_and(|saved| self.acknowledge_settings_save(saved));
                 if let Err(error) = result {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not open a new window: {error}"
                     )));
                 }
-                Task::none()
+                if refresh {
+                    self.refresh_account_policy()
+                } else {
+                    Task::none()
+                }
             }
             Message::SettingsSaved { generation, result } => {
+                let mut refresh_accounts = false;
                 match result {
                     Ok(saved) => {
                         if saved.generation >= self.settings_ack_generation {
                             self.settings_save_error = None;
                         }
-                        self.acknowledge_settings_save(saved);
+                        refresh_accounts = self.acknowledge_settings_save(saved);
                     }
                     Err(error) if generation >= self.settings_ack_generation => {
                         self.status = Some(TransientNotice::warning(format!(
@@ -14804,7 +15291,14 @@ impl Application for Cagents {
                     Err(_) => {}
                 }
                 self.refresh_settings_feedback();
-                Task::none()
+                if refresh_accounts {
+                    // Discovery reads saved execution policy. Run after the
+                    // write acknowledgement, so it cannot observe old paths
+                    // or environment while the settings save is still queued.
+                    self.refresh_account_policy()
+                } else {
+                    Task::none()
+                }
             }
             Message::UiUpdate(request) => match request.action {
                 instance::UiUpdateAction::Prepare => {
@@ -14897,13 +15391,15 @@ impl Application for Cagents {
                 saved,
                 result,
             } => {
-                if let Ok(saved) = saved {
-                    self.acknowledge_settings_save(saved);
-                }
+                let refresh = saved.is_ok_and(|saved| self.acknowledge_settings_save(saved));
                 if generation != self.update_generation || !self.update_prepared {
                     let _ =
                         response.try_send("error: window update preparation was cancelled".into());
-                    return Task::none();
+                    return if refresh {
+                        self.refresh_account_policy()
+                    } else {
+                        Task::none()
+                    };
                 }
                 self.update_flush_pending = false;
                 match result {
@@ -14913,7 +15409,11 @@ impl Application for Cagents {
                             self.status = Some(TransientNotice::warning(
                                 "Updater disconnected; window is ready.",
                             ));
-                            return Task::none();
+                            return if refresh {
+                                self.refresh_account_policy()
+                            } else {
+                                Task::none()
+                            };
                         }
                         if committing {
                             self.update_committed = true;
@@ -14926,7 +15426,11 @@ impl Application for Cagents {
                         let _ = response.try_send(format!("error: {error}").replace('\n', " "));
                     }
                 }
-                Task::none()
+                if refresh {
+                    self.refresh_account_policy()
+                } else {
+                    Task::none()
+                }
             }
             Message::UiUpdateWatchdog(generation) => {
                 if self.update_prepared
@@ -16099,11 +16603,109 @@ impl Application for Cagents {
             Message::SelectSettingsCategory(category) => {
                 self.settings_search.clear();
                 self.settings_category = category;
-                crate::settings_widgets::reveal_content_start()
+                Task::batch([
+                    crate::settings_widgets::reveal_content_start(),
+                    if category == SettingsCategory::Agents {
+                        self.settings_path_feedback()
+                    } else {
+                        Task::none()
+                    },
+                ])
+            }
+            Message::DetectAgentExecutable(provider) => {
+                let draft = self.settings_draft.agents.entry(provider).or_default();
+                // A new request, edited execution input, or replaced draft
+                // invalidates old discovery even when its text later matches.
+                draft.executable_revision = uuid::Uuid::new_v4();
+                let revision = draft.executable_revision;
+                let mut configuration = draft.configuration.clone();
+                let previous_executable = configuration.executable.take();
+                let previous_path = configuration.environment.get("PATH").cloned();
+                cosmic::task::future(async move {
+                    let search = if previous_path.is_none() {
+                        crate::account::probe::refresh_search_path().await
+                    } else {
+                        None
+                    };
+                    let result = tokio::task::spawn_blocking(move || {
+                        configuration
+                            .resolve_executable(provider, search.as_deref())
+                            .and_then(detected_executable_path)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("Could not detect the executable. Try again.".into()));
+                    Message::AgentExecutableDetected {
+                        provider,
+                        revision,
+                        previous_executable,
+                        previous_path,
+                        result,
+                    }
+                })
+            }
+            Message::AgentExecutableDetected {
+                provider,
+                revision,
+                previous_executable,
+                previous_path,
+                ..
+            } if self
+                .settings_draft
+                .agents
+                .get(&provider)
+                .is_none_or(|draft| draft.executable_revision != revision)
+                || self
+                    .settings_draft
+                    .agents
+                    .get(&provider)
+                    .and_then(|draft| draft.configuration.executable.as_ref())
+                    != previous_executable.as_ref()
+                || self
+                    .settings_draft
+                    .agents
+                    .get(&provider)
+                    .and_then(|draft| draft.configuration.environment.get("PATH"))
+                    != previous_path.as_ref() =>
+            {
+                Task::none()
+            }
+            Message::AgentExecutableDetected {
+                provider,
+                result: Ok(path),
+                ..
+            } => self.apply_setting_input(
+                SettingsField::Agent(provider, AgentSetting::Executable),
+                path,
+            ),
+            Message::AgentExecutableDetected {
+                provider,
+                result: Err(reason),
+                ..
+            } => {
+                self.settings_invalid.insert(
+                    SettingsField::Agent(provider, AgentSetting::Executable),
+                    reason,
+                );
+                self.refresh_settings_feedback();
+                Task::none()
             }
             Message::SettingsSearchChanged(query) => {
                 self.settings_search = query;
                 crate::settings_widgets::reveal_content_start()
+            }
+            Message::AgentListEdited {
+                provider,
+                owner,
+                edit,
+            } => {
+                let change = self
+                    .settings_draft
+                    .agents
+                    .get_mut(&provider)
+                    .and_then(|draft| draft.edit_list(owner, edit));
+                change.map_or_else(Task::none, |(field, value)| {
+                    self.queue_setting_input(SettingsField::Agent(provider, field), value)
+                })
             }
             Message::SettingsChanged { field, value } => self.apply_setting_input(field, value),
             Message::SettingsDraftChanged { field, value } => {
@@ -16111,6 +16713,52 @@ impl Application for Cagents {
             }
             Message::SettingsAutosave { field, generation } => {
                 self.autosave_setting(field, generation)
+            }
+            Message::SettingsPathChecked {
+                field,
+                generation,
+                available,
+            } => {
+                if !self
+                    .settings_pending
+                    .get(&field)
+                    .is_some_and(|pending| pending.0 == generation)
+                {
+                    return Task::none();
+                }
+                let (_, value) = self
+                    .settings_pending
+                    .remove(&field)
+                    .expect("matched path check");
+                if !available {
+                    self.settings_invalid.insert(
+                        field,
+                        format!(
+                            "{} must be an absolute path to an executable file.",
+                            field.label()
+                        ),
+                    );
+                    self.refresh_settings_feedback();
+                    return Task::none();
+                }
+                self.commit_setting_input(field, value)
+            }
+            Message::SettingsPathFeedback {
+                providers,
+                shell,
+                shell_unavailable,
+            } => {
+                for (provider, revision, unavailable) in providers {
+                    if let Some(draft) = self.settings_draft.agents.get_mut(&provider)
+                        && draft.executable_revision == revision
+                    {
+                        draft.executable_unavailable = unavailable;
+                    }
+                }
+                if self.settings_draft.default_shell == shell {
+                    self.settings_draft.default_shell_unavailable = shell_unavailable;
+                }
+                Task::none()
             }
             Message::ProjectUi(action) => self.handle_project_action(action),
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
@@ -19429,6 +20077,334 @@ mod tests {
     }
 
     #[test]
+    fn settings_executable_detection_uses_provider_path_and_fences_changed_inputs() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory
+            .path()
+            .join(crate::agent::Provider::Claude.executable());
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let provider = crate::agent::Provider::Claude;
+        let configured = settings::AgentLaunchSettings {
+            executable: Some("/missing/old-provider".into()),
+            environment: [("PATH".into(), directory.path().to_str().unwrap().into())].into(),
+            ..Default::default()
+        };
+        let mut app = context_inspector_test_app(false);
+        app.settings
+            .agents
+            .insert("claude".into(), configured.clone());
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
+        assert!(
+            matches!(&message, Message::AgentExecutableDetected { result: Ok(path), .. } if path == executable.to_str().unwrap())
+        );
+        app.settings_draft
+            .agents
+            .get_mut(&provider)
+            .unwrap()
+            .configuration
+            .environment
+            .insert("PATH".into(), "/changed/path".into());
+        drop(app.update(message));
+        assert_eq!(app.settings.agents["claude"], configured);
+        assert!(app.settings_invalid.is_empty());
+
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
+        app.settings_draft
+            .agents
+            .get_mut(&provider)
+            .unwrap()
+            .configuration
+            .executable = Some("/manual/new-provider".into());
+        drop(app.update(message));
+        assert_eq!(app.settings.agents["claude"], configured);
+
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
+        let checked = task_app_message(app.update(message));
+        assert!(matches!(
+            checked,
+            Message::SettingsPathChecked {
+                available: true,
+                ..
+            }
+        ));
+        drop(app.update(checked));
+        assert_eq!(
+            app.settings.agents["claude"].executable.as_deref(),
+            executable.to_str()
+        );
+        assert_eq!(
+            app.settings.agents["claude"].environment,
+            configured.environment
+        );
+
+        app.settings_draft
+            .agents
+            .get_mut(&provider)
+            .unwrap()
+            .configuration
+            .environment
+            .insert("PATH".into(), "relative-tools".into());
+        let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
+        assert!(
+            matches!(&message, Message::AgentExecutableDetected { result: Err(reason), .. } if reason.contains("absolute"))
+        );
+        drop(app.update(message));
+        assert_eq!(
+            app.settings.agents["claude"].executable.as_deref(),
+            executable.to_str()
+        );
+        assert!(
+            app.settings_invalid[&SettingsField::Agent(provider, AgentSetting::Executable)]
+                .contains("absolute")
+        );
+    }
+
+    #[test]
+    fn settings_path_checks_run_off_reducer_and_reject_superseded_edits() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("claude");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let provider = crate::agent::Provider::Claude;
+        let field = SettingsField::Agent(provider, AgentSetting::Executable);
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings.agents.insert(
+            "claude".into(),
+            settings::AgentLaunchSettings {
+                executable: Some("/unavailable/retained-cli".into()),
+                ..Default::default()
+            },
+        );
+        settings::agents::without_executable_checks(|| {
+            app.settings_draft = SettingsDraft::from_settings(&app.settings);
+            app.settings_draft.set(
+                SettingsField::Agent(provider, AgentSetting::Environment),
+                "[[\"EXAMPLE\",\"value\"]]".into(),
+            );
+        });
+        assert!(app.settings_draft.agents[&provider].launch_error.is_none());
+        settings::agents::without_executable_checks(|| {
+            drop(app.apply_setting_input(
+                SettingsField::Agent(provider, AgentSetting::Environment),
+                "[[\"EXAMPLE\",\"latest\"]]".into(),
+            ));
+        });
+        assert_eq!(
+            app.settings.agents["claude"].environment["EXAMPLE"],
+            "latest"
+        );
+        let feedback = task_app_message(app.settings_path_feedback());
+        settings::agents::without_executable_checks(|| {
+            drop(app.update(feedback));
+        });
+        assert!(app.settings_draft.agents[&provider].executable_unavailable);
+        for superseded in ["edit", "reset", "positive"] {
+            let before = app.settings.clone();
+            let task = settings::agents::without_executable_checks(|| {
+                app.apply_setting_input(field, executable.to_str().unwrap().into())
+            });
+            assert_eq!(
+                app.settings, before,
+                "no policy adoption before worker validation"
+            );
+            let checked = task_app_message(task);
+            assert!(matches!(
+                checked,
+                Message::SettingsPathChecked {
+                    available: true,
+                    ..
+                }
+            ));
+            match superseded {
+                "edit" => {
+                    drop(app.queue_setting_input(field, String::new()));
+                }
+                "reset" => {
+                    drop(app.reset_settings());
+                }
+                "positive" => {}
+                _ => unreachable!(),
+            }
+            let before = app.settings.clone();
+            settings::agents::without_executable_checks(|| {
+                drop(app.update(checked));
+            });
+            if superseded == "positive" {
+                assert_eq!(
+                    app.settings.agents["claude"].executable.as_deref(),
+                    executable.to_str()
+                );
+            } else {
+                assert_eq!(app.settings, before);
+            }
+        }
+        let before = app.settings.clone();
+        let checked = task_app_message(settings::agents::without_executable_checks(|| {
+            app.apply_setting_input(field, "/missing/new-cli".into())
+        }));
+        assert!(matches!(
+            checked,
+            Message::SettingsPathChecked {
+                available: false,
+                ..
+            }
+        ));
+        settings::agents::without_executable_checks(|| {
+            drop(app.update(checked));
+        });
+        assert_eq!(app.settings, before);
+        assert!(app.settings_invalid[&field].contains("executable"));
+        let shell = SettingsField::DefaultShell;
+        let checked = task_app_message(settings::agents::without_executable_checks(|| {
+            app.apply_setting_input(shell, executable.to_str().unwrap().into())
+        }));
+        settings::agents::without_executable_checks(|| {
+            drop(app.update(checked));
+        });
+        assert_eq!(app.settings.default_shell.as_deref(), executable.to_str());
+    }
+
+    #[test]
+    fn settings_shutdown_fold_preserves_valid_edits_beside_a_refused_path() {
+        let directory = tempfile::tempdir().unwrap();
+        for field in [
+            SettingsField::DefaultShell,
+            SettingsField::Agent(crate::agent::Provider::Claude, AgentSetting::Executable),
+        ] {
+            let path = directory.path().join(format!("{field:?}.toml"));
+            let mut app = context_inspector_test_app(false);
+            app.settings_path = Some(path.clone());
+            app.settings_write_blocked = false;
+            drop(app.queue_setting_input(SettingsField::TerminalFontSize, "23".into()));
+            drop(app.queue_setting_input(field, "/missing/unvalidated-program".into()));
+            app.fold_settings_drafts();
+            app.save_settings_now().unwrap();
+            let saved = settings::load(&path).unwrap();
+            assert_eq!(saved.terminal_font_size, 23.0);
+            assert!(saved.default_shell.is_none());
+            assert!(
+                saved
+                    .agents
+                    .get("claude")
+                    .is_none_or(|configuration| configuration.executable.is_none())
+            );
+        }
+    }
+
+    #[test]
+    fn settings_detect_refuses_non_utf8_instead_of_selecting_a_lossy_path_alias() {
+        use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![0xff]));
+        let alias = directory.path().join("\u{fffd}");
+        for bin in [&original, &alias] {
+            std::fs::create_dir(bin).unwrap();
+            let program = bin.join("claude");
+            std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let found = settings::AgentLaunchSettings::default()
+            .resolve_executable(crate::agent::Provider::Claude, Some(original.as_os_str()))
+            .unwrap();
+        assert_eq!(found, original.join("claude"));
+        assert_eq!(
+            PathBuf::from(found.to_string_lossy().into_owned()),
+            alias.join("claude")
+        );
+        assert!(alias.join("claude").is_file());
+        assert!(
+            detected_executable_path(found)
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+        assert_eq!(
+            detected_executable_path(alias.join("claude")).unwrap(),
+            alias.join("claude").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn settings_detect_rejects_reset_edit_clear_and_superseded_request_callbacks() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("claude");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let provider = crate::agent::Provider::Claude;
+        let field = SettingsField::Agent(provider, AgentSetting::Executable);
+        let environment = vec![(
+            "PATH".to_owned(),
+            directory.path().to_str().unwrap().to_owned(),
+        )];
+        for replaced in ["edit_clear", "reset_restore_path", "new_request"] {
+            let mut app = context_inspector_test_app(false);
+            app.settings_path = Some(directory.path().join("settings.toml"));
+            app.settings.agents.insert(
+                "claude".into(),
+                settings::AgentLaunchSettings {
+                    environment: environment.iter().cloned().collect(),
+                    ..Default::default()
+                },
+            );
+            app.settings_draft = SettingsDraft::from_settings(&app.settings);
+            let message = task_app_message(app.update(Message::DetectAgentExecutable(provider)));
+            assert!(
+                matches!(&message, Message::AgentExecutableDetected { result: Ok(path), .. } if path == executable.to_str().unwrap())
+            );
+            match replaced {
+                "edit_clear" => {
+                    drop(app.update(Message::SettingsDraftChanged {
+                        field,
+                        value: "/manual/choice".into(),
+                    }));
+                    drop(app.update(Message::SettingsDraftChanged {
+                        field,
+                        value: String::new(),
+                    }));
+                }
+                "reset_restore_path" => {
+                    drop(app.update(Message::ResetSettings));
+                    drop(app.update(Message::ConfirmResetSettings));
+                    // Return to the same text after an actual reset. Equality
+                    // alone must not restore the old request's ownership.
+                    drop(app.update(Message::SettingsDraftChanged {
+                        field: SettingsField::Agent(provider, AgentSetting::Environment),
+                        value: serde_json::to_string(&environment).unwrap(),
+                    }));
+                }
+                "new_request" => {
+                    drop(app.update(Message::DetectAgentExecutable(provider)));
+                }
+                _ => unreachable!(),
+            }
+            let before = app.settings.clone();
+            let draft = app.settings_draft.clone();
+            let pending = app.settings_pending.clone();
+            let generation = app.settings_save_generation;
+            let revision = draft.agents[&provider].executable_revision;
+            drop(app.update(message));
+            assert_eq!(app.settings, before, "{replaced}");
+            assert_eq!(app.settings_draft, draft, "{replaced}");
+            assert_eq!(
+                app.settings_draft.agents[&provider].executable_revision,
+                revision
+            );
+            assert_eq!(app.settings_pending, pending);
+            assert_eq!(app.settings_save_generation, generation);
+            assert!(app.settings_invalid.is_empty());
+        }
+    }
+
+    #[test]
     fn out_of_order_settings_saves_and_acknowledgments_preserve_latest_edits() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
@@ -19584,6 +20560,249 @@ mod tests {
         let _ = app.clone_focused_pane();
         assert_eq!(open_settings_panes(&app), [pane]);
         assert_eq!(app.workspace.order().count(), 2);
+    }
+
+    pub(super) fn agent_list_test_app() -> Cagents {
+        let mut app = context_inspector_test_app(true);
+        app.settings_path = None;
+        app.settings_write_blocked = true;
+        app.settings.agents.insert(
+            "claude".into(),
+            settings::AgentLaunchSettings {
+                arguments: vec!["first".into(), "second".into()],
+                environment: std::collections::BTreeMap::from([
+                    ("FIXTURE_A".into(), "a".into()),
+                    ("FIXTURE_B".into(), "b".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        app
+    }
+
+    #[test]
+    fn settings_agent_rows_apply_a_batch_without_replacing_other_rows_edits() {
+        let mut app = agent_list_test_app();
+        let provider = crate::agent::Provider::Claude;
+        let draft = &app.settings_draft.agents[&provider];
+        let (arguments, environment) = (draft.argument_owner, draft.environment_owner);
+        let (first, second) = (draft.argument_rows[0], draft.argument_rows[1]);
+        let (a, b) = (draft.environment_rows[0], draft.environment_rows[1]);
+        // Capture the IDs used by a single settings view, then reduce its
+        // emitted row operations without rebuilding a view between messages.
+        let emitted = [
+            Message::AgentListEdited {
+                provider,
+                owner: arguments,
+                edit: AgentListEdit::Argument {
+                    row: first,
+                    value: "first-one".into(),
+                },
+            },
+            Message::AgentListEdited {
+                provider,
+                owner: arguments,
+                edit: AgentListEdit::Argument {
+                    row: second,
+                    value: "second-one".into(),
+                },
+            },
+            Message::AgentListEdited {
+                provider,
+                owner: arguments,
+                edit: AgentListEdit::Argument {
+                    row: first,
+                    value: "first-two".into(),
+                },
+            },
+            Message::AgentListEdited {
+                provider,
+                owner: environment,
+                edit: AgentListEdit::EnvironmentName {
+                    row: a,
+                    value: "RENAMED_A".into(),
+                },
+            },
+            Message::AgentListEdited {
+                provider,
+                owner: environment,
+                edit: AgentListEdit::EnvironmentValue {
+                    row: a,
+                    value: "updated-a".into(),
+                },
+            },
+            Message::AgentListEdited {
+                provider,
+                owner: environment,
+                edit: AgentListEdit::EnvironmentValue {
+                    row: b,
+                    value: "updated-b".into(),
+                },
+            },
+        ];
+        for message in emitted {
+            drop(app.update(message));
+        }
+        let draft = &app.settings_draft.agents[&provider];
+        assert_eq!(draft.configuration.arguments, ["first-two", "second-one"]);
+        assert_eq!(
+            draft.environment,
+            [
+                ("RENAMED_A".to_owned(), "updated-a".to_owned()),
+                ("FIXTURE_B".to_owned(), "updated-b".to_owned())
+            ]
+        );
+        let pending: Vec<_> = app
+            .settings_pending
+            .iter()
+            .map(|(field, (generation, _))| (*field, *generation))
+            .collect();
+        assert_eq!(pending.len(), 2);
+        for (field, generation) in pending {
+            drop(app.update(Message::SettingsAutosave { field, generation }));
+        }
+        let saved = &app.settings.agents["claude"];
+        assert_eq!(saved.arguments, ["first-two", "second-one"]);
+        assert_eq!(saved.environment["RENAMED_A"], "updated-a");
+        assert_eq!(saved.environment["FIXTURE_B"], "updated-b");
+        assert!(!saved.environment.contains_key("FIXTURE_A"));
+    }
+
+    #[test]
+    fn settings_agent_rows_reject_removed_rows_and_replaced_drafts_before_mutation() {
+        let mut app = agent_list_test_app();
+        let provider = crate::agent::Provider::Claude;
+        let draft = &app.settings_draft.agents[&provider];
+        let (arguments, environment) = (draft.argument_owner, draft.environment_owner);
+        let (first, second) = (draft.argument_rows[0], draft.argument_rows[1]);
+        let (a, b) = (draft.environment_rows[0], draft.environment_rows[1]);
+        for edit in [
+            AgentListEdit::RemoveArgument(first),
+            AgentListEdit::Argument {
+                row: first,
+                value: "must-not-return".into(),
+            },
+            AgentListEdit::Argument {
+                row: second,
+                value: "still-second".into(),
+            },
+        ] {
+            drop(app.update(Message::AgentListEdited {
+                provider,
+                owner: arguments,
+                edit,
+            }));
+        }
+        for edit in [
+            AgentListEdit::RemoveEnvironment(a),
+            AgentListEdit::EnvironmentName {
+                row: a,
+                value: "MUST_NOT_RETURN".into(),
+            },
+            AgentListEdit::EnvironmentValue {
+                row: b,
+                value: "still-b".into(),
+            },
+        ] {
+            drop(app.update(Message::AgentListEdited {
+                provider,
+                owner: environment,
+                edit,
+            }));
+        }
+        assert_eq!(
+            app.settings_draft.agents[&provider].configuration.arguments,
+            ["still-second"]
+        );
+        assert_eq!(
+            app.settings_draft.agents[&provider].environment,
+            [("FIXTURE_B".to_owned(), "still-b".to_owned())]
+        );
+        // Two Add callbacks from the same tree both append to the current
+        // draft; newly created rows keep independent identities.
+        for _ in 0..2 {
+            drop(app.update(Message::AgentListEdited {
+                provider,
+                owner: arguments,
+                edit: AgentListEdit::AddArgument,
+            }));
+        }
+        let draft = &app.settings_draft.agents[&provider];
+        assert_eq!(draft.configuration.arguments, ["still-second", "", ""]);
+        assert_eq!(draft.argument_rows.len(), 3);
+        assert_ne!(draft.argument_rows[1], draft.argument_rows[2]);
+        assert!(!draft.argument_rows.contains(&first));
+        drop(app.update(Message::AgentListEdited {
+            provider,
+            owner: environment,
+            edit: AgentListEdit::AddEnvironment,
+        }));
+        let new_row = *app.settings_draft.agents[&provider]
+            .environment_rows
+            .last()
+            .unwrap();
+        for edit in [
+            AgentListEdit::EnvironmentName {
+                row: new_row,
+                value: "FIXTURE_C".into(),
+            },
+            AgentListEdit::EnvironmentValue {
+                row: new_row,
+                value: "c".into(),
+            },
+        ] {
+            drop(app.update(Message::AgentListEdited {
+                provider,
+                owner: environment,
+                edit,
+            }));
+        }
+        assert_eq!(
+            app.settings_draft.agents[&provider].environment,
+            [
+                ("FIXTURE_B".to_owned(), "still-b".to_owned()),
+                ("FIXTURE_C".to_owned(), "c".to_owned())
+            ]
+        );
+        // External adoption/reset installs new list ownership even when the
+        // preference values compare equal. Old Add/remove/type callbacks fail.
+        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+        app.settings_pending.clear();
+        let before = app.settings_draft.clone();
+        let generation = app.settings_generation;
+        for (owner, edit) in [
+            (arguments, AgentListEdit::AddArgument),
+            (arguments, AgentListEdit::RemoveArgument(second)),
+            (environment, AgentListEdit::AddEnvironment),
+            (
+                environment,
+                AgentListEdit::EnvironmentValue {
+                    row: b,
+                    value: "old".into(),
+                },
+            ),
+        ] {
+            drop(app.update(Message::AgentListEdited {
+                provider,
+                owner,
+                edit,
+            }));
+        }
+        assert_eq!(app.settings_draft, before);
+        // Semantic draft equality intentionally excludes callback metadata.
+        // Rejected old messages must preserve the new tree's authority too.
+        let (after, before) = (
+            &app.settings_draft.agents[&provider],
+            &before.agents[&provider],
+        );
+        assert_eq!(after.argument_owner, before.argument_owner);
+        assert_eq!(after.argument_rows, before.argument_rows);
+        assert_eq!(after.environment_owner, before.environment_owner);
+        assert_eq!(after.environment_rows, before.environment_rows);
+        assert!(app.settings_pending.is_empty());
+        assert_eq!(app.settings_generation, generation);
     }
 
     #[test]
