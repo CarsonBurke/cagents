@@ -55,6 +55,7 @@ mod tests {
     fn account_remove_requires_a_stable_id_and_explicit_confirmation() {
         let id: AccountId = "claude/00000000-0000-4000-8000-000000000001".parse().unwrap();
         assert!(Cli::try_parse_from(["cagents", "account", "remove", id.as_str(), "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["cagents", "account", "remove", id.as_str()]).is_err());
         assert!(Cli::try_parse_from(["cagents", "account", "remove", "/a/home", "--yes"]).is_err());
         let Err(error) = execute(id, false) else { panic!("unconfirmed removal was accepted"); };
         assert_eq!(error.kind, "confirmation");

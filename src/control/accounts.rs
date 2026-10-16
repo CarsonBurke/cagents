@@ -11,7 +11,7 @@ pub enum AccountCommand {
         /// Stable account ID from account list on the selected device.
         account: crate::account::AccountId,
         /// Confirm removing the registration; linked files are left unchanged.
-        #[arg(long)]
+        #[arg(long, required = true)]
         yes: bool,
     },
     /// List active accounts and any retained caller account from the selected daemon.
