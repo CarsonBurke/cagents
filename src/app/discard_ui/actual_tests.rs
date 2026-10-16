@@ -223,3 +223,66 @@ fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_
     assert_eq!(fs::read_dir(data.join("Trash/info")).unwrap().count(), 0);
     assert!(app.discard_ui.close_block_reason().is_none());
 }
+
+#[test]
+fn discard_app_partial_undo_preserves_newer_file_and_keeps_remaining_receipt() {
+    const NAME: &str = "app::discard_ui::actual_tests::discard_app_partial_undo_preserves_newer_file_and_keeps_remaining_receipt";
+    if isolated(NAME) { return; }
+    let root = PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap());
+    git(&root, &["init", "-q"]);
+    fs::write(root.join("changed"), b"base\n").unwrap();
+    git(&root, &["add", "--all"]);
+    git(&root, &["commit", "-qm", "base"]);
+    fs::write(root.join("changed"), b"discarded precious work\n").unwrap();
+    fs::write(root.join("new file"), b"new file original\n").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let key = ActiveWorktreeKey {
+        project_id: crate::model::ProjectId::new(),
+        worktree_id: crate::model::WorktreeId::new(),
+        canonical_path: root.clone(),
+    };
+    app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
+    let task = app.source_control_snapshot_task(key.clone());
+    let loaded = crate::app::tests::task_app_message(task);
+    assert!(matches!(&loaded, Message::SourceControlLoaded { result: Ok(_), .. }));
+    drop(app.update(loaded));
+    let source = app.discard_ui.source().unwrap().id;
+    let request = DiscardRequest {
+        worktree: root.clone(),
+        tracked: vec![crate::repository::PathSelection::new(RepoPath::parse("changed").unwrap())],
+        untracked: vec![RepoPath::parse("new file").unwrap()],
+        confirmed: false,
+    };
+    drop(app.update(Message::SidebarSnapshot {
+        source, action: Box::new(SidebarAction::RequestDiscard { key: key.clone(), request: request.clone() }),
+    }));
+    let task = app.update(Message::SidebarSnapshot {
+        source, action: Box::new(SidebarAction::ConfirmDiscard {
+            key, request: DiscardRequest { confirmed: true, ..request },
+        }),
+    });
+    let slot = app.discard_ui.slots[0].clone();
+    let finished = crate::app::tests::task_app_message(task);
+    drop(app.update(finished));
+    let receipt = slot.0.lock().unwrap().receipt.clone().unwrap();
+    assert_eq!(receipt.remaining_paths(), 2);
+    assert_eq!(fs::read(root.join("changed")).unwrap(), b"base\n");
+    assert!(!root.join("new file").exists());
+    fs::write(root.join("changed"), b"user's newer work\n").unwrap();
+    let task = app.update(Message::DiscardUndo { id: slot.id(), resolve: false });
+    let finished = crate::app::tests::task_app_message(task);
+    assert!(matches!(&finished, Message::DiscardFinished { report: Some(report), .. } if report.contains("changed")));
+    drop(app.update(finished));
+    assert_eq!(fs::read(root.join("changed")).unwrap(), b"user's newer work\n");
+    assert_eq!(fs::read(root.join("new file")).unwrap(), b"new file original\n");
+    assert_eq!(receipt.remaining_paths(), 1);
+    assert!(receipt.can_undo());
+    assert!(app.discard_ui.slot(slot.id()).is_some());
+    let task = app.update(Message::DiscardUndo { id: slot.id(), resolve: false });
+    let finished = crate::app::tests::task_app_message(task);
+    assert!(matches!(&finished, Message::DiscardFinished { report: Some(report), .. } if report.contains("changed")));
+    drop(app.update(finished));
+    assert_eq!(receipt.remaining_paths(), 1);
+    assert_eq!(fs::read(root.join("changed")).unwrap(), b"user's newer work\n");
+    assert_eq!(fs::read(root.join("new file")).unwrap(), b"new file original\n");
+}
