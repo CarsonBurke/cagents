@@ -2,6 +2,8 @@
 //! The broker alone touches SQLite and the desktop portal, outside HostState.
 mod batching;
 mod journal;
+#[cfg(test)]
+mod registration_tests;
 mod withdrawals;
 use withdrawals::Withdrawals;
 
@@ -563,18 +565,34 @@ impl Activation {
         &mut self,
         shared: &Weak<Shared>,
         application: crate::notifications::Application,
+        connection: &zbus::Connection,
     ) -> Result<(), String> {
         let desktop_id = crate::instance::notification_desktop_id(application);
         // A host daemon is not launched from the UI desktop file's cgroup.
         // Registration gives the portal the same application identity as UI.
         if self.registration.needs_attempt() {
-            let id = desktop_id
+            let id: ashpd::AppID = desktop_id
                 .parse()
                 .map_err(|error| format!("Invalid application identity: {error}"))?;
             let previous = self.registration;
             // A timeout may drop this future after the call was sent.
             self.registration = Registration::Unknown;
-            let outcome = ashpd::register_host_app(id).await;
+            // ashpd's convenience helper also treats GTK_USE_PORTAL=1 as a
+            // sandbox and returns Ok without registering. A toolkit preference
+            // is not evidence that this host connection has our application ID.
+            // Ask the portal on the exact connection that sends notifications;
+            // a real sandbox/older portal may refuse and keeps the signal path.
+            let options = std::collections::HashMap::<String, OwnedValue>::new();
+            let outcome = connection
+                .call_method(
+                    Some("org.freedesktop.portal.Desktop"),
+                    "/org/freedesktop/portal/desktop",
+                    Some("org.freedesktop.host.portal.Registry"),
+                    "Register",
+                    &(id, options),
+                )
+                .await
+                .map(|_| ());
             if let Err(error) = &outcome {
                 tracing::debug!(%error, "desktop portal did not register the application");
             }
@@ -603,10 +621,15 @@ async fn connect(
     activation: &mut Activation,
 ) -> Result<Portal, String> {
     tokio::time::timeout(PORTAL_TIMEOUT, async move {
-        activation.prepare(&shared, application).await?;
         let proxy = NotificationProxy::new()
             .await
             .map_err(|error| error.to_string())?;
+        // Construction reads only the version property. GDBus dispatches
+        // property getters without the portal's method authorization/identity
+        // callback, so Register still precedes every identity-associating call.
+        activation
+            .prepare(&shared, application, proxy.connection())
+            .await?;
         if activation.portal.is_none() {
             // Asks the bus, not the portal, so it cannot affect registration.
             activation.portal = zbus::fdo::DBusProxy::new(proxy.connection())
