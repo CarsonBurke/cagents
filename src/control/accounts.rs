@@ -51,7 +51,7 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
             false,
         ),
     };
-    let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+    let socket = control_daemon_socket()?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
     let report = read_report(&mut client, Authority::from_environment(), query)?;

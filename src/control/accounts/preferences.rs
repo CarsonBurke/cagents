@@ -8,7 +8,7 @@ struct Revision { revision: u64 }
 struct Snapshot { registry: Revision }
 
 pub(super) fn execute(provider: Provider, selection: DefaultSelection) -> Result<CommandOutput, AppError> {
-    let socket = terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket).map_err(|error| AppError::new("daemon_connection", error))?;
     // Bind the real caller before preferences reads/writes. Device operations
     // remain user-only under the existing daemon token policy.
