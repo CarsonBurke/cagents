@@ -5,7 +5,17 @@ use tokio::io::unix::AsyncFd;
 
 pub(super) struct Watch {
     task: tokio::task::JoinHandle<()>,
+    #[cfg_attr(not(test), allow(dead_code))]
     done: Receiver<()>,
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        // The Holder first transfers this exact observer to final cleanup, or
+        // releases it after close/preservation. Cancel metadata observation
+        // without waiting on its caller; abort is not cleanup/destruction proof.
+        self.task.abort();
+    }
 }
 
 impl Watch {
@@ -15,6 +25,7 @@ impl Watch {
         released: std::io::PipeReader,
         exits: Sender<ChildExit>,
         acknowledge: Sender<Result<(), String>>,
+        cleanup: Sender<()>,
         reported: bool,
     ) -> Result<Self, String> {
         let runtime = crate::terminal::reactor::runtime()?;
@@ -26,13 +37,14 @@ impl Watch {
         let (finished, done) = crossbeam_channel::bounded::<()>(0);
         let task = runtime.spawn(async move {
             let _finished = finished;
-            observe(control, root, released, exits, acknowledge, reported).await;
+            observe(control, root, released, exits, acknowledge, cleanup, reported).await;
         });
         Ok(Self { task, done })
     }
 
-    /// The owner closes its release pipe before calling this. Metadata I/O
-    /// cannot make Holder::drop wait indefinitely, even on a partial frame.
+    /// Test owners require positive completion before the abort fallback.
+    /// Production Holder::drop cancels without a caller-side wait.
+    #[cfg(test)]
     pub(super) fn stop(self) {
         if matches!(
             self.done.recv_timeout(RELEASE_GRACE),
@@ -50,6 +62,7 @@ async fn observe(
     released: AsyncFd<std::io::PipeReader>,
     exits: Sender<ChildExit>,
     acknowledge: Sender<Result<(), String>>,
+    cleanup: Sender<()>,
     mut reported: bool,
 ) {
     loop {
@@ -65,6 +78,12 @@ async fn observe(
             }
             Ok(Some(Report::Detached)) => {
                 let _ = acknowledge.try_send(Ok(()));
+                return;
+            }
+            Ok(Some(Report::CleanupProved)) => {
+                // Only the actual holder's dedicated family-proof report may
+                // satisfy this channel. Ordinary ACK/exit/EOF is not proof.
+                let _ = cleanup.try_send(());
                 return;
             }
             Ok(Some(Report::ScreenCached | Report::AdoptionCommitted)) => {

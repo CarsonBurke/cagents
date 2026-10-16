@@ -29,7 +29,9 @@ pub struct WorktreeSetupIntent {
     pub copy_done: bool,
 }
 
-fn settled_setup_journal(operation: &PendingOperation) -> Result<WorktreeJournal, StoreError> {
+pub(super) fn settled_setup_journal(
+    operation: &PendingOperation,
+) -> Result<WorktreeJournal, StoreError> {
     let creation_id = operation.id;
     let invalid = || {
         StoreError::InvalidState(format!(

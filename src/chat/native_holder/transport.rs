@@ -185,6 +185,10 @@ pub(crate) struct Holder {
 }
 
 impl Holder {
+    pub(crate) fn record(&self) -> &Record {
+        &self.identity.record
+    }
+
     pub fn is_durable(&self) -> bool {
         self.durable
     }

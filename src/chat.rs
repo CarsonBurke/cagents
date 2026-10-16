@@ -2058,6 +2058,10 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// Explicit provider-maintenance boundary, separate from prompt completion.
+    Compaction {
+        active: bool,
+    },
 }
 
 #[cfg(test)]

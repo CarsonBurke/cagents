@@ -1,6 +1,7 @@
 use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
+mod execution_directory;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
@@ -1016,6 +1017,10 @@ fn start_with_execution(
         &crate::account::launch_credential_overrides(&process_launch.recipe),
         true,
     )?;
+    let prepared_directory =
+        execution_directory::prepare(restart_launch.unwrap_or(&session.launch), execution)?;
+    let execution = prepared_directory.context.clone();
+    let process_launch = &prepared_directory.launch;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener(process_launch, owned_socket)
     } else {
@@ -1089,6 +1094,7 @@ fn start_with_execution(
         .unwrap_or_else(|p| p.into_inner())
         .mailbox_seal
         .clone();
+    prepared_directory.authorize(&mut spec, adapter.as_mut())?;
     super::account_lifecycle::ensure_launch(
         host,
         &spec.working_directory,

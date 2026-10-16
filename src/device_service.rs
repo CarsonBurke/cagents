@@ -60,6 +60,9 @@ pub enum Operation {
         root: PathBuf,
         operation: GitOperation,
     },
+    Worktree {
+        operation: crate::worktree_control::Operation,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -105,13 +108,14 @@ pub enum Reply {
     },
     Text(String),
     Saved,
-    MergedWorktreeRemoved(Option<crate::worktree_cleanup::RemovedWorktree>),
+    MergedWorktreeRemoved(Result<crate::worktree_cleanup::RemovedWorktree, String>),
     ProjectNavigation(Navigation),
     /// The replacement is published, but its directory entry could not be
     /// synced. Callers must advance their disk baseline and show this warning.
     SavedUnconfirmed {
         error: String,
     },
+    Worktree(crate::worktree_control::Reply),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -169,6 +173,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
+        Operation::Worktree { .. } => {
+            Err("Worktree operations require the owning daemon's lifecycle admission".into())
+        }
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
         }

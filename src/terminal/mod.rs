@@ -34,6 +34,8 @@ pub use snapshot::{
 };
 #[cfg(feature = "ui")]
 pub use surface::TerminalSurface;
+#[cfg(feature = "ui")]
+pub(crate) use surface::TerminalSurfaceIdentity;
 pub use types::{
     KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, PasteOrigin,
     TerminalConfig, TerminalEvent, TerminalKey, TerminalSendError, TerminalSize,
@@ -45,9 +47,9 @@ pub(crate) use widget::ReviewInputBarrier;
 pub use widget::{CellMetrics, TerminalWidget};
 #[cfg(feature = "host")]
 pub use worker::TerminalHandle;
-#[cfg(feature = "host")]
-pub(crate) use worker::UpgradeSnapshot;
 #[cfg(all(test, feature = "host"))]
 pub(crate) use worker::flush_archived_notices;
 #[cfg(feature = "host")]
 pub(crate) use worker::holder::inspect as inspect_holder;
+#[cfg(feature = "host")]
+pub(crate) use worker::{TerminalSessionStop, UpgradeSnapshot};

@@ -24,7 +24,20 @@ pub struct TerminalSurface {
     unsized_spawn: Arc<AtomicBool>,
 }
 
+/// Weak identity of one UI surface allocation, not authority over its process.
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalSurfaceIdentity(std::sync::Weak<AtomicBool>);
+impl TerminalSurfaceIdentity {
+    pub(crate) fn matches(&self, surface: &TerminalSurface) -> bool {
+        self.0.ptr_eq(&Arc::downgrade(&surface.unsized_spawn))
+    }
+}
+
 impl TerminalSurface {
+    pub(crate) fn client_identity(&self) -> TerminalSurfaceIdentity {
+        TerminalSurfaceIdentity(Arc::downgrade(&self.unsized_spawn))
+    }
+
     /// Marks a terminal this client just started, so its first layout sizes
     /// the PTY at once rather than as a resize that waits to settle.
     pub fn spawned(self) -> Self {

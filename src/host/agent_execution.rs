@@ -660,6 +660,10 @@ fn announce(host: &SharedHost, registry: &SharedRegistry) {
 }
 
 pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
+    retired_hosted(host, &HostedSession::Chat(session.clone()))
+}
+
+pub(super) fn retired_hosted(host: &SharedHost, session: &HostedSession) -> Result<(), String> {
     // Normal interactive sessions still work without the optional registry.
     let Ok(registry) = registry(host) else {
         return Ok(());
@@ -667,7 +671,7 @@ pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), 
     let changed = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .retire_agent_process(&HostedSession::Chat(session.clone()), now())?;
+        .retire_agent_process(session, now())?;
     if changed {
         announce(host, &registry);
     }

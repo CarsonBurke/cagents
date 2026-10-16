@@ -353,6 +353,7 @@ fn create_inner(
             start,
             alias,
             cwd: launch.recipe.working_directory.clone(),
+            relocated_directory: false,
             expected_home,
             next_id: 0,
             pending: BTreeMap::new(),
@@ -373,6 +374,9 @@ fn create_inner(
             turn_pricing: Default::default(),
             turn: None,
             busy: false,
+            compaction_pending: false,
+            compaction_revision: 0,
+            compaction_acknowledged: false,
             lifecycle_revision: 0,
             suggestion_turn: None,
             prediction_turn: None,
@@ -425,7 +429,12 @@ enum Pending {
     /// Compaction rewrites the thread's history and its context occupancy, so
     /// its acknowledgement is what a re-read hangs off: nothing else on the
     /// wire announces that the figures a reader was looking at have moved.
-    Compact,
+    Compact {
+        revision: u64,
+    },
+    CompactRead {
+        revision: u64,
+    },
     Other,
     FastMode {
         enabled: bool,
@@ -489,6 +498,7 @@ struct Codex {
     start: Value,
     alias: Option<PathBuf>,
     cwd: PathBuf,
+    relocated_directory: bool,
     expected_home: PathBuf,
     next_id: u64,
     pending: BTreeMap<String, Pending>,
@@ -515,6 +525,9 @@ struct Codex {
     turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
     turn: Option<String>,
     busy: bool,
+    compaction_pending: bool,
+    compaction_revision: u64,
+    compaction_acknowledged: bool,
     lifecycle_revision: u64,
     suggestion_turn: Option<String>,
     prediction_turn: Option<String>,
@@ -1012,7 +1025,13 @@ impl Codex {
             step,
             "thread/read",
             json!({"threadId":self.thread,"includeTurns":false}),
-            Pending::Other,
+            if self.compaction_acknowledged {
+                Pending::CompactRead {
+                    revision: self.compaction_revision,
+                }
+            } else {
+                Pending::Other
+            },
         )?;
         self.history(step, None)
     }
@@ -1478,6 +1497,12 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
+        self.cwd = directory.to_path_buf();
+        self.relocated_directory = true;
+        self.start["cwd"] = serde_json::Value::String(directory.to_string_lossy().into_owned());
+        Ok(())
+    }
     fn answer_declines(&self, request_id: &str, action: &str) -> bool {
         let Some(request) = self.requests.get(request_id) else {
             return false;
@@ -1559,6 +1584,7 @@ impl Adapter for Codex {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
                         let mut params = json!({"threadId":self.thread,"input":input});
+                        if self.relocated_directory { params["cwd"] = json!(self.cwd); }
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, model: self.selected.clone(), tier: self.service_tier.clone() })?;
                         self.suggestion_turn = None;
@@ -1651,8 +1677,12 @@ impl Adapter for Codex {
                 }), Pending::Other)?;
             }
             Command::Compact => {
-                if !self.capabilities().compact || self.busy { return Err("Codex compaction requires an idle, writable thread".into()); }
-                self.call(&mut step, "thread/compact/start", json!({"threadId":self.thread}), Pending::Compact)?;
+                if !self.capabilities().compact || self.busy || self.compaction_pending { return Err("Codex compaction requires an idle, writable thread".into()); }
+                self.compaction_revision=self.compaction_revision.saturating_add(1);
+                self.call(&mut step, "thread/compact/start", json!({"threadId":self.thread}), Pending::Compact {revision:self.compaction_revision})?;
+                self.compaction_pending=true;
+                self.compaction_acknowledged=false;
+                step.events.push(Event::Compaction {active:true});
             }
             Command::ResumeAfterLogin { failure, expected } => {
                 if self.busy || self.pending.values().any(|pending| matches!(pending, Pending::Turn { .. } | Pending::LoginRecovery { .. })) {
@@ -1822,6 +1852,12 @@ impl Adapter for Codex {
                         busy: false,
                         detail: "Turn failed".into(),
                     });
+                }
+                if matches!(pending,Pending::Compact {revision} if revision==self.compaction_revision)
+                {
+                    self.compaction_pending = false;
+                    self.compaction_acknowledged = false;
+                    step.events.push(Event::Compaction { active: false });
                 }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
                 let message = format!(
@@ -2240,7 +2276,24 @@ impl Adapter for Codex {
                 // Without this the reader pressed a control and the gauge it
                 // exists to move kept its old reading until some later frame
                 // happened to carry a new one.
-                Pending::Compact => self.reread(&mut step)?,
+                Pending::Compact { revision } => {
+                    if revision == self.compaction_revision && self.compaction_pending {
+                        self.compaction_acknowledged = true;
+                        self.reread(&mut step)?;
+                    }
+                }
+                Pending::CompactRead { revision } => {
+                    if revision != self.compaction_revision || !self.compaction_pending {
+                        return Ok(step);
+                    }
+                    self.thread_state(&result["thread"], &mut step)?;
+                    if self.compaction_acknowledged && result["thread"]["status"]["type"] == "idle"
+                    {
+                        self.compaction_pending = false;
+                        self.compaction_acknowledged = false;
+                        step.events.push(Event::Compaction { active: false });
+                    }
+                }
                 Pending::QueueAdd => self.read_queue(&mut step)?,
                 Pending::QueueDelete(id) => {
                     step.events.push(Event::QueueRemoval(chat::QueueRemoval {
@@ -2883,7 +2936,14 @@ impl Adapter for Codex {
             "account/updated" => step.events.push(Event::AccountUsage(LiveReport::CodexLogin(
                 account::codex::parse_login_update(params),
             ))),
-            "item/reasoning/summaryPartAdded" | "thread/compacted" => {}
+            "thread/compacted" => {
+                if self.compaction_pending {
+                    self.compaction_pending = false;
+                    self.compaction_acknowledged = false;
+                    step.events.push(Event::Compaction { active: false });
+                }
+            }
+            "item/reasoning/summaryPartAdded" => {}
             // Auxiliary app-server notifications are not transcript data.
             // Unknown item types are shown as tool disclosures and unknown
             // requests are visibly rejected above.
@@ -4266,6 +4326,7 @@ mod tests {
             start: json!({}),
             alias: None,
             cwd: PathBuf::from("/tmp"),
+            relocated_directory: false,
             expected_home: std::fs::canonicalize("/tmp").unwrap(),
             next_id: 0,
             pending: BTreeMap::new(),
@@ -4290,6 +4351,9 @@ mod tests {
             turn_pricing: Default::default(),
             turn: None,
             busy: false,
+            compaction_pending: false,
+            compaction_revision: 0,
+            compaction_acknowledged: false,
             lifecycle_revision: 0,
             suggestion_turn: None,
             prediction_turn: None,
@@ -6460,6 +6524,66 @@ mod tests {
         assert!(
             methods.contains(&"thread/turns/list".to_owned()),
             "the rewritten history is never asked for: {methods:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_acknowledgement_waits_for_matching_post_ack_idle_metadata() {
+        let mut adapter = adapter();
+        let requested = adapter.command(Command::Compact).unwrap();
+        assert!(
+            requested
+                .events
+                .contains(&Event::Compaction { active: true })
+        );
+        let unrelated=adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}})).unwrap();
+        assert!(
+            !unrelated
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        assert!(adapter.command(Command::Compact).is_err());
+        let acknowledged = adapter
+            .receive(json!({"id":requested.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert!(
+            !acknowledged
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        let probe = acknowledged
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/read")
+            .unwrap();
+        let completed=adapter.receive(json!({"id":probe["id"],"result":{"thread":{"id":"thread-exact","status":{"type":"idle"},"canAcceptDirectInput":true}}})).unwrap();
+        assert!(
+            completed
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        assert!(
+            !completed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        );
+        adapter.command(Command::Compact).unwrap();
+        let wrong_thread = adapter
+            .receive(json!({"method":"thread/compacted","params":{"threadId":"unrelated"}}))
+            .unwrap();
+        assert!(
+            !wrong_thread
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        let completed = adapter
+            .receive(json!({"method":"thread/compacted","params":{"threadId":"thread-exact"}}))
+            .unwrap();
+        assert!(
+            completed
+                .events
+                .contains(&Event::Compaction { active: false })
         );
     }
 
