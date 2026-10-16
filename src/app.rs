@@ -14292,7 +14292,7 @@ impl Application for Cagents {
                 if let SidebarAction::RequestDiscard { request, .. } = &action {
                     if !crate::repository::WorktreeAuthority::supported() {
                         self.status = Some(TransientNotice::error(
-                            "Recoverable Discard is currently supported on Linux only. Git changes remain available to inspect.".into(),
+                            "Recoverable Discard is currently supported on Linux only. Git changes remain available to inspect.",
                         ));
                         return Task::none();
                     }
