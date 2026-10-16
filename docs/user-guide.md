@@ -76,10 +76,11 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   update describes unread news, so newer work in that conversation can continue.
   Hover shows the full project status and unread count; keyboard-focused
   controls expose the same information to assistive technology.
-- Unread updates survive a normal UI restart. An agent finishing while the
-  window is in the background remains unread until you view its pane. In
-  **Attention**, reading a row keeps it in place with dimmed styling until you
-  navigate elsewhere or re-enter the filter. A new update makes it unread again.
+- Unread updates survive a normal UI restart, including an agent finishing
+  while the window is in the background. Viewing its pane or marking it read
+  acknowledges the update. In **Attention**, reading a row keeps it in place
+  with dimmed styling until you navigate elsewhere or re-enter the filter.
+  A new update makes it unread again.
 - Project search ranks exact and prefix matches before looser matches. Long
   highlighted labels end in an ellipsis, leaving room for the row's status.
 - Right-click project or worktree rows for their actions. Icon tooltips appear
