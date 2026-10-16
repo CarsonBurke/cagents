@@ -7,7 +7,10 @@ impl Cagents {
             || self.form_dialog_is_open()
             || self.modal_over_form_dialogs_except_save_close();
         Admission {
-            writable: !self.update_prepared && self.exit.is_none() && !crate::device::is_remote(),
+            writable: !self.update_prepared
+                && self.exit.is_none()
+                && !crate::device::is_remote()
+                && !self.operation_recovery_pending(),
             other_modal: upper || self.dirty_repository_close.is_some(),
             close_save: (!upper)
                 .then(|| self.dirty_repository_close.as_ref().map(|close| close.card))
