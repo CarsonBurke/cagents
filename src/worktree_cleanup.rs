@@ -424,6 +424,15 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
     acquire(&crate::instance::runtime_directory()?, directory, false).map(Some)
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_protection(
+    runtime: &Path,
+    directory: &Path,
+    exclusive: bool,
+) -> io::Result<Protection> {
+    acquire(runtime, directory, exclusive)
+}
+
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
 #[derive(Default)]
@@ -435,6 +444,8 @@ pub(crate) struct WindowProtections {
     retry_after: Option<std::time::Instant>,
     last_failure: Option<String>,
     missing: std::collections::BTreeSet<PathBuf>,
+    #[cfg(test)]
+    fixture_runtime: Option<PathBuf>,
 }
 
 impl WindowProtections {
@@ -445,8 +456,21 @@ impl WindowProtections {
         self.last_failure = None;
     }
 
+    #[cfg(test)]
+    pub(crate) fn use_fixture_runtime(&mut self, runtime: PathBuf) {
+        assert!(self.directories.is_empty());
+        self.fixture_runtime = Some(runtime);
+    }
+
     pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
-        if let Some(protection) = protect(directory)? {
+        #[cfg(test)]
+        let protection = match &self.fixture_runtime {
+            Some(runtime) => Some(acquire(runtime, directory, false)?),
+            None => protect(directory)?,
+        };
+        #[cfg(not(test))]
+        let protection = protect(directory)?;
+        if let Some(protection) = protection {
             self.resolved
                 .insert(directory.to_owned(), protection.directory.clone());
             self.directories

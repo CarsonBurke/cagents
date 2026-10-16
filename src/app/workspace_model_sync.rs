@@ -56,6 +56,9 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
+    /// Optional naming yielded after temporary admission pressure. The next
+    /// real wake may retry this exact current candidate; this is not a timer.
+    TitleDeferred(ModelEdit),
     PaneTransferFailed {
         operation: uuid::Uuid,
         error: String,
@@ -119,14 +122,14 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
         let (sequence, edit) = client
             .next_workspace_model_edit()
             .map_err(|error| error.to_string())?;
-        // A create's rank is assigned by the registry, so it is not in the edit.
-        // Reading the model afterwards is how an adopting window learns where
-        // the new channel sorts, and it is one request on a connection that is
-        // otherwise idle until the next edge.
+        // View edits and proof-dependent title suggestions need complete
+        // authoritative pane data: the cached view may precede their revision.
+        // Navigation also reads its settled registry ordering.
         if matches!(
             edit,
             ModelEdit::SeedView { .. }
                 | ModelEdit::ChangeView { .. }
+                | ModelEdit::SuggestConversationTitle { .. }
                 | ModelEdit::ReorderNavigation { .. }
                 | ModelEdit::ResetNavigation { .. }
         ) {
@@ -225,6 +228,13 @@ fn publish(
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
+                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. })
+                        && let Ok(model) = client.read_workspace_model()
+                    {
+                        // A refused suggestion is not replayed against a newer
+                        // owner. Restore the authoritative name after optimism.
+                        let _ = updates.send_blocking(ModelUpdate::Read(model));
+                    }
                     if let ModelEdit::ChangeView {
                         scope, operation, ..
                     } = &request
@@ -274,9 +284,28 @@ fn send(
     };
     let mut request = edit;
     let mut conflicts = 0;
+    let mut title_busy = 0;
     let model = loop {
         match client.edit_workspace_model(request.clone()) {
             Ok(model) => break model,
+            Err(ControlError::Remote {
+                code: crate::terminal::ipc::ProtocolErrorCode::QueueFull,
+                retryable: true,
+                ..
+            }) if matches!(&request, ModelEdit::SuggestConversationTitle { .. }) => {
+                title_busy += 1;
+                if title_busy < 3 {
+                    std::thread::sleep(Duration::from_millis(20 * title_busy));
+                    continue;
+                }
+                // Optional metadata must not hold every later model edit at
+                // the queue head. Do not renew its proof or reconnect/replay it.
+                if let Ok(model) = client.read_workspace_model() {
+                    let _ = updates.send_blocking(ModelUpdate::Read(model));
+                }
+                let _ = updates.send_blocking(ModelUpdate::TitleDeferred(request));
+                return Ok(());
+            }
             Err(
                 error @ ControlError::Remote {
                     code: crate::terminal::ipc::ProtocolErrorCode::ViewConflict,
@@ -343,7 +372,7 @@ fn send(
             ordinal: channel.ordinal,
         });
     }
-    if reordered {
+    if reordered || matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
         let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
     }
     if let Some(repository) = reopened {
@@ -488,6 +517,10 @@ impl Cagents {
 
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::TitleDeferred(edit) => {
+                self.defer_channel_title_suggestion(&edit);
+                Task::none()
+            }
             ModelUpdate::ViewConflicted {
                 scope,
                 operation,
@@ -863,6 +896,7 @@ impl Cagents {
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());
         }
+        self.refresh_channel_title_suggestions();
         Task::batch(tasks)
     }
 
@@ -1426,6 +1460,127 @@ mod tests {
     use super::*;
 
     #[test]
+    fn busy_title_publication_yields_after_three_original_attempts_to_the_next_edit() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+            ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
+        };
+        let id = ChannelId::new();
+        let title = ModelEdit::SuggestConversationTitle {
+            id,
+            card: crate::model::CardId::new(),
+            expected_revision: 17,
+            title: "Encryption review".into(),
+            source: crate::model::ChannelTitleSource::Provider,
+        };
+        let manual = ModelEdit::RetitleChannel {
+            id,
+            title: "My project".into(),
+        };
+        let expected_title = title.clone();
+        let expected_manual = manual.clone();
+        let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "title-publisher".into(),
+                boot_id: "fixture-boot".into(),
+                host_incarnation: "fixture-incarnation".into(),
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(hello.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: vec![],
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            for _ in 0..3 {
+                let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(
+                    request.request,
+                    ClientRequest::EditWorkspaceModel {
+                        edit: expected_title.clone()
+                    }
+                );
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::QueueFull,
+                            "Resident metadata is busy",
+                            true,
+                        )),
+                    },
+                )
+                .unwrap();
+            }
+            let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(read.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel {
+                            model: WorkspaceModel::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let next: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(
+                next.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: expected_manual
+                }
+            );
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(next.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel {
+                            model: WorkspaceModel::default(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            assert!(
+                read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                "No title replay after yielding"
+            );
+        });
+        let mut client = ControlClient::from_stream(client).unwrap();
+        let (sender, updates) = async_channel::unbounded();
+        send(&mut client, title.clone(), &sender).unwrap();
+        assert!(matches!(updates.try_recv().unwrap(), ModelUpdate::Read(_)));
+        assert!(
+            matches!(updates.try_recv().unwrap(), ModelUpdate::TitleDeferred(edit) if edit == title)
+        );
+        send(&mut client, manual, &sender).unwrap();
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn a_source_conflict_drains_the_stale_request_without_an_applied_receipt() {
         use crate::terminal::ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
@@ -1975,6 +2130,7 @@ mod tests {
             (true, false, false, 1),
             (true, false, false, 2),
             (true, false, false, 3),
+            (true, false, false, 4),
             (true, false, false, 5),
             (true, false, false, 6),
             (true, false, false, 7),
@@ -2238,6 +2394,13 @@ mod tests {
                     title: "New provider title".into(),
                     source: crate::model::ChannelTitleSource::Provider,
                 },
+                4 => ModelEdit::SuggestConversationTitle {
+                    id: target,
+                    card: primary.unwrap(),
+                    expected_revision: model.views[0].revision,
+                    title: "New conversation title".into(),
+                    source: crate::model::ChannelTitleSource::Provider,
+                },
                 5 => ModelEdit::CreateChannel {
                     id: ChannelId::new(),
                     repository: agent.spec.target.repository.clone(),
@@ -2259,10 +2422,18 @@ mod tests {
             if let Some(edit) = &edge {
                 // The observer and publisher use distinct connections. A
                 // metadata edge may arrive before this Insert's own reply.
-                drop(app.apply_workspace_model_update(ModelUpdate::Edited {
-                    sequence: model.sequence + 1,
-                    edit: edit.clone(),
-                }));
+                if matches!(edit, ModelEdit::SuggestConversationTitle { .. }) {
+                    // The real observer reads this proof-dependent edge as a
+                    // complete snapshot, not a fold against its stale view17.
+                    let mut observed = model.clone();
+                    observed.fold(model.sequence + 1, edit);
+                    drop(app.apply_workspace_model_update(ModelUpdate::Read(observed)));
+                } else {
+                    drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+                        sequence: model.sequence + 1,
+                        edit: edit.clone(),
+                    }));
+                }
             }
             let newer_metadata = (
                 app.workspace_model.channels.clone(),
@@ -2285,6 +2456,7 @@ mod tests {
                 let expected_title = match metadata_edge {
                     2 => Some("New manual title"),
                     3 => Some("New provider title"),
+                    4 => Some("New conversation title"),
                     _ => None,
                 };
                 if let Some(title) = expected_title {
@@ -3326,7 +3498,11 @@ mod tests {
             ..registry(Vec::new())
         }));
 
-        let _ = app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(id, Ok(())));
+        let _ = app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(
+            id,
+            uuid::Uuid::new_v4(),
+            Ok(()),
+        ));
 
         assert!(
             !app.durable.channels.iter().any(|channel| channel.id == id),

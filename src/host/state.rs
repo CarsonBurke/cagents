@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, Weak},
+    sync::{Arc, Mutex, OnceLock, RwLock, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -637,6 +637,65 @@ impl HostState {
                         true,
                     ));
                 }
+            }
+        }
+        if let ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title,
+            source,
+        } = &edit
+        {
+            let expected = self
+                .registry()?
+                .title_conversation(*id, *card, *expected_revision)
+                .map_err(model_unavailable)?;
+            let invalid = || {
+                ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "The conversation's current name or source changed; refresh before suggesting a title",
+                    false,
+                )
+            };
+            let actual = self.chats.get(&expected.id).ok_or_else(invalid)?;
+            if expected.proof.as_ref() != Some(self.proof())
+                || actual.session.launch.provider != expected.launch.provider
+                || actual.session.launch.recipe != expected.launch.recipe
+            {
+                return Err(invalid());
+            }
+            // Model mutations serialize under this HostLock. Read only resident
+            // metadata, not Store, snapshot/history or files. A later B edit
+            // cannot overtake this A admission; a delayed A sees B's current name.
+            let (session, current_title) =
+                actual.handle.conversation_title().map_err(|reason| {
+                    let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
+                    ProtocolError::new(
+                        if busy {
+                            ProtocolErrorCode::QueueFull
+                        } else {
+                            ProtocolErrorCode::Internal
+                        },
+                        if busy {
+                            "Conversation metadata is busy; retry the original title suggestion"
+                        } else {
+                            "Conversation metadata is unavailable"
+                        },
+                        busy,
+                    )
+                })?;
+            if session.is_none() || session != expected.launch.session_id {
+                return Err(invalid());
+            }
+            let current_title = current_title
+                .as_deref()
+                .and_then(crate::workspace_model::channel_title);
+            match source {
+                crate::model::ChannelTitleSource::Provider
+                    if current_title.as_ref() == Some(title) => {}
+                crate::model::ChannelTitleSource::Prompt if current_title.is_none() => {}
+                _ => return Err(invalid()),
             }
         }
         let registry = self.registry()?;
@@ -3825,7 +3884,11 @@ fn start_terminal_view_owned(
     } else {
         Default::default()
     };
-    let weak = Arc::downgrade(shared);
+    let redraw = Arc::new(TerminalRedraw {
+        host: Arc::downgrade(shared),
+        terminal_id,
+        worker: OnceLock::new(),
+    });
     let config = TerminalConfig {
         agent_authority,
         columns: options.columns,
@@ -3840,12 +3903,13 @@ fn start_terminal_view_owned(
         holder_recovery,
         ..TerminalConfig::default()
     };
+    let wake_redraw = Arc::clone(&redraw);
     let handle = match TerminalHandle::spawn_with_execution(
         session.clone(),
         config,
         execution_recipe.clone(),
         move |wake| {
-            broadcast_redraw(&weak, terminal_id, wake.generation);
+            wake_redraw.publish(wake.generation);
         },
     ) {
         Ok(handle) => handle,
@@ -3861,6 +3925,9 @@ fn start_terminal_view_owned(
             ));
         }
     };
+    // Bind before publishing the Host record. Pre-binding captures are covered
+    // by the initial Spawn snapshot and acknowledge below, never by an ID lookup.
+    let _ = redraw.worker.set(handle.downgrade());
     let output_host = Arc::downgrade(shared);
     handle
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
@@ -3952,7 +4019,7 @@ fn start_terminal_view_owned(
         if completed {
             // Completed is emitted only after the final grid and parser
             // teardown. Notify visible subscribers from that exact worker.
-            broadcast_redraw(&event_host, terminal_id, handle.generation());
+            broadcast_redraw(&event_host, terminal_id, handle.generation(), handle);
         }
     });
     Ok((descriptor, redraw_handle))
@@ -4077,7 +4144,22 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
     }
 }
 
-/// Publishes a repaint to every visible subscriber of `terminal_id`.
+/// Binds redraw wakes before Host publication without a strong callback cycle.
+struct TerminalRedraw {
+    host: Weak<HostLock>,
+    terminal_id: TerminalId,
+    worker: OnceLock<crate::terminal::WeakTerminalHandle>,
+}
+
+impl TerminalRedraw {
+    fn publish(&self, generation: u64) {
+        if let Some(worker) = self.worker.get().and_then(|worker| worker.upgrade()) {
+            broadcast_redraw(&self.host, self.terminal_id, generation, &worker);
+        }
+    }
+}
+
+/// Publishes a repaint to every visible subscriber of this exact worker.
 ///
 /// A subscriber for which the daemon already recorded the exact capture it last
 /// delivered receives the repaint itself, diff-encoded against that capture,
@@ -4094,13 +4176,28 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
 /// every delta chained to the previous delivery; an unapplicable delta is
 /// detected by `base_generation` and answered with a full repaint, so a client
 /// that misses a push still recovers.
-fn broadcast_redraw(host: &Weak<HostLock>, terminal_id: TerminalId, generation: u64) {
+fn broadcast_redraw(
+    host: &Weak<HostLock>,
+    terminal_id: TerminalId,
+    generation: u64,
+    worker: &TerminalHandle,
+) {
     let Some(host) = host.upgrade() else {
         return;
     };
     let mut pending = Vec::new();
     {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Retirement does not drain queued callbacks. Validate the original
+        // worker under the same lock as visibility, viewport and capture work;
+        // an earlier identity check could race a same-ID replacement.
+        if !state
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|record| record.handle.same_worker(worker))
+        {
+            return;
+        }
         let visible = state
             .subscriptions
             .by_terminal
@@ -4300,6 +4397,8 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
 #[cfg(test)]
 mod native_upgrade_tests;
 #[cfg(test)]
+mod redraw_identity_tests;
+#[cfg(test)]
 mod strict_upgrade_tests;
 
 #[cfg(test)]
@@ -4317,6 +4416,192 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn channel_title_admission_rejects_delayed_names_from_the_same_resident_actor() {
+        use crate::{
+            chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec},
+            chat::{self, Command, Event},
+            model::{CardId, CardKind, ChannelId, ChannelTitleSource, LaunchRecipe},
+            workspace_model::views::{Pane, Scope},
+        };
+        const SESSION: &str = "12345678-1234-4234-8234-123456789abc";
+        struct Names(usize);
+        impl Adapter for Names {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Session {
+                            id: SESSION.into(),
+                            title: Some("Initial bundle audit".into()),
+                        },
+                        Event::Ready(true),
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.0 += 1;
+                Ok(Step {
+                    events: vec![Event::Session {
+                        id: SESSION.into(),
+                        title: Some(
+                            if self.0 == 1 {
+                                "Encryption performance review"
+                            } else {
+                                "Final encryption audit"
+                            }
+                            .into(),
+                        ),
+                    }],
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = test_host();
+        state.install_model(
+            super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+        );
+        let recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut spec = ProcessSpec::from(&recipe);
+        spec.transport = TransportSpec::History;
+        let mut adapter = Names(0);
+        let mut initial = adapter.initialize().unwrap();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle =
+            chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle
+            .conversation_title()
+            .ok()
+            .and_then(|(session, _)| session)
+            .as_deref()
+            != Some(SESSION)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "history worker did not publish its exact session"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let session = chat::Session {
+            id: TerminalId::new(),
+            proof: Some(state.proof().clone()),
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe,
+                session_id: Some(SESSION.into()),
+            },
+        };
+        state.chats.insert(
+            session.id,
+            super::super::chat::Record {
+                execution_instance: uuid::Uuid::new_v4(),
+                session: session.clone(),
+                handle: handle.clone(),
+                console_recipe: None,
+                paired_terminal: None,
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let id = ChannelId::new();
+        let card = CardId::new();
+        state
+            .edit_model(
+                1,
+                ModelEdit::OpenProject {
+                    repository: directory.path().into(),
+                    name: "project".into(),
+                    kind: Default::default(),
+                },
+            )
+            .unwrap();
+        state
+            .edit_model(
+                1,
+                ModelEdit::CreateChannel {
+                    id,
+                    repository: directory.path().into(),
+                    title: String::new(),
+                    title_source: Default::default(),
+                },
+            )
+            .unwrap();
+        let model = state
+            .edit_model(
+                1,
+                ModelEdit::SeedView {
+                    scope: Scope::Channel(id),
+                    closed: Vec::new(),
+                    panes: vec![Pane {
+                        id: card,
+                        title: "Chat".into(),
+                        user_title: None,
+                        pending_terminal_start: false,
+                        width_fraction: 1.,
+                        scope: Some(directory.path().into()),
+                        kind: CardKind::Chat(session),
+                    }],
+                },
+            )
+            .unwrap();
+        let revision = model.views[0].revision;
+        let suggest = |name: &str| ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision: revision,
+            title: name.into(),
+            source: ChannelTitleSource::Provider,
+        };
+        let apply = |state: &mut HostState, origin, edit: ModelEdit| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match state.edit_model(origin, edit.clone()) {
+                    Err(error) if error.retryable && error.code == ProtocolErrorCode::QueueFull => {
+                        assert!(Instant::now() < deadline, "resident metadata remained busy");
+                        std::thread::yield_now();
+                    }
+                    result => break result,
+                }
+            }
+        };
+        apply(&mut state, 1, suggest("Initial bundle audit")).unwrap();
+        handle.command(Command::Compact).unwrap();
+        apply(&mut state, 2, suggest("Encryption performance review")).unwrap();
+        assert!(
+            apply(&mut state, 1, suggest("Initial bundle audit")).is_err(),
+            "delayed A must not replace accepted B at the same view revision"
+        );
+        assert_eq!(
+            state.read_model().unwrap().channels[0].title,
+            "Encryption performance review"
+        );
+        handle.command(Command::Compact).unwrap();
+        apply(&mut state, 1, suggest("Final encryption audit")).unwrap();
+        assert_eq!(
+            state.read_model().unwrap().channels[0].title,
+            "Final encryption audit"
+        );
+        handle.close().unwrap();
     }
 
     #[test]
@@ -5987,9 +6272,10 @@ for line in sys.stdin:
     fn redraw_delivery_excludes_hidden_and_hibernated_subscribers() {
         let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let terminal_id = TerminalId::new();
+        let stream = crate::terminal::RenderStreamFixture::new(|_| {});
         let deliveries = {
             let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
-            [
+            let deliveries = [
                 TerminalVisibility::Visible,
                 TerminalVisibility::Hidden,
                 TerminalVisibility::Hibernated,
@@ -6004,16 +6290,26 @@ for line in sys.stdin:
                     .attach(client_id, terminal_id, visibility);
                 delivery
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+            state.reserve_spawn(terminal_id).unwrap();
+            state
+                .finish_spawn(
+                    1,
+                    redraw_identity_tests::session(terminal_id),
+                    stream.handle.clone(),
+                    true,
+                )
+                .unwrap();
+            deliveries
         };
 
-        broadcast_redraw(&Arc::downgrade(&shared), terminal_id, 7);
+        broadcast_redraw(&Arc::downgrade(&shared), terminal_id, 7, &stream.handle);
         for delivery in &deliveries {
             delivery.close_after_drain();
         }
         assert!(matches!(
             deliveries[0].pop().unwrap().message,
-            ServerMessage::Redraw { generation: 7, .. }
+            ServerMessage::Snapshot { snapshot, .. } if snapshot.generation == 7
         ));
         assert!(deliveries[1].pop().is_none());
         assert!(deliveries[2].pop().is_none());
@@ -6072,7 +6368,7 @@ for line in sys.stdin:
             thread::sleep(Duration::from_millis(10));
         }
 
-        broadcast_redraw(&Arc::downgrade(&shared), id, handle.generation());
+        broadcast_redraw(&Arc::downgrade(&shared), id, handle.generation(), &handle);
         delivery.close_after_drain();
         let mut pushed = None;
         while let Some(message) = delivery.pop() {

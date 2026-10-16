@@ -343,6 +343,14 @@ pub enum Change {
 }
 
 impl View {
+    /// Stable conversation identity: utilities never displace the first chat.
+    pub fn primary_chat(&self) -> Option<CardId> {
+        self.panes
+            .iter()
+            .find(|pane| matches!(pane.kind, CardKind::Chat(_)) && !self.retired.contains(&pane.id))
+            .map(|pane| pane.id)
+    }
+
     pub fn empty(scope: impl Into<Scope>) -> Self {
         Self {
             scope: scope.into(),

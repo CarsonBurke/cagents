@@ -387,7 +387,7 @@ fn settings_category_controls<'a>(
                     .into(),
             );
             let directory = setting_input(
-                "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
+                "Absolute path, or relative to the repository root. Defaults to .worktrees/. Each new worktree gets its own subdirectory.",
                 &draft.managed_worktree_directory,
                 SettingsField::ManagedWorktreeDirectory,
                 invalid,

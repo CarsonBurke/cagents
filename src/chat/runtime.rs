@@ -127,6 +127,12 @@ impl Handle {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TitleUnavailable {
+    Busy,
+    Poisoned,
+}
+
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
@@ -170,6 +176,23 @@ impl Handle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         Self::start_inner(spec, adapter, initial, store, session_id, None, notify)
+    }
+
+    /// Retain an actual native holder after closing the fixture's local actor.
+    /// Cleanup still requires the real holder protocol and receipt.
+    #[cfg(test)]
+    pub(crate) fn fixture_retained_native_holder(
+        &self,
+        holder: super::native_holder::Holder,
+        reason: String,
+    ) {
+        assert!(self.is_completed(), "fixture requires a closed actor");
+        assert!(self.0.worker.lock().unwrap().is_none());
+        let mut retained = self.0.retained_native.lock().unwrap();
+        assert!(retained.is_none());
+        *retained = Some(holder);
+        *self.0.failure.lock().unwrap() = Some(reason);
+        self.0.completed.store(false, Ordering::Release);
     }
 
     pub(crate) fn start_owned(
@@ -1032,6 +1055,18 @@ impl Handle {
             .map(|agent| agent.id.clone())
             .collect()
     }
+    /// A coherent resident naming projection. Never opens the transcript Store,
+    /// pages history or touches the filesystem; safe at host admission points.
+    pub(crate) fn conversation_title(
+        &self,
+    ) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
+        let state = self.0.state.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => TitleUnavailable::Busy,
+            std::sync::TryLockError::Poisoned(_) => TitleUnavailable::Poisoned,
+        })?;
+        Ok((state.session_id.clone(), state.title.clone()))
+    }
+
     /// The provider-reported title, read without loading the transcript.
     pub(crate) fn title(&self) -> Option<String> {
         self.0
@@ -2627,9 +2662,12 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::Session { id, title } => {
             if state.session_id.as_deref() != Some(id.as_str()) {
                 state.prompt_suggestion = None;
+                state.title = title;
+            } else if title.is_some() {
+                // Identity-only frames carry no new naming information.
+                state.title = title;
             }
             state.session_id = Some(id);
-            state.title = title;
         }
         Event::Plan { steps } => state.plan = steps,
         // About the account rather than the conversation: `step` forwards it
@@ -3055,6 +3093,95 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resident_title_admission_refuses_without_waiting_for_the_state_owner() {
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::History,
+            program: "unused-history-reader".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+        let state = handle.0.state.lock().unwrap();
+        let probe = handle.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || sender.send(probe.conversation_title()).unwrap());
+        let outcome = receiver.recv_timeout(Duration::from_millis(250));
+        // Release before joining/asserting: the old blocking implementation
+        // fails the test without stranding its thread or the runtime worker.
+        drop(state);
+        worker.join().unwrap();
+        handle.close().unwrap();
+        assert_eq!(outcome.unwrap(), Err(TitleUnavailable::Busy));
+    }
+
+    #[test]
+    fn identity_only_frames_preserve_a_name_until_actual_session_change_or_reset() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "a".into(),
+                title: Some("Bundle review".into()),
+            },
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "a".into(),
+                title: None,
+            },
+        );
+        assert_eq!(state.title.as_deref(), Some("Bundle review"));
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "b".into(),
+                title: None,
+            },
+        );
+        assert!(state.title.is_none());
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "b".into(),
+                title: Some("New task".into()),
+            },
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Reset {
+                reason: "Reset".into(),
+            },
+        );
+        assert!(state.title.is_none());
+    }
+
     #[test]
     fn prompt_suggestion_metadata_cannot_survive_a_turn_session_or_process_boundary() {
         let mut state = Snapshot {

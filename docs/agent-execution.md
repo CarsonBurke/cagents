@@ -72,6 +72,18 @@ If a daemon restart loses proof of an accepted prompt's outcome, the run becomes
 ## Reading context and account budgets
 
 ```sh
+cagents account list
+cagents account list --provider codex --json
+```
+
+`account list` reads active accounts and any retained caller account from the
+selected daemon. Its table shows stable account IDs, names, defaults, current
+caller selection and archived status. JSON projects those metadata fields with
+lowercase provider names; it omits usage bodies and launch recipes. This request
+does not probe a provider CLI. A default marker describes saved preferences,
+not a guarantee that the account is currently available for new work.
+
+```sh
 cagents account info --json
 cagents account info --provider claude --json
 cagents account info --account claude/system --refresh --json
@@ -230,3 +242,11 @@ Elvish and PowerShell scripts are available with `completions elvish` and
 Automation definition and history pages accept `--limit` from 1 through 100;
 values outside that range are refused. For definitions, pass the last returned
 UUID as `--after` to request the next page.
+
+Linear collection commands use the same plain tables and explicit empty states.
+Their `--json` payloads retain the original API fields and pagination metadata.
+Human pages indicate when more results are available; use `--after` to continue.
+Comments appear in a single table row; use JSON to preserve Markdown line breaks.
+
+Session directory tables keep full session IDs, lineage, view and delegation
+context. Session and whoami JSON retain their original directory metadata.
