@@ -2460,7 +2460,8 @@ mod tests {
         // The terminal hangs up once its last master closes.
         drop(master);
         drop(holder);
-        assert!(!alive(holder_pid));
+        // Drop transfers cleanup to the bounded owner; it does not wait inline.
+        wait_gone(holder_pid);
         wait_gone(root);
     }
 
