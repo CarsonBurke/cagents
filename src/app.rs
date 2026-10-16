@@ -10988,6 +10988,7 @@ impl Cagents {
             .source()
             .cloned()
             .expect("selected original source");
+        #[cfg(target_os = "linux")]
         let read_source = source.clone();
         let worktree = key.canonical_path.clone();
         let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
@@ -11010,7 +11011,12 @@ impl Cagents {
             .collect::<Vec<_>>();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
+                #[cfg(target_os = "linux")]
                 let service = read_source.read_service()?;
+                // Read-only Git inspection keeps its existing platform
+                // support even where strong recoverable mutation is absent.
+                #[cfg(not(target_os = "linux"))]
+                let service = crate::repository::RepositoryService::system("git");
                 let mut snapshot = service
                     .snapshot_with_options(&worktree, options, &cancellation)
                     .map_err(|error| error.to_string())?;
@@ -11028,6 +11034,7 @@ impl Cagents {
                         &cancellation,
                     )?;
                 }
+                #[cfg(target_os = "linux")]
                 read_source.validate_original()?;
                 Ok(snapshot)
             })
@@ -14283,6 +14290,12 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 if let SidebarAction::RequestDiscard { request, .. } = &action {
+                    if !crate::repository::WorktreeAuthority::supported() {
+                        self.status = Some(TransientNotice::error(
+                            "Recoverable Discard is currently supported on Linux only. Git changes remain available to inspect.".into(),
+                        ));
+                        return Task::none();
+                    }
                     if !self
                         .discard_ui
                         .confirm_intent(discard_event.unwrap(), request)
