@@ -569,6 +569,98 @@ fn migrate_through(
 mod tests {
     use super::*;
 
+    /// Functional coverage for the two independently retained production WAL
+    /// connections. This is not a reproduction of SQLite's rare reset race.
+    /// Use published model rows so strict schema admission stays in force.
+    #[test]
+    fn model_and_execution_connections_preserve_commits_during_checkpoints() {
+        fn write(
+            mut registry: Registry,
+            lane: i64,
+            start: std::sync::Arc<std::sync::Barrier>,
+        ) -> (Registry, Vec<(ChannelId, String)>) {
+            let mut committed = Vec::new();
+            start.wait();
+            for turn in 0..32_i64 {
+                let channel = ChannelId::new();
+                let payload = format!("lane={lane} turn={turn} {}", "x".repeat(8192));
+                let applied = registry
+                    .apply(&create(channel, "/sqlite-contract", &payload))
+                    .unwrap();
+                assert!(applied.changed);
+                committed.push((channel, payload));
+                let (busy, _, _): (i64, i64, i64) = registry
+                    .db
+                    .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                assert!(matches!(busy, 0 | 1));
+            }
+            (registry, committed)
+        }
+        fn payloads(registry: &Registry) -> std::collections::BTreeMap<String, String> {
+            registry
+                .model()
+                .unwrap()
+                .channels
+                .into_iter()
+                .map(|channel| (channel.id.to_string(), channel.title))
+                .collect()
+        }
+        let (mut registry, directory) = registry();
+        let path = registry.path.clone();
+        registry.apply(&open("/sqlite-contract")).unwrap();
+        let execution = registry.execution_connection().unwrap();
+        for connection in [&registry.db, &execution.db] {
+            connection
+                .pragma_update(None, "wal_autocheckpoint", 1)
+                .unwrap();
+            let journal: String = connection
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal, "wal");
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let other_start = start.clone();
+        let writer = std::thread::spawn(move || write(execution, 1, other_start));
+        let (mut registry, mut committed) = write(registry, 0, start);
+        let (execution, other_committed) = writer.join().unwrap();
+        committed.extend(other_committed);
+        let mut expected: std::collections::BTreeMap<_, _> = committed
+            .into_iter()
+            .map(|(channel, payload)| (channel.to_string(), payload))
+            .collect();
+        assert_eq!(expected.len(), 64);
+        assert_eq!(payloads(&registry), expected);
+        assert_eq!(payloads(&execution), expected);
+        let channel = ChannelId::new();
+        registry
+            .apply(&create(channel, "/sqlite-contract", "retained"))
+            .unwrap();
+        expected.insert(channel.to_string(), "retained".into());
+        assert_eq!(payloads(&execution), expected);
+        let integrity: String = execution
+            .db
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        drop(execution);
+        drop(registry);
+        let reopened = Registry::at(&path).unwrap();
+        assert_eq!(payloads(&reopened), expected);
+        let version: u32 = reopened
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        println!(
+            "SQLITE_REGISTRY_WAL_CONNECTIONS_VERIFIED schema={version} rows={} {}",
+            expected.len(),
+            directory.path().display()
+        );
+    }
+
     #[test]
     fn navigation_rejects_cross_project_channels_and_relative_paths_without_writing() {
         use crate::workspace_model::NavigationItem;
