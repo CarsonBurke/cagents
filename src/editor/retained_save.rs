@@ -40,6 +40,7 @@ pub struct RetainedSaveOutcome {
     recovery: Option<RecoveryAuthority>,
 }
 impl RetainedSaveOutcome {
+    pub fn outcome(&self) -> &SaveOutcome { &self.outcome }
     pub fn recovery_authority(&self) -> Option<&RecoveryAuthority> { self.recovery.as_ref() }
     pub(crate) fn into_parts(self) -> (SaveOutcome, Option<RecoveryAuthority>) { (self.outcome, self.recovery) }
 }

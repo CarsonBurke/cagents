@@ -522,6 +522,13 @@ pub enum RepositoryAction {
         saved_text: String,
         result: Result<SaveOutcome, FileIoError>,
     },
+    RetainedSaveFinished {
+        identity: AsyncIdentity,
+        ticket: u64,
+        revision: u64,
+        saved_text: String,
+        result: Result<crate::editor::retained_save::RetainedSaveOutcome, crate::editor::retained_save::RetainedSaveError>,
+    },
     Reload {
         card: CardId,
     },
@@ -676,6 +683,18 @@ pub enum ClipboardOp {
 }
 
 impl RepositoryAction {
+    pub fn recovery_authority(&self) -> Option<&crate::recovery_authority::RecoveryAuthority> {
+        match self {
+            Self::RetainedSaveFinished { result, .. } => match result {
+                Ok(outcome) => outcome.recovery_authority(),
+                Err(error) => error.recovery_authority(),
+            },
+            _ => None,
+        }
+    }
+    pub fn recovery_scope(&self) -> Option<&Path> {
+        match self { Self::RetainedSaveFinished { identity, .. } => Some(&identity.worktree), _ => None }
+    }
     pub fn card(&self) -> CardId {
         match self {
             Self::Review { card, .. }
@@ -744,7 +763,8 @@ impl RepositoryAction {
             | Self::WorkingDiffLoaded { identity, .. }
             | Self::DiffBasisResolved { identity, .. }
             | Self::AutoSaveDue { identity, .. }
-            | Self::SaveFinished { identity, .. } => identity.card,
+            | Self::SaveFinished { identity, .. }
+            | Self::RetainedSaveFinished { identity, .. } => identity.card,
         }
     }
 }
@@ -1848,6 +1868,9 @@ pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
     worktree_protection: Option<crate::worktree_cleanup::Protection>,
     original_editor_root: Option<Arc<crate::fs_safety::Root>>,
+    save_recovery_window: Option<crate::operation_recovery::Shared>,
+    known_checkout_paths: Option<Vec<PathBuf>>,
+    editor_recovery: Option<crate::recovery_authority::RecoveryAuthority>,
     directory_only: bool,
     standalone: bool,
     external_editors: Vec<crate::sidebar::SidebarEditor>,
@@ -2071,6 +2094,9 @@ impl RepositoryRuntime {
             descriptor,
             worktree_protection: None,
             original_editor_root: None,
+            save_recovery_window: None,
+            known_checkout_paths: None,
+            editor_recovery: None,
             standalone: false,
             external_editors: Vec::new(),
             generation: 0,
@@ -2168,6 +2194,22 @@ impl RepositoryRuntime {
 
     pub fn retained_editor_root(&self) -> Option<Arc<crate::fs_safety::Root>> {
         self.original_editor_root.clone()
+    }
+
+    /// Pure window-owned custody and negative checkout census. The worker
+    /// acquires the real original-root cleanup protection before any effect.
+    pub fn configure_save_recovery(&mut self, window: crate::operation_recovery::Shared, known: Vec<PathBuf>) -> bool {
+        if known.len() > 256 || self.save_recovery_window.as_ref().is_some_and(|original| !Arc::ptr_eq(original, &window)) { return false; }
+        self.save_recovery_window = Some(window);
+        self.known_checkout_paths = Some(known);
+        true
+    }
+    pub fn has_editor_recovery(&self) -> bool {
+        self.editor_recovery.as_ref().is_some_and(|authority| !authority.is_resolved())
+    }
+    pub fn retire_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) {
+        if ticket == self.next_auto_save_ticket && self.accepts_selected(identity)
+            && self.auto_save_pending == Some((identity.generation, revision)) { self.auto_save_pending = None; }
     }
 
     /// Hides workbench launch controls in an independent editor window.
@@ -4356,7 +4398,7 @@ impl RepositoryRuntime {
     }
 
     pub fn blocks_navigation(&self) -> bool {
-        self.is_dirty()
+        self.has_editor_recovery() || self.is_dirty()
             || self.is_saving()
             || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
     }
@@ -4649,6 +4691,15 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
+        if self.has_editor_recovery() { return Task::none(); }
+        let Some(root) = self.original_editor_root.clone() else {
+            if let DocumentState::Editable(document) = &mut self.document { document.error = Some("The original read root is unavailable; reopen this file before saving.".into()); }
+            return Task::none();
+        };
+        let Some((window, known)) = self.save_recovery_window.clone().zip(self.known_checkout_paths.clone()) else {
+            if let DocumentState::Editable(document) = &mut self.document { document.error = Some("File recovery custody is unavailable; the save was refused before changing files.".into()); }
+            return Task::none();
+        };
         let (path, destination, text, disk_hash, revision) = match &self.document {
             DocumentState::Editable(document)
                 if (document.dirty || document.durability_warning.is_some())
@@ -4663,6 +4714,13 @@ impl RepositoryRuntime {
                 )
             }
             _ => return Task::none(),
+        };
+        let operation = match crate::operation_recovery::begin_operation(&window, self.descriptor.worktree.clone()) {
+            Ok(operation) => operation,
+            Err(error) => {
+                if let DocumentState::Editable(document) = &mut self.document { document.error = Some(error); }
+                return Task::none();
+            }
         };
         // The ticket is about the selected row, which is what a result is
         // matched against; the bytes go where they were read from.
@@ -4684,16 +4742,21 @@ impl RepositoryRuntime {
             self.source_surface = SourceSurface::Editor;
             self.markdown_mode = MarkdownMode::Edit;
         }
-        let worktree = identity.worktree.clone();
         let saved_text = text.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                save_file(&worktree, &destination, &text, disk_hash, overwrite)
+                operation.start();
+                let result = crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire(&root, &known)
+                    .map_err(|error| crate::editor::retained_save::RetainedSaveError::Io(error.to_string()))
+                    .and_then(|context| crate::editor::retained_save::save_file_at(&root, &destination, &text, disk_hash, overwrite, &context));
+                let authority = match &result { Ok(outcome) => outcome.recovery_authority(), Err(error) => error.recovery_authority() }.cloned();
+                operation.finish(authority);
+                result
             })
             .await
-            .map_err(|error| FileIoError::Io(format!("save worker failed: {error}")))
+            .map_err(|error| crate::editor::retained_save::RetainedSaveError::Io(format!("save worker failed: {error}")))
             .and_then(|result| result);
-            RepositoryAction::SaveFinished {
+            RepositoryAction::RetainedSaveFinished {
                 identity,
                 ticket: ticket.id,
                 revision,
@@ -4704,6 +4767,12 @@ impl RepositoryRuntime {
     }
 
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
+        if let Some(authority) = action.recovery_authority().filter(|authority| !authority.is_resolved()) {
+            self.editor_recovery = Some(match self.editor_recovery.take().filter(|old| !old.is_resolved()) {
+                Some(old) => old.combine(authority.clone()),
+                None => authority.clone(),
+            });
+        }
         let card = action.card();
         let task = self.update_inner(action);
         Task::batch([task, self.find_task(card)])
@@ -5265,6 +5334,11 @@ impl RepositoryRuntime {
                 }
                 self.auto_save_pending = None;
                 self.request_save_inner(identity.card, false, false)
+            }
+            RepositoryAction::RetainedSaveFinished { identity, ticket, revision, saved_text, result } => {
+                let result = result.map(|outcome| outcome.into_parts().0)
+                    .map_err(|error| FileIoError::Io(error.to_string()));
+                self.update_inner(RepositoryAction::SaveFinished { identity, ticket, revision, saved_text, result })
             }
             RepositoryAction::SaveFinished {
                 identity,
