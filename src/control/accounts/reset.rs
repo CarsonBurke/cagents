@@ -17,6 +17,17 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
     let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    execute_with_client(&mut client, command, Authority::from_environment())
+}
+
+fn execute_with_client(
+    client: &mut ControlClient,
+    command: AccountCommand,
+    authority: Authority,
+) -> Result<CommandOutput, AppError> {
+    // Preserve the caller role on this exact connection. A failed session
+    // authentication must never fall back to user authority or another client.
+    client.authenticate(authority).map_err(protocol_error)?;
     let mut invoke = |request: Request| {
         request
             .validate()
@@ -292,6 +303,116 @@ mod tests {
             reconciled: false,
         }
     }
+    #[test]
+    fn allowance_commands_authenticate_the_same_client_and_preserve_agent_refusals() {
+        use crate::{
+            device_service::{Operation, Reply},
+            model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
+            terminal_ipc::{
+                ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError,
+                ProtocolErrorCode, ServerEnvelope, ServerMessage, ServerResponse,
+                read_frame, write_frame,
+            },
+        };
+        use std::os::unix::net::UnixStream;
+
+        // These are synthetic fixture roles, never a process environment token.
+        // User succeeds; valid agent is refused at DeviceOperation; invalid
+        // agent is refused at Authenticate. Neither failure can retry as user.
+        for role in 0..3 {
+            for command_kind in 0..3 {
+                let session = TerminalId::new();
+                let (stream, mut peer) = UnixStream::pair().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                let worker = thread::spawn(move || {
+                    let proof = HostSessionProof {
+                        host_session_id: HostSessionId::new("private-reset-role-peer"),
+                        boot_id: BootId::new("private-boot"),
+                        host_incarnation: HostIncarnation::new("private-incarnation"),
+                    };
+                    let steps = if role == 2 { 2 } else { 3 };
+                    for step in 0..steps {
+                        let envelope: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                        if step > 0 {
+                            assert_eq!(envelope.proof.as_ref(), Some(&proof));
+                        }
+                        let response = match (step, envelope.request) {
+                            (0, ClientRequest::Connect { .. }) => ServerResponse::Connected {
+                                proof: proof.clone(), resumed: vec![],
+                            },
+                            (1, ClientRequest::Authenticate { authority }) => {
+                                let expected = if role == 0 { Authority::default() } else {
+                                    Authority::session("synthetic-reset-fixture-role".into())
+                                };
+                                assert_eq!(authority, expected);
+                                ServerResponse::Accepted
+                            }
+                            (2, ClientRequest::DeviceOperation {
+                                operation: Operation::AccountAllowance { request },
+                            }) => {
+                                assert_eq!(request.session, session);
+                                request.validate().unwrap();
+                                if command_kind == 1 {
+                                    assert!(matches!(request.action, Action::Redeem {
+                                        authorized: true, condition: None, ..
+                                    }));
+                                } else {
+                                    assert_eq!(request.action, Action::Inspect);
+                                }
+                                ServerResponse::DeviceOperation {
+                                    reply: Reply::AccountAllowance(reading(session)),
+                                }
+                            }
+                            _ => panic!("unexpected request, role fallback or replacement target"),
+                        };
+                        let refused = (role == 2 && step == 1) || (role == 1 && step == 2);
+                        let message = if refused {
+                            ServerMessage::Error(ProtocolError::new(
+                                ProtocolErrorCode::InvalidRequest,
+                                "Synthetic caller role refused; no allowance effect admitted", false,
+                            ))
+                        } else { ServerMessage::Response { response } };
+                        write_frame(&mut peer, &ServerEnvelope {
+                            version: PROTOCOL_VERSION, request_id: Some(envelope.request_id),
+                            proof: proof.clone(), message,
+                        }).unwrap();
+                    }
+                    assert!(read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                        "caller refusal must not retry or reconnect as the user");
+                });
+                let command = match command_kind {
+                    0 => AccountCommand::Allowance { session },
+                    1 => AccountCommand::Redeem {
+                        session, provider_account: "actual-account".into(),
+                        backend_origin: "https://chatgpt.com".into(),
+                        credit: "actual-credit".into(), authorize: true,
+                    },
+                    _ => AccountCommand::Monitor {
+                        session, threshold: 90, interval_seconds: 1, checks: 1,
+                        max_redemptions: 1, authorize: false,
+                    },
+                };
+                let authority = if role == 0 { Authority::default() } else {
+                    Authority::session("synthetic-reset-fixture-role".into())
+                };
+                let mut client = ControlClient::from_stream(stream);
+                let result = match &mut client {
+                    Ok(client) => execute_with_client(client, command, authority),
+                    Err(_) => Err(AppError::new("fixture", "private handshake failed")),
+                };
+                drop(client);
+                let joined = worker.join();
+                joined.unwrap();
+                if role == 0 {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(result.err().unwrap().message.contains("Synthetic caller role refused"));
+                }
+            }
+        }
+    }
+
     #[test]
     fn observe_only_monitor_never_constructs_a_redeem_request() {
         let session = TerminalId::new();

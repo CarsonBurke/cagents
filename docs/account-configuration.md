@@ -58,6 +58,11 @@ cagents account allowance --session "$SESSION" --json
 cagents --device fw16 account allowance --session "$SESSION" --json
 ```
 
+These device operations are user-only. A CLI launched with a hosted agent's
+session authority keeps that authenticated role and is refused; `--authorize`
+does not change the caller's role. Failed authentication never falls back to a
+user connection.
+
 Use the exact native session UUID on that device. The command does not start or
 resume a provider, submit a prompt, compact context, or stop work. Its result
 includes provider account identity, allowance windows, reset-credit count and
