@@ -10,6 +10,8 @@ use cosmic::{
     iced::{Event, Length, Rectangle, Size, Vector, mouse},
 };
 
+struct Ticket(u64);
+
 struct Dialog<'a> {
     ticket: u64,
     content: Element<'a, Action>,
@@ -19,18 +21,18 @@ pub(super) fn scoped(ticket: u64, content: Element<'_, Action>) -> Element<'_, A
 }
 impl Widget<Action, Theme, Renderer> for Dialog<'_> {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<u64>()
+        tree::Tag::of::<Ticket>()
     }
     fn state(&self) -> tree::State {
-        tree::State::new(self.ticket)
+        tree::State::new(Ticket(self.ticket))
     }
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(self.content.as_widget())]
     }
     fn diff(&mut self, tree: &mut Tree) {
-        let ticket = tree.state.downcast_mut::<u64>();
-        if *ticket != self.ticket {
-            *ticket = self.ticket;
+        let ticket = tree.state.downcast_mut::<Ticket>();
+        if ticket.0 != self.ticket {
+            ticket.0 = self.ticket;
             tree.children = self.children();
         } else {
             tree.children[0].diff(self.content.as_widget_mut());
