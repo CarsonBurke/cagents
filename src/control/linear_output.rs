@@ -72,26 +72,27 @@ mod tests {
     #[test]
     fn readable_linear_collections_have_headers_and_explicit_empty_states() {
         let cases = [
-            (List::Issues, "ISSUE", "No Linear issues"),
-            (List::Comments, "COMMENT", "No Linear comments"),
-            (List::Attachments, "ATTACHMENT", "No Linear attachments"),
-            (List::Relations, "RELATION", "No Linear relations"),
-            (List::Teams, "TEAM", "No Linear teams"),
-            (List::States, "STATE", "No Linear states"),
-            (List::Labels, "LABEL", "No Linear labels"),
-            (List::Members, "MEMBER", "No Linear members"),
-            (List::Projects, "PROJECT", "No Linear projects"),
+            (List::Issues, "ISSUE", "No Linear issues", "ENG-7"),
+            (List::Comments, "COMMENT", "No Linear comments", "Comment text"),
+            (List::Attachments, "ATTACHMENT", "No Linear attachments", "https://example.invalid"),
+            (List::Relations, "RELATION", "No Linear relations", "ENG-8"),
+            (List::Teams, "TEAM", "No Linear teams", "A name"),
+            (List::States, "STATE", "No Linear states", "started"),
+            (List::Labels, "LABEL", "No Linear labels", "A name"),
+            (List::Members, "MEMBER", "No Linear members", "member@example.invalid"),
+            (List::Projects, "PROJECT", "No Linear projects", "https://example.invalid"),
         ];
         let row = json!({"id":"id1","identifier":"ENG-7","title":"Fix it","name":"A name","key":"ENG","type":"started","url":"https://example.invalid","email":"member@example.invalid","priority":2,"state":{"name":"In progress"},"assignee":null,"user":{"name":"Writer"},"body":"Comment text","issue":{"identifier":"ENG-7"},"relatedIssue":{"identifier":"ENG-8"}});
-        for (kind, header, empty) in cases {
+        for (kind, header, empty, expected) in cases {
             assert_eq!(render(kind, &json!({"nodes":[]})), empty);
             let result = render(kind, &json!({"nodes":[row.clone()]}));
             assert!(result.starts_with(header), "{kind:?}: {result}");
-            assert!(result.lines().count() == 2);
+            assert_eq!(result.lines().count(), 2);
+            assert!(result.contains(expected), "{kind:?}: {result}");
             for debug in ["Some(", "None", "{ ", "_ms"] { assert!(!result.contains(debug)); }
         }
         let issues = render(List::Issues, &json!({"nodes":[row]}));
-        assert!(issues.contains("In progress") && issues.contains("high") && issues.contains("unassigned"));
+        assert_eq!(issues, "ISSUE  TITLE   STATE        PRIORITY  ASSIGNEE\nENG-7  Fix it  In progress  high      unassigned");
     }
 
     #[test]
