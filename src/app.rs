@@ -13970,7 +13970,12 @@ impl Application for Cagents {
             }
             Message::OperationRecovery(action) => {
                 let task = self.operation_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner).update(action);
-                task.map(Message::OperationRecovery).map(cosmic::Action::App)
+                
+                let mut tasks = vec![task.map(Message::OperationRecovery).map(cosmic::Action::App)];
+                for (card, runtime) in &mut self.cards {
+                    if let CardRuntime::Repository(runtime) = runtime { tasks.push(repository_task(runtime.reconcile_operation_recovery(*card))); }
+                }
+                Task::batch(tasks)
             }
             Message::Repository(action) => {
                 self.retain_repository_operation(&action);

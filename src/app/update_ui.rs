@@ -442,6 +442,8 @@ impl Cagents {
     }
 
     pub(super) fn window_update_blocker(&self) -> Option<&'static str> {
+        if self.operation_recovery_pending() { return Some("Finish or resolve retained file operations before updating this window."); }
+
         if self.other_modal_is_open()
             || self.has_active_worktree_operations()
             || self.project_ui.deletion_running()

@@ -3406,7 +3406,10 @@ impl Application for Editor {
                 }
                 Message::OperationRecovery(action) => {
                     let task = self.operation_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner).update(action);
-                    task.map(Message::OperationRecovery).map(cosmic::Action::App)
+                    
+                    let mut tasks = vec![task.map(Message::OperationRecovery).map(cosmic::Action::App)];
+                    for tab in &mut self.tabs { tasks.push(repository_task(tab.runtime.reconcile_operation_recovery(tab.id))); }
+                    Task::batch(tasks)
                 }
                 Message::Repository(action) => {
                     self.retain_repository_operation(&action);

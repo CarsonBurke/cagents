@@ -824,6 +824,7 @@ struct EditorDocument {
     conflict: bool,
     error: Option<String>,
     durability_warning: Option<String>,
+    cleanup_recovery: Option<crate::recovery_authority::RecoveryAuthority>,
     /// Undo and redo for this buffer. It lives exactly as long as the buffer:
     /// a document loaded afresh starts a history of its own.
     history: History,
@@ -880,6 +881,7 @@ impl EditorDocument {
             conflict: false,
             error: None,
             durability_warning: None,
+            cleanup_recovery: None,
             history: History::default(),
             #[cfg(test)]
             history_time: None,
@@ -2206,6 +2208,15 @@ impl RepositoryRuntime {
     }
     pub fn has_editor_recovery(&self) -> bool {
         self.editor_recovery.as_ref().is_some_and(|authority| !authority.is_resolved())
+    }
+    pub fn reconcile_operation_recovery(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if let DocumentState::Editable(document) = &mut self.document
+            && document.cleanup_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) {
+            document.cleanup_recovery = None;
+            document.durability_warning = None;
+        }
+        if self.editor_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) { self.editor_recovery = None; }
+        self.auto_save_task(card)
     }
     pub fn retire_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) {
         if ticket == self.next_auto_save_ticket && self.accepts_selected(identity)
@@ -5336,9 +5347,14 @@ impl RepositoryRuntime {
                 self.request_save_inner(identity.card, false, false)
             }
             RepositoryAction::RetainedSaveFinished { identity, ticket, revision, saved_text, result } => {
+                let cleanup = result.as_ref().ok().and_then(|outcome| outcome.recovery_authority()).cloned();
+                let owns_snapshot = matches!(&self.document, DocumentState::Editable(document)
+                    if document.active_save.as_ref().is_some_and(|active| active.id == ticket && active.identity == identity && active.revision == revision && active.snapshot == saved_text));
                 let result = result.map(|outcome| outcome.into_parts().0)
                     .map_err(|error| FileIoError::Io(error.to_string()));
-                self.update_inner(RepositoryAction::SaveFinished { identity, ticket, revision, saved_text, result })
+                let task = self.update_inner(RepositoryAction::SaveFinished { identity, ticket, revision, saved_text, result });
+                if owns_snapshot && let DocumentState::Editable(document) = &mut self.document { document.cleanup_recovery = cleanup; }
+                task
             }
             RepositoryAction::SaveFinished {
                 identity,
