@@ -122,6 +122,10 @@ impl NativePreimage {
     /// Only after the original source and both Trash directories are synced.
     /// Payload identity is never reopened or released here.
     #[cfg(test)]
+    pub(super) fn matches_recorded_metadata(&self, expected: &fs::Metadata) -> bool {
+        same_version(&self.metadata, expected)
+    }
+    #[cfg(test)]
     pub(super) fn has_source_parent(&self) -> bool {
         self.parent.is_some()
     }

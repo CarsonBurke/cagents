@@ -837,16 +837,19 @@ impl Owner {
             // An uncertain post-rename observation verifies the SAME original
             // bytes/access and only the ctime introduced by our recorded move.
             self.validate_native()?;
-            self.preimage
-                .verify_at(&self.files, &self.id, true, &CancellationToken::new())?;
             if self.restore_parent.is_some() {
                 // The original discard/source sync was already settled and
                 // compacted. This Undo installed a new holding but never
                 // acquired the native payload. Dispose only that empty H;
                 // the original native entry remains available for Undo.
+                // No payload rename was dispatched by this Undo. Preserve
+                // the settled original version, including ctime.
+                self.preimage.verify_at(&self.files, &self.id, false, &CancellationToken::new())?;
                 self.verify_info(&self.info, &self.info_name, false)?;
                 return self.remove_empty_holding();
             }
+            self.preimage
+                .verify_at(&self.files, &self.id, true, &CancellationToken::new())?;
             return self.finish_trash();
         }
         if self.payload_in_holding {
@@ -1290,6 +1293,7 @@ mod tests {
 
     #[test]
     fn native_compact_receipt_resolves_preacquisition_undo_failure_then_retries_same_public_undo() {
+        for change_settled_payload_ctime in [false, true] {
         let source = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let base = RepositoryService::system("git");
@@ -1343,6 +1347,24 @@ mod tests {
             assert!(owner.payload_in_trash);
             assert!(!owner.preimage.has_source_parent());
         }
+        if change_settled_payload_ctime {
+            let pin = receipt.owner.lock().unwrap().preimage.payload();
+            let settled = pin.metadata().unwrap();
+            pin.set_permissions(fs::Permissions::from_mode((settled.mode() & 0o7777) ^ 0o100)).unwrap();
+            pin.set_permissions(settled.permissions()).unwrap();
+            let changed = pin.metadata().unwrap();
+            assert_eq!(changed.mode(), settled.mode());
+            assert_ne!((changed.ctime(), changed.ctime_nsec()), (settled.ctime(), settled.ctime_nsec()));
+            for _ in 0..2 {
+                assert!(service.resolve_discard_recovery(&recovery, &CancellationToken::new()).is_err());
+                assert!(receipt.owner.lock().unwrap().preimage.matches_recorded_metadata(&settled));
+                assert_eq!(recovery.remaining_paths(), 1);
+                assert!(recovery.live_recovery.needs_resolution());
+                assert!(!confirmed_restore(&receipt));
+                assert!(!file.exists());
+            }
+            continue;
+        }
         let resolved = service.resolve_discard_recovery(&recovery, &CancellationToken::new()).unwrap();
         assert_eq!(resolved.remaining_paths, 1);
         assert!(!recovery.live_recovery.needs_resolution());
@@ -1358,6 +1380,7 @@ mod tests {
         assert_eq!((restored.dev(), restored.ino()), (original.dev(), original.ino()));
         assert_eq!(fs::read_dir(data.path().join("Trash/files")).unwrap().count(), 0);
         assert_eq!(fs::read_dir(data.path().join("Trash/info")).unwrap().count(), 0);
+        }
     }
 
     #[test]
