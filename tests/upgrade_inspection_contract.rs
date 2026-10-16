@@ -17,7 +17,7 @@ use std::{
     fs,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::fs::{DirBuilderExt, MetadataExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -256,12 +256,86 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             .trim()
             .parse::<u32>()
             .map_err(|e| e.to_string())?;
+        #[derive(serde::Deserialize)]
+        struct Epoch {
+            pid: u32,
+            start: u64,
+        }
+        #[derive(serde::Deserialize)]
+        struct OriginalHolder {
+            terminal: TerminalId,
+            application: String,
+            boot: cagents::model::BootId,
+            root: Epoch,
+            holder: Epoch,
+        }
+        let record_path = socket
+            .parent()
+            .unwrap()
+            .join("holders")
+            .join(format!("{id}.json"));
+        let mut record_file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(record_path)
+            .map_err(|e| e.to_string())?;
+        let record_stat = record_file.metadata().map_err(|e| e.to_string())?;
+        if !record_stat.is_file()
+            || record_stat.uid() != unsafe { libc::geteuid() }
+            || record_stat.mode() & 0o077 != 0
+            || record_stat.len() > 16 * 1024
+        {
+            return Err("original private holder record is unsafe".into());
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(&mut record_file, 16 * 1024 + 1),
+            &mut bytes,
+        )
+        .map_err(|e| e.to_string())?;
+        if bytes.len() > 16 * 1024 {
+            return Err("original private holder record exceeds limit".into());
+        }
+        let record: OriginalHolder = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if record.terminal != id
+            || record.application != cagents::instance::APPLICATION_ID
+            || record.boot != original_proof.boot_id
+            || record.root.pid != pid
+            || pid <= 1
+        {
+            return Err("shell hint does not name the actual original holder root".into());
+        }
+        let original_birth = record.root.start.to_string();
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         if raw < 0 {
             return Err("cannot retain original private shell pidfd".into());
         }
-        let pidfd = ShellOwner(unsafe { OwnedFd::from_raw_fd(raw as i32) });
-        let original_birth = birth(pid)?;
+        // This is read-only until the acquired epoch is positively bound below.
+        let acquired = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
+        let parent = stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u32>().ok());
+        let argv = fs::read(format!("/proc/{pid}/cmdline")).map_err(|e| e.to_string())?;
+        let mut expected = saved.launch.program.as_bytes().to_vec();
+        expected.push(0);
+        for argument in &saved.launch.arguments {
+            expected.extend_from_slice(argument.as_bytes());
+            expected.push(0);
+        }
+        if !live(&acquired)
+            || birth(pid)? != original_birth
+            || parent != Some(record.holder.pid)
+            || birth(record.holder.pid)? != record.holder.start.to_string()
+            || fs::read_link(format!("/proc/{pid}/cwd")).map_err(|e| e.to_string())? != root
+            || argv != expected
+            || birth(pid)? != original_birth
+            || !live(&acquired)
+        {
+            return Err("acquired process is not the original private fixture shell".into());
+        }
+        let pidfd = ShellOwner(acquired);
         let tty = fs::metadata(format!("/proc/{pid}/fd/0")).map_err(|e| e.to_string())?;
         let tty_stamp = (tty.dev(), tty.ino(), tty.rdev());
         let mut workspace = WorkspaceState::default();
