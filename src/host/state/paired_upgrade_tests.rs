@@ -798,14 +798,46 @@ fn run_effective_holder(failed_native: bool) {
         proof = make_proof(generation + 1);
         lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
         if failed_native {
-            restore_missing_native_with_carried_scope(
-                &root,
-                &issued,
-                &effective,
-                &previous_proof,
-                &proof,
-                &original,
-            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                restore_missing_native_with_carried_scope(
+                    &root,
+                    &issued,
+                    &effective,
+                    &previous_proof,
+                    &proof,
+                    &original,
+                );
+            }));
+            // A failed assertion must not abandon the holder deliberately
+            // detached above. Reclaim only this original owner through the
+            // normal authenticated successor path, then close it normally.
+            if original.root.is_current() {
+                let cleanup = (|| -> Result<(), String> {
+                    let (mut recovery, _) =
+                        crate::terminal::inspect_holder(&socket, &original, &proof)?;
+                    recovery.previous_sources.push(recovery.source.clone());
+                    recovery.source.continuity = continuity(&proof);
+                    let cleanup = TerminalHandle::spawn_with_execution(
+                        recovery.source.clone(),
+                        TerminalConfig {
+                            holder_recovery: Some(recovery),
+                            adoption: Some(socket.clone()),
+                            initially_visible: false,
+                            ..Default::default()
+                        },
+                        Some(effective.clone()),
+                        |_| {},
+                    )
+                    .map_err(|error| error.to_string())?;
+                    cleanup.shutdown().map_err(|error| error.to_string())
+                })();
+                if let Err(error) = cleanup {
+                    eprintln!("original carried fixture owner remains unresolved: {error}");
+                }
+            }
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
             return;
         }
         let (mut recovery, _) =
@@ -906,6 +938,9 @@ fn restore_missing_native_with_carried_scope(
     let store = Store::open(&store_root).unwrap();
     store.save(&checkpoint).unwrap();
     let restored = Arc::new(HostLock::new(HostState::new(proof.clone())));
+    // Match host::run: retained-holder adoption is explicitly enabled before
+    // reading the upgrade checkpoint, rather than silently omitting Recovery.
+    restored.lock().unwrap().enable_holder_recovery();
     let holders = crate::terminal::holder::directory().unwrap();
     let proc_root = root.join("empty-proc");
     fs::create_dir(&proc_root).unwrap();
