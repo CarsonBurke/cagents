@@ -153,7 +153,7 @@ impl State {
         }
         let message = if authority.is_some() { self.message.clone() }
         else if self.operations.values().any(|operation| operation.interrupted) {
-            "A file worker ended without a confirmed result. Keep this window open; the original operation is still retained.".into()
+            "A file operation did not report a result. Closing is blocked because its disk state is unknown.".into()
         } else { "Finishing file operations…".into() };
         let mut controls = vec![crate::design::body(message).width(cosmic::iced::Length::Fill).into()];
         if let Some(authority) = authority {
