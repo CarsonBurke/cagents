@@ -7359,6 +7359,14 @@ impl Cagents {
         // Attention belongs to the native parent. Reveal its transcript before
         // acknowledging it, but only after navigation has actually succeeded.
         let (transcript, read) = if self.workspace.focused() == Some(id) {
+            let row = channel.map(sidebar::SelectionRow::Channel).or_else(|| {
+                self.agent_worktree(id).map(|key| {
+                    sidebar::SelectionRow::Worktree(key.project_id, key.worktree_id)
+                })
+            });
+            if let Some(row) = row {
+                self.sidebar_state.navigate_attention(row);
+            }
             let parent = match self.cards.get(&id) {
                 Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
                 _ => None,
@@ -7373,10 +7381,27 @@ impl Cagents {
         Task::batch([scope, focus, transcript, read])
     }
 
+    fn retain_attention_for_read(&mut self, card: CardId) {
+        if !self.sidebar_state.has_card_update(card)
+            && self.sidebar_state.card_activity(card).is_none_or(|activity| {
+                activity.state != crate::agent::ActivityState::Waiting
+            })
+        {
+            return;
+        }
+        self.sidebar_state.retain_card_attention(card);
+        if let Some(channel) = self.durable.channels.iter()
+            .find(|channel| channel.cards.contains(&card))
+        {
+            self.sidebar_state.retain_attention_channel(channel.id);
+        }
+    }
+
     fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
         let tasks: Vec<_> = cards
             .into_iter()
             .map(|card| {
+                self.retain_attention_for_read(card);
                 self.sidebar_state.acknowledge_agent_update(card);
                 self.acknowledge_card_notices(card);
                 if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
@@ -7408,6 +7433,7 @@ impl Cagents {
         if !self.sidebar_state.has_card_update(card) {
             return Task::none();
         }
+        self.retain_attention_for_read(card);
         self.sidebar_state.acknowledge_agent_update(card);
         if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
             && let Err(error) = handle.acknowledge_updates()
@@ -14254,6 +14280,7 @@ impl Application for Cagents {
                     _ => None,
                 };
                 if let Some(row) = opened {
+                    self.sidebar_state.navigate_attention(row);
                     self.select_sidebar_rows(row, sidebar::SelectionIntent::Navigate);
                 }
                 match action {
