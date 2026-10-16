@@ -12049,9 +12049,29 @@ impl Cagents {
     }
 
     fn activate_main_window(&self, token: Option<String>) -> Task<Message> {
-        iced::Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Activate(
-            token.unwrap_or_default(),
-        )))
+        self.activate_main_window_on_backend(cosmic::app::cosmic::windowing_system(), token)
+    }
+
+    fn activate_main_window_on_backend(
+        &self,
+        backend: Option<cosmic::app::cosmic::WindowingSystem>,
+        token: Option<String>,
+    ) -> Task<Message> {
+        let Some(window) = self.core.main_window_id() else {
+            return Task::none();
+        };
+        if backend == Some(cosmic::app::cosmic::WindowingSystem::Wayland) {
+            // Preserve the compositor's token decision on an actual Wayland
+            // surface. Compiling Wayland support does not make an X11 window
+            // capable of receiving that platform-specific activation command.
+            iced::Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Activate(
+                token.unwrap_or_default(),
+            )))
+        } else {
+            iced::window::minimize(window, false)
+                .chain(iced::window::gain_focus(window))
+                .map(cosmic::Action::App)
+        }
     }
 
     fn window_close_transient_blocker(&self) -> Option<&'static str> {
@@ -26326,6 +26346,62 @@ mod tests {
         assert_eq!(app.workspace.take_widget_focus_request(), None);
         let _ = app.apply_viewport(update, true, false);
         assert_ne!(app.workspace.focused(), Some(first));
+    }
+
+    #[test]
+    fn notification_activation_unminimizes_and_focuses_actual_x11_window() {
+        use cosmic::app::cosmic::WindowingSystem;
+        use iced::runtime::{Action, window::Action as WindowAction};
+        let mut app = context_inspector_test_app(true);
+        let window = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(window));
+        for backend in [
+            Some(WindowingSystem::Xlib),
+            Some(WindowingSystem::Xcb),
+            None,
+        ] {
+            let task = app.activate_main_window_on_backend(backend, Some("portal-token".into()));
+            let stream = iced::runtime::task::into_stream(task).unwrap();
+            let effects = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(stream.collect::<Vec<_>>());
+            assert_eq!(effects.len(), 2);
+            assert!(
+                matches!(effects[0], Action::Window(WindowAction::Minimize(id, false)) if id == window)
+            );
+            assert!(
+                matches!(effects[1], Action::Window(WindowAction::GainFocus(id)) if id == window)
+            );
+        }
+    }
+
+    #[test]
+    fn notification_activation_keeps_actual_wayland_token_and_refusal_semantics() {
+        use cosmic::app::cosmic::WindowingSystem;
+        let mut app = context_inspector_test_app(true);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        for token in [Some("portal-token".to_owned()), None] {
+            let expected = token.clone().unwrap_or_default();
+            let task = app.activate_main_window_on_backend(Some(WindowingSystem::Wayland), token);
+            let stream = iced::runtime::task::into_stream(task).unwrap();
+            let effects = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(stream.collect::<Vec<_>>());
+            assert_eq!(effects.len(), 1);
+            assert!(
+                matches!(&effects[0], iced::runtime::Action::Output(cosmic::Action::Cosmic(cosmic::app::Action::Activate(actual))) if actual == &expected)
+            );
+        }
+        app.core.set_main_window_id(None);
+        assert!(
+            iced::runtime::task::into_stream(app.activate_main_window_on_backend(
+                Some(WindowingSystem::Wayland),
+                Some("portal-token".into())
+            ))
+            .is_none()
+        );
     }
 
     pub(super) fn task_app_message(task: Task<Message>) -> Message {
