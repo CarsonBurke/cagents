@@ -3064,6 +3064,19 @@ impl SidebarState {
         self.retained_attention.retain(|retained| *retained == row);
     }
 
+    pub(crate) fn unread_updates(&self) -> &BTreeMap<CardId, Option<(ProjectId, WorktreeId)>> {
+        &self.agent_updates
+    }
+
+    pub(crate) fn restore_unread_updates(
+        &mut self,
+        updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
+    ) {
+        // Restore through the same counter and projection invalidation path
+        // as a live read/update; a raw assignment would lose saved badges.
+        self.restore_agent_updates(updates);
+    }
+
     pub fn has_card_update(&self, card: CardId) -> bool {
         self.agent_updates.contains_key(&card)
     }
