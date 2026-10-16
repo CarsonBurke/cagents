@@ -3130,6 +3130,10 @@ impl SidebarState {
         // Count it once, and refuse conflicting project attribution.
         let mut conversations: BTreeMap<_, Option<(ProjectId, Option<WorktreeId>, AttentionSummary)>> = BTreeMap::new();
         for card in durable.cards.iter().filter(|card| card.existence.is_open()) {
+            let summary = self.card_attention(card.id);
+            // Inventory-only draft aliases carry no attention evidence. They
+            // cannot veto the canonical card selected by journal attribution.
+            if summary == AttentionSummary::default() { continue; }
             let owner = if let Some(channel) = channels.get(&card.id) {
                 channel.map(|owner| owner.0)
             } else if let Some(scope) = durable.card_scopes.get(&card.id) {
@@ -3146,7 +3150,6 @@ impl SidebarState {
                 crate::model::CardKind::Terminal(session) => (0, session.id.as_uuid()),
                 _ => (1, card.id.as_uuid()),
             };
-            let summary = self.card_attention(card.id);
             conversations.entry(resource).and_modify(|old| {
                 if let Some((project, current_worktree, current)) = old {
                     if *project != owner { *old = None; }
@@ -5564,8 +5567,15 @@ fn compact_project_identity(
                 worktree.behind
             )
         );
+        let mut worktree_attention = state.worktree_attention(project.id, worktree.id);
         if attention.waiting_worktrees.contains(&worktree.id) {
             description.push_str(", agent needs input");
+            worktree_attention.waiting = 0;
+        }
+        let news = worktree_attention.description();
+        if !news.is_empty() {
+            description.push_str(", ");
+            description.push_str(&news);
         }
     }
     let news = attention.summary.description();
@@ -11585,6 +11595,9 @@ pub(crate) mod tests {
         assert_eq!(channel.attention.state(), state.worktree_attention(project.id, worktree).state());
         let names = accessible_names(&headless_renderer(), compact_project_identity(&project, false, false, &state));
         assert!(names.iter().any(|name| name.contains("3 unread conversations") && name.contains("unread failed updates")), "{names:?}");
+        let prefix = format!("{}:", project.worktrees[0].label());
+        assert!(names.iter().any(|name| name.lines().any(|line|
+            line.starts_with(&prefix) && line.contains("unread failed updates"))), "{names:?}");
         state.set_agent_activity(waiting, project.id, worktree, Activity { provider: Provider::Claude, state: ActivityState::Waiting });
         assert_eq!(state.project_attention(project.id).state(), Some(AttentionState::Waiting));
         assert_eq!(state.worktree_attention(project.id, worktree).state(), Some(AttentionState::Waiting));

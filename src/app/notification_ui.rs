@@ -2649,6 +2649,62 @@ mod tests {
     }
 
     #[test]
+    fn compact_attention_empty_foreign_draft_alias_cannot_erase_canonical_failed_news() {
+        use crate::workspace_model::views::{Pane, View};
+        let (mut app, agent) = scheduled_attention_fixture();
+        let session = agent.console.as_ref().unwrap().id;
+        let canonical = CardId::from_uuid(agent.id.as_uuid());
+        let channel = match &agent.placement {
+            crate::agent_execution::Placement::Channel(channel) => *channel,
+            _ => unreachable!(),
+        };
+        let project = app.durable.channels[0].project_id;
+        app.workspace_model.agents.push(agent.clone());
+        drop(app.adopt_execution_agent(&agent).unwrap());
+        let card = app.card_state(canonical).unwrap().clone();
+        app.workspace_model.views = vec![View { scope: agent.placement.clone(), revision: 1,
+            panes: vec![Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap()], retired: vec![] }];
+        let mut alias = card.clone(); alias.id = CardId::new();
+        let alias_id = alias.id;
+        let foreign = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(foreign, RepositoryId::new(),
+            "Legacy inventory".into(), "/foreign".into(), Vec::new(), Vec::new()));
+        let mut foreign_channel = app.durable.channels[0].clone();
+        foreign_channel.id = ChannelId::new(); foreign_channel.project_id = foreign;
+        foreign_channel.shared = false; foreign_channel.cards = vec![alias_id]; foreign_channel.focused = None;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.insert(0, alias);
+        durable.channels.push(foreign_channel);
+        app.chat_ui = chat_ui::State::with_drafts(HashMap::from([
+            (alias_id, "Keep alias draft".into()), (canonical, "Keep canonical draft".into()),
+        ]));
+        app.acknowledge_view_edit(agent.placement.clone(), None);
+        drop(app.reconcile_shared_views());
+        assert!(app.shared_views.blocked.contains(&agent.placement));
+        assert!(app.card_state(alias_id).unwrap().existence.is_open());
+        assert_eq!(app.sidebar_state.card_attention(alias_id), sidebar::AttentionSummary::default());
+        app.refresh_ui.focused = false;
+        let mut snapshot = attention_snapshot(session);
+        snapshot.notices[0].event.evidence.kind = crate::notifications::Kind::Failed;
+        let notice = snapshot.notices[0].id;
+        drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 1);
+        assert_eq!(app.sidebar_state.project_attention(project).failed, 1);
+        assert_eq!(app.sidebar_state.project_attention(foreign), sidebar::AttentionSummary::default());
+        assert!(!app.sidebar_state.has_card_update(alias_id));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        drop(app.update_notifications(Action::Snapshot(snapshot)));
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 0);
+        assert_eq!(app.sidebar_state.project_attention(project).failed, 0);
+        assert!(app.notification_ui.acknowledged_for_test(notice));
+        assert!(app.card_state(alias_id).unwrap().existence.is_open());
+        let saved = app.persistent_workspace();
+        let drafts = &saved.chat_drafts;
+        assert_eq!(drafts.get(&alias_id).map(String::as_str), Some("Keep alias draft"));
+        assert_eq!(drafts.get(&canonical).map(String::as_str), Some("Keep canonical draft"));
+    }
+
+    #[test]
     fn notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot() {
         use super::super::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::views::{Pane, View};
