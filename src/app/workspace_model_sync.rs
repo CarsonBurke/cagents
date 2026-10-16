@@ -2503,6 +2503,7 @@ mod tests {
                     .find(|view| view.scope == scope)
                     .unwrap();
                 view.apply(&Change::Remove { id: card }).unwrap();
+                view.revision += 1;
                 drop(app.apply_workspace_model_update(ModelUpdate::Read(removed.clone())));
                 drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
                     scope: scope.clone(),
