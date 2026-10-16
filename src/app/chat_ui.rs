@@ -15376,6 +15376,13 @@ mod tests {
         ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            // This assertion observes the presented history. Hidden panes
+            // intentionally keep no rendered snapshot until they are shown.
+            app.workspace.resize_viewport(1_600.0);
+            assert_eq!(
+                app.workspace.visibility(card),
+                Some(VisibilityClass::Visible)
+            );
             let mut source = chat_runtime(&app, card).session.clone();
             if codex_resume || legacy_paired {
                 source.launch.provider = Provider::Codex;
