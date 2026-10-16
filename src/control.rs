@@ -26,8 +26,8 @@ pub use agents::AgentCommand;
 mod automations;
 mod completions;
 pub use automations::AutomationCommand;
-mod terminal_list;
 mod sessions;
+mod terminal_list;
 pub use sessions::SessionsArgs;
 mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
@@ -2961,8 +2961,12 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         }
         TerminalCommand::Show { terminal_id } => {
             let terminals = client.list().map_err(protocol_error)?;
-            let terminal = terminals.iter().find(|terminal| terminal.session.id == terminal_id)
-                .ok_or_else(|| AppError::new("not_found", format!("Unknown terminal {terminal_id}")))?;
+            let terminal = terminals
+                .iter()
+                .find(|terminal| terminal.session.id == terminal_id)
+                .ok_or_else(|| {
+                    AppError::new("not_found", format!("Unknown terminal {terminal_id}"))
+                })?;
             Ok(terminal_list::show(terminal, client.proof()))
         }
         TerminalCommand::Spawn { cwd, argv } => {

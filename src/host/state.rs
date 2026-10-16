@@ -4034,8 +4034,12 @@ fn record_event_from(
         record.event_sequence = record.event_sequence.saturating_add(1);
         let sequence = record.event_sequence;
         if let WireTerminalEvent::TitleChanged { title } = &wire_event {
-            record.display_title = Some(title.chars()
-                .take(crate::terminal_ipc::MAX_TERMINAL_TITLE_CHARACTERS).collect());
+            record.display_title = Some(
+                title
+                    .chars()
+                    .take(crate::terminal_ipc::MAX_TERMINAL_TITLE_CHARACTERS)
+                    .collect(),
+            );
         }
         if let WireTerminalEvent::ConversationTitleChanged { title } = &wire_event {
             record.conversation_title = Some((sequence, title.clone()));
@@ -6133,35 +6137,82 @@ for line in sys.stdin:
     fn terminal_descriptor_retains_only_native_display_title_after_event_eviction() {
         let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let recipe = crate::model::LaunchRecipe {
-            unset_environment: Default::default(), program: "/bin/cat".into(), arguments: vec![],
-            working_directory: "/".into(), environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+            program: "/bin/cat".into(),
+            arguments: vec![],
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
         };
         let id = TerminalId::new();
-        let session = TerminalSession { id, recovery_origin: None, predecessor: None,
-            owned_codex_listener: None, launch: recipe.clone(), transcript_path: None, resume_hint: None,
-            continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None } };
-        let handle = TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
-        shared.lock().unwrap().finish_spawn(1, session, handle.clone(), false).unwrap();
+        let session = TerminalSession {
+            id,
+            recovery_origin: None,
+            predecessor: None,
+            owned_codex_listener: None,
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .finish_spawn(1, session, handle.clone(), false)
+            .unwrap();
         let weak = Arc::downgrade(&shared);
         let observations = (|| -> Result<_, ProtocolError> {
             let initial = shared.lock().unwrap().descriptor(1, id)?.title;
-            record_event(&weak, id, TerminalEvent::ConversationTitleChanged("Provider conversation".into()));
+            record_event(
+                &weak,
+                id,
+                TerminalEvent::ConversationTitleChanged("Provider conversation".into()),
+            );
             let provider_only = shared.lock().unwrap().descriptor(1, id)?.title;
-            record_event_from(&weak, id, TerminalEvent::TitleChanged("界".repeat(300)), Some(&handle));
-            for _ in 0..EVENT_REPLAY_CAPACITY { record_event(&weak, id, TerminalEvent::Bell); }
+            record_event_from(
+                &weak,
+                id,
+                TerminalEvent::TitleChanged("界".repeat(300)),
+                Some(&handle),
+            );
+            for _ in 0..EVENT_REPLAY_CAPACITY {
+                record_event(&weak, id, TerminalEvent::Bell);
+            }
             let (retained, evicted) = {
                 let state = shared.lock().unwrap();
-                (state.list(1).into_iter().find(|row| row.session.id == id).unwrap().title,
-                    state.replay_events(id, 0)?.iter().all(|(_, event)| !matches!(event, WireTerminalEvent::TitleChanged { .. })))
+                (
+                    state
+                        .list(1)
+                        .into_iter()
+                        .find(|row| row.session.id == id)
+                        .unwrap()
+                        .title,
+                    state
+                        .replay_events(id, 0)?
+                        .iter()
+                        .all(|(_, event)| !matches!(event, WireTerminalEvent::TitleChanged { .. })),
+                )
             };
-            record_event_from(&weak, id, TerminalEvent::TitleChanged(String::new()), Some(&handle));
+            record_event_from(
+                &weak,
+                id,
+                TerminalEvent::TitleChanged(String::new()),
+                Some(&handle),
+            );
             let cleared = shared.lock().unwrap().descriptor(1, id)?.title;
             Ok((initial, provider_only, retained, evicted, cleared))
         })();
         handle.shutdown().unwrap();
         let (initial, provider_only, retained, evicted, cleared) = observations.unwrap();
         assert_eq!(initial, None);
-        assert_eq!(provider_only, None, "provider conversation titles are a different observation");
+        assert_eq!(
+            provider_only, None,
+            "provider conversation titles are a different observation"
+        );
         assert_eq!(retained, Some("界".repeat(256)));
         assert!(evicted, "the title must survive actual transition eviction");
         assert_eq!(cleared, Some(String::new()));
@@ -6171,22 +6222,47 @@ for line in sys.stdin:
     fn terminal_descriptor_title_comes_from_an_actual_pty_osc_event() {
         let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let recipe = crate::model::LaunchRecipe {
-            unset_environment: Default::default(), program: "/bin/sh".into(),
-            arguments: vec!["-c".into(), "printf '\\033]2;Native terminal title\\007'; exec /bin/cat".into()],
-            working_directory: "/".into(), environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "printf '\\033]2;Native terminal title\\007'; exec /bin/cat".into(),
+            ],
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
         };
         let id = TerminalId::new();
-        let session = TerminalSession { id, recovery_origin: None, predecessor: None,
-            owned_codex_listener: None, launch: recipe.clone(), transcript_path: None, resume_hint: None,
-            continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None } };
+        let session = TerminalSession {
+            id,
+            recovery_origin: None,
+            predecessor: None,
+            owned_codex_listener: None,
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
         let (_, handle) = spawn_terminal_view_owned(
-            &shared, 1, session, TerminalSpawnOptions::default(), None, false,
-        ).unwrap();
+            &shared,
+            1,
+            session,
+            TerminalSpawnOptions::default(),
+            None,
+            false,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let observation = (|| -> Result<_, String> {
             loop {
-                let title = shared.lock().unwrap().descriptor(1, id)
-                    .map_err(|error| error.to_string())?.title;
+                let title = shared
+                    .lock()
+                    .unwrap()
+                    .descriptor(1, id)
+                    .map_err(|error| error.to_string())?
+                    .title;
                 if title.as_deref() == Some("Native terminal title") {
                     return Ok(title);
                 }

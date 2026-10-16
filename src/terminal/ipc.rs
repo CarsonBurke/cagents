@@ -1922,21 +1922,56 @@ mod tests {
 
     #[test]
     fn terminal_title_round_trips_through_every_descriptor_carrier() {
-        for title in [None, Some(String::new()), Some("Native terminal 界".to_owned())] {
-            let mut terminal = TerminalDescriptor::relaunchable(TerminalId::new(), LaunchRecipe {
-                program: "/bin/sh".into(), arguments: vec![], working_directory: "/fixture".into(),
-                environment: Default::default(), unset_environment: Default::default(),
-            }, None);
+        for title in [
+            None,
+            Some(String::new()),
+            Some("Native terminal 界".to_owned()),
+        ] {
+            let mut terminal = TerminalDescriptor::relaunchable(
+                TerminalId::new(),
+                LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: vec![],
+                    working_directory: "/fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                None,
+            );
             terminal.title = title.clone();
             let peer = proof("title-peer", "private-boot", "private-incarnation");
             for message in [
-                ServerMessage::Response { response: ServerResponse::Connected { proof: peer.clone(), resumed: vec![terminal.clone()] } },
-                ServerMessage::Response { response: ServerResponse::Listed { terminals: vec![terminal.clone()] } },
-                ServerMessage::Response { response: ServerResponse::Spawned { terminal: terminal.clone() } },
-                ServerMessage::Response { response: ServerResponse::Attached { terminal: terminal.clone() } },
-                ServerMessage::TerminalCreated { terminal: terminal.clone() },
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: peer.clone(),
+                        resumed: vec![terminal.clone()],
+                    },
+                },
+                ServerMessage::Response {
+                    response: ServerResponse::Listed {
+                        terminals: vec![terminal.clone()],
+                    },
+                },
+                ServerMessage::Response {
+                    response: ServerResponse::Spawned {
+                        terminal: terminal.clone(),
+                    },
+                },
+                ServerMessage::Response {
+                    response: ServerResponse::Attached {
+                        terminal: terminal.clone(),
+                    },
+                },
+                ServerMessage::TerminalCreated {
+                    terminal: terminal.clone(),
+                },
             ] {
-                let envelope = ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(1), proof: peer.clone(), message };
+                let envelope = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(1),
+                    proof: peer.clone(),
+                    message,
+                };
                 let mut bytes = Vec::new();
                 write_frame(&mut bytes, &envelope).unwrap();
                 let decoded: ServerEnvelope = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
