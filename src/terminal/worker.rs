@@ -1000,6 +1000,19 @@ impl std::fmt::Debug for TerminalHandle {
 }
 
 impl TerminalHandle {
+    /// Tests retain the startup-published ORIGINAL root capability before
+    /// fallible assertions. No PID lookup or new process authority is minted.
+    #[cfg(test)]
+    pub(crate) fn original_root_pidfd_for_test(&self) -> File {
+        self.inner
+            .published
+            .shutdown_pidfd
+            .get()
+            .expect("real worker startup publishes its root capability")
+            .try_clone()
+            .unwrap()
+    }
+
     /// Warm fixed retirement resources before the daemon reports readiness.
     /// The idle baseline includes actual joins, exact-child reaping and holder
     /// cleanup; adding terminals then contributes only each emulator worker.

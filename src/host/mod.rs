@@ -12,6 +12,8 @@ mod model;
 mod notifications;
 mod service;
 mod state;
+#[cfg(test)]
+mod terminal_shutdown_tests;
 mod worktree_inspections;
 mod worktree_requests;
 mod worktree_sessions;
@@ -401,16 +403,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         });
         delivery.close_after_drain();
     }
-    for handle in &handles {
-        handle.request_shutdown();
-    }
-    for handle in handles {
-        if let Err(error) = handle.shutdown() {
-            tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
-            runtime_error = Some(io::Error::other(format!(
-                "terminal shutdown left unconfirmed ownership: {error}"
-            )));
-        }
+    if let Err(error) = finish_terminal_shutdown(handles) {
+        runtime_error = Some(error);
     }
     for client in clients {
         let _ = client.join();
@@ -419,6 +413,22 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
+}
+
+fn finish_terminal_shutdown(handles: Vec<crate::terminal::TerminalHandle>) -> io::Result<()> {
+    for handle in &handles {
+        handle.request_shutdown();
+    }
+    let mut failure = None;
+    for handle in handles {
+        if let Err(error) = handle.shutdown() {
+            tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
+            failure = Some(io::Error::other(format!(
+                "terminal shutdown left unconfirmed ownership: {error}"
+            )));
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
