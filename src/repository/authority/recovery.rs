@@ -13,6 +13,18 @@ enum RecoveryObjectCommand<'a> {
     Hash(&'a Arc<fs::File>),
 }
 
+impl WorktreeAuthority {
+    // Three retained Root descriptors plus the child scope descriptors; primary
+    // private/common share the same child Arc and are counted once. Pure/O(1).
+    pub(in crate::repository) fn recovery_descriptor_count(&self) -> usize {
+        3 + if Arc::ptr_eq(&self.child_git, &self.child_common) {
+            2
+        } else {
+            3
+        }
+    }
+}
+
 impl<E: ProcessExecutor> RepositoryService<E> {
     /// Retain the original object-store authority for one recovery operation.
     /// Recovery requires the original retained metadata authority. A later

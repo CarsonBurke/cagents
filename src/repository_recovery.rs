@@ -344,11 +344,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let root = self.captured_worktree_root(&request.worktree)?;
         let source = self.recovery_source_authority(&request.worktree, &root)?;
-        let context = crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire(
-            &root,
-            known_checkouts,
-        )
-        .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let context =
+            crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire_with_owner(
+                &root,
+                known_checkouts,
+                source.clone(),
+                source.recovery_descriptor_count(),
+            )
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
         let custody = Arc::new(DiscardCustody {
             git: self.git.clone(),
             executor: self.creation_executor.clone(),
@@ -449,6 +452,33 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         })
     }
 
+    // Recovery backups must land in the ORIGINAL object database. Do not
+    // inherit object-directory/config injections or run filters/hooks while
+    // authenticating a preimage. The canonical scoped executor reinstalls
+    // its owned original private/common roles after this command is built.
+    fn backup_object_command(
+        &self,
+        worktree: &Path,
+        args: impl IntoIterator<Item = impl Into<OsString>>,
+    ) -> CommandSpec {
+        let mut command = self
+            .git_mutation(
+                worktree,
+                ["--no-replace-objects", "-c", "core.hooksPath=/dev/null"],
+            )
+            .args(args);
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"GIT_") {
+                command = command.env_remove(name);
+            }
+        }
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
+    }
+
     /// Hash pinned regular-file descriptors in bounded batches. A mass discard
     /// uses one Git invocation per256 files rather than one per selected path.
     fn capture_recovery_entries(
@@ -522,8 +552,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     format!("/proc/{}/fd/{}\n", std::process::id(), file.as_raw_fd()).as_bytes(),
                 );
             }
-            let mut command =
-                self.git_mutation(worktree, ["hash-object", "--no-filters", "--stdin-paths"]);
+            let mut command = self
+                .backup_object_command(worktree, ["hash-object", "--no-filters", "--stdin-paths"]);
             if store {
                 command = command.arg("-w");
             }
@@ -591,7 +621,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             if store {
                 self.run_checked(
                     &self
-                        .git_mutation(worktree, ["hash-object", "-w", "--stdin"])
+                        .backup_object_command(worktree, ["hash-object", "-w", "--stdin"])
                         .stdin(target.as_os_str().as_bytes().to_vec()),
                     cancellation,
                 )
@@ -611,7 +641,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // The descriptor path pins the opened file rather than resolving its
         // worktree name again, and avoids allocating the whole file on stdin.
         let descriptor_path = format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd());
-        let mut command = self.git_mutation(worktree, ["hash-object", "--no-filters"]);
+        let mut command = self.backup_object_command(worktree, ["hash-object", "--no-filters"]);
         if store {
             command = command.arg("-w");
         }
@@ -655,6 +685,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             authority
                 .retry()
                 .map_err(|message| ValidationError::Io(message))?;
+        }
+        // A pending native source rename is completed only after retry has
+        // reverified its SAME original inode/content/access at that endpoint.
+        // No callback captures the live authority itself (avoids an Arc cycle).
+        for entry in &recovery.entries {
+            if entry
+                .trash
+                .as_ref()
+                .is_some_and(native_trash::confirmed_restore)
+            {
+                recovery.live_recovery.mark_completed(&entry.path);
+            }
         }
         recovery.live_recovery.acknowledge_resolution();
         Ok(DiscardRecoveryResolution {
@@ -798,9 +840,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 "the post-discard state could not be verified: {reason}; backup was preserved"
             ));
         }
-        let current_version = fs_safety::metadata_beneath(root, entry.path.as_path())
-            .ok()
-            .map(|metadata| metadata_version(&metadata));
+        let current_version = match fs_safety::metadata_beneath(root, entry.path.as_path()) {
+            Ok(metadata) => Some(metadata_version(&metadata)),
+            Err(cause) if cause.is_not_found() => None,
+            Err(cause) => {
+                return Err(format!(
+                    "Current source entry cannot be verified: {cause}; no entry was changed"
+                ));
+            }
+        };
         if current_version != entry.after_version {
             return Err("changed since discard; newer work was preserved".into());
         }
@@ -1054,13 +1102,6 @@ fn open_directory_sync_handle(root: &fs_safety::Root) -> io::Result<fs::File> {
 }
 
 impl RecoveryDirectoryFrontier {
-    #[cfg(test)]
-    fn new(root: &fs_safety::Root) -> Self {
-        Self::new_with_recovery(
-            &LiveDiscardRecovery::default(),
-            &crate::filesystem_recovery_context::fixtures::fixture_context(root).unwrap(),
-        )
-    }
     fn new_with_recovery(
         live: &LiveDiscardRecovery,
         context: &crate::filesystem_recovery_context::FilesystemRecoveryContext,

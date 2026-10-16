@@ -196,10 +196,22 @@ fn ensure_directory(
         }
     }
 }
+fn verify_native_spelling(root: &fs_safety::Root) -> Result<(), String> {
+    let named = fs_safety::Root::open(root.path()).map_err(error)?;
+    if identity(&named)? != identity(root)? {
+        return Err(
+            "The native Trash directory or an ancestor was replaced; no replacement was changed"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn check_native(
     root: &fs_safety::Root,
     context: &FilesystemRecoveryContext,
 ) -> Result<fs::Metadata, String> {
+    verify_native_spelling(root)?;
     context.validate_payload_root(root).map_err(error)?;
     let metadata = root.metadata().map_err(error)?;
     if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o700 {
@@ -216,6 +228,24 @@ pub(super) fn prepare(
     context: &FilesystemRecoveryContext,
     live: &LiveDiscardRecovery,
     cancellation: &CancellationToken,
+) -> Result<Option<Batch>, String> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
+        .ok_or("No native Trash data directory is configured")?;
+    prepare_in(root, paths, context, live, cancellation, data)
+}
+fn prepare_in(
+    root: Arc<fs_safety::Root>,
+    paths: &[RepoPath],
+    context: &FilesystemRecoveryContext,
+    live: &LiveDiscardRecovery,
+    cancellation: &CancellationToken,
+    data: PathBuf,
 ) -> Result<Option<Batch>, String> {
     if paths.is_empty() {
         return Ok(None);
@@ -246,11 +276,6 @@ pub(super) fn prepare(
             retry_slot: retry,
         });
     }
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
-        .ok_or("No native Trash data directory is configured")?;
     if !data.is_absolute() {
         return Err("Native Trash data directory must be absolute".into());
     }
@@ -479,6 +504,8 @@ impl Owner {
         self.publication.directory()
     }
     fn validate_native(&self) -> Result<(), String> {
+        verify_native_spelling(&self.files)?;
+        verify_native_spelling(&self.info)?;
         fs_safety::verify_recovery_directory_private(&self.files, &self.files_metadata)
             .map_err(error)?;
         fs_safety::verify_recovery_directory_private(&self.info, &self.info_metadata)
@@ -488,7 +515,9 @@ impl Owner {
             .map_err(error)?;
         self.context
             .validate_payload_root(&self.info)
-            .map_err(error)
+            .map_err(error)?;
+        verify_native_spelling(&self.files)?;
+        verify_native_spelling(&self.info)
     }
     fn validate_holding(&self) -> Result<(), String> {
         fs_safety::verify_recovery_directory_private(self.holding(), &self.private_metadata)
@@ -789,6 +818,7 @@ impl Owner {
                 .to_owned();
             self.preimage
                 .verify_at(&parent, &name, true, &CancellationToken::new())?;
+            self.restored_verified = true;
         }
         // Before a successful source acquisition, cancellation/stale source
         // edits did not authorize a source effect. Dispose only our metadata
@@ -797,11 +827,22 @@ impl Owner {
             let parent = self
                 .restore_parent
                 .as_ref()
-                .unwrap_or(self.preimage.parent());
-            let name = self.restore_name.as_deref().unwrap_or(self.preimage.name());
-            verify_source_target(&self.preimage, parent, name)?;
-            self.preimage
-                .verify_at(parent, name, false, &CancellationToken::new())?;
+                .unwrap_or(self.preimage.parent())
+                .try_clone()
+                .map_err(error)?;
+            let name = self
+                .restore_name
+                .as_deref()
+                .unwrap_or(self.preimage.name())
+                .to_owned();
+            verify_source_target(&self.preimage, &parent, &name)?;
+            self.preimage.verify_at(
+                &parent,
+                &name,
+                !self.restored_verified,
+                &CancellationToken::new(),
+            )?;
+            self.restored_verified = true;
         }
         if self.info_file.is_some() {
             self.remove_info()?;
@@ -818,6 +859,25 @@ pub(super) fn restore(
     cancellation: &CancellationToken,
     context: &FilesystemRecoveryContext,
 ) -> Result<Option<String>, String> {
+    restore_observing(
+        receipt,
+        recovery,
+        parent,
+        name,
+        cancellation,
+        context,
+        || Ok(()),
+    )
+}
+fn restore_observing(
+    receipt: &TrashReceipt,
+    recovery: &DiscardRecovery,
+    parent: &fs_safety::Root,
+    name: &OsStr,
+    cancellation: &CancellationToken,
+    context: &FilesystemRecoveryContext,
+    after_source_rename: impl FnOnce() -> Result<(), String>,
+) -> Result<Option<String>, String> {
     let mut owner = receipt.owner.lock().unwrap_or_else(|e| e.into_inner());
     if owner.restored {
         return Err("This native Trash entry was already restored".into());
@@ -826,8 +886,16 @@ pub(super) fn restore(
     context
         .validate_for_source(&owner.preimage.source_root())
         .map_err(error)?;
-    if fs_safety::metadata_beneath(parent, Path::new(name)).is_ok() {
-        return Err("A newer source entry exists; native Trash contents were preserved".into());
+    match fs_safety::metadata_beneath(parent, Path::new(name)) {
+        Ok(_) => {
+            return Err("A newer source entry exists; native Trash contents were preserved".into());
+        }
+        Err(cause) if cause.is_not_found() => {}
+        Err(cause) => {
+            return Err(format!(
+                "Source destination cannot be verified: {cause}; native Trash contents were preserved"
+            ));
+        }
     }
     let native_files = owner.files.clone();
     let native_name = owner.id.clone();
@@ -914,6 +982,7 @@ pub(super) fn restore(
         rename(owner.holding(), OsStr::new("payload"), &target, name)?;
         owner.payload_in_holding = false;
         owner.restored = true;
+        after_source_rename()?;
         owner
             .preimage
             .verify_at(&target, name, true, cancellation)?;
@@ -944,6 +1013,14 @@ pub(super) fn restore(
         }
     }
 }
+pub(super) fn confirmed_restore(receipt: &TrashReceipt) -> bool {
+    receipt
+        .owner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .restored_verified
+}
+
 fn verify_source_target(
     proof: &NativePreimage,
     parent: &fs_safety::Root,
@@ -964,4 +1041,121 @@ fn verify_source_target(
 fn identity(root: &fs_safety::Root) -> Result<(u64, u64), String> {
     let m = root.metadata().map_err(error)?;
     Ok((m.dev(), m.ino()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_restore_post_rename_cancellation_retries_original_proof_and_acknowledges_exact_path()
+    {
+        for change_after_rename in [false, true] {
+            let source = tempfile::tempdir().unwrap();
+            let data = tempfile::tempdir().unwrap();
+            let root = Arc::new(fs_safety::Root::open(source.path()).unwrap());
+            let file = source.path().join("original");
+            fs::write(&file, b"original data\n").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+            let original = fs::metadata(&file).unwrap();
+            let original_time = original.modified().unwrap();
+            let context =
+                crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
+            let live = LiveDiscardRecovery::default();
+            let path = RepoPath::parse("original").unwrap();
+            let mut batch = prepare_in(
+                root.clone(),
+                &[path.clone()],
+                &context,
+                &live,
+                &CancellationToken::new(),
+                data.path().to_owned(),
+            )
+            .unwrap()
+            .unwrap();
+            let receipt = batch
+                .discard(&path, &live, &CancellationToken::new())
+                .unwrap();
+            assert!(!file.exists());
+            let recovery = DiscardRecovery {
+                live_recovery: live,
+                custody: None,
+                worktree: source.path().to_owned(),
+                worktree_identity: (original.dev(), root.metadata().unwrap().ino()),
+                directories: BTreeMap::new(),
+                entries: vec![DiscardRecoveryEntry {
+                    path: path.clone(),
+                    before: SavedEntry::Trashed,
+                    after: SavedEntry::Absent,
+                    after_version: None,
+                    trash: Some(receipt.clone()),
+                }],
+                expires_unix_ms: u64::MAX,
+            };
+            let cancelled = CancellationToken::new();
+            let result = restore_observing(
+                &receipt,
+                &recovery,
+                &root,
+                OsStr::new("original"),
+                &cancelled,
+                &context,
+                || {
+                    cancelled.cancel();
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert!(file.exists());
+            assert_eq!(fs::read(&file).unwrap(), b"original data\n");
+            assert!(recovery.live_recovery.needs_resolution());
+            assert_eq!(recovery.remaining_paths(), 1);
+            assert!(!confirmed_restore(&receipt));
+            let service = RepositoryService::system("git");
+            if change_after_rename {
+                fs::write(&file, b"user's newer contents\n").unwrap();
+                assert!(
+                    service
+                        .resolve_discard_recovery(&recovery, &CancellationToken::new())
+                        .is_err()
+                );
+                assert_eq!(fs::read(&file).unwrap(), b"user's newer contents\n");
+                assert_eq!(recovery.remaining_paths(), 1);
+                assert!(!confirmed_restore(&receipt));
+                // Explicit user repair of the original held inode, preserving
+                // newer data until that deliberate repair, enables retry.
+                fs::write(&file, b"original data\n").unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(original_time))
+                    .unwrap();
+            }
+            let resolution = service
+                .resolve_discard_recovery(&recovery, &CancellationToken::new())
+                .unwrap();
+            assert_eq!(resolution.remaining_paths, 0);
+            assert_eq!(recovery.remaining_paths(), 0);
+            assert!(!recovery.live_recovery.needs_resolution());
+            assert!(confirmed_restore(&receipt));
+            let restored = fs::metadata(&file).unwrap();
+            assert_eq!(
+                (original.dev(), original.ino()),
+                (restored.dev(), restored.ino())
+            );
+            assert_eq!(restored.mode() & 0o7777, 0o640);
+            assert_eq!(
+                fs::read_dir(data.path().join("Trash/files"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert_eq!(
+                fs::read_dir(data.path().join("Trash/info"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
 }

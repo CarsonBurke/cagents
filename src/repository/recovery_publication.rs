@@ -41,6 +41,7 @@ struct Holding {
     parent: fs_safety::Root,
     files: Vec<Arc<fs::File>>,
     private_metadata: fs::Metadata,
+    target: Option<(WorktreeAuthority, RepoPath)>,
     context: FilesystemRecoveryContext,
     // Native owners above close before their creation/private charge releases.
     slot: Option<RecoverySlot>,
@@ -87,8 +88,28 @@ impl Holding {
             private_metadata,
             slot: Some(slot),
             files: vec![],
+            target: None,
             context,
         })
+    }
+    fn verify_target(&self, name: &OsStr) -> Result<(), String> {
+        let (source, path) = self
+            .target
+            .as_ref()
+            .ok_or("Original source-relative Undo target is unavailable")?;
+        source.validate().map_err(|e| e.to_string())?;
+        let root = source.retained_worktree_root();
+        let (actual, actual_name) =
+            fs_safety::open_parent_beneath(&root, path.as_path()).map_err(|e| e.to_string())?;
+        let original = self.parent.metadata().map_err(|e| e.to_string())?;
+        let named = actual.metadata().map_err(|e| e.to_string())?;
+        if actual_name != name || (original.dev(), original.ino()) != (named.dev(), named.ino()) {
+            return Err(
+                "The original source-relative Undo parent changed; no replacement was modified"
+                    .into(),
+            );
+        }
+        Ok(())
     }
     fn root(&self) -> &fs_safety::Root {
         self.publication.directory()
@@ -564,6 +585,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         name: &OsStr,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, String> {
+        holding.target = Some((source.clone(), entry.path.clone()));
+        holding.verify_target(name)?;
         holding.validate()?;
         let materialized = match &entry.before {
             SavedEntry::Absent => None,
@@ -655,6 +678,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let before_publication: Result<(), String> = (|| {
             if current.is_some() {
                 holding.validate()?;
+                holding.verify_target(name)?;
                 fs_safety::rename_new_between(
                     &holding.parent,
                     name,
@@ -716,6 +740,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             holding.validate()?;
             fs_safety::sync_directory(holding.root()).map_err(|error| error.to_string())?;
+            holding.verify_target(name)?;
             if let Some((generated, _)) = &materialized {
                 fs_safety::rename_new_between(
                     holding.root(),
@@ -734,6 +759,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 holding
                     .validate()
                     .and_then(|()| proof.same_identity(holding, previous))
+                    .and_then(|()| holding.verify_target(name))
                     .and_then(|()| {
                         fs_safety::rename_new_between(
                             holding.root(),
@@ -778,5 +804,739 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(cleanup.err().map(|error| {
             format!("Undo was applied, but cleanup or durability is unconfirmed: {error}")
         }))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, DiscardRecovery, Holding) {
+        fixture_with_guard(())
+    }
+
+    fn fixture_with_guard(
+        guard: impl Send + Sync + 'static,
+    ) -> (tempfile::TempDir, DiscardRecovery, Holding) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(directory.path()).unwrap();
+        let metadata = root.metadata().unwrap();
+        let recovery = DiscardRecovery {
+            worktree: directory.path().to_owned(),
+            worktree_identity: (metadata.dev(), metadata.ino()),
+            live_recovery: LiveDiscardRecovery::default(),
+            custody: None,
+            directories: BTreeMap::new(),
+            entries: vec![],
+            expires_unix_ms: u64::MAX,
+        };
+        let holding = Holding::create(
+            &root,
+            &recovery,
+            &CancellationToken::new(),
+            &crate::filesystem_recovery_context::fixtures::fixture_context_with_guard(&root, guard)
+                .unwrap(),
+        )
+        .unwrap();
+        (directory, recovery, holding)
+    }
+
+    #[test]
+    fn undo_refuses_changed_private_permissions_before_payload_and_during_live_retry() {
+        let (directory, recovery, mut holding) = fixture();
+        fs::write(directory.path().join("original"), b"preserved").unwrap();
+        let private = holding.root().path().to_owned();
+        fs_safety::set_directory_permissions(holding.root(), 0o711).unwrap();
+        assert!(holding.create_private_blob().is_err());
+        assert_eq!(
+            holding.root().read_dir().unwrap().count(),
+            0,
+            "no payload is created under a changed boundary"
+        );
+        assert_eq!(holding.root().metadata().unwrap().mode() & 0o7777, 0o711);
+        holding.retain(&recovery);
+        let authority = recovery.live_recovery.authority().unwrap();
+        assert!(authority.retry().is_err());
+        assert_eq!(
+            fs::metadata(&private).unwrap().mode() & 0o7777,
+            0o711,
+            "retry never repairs newer permissions implicitly"
+        );
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert!(!private.exists());
+        assert_eq!(
+            fs::read(directory.path().join("original")).unwrap(),
+            b"preserved"
+        );
+    }
+
+    #[test]
+    fn undo_early_read_pin_survives_archived_no_read_modes_and_closes_all_writers() {
+        use std::os::fd::AsRawFd;
+        for mode in [0o000, 0o111] {
+            let (_directory, _recovery, mut holding) = fixture();
+            let writer = holding.create_private_blob().unwrap();
+            let readable = holding.pin_readable_blob(&writer).unwrap();
+            writer.write_all_at(b"immutable bytes", 0).unwrap();
+            writer.sync_all().unwrap();
+            let before = writer.metadata().unwrap();
+            let access = SavedFileAccess::capture(&writer).unwrap();
+            let digest = digest_file(&writer, before.len(), &CancellationToken::new()).unwrap();
+            let proof = Proof::after_blob_access_change(
+                &holding,
+                Path::new("restored-blob"),
+                access,
+                readable,
+                before,
+                digest,
+                mode,
+                &CancellationToken::new(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            holding
+                .release_blob_writers(
+                    writer,
+                    &proof,
+                    Path::new("restored-blob"),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert_eq!(proof.identity_pin.metadata().unwrap().mode() & 0o7777, mode);
+            assert_eq!(
+                unsafe { libc::fcntl(proof.identity_pin.as_raw_fd(), libc::F_GETFL) }
+                    & libc::O_ACCMODE,
+                libc::O_RDONLY
+            );
+            assert_eq!(
+                digest_file(
+                    &proof.identity_pin,
+                    proof.metadata.len(),
+                    &CancellationToken::new()
+                )
+                .unwrap(),
+                digest
+            );
+            for file in &holding.files {
+                assert_eq!(
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                    libc::O_RDONLY
+                );
+            }
+            fs_safety::unlink_within(holding.root(), OsStr::new("restored-blob")).unwrap();
+            holding.publication.cleanup_empty().unwrap();
+        }
+    }
+
+    #[test]
+    fn undo_read_only_handoff_refuses_outstanding_writer_without_publishing_or_losing_custody() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ChargedGuard(Arc<AtomicBool>);
+        impl Drop for ChargedGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for weak_only in [false, true] {
+            let released = Arc::new(AtomicBool::new(false));
+            let (directory, recovery, mut holding) =
+                fixture_with_guard(ChargedGuard(released.clone()));
+            let writer = holding.create_private_blob().unwrap();
+            let readable = holding.pin_readable_blob(&writer).unwrap();
+            writer.write_all_at(b"original bytes", 0).unwrap();
+            writer.sync_all().unwrap();
+            let before = writer.metadata().unwrap();
+            let access = SavedFileAccess::capture(&writer).unwrap();
+            let digest = digest_file(&writer, before.len(), &CancellationToken::new()).unwrap();
+            let proof = Proof::after_blob_access_change(
+                &holding,
+                Path::new("restored-blob"),
+                access,
+                readable,
+                before,
+                digest,
+                0o700,
+                &CancellationToken::new(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let original = writer.metadata().unwrap();
+            let mut outstanding = Some(writer.clone());
+            let weak = weak_only.then(|| Arc::downgrade(&writer));
+            if weak_only {
+                drop(outstanding.take());
+            }
+            let error = holding
+                .release_blob_writers(
+                    writer,
+                    &proof,
+                    Path::new("restored-blob"),
+                    &CancellationToken::new(),
+                )
+                .unwrap_err();
+            assert!(error.contains("outstanding executor owner"));
+            assert!(
+                fs::read_dir(directory.path()).unwrap().next().is_none(),
+                "no public entry was published"
+            );
+            let private = holding.root().path().to_owned();
+            // Test-owned readonly proof aliases must return too; only the
+            // deliberate executor strong/Weak capability remains outstanding.
+            drop(proof);
+            holding.retain(&recovery);
+            let authority = recovery.live_recovery.authority().unwrap();
+            assert!(authority.retry().is_err());
+            let retained = fs::metadata(private.join("restored-blob")).unwrap();
+            assert_eq!(
+                (retained.dev(), retained.ino()),
+                (original.dev(), original.ino())
+            );
+            assert!(!authority.is_resolved());
+            assert!(!released.load(Ordering::SeqCst));
+            // Even positive removal of the original payload/H cannot release
+            // the charged owner while its same original FD can still be used.
+            fs::remove_file(private.join("restored-blob")).unwrap();
+            let error = authority.retry().unwrap_err();
+            assert!(error.contains("outstanding original file custody"));
+            assert!(!private.exists(), "known removed-H retry must stay live");
+            assert!(!authority.is_resolved());
+            assert!(!released.load(Ordering::SeqCst));
+            let held = outstanding
+                .as_ref()
+                .cloned()
+                .or_else(|| weak.as_ref().unwrap().upgrade())
+                .unwrap();
+            let held_metadata = held.metadata().unwrap();
+            assert_eq!(
+                (
+                    held_metadata.dev(),
+                    held_metadata.ino(),
+                    held_metadata.nlink()
+                ),
+                (original.dev(), original.ino(), 0)
+            );
+            drop(held);
+            assert!(
+                authority
+                    .retry()
+                    .unwrap_err()
+                    .contains("outstanding original file custody")
+            );
+            drop(outstanding);
+            drop(weak);
+            authority.retry().unwrap();
+            assert!(authority.is_resolved());
+            assert!(released.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn undo_factory_cancelled_admission_creates_no_holding_or_live_obligation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(directory.path()).unwrap();
+        let metadata = root.metadata().unwrap();
+        let recovery = DiscardRecovery {
+            worktree: directory.path().to_owned(),
+            worktree_identity: (metadata.dev(), metadata.ino()),
+            live_recovery: LiveDiscardRecovery::default(),
+            custody: None,
+            directories: BTreeMap::new(),
+            entries: vec![],
+            expires_unix_ms: u64::MAX,
+        };
+        let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(Holding::create(&root, &recovery, &cancellation, &context).is_err());
+        assert!(
+            context
+                .placement()
+                .directory()
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(!recovery.live_recovery.needs_resolution());
+    }
+
+    #[test]
+    fn undo_factory_real_preparation_error_retains_same_receipt_and_cleanup_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(directory.path()).unwrap();
+        let metadata = root.metadata().unwrap();
+        let recovery = DiscardRecovery {
+            worktree: directory.path().to_owned(),
+            worktree_identity: (metadata.dev(), metadata.ino()),
+            live_recovery: LiveDiscardRecovery::default(),
+            custody: None,
+            directories: BTreeMap::new(),
+            entries: vec![],
+            expires_unix_ms: u64::MAX,
+        };
+        let context = crate::filesystem_recovery_context::fixtures::fixture_context_at_runtime(
+            &root,
+            runtime.path(),
+        )
+        .unwrap();
+        let outside = context.placement().directory().path().to_owned();
+        let error = fs_safety::fixture_recovery_directory_preparation_failure(
+            context.reserve_directory().unwrap(),
+            root.try_clone().unwrap(),
+        );
+        let _message = remember_directory_error(&recovery, error);
+        assert!(recovery.live_recovery.needs_resolution());
+        drop(context);
+        let service = RepositoryService::system("git");
+        assert!(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true)
+                .is_err()
+        );
+        assert!(
+            service
+                .resolve_discard_recovery(&recovery, &CancellationToken::new())
+                .is_err()
+        );
+        assert!(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true)
+                .is_err()
+        );
+        let staging = fs::read_dir(&outside)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            fs::read(staging.join("directory")).unwrap(),
+            b"retained fixture artifact"
+        );
+        fs::remove_file(staging.join("directory")).unwrap();
+        let result = service
+            .resolve_discard_recovery(&recovery, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(result.remaining_paths, 0);
+        assert!(!recovery.live_recovery.needs_resolution());
+        assert!(!staging.exists());
+        drop(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn undo_holding_is_outside_source_and_refuses_actual_payload_relocation() {
+        let (directory, recovery, holding) = fixture();
+        let source_file = directory.path().join("current");
+        fs::write(&source_file, b"newer source").unwrap();
+        let original = holding.root().path().to_owned();
+        assert!(!original.starts_with(directory.path()));
+        let relocated = directory.path().join("moved-holding");
+        fs::rename(&original, &relocated).unwrap();
+        holding.context.placement().validate().unwrap();
+        assert!(
+            holding.validate().is_err(),
+            "actual H ancestry, not just safe outside parent, must be fenced"
+        );
+        let private = holding.root().try_clone().unwrap();
+        holding.retain(&recovery);
+        let service = RepositoryService::system("git");
+        assert!(
+            service
+                .resolve_discard_recovery(&recovery, &CancellationToken::new())
+                .is_err()
+        );
+        assert_eq!(fs::read(&source_file).unwrap(), b"newer source");
+        assert!(private.read_dir().unwrap().next().is_none());
+        fs::rename(&relocated, &original).unwrap();
+        service
+            .resolve_discard_recovery(&recovery, &CancellationToken::new())
+            .unwrap();
+        assert!(!recovery.live_recovery.needs_resolution());
+        assert_eq!(fs::read(&source_file).unwrap(), b"newer source");
+    }
+
+    #[test]
+    fn undo_without_original_context_refuses_before_any_filesystem_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("current"), b"newer source").unwrap();
+        let root = fs_safety::Root::open(directory.path()).unwrap();
+        let metadata = root.metadata().unwrap();
+        let recovery = DiscardRecovery {
+            worktree: directory.path().to_owned(),
+            worktree_identity: (metadata.dev(), metadata.ino()),
+            live_recovery: LiveDiscardRecovery::default(),
+            custody: None,
+            directories: BTreeMap::new(),
+            entries: vec![DiscardRecoveryEntry {
+                path: RepoPath::parse("restored").unwrap(),
+                before: SavedEntry::Symlink {
+                    target: PathBuf::from("original-target"),
+                },
+                after: SavedEntry::Absent,
+                after_version: None,
+                trash: None,
+            }],
+            expires_unix_ms: u64::MAX,
+        };
+        // Exercise actual missing-context admission, not the earlier no-Undo
+        // fast path for a receipt with no remaining entries.
+        assert!(recovery.can_undo());
+        let error = RepositoryService::system("git")
+            .undo_discard(&recovery, &CancellationToken::new())
+            .unwrap_err();
+        assert!(error.to_string().contains("original worker-owned receipt"));
+        assert_eq!(
+            fs::read(directory.path().join("current")).unwrap(),
+            b"newer source"
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn undo_pending_holding_keeps_exact_cleanup_lease_until_explicit_resolution() {
+        let (directory, recovery, holding) = fixture();
+        holding.publication.directory().metadata().unwrap();
+        // Retire the fixture's empty holding before acquiring a real protected
+        // context; every new effect below uses that context's reservation.
+        let mut original = holding;
+        original.publication.cleanup_empty().unwrap();
+        drop(original);
+        let runtime = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(directory.path()).unwrap();
+        let context = crate::filesystem_recovery_context::fixtures::fixture_context_at_runtime(
+            &root,
+            runtime.path(),
+        )
+        .unwrap();
+        let holding =
+            Holding::create(&root, &recovery, &CancellationToken::new(), &context).unwrap();
+        let private = holding.root().try_clone().unwrap();
+        fs::write(private.path().join("unresolved"), b"preserve").unwrap();
+        holding.retain(&recovery);
+        drop(context);
+        assert!(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true)
+                .is_err()
+        );
+        let service = RepositoryService::system("git");
+        assert!(
+            service
+                .resolve_discard_recovery(&recovery, &CancellationToken::new())
+                .is_err()
+        );
+        assert!(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true)
+                .is_err()
+        );
+        fs_safety::unlink_within(&private, OsStr::new("unresolved")).unwrap();
+        service
+            .resolve_discard_recovery(&recovery, &CancellationToken::new())
+            .unwrap();
+        assert!(!recovery.live_recovery.needs_resolution());
+        let exclusive =
+            crate::worktree_cleanup::fixture_protection(runtime.path(), directory.path(), true)
+                .unwrap();
+        drop(exclusive);
+    }
+
+    fn named_access_acl(named_uid: u32) -> Vec<u8> {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01u16, 6u16, u32::MAX),
+            (0x02, 4, named_uid),
+            (0x04, 0, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        acl
+    }
+
+    #[test]
+    fn undo_blob_preserves_original_acl_and_removes_inherited_named_access() {
+        for original_has_acl in [false, true] {
+            let (directory, _recovery, mut holding) = fixture();
+            fs::write(directory.path().join("original"), b"work").unwrap();
+            let original = fs::File::open(directory.path().join("original")).unwrap();
+            original
+                .set_permissions(fs::Permissions::from_mode(0o640))
+                .unwrap();
+            let original_acl = named_access_acl(12_345);
+            fs_safety::restore_access_acl(
+                &original,
+                original_has_acl.then_some(original_acl.as_slice()),
+            )
+            .unwrap();
+            let access = SavedFileAccess::capture(&original).unwrap();
+            assert_eq!(access.acl.is_some(), original_has_acl);
+            // A default ACL in the outside staging parent can carry another
+            // named reader even while a fresh0600 child masks it out. chmod640
+            // would activate that reader unless original absence is restored.
+            let parent = open_directory_sync_handle(holding.root()).unwrap();
+            let inherited = named_access_acl(23_456);
+            let result = unsafe {
+                libc::fsetxattr(
+                    parent.as_raw_fd(),
+                    c"system.posix_acl_default".as_ptr(),
+                    inherited.as_ptr().cast(),
+                    inherited.len(),
+                    0,
+                )
+            };
+            assert_eq!(result, 0, "{}", io::Error::last_os_error());
+            let file = holding.create_private_blob().unwrap();
+            file.write_at(b"work", 0).unwrap();
+            assert!(fs_safety::capture_access_acl(&file).unwrap().is_some());
+            let before = file.metadata().unwrap();
+            let digest = digest_file(&file, before.len(), &CancellationToken::new()).unwrap();
+            let proof = Proof::after_blob_access_change(
+                &holding,
+                Path::new("restored-blob"),
+                access.clone(),
+                file.clone(),
+                before,
+                digest,
+                0o640,
+                &CancellationToken::new(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            proof
+                .verify(
+                    &holding,
+                    Path::new("restored-blob"),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert_eq!(
+                fs_safety::capture_access_acl(&file).unwrap().as_deref(),
+                access.acl.as_deref()
+            );
+            assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o640);
+            assert_eq!(
+                (
+                    file.metadata().unwrap().uid(),
+                    file.metadata().unwrap().gid()
+                ),
+                (access.uid, access.gid)
+            );
+        }
+    }
+
+    #[test]
+    fn undo_blob_original_policy_refuses_after_restoration_acl_replacement() {
+        let (_directory, _recovery, mut holding) = fixture();
+        let file = holding.create_private_blob().unwrap();
+        file.write_at(b"work", 0).unwrap();
+        let access = SavedFileAccess::capture(&file).unwrap();
+        assert!(access.acl.is_none());
+        let before = file.metadata().unwrap();
+        let digest = digest_file(&file, before.len(), &CancellationToken::new()).unwrap();
+        let result = Proof::after_blob_access_change(
+            &holding,
+            Path::new("restored-blob"),
+            access,
+            file,
+            before,
+            digest,
+            0o640,
+            &CancellationToken::new(),
+            |file| {
+                fs_safety::restore_access_acl(file, Some(&named_access_acl(12_345)))
+                    .map_err(|error| error.to_string())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a fresh post-restoration ACL must not replace the archived policy"
+        );
+    }
+
+    #[test]
+    fn undo_blob_preserves_recorded_group_or_refuses_unavailable_ownership() {
+        let (directory, recovery, mut holding) = fixture();
+        fs::write(directory.path().join("original"), b"work").unwrap();
+        let original = fs::File::open(directory.path().join("original")).unwrap();
+        original
+            .set_permissions(fs::Permissions::from_mode(0o640))
+            .unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let primary = unsafe { libc::getegid() };
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0);
+        let mut groups = vec![0; count as usize];
+        assert_eq!(
+            unsafe { libc::getgroups(count, groups.as_mut_ptr()) },
+            count
+        );
+        let alternate = groups
+            .into_iter()
+            .find(|gid| *gid != primary)
+            .or_else(|| (uid == 0).then_some(if primary == 23_456 { 23_457 } else { 23_456 }));
+        // Root UID is not proof of CAP_CHOWN (e.g. a user namespace or a
+        // capability-dropped runner). Require the actual positive native step.
+        let alternate =
+            alternate.filter(|gid| fs_safety::restore_ownership(&original, uid, *gid).is_ok());
+        if alternate.is_none() {
+            // No restorable secondary group is available in this runner.
+            // Exercise actual post-fchown verification refusal instead and
+            // never report this branch as cross-GID restoration coverage.
+            eprintln!(
+                "NO_RESTORABLE_SECONDARY_GID: testing unavailable ownership refusal, not cross-GID restoration"
+            );
+        }
+        let mut access = SavedFileAccess::capture(&original).unwrap();
+        let file = holding.create_private_blob().unwrap();
+        file.write_at(b"work", 0).unwrap();
+        let before = file.metadata().unwrap();
+        let digest = digest_file(&file, before.len(), &CancellationToken::new()).unwrap();
+        // uid_t::MAX is fchown's no-change sentinel, never an installable
+        // owner. The helper must reject its actual post-syscall mismatch even
+        // when the runner has CAP_CHOWN; no euid-only capability assumption.
+        if alternate.is_none() {
+            access.uid = u32::MAX;
+        }
+        let result = Proof::after_blob_access_change(
+            &holding,
+            Path::new("restored-blob"),
+            access.clone(),
+            file.clone(),
+            before,
+            digest,
+            0o640,
+            &CancellationToken::new(),
+            |_| Ok(()),
+        );
+        if alternate.is_some() {
+            result.unwrap();
+            assert_ne!(access.gid, primary);
+            assert_eq!(file.metadata().unwrap().gid(), access.gid);
+            assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o640);
+        } else {
+            assert!(result.is_err());
+            let expected = file.metadata().unwrap();
+            holding.retain(&recovery);
+            assert!(recovery.live_recovery.needs_resolution());
+            assert_eq!(file.metadata().unwrap().ino(), expected.ino());
+            assert_eq!(
+                fs::read(directory.path().join("original")).unwrap(),
+                b"work"
+            );
+        }
+    }
+
+    #[test]
+    fn undo_blob_authenticated_proof_refuses_existing_fd_write_during_own_chmod_window() {
+        let (_directory, _recovery, mut holding) = fixture();
+        let path = Path::new("generated");
+        fs::write(holding.root().path().join(path), b"work").unwrap();
+        let file = holding.open(path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let modified = metadata.modified().unwrap();
+        let digest = digest_file(&file, metadata.len(), &CancellationToken::new()).unwrap();
+        // This writer already owns its FD before the permission transition;
+        // private namespace trust does not exclude its subsequent content write.
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(holding.root().path().join(path))
+            .unwrap();
+        let result = Proof::after_blob_access_change(
+            &holding,
+            path,
+            SavedFileAccess::capture(&file).unwrap(),
+            file,
+            metadata,
+            digest,
+            0o640,
+            &CancellationToken::new(),
+            |_| {
+                assert_eq!(writer.write_at(b"EVIL", 0).unwrap(), 4);
+                writer
+                    .set_times(fs::FileTimes::new().set_modified(modified))
+                    .map_err(|error| error.to_string())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "the original authenticated digest must survive our own ctime change"
+        );
+        assert_eq!(fs::read(holding.root().path().join(path)).unwrap(), b"EVIL");
+    }
+
+    #[test]
+    fn undo_blob_authenticated_proof_never_adopts_a_fresh_named_replacement() {
+        let (_directory, _recovery, mut holding) = fixture();
+        let path = Path::new("generated");
+        fs::write(holding.root().path().join(path), b"work").unwrap();
+        let file = holding.open(path).unwrap();
+        let original = file.clone();
+        let metadata = file.metadata().unwrap();
+        let digest = digest_file(&file, metadata.len(), &CancellationToken::new()).unwrap();
+        let result = Proof::after_blob_access_change(
+            &holding,
+            path,
+            SavedFileAccess::capture(&file).unwrap(),
+            file,
+            metadata,
+            digest,
+            0o640,
+            &CancellationToken::new(),
+            |_| {
+                fs::rename(
+                    holding.root().path().join(path),
+                    holding.root().path().join("original"),
+                )
+                .unwrap();
+                fs::write(holding.root().path().join(path), b"EVIL")
+                    .map_err(|error| error.to_string())
+            },
+        );
+        assert!(result.is_err());
+        let mut bytes = [0; 4];
+        original.read_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"work");
+        assert_eq!(fs::read(holding.root().path().join(path)).unwrap(), b"EVIL");
+    }
+
+    #[test]
+    fn undo_symlink_proof_pins_unlinked_metadata_instead_of_naked_inode_numbers() {
+        let (_directory, _recovery, mut holding) = fixture();
+        let path = Path::new("link");
+        fs_safety::symlink_within(holding.root(), Path::new("saved-target"), path.as_os_str())
+            .unwrap();
+        let proof = Proof::capture(&mut holding, path, &CancellationToken::new()).unwrap();
+        assert!(
+            proof
+                .identity_pin
+                .metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs_safety::unlink_within(holding.root(), path.as_os_str()).unwrap();
+        let unlinked = proof.identity_pin.metadata().unwrap();
+        assert_eq!(unlinked.nlink(), 0);
+        assert_eq!(
+            (unlinked.dev(), unlinked.ino()),
+            (proof.metadata.dev(), proof.metadata.ino())
+        );
+        fs_safety::symlink_within(
+            holding.root(),
+            Path::new("foreign-target"),
+            path.as_os_str(),
+        )
+        .unwrap();
+        assert!(proof.same_identity(&holding, path).is_err());
+        assert_eq!(
+            fs_safety::read_link_beneath(holding.root(), path).unwrap(),
+            Path::new("foreign-target")
+        );
     }
 }

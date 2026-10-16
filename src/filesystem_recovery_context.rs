@@ -37,6 +37,15 @@ impl FilesystemRecoveryContext {
     /// No recovery directory is created until a protected, same-filesystem
     /// parent outside the source and captured known checkout roots is held.
     pub(crate) fn acquire(source: &Root, known: &[PathBuf]) -> io::Result<Self> {
+        Self::acquire_with_owner(source, known, (), 0)
+    }
+
+    pub(crate) fn acquire_with_owner(
+        source: &Root,
+        known: &[PathBuf],
+        owner: impl Send + Sync + 'static,
+        owner_descriptors: usize,
+    ) -> io::Result<Self> {
         if known.len() > 256 {
             return Err(io::Error::other(
                 "The known checkout census exceeds the bounded recovery inspection; no file was changed",
@@ -59,7 +68,15 @@ impl FilesystemRecoveryContext {
         for parent in RecoveryParentCandidates::new(source.clone())? {
             let parent = parent?;
             match RecoveryPlacement::acquire(parent, source.clone(), excluded.clone()) {
-                Ok(placement) => return Self::from_placement(&source, protection, placement, ()),
+                Ok(placement) => {
+                    return Self::from_placement_counted(
+                        &source,
+                        protection,
+                        placement,
+                        owner,
+                        owner_descriptors,
+                    );
+                }
                 Err(error) => last_error = Some(error),
             }
         }
@@ -74,6 +91,15 @@ impl FilesystemRecoveryContext {
         placement: Arc<RecoveryPlacement>,
         owner: impl Send + Sync + 'static,
     ) -> io::Result<Self> {
+        Self::from_placement_counted(source, protection, placement, owner, 0)
+    }
+    fn from_placement_counted(
+        source: &Root,
+        protection: Protection,
+        placement: Arc<RecoveryPlacement>,
+        owner: impl Send + Sync + 'static,
+        owner_descriptors: usize,
+    ) -> io::Result<Self> {
         placement.validate_for_source(source)?;
         if !protection.protects_root(source)? {
             return Err(io::Error::other(
@@ -83,6 +109,7 @@ impl FilesystemRecoveryContext {
         let descriptors = placement
             .retained_descriptor_count()
             .checked_add(protection.retained_descriptor_count())
+            .and_then(|count| count.checked_add(owner_descriptors))
             .ok_or_else(|| io::Error::other("Recovery descriptor accounting overflowed"))?;
         // The SAME context owns these actual native handles. Its charge stays
         // until the guard tuple has dropped, including unresolved leaf retries.
@@ -123,6 +150,23 @@ pub(crate) mod fixtures {
 
     pub(crate) fn fixture_context(source: &Root) -> io::Result<FilesystemRecoveryContext> {
         fixture_context_with_guard(source, ())
+    }
+    pub(crate) fn fixture_context_at_runtime(
+        source: &Root,
+        runtime: &std::path::Path,
+    ) -> io::Result<FilesystemRecoveryContext> {
+        let outside = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let protection =
+            crate::worktree_cleanup::fixture_protection(runtime, source.path(), false)?;
+        let source = Arc::new(source.try_clone()?);
+        let placement = RecoveryPlacement::acquire(
+            Arc::new(Root::open(outside.path())?),
+            source.clone(),
+            Arc::from([source.clone()]),
+        )?;
+        FilesystemRecoveryContext::from_placement(&source, protection, placement, outside)
     }
     pub(crate) fn fixture_context_with_guard(
         source: &Root,
