@@ -1106,6 +1106,33 @@ fn identity(root: &fs_safety::Root) -> Result<(u64, u64), String> {
 mod tests {
     use super::*;
     #[test]
+    fn native_batch_capacity_refusal_precedes_trash_bootstrap_and_all_source_effects() {
+        let source = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let root = Arc::new(fs_safety::Root::open(source.path()).unwrap());
+        let paths = (0..128).map(|index| RepoPath::parse(format!("entry-{index}")).unwrap())
+            .collect::<Vec<_>>();
+        for path in &paths {
+            fs::write(source.path().join(path.as_path()), b"still original").unwrap();
+        }
+        let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
+        let live = LiveDiscardRecovery::default();
+        let occupied = (0..7).map(|_| context.reserve().unwrap()).collect::<Vec<_>>();
+        assert!(prepare_in(root.clone(), &paths, &context, &live,
+            &CancellationToken::new(), data.path().to_owned()).is_err());
+        assert!(!live.needs_resolution());
+        assert_eq!(fs::read_dir(data.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(context.placement().directory().path()).unwrap().count(), 0);
+        for path in &paths {
+            assert_eq!(fs::read(source.path().join(path.as_path())).unwrap(), b"still original");
+        }
+        drop(occupied);
+        let batch = prepare_in(root, &paths, &context, &live,
+            &CancellationToken::new(), data.path().to_owned()).unwrap().unwrap();
+        assert_eq!(batch.prepared.len(), 128);
+    }
+
+    #[test]
     fn native_batch_128_compacts_only_completed_entries_and_keeps_shared_pins_through_clones() {
         let source = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
