@@ -1,23 +1,28 @@
-//! Claude's persisted session names, using the same custom-title / summary
-//! records exposed by the Agent SDK session-info API. No model request is made.
-//! Read only after a confirmed resume or top-level result, on the host worker.
-//! Metadata format: https://platform.claude.com/cookbook/claude-agent-sdk-05-building-a-session-browser
-//! This is presentation metadata, never execution or filesystem ownership proof.
-use crate::chat::Launch;
-use serde_json::Value;
-use std::{
-    fs::File,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+//! Claude's persisted names, refreshed only after a confirmed resume/result.
+//! Metadata is presentation only, never execution or filesystem ownership proof.
+use crate::chat::{
+    Launch,
+    claude_metadata::{Lines, Names},
 };
-
-const HEAD_BYTES: u64 = 256 * 1024;
-const TAIL_BYTES: u64 = 64 * 1024;
+use std::{fs::File, os::unix::fs::MetadataExt, path::PathBuf};
 
 pub(super) struct ClaudeTitles {
     config: PathBuf,
     cwd: PathBuf,
     previous: Option<(String, String)>,
+    transcript: Option<Transcript>,
+}
+
+struct Transcript {
+    id: String,
+    path: PathBuf,
+    cwd: PathBuf,
+    device: u64,
+    inode: u64,
+    len: u64,
+    changed: (i64, i64, i64, i64),
+    lines: Lines,
+    names: Names,
 }
 
 impl ClaudeTitles {
@@ -35,9 +40,7 @@ impl ClaudeTitles {
         let config = match value("CLAUDE_CONFIG_DIR") {
             Some(config) => recipe.working_directory.join(config),
             None => {
-                let home = Path::new(value("HOME")?);
-                // History::open's HOME fallback is not launch-cwd-relative.
-                // Refuse ambiguous metadata instead of naming another account.
+                let home = std::path::Path::new(value("HOME")?);
                 if !home.is_absolute() {
                     return None;
                 }
@@ -48,6 +51,7 @@ impl ClaudeTitles {
             config,
             cwd: recipe.working_directory.clone(),
             previous: None,
+            transcript: None,
         })
     }
 
@@ -61,12 +65,55 @@ impl ClaudeTitles {
         let mut file = File::options()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
+            .open(&path)
             .ok()?;
-        if !file.metadata().ok()?.is_file() {
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() {
             return None;
         }
-        let title = named_title(&mut file, id, &cwd)?;
+        let changed = (
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        );
+        if self.transcript.as_ref().is_none_or(|saved| {
+            saved.id != id
+                || saved.path != path
+                || saved.cwd != cwd
+                || saved.device != metadata.dev()
+                || saved.inode != metadata.ino()
+                || metadata.len() < saved.lines.offset
+                || (metadata.len() == saved.len && changed != saved.changed)
+        }) {
+            self.transcript = Some(Transcript {
+                id: id.to_owned(),
+                path,
+                cwd: cwd.clone(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                len: 0,
+                changed,
+                lines: Lines::default(),
+                names: Names::default(),
+            });
+        }
+        let saved = self.transcript.as_mut()?;
+        let names = &mut saved.names;
+        let complete = saved
+            .lines
+            .scan(
+                &mut file,
+                metadata.len(),
+                || false,
+                |line| names.note(line, id, &cwd),
+            )
+            .ok()?;
+        saved.len = metadata.len();
+        saved.changed = changed;
+        // Do not publish an inferior partial first-pass result on an IO error
+        // or interrupted coverage. Subsequent results only read new bytes.
+        let title = complete.then(|| saved.names.title()).flatten()?.to_owned();
         if self
             .previous
             .as_ref()
@@ -79,95 +126,26 @@ impl ClaudeTitles {
     }
 }
 
-#[derive(Default)]
-struct Names {
-    matched: bool,
-    custom: Option<String>,
-    generated: Option<String>,
-    summary: Option<String>,
-}
-impl Names {
-    fn note(&mut self, line: &[u8], id: &str, cwd: &Path) {
-        let Ok(row) = serde_json::from_slice::<Value>(line) else {
-            return;
-        };
-        if row["isSidechain"] == true
-            || row["cwd"]
-                .as_str()
-                .is_some_and(|path| Path::new(path) != cwd)
-        {
-            return;
-        }
-        if let Some(session) = row["sessionId"].as_str() {
-            if session != id {
-                return;
-            }
-            if row["cwd"]
-                .as_str()
-                .is_some_and(|path| Path::new(path) == cwd)
-            {
-                self.matched = true;
-            }
-        }
-        let label = |key: &str| {
-            row[key]
-                .as_str()
-                .and_then(crate::workspace_model::channel_title)
-        };
-        match row["type"].as_str() {
-            Some("custom-title") => {
-                if let Some(title) = label("customTitle") {
-                    self.custom = Some(title);
-                }
-            }
-            Some("ai-title") => {
-                if let Some(title) = label("aiTitle") {
-                    self.generated = Some(title);
-                }
-            }
-            Some("summary") => {
-                if let Some(title) = label("summary") {
-                    self.summary = Some(title);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn named_title(file: &mut File, id: &str, cwd: &Path) -> Option<String> {
-    file.rewind().ok()?;
-    let len = file.metadata().ok()?.len();
+#[cfg(test)]
+fn named_title(file: &mut File, id: &str, cwd: &std::path::Path) -> Option<String> {
+    let mut lines = Lines::default();
     let mut names = Names::default();
-    let mut reader = BufReader::new((&mut *file).take(HEAD_BYTES));
-    let mut line = Vec::new();
-    while reader.read_until(b'\n', &mut line).ok()? != 0 {
-        names.note(&line, id, cwd);
-        line.clear();
-    }
-    drop(reader);
-    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+    let len = file.metadata().ok()?.len();
+    lines
+        .scan(file, len, || false, |line| names.note(line, id, cwd))
         .ok()?;
-    let mut reader = BufReader::new(file.take(TAIL_BYTES));
-    if len > TAIL_BYTES {
-        reader.read_until(b'\n', &mut line).ok()?;
-        line.clear();
-    }
-    while reader.read_until(b'\n', &mut line).ok()? != 0 {
-        names.note(&line, id, cwd);
-        line.clear();
-    }
-    names
-        .matched
-        .then(|| names.custom.or(names.generated).or(names.summary))
-        .flatten()
+    names.title().map(str::to_owned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::io::Write;
+    use std::{
+        io::{Seek, SeekFrom},
+        path::Path,
+    };
 
     fn append(file: &mut File, value: Value) {
         writeln!(file, "{value}").unwrap();
@@ -357,5 +335,168 @@ mod tests {
             json!({"sessionId":id,"cwd":"/work","isSidechain":true,"type":"summary","summary":"Child work"}),
         );
         assert!(named_title(&mut file, &id, Path::new("/work")).is_none());
+    }
+
+    fn live_fixture() -> (tempfile::TempDir, Launch, String, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let config = directory.path().join("config");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let id = "00000000-0000-4000-8000-000000000001".to_owned();
+        let parent = config.join("projects").join(project);
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join(format!("{id}.jsonl"));
+        let launch = Launch {
+            provider: crate::agent::Provider::Claude,
+            session_id: Some(id.clone()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: vec![],
+                working_directory: cwd,
+                environment: [("CLAUDE_CONFIG_DIR".into(), config.to_str().unwrap().into())].into(),
+                unset_environment: Default::default(),
+            },
+        };
+        (directory, launch, id, path)
+    }
+
+    fn history(path: &Path, id: &str, cwd: &Path, name: &str) {
+        std::fs::write(path, format!("{}\n{}\n", json!({"type":"user","sessionId":id,"cwd":cwd,"message":{"content":"First prompt"}}), json!({"type":"custom-title","sessionId":id,"customTitle":name}))).unwrap();
+    }
+
+    #[test]
+    fn middle_custom_name_survives_append_and_fresh_live_resume() {
+        let (_directory, launch, id, path) = live_fixture();
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "{}", json!({"type":"user","sessionId":id,"cwd":launch.recipe.working_directory,"message":{"content":"First prompt"}})).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"ai-title","sessionId":id,"aiTitle":"Early generated"})
+        )
+        .unwrap();
+        let ordinary = json!({"type":"assistant","sessionId":id,"cwd":launch.recipe.working_directory,"message":{"content":"x".repeat(4096)}});
+        for _ in 0..70 {
+            writeln!(file, "{ordinary}").unwrap();
+        }
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Middle custom"})
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let mut live = ClaudeTitles::new(&launch).unwrap();
+        assert_eq!(live.update(&id).as_deref(), Some("Middle custom"));
+        for _ in 0..30 {
+            writeln!(file, "{ordinary}").unwrap();
+        }
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"ai-title","sessionId":id,"aiTitle":"Later generated"})
+        )
+        .unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            live.update(&id),
+            None,
+            "Appending ordinary/generated rows must not revert custom"
+        );
+        assert_eq!(
+            ClaudeTitles::new(&launch).unwrap().update(&id).as_deref(),
+            Some("Middle custom"),
+            "A fresh live resume must find the middle too"
+        );
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Newest custom"})
+        )
+        .unwrap();
+        file.flush().unwrap();
+        assert_eq!(live.update(&id).as_deref(), Some("Newest custom"));
+        assert_eq!(
+            live.transcript.as_ref().unwrap().lines.offset,
+            file.metadata().unwrap().len()
+        );
+    }
+
+    #[test]
+    fn replaced_truncated_and_different_session_files_reset_live_cursor() {
+        let (_directory, launch, id, path) = live_fixture();
+        let cwd = &launch.recipe.working_directory;
+        history(&path, &id, cwd, "Original custom");
+        let mut live = ClaudeTitles::new(&launch).unwrap();
+        assert_eq!(live.update(&id).as_deref(), Some("Original custom"));
+        let replacement = path.with_extension("replacement");
+        history(&replacement, &id, cwd, "Replaced custom");
+        std::fs::rename(replacement, &path).unwrap();
+        assert_eq!(live.update(&id).as_deref(), Some("Replaced custom"));
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert_eq!(live.update(&id), None);
+        history(&path, &id, cwd, "Reset custom");
+        assert_eq!(live.update(&id).as_deref(), Some("Reset custom"));
+        history(&path, &id, cwd, "Fresh custom");
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(123))
+            .unwrap();
+        assert_eq!(
+            live.update(&id).as_deref(),
+            Some("Fresh custom"),
+            "Same-size rewrite resets ranked names too"
+        );
+        let other = "00000000-0000-4000-8000-000000000002";
+        let other_path = path.with_file_name(format!("{other}.jsonl"));
+        history(&other_path, other, cwd, "Other session");
+        assert_eq!(live.update(other).as_deref(), Some("Other session"));
+        let mut file = File::options().append(true).open(&other_path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Wrong session"})
+        )
+        .unwrap();
+        assert_eq!(live.update(other), None);
+        assert_eq!(live.update(&id).as_deref(), Some("Fresh custom"));
+    }
+
+    #[test]
+    fn incomplete_live_title_is_retained_until_its_line_finishes() {
+        let (_directory, launch, id, path) = live_fixture();
+        history(
+            &path,
+            &id,
+            &launch.recipe.working_directory,
+            "Existing custom",
+        );
+        let mut live = ClaudeTitles::new(&launch).unwrap();
+        assert_eq!(live.update(&id).as_deref(), Some("Existing custom"));
+        let record = format!(
+            "{}\n",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Completed custom"})
+        );
+        let cut = record.len() / 2;
+        let mut file = File::options().append(true).open(&path).unwrap();
+        file.write_all(&record.as_bytes()[..cut]).unwrap();
+        file.flush().unwrap();
+        assert_eq!(live.update(&id), None);
+        file.write_all(&record.as_bytes()[cut..]).unwrap();
+        file.flush().unwrap();
+        assert_eq!(live.update(&id).as_deref(), Some("Completed custom"));
     }
 }

@@ -3,12 +3,13 @@
 //! Discovery takes two passes so that a large history is listed at once. The
 //! first only stats each provider's session store, which stays cheap at any
 //! size and orders every transcript newest first. The second reads each
-//! transcript's identity and title from as little of the file as answers
-//! them, newest first, and remembers the answer until the file changes.
+//! transcript's bounded identity header and complete Claude name metadata,
+//! newest first, and remembers the answer until the file changes.
 use super::*;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -28,7 +29,7 @@ pub struct Candidate {
     pub seed: usize,
     pub path: PathBuf,
     modified_ms: i64,
-    len: u64,
+    version: FileVersion,
 }
 
 /// A saved conversation as listed, without the session it would resume as.
@@ -59,10 +60,31 @@ struct Header {
     named: bool,
 }
 
-/// Transcript headers by path, valid while the file keeps its size and
-/// modification time.
+/// File identity and nanosecond change stamps distinguish replacement and
+/// same-size rewrites too; the millisecond UI timestamp is not a cache key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileVersion {
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+impl FileVersion {
+    fn new(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+/// Transcript headers by exact file version, retained across picker openings.
 #[derive(Default)]
-pub struct Cache(Mutex<HashMap<PathBuf, (i64, u64, Option<Header>)>>);
+pub struct Cache(Mutex<HashMap<PathBuf, (FileVersion, Option<Header>)>>);
 
 /// Every transcript in the seeds' session stores, newest first, or as many
 /// as were found before `cancel` was set.
@@ -98,7 +120,7 @@ pub fn candidates(seeds: &[chat::Session], cancel: &AtomicBool) -> Vec<Candidate
                 seed: index,
                 path,
                 modified_ms,
-                len: metadata.len(),
+                version: FileVersion::new(&metadata),
             });
         }
     }
@@ -154,28 +176,39 @@ fn modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
 impl Cache {
     /// The conversation `candidate` holds, read only when it changed since it
     /// was last read.
+    #[cfg(test)]
     pub fn find(&self, provider: Provider, candidate: &Candidate) -> Option<Found> {
+        self.find_with_cancel(provider, candidate, &AtomicBool::new(false))
+    }
+
+    fn find_with_cancel(
+        &self,
+        provider: Provider,
+        candidate: &Candidate,
+        cancel: &AtomicBool,
+    ) -> Option<Found> {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         let cached = self
             .0
             .lock()
             .ok()?
             .get(&candidate.path)
-            .filter(|(modified, len, _)| {
-                *modified == candidate.modified_ms && *len == candidate.len
-            })
-            .map(|(_, _, header)| header.clone());
+            .filter(|(version, _)| *version == candidate.version)
+            .map(|(_, header)| header.clone());
         let header = match cached {
             Some(header) => header,
             None => {
-                let header = header(provider, &candidate.path);
+                let header = header_with_cancel(provider, &candidate.path, cancel);
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
                 let mut cache = self.0.lock().ok()?;
                 if cache.len() >= CACHE_LIMIT {
                     cache.clear();
                 }
-                cache.insert(
-                    candidate.path.clone(),
-                    (candidate.modified_ms, candidate.len, header.clone()),
-                );
+                cache.insert(candidate.path.clone(), (candidate.version, header.clone()));
                 header
             }
         }?;
@@ -207,7 +240,9 @@ pub fn find_all(
         chunk
             .iter()
             .take_while(|_| !cancel.load(Ordering::Relaxed))
-            .filter_map(|candidate| cache.find(seeds[candidate.seed].launch.provider, candidate))
+            .filter_map(|candidate| {
+                cache.find_with_cancel(seeds[candidate.seed].launch.provider, candidate, cancel)
+            })
             .collect::<Vec<_>>()
     };
     let size = candidates.len().div_ceil(workers.max(1)).max(1);
@@ -269,7 +304,12 @@ pub fn names(seeds: &[chat::Session]) -> Vec<Arc<HashMap<String, String>>> {
 
 /// Reads a transcript's identity and title, or `None` for a file that is not
 /// a resumable top-level conversation.
+#[cfg(test)]
 fn header(provider: Provider, path: &Path) -> Option<Header> {
+    header_with_cancel(provider, path, &AtomicBool::new(false))
+}
+
+fn header_with_cancel(provider: Provider, path: &Path, cancel: &AtomicBool) -> Option<Header> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let mut identity = None;
@@ -280,6 +320,9 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
     // Most records are irrelevant and some are large, so a record is parsed
     // only when its text could hold what is still missing.
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         line.clear();
         if reader.read_until(b'\n', &mut line).ok()? == 0 {
             break;
@@ -307,15 +350,37 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
         if wants_title {
             titles.note(&value);
         }
-        // Titles past this point are looked for only in the tail, as Claude's
-        // own picker does: it appends a conversation's name again there for
-        // that reader, OMP keeps its title on the first line, and Codex keeps
-        // names apart. Reading the whole head would double a cold index.
+        // Identity and first prompt are bounded header data. Claude names
+        // need the complete metadata pass below: a rename is not guaranteed
+        // to remain near either end of a growing transcript.
         if identity.is_some() && prompt.is_some() {
             break;
         }
     }
     let (id, directory) = identity?;
+    if provider == Provider::Claude {
+        use crate::chat::claude_metadata::{Lines, Names};
+        let mut lines = Lines::default();
+        let mut names = Names::default();
+        let complete = lines
+            .scan(
+                &mut file,
+                len,
+                || cancel.load(Ordering::Relaxed),
+                |line| names.note(line, &id, &directory),
+            )
+            .ok()?;
+        if !complete {
+            return None;
+        }
+        let name = names.title().map(str::to_owned);
+        return Some(Header {
+            id,
+            directory,
+            named: name.is_some(),
+            title: name.or(prompt),
+        });
+    }
     let answer = |titles: Titles| Header {
         id,
         directory,
@@ -913,7 +978,7 @@ mod tests {
                 seed: 0,
                 path: path.clone(),
                 modified_ms: modified_ms(&metadata).unwrap(),
-                len: metadata.len(),
+                version: FileVersion::new(&metadata),
             }
         };
         let cache = Cache::default();
@@ -926,6 +991,189 @@ mod tests {
         assert_eq!(
             cache.find(Provider::Claude, &candidate()).unwrap().title,
             "Review encryption throughput"
+        );
+    }
+
+    #[test]
+    fn fresh_claude_picker_and_changed_cache_keep_middle_custom_name() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let cwd = directory.path();
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"user","sessionId":id,"cwd":cwd,"message":{"content":"First fallback"}})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"ai-title","sessionId":id,"aiTitle":"Earlier generated"})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"assistant","message":{"content":"x".repeat(2*HEAD_BYTES as usize)}})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Middle custom"})
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let candidate = || {
+            let metadata = std::fs::metadata(&path).unwrap();
+            Candidate {
+                seed: 0,
+                path: path.clone(),
+                modified_ms: modified_ms(&metadata).unwrap(),
+                version: FileVersion::new(&metadata),
+            }
+        };
+        let cache = Cache::default();
+        assert_eq!(
+            cache.find(Provider::Claude, &candidate()).unwrap().title,
+            "Middle custom"
+        );
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"assistant","message":{"content":"y".repeat(128*1024)}})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"ai-title","sessionId":id,"aiTitle":"Later generated"})
+        )
+        .unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            cache.find(Provider::Claude, &candidate()).unwrap().title,
+            "Middle custom"
+        );
+        let fresh = Cache::default()
+            .find(Provider::Claude, &candidate())
+            .unwrap();
+        assert_eq!(fresh.title, "Middle custom");
+        assert!(fresh.named);
+        assert_eq!(fresh.id, id);
+        assert_eq!(fresh.directory, cwd);
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Latest custom"})
+        )
+        .unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            cache.find(Provider::Claude, &candidate()).unwrap().title,
+            "Latest custom"
+        );
+    }
+
+    #[test]
+    fn claude_picker_scopes_names_and_does_not_cache_cancelled_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let records = [
+            json!({"type":"user","sessionId":id,"cwd":directory.path(),"message":{"content":"Original fallback"}}),
+            json!({"type":"custom-title","sessionId":"00000000-0000-4000-8000-000000000002","customTitle":"Other session"}),
+            json!({"type":"custom-title","sessionId":id,"cwd":"/foreign","customTitle":"Other directory"}),
+            json!({"type":"custom-title","sessionId":id,"isSidechain":true,"customTitle":"Sidechain"}),
+        ];
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let candidate = Candidate {
+            seed: 0,
+            path: path.clone(),
+            modified_ms: modified_ms(&metadata).unwrap(),
+            version: FileVersion::new(&metadata),
+        };
+        let cache = Cache::default();
+        assert!(
+            cache
+                .find_with_cancel(Provider::Claude, &candidate, &AtomicBool::new(true))
+                .is_none()
+        );
+        assert!(cache.0.lock().unwrap().is_empty());
+        let found = cache.find(Provider::Claude, &candidate).unwrap();
+        assert_eq!(found.title, "Original fallback");
+        assert!(!found.named);
+        let other = directory.path().join("another-account.jsonl");
+        std::fs::write(
+            &other,
+            format!(
+                "{}\n{}\n",
+                records[0],
+                json!({"type":"custom-title","sessionId":id,"customTitle":"Another account name"})
+            ),
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&other).unwrap();
+        let other = Candidate {
+            seed: 1,
+            path: other,
+            modified_ms: modified_ms(&metadata).unwrap(),
+            version: FileVersion::new(&metadata),
+        };
+        assert_eq!(
+            cache.find(Provider::Claude, &other).unwrap().title,
+            "Another account name"
+        );
+        assert_eq!(
+            cache.find(Provider::Claude, &candidate).unwrap().title,
+            "Original fallback"
+        );
+    }
+
+    #[test]
+    fn same_size_replacement_invalidates_claude_picker_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let write = |path: &Path, name: &str| {
+            std::fs::write(path,format!("{}\n{}\n",json!({"type":"user","sessionId":id,"cwd":directory.path(),"message":{"content":"Fallback"}}),json!({"type":"custom-title","sessionId":id,"customTitle":name}))).unwrap();
+        };
+        let candidate = || {
+            let metadata = std::fs::metadata(&path).unwrap();
+            Candidate {
+                seed: 0,
+                path: path.clone(),
+                modified_ms: modified_ms(&metadata).unwrap(),
+                version: FileVersion::new(&metadata),
+            }
+        };
+        write(&path, "First custom");
+        let before = candidate();
+        let cache = Cache::default();
+        assert_eq!(
+            cache.find(Provider::Claude, &before).unwrap().title,
+            "First custom"
+        );
+        let replacement = path.with_extension("replacement");
+        write(&replacement, "Other custom");
+        std::fs::rename(replacement, &path).unwrap();
+        let after = candidate();
+        assert_eq!(before.version.len, after.version.len);
+        assert_ne!(before.version.inode, after.version.inode);
+        assert_eq!(
+            cache.find(Provider::Claude, &after).unwrap().title,
+            "Other custom"
         );
     }
 }
