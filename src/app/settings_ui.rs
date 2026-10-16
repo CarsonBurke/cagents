@@ -1427,13 +1427,15 @@ fn shortcut_input<'a>(
         }
     }
     let row = widget::row::with_children(vec![
+        // Keep every key chip and its Record/Reset controls usable. Give
+        // the label the remaining width rather than shrinking buttons to zero.
         design::body(format!("{label}{required}"))
-            .width(Length::FillPortion(3))
+            .width(Length::Fill)
             .into(),
         widget::row::with_children(controls)
             .spacing(2)
             .align_y(Alignment::Center)
-            .width(Length::FillPortion(4))
+            .width(Length::Shrink)
             .into(),
         design::caption(source).width(64).into(),
         {
@@ -1698,7 +1700,11 @@ mod keyboard_table_tests {
             );
             let center = controls.buttons[0].center_y();
             for bounds in &controls.buttons {
-                assert!(bounds.width > 0.0 && bounds.height > 0.0);
+                assert!(
+                    bounds.width > 0.0 && bounds.height > 0.0,
+                    "{field:?} has an empty control: {:?}",
+                    controls.buttons
+                );
                 assert!(
                     (bounds.center_y() - center).abs() < 0.1,
                     "{field:?} controls wrapped: {:?}",

@@ -7157,6 +7157,46 @@ mod tests {
             element
                 .as_widget_mut()
                 .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+            // Native unfocus queues ClearSelection even for an already
+            // unfocused editor. Let that exact focus lifecycle run before
+            // asking which editor owns the next keyboard action.
+            let mut focus_messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Window(iced::window::Event::RedrawRequested(
+                    std::time::Instant::now(),
+                )),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut focus_messages),
+                &viewport,
+            );
+            let mut cleared = Vec::new();
+            let mut observed = Vec::new();
+            for message in &focus_messages {
+                match message {
+                    Message::ChatUi(Action::Composer(
+                        target,
+                        text_editor::Action::ClearSelection,
+                    )) => {
+                        cleared.push(*target);
+                    }
+                    Message::ChatUi(Action::ComposerHistory(target, command))
+                        if !command.changes_text() =>
+                    {
+                        observed.push(*target)
+                    }
+                    _ => panic!("unexpected focus lifecycle message: {message:?}"),
+                }
+            }
+            let nonowners = [first.target, second.target]
+                .into_iter()
+                .filter(|target| Some(*target) != expected)
+                .collect::<Vec<_>>();
+            assert_eq!(cleared, nonowners);
+            assert_eq!(observed, nonowners);
             for (key, code, latest) in [
                 (Named::End, Code::End, true),
                 (Named::Enter, Code::Enter, false),
