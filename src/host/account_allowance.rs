@@ -143,26 +143,37 @@ mod tests {
             // Explicit unit-test precondition: this is the bound lineage read
             // by actual admission, not proof of token mint/authentication.
             // The separate framed CLI fixture covers Authenticate ordering.
-            state.agent_clients.insert(AGENT, Lineage(TerminalId::new()));
+            state
+                .agent_clients
+                .insert(AGENT, Lineage(TerminalId::new()));
         }
         for action in [
             Action::Inspect,
             Action::Redeem {
-                expected: account(), credit_id: "private-credit".into(),
-                authorized: true, condition: None,
+                expected: account(),
+                credit_id: "private-credit".into(),
+                authorized: true,
+                condition: None,
             },
         ] {
             let request = ClientRequest::DeviceOperation {
                 operation: Operation::AccountAllowance {
-                    request: Request { session: TerminalId::new(), action },
+                    request: Request {
+                        session: TerminalId::new(),
+                        action,
+                    },
                 },
             };
-            let denied = super::super::client::process_request(&host, AGENT, request.clone())
-                .unwrap_err();
+            let denied =
+                super::super::client::process_request(&host, AGENT, request.clone()).unwrap_err();
             assert_eq!(denied.code, ProtocolErrorCode::PermissionDenied);
             let target = super::super::client::process_request(&host, USER, request).unwrap_err();
             assert_eq!(target.code, ProtocolErrorCode::InvalidRequest);
-            assert!(target.message.contains("not an existing live native conversation"));
+            assert!(
+                target
+                    .message
+                    .contains("not an existing live native conversation")
+            );
         }
         assert!(host.lock().unwrap().chats.is_empty());
     }

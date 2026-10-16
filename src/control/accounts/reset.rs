@@ -309,9 +309,8 @@ mod tests {
             device_service::{Operation, Reply},
             model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
             terminal_ipc::{
-                ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError,
-                ProtocolErrorCode, ServerEnvelope, ServerMessage, ServerResponse,
-                read_frame, write_frame,
+                ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+                ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
             },
         };
         use std::os::unix::net::UnixStream;
@@ -324,7 +323,8 @@ mod tests {
                 let session = TerminalId::new();
                 let (stream, mut peer) = UnixStream::pair().unwrap();
                 peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                peer.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
                 let worker = thread::spawn(move || {
                     let proof = HostSessionProof {
                         host_session_id: HostSessionId::new("private-reset-role-peer"),
@@ -339,24 +339,35 @@ mod tests {
                         }
                         let response = match (step, envelope.request) {
                             (0, ClientRequest::Connect { .. }) => ServerResponse::Connected {
-                                proof: proof.clone(), resumed: vec![],
+                                proof: proof.clone(),
+                                resumed: vec![],
                             },
                             (1, ClientRequest::Authenticate { authority }) => {
-                                let expected = if role == 0 { Authority::default() } else {
+                                let expected = if role == 0 {
+                                    Authority::default()
+                                } else {
                                     Authority::session("synthetic-reset-fixture-role".into())
                                 };
                                 assert_eq!(authority, expected);
                                 ServerResponse::Accepted
                             }
-                            (2, ClientRequest::DeviceOperation {
-                                operation: Operation::AccountAllowance { request },
-                            }) => {
+                            (
+                                2,
+                                ClientRequest::DeviceOperation {
+                                    operation: Operation::AccountAllowance { request },
+                                },
+                            ) => {
                                 assert_eq!(request.session, session);
                                 request.validate().unwrap();
                                 if command_kind == 1 {
-                                    assert!(matches!(request.action, Action::Redeem {
-                                        authorized: true, condition: None, ..
-                                    }));
+                                    assert!(matches!(
+                                        request.action,
+                                        Action::Redeem {
+                                            authorized: true,
+                                            condition: None,
+                                            ..
+                                        }
+                                    ));
                                 } else {
                                     assert_eq!(request.action, Action::Inspect);
                                 }
@@ -370,30 +381,49 @@ mod tests {
                         let message = if refused {
                             ServerMessage::Error(ProtocolError::new(
                                 ProtocolErrorCode::PermissionDenied,
-                                "Synthetic caller role refused; no allowance effect admitted", false,
+                                "Synthetic caller role refused; no allowance effect admitted",
+                                false,
                             ))
-                        } else { ServerMessage::Response { response } };
-                        write_frame(&mut peer, &ServerEnvelope {
-                            version: PROTOCOL_VERSION, request_id: Some(envelope.request_id),
-                            proof: proof.clone(), message,
-                        }).unwrap();
+                        } else {
+                            ServerMessage::Response { response }
+                        };
+                        write_frame(
+                            &mut peer,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(envelope.request_id),
+                                proof: proof.clone(),
+                                message,
+                            },
+                        )
+                        .unwrap();
                     }
-                    assert!(read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
-                        "caller refusal must not retry or reconnect as the user");
+                    assert!(
+                        read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                        "caller refusal must not retry or reconnect as the user"
+                    );
                 });
                 let command = match command_kind {
                     0 => AccountCommand::Allowance { session },
                     1 => AccountCommand::Redeem {
-                        session, provider_account: "actual-account".into(),
+                        session,
+                        provider_account: "actual-account".into(),
                         backend_origin: "https://chatgpt.com".into(),
-                        credit: "actual-credit".into(), authorize: true,
+                        credit: "actual-credit".into(),
+                        authorize: true,
                     },
                     _ => AccountCommand::Monitor {
-                        session, threshold: 90, interval_seconds: 1, checks: 1,
-                        max_redemptions: 1, authorize: false,
+                        session,
+                        threshold: 90,
+                        interval_seconds: 1,
+                        checks: 1,
+                        max_redemptions: 1,
+                        authorize: false,
                     },
                 };
-                let authority = if role == 0 { Authority::default() } else {
+                let authority = if role == 0 {
+                    Authority::default()
+                } else {
                     Authority::session("synthetic-reset-fixture-role".into())
                 };
                 let mut client = ControlClient::from_stream(stream);
@@ -407,7 +437,13 @@ mod tests {
                 if role == 0 {
                     assert!(result.is_ok());
                 } else {
-                    assert!(result.err().unwrap().message.contains("Synthetic caller role refused"));
+                    assert!(
+                        result
+                            .err()
+                            .unwrap()
+                            .message
+                            .contains("Synthetic caller role refused")
+                    );
                 }
             }
         }
