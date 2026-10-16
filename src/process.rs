@@ -1441,6 +1441,7 @@ fn join_readers(
             PipeRead {
                 output: Vec::new(),
                 limit_exceeded: false,
+                stdout_truncated: false,
             },
             None,
         ),
