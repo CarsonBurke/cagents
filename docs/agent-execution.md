@@ -72,6 +72,18 @@ If a daemon restart loses proof of an accepted prompt's outcome, the run becomes
 ## Reading context and account budgets
 
 ```sh
+cagents account list
+cagents account list --provider codex --json
+```
+
+`account list` reads active accounts and any retained caller account from the
+selected daemon. Its table shows stable account IDs, names, defaults, current
+caller selection and archived status. JSON projects those metadata fields with
+lowercase provider names; it omits usage bodies and launch recipes. This request
+does not probe a provider CLI. A default marker describes saved preferences,
+not a guarantee that the account is currently available for new work.
+
+```sh
 cagents account info --json
 cagents account info --provider claude --json
 cagents account info --account claude/system --refresh --json
