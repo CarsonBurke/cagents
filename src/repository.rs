@@ -3113,6 +3113,9 @@ impl BaseRevision {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorktreeRequest {
+    /// Explicit ticket context, persisted with creation for crash-safe linking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_issue: Option<crate::linear::context::LinkedIssue>,
     pub repository: PathBuf,
     pub managed_root: PathBuf,
     pub destination: PathBuf,
@@ -5715,6 +5718,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         Ok(CreateWorktreeRequest {
             setup_intent: None,
+            linear_issue: None,
             // Preserve the project identity used to restore operation rows.
             // Only relative destination resolution uses its worktree root.
             repository: input.repository.clone(),
@@ -7424,6 +7428,7 @@ mod tests {
         let destination = root.path().join("feature; echo nope");
         let request = CreateWorktreeRequest {
             setup_intent: None,
+            linear_issue: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: destination.clone(),
@@ -7455,6 +7460,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let request = CreateWorktreeRequest {
             setup_intent: None,
+            linear_issue: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: root.path().join("feature"),
@@ -9215,6 +9221,7 @@ mod tests {
         let plan = service
             .plan_worktree_creation(&CreateWorktreeRequest {
                 setup_intent: None,
+                linear_issue: None,
                 repository: PathBuf::from("/repo"),
                 managed_root: managed.path().to_path_buf(),
                 destination: managed.path().join("feature"),
@@ -11426,9 +11433,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     && worktree.lock.reason.as_deref()
                         == Some(format!("cagents:{}", journal.request.operation_id).as_str())
             });
-        let admin_dir = self.created_admin_dir(journal);
-        if residual.branch_exists && owned && admin_dir.is_some() {
-            journal.admin_dir = admin_dir;
+        let admin_root = self.created_admin_root(journal);
+        if residual.branch_exists && owned && admin_root.is_some() {
+            let admin_root = admin_root.expect("administrative identity checked");
+            journal.admin_dir = Some(admin_root.path().to_path_buf());
             journal.state = WorktreeOperationState::Created;
             journal.outcome = Some(WorktreeCreationOutcome::Created {
                 worktree: residual.registered_worktree.expect("ownership checked"),
@@ -11439,6 +11447,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             } else {
                 format!("Created with warning: {}", journal.detail)
             };
+            // Complete ticket context while the operation-id lock still proves
+            // ownership, before ANY transition can persist Created as Applied.
+            // A crash leaves the prior unresolved row and the marker intact;
+            // recovery repeats this idempotent write instead of losing the link.
+            if let Some(issue) = &journal.request.linear_issue
+                && let Err(error) = crate::linear::context::ensure_link_for_creation(
+                    &journal.request.destination,
+                    &admin_root,
+                    &issue.issue_id,
+                    issue.workspace.as_deref(),
+                )
+            {
+                journal.state = WorktreeOperationState::ReconcileRequired;
+                journal.detail =
+                    format!("Worktree created; Linear linking requires reconciliation: {error}");
+            }
         } else if (!residual.branch_exists
             || journal.existing_branch_oid.as_ref().is_some_and(|before| {
                 self.resolve_optional_revision(
@@ -11464,23 +11488,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// The created worktree's administrative directory, when the destination
     /// is evidently the worktree this journal created.
-    fn created_admin_dir(&self, journal: &WorktreeJournal) -> Option<PathBuf> {
+    fn created_admin_root(&self, journal: &WorktreeJournal) -> Option<crate::fs_safety::Root> {
         let token = CancellationToken::new();
         let destination = &journal.request.destination;
         if fs::canonicalize(destination).ok().as_ref() != Some(destination) {
             return None;
         }
         let git_dir = self.git_dir(destination, &token).ok()?;
+        let root = crate::fs_safety::Root::open(&git_dir).ok()?;
+        let read_marker = |name: &str| {
+            let mut file = crate::fs_safety::open_beneath(&root, Path::new(name)).ok()?;
+            crate::fs_safety::read_bounded(&mut file, 8192).ok()
+        };
         // A linked worktree must resolve to its own administrative directory,
         // whose backlink names exactly this destination's .git file.
         if git_dir.parent() != Some(journal.common_dir.join("worktrees").as_path())
-            || fs::read(git_dir.join("gitdir"))
-                .ok()
+            || read_marker("gitdir")
                 .map(|bytes| bytes_to_path(trim_one_line_ending(&bytes)))
                 .as_ref()
                 != Some(&destination.join(".git"))
-            || fs::read(git_dir.join("commondir"))
-                .ok()
+            || read_marker("commondir")
                 .map(|bytes| git_dir.join(bytes_to_path(trim_one_line_ending(&bytes))))
                 .and_then(|path| fs::canonicalize(path).ok())
                 .as_ref()
@@ -11489,12 +11516,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return None;
         }
         if journal.checkout_completed {
-            return Some(git_dir);
+            return Some(root);
         }
         // HEAD and backlinks precede checkout in Git. Without a recorded
         // successful exit, require a real index and a clean index/worktree
         // comparison; partial checkout and subsequent edits remain unknown.
-        let clean = fs::symlink_metadata(git_dir.join("index"))
+        let clean = crate::fs_safety::metadata_beneath(&root, Path::new("index"))
             .is_ok_and(|metadata| metadata.is_file())
             && self
                 .run_checked(
@@ -11505,7 +11532,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     &token,
                 )
                 .is_ok_and(|output| output.stdout.is_empty());
-        clean.then_some(git_dir)
+        clean.then_some(root)
     }
 
     /// Only the original live request may clean up its own Git lock. Startup
@@ -11745,6 +11772,7 @@ mod worktree_journal_tests {
             let root = directory.path().join("managed");
             let request = CreateWorktreeRequest {
                 setup_intent: None,
+                linear_issue: None,
                 repository,
                 managed_root: root.clone(),
                 destination: root.join("feature"),
@@ -11890,6 +11918,323 @@ mod worktree_journal_tests {
                 &sender,
             )
         }
+    }
+
+    /// Simulate process loss after Git completed but before reconciliation
+    /// can write the link or settle Applied. The original operation lock stays.
+    fn interrupted_linear_checkout(fixture: &Fixture) {
+        let (mut journal, payload) = fixture.prepare();
+        let lease = worktree_lease(&journal.lease_path, true).unwrap();
+        journal.lease_identity = Some(lease_file_identity(&lease).unwrap());
+        journal.state = WorktreeOperationState::Running;
+        journal.effects_started = true;
+        let oid = fixture.git(&["rev-parse", "HEAD"]);
+        journal.base_oid = Some(oid.clone());
+        let payload = journal.persist(&fixture.store, &payload).unwrap();
+        fs::create_dir(&fixture.request.managed_root).unwrap();
+        let mut command = fixture
+            .service
+            .create_worktree_command(&fixture.request, &oid)
+            .unwrap();
+        command.inherited_lease = Some(lease.as_raw_fd());
+        assert!(
+            SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap()
+                .success
+        );
+        journal.checkout_completed = true;
+        journal.persist(&fixture.store, &payload).unwrap();
+        drop(lease);
+    }
+
+    #[test]
+    fn interrupted_creation_recovers_linear_link_before_first_applied_transition() {
+        for already_linked in [false, true] {
+            let mut fixture = Fixture::new();
+            fixture.request.linear_issue = Some(crate::linear::context::LinkedIssue {
+                issue_id: "ENG-123".into(),
+                workspace: None,
+            });
+            interrupted_linear_checkout(&fixture);
+            if already_linked {
+                crate::linear::context::link_at(&fixture.request.destination, "ENG-123", None)
+                    .unwrap();
+            }
+            let report = fixture
+                .service
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap()
+                .remove(0);
+            assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+            assert_eq!(
+                crate::linear::context::resolve_at(&fixture.request.destination)
+                    .unwrap()
+                    .issue_id,
+                "ENG-123"
+            );
+            assert_eq!(
+                fixture.journal(fixture.request.operation_id).state,
+                WorktreeOperationState::Created
+            );
+        }
+    }
+
+    #[test]
+    fn linear_creation_retains_admin_identity_when_checkout_is_retargeted() {
+        struct RetargetAfterDiscovery {
+            destination: PathBuf,
+            other_admin: PathBuf,
+            fired: std::sync::atomic::AtomicBool,
+        }
+        impl ProcessExecutor for RetargetAfterDiscovery {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                token: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                let output = SystemProcessExecutor.execute(command, token)?;
+                if output.success
+                    && command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "--git-dir")
+                    && command
+                        .arguments
+                        .windows(2)
+                        .any(|pair| pair[0] == "-C" && pair[1] == self.destination.as_os_str())
+                    && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    fs::write(
+                        self.destination.join(".git"),
+                        format!("gitdir: {}\n", self.other_admin.display()),
+                    )
+                    .unwrap();
+                }
+                Ok(output)
+            }
+        }
+        let mut fixture = Fixture::new();
+        fixture.request.linear_issue = Some(crate::linear::context::LinkedIssue {
+            issue_id: "ENG-123".into(),
+            workspace: None,
+        });
+        interrupted_linear_checkout(&fixture);
+        let original_admin = fixture
+            .service
+            .git_dir(&fixture.request.destination, &CancellationToken::new())
+            .unwrap();
+        let original_gitfile = fs::read(fixture.request.destination.join(".git")).unwrap();
+        let unrelated = Fixture::new();
+        let other_admin = unrelated
+            .service
+            .git_dir(&unrelated.request.repository, &CancellationToken::new())
+            .unwrap();
+        let executor = Arc::new(RetargetAfterDiscovery {
+            destination: fixture.request.destination.clone(),
+            other_admin: other_admin.clone(),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        });
+        let service = RepositoryService::new("git", Arc::clone(&executor));
+        let report = service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap()
+            .remove(0);
+        assert!(executor.fired.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::ReconcileRequired,
+            "{report:?}"
+        );
+        assert!(report.detail.contains("administrative identity changed"));
+        for admin in [&original_admin, &other_admin] {
+            assert!(!admin.join("cagents-linear.json").exists());
+        }
+        assert_eq!(
+            fs::read_to_string(original_admin.join("locked"))
+                .unwrap()
+                .trim(),
+            format!("cagents:{}", fixture.request.operation_id)
+        );
+        fs::write(fixture.request.destination.join(".git"), original_gitfile).unwrap();
+        let recovered = fixture
+            .service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            recovered.state,
+            WorktreeOperationState::Created,
+            "{recovered:?}"
+        );
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.destination)
+                .unwrap()
+                .issue_id,
+            "ENG-123"
+        );
+        assert!(!other_admin.join("cagents-linear.json").exists());
+    }
+
+    #[test]
+    fn failed_linear_link_retains_ownership_for_recovery_retry() {
+        let mut fixture = Fixture::new();
+        fixture.request.linear_issue = Some(crate::linear::context::LinkedIssue {
+            issue_id: "ENG-123".into(),
+            workspace: None,
+        });
+        interrupted_linear_checkout(&fixture);
+        let admin = fixture
+            .service
+            .git_dir(&fixture.request.destination, &CancellationToken::new())
+            .unwrap();
+        let obstruction = admin.join("cagents-linear.json");
+        fs::create_dir(&obstruction).unwrap();
+        let report = fixture
+            .service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::ReconcileRequired,
+            "{report:?}"
+        );
+        assert!(
+            report
+                .detail
+                .contains("Linear linking requires reconciliation")
+        );
+        assert_eq!(
+            fixture.journal(fixture.request.operation_id).state,
+            WorktreeOperationState::ReconcileRequired
+        );
+        let worktree = fixture
+            .service
+            .list_worktrees(&fixture.request.repository, &CancellationToken::new())
+            .unwrap()
+            .into_iter()
+            .find(|worktree| worktree.path == fixture.request.destination)
+            .unwrap();
+        assert_eq!(
+            worktree.lock.reason,
+            Some(format!("cagents:{}", fixture.request.operation_id))
+        );
+        fs::remove_dir(obstruction).unwrap();
+        let recovered = fixture
+            .service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            recovered.state,
+            WorktreeOperationState::Created,
+            "{recovered:?}"
+        );
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.destination)
+                .unwrap()
+                .issue_id,
+            "ENG-123"
+        );
+    }
+
+    #[test]
+    fn interrupted_linear_creation_preserves_later_ticket_workspace_and_unlink() {
+        for change in ["ticket", "workspace", "unlink"] {
+            let mut fixture = Fixture::new();
+            let original = crate::linear::context::LinkedIssue {
+                issue_id: "ENG-123".into(),
+                workspace: Some("TEST".into()),
+            };
+            fixture.request.linear_issue = Some(original.clone());
+            interrupted_linear_checkout(&fixture);
+            let later = match change {
+                "ticket" => Some(
+                    crate::linear::context::link_at(
+                        &fixture.request.destination,
+                        "ENG-999",
+                        Some("TEST"),
+                    )
+                    .unwrap(),
+                ),
+                "workspace" => Some(
+                    crate::linear::context::link_at(
+                        &fixture.request.destination,
+                        "ENG-123",
+                        Some("OTHER"),
+                    )
+                    .unwrap(),
+                ),
+                _ => {
+                    crate::linear::context::unlink_at(&fixture.request.destination).unwrap();
+                    None
+                }
+            };
+            let report = fixture
+                .service
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                report.state,
+                WorktreeOperationState::ReconcileRequired,
+                "{change}: {report:?}"
+            );
+            assert!(report.detail.contains("preserved"), "{report:?}");
+            let current = crate::linear::context::resolve_at(&fixture.request.destination);
+            match later {
+                Some(later) => assert_eq!(current.unwrap(), later),
+                None => assert_eq!(current.unwrap_err().kind, "linear_issue_required"),
+            }
+            assert_eq!(
+                fixture.journal(fixture.request.operation_id).state,
+                WorktreeOperationState::ReconcileRequired
+            );
+            // A deliberate explicit resolution allows the retained operation
+            // to settle without replaying Git or overriding the user's edit.
+            crate::linear::context::link_at(
+                &fixture.request.destination,
+                &original.issue_id,
+                original.workspace.as_deref(),
+            )
+            .unwrap();
+            let report = fixture
+                .service
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap()
+                .remove(0);
+            assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        }
+    }
+
+    #[test]
+    fn created_worktree_has_its_requested_linear_link_before_settlement() {
+        let mut fixture = Fixture::new();
+        let issue = crate::linear::context::LinkedIssue {
+            issue_id: "ENG-123".into(),
+            workspace: Some("TEST".into()),
+        };
+        fixture.request.linear_issue = Some(issue.clone());
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.destination).unwrap(),
+            issue,
+        );
+        assert_eq!(
+            fixture
+                .journal(fixture.request.operation_id)
+                .request
+                .linear_issue,
+            Some(issue)
+        );
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.repository)
+                .unwrap_err()
+                .kind,
+            "linear_issue_required",
+        );
     }
 
     /// Deleting a created worktree in the app frees its identity, so the same
