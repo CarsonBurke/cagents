@@ -410,7 +410,14 @@ fn unconfirmed_account_removal_is_rejected_before_device_preparation() {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("runtime-must-not-be-created");
     let command = CommandSpec::new(Path::new(env!("CARGO_BIN_EXE_cagents")))
-        .args(["--json", "--device", "not-a-configured-device", "account", "remove", "claude/00000000-0000-4000-8000-000000000001"])
+        .args([
+            "--json",
+            "--device",
+            "not-a-configured-device",
+            "account",
+            "remove",
+            "claude/00000000-0000-4000-8000-000000000001",
+        ])
         .env("HOME", root.path())
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -418,11 +425,18 @@ fn unconfirmed_account_removal_is_rejected_before_device_preparation() {
         .env("XDG_CACHE_HOME", root.path().join("cache"))
         .timeout(Duration::from_secs(5))
         .output_limits(64 * 1024, 64 * 1024);
-    let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
+    let output = SystemProcessExecutor
+        .execute(&command, &CancellationToken::new())
+        .unwrap();
     assert_eq!(output.exit_code, Some(2), "{output:?}");
     let value: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(value["error"]["kind"], "usage", "{value}");
-    assert!(value["error"]["message"].as_str().unwrap().contains("--yes"));
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--yes")
+    );
     assert!(output.stdout.is_empty());
     assert!(!runtime.exists());
 }
