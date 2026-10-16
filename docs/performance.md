@@ -87,8 +87,13 @@ monitor. Holder-control reports also use one `terminal-io` reactor thread.
 Each watcher retains its authenticated original socket and root pidfd; a partial
 frame or idle holder cannot block other watchers. Reads use per-call
 `MSG_DONTWAIT`, preserving the control writer's blocking descriptor flags.
-PTY parsing, PTY readers, and UI socket transport still have separate thread
-costs; these changes alone do not meet a total idle-plus-one-thread-per-terminal
+PTY reads use that same reactor after the bounded writer establishes the
+original master's nonblocking mode. Each reader keeps at most one undelivered
+64 KiB batch beyond its bounded parser inbox; a full inbox never blocks the
+reactor. Carry drains that consumed batch before detach, while destructive
+teardown may cancel it. Parser workers, optional transcript writers, and UI
+socket transport still have separate thread costs; these changes alone do not
+meet a total idle-plus-one-thread-per-terminal
 budget.
 
 For multi-terminal memory comparisons, report daemon and UI RSS separately

@@ -9,6 +9,7 @@ mod event_dispatch_tests;
 pub(crate) mod holder;
 mod input_queue;
 mod joins;
+mod pty_async;
 #[cfg(test)]
 mod pty_reader_tests;
 
@@ -2380,7 +2381,7 @@ struct Worker {
     /// The process that owns this terminal's PTY and reaps its root.
     /// Released last, once nothing here reads or writes the terminal.
     holder: holder::Holder,
-    reader: Option<JoinHandle<()>>,
+    reader: Option<pty_async::Task>,
     /// Write end of the reader's wake pipe. Closing it releases a read that a
     /// disowned grandchild would otherwise hold open indefinitely.
     reader_wake: Option<OwnedFd>,
@@ -2393,10 +2394,10 @@ struct Worker {
     pty_capacity: usize,
 }
 
-/// The thread that reads a terminal's PTY into its worker.
+/// A shared-reactor task that reads a terminal's PTY into its parser worker.
 struct Reader {
-    thread: JoinHandle<()>,
-    start: Option<Sender<()>>,
+    task: pty_async::Task,
+    start: Option<tokio::sync::oneshot::Sender<()>>,
     /// Closing this releases the reader, however long a read would block.
     wake: OwnedFd,
     done: Receiver<()>,
@@ -2419,7 +2420,7 @@ impl Reader {
 
     /// Allocate the reader without consuming PTY output until ownership commits.
     fn prepare(
-        terminal_id: crate::model::TerminalId,
+        _terminal_id: crate::model::TerminalId,
         master: &holder::PtyMaster,
         capacity: usize,
         pending: Vec<u8>,
@@ -2429,40 +2430,17 @@ impl Reader {
                 .duplicate()
                 .map_err(|error| format!("duplicate PTY descriptor for {purpose}: {error}"))
         };
-        let mut reader = File::from(duplicate("reading")?);
-        // Closing the master does not release a read already blocked on a
-        // duplicate: a PTY master read only fails with EIO once the last slave
-        // descriptor closes, which a disowned grandchild can defer forever.
-        // Wait for readiness on a descriptor this worker hands over instead,
-        // alongside a pipe whose closure is the shutdown signal, so the reader
-        // always has a way out.
-        let readiness = duplicate("readiness")?;
+        let reader = File::from(duplicate("reading")?);
         let (wake_rx, wake) = wake_pipe()?;
         let (pty_tx, output) = crossbeam_channel::bounded(capacity.max(1));
         if !pending.is_empty() {
-            let _ = pty_tx.send(PtyMessage::Bytes(pending));
+            let _ = pty_tx.try_send(PtyMessage::Bytes(pending));
         }
-        let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
-        let (start, started) = crossbeam_channel::bounded(1);
         let discard_pending = Arc::new(AtomicBool::new(false));
-        let reader_discard_pending = Arc::clone(&discard_pending);
-        let thread = thread::Builder::new()
-            .name(format!("terminal-pty-reader-{terminal_id:?}"))
-            .spawn(move || {
-                let _done = done_tx;
-                if started.recv().is_ok() {
-                    read_pty(
-                        &mut reader,
-                        &pty_tx,
-                        readiness,
-                        wake_rx,
-                        &reader_discard_pending,
-                    );
-                }
-            })
-            .map_err(|error| format!("start PTY reader: {error}"))?;
+        let (task, start, done) =
+            pty_async::Task::prepare(reader, wake_rx, pty_tx, Arc::clone(&discard_pending))?;
         Ok(Self {
-            thread,
+            task,
             start: Some(start),
             wake,
             done,
@@ -2778,7 +2756,7 @@ impl Worker {
             carried: false,
             holder: held.holder,
             pty_capacity: config.pty_capacity,
-            reader: Some(reader.thread),
+            reader: Some(reader.task),
             reader_wake: Some(reader.wake),
             reader_done: reader.done,
             reader_discard_pending: reader.discard_pending,
@@ -4041,7 +4019,7 @@ impl Worker {
                 Vec::new(),
             ) {
                 Ok(reader) => {
-                    self.reader = Some(reader.thread);
+                    self.reader = Some(reader.task);
                     self.reader_wake = Some(reader.wake);
                     self.reader_done = reader.done;
                     self.reader_discard_pending = reader.discard_pending;
@@ -5017,6 +4995,7 @@ fn wake_pipe() -> Result<(OwnedFd, OwnedFd), String> {
     unsafe { Ok((OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1]))) }
 }
 
+#[cfg(test)]
 enum Readiness {
     Readable,
     Shutdown,
@@ -5027,6 +5006,7 @@ enum Readiness {
 /// pipe. A PTY master read only fails with EIO once the last slave descriptor
 /// closes, so a disowned grandchild can keep a blocking read - and therefore
 /// shutdown - waiting indefinitely; the pipe is the way out.
+#[cfg(test)]
 fn wait_readable(readiness: &OwnedFd, wake: &OwnedFd) -> Readiness {
     let mut fds = [
         libc::pollfd {
@@ -5062,6 +5042,7 @@ fn wait_readable(readiness: &OwnedFd, wake: &OwnedFd) -> Readiness {
     }
 }
 
+#[cfg(test)]
 fn read_pty(
     reader: &mut dyn Read,
     sender: &Sender<PtyMessage>,
@@ -5122,6 +5103,7 @@ fn read_pty(
     }
 }
 
+#[cfg(test)]
 fn send_pty_message(
     sender: &Sender<PtyMessage>,
     mut message: PtyMessage,

@@ -10,6 +10,7 @@ pub(super) fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
                 .worker_threads(1)
                 .thread_name("terminal-io")
                 .enable_io()
+                .enable_time()
                 .build()
                 .map_err(|error| format!("start shared terminal I/O reactor: {error}"))
         })
