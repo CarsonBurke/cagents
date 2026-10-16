@@ -2106,11 +2106,12 @@ mod tests {
         use crate::agent::Provider;
         use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
         use crate::workspace_model::views::{Change, Scope, View};
-        for (active_target, retired, blocked_before) in [
-            (true, false, false),
-            (false, false, false),
-            (true, true, false),
-            (true, false, true),
+        for (active_target, retired, blocked_before, existing_primary) in [
+            (true, false, false, false),
+            (false, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
         ] {
             let (mut app, project, repository) = app_with_project();
             let active = ChannelId::new();
@@ -2190,12 +2191,42 @@ mod tests {
                 view.retired.push(card);
             }
             model.views.push(view);
+            if existing_primary {
+                app.active_workspace = Some(PathBuf::from("/repo"));
+            }
+            app.workspace.resize_viewport(1000.0);
+            let primary = existing_primary.then(|| {
+                let mut primary = agent.clone();
+                primary.id = crate::model::AgentId::new();
+                let mut primary_session = session.clone();
+                primary_session.id = TerminalId::new();
+                primary.session = Some(HostedSession::Chat(primary_session.clone()));
+                let id = CardId::from_uuid(primary.id.as_uuid());
+                model.views[0]
+                    .panes
+                    .push(crate::workspace_model::views::Pane {
+                        id,
+                        title: "Existing primary".into(),
+                        user_title: Some("Existing primary".into()),
+                        pending_terminal_start: false,
+                        width_fraction: 0.5,
+                        kind: CardKind::Chat(primary_session),
+                        scope: Some(primary.spec.target.directory.clone()),
+                    });
+                model.agents.push(primary);
+                id
+            });
             app.workspace_model = model.clone();
             let (tx, rx) = async_channel::unbounded();
             app.workspace_model_tx = tx;
             // This view already exists and its real seed acknowledgement has
             // completed before the daemon announces the new live Agent.
             app.acknowledge_view_edit(scope.clone(), None);
+            if let Some(primary) = primary {
+                drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+                assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![primary]);
+                assert_eq!(app.workspace.focused(), Some(primary));
+            }
             while rx.try_recv().is_ok() {}
             if blocked_before {
                 let mut conflict_agent = agent.clone();
@@ -2287,9 +2318,15 @@ mod tests {
                 "unpolled real attachment Task remains Starting, not detached"
             );
             assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
-            assert_eq!(app.workspace_model.agents[0], agent);
-            if !active_target {
+            assert_eq!(app.workspace_model.agents.last(), Some(&agent));
+            if !active_target || existing_primary {
                 assert_eq!(app.workspace.focused(), focus);
+            }
+            if let Some(primary) = primary {
+                assert_eq!(
+                    app.workspace.order().collect::<Vec<_>>(),
+                    vec![primary, card]
+                );
             }
             // Repeated daemon snapshots preserve the exact pending Insert,
             // rather than re-issuing it or treating the old empty view as close.
