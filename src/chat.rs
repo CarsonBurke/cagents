@@ -13,6 +13,8 @@ pub mod pricing;
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod claude_metadata;
 #[cfg(feature = "ui")]
 pub mod client;
 #[cfg(feature = "host")]
