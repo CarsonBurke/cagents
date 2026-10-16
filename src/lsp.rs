@@ -63,6 +63,8 @@ use crate::settings::LanguageServerSettings;
 mod features;
 pub use features::{LspChangeAnnotation,LspCapabilities,LspCodeAction,LspCodeActionContext,LspCommand,LspDocumentEdits,LspEditKind,LspFormattingOptions,LspMessageLevel,LspParameter,LspServerEditId,LspServerEditLease,LspSignature,LspSignatureHelp,LspWorkspaceEdit};
 mod workspace_wire;
+mod root_binding;
+use root_binding::ReadRoot;
 use features::RequestArgs;
 
 
@@ -1982,6 +1984,7 @@ struct LaunchSpec {
     initialization_options: Option<serde_json::Value>,
     command: Vec<String>,
     root: PathBuf,
+    read_root: Option<Arc<ReadRoot>>,
 }
 
 type TransportFactory = Arc<dyn Fn(&LaunchSpec) -> Result<Transport, String> + Send + Sync>;
@@ -1989,7 +1992,7 @@ type TransportFactory = Arc<dyn Fn(&LaunchSpec) -> Result<Transport, String> + S
 /// Keep the original directory inode allocated while a server owns its root.
 /// A path can be renamed and replaced between watchdog polls; existence alone
 /// would then keep a server for the previous checkout alive indefinitely.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RootIdentity {
     device: u64,
     inode: u64,
@@ -2112,6 +2115,9 @@ fn spawn_process_transport(spec: &LaunchSpec) -> Result<Transport, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(binding) = &spec.read_root {
+        binding.bind_command(&mut command).map_err(|error| format!("cannot bind the original language server root: {error}"))?;
+    }
     #[cfg(unix)]
     command.process_group(0);
     let child = command.spawn().map_err(|error| {
@@ -3968,6 +3974,7 @@ struct SessionHandle {
     capabilities: Arc<Mutex<LspCapabilities>>,
     server_settings: LanguageServerSettings,
     worktree: Arc<Path>,
+    read_root: Option<Arc<ReadRoot>>,
     activity: Arc<Mutex<SessionActivity>>,
     resident_bytes: Arc<AtomicU64>,
     commands: commands::Sender,
@@ -4012,6 +4019,14 @@ impl SessionHandle {
                 task,
                 process_group: Arc::clone(&self.process_group),
             })
+    }
+}
+
+fn same_read_scope(first: Option<&ReadRoot>, second: Option<&ReadRoot>) -> bool {
+    match (first, second) {
+        (None, None) => true,
+        (Some(first), Some(second)) => first.same_scope(second),
+        _ => false,
     }
 }
 
@@ -4083,6 +4098,8 @@ struct RegistrationOwner {
     // a session actually created by this registration belongs to that capture;
     // joining an already existing successor does not grant authority over it.
     created_session: Mutex<Option<CapturedSession>>,
+    original_root: Option<Arc<crate::fs_safety::Root>>,
+    discovered_root: Mutex<Option<Result<Arc<ReadRoot>, String>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -4326,6 +4343,39 @@ impl LspManager {
         version: i32,
         source: Arc<Snapshot>,
     ) -> LspStatus {
+        self.open_source_owned(doc, path, worktree, language, version, source, Arc::default())
+    }
+
+    /// Registers bytes read through the actual retained editor worktree.
+    /// Discovery and launch validate its named identity off the UI thread;
+    /// replacement worktrees cannot inherit this registration's authority.
+    pub fn open_snapshot_with_root(
+        &mut self,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+        language: LspLanguage,
+        version: i32,
+        source: TextSnapshot,
+        root: Arc<crate::fs_safety::Root>,
+    ) -> LspStatus {
+        self.open_source_owned(
+            doc, path, worktree, language, version,
+            Arc::new(Snapshot::from_native(version, source)),
+            Arc::new(RegistrationOwner { original_root: Some(root), ..Default::default() }),
+        )
+    }
+
+    fn open_source_owned(
+        &mut self,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+        language: LspLanguage,
+        version: i32,
+        source: Arc<Snapshot>,
+        owner: Arc<RegistrationOwner>,
+    ) -> LspStatus {
         if self.servers.is_empty() {
             return LspStatus::Disabled;
         }
@@ -4360,8 +4410,9 @@ impl LspManager {
             text: source,
             saved_text: None,
             ticket,
-            owner: Arc::default(),
+            owner,
         };
+        let worker_owner = Arc::clone(&pending.owner);
         let worker_path = pending.path.clone();
         let worker_worktree = pending.worktree.clone();
         let markers = server.root_markers.clone();
@@ -4370,7 +4421,14 @@ impl LspManager {
         // Canonicalization, marker reads and manifest parsing all happen here.
         runtime.spawn(async move {
             if let Ok(root) = tokio::task::spawn_blocking(move || {
-                discover_root(&worker_path, &worker_worktree, &markers)
+                if let Some(original) = &worker_owner.original_root {
+                    let result = ReadRoot::discover(Arc::clone(original), &worker_path, &worker_worktree, &markers);
+                    let root = result.as_ref().map_or_else(|_| worker_worktree.clone(), |binding| binding.directory.path().to_path_buf());
+                    *worker_owner.discovered_root.lock().unwrap_or_else(|error| error.into_inner()) = Some(result);
+                    root
+                } else {
+                    discover_root(&worker_path, &worker_worktree, &markers)
+                }
             })
             .await
             {
@@ -4480,6 +4538,14 @@ impl LspManager {
             );
         };
 
+        let read_root = if owner.original_root.is_some() {
+            match owner.discovered_root.lock().unwrap_or_else(|error| error.into_inner()).as_ref() {
+                Some(Ok(binding)) if binding.original.path() == worktree && binding.directory.path() == root => Some(Arc::clone(binding)),
+                Some(Err(reason)) => return self.unavailable(doc, reason.clone()),
+                _ => return self.unavailable(doc, "the original editor root has not been validated for this language server".into()),
+            }
+        } else { None };
+
         let key = self
             .sessions
             .iter()
@@ -4487,6 +4553,7 @@ impl LspManager {
                 key.server_id.as_ref() == server.id
                     && !handle.retired.load(Ordering::Acquire)
                     && handle.worktree.as_ref() == worktree
+                    && same_read_scope(handle.read_root.as_deref(), read_root.as_deref())
                     && path.starts_with(key.root.as_ref())
             })
             .min_by_key(|(key, _)| key.root.components().count())
@@ -4495,6 +4562,16 @@ impl LspManager {
                 server_id: Arc::from(server.id.as_str()),
                 root: Arc::from(root.clone()),
             });
+        // A different root must not enter the shared URI snapshot store at
+        // all: registering its text could overwrite the original session's
+        // snapshot even if session admission itself was refused.
+        if let Some(existing) = self.sessions.get(&key)
+            && !existing.retired.load(Ordering::Acquire)
+            && !existing.commands.is_closed()
+            && !same_read_scope(existing.read_root.as_deref(), read_root.as_deref())
+        {
+            return self.unavailable(doc, "this language server belongs to another editor root; close its documents before reopening this worktree".into());
+        }
         // Keep a refused document registered so Restart can retry admission
         // after another workspace becomes idle, with its latest buffer text.
         // Ensure first: reopening previously blocked documents must not also
@@ -4503,8 +4580,14 @@ impl LspManager {
             .sessions
             .get(&key)
             .map(|handle| Arc::clone(&handle.retired));
-        let handle = self.ensure_session(&key, &server, &root, worktree);
+        let handle = self.ensure_session_bound(&key, &server, worktree, read_root);
         if let Ok(handle) = &handle {
+            if let Some(binding) = &handle.read_root {
+                // Ancestor workspace reuse chooses the existing server's
+                // retained directory. Restart must keep that same binding,
+                // not the narrower directory discovered by the joining file.
+                *owner.discovered_root.lock().unwrap_or_else(|error| error.into_inner()) = Some(Ok(Arc::clone(binding)));
+            }
             if prior_session
                 .as_ref()
                 .is_none_or(|prior| !Arc::ptr_eq(prior, &handle.retired))
@@ -5222,12 +5305,23 @@ impl LspManager {
     /// run, leaving its process group orphaned by the very exit that ordered
     /// the teardown. The refusal is reported rather than silent: the caller
     /// turns it into [`LspStatus::Unavailable`], which the editor renders.
+    #[cfg(test)]
     fn ensure_session(
         &mut self,
         key: &SessionKey,
         server: &LanguageServerSettings,
         _root: &Path,
         worktree: &Path,
+    ) -> Result<SessionHandle, String> {
+        self.ensure_session_bound(key, server, worktree, None)
+    }
+
+    fn ensure_session_bound(
+        &mut self,
+        key: &SessionKey,
+        server: &LanguageServerSettings,
+        worktree: &Path,
+        read_root: Option<Arc<ReadRoot>>,
     ) -> Result<SessionHandle, String> {
         if self.stopping {
             return Err("the editor is shutting its language servers down".to_owned());
@@ -5239,6 +5333,9 @@ impl LspManager {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if !existing.commands.is_closed() && !existing.retired.load(Ordering::Acquire) {
+                if !same_read_scope(existing.read_root.as_deref(), read_root.as_deref()) {
+                    return Err("this language server belongs to another editor root; close its documents before reopening this worktree".into());
+                }
                 // Fence the idle worker before joining this server. It holds
                 // the same lock while publishing retirement.
                 activity.last_used = self.epoch.elapsed();
@@ -5298,6 +5395,7 @@ impl LspManager {
             capabilities: Arc::new(Mutex::new(LspCapabilities::default())),
             server_settings: server.clone(),
             worktree: Arc::from(worktree.to_path_buf()),
+            read_root: read_root.clone(),
             activity: Arc::new(Mutex::new(SessionActivity::default())),
             resident_bytes: Arc::new(AtomicU64::new(0)),
             commands: tx,
@@ -5317,6 +5415,7 @@ impl LspManager {
                 initialization_options: server.initialization_options.clone(),
                 command: server.command.clone(),
                 root: key.root.to_path_buf(),
+                read_root,
             },
             transport: Arc::clone(&self.transport),
             snapshots: Arc::clone(&self.snapshots),
@@ -5345,6 +5444,13 @@ impl LspManager {
                 return;
             };
             if !context.retired.load(Ordering::Acquire) {
+                if let Some(binding) = context.launch.read_root.clone() {
+                    let valid = tokio::task::spawn_blocking(move || binding.validate()).await;
+                    if !matches!(valid, Ok(Ok(()))) {
+                        context.set_status(LspStatus::Unavailable { reason: "the original editor worktree changed; reopen the document before starting its language server".into() }).await;
+                        return;
+                    }
+                }
                 let (directory_pin, identity) = match pin_session_root(&context.launch.root).await {
                     Ok(pin) => pin,
                     Err(error) => {
@@ -5356,6 +5462,10 @@ impl LspManager {
                         return;
                     }
                 };
+                if context.launch.read_root.as_ref().is_some_and(|binding| !binding.directory_matches(identity)) {
+                    context.set_status(LspStatus::Unavailable { reason: "the original language server directory changed; reopen the document".into() }).await;
+                    return;
+                }
                 *launched_root_identity
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = Some(identity);
@@ -5411,6 +5521,10 @@ impl LspManager {
                         .is_some_and(|identity| identity != RootIdentity::from_metadata(&metadata)),
                     Err(error) => error.kind() == io::ErrorKind::NotFound,
                 };
+                let read_root_changed = if let Some(binding) = watched.read_root.clone() {
+                    !matches!(tokio::task::spawn_blocking(move || binding.validate()).await, Ok(Ok(())))
+                } else { false };
+                let root_changed = root_changed || read_root_changed;
                 if root_changed {
                     let doc = watched
                         .activity
@@ -5499,7 +5613,11 @@ impl LspManager {
                 version,
                 text,
                 key.root.to_path_buf(),
-                Arc::default(),
+                Arc::new(RegistrationOwner {
+                    original_root: document.owner.original_root.clone(),
+                    discovered_root: Mutex::new(document.owner.discovered_root.lock().unwrap_or_else(|error| error.into_inner()).clone()),
+                    ..Default::default()
+                }),
             );
         }
     }
@@ -7822,6 +7940,203 @@ mod tests {
             );
             assert_eq!(changes[0]["text"], json!("resynchronised\n"));
             manager.shutdown();
+        });
+    }
+
+    fn original_root_workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let worktree = guard.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();
+        let file = worktree.join("main.rs");
+        std::fs::write(&file, "original").unwrap();
+        (guard, worktree, file)
+    }
+
+    async fn finish_original_root_discovery(
+        manager: &mut LspManager,
+        events: &async_channel::Receiver<LspEvent>,
+        doc: LspDocumentId,
+    ) -> LspStatus {
+        let (ticket, root) = next_matching(events, |event| match event {
+            LspEvent::RootDiscovered { doc: at, ticket, root } if *at == doc => Some((*ticket, root.clone())),
+            _ => None,
+        }).await;
+        manager.finish_discovery(doc, ticket, root).expect("current registration")
+    }
+
+    #[test]
+    fn original_read_root_shares_session_and_survives_restart_with_fresh_removal_owner() {
+        block_on(async {
+            let (_guard, worktree, file) = original_root_workspace();
+            let original = Arc::new(crate::fs_safety::Root::open(&worktree).unwrap());
+            // This file discovers a narrower marker. Sharing the existing
+            // ancestor session must retain that session's directory on restart.
+            let nested = worktree.join("member");
+            std::fs::create_dir(&nested).unwrap();
+            std::fs::write(nested.join("Cargo.toml"), "[package]\n").unwrap();
+            let second = nested.join("second.rs");
+            std::fs::write(&second, "second").unwrap();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let first_doc = LspDocumentId(901);
+            let second_doc = LspDocumentId(902);
+            manager.open_snapshot_with_root(first_doc, &file, &worktree, rust_language(), 1, native_source("original"), Arc::clone(&original));
+            finish_original_root_discovery(&mut manager, &events, first_doc).await;
+            await_ready(&events, first_doc).await;
+            let first_server = handle_of(&slot).await;
+            first_server.wait_for("textDocument/didOpen").await;
+            manager.open_snapshot_with_root(second_doc, &second, &worktree, rust_language(), 1, native_source("second"), Arc::clone(&original));
+            finish_original_root_discovery(&mut manager, &events, second_doc).await;
+            first_server.wait_for_count("textDocument/didOpen", 2).await;
+            assert_eq!(manager.sessions.len(), 1);
+            assert_eq!(first_server.entries("initialize").len(), 1);
+            let old_owner = Arc::clone(&manager.documents[&first_doc].owner);
+            let binding = manager.sessions.values().next().unwrap().read_root.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&binding.original, &original));
+            slot.lock().unwrap().take();
+            manager.restart(first_doc);
+            let replacement = handle_of(&slot).await;
+            replacement.wait_for_count("textDocument/didOpen", 2).await;
+            let new_owner = &manager.documents[&first_doc].owner;
+            assert!(!Arc::ptr_eq(&old_owner, new_owner));
+            assert!(Arc::ptr_eq(new_owner.original_root.as_ref().unwrap(), &original));
+            assert!(manager.documents.values().all(|reference| Arc::ptr_eq(reference.owner.original_root.as_ref().unwrap(), &original)));
+            manager.begin_shutdown().await;
+            first_server.wait_for("exit").await;
+            replacement.wait_for("exit").await;
+        });
+    }
+
+    #[test]
+    fn original_read_root_rejects_replacement_before_discovery_without_serializing_source() {
+        block_on(async {
+            let (guard, worktree, file) = original_root_workspace();
+            let original = Arc::new(crate::fs_safety::Root::open(&worktree).unwrap());
+            std::fs::rename(&worktree, guard.path().join("old-worktree")).unwrap();
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(&file, "replacement").unwrap();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(903);
+            let source = native_source("original");
+            manager.open_snapshot_with_root(doc, &file, &worktree, rust_language(), 1, source.clone(), original);
+            assert!(matches!(finish_original_root_discovery(&mut manager, &events, doc).await, LspStatus::Unavailable { .. }));
+            assert!(manager.sessions.is_empty());
+            assert!(!manager.documents.contains_key(&doc));
+            assert!(slot.lock().unwrap().is_none());
+            assert_eq!(source.serialization_count(), 0);
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn original_read_root_revalidates_after_predecessor_barrier_before_transport_launch() {
+        block_on(async {
+            let (guard, worktree, file) = original_root_workspace();
+            let original = Arc::new(crate::fs_safety::Root::open(&worktree).unwrap());
+            let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+            let mut manager = rust_manager().after_shutdown(async move { let _ = waiting.await; });
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(904);
+            let source = native_source("original");
+            manager.open_snapshot_with_root(doc, &file, &worktree, rust_language(), 1, source.clone(), Arc::clone(&original));
+            finish_original_root_discovery(&mut manager, &events, doc).await;
+            assert!(Arc::ptr_eq(manager.documents[&doc].owner.original_root.as_ref().unwrap(), &original));
+            std::fs::rename(&worktree, guard.path().join("old-worktree")).unwrap();
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(&file, "replacement").unwrap();
+            release.send(()).unwrap();
+            next_matching(&events, |event| match event {
+                LspEvent::Status { doc: at, status: LspStatus::Unavailable { reason } } if *at == doc => Some(assert!(reason.contains("original editor worktree changed"))),
+                _ => None,
+            }).await;
+            assert!(slot.lock().unwrap().is_none());
+            assert_eq!(source.serialization_count(), 0);
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn original_read_root_refuses_new_same_path_scope_without_overwriting_original_snapshot() {
+        block_on(async {
+            let (guard, worktree, file) = original_root_workspace();
+            let original = Arc::new(crate::fs_safety::Root::open(&worktree).unwrap());
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let first = LspDocumentId(905);
+            manager.open_snapshot_with_root(first, &file, &worktree, rust_language(), 1, native_source("original"), Arc::clone(&original));
+            finish_original_root_discovery(&mut manager, &events, first).await;
+            await_ready(&events, first).await;
+            let server = handle_of(&slot).await;
+            server.wait_for("textDocument/didOpen").await;
+            let original_snapshot = manager.snapshots.latest(&manager.documents[&first].uri).unwrap();
+            std::fs::rename(&worktree, guard.path().join("old-worktree")).unwrap();
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(&file, "replacement").unwrap();
+            let replacement = Arc::new(crate::fs_safety::Root::open(&worktree).unwrap());
+            let second = LspDocumentId(906);
+            manager.open_snapshot_with_root(second, &file, &worktree, rust_language(), 1, native_source("replacement"), replacement);
+            assert!(matches!(finish_original_root_discovery(&mut manager, &events, second).await, LspStatus::Unavailable { .. }));
+            assert!(!manager.documents.contains_key(&second));
+            let current = manager.snapshots.latest(&manager.documents[&first].uri).unwrap();
+            assert!(Arc::ptr_eq(&current, &original_snapshot));
+            assert_eq!(current.full_text().as_ref(), "original");
+            assert_eq!(server.entries("textDocument/didOpen").len(), 1);
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn original_read_root_cannot_adopt_an_unbound_session_or_a_foreign_named_worktree() {
+        block_on(async {
+            let (_guard, worktree, file) = original_root_workspace();
+            let original = Arc::new(crate::fs_safety::Root::open(&worktree).unwrap());
+            let foreign = tempfile::tempdir().unwrap();
+            assert!(ReadRoot::discover(Arc::clone(&original), &file, foreign.path(), &[]).is_err());
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let old_doc = LspDocumentId(907);
+            manager.open_for_test(old_doc, &file, &worktree, rust_language(), 1, "legacy");
+            await_ready(&events, old_doc).await;
+            let server = handle_of(&slot).await;
+            server.wait_for("textDocument/didOpen").await;
+            let doc = LspDocumentId(908);
+            manager.open_snapshot_with_root(doc, &file, &worktree, rust_language(), 1, native_source("retained-root"), original);
+            assert!(matches!(finish_original_root_discovery(&mut manager, &events, doc).await, LspStatus::Unavailable { .. }));
+            assert!(!manager.documents.contains_key(&doc));
+            assert!(manager.sessions.values().all(|session| session.read_root.is_none()));
+            assert_eq!(manager.snapshots.latest(&manager.documents[&old_doc].uri).unwrap().full_text().as_ref(), "legacy");
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn original_read_root_production_command_enters_held_directory_and_refuses_replaced_name() {
+        block_on(async {
+            let (guard, worktree, file) = original_root_workspace();
+            let original = Arc::new(crate::fs_safety::Root::open(&worktree).unwrap());
+            let binding = ReadRoot::discover(original, &file, &worktree, &[]).unwrap();
+            // Exercise the same pre-exec callback used by the real transport,
+            // with an actual child and its positively awaited exit.
+            let mut command = tokio::process::Command::new("/bin/pwd");
+            command.current_dir(&worktree).kill_on_drop(true);
+            binding.bind_command(&mut command).unwrap();
+            let output = command.output().await.unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), worktree.to_str().unwrap());
+            let mut refused = tokio::process::Command::new("/bin/pwd");
+            refused.current_dir(&worktree).kill_on_drop(true);
+            binding.bind_command(&mut refused).unwrap();
+            std::fs::rename(&worktree, guard.path().join("old-worktree")).unwrap();
+            std::fs::create_dir(&worktree).unwrap();
+            let error = refused.output().await.unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
         });
     }
 
