@@ -94,7 +94,7 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     let mut reader = connect(path, true)?;
     let pin = reader.transaction().map_err(|e| e.to_string())?;
     let inspected = inspect(&pin)?;
-    // Published twelve remains an exact input format after thirteen.
+    // Published twelve and thirteen remain exact input formats after fourteen.
     // Refuse damage before opening a writer can recreate missing objects.
     if inspected.version >= 12 {
         require_open_layout(&pin, inspected.version)?;
@@ -221,9 +221,11 @@ fn inspect(db: &Connection) -> Result<Inspection, String> {
 type Layout = Vec<(String, String, String, Vec<String>)>;
 fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> {
     static TWELVE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static THIRTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static CURRENT: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
+        13 => &THIRTEEN,
         SCHEMA_VERSION => &CURRENT,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
@@ -572,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn published_twelve_migrates_to_thirteen_without_historical_terminal_proof() {
+    fn published_twelve_migrates_to_fourteen_without_historical_terminal_proof() {
         use crate::model::{
             CardId, CardKind, LaunchRecipe, TerminalContinuity, TerminalExit, TerminalId,
             TerminalSession,
@@ -692,6 +694,247 @@ mod tests {
     }
 
     #[test]
+    fn published_baselines_history_migrate_atomically_once_and_keep_full_durability() {
+        let _clear = Clear;
+        for version in [12, 13] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("history12.sqlite3");
+            let (identity, channel) = legacy(&path, version);
+            let scope =
+                serde_json::to_string(&crate::workspace_model::views::Scope::Channel(channel))
+                    .unwrap();
+            let ids = (0..1500)
+                .map(|_| crate::model::CardId::new())
+                .collect::<Vec<_>>();
+            let mut db = Connection::open(&path).unwrap();
+            let tx = db.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO shared_view_scopes(scope,channel) VALUES(?1,?2)",
+                rusqlite::params![scope, channel.to_string()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO shared_views VALUES(?1,9,'[]',?2)",
+                rusqlite::params![scope, serde_json::to_string(&ids).unwrap()],
+            )
+            .unwrap();
+            for _ in 0..2100 {
+                tx.execute(
+                    "INSERT INTO shared_view_edits VALUES(?1,?2)",
+                    rusqlite::params![uuid::Uuid::new_v4().to_string(), scope],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            drop(db);
+            let before = bytes(&path);
+            for step in (version + 1)..=14 {
+                FAIL_STEP.with(|failure| failure.set(Some(step)));
+                let error = Registry::at(&path)
+                    .err()
+                    .expect("each actual migration body must roll back");
+                FAIL_STEP.with(|failure| failure.set(None));
+                assert!(error.contains(&format!("failure at {step}")), "{error}");
+                assert_eq!(
+                    bytes(&path),
+                    before,
+                    "provenance and history DDL, trimming and metadata must roll back together"
+                );
+                assert!(!wal(&path).exists());
+            }
+
+            let registry = Registry::at(&path).unwrap();
+            require_current(&registry.db).unwrap();
+            let model = registry.model().unwrap();
+            assert_eq!(model.identity.to_string(), identity);
+            assert_eq!(model.sequence, 8);
+            let view = model
+                .views
+                .iter()
+                .find(|view| serde_json::to_string(&view.scope).unwrap() == scope)
+                .unwrap();
+            assert_eq!(view.revision, 10);
+            let limit = crate::workspace_model::views::RECENT_RETIRED_LIMIT;
+            assert_eq!(view.retired, ids[ids.len() - limit..]);
+            assert_eq!(
+                registry
+                    .db
+                    .query_row(
+                        "SELECT count(*) FROM retired_view_panes WHERE scope=?1",
+                        [&scope],
+                        |row| row.get::<_, usize>(0)
+                    )
+                    .unwrap(),
+                ids.len()
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .query_row("SELECT count(*) FROM shared_view_edits", [], |row| row
+                        .get::<_, usize>(0))
+                    .unwrap(),
+                2048
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                registry
+                    .db
+                    .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "wal"
+            );
+            drop(registry);
+            assert_eq!(
+                Registry::at(&path).unwrap().model().unwrap(),
+                model,
+                "reopen must not repeat history trimming or sequence publication"
+            );
+        }
+    }
+
+    #[test]
+    fn published_twelve_missing_objects_are_refused_without_migration_backfill() {
+        for damage in [
+            "DROP INDEX channels_by_repository;",
+            "DROP TABLE navigation_orders;",
+            "ALTER TABLE projects ADD COLUMN unknown_payload TEXT;",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("damaged12.sqlite3");
+            legacy(&path, 12);
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(damage).unwrap();
+            drop(db);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let before = bytes(&path);
+            let error = Registry::at(&path)
+                .err()
+                .expect("published twelve must be validated before migration");
+            assert!(error.contains("published schema 12"), "{error}");
+            assert_eq!(bytes(&path), before);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            assert!(
+                !wal(&path).exists(),
+                "refusal must precede persistent WAL conversion"
+            );
+        }
+    }
+
+    #[test]
+    fn current_fourteen_missing_history_is_not_silently_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("damaged14.sqlite3");
+        legacy(&path, SCHEMA_VERSION);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DROP TABLE retired_view_panes;").unwrap();
+        drop(db);
+        let before = bytes(&path);
+        let error = Registry::at(&path)
+            .err()
+            .expect("a current header does not authorize history backfill");
+        assert!(error.contains("published schema 14"), "{error}");
+        assert_eq!(bytes(&path), before);
+    }
+
+    #[test]
+    fn history_migration_refuses_a_newer_schema_committed_after_outer_admission() {
+        let _clear = Clear;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history-race.sqlite3");
+        legacy(&path, 12);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        drop(db);
+        let target = path.clone();
+        let saved = Rc::new(std::cell::RefCell::new(None));
+        let observed = saved.clone();
+        hook(move |stage| {
+            if stage == "inspected" {
+                let writer = connect(&target, false)?;
+                writer.execute_batch("CREATE TABLE successor_marker(value TEXT); INSERT INTO successor_marker VALUES('preserve');").map_err(|e| e.to_string())?;
+                writer
+                    .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                    .map_err(|e| e.to_string())?;
+                drop(writer);
+                *observed.borrow_mut() = Some((bytes(&target), bytes(&wal(&target))));
+            }
+            Ok(())
+        });
+        let error = Registry::at(&path)
+            .err()
+            .expect("the stale history admission must refuse");
+        HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(error.contains("newer"), "{error}");
+        let (before, before_wal) = saved.borrow_mut().take().unwrap();
+        assert_eq!(bytes(&path), before);
+        assert_eq!(bytes(&wal(&path)), before_wal);
+        let db = connect(&path, true).unwrap();
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_VERSION + 1
+        );
+        assert_eq!(
+            db.query_row("SELECT value FROM successor_marker", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "preserve"
+        );
+        assert_eq!(db.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('retired_view_panes','agents_open_by_recency')", [], |row| row.get::<_, usize>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn alternate_history_thirteen_is_refused_before_writable_admission() {
+        let _clear = Clear;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alternate13.sqlite3");
+        legacy(&path, 13);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DROP TABLE shared_view_terminal_sources;
+            CREATE TABLE retired_view_panes(scope TEXT NOT NULL REFERENCES shared_view_scopes(scope) ON DELETE CASCADE,id TEXT NOT NULL,PRIMARY KEY(scope,id)) STRICT;
+            CREATE INDEX agents_open_by_recency ON agents(closed) WHERE closed=0;").unwrap();
+        drop(db);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = bytes(&path);
+        let reached = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&reached);
+        hook(move |_| {
+            observed.set(true);
+            Ok(())
+        });
+        let error = Registry::at(&path)
+            .err()
+            .expect("an incompatible draft13 is not canonical provenance13");
+        assert!(error.contains("published schema 13"), "{error}");
+        assert!(
+            !reached.get(),
+            "refuse before opening a writable connection"
+        );
+        assert_eq!(bytes(&path), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!wal(&path).exists());
+    }
+
+    #[test]
     fn every_published_version_preserves_nonempty_model_identity_and_ordinals() {
         for version in 0..=SCHEMA_VERSION {
             let dir = tempfile::tempdir().unwrap();
@@ -736,7 +979,7 @@ mod tests {
             CREATE TABLE workspace_view_edits(operation TEXT PRIMARY KEY,channel TEXT NOT NULL REFERENCES workspace_views(channel)) STRICT;
             PRAGMA user_version=7;").unwrap();
         db.execute(
-            "INSERT INTO workspace_views VALUES(?1,9,'[]','[\"kept\"]')",
+            "INSERT INTO workspace_views VALUES(?1,9,'[]','[\"00000000-0000-0000-0000-000000000123\"]')",
             [channel.to_string()],
         )
         .unwrap();
@@ -770,7 +1013,14 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(view, (9, "[]".into(), "[\"kept\"]".into()));
+        assert_eq!(
+            view,
+            (
+                9,
+                "[]".into(),
+                "[\"00000000-0000-0000-0000-000000000123\"]".into()
+            )
+        );
         for (table, column, value) in [
             ("shared_view_panes", "id", "pane"),
             ("shared_view_edits", "operation", "edit"),
@@ -887,9 +1137,10 @@ mod tests {
         let registry = Registry::at(&path).unwrap();
         let writer = connect(&path, false).unwrap();
         writer
-            .execute_batch(
-                "PRAGMA user_version=14; INSERT INTO projects VALUES('/future','Future',1,'git');",
-            )
+            .execute_batch(&format!(
+                "PRAGMA user_version={}; INSERT INTO projects VALUES('/future','Future',1,'git');",
+                SCHEMA_VERSION + 1
+            ))
             .unwrap();
         drop(registry);
         drop(writer);
@@ -905,8 +1156,8 @@ mod tests {
     fn authoritative_writer_rejects_concurrent_header_and_layout_changes() {
         let _clear = Clear;
         for change in [
-            "PRAGMA user_version=14;",
-            "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;",
+            format!("PRAGMA user_version={};", SCHEMA_VERSION + 1),
+            "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;".to_owned(),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("stale-wal.sqlite3");
@@ -917,7 +1168,7 @@ mod tests {
             hook(move |stage| {
                 if stage == "inspected" {
                     let writer = connect(&target, false)?;
-                    writer.execute_batch(change).map_err(|e| e.to_string())?;
+                    writer.execute_batch(&change).map_err(|e| e.to_string())?;
                     drop(writer);
                     *observed.borrow_mut() = Some((bytes(&target), bytes(&wal(&target))));
                 }
@@ -953,7 +1204,7 @@ mod tests {
                     .busy_timeout(Duration::ZERO)
                     .map_err(|e| e.to_string())?;
                 let error = writer
-                    .execute_batch("PRAGMA user_version=14;")
+                    .execute_batch(&format!("PRAGMA user_version={};", SCHEMA_VERSION + 1))
                     .expect_err("future writer must remain excluded after COMMIT");
                 assert!(
                     matches!(error,rusqlite::Error::SqliteFailure(ref code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseBusy|rusqlite::ErrorCode::DatabaseLocked)),
@@ -1006,7 +1257,7 @@ mod tests {
         hook(move |stage| {
             if stage == "committed" {
                 let writer = connect(&target, false)?;
-                writer.execute_batch("PRAGMA user_version=14; INSERT INTO projects VALUES('/future','Future',1,'git');").map_err(|e|e.to_string())?;
+                writer.execute_batch(&format!("PRAGMA user_version={}; INSERT INTO projects VALUES('/future','Future',1,'git');", SCHEMA_VERSION + 1)).map_err(|e|e.to_string())?;
                 drop(writer);
                 *observed.borrow_mut() = Some((bytes(&target), bytes(&wal(&target))));
             }
@@ -1034,15 +1285,15 @@ mod tests {
     #[test]
     fn retained_outer_edits_refuse_future_or_unknown_layout_before_dml() {
         for change in [
-            "PRAGMA user_version=14;",
-            "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;",
+            format!("PRAGMA user_version={};", SCHEMA_VERSION + 1),
+            "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;".to_owned(),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("outer.sqlite3");
             let (_, channel) = legacy(&path, 12);
             let mut registry = Registry::at(&path).unwrap();
             let other = connect(&path, false).unwrap();
-            other.execute_batch(change).unwrap();
+            other.execute_batch(&change).unwrap();
             let edits = [
                 ModelEdit::OpenProject {
                     repository: "/new".into(),
@@ -1340,7 +1591,7 @@ mod tests {
             0o700
         );
         let db = Connection::open(root.join("hot.sqlite3")).unwrap();
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE future_payload(value BLOB); INSERT INTO future_payload VALUES(zeroblob(1048576)); PRAGMA user_version=14; PRAGMA cache_size=4; PRAGMA cache_spill=ON; BEGIN IMMEDIATE; UPDATE future_payload SET value=randomblob(1048576);").unwrap();
+        db.execute_batch(&format!("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE future_payload(value BLOB); INSERT INTO future_payload VALUES(zeroblob(1048576)); PRAGMA user_version={}; PRAGMA cache_size=4; PRAGMA cache_spill=ON; BEGIN IMMEDIATE; UPDATE future_payload SET value=randomblob(1048576);", SCHEMA_VERSION + 1)).unwrap();
         assert!(root.join("hot.sqlite3-journal").is_file());
         // The bounded original-child executor owns this exact process and its
         // wait/cleanup. No numeric PID lookup or fixture killing Drop exists.

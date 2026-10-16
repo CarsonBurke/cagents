@@ -35,7 +35,7 @@ mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -49,6 +49,9 @@ const FILE_MODE: u32 = 0o600;
 #[derive(Debug)]
 pub(crate) struct Applied {
     pub(crate) model: WorkspaceModel,
+    /// Sequence assigned by this transaction, not a newer execution commit
+    /// that may land before the response snapshot is read.
+    pub(crate) sequence: u64,
     /// Whether the edit changed anything. A retitle to the same title, or a
     /// delete of a channel that is already gone, must neither bump `sequence`
     /// nor wake a watcher: a window that reacted to it would redraw for nothing
@@ -59,6 +62,8 @@ pub(crate) struct Applied {
 pub(crate) struct Registry {
     db: Connection,
     path: PathBuf,
+    #[cfg(test)]
+    after_workspace_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Registry {
@@ -75,6 +80,8 @@ impl Registry {
         Ok(Self {
             db,
             path: path.to_owned(),
+            #[cfg(test)]
+            after_workspace_commit: None,
         })
     }
 
@@ -85,8 +92,20 @@ impl Registry {
         Self::at(&self.path)
     }
 
+    /// A distinct connection serializes layout writes without borrowing the
+    /// global host lock. Keep FULL durability for both views and execution.
+    pub(crate) fn workspace_connection(&self) -> Result<Self, String> {
+        Self::at(&self.path)
+    }
+
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
+        // Writers commit independently of HostState. One read transaction
+        // keeps metadata, views and agents on the same WAL snapshot.
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
         let (identity, sequence) = self
             .db
             .query_row(
@@ -183,7 +202,7 @@ impl Registry {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(WorkspaceModel {
+        let model = WorkspaceModel {
             navigation_orders,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
@@ -192,7 +211,9 @@ impl Registry {
             projects,
             channels,
             closed_projects,
-        })
+        };
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(model)
     }
 
     /// Applies one edit as a single transaction, bumping `sequence` when it
@@ -201,6 +222,9 @@ impl Registry {
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
+        // Acquire the WAL writer before any model reads. A Deferred read
+        // transaction's later promotion cannot use busy_timeout to wait for
+        // another connection's writer, and would spuriously fail pane edits.
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -392,9 +416,19 @@ impl Registry {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        let sequence: u64 = transaction
+            .query_row("SELECT sequence FROM metadata WHERE key=0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        if let Some(after_commit) = self.after_workspace_commit.take() {
+            after_commit();
+        }
         Ok(Applied {
             model: self.model()?,
+            sequence,
             changed,
         })
     }
@@ -561,6 +595,10 @@ fn migrate_through(
     if version < 13 && target >= 13 {
         views::migrate_terminal_sources(tx)?;
         schema::migration_checkpoint(13)?;
+    }
+    if version < 14 && target >= 14 {
+        views::migrate_history(tx)?;
+        schema::migration_checkpoint(14)?;
     }
     Ok(())
 }
@@ -1160,5 +1198,21 @@ mod tests {
             1,
             "the rank is durable too"
         );
+    }
+    #[test]
+    fn edit_edge_uses_its_committed_sequence_when_a_later_writer_wins_the_snapshot_race() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.sqlite3");
+        let mut registry = Registry::at(&path).unwrap();
+        let before = registry.model().unwrap().sequence;
+        registry.after_workspace_commit = Some(Box::new(move || {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+                .unwrap();
+        }));
+        let applied = registry.apply(&open("/sequence-race")).unwrap();
+        assert_eq!(applied.sequence, before + 1);
+        assert_eq!(applied.model.sequence, before + 2);
     }
 }
