@@ -29,6 +29,7 @@ enum Listing {
     Channels,
     Automations,
     History,
+    Sessions,
 }
 
 impl Listing {
@@ -39,11 +40,27 @@ impl Listing {
             Self::Channels => &["channel", "list"],
             Self::Automations => &["automation", "list"],
             Self::History => &["automation", "history"],
+            Self::Sessions => &["sessions"],
         }
     }
 
     fn reply(self, request: ClientRequest, populated: bool) -> ServerResponse {
         match (self, request) {
+            (Self::Sessions, ClientRequest::Agent { operation: Operation::Directory(scope), .. }) => {
+                assert!(matches!(scope, agent_execution::directory::Scope::Containing(path) if path.is_absolute()));
+                let sessions = if populated {
+                    let id = "00000000-0000-4000-8000-000000000001".parse().unwrap();
+                    vec![agent_execution::directory::Entry { id,
+                        surface: agent_execution::directory::Surface::Chat, provider: Some(Provider::Claude),
+                        title: Some("Fixture session".into()), channel: None, view_scope: None, channel_repository: None,
+                        state: cagents::agent::ActivityState::Working, directory: Some("/fixture".into()),
+                        worktree: Some("/fixture".into()), project: Some("/fixture/.git".into()), project_name: Some("Fixture".into()),
+                        delegation: None, relation: agent_execution::directory::Relation::Peer, lineage: agent_execution::Lineage(id), }]
+                } else { vec![] };
+                ServerResponse::Agent(agent_execution::Reply::Directory(agent_execution::directory::Directory {
+                    caller: None, scope: agent_execution::directory::Scope::All, sessions,
+                }))
+            }
             (
                 Self::Accounts,
                 ClientRequest::Agent {
@@ -331,6 +348,7 @@ fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values()
             "No automation history",
             "At capacity",
         ),
+        (Listing::Sessions, "SESSION", "No live sessions", "Fixture session"),
     ] {
         assert_eq!(output(listing, false, false).trim(), empty);
         let human = output(listing, true, false);
