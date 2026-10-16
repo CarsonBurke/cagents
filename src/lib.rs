@@ -3,3 +3,6 @@
 #[doc(hidden)]
 pub mod runtime_state;
 include!("modules.rs");
+
+#[cfg(all(test, any(feature = "host", feature = "ui")))]
+mod sqlite_contracts;
