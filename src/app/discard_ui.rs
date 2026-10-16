@@ -22,6 +22,21 @@ impl ReadSource {
             authority: Arc::new(OnceLock::new()),
         }
     }
+    /// Intake an already-held source from its acknowledged creator. This is
+    /// pure: it neither opens the path nor adopts a later root at that name.
+    pub fn from_authority(
+        key: ActiveWorktreeKey,
+        authority: WorktreeAuthority,
+    ) -> Result<Self, String> {
+        if key.canonical_path != authority.path() {
+            return Err("The supplied original source belongs to a different worktree".into());
+        }
+        Ok(Self {
+            id: uuid::Uuid::new_v4(),
+            key,
+            authority: Arc::new(OnceLock::from(Ok(authority))),
+        })
+    }
     /// Called only by the actual snapshot worker BEFORE its first Git read.
     pub fn read_service(
         &self,
@@ -170,6 +185,7 @@ impl Slot {
 #[derive(Default)]
 pub(super) struct State {
     active: Option<ReadSource>,
+    supplied: Option<ReadSource>,
     intent: Option<(ReadSource, DiscardRequest)>,
     admitted_event: Option<uuid::Uuid>,
     slots: Vec<Slot>,
@@ -206,7 +222,38 @@ impl State {
     pub fn source(&self) -> Option<&ReadSource> {
         self.active.as_ref()
     }
+    /// Stage exactly one original creator source before selection/rebind.
+    /// The next selected key must match; any other selection drops it.
+    pub fn supply_original(
+        &mut self,
+        key: ActiveWorktreeKey,
+        authority: WorktreeAuthority,
+    ) -> Result<uuid::Uuid, String> {
+        let supplied = ReadSource::from_authority(key, authority)?;
+        let id = supplied.id;
+        self.supplied = Some(supplied);
+        Ok(id)
+    }
+    /// The cache-release half of a real rebind retires the old actor while
+    /// preserving the one-shot source intended for that same rebind.
+    pub fn retire_source(&mut self) {
+        self.active = None;
+        self.intent = None;
+        self.admitted_event = None;
+    }
     pub fn select(&mut self, key: Option<ActiveWorktreeKey>) {
+        if key.is_none() {
+            self.supplied = None;
+            self.retire_source();
+            return;
+        }
+        if let Some(supplied) = self.supplied.take()
+            && Some(&supplied.key) == key.as_ref()
+        {
+            self.retire_source();
+            self.active = Some(supplied);
+            return;
+        }
         if self.active.as_ref().map(|s| &s.key) == key.as_ref() {
             return;
         }
@@ -388,6 +435,36 @@ mod tests {
             confirmed: false,
         }
     }
+    #[test]
+    fn discard_supplied_original_survives_release_and_never_recaptures_on_focus_return() {
+        let (temp, original) = source();
+        let authority = original.authority.get().unwrap().clone().unwrap();
+        let mut state = State::default();
+        state.active = Some(original.clone());
+        let supplied = state.supply_original(original.key.clone(), authority.clone()).unwrap();
+        assert_ne!(supplied, original.id);
+        state.retire_source();
+        assert!(state.source().is_none());
+        state.select(Some(original.key.clone()));
+        assert_eq!(state.source().unwrap().id, supplied);
+        assert!(state.source().unwrap().authority.get().unwrap().as_ref().unwrap().same_scope(&authority));
+        assert!(!state.admit_event(original.id));
+        state.select(Some(original.key.clone()));
+        assert_eq!(state.source().unwrap().id, supplied, "ordinary refresh keeps the supplied actor");
+        std::fs::rename(temp.path().join(".git"), temp.path().join("old-git")).unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        assert!(state.source().unwrap().read_service().is_err());
+        assert!(state.source().unwrap().mutation_service().is_err());
+        let wrong = ActiveWorktreeKey { canonical_path: temp.path().join("other"), ..original.key.clone() };
+        assert!(ReadSource::from_authority(wrong.clone(), authority.clone()).is_err());
+        state.supply_original(original.key.clone(), authority).unwrap();
+        state.retire_source();
+        state.select(Some(wrong));
+        state.select(Some(original.key));
+        assert_ne!(state.source().unwrap().id, supplied, "a different selection consumes no old intake");
+        assert!(state.source().unwrap().authority.get().is_none());
+    }
+
     #[test]
     fn discard_old_rendered_nonce_cannot_bind_same_path_new_actor() {
         let (_temp, old) = source();
