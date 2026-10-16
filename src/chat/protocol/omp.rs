@@ -127,6 +127,7 @@ struct Omp {
     child_requests: HashMap<String, String>,
     subscribed: bool,
     subscription_request: Option<String>,
+    child_presented: Option<std::time::Instant>,
     children_request: Option<String>,
     child_loaded: std::collections::HashSet<String>,
     child_buffer: HashMap<String, Vec<Value>>,
@@ -349,12 +350,22 @@ impl Omp {
         self.read_child(id, step);
     }
     fn child_content(&mut self, frame: Value) -> Result<Step, String> {
+        self.child_content_at(frame, std::time::Instant::now())
+    }
+    fn child_content_at(&mut self, frame: Value, now: std::time::Instant) -> Result<Step, String> {
         // The subscription includes the authoritative partial message. Reapply
         // that full item after history hydration instead of appending a delta
         // that may already be included in the snapshot.
         if text(&frame, "type") == "message_update"
             && frame["assistantMessageEvent"]["partial"].is_object()
         {
+            if self
+                .child_presented
+                .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(50))
+            {
+                return Ok(Step::default());
+            }
+            self.child_presented = Some(now);
             return Ok(Step {
                 events: self
                     .message_items(&frame["assistantMessageEvent"]["partial"])
@@ -808,6 +819,61 @@ impl Adapter for Omp {
             Command::Slash{command} => {let mut request=self.request("prompt");request["message"]=command.into();step.writes.push(request);}
         }
         Ok(step)
+    }
+    fn decode(&self, bytes: &[u8]) -> Result<Value, serde_json::Error> {
+        #[derive(serde::Deserialize)]
+        struct Header {
+            #[serde(rename = "type", default)]
+            kind: String,
+            #[serde(rename = "assistantMessageEvent", default)]
+            event: Option<Delta>,
+            #[serde(default)]
+            message: Option<Message>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Delta {
+            #[serde(rename = "type", default)]
+            kind: String,
+            #[serde(default)]
+            delta: String,
+            #[serde(rename = "contentIndex", default)]
+            index: u64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Message {
+            #[serde(default)]
+            role: String,
+            #[serde(default)]
+            timestamp: Option<Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Kind {
+            #[serde(rename = "type", default)]
+            kind: String,
+        }
+        let kind: Kind = serde_json::from_slice(bytes)?;
+        if kind.kind != "message_update" {
+            return serde_json::from_slice(bytes);
+        }
+        let header: Header = serde_json::from_slice(bytes)?;
+        if header.kind == "message_update"
+            && let Some(event) = header.event
+            && matches!(event.kind.as_str(), "text_delta" | "thinking_delta")
+        {
+            let message = header
+                .message
+                .map(|message| {
+                    let mut value = json!({"role": message.role});
+                    if let Some(timestamp) = message.timestamp {
+                        value["timestamp"] = timestamp;
+                    }
+                    value
+                })
+                .unwrap_or(Value::Null);
+            return Ok(json!({"type":"message_update", "message": message,
+                "assistantMessageEvent":{"type":event.kind,"delta":event.delta,"contentIndex":event.index}}));
+        }
+        serde_json::from_slice(bytes)
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
@@ -1758,6 +1824,46 @@ fn answer_value(answers: &[Answer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_decode_skips_redundant_partial_tree() {
+        let mut adapter = Omp::default();
+        let line = serde_json::to_vec(&json!({"type":"message_update", "message":{"role":"assistant","timestamp":123}, "assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"small","partial":{"content":[{"text":"x".repeat(1024 * 1024)}]}}})).unwrap();
+        let decoded = adapter.decode(&line).unwrap();
+        assert!(decoded["assistantMessageEvent"].get("partial").is_none());
+        assert!(decoded.to_string().len() < 300);
+        let result = adapter.receive(decoded).unwrap();
+        assert!(
+            matches!(&result.events[..], [Event::TextDelta { id, delta, .. }] if id == "assistant:123:0" && delta == "small")
+        );
+    }
+
+    #[test]
+    fn child_partial_updates_are_throttled_and_completion_is_authoritative() {
+        let mut adapter = Omp::default();
+        let update = |text: &str| json!({"type":"message_update", "assistantMessageEvent":{"type":"text_delta","partial":{"role":"assistant","timestamp":1,"content":[{"type":"text","text":text}]}}});
+        let now = std::time::Instant::now();
+        assert!(
+            !adapter
+                .child_content_at(update("a"), now)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert!(
+            adapter
+                .child_content_at(update("ab"), now + std::time::Duration::from_millis(1))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        let later = adapter
+            .child_content_at(update("abc"), now + std::time::Duration::from_millis(51))
+            .unwrap();
+        assert!(later.events.iter().any(|event| matches!(event,Event::Item(Item{content:ItemContent::Text{text,..},..}) if text=="abc")));
+        let end = adapter.child_content(json!({"type":"message_end","message":{"role":"assistant","timestamp":1,"content":[{"type":"text","text":"abcd"}]}})).unwrap();
+        assert!(end.events.iter().any(|event| matches!(event, Event::Item(Item { content:ItemContent::Text { text, .. }, .. }) if text == "abcd")));
+    }
 
     #[test]
     fn branching_restores_the_selected_prompt_after_the_confirmed_session_reset() {

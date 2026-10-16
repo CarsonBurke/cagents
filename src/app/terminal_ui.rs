@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(test)]
+mod clipboard_tests;
+
 #[derive(Clone, Debug)]
 pub enum Action {
     Open(CardId),
@@ -88,9 +91,10 @@ mod tests {
         assert!(find.background_results);
         assert_eq!(find.schedule_refresh(latest), None);
         assert!(!find.begin_refresh(pending, latest));
-        assert!(find
-            .schedule_refresh(SearchContent::of(&output_snapshot(4)))
-            .is_some());
+        assert!(
+            find.schedule_refresh(SearchContent::of(&output_snapshot(4)))
+                .is_some()
+        );
     }
 
     #[test]
@@ -113,7 +117,10 @@ mod tests {
         let pending = find.schedule_refresh(SearchContent::of(&snapshot)).unwrap();
         assert!(find.begin_refresh(pending, SearchContent::of(&snapshot)));
         snapshot.scroll.total += 1;
-        assert!(find.schedule_refresh(SearchContent::of(&snapshot)).is_some());
+        assert!(
+            find.schedule_refresh(SearchContent::of(&snapshot))
+                .is_some()
+        );
     }
 
     #[test]
@@ -238,12 +245,24 @@ mod tests {
                 TerminalId::new(),
             )),
         );
-        app.terminal_find.insert(card, Find { open: true, ..Find::default() });
-        drop(app.update(Message::KeyEvent { event: escape_event(), captured: true }));
+        app.terminal_find.insert(
+            card,
+            Find {
+                open: true,
+                ..Find::default()
+            },
+        );
+        drop(app.update(Message::KeyEvent {
+            event: escape_event(),
+            captured: true,
+        }));
         assert!(app.terminal_find[&card].open);
         // With no focused field answering the key, Escape on the terminal
         // surface still closes its open find bar.
-        drop(app.update(Message::KeyEvent { event: escape_event(), captured: false }));
+        drop(app.update(Message::KeyEvent {
+            event: escape_event(),
+            captured: false,
+        }));
         assert!(!app.terminal_find[&card].open);
     }
 
@@ -251,12 +270,21 @@ mod tests {
     fn focused_terminal_find_closes_on_its_first_escape_before_native_blur() {
         use cosmic::iced::{
             Event, Rectangle,
-            advanced::{Layout, Shell, clipboard, layout, widget::{Tree, operation}},
+            advanced::{
+                Layout, Shell, clipboard, layout,
+                widget::{Tree, operation},
+            },
             mouse,
         };
         let mut app = super::super::tests::context_inspector_test_app(false);
         let card = CardId::new();
-        app.terminal_find.insert(card, Find { open: true, ..Find::default() });
+        app.terminal_find.insert(
+            card,
+            Find {
+                open: true,
+                ..Find::default()
+            },
+        );
         let renderer = super::super::tests::headless_renderer();
         let mut element = app.terminal_find_view(card).unwrap();
         let mut tree = Tree::new(&element);
@@ -289,10 +317,11 @@ mod tests {
             message,
             Message::TerminalFind(Action::Close(target)) if *target == card
         )));
-        assert!(!published.iter().any(|message| matches!(
-            message,
-            Message::TerminalFind(Action::Focus(_, false))
-        )));
+        assert!(
+            !published
+                .iter()
+                .any(|message| matches!(message, Message::TerminalFind(Action::Focus(_, false))))
+        );
     }
 
     #[test]
@@ -304,6 +333,11 @@ mod tests {
         drop(app.handle_terminal_find(Action::ConfirmPaste(card, false)));
         assert!(app.terminal_paste.is_none());
     }
+}
+
+pub(super) struct PendingCopy {
+    pub request: uuid::Uuid,
+    pub intent: chat_ui::ClipboardIntent,
 }
 
 #[derive(Default)]
@@ -318,7 +352,7 @@ pub(super) struct Find {
     pub focused: bool,
     pub select_all_request: u64,
     pub selection_reset: u64,
-    pub pending_copy: Option<uuid::Uuid>,
+    pub pending_copy: Option<PendingCopy>,
     searched_content: Option<SearchContent>,
     refresh_generation: u64,
     refresh_pending: Option<u64>,
@@ -467,14 +501,19 @@ impl Cagents {
                 return Task::none();
             }
             Action::Copy(_, text) => {
+                self.chat_ui.begin_clipboard_copy();
                 self.terminal_context = None;
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }
             Action::CopySelection(_, selection) => {
                 self.terminal_context = None;
                 let request = uuid::Uuid::new_v4();
-                find.pending_copy = Some(request);
+                find.pending_copy = Some(PendingCopy {
+                    request,
+                    intent: self.chat_ui.begin_clipboard_copy(),
+                });
                 if let Err(error) = handle.copy_selection(request, selection) {
+                    find.pending_copy = None;
                     return cosmic::task::message(Message::TerminalError {
                         card,
                         message: error.to_string(),
@@ -628,7 +667,9 @@ impl Cagents {
         let previous = find.matches.get(find.selected).copied();
         let background = std::mem::take(&mut find.background_results);
         let selected = background
-            .then(|| previous.and_then(|previous| matches.iter().position(|item| *item == previous)))
+            .then(|| {
+                previous.and_then(|previous| matches.iter().position(|item| *item == previous))
+            })
             .flatten()
             .unwrap_or_else(|| {
                 if background {

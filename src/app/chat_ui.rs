@@ -16,6 +16,7 @@ use std::sync::{
 mod auth_recovery;
 mod changes;
 mod clipboard_image;
+mod clipboard_intent;
 mod completion;
 mod coordination;
 mod find;
@@ -27,6 +28,9 @@ mod markdown_source;
 mod monospace;
 mod permissions;
 mod prose;
+mod provider_exit;
+pub(super) use clipboard_intent::Intent as ClipboardIntent;
+mod clipboard_surface;
 mod retained;
 mod scroll;
 mod selectable_prose;
@@ -200,6 +204,22 @@ pub enum Action {
     DisarmInterrupt(Target, Instant),
     CommandFinished(Target, u64, Result<(), String>),
     Toggle(Target, String),
+    ToggleProviderExit(Target),
+    CopyProviderExit(Target),
+    CopyProviderExitRecent(Target),
+    LoadProviderExit(Target),
+    ProviderExitPage(Target, bool),
+    ProviderExitLoaded(
+        Target,
+        provider_exit::Request,
+        chat::client::DiagnosticCompletion,
+    ),
+    ProviderExitCopyReady(
+        Target,
+        provider_exit::Request,
+        chat::client::DiagnosticCopyCompletion,
+    ),
+    ProviderExitClipboardIssued(chat::client::DiagnosticCopyReceipt),
     /// Opens or closes one group's step strip, addressed by the id of the item
     /// that started the group.
     ToggleTurn(Target, String),
@@ -311,6 +331,9 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::ProviderExitLoaded(..)
+                | Self::ProviderExitCopyReady(..)
+                | Self::ProviderExitClipboardIssued(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
                 | Self::Wake(..)
@@ -449,6 +472,7 @@ impl Phase {
 }
 
 pub(super) struct State {
+    copy_intents: clipboard_intent::Intents,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -486,10 +510,24 @@ pub(super) struct State {
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
 }
+impl State {
+    pub(super) fn begin_clipboard_copy(&self) -> ClipboardIntent {
+        self.copy_intents.next()
+    }
+
+    pub(super) fn clipboard_surface<'a, M: 'a>(
+        &self,
+        content: cosmic::Element<'a, M>,
+    ) -> cosmic::Element<'a, M> {
+        clipboard_surface::surface(content, self.copy_intents.clone())
+    }
+}
+
 impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
         Self {
+            copy_intents: clipboard_intent::Intents::default(),
             image_viewer: None,
             files: HashMap::new(),
             sender,
@@ -1561,6 +1599,8 @@ pub(super) struct Runtime {
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: bool,
     expanded: HashSet<String>,
+    provider_exit_expanded: bool,
+    provider_exit_output: provider_exit::State,
     /// Coordination card parts shown in full, as `{item id}#{part}`.
     unfolded: HashSet<String>,
     answers: view::Answers,
@@ -2129,6 +2169,8 @@ impl Runtime {
             submit_after_paste: None,
             attachment_chooser_pending: false,
             expanded: HashSet::new(),
+            provider_exit_expanded: false,
+            provider_exit_output: provider_exit::State::default(),
             unfolded: HashSet::new(),
             answers: HashMap::new(),
             pending: None,
@@ -2545,6 +2587,13 @@ impl Runtime {
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
             self.interrupt_armed = None;
         }
+        if snapshot.provider_exit.is_none()
+            || snapshot.turn_generation != self.snapshot.turn_generation
+        {
+            self.provider_exit_expanded = false;
+        }
+        let actor = self.handle().map(Arc::downgrade);
+        self.provider_exit_output.reconcile(&snapshot, actor);
         self.snapshot = snapshot;
         images::sync(self);
         self.refresh_find();
@@ -2609,6 +2658,9 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
+        if !visible {
+            self.provider_exit_output.hide();
+        }
         images::sync(self);
         self.present()
     }
@@ -6634,6 +6686,7 @@ impl Cagents {
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
                             self.resume_history_navigation(target),
+                            self.reload_provider_exit(target),
                             fork.map_or_else(Task::none, |session| {
                                 let scope = if let Some(channel) = self
                                     .durable
@@ -7569,6 +7622,26 @@ impl Cagents {
                     self.resume_history_navigation(target),
                 ]);
             }
+            Action::ToggleProviderExit(target) => return self.toggle_provider_exit(target),
+            Action::CopyProviderExit(target) => return self.load_provider_exit(target, true),
+            Action::CopyProviderExitRecent(target) => {
+                return self.copy_recent_provider_exit(target);
+            }
+            Action::LoadProviderExit(target) => return self.load_provider_exit(target, false),
+            Action::ProviderExitLoaded(target, request, result) => {
+                return self.provider_exit_loaded(target, request, result);
+            }
+            Action::ProviderExitCopyReady(target, request, result) => {
+                return self.provider_exit_copy_ready(target, request, result);
+            }
+            Action::ProviderExitClipboardIssued(receipt) => {
+                drop(receipt);
+            }
+            Action::ProviderExitPage(target, forward) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.provider_exit_page(forward);
+                }
+            }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.find_disclosure.manual_item(&id);
@@ -7634,6 +7707,7 @@ impl Cagents {
                 }
             }
             Action::Copy(target, id, part) => {
+                self.chat_ui.copy_intents.next();
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
@@ -7791,6 +7865,7 @@ impl Cagents {
                 }
             }
             Action::CopyLiteral(text) => {
+                self.chat_ui.copy_intents.next();
                 self.status = Some(TransientNotice::success("Copied code block"));
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }
@@ -11173,6 +11248,116 @@ mod tests {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
         }
+    }
+
+    #[test]
+    fn provider_output_disclosure_ignores_replaced_targets_and_absent_diagnostics() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
+        assert!(!chat_runtime(&app, card).provider_exit_expanded);
+        let diagnostic = chat::ProviderExitDiagnostic {
+            summary: "Provider exited with status 3".into(),
+            output: "start\nlast meaningful failure".into(),
+            log: None,
+        };
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).provider_exit =
+            Some(diagnostic.clone());
+        let stale = Target {
+            generation: target.generation.wrapping_add(1),
+            ..target
+        };
+        drop(app.handle_chat_ui(Action::ToggleProviderExit(stale)));
+        assert!(!chat_runtime(&app, card).provider_exit_expanded);
+        drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
+        assert!(chat_runtime(&app, card).provider_exit_expanded);
+        assert!(chat_runtime(&app, card).provider_exit_notice(&diagnostic.summary));
+        assert!(!chat_runtime(&app, card).provider_exit_notice("Another failure"));
+        app.chat_runtime_mut(target).unwrap().failures = vec![
+            (Some("previous-turn".into()), diagnostic.summary.clone()),
+            (None, diagnostic.summary.clone()),
+        ];
+        assert_eq!(
+            chat_runtime(&app, card).provider_exit_failure_index(),
+            Some(1)
+        );
+        drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
+        assert!(!chat_runtime(&app, card).provider_exit_expanded);
+    }
+
+    #[test]
+    fn provider_output_shapes_only_the_selected_page_after_expansion() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct TextProbe(Vec<String>);
+        impl Operation for TextProbe {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn text(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                _: iced::Rectangle,
+                text: &str,
+            ) {
+                self.0.push(text.to_owned());
+            }
+        }
+        fn rendered_text(runtime: &Runtime) -> Vec<String> {
+            let mut element = runtime.provider_exit_view().expect("provider diagnostic");
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1200.0)),
+            );
+            assert!(
+                node.size().height < 600.0,
+                "output remains in a bounded viewport"
+            );
+            let mut probe = TextProbe::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            probe.0
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let output = format!(
+            "first line\n{}\nlast line",
+            "retained stderr ".repeat(2_000)
+        );
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).provider_exit =
+            Some(chat::ProviderExitDiagnostic {
+                summary: "Provider exited with status 3".into(),
+                output: output.clone(),
+                log: None,
+            });
+        assert!(!rendered_text(chat_runtime(&app, card)).contains(&output));
+        drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
+        let mut restored = String::new();
+        for page in 0..output.len().div_ceil(16 * 1024) {
+            let start = page * 16 * 1024;
+            let end = (start + 16 * 1024).min(output.len());
+            assert!(
+                rendered_text(chat_runtime(&app, card)).contains(&output[start..end].to_owned())
+            );
+            restored.push_str(&output[start..end]);
+            drop(app.handle_chat_ui(Action::ProviderExitPage(target, true)));
+        }
+        assert_eq!(restored, output);
+        // Stale queued Next actions cannot leave an inaccessible page index.
+        for _ in 0..10 {
+            drop(app.handle_chat_ui(Action::ProviderExitPage(target, true)));
+        }
+        drop(app.handle_chat_ui(Action::ProviderExitPage(target, false)));
+        assert!(rendered_text(chat_runtime(&app, card)).contains(&output[..16 * 1024].to_owned()));
     }
 
     #[test]

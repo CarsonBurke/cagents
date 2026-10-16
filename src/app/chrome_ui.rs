@@ -1150,6 +1150,7 @@ impl Cagents {
                     .map(Path::to_path_buf),
             }
             .map_or_else(Task::none, |path| {
+                self.chat_ui.begin_clipboard_copy();
                 iced::clipboard::write(path.display().to_string())
             }),
             Action::Reveal(id) => {

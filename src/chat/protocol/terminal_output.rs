@@ -13,7 +13,7 @@
 
 /// Output reported whole, without its escape sequences and with each line as
 /// it was last redrawn.
-pub(super) fn display(raw: String) -> String {
+pub(crate) fn display(raw: String) -> String {
     if !raw.bytes().any(interpreted) {
         return raw;
     }
@@ -215,7 +215,7 @@ fn interpreted(byte: u8) -> bool {
 /// Copies `raw` to `text` without its escape sequences and control
 /// characters, keeping newlines, tabs and carriage returns. Returns how much
 /// of `raw` was read: the rest is a sequence that has not ended yet.
-fn strip(raw: &str, text: &mut String) -> usize {
+pub(crate) fn strip(raw: &str, text: &mut String) -> usize {
     let bytes = raw.as_bytes();
     let (mut at, mut copied) = (0, 0);
     while at < bytes.len() {

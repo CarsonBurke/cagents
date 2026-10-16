@@ -56,7 +56,11 @@ impl BuildIdentity {
                 .and_then(|metadata| metadata.split('.').next())
                 .map(str::to_owned),
             capabilities: match kind {
-                Kind::Native => vec!["event-driven-orphan-reaping".into()],
+                Kind::Native => vec![
+                    "event-driven-orphan-reaping".into(),
+                    "provider-exit-diagnostics".into(),
+                    "provider-retained-output".into(),
+                ],
                 Kind::Terminal => Vec::new(),
             },
         }
@@ -171,6 +175,16 @@ impl Record {
                         .capabilities
                         .iter()
                         .any(|capability| capability == "event-driven-orphan-reaping"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "provider-exit-diagnostics"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "provider-retained-output"))
         })
     }
 

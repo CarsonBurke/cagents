@@ -27,6 +27,29 @@ use std::{
 // and a busy desktop scheduler.
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
+mod diagnostic_decode;
+mod diagnostic_read;
+mod provider_exit;
+pub(crate) use diagnostic_read::{
+    DiagnosticAuthority, DiagnosticCompletion, DiagnosticCopyCompletion, DiagnosticCopyInterest,
+    DiagnosticCopyReceipt, DiagnosticCopySummary, DiagnosticOutput, DiagnosticReadRequest,
+    DiagnosticResourceUsage, DiagnosticSource, diagnostic_resource_usage,
+};
+
+#[cfg(test)]
+pub(crate) use diagnostic_read::diagnostic_test_guard;
+
+// Keep ordinary request IDs below the local-query namespace. This prevents
+// an expired diagnostic reply from becoming an unrelated conversation error.
+fn next_request_id(next: &AtomicU64) -> Result<u64, String> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value
+            .checked_add(1)
+            .filter(|next| *next < provider_exit::REQUEST_NAMESPACE)
+    })
+    .map_err(|_| "Chat request identifiers are exhausted; reconnect this conversation".to_owned())
+}
+
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
@@ -145,6 +168,7 @@ struct Inner {
     reader: Mutex<Option<JoinHandle<()>>>,
     pending: Pending,
     file_pending: FilePending,
+    diagnostic_pending: provider_exit::Pending,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -204,19 +228,30 @@ impl AccountUsage {
 struct ActivityObservation {
     generation: u64,
     state: ActivityState,
+    outcome: Option<crate::agent::ActivityOutcome>,
     pending: bool,
 }
 
 impl ActivityObservation {
     fn observe(&mut self, generation: u64, state: ActivityState) -> bool {
+        self.observe_outcome(generation, state, None)
+    }
+
+    fn observe_outcome(
+        &mut self,
+        generation: u64,
+        state: ActivityState,
+        outcome: Option<crate::agent::ActivityOutcome>,
+    ) -> bool {
         if generation < self.generation {
             return false;
         }
         self.generation = generation;
-        if self.state == state {
+        if self.state == state && self.outcome == outcome {
             return false;
         }
         self.state = state;
+        self.outcome = outcome;
         !std::mem::replace(&mut self.pending, true)
     }
 
@@ -459,6 +494,12 @@ impl ClientHandle {
             boot_id: crate::model::BootId::new("fixture-boot"),
             host_incarnation: crate::model::HostIncarnation::new("fixture-incarnation"),
         };
+        let activity = ActivityObservation {
+            generation: snapshot.generation,
+            state: snapshot.activity(),
+            outcome: snapshot.outcome.clone(),
+            pending: false,
+        };
         Self {
             inner: Arc::new(Inner {
                 id: session.id,
@@ -475,11 +516,7 @@ impl ClientHandle {
                     Instant::now(),
                 ))),
                 snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
-                activity: Arc::new(Mutex::new(ActivityObservation {
-                    generation: 0,
-                    state: ActivityState::Idle,
-                    pending: false,
-                })),
+                activity: Arc::new(Mutex::new(activity)),
                 observed: Arc::new(Mutex::new(OutputObservation::default())),
                 account_usage: Arc::default(),
                 next: Arc::new(AtomicU64::new(1)),
@@ -489,6 +526,7 @@ impl ClientHandle {
                 reader: Mutex::new(None),
                 pending: Arc::new(Mutex::new(BTreeMap::new())),
                 file_pending: Arc::new(Mutex::new(BTreeMap::new())),
+                diagnostic_pending: Arc::new(Mutex::new(BTreeMap::new())),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
             }),
@@ -861,8 +899,9 @@ impl ClientHandle {
                     chat_id,
                     state,
                     generation,
+                    outcome,
                 } if chat_id == id && envelope.request_id.is_none() => {
-                    early_activity = Some((generation, state));
+                    early_activity = Some((generation, state, outcome));
                 }
                 ServerMessage::ChatObserved { chat_id, epoch }
                     if chat_id == id && envelope.request_id.is_none() =>
@@ -916,10 +955,11 @@ impl ClientHandle {
         let mut activity = ActivityObservation {
             generation: initial.generation,
             state: initial.activity(),
+            outcome: initial.outcome.clone(),
             pending: false,
         };
-        if let Some((generation, state)) = early_activity {
-            activity.observe(generation, state);
+        if let Some((generation, state, outcome)) = early_activity {
+            activity.observe_outcome(generation, state, outcome);
         }
         let activity = Arc::new(Mutex::new(activity));
         let observed = Arc::new(Mutex::new(early_observed));
@@ -934,6 +974,7 @@ impl ClientHandle {
         let visible = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
+        let diagnostic_pending: provider_exit::Pending = Arc::new(Mutex::new(BTreeMap::new()));
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
         let inner = Arc::new(Inner {
             id,
@@ -954,6 +995,7 @@ impl ClientHandle {
             reader: Mutex::new(None),
             pending: pending.clone(),
             file_pending: file_pending.clone(),
+            diagnostic_pending: diagnostic_pending.clone(),
             visibility_tx,
             visibility_worker: Mutex::new(None),
         });
@@ -973,13 +1015,9 @@ impl ClientHandle {
                         chat_id: id,
                         visible: visibility_value.load(Ordering::Acquire),
                     };
-                    if transmit(
-                        &visibility_wire,
-                        &visibility_proof,
-                        visibility_next.fetch_add(1, Ordering::Relaxed),
-                        request,
-                    )
-                    .is_err()
+                    if next_request_id(&visibility_next)
+                        .and_then(|id| transmit(&visibility_wire, &visibility_proof, id, request))
+                        .is_err()
                     {
                         let _ = visibility_wire
                             .lock()
@@ -1003,8 +1041,10 @@ impl ClientHandle {
             let mut read_again = false;
             let mut resync = false;
             let failure = loop {
-                let envelope: ServerEnvelope = match codec.read(&mut reader_stream) {
-                    Ok(Some(value)) => value,
+                let envelope: ServerEnvelope = match codec.read_with(&mut reader_stream, |payload|
+                    diagnostic_decode::decode(payload, &proof, id, &diagnostic_pending)) {
+                    Ok(Some(Some(value))) => value,
+                    Ok(Some(None)) => continue,
                     Ok(None) => break "Chat daemon disconnected; exact session retained for reattachment".into(),
                     Err(error) => break format!("Chat daemon frame failed: {error}"),
                 };
@@ -1040,9 +1080,12 @@ impl ClientHandle {
                         let _=reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
                     }
                     for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
+                    provider_exit::disconnected(&diagnostic_pending, "Chat was explicitly closed");
                     wake(Wake::Changed);
                     return;
                 }
+                // Diagnostic replies were authenticated and routed by their
+                // borrowed bounded decoder before allocating an owned envelope.
                 if let Some(reply)=envelope.request_id.and_then(|request|file_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
                     let result=match envelope.message {
                         ServerMessage::Response{response:ServerResponse::ChatFileChanges{chat_id,summary}} if chat_id==id=>Ok(super::FileChangeReply::Files(summary)),
@@ -1056,6 +1099,7 @@ impl ClientHandle {
                 if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&id)) {
                     let result = match &envelope.message { ServerMessage::Response { response: ServerResponse::Accepted | ServerResponse::Detached } => Ok(None), ServerMessage::Error(error) => Err(error.message.clone()), _ => Err("Unexpected chat command response".into()) };
                     let _ = reply.try_send(result);
+                    continue;
                 }
                 match envelope.message {
                     ServerMessage::ChatChanged { chat_id } if chat_id == id && visible.load(Ordering::Acquire) => {
@@ -1070,9 +1114,9 @@ impl ClientHandle {
                             wake(Wake::Observed);
                         }
                     },
-                    ServerMessage::ChatActivity { chat_id, state, generation } if chat_id == id => {
+                    ServerMessage::ChatActivity { chat_id, state, generation, outcome } if chat_id == id => {
                         let changed = activity.lock().unwrap_or_else(|p| p.into_inner())
-                            .observe(generation, state);
+                            .observe_outcome(generation, state, outcome);
                         if changed { wake(Wake::Activity); }
                     },
                     ServerMessage::ChatAccountUsage { chat_id, report, observed_at } if chat_id == id => {
@@ -1122,7 +1166,7 @@ impl ClientHandle {
                 if read_again && !read_pending && visible.load(Ordering::Acquire) {
                     read_again = false;
                     let generation = snapshot.lock().unwrap_or_else(|p| p.into_inner()).generation;
-                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: (!resync).then_some(generation) }) { break error; }
+                    if let Err(error) = next_request_id(&next).and_then(|request| transmit(&wire, &proof, request, ClientRequest::ChatRead { chat_id: id, after_generation: (!resync).then_some(generation) })) { break error; }
                     read_pending = true;
                 }
             };
@@ -1139,6 +1183,7 @@ impl ClientHandle {
             for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {
                 let _=reply.try_send(Err(failure.clone()));
             }
+            provider_exit::disconnected(&diagnostic_pending, &failure);
             wake(Wake::Disconnected(failure));
         }).map_err(|e| e.to_string())?;
         *inner.reader.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
@@ -1177,6 +1222,58 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+    /// A compact authenticated identity for an explicit diagnostic operation.
+    /// Rebuild from validated borrowed text so spare input capacity is not kept.
+    pub(crate) fn diagnostic_proof(&self) -> Option<HostSessionProof> {
+        let proof = &self.inner.proof;
+        if !proof.is_complete()
+            || [
+                proof.host_session_id.as_str(),
+                proof.boot_id.as_str(),
+                proof.host_incarnation.as_str(),
+            ]
+            .into_iter()
+            .any(|field| field.len() > 256)
+        {
+            return None;
+        }
+        Some(HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new(proof.host_session_id.as_str()),
+            boot_id: crate::model::BootId::new(proof.boot_id.as_str()),
+            host_incarnation: crate::model::HostIncarnation::new(proof.host_incarnation.as_str()),
+        })
+    }
+
+    /// Checks the current diagnostic against this original authenticated attachment.
+    /// This baseline has no global source-revocation model: exact attachment,
+    /// proof, native session, turn and opaque log identity are the real contract.
+    pub(crate) fn diagnostic_snapshot_matches(
+        &self,
+        proof: &HostSessionProof,
+        session: Option<&str>,
+        matches: impl FnOnce(&Snapshot) -> bool,
+    ) -> bool {
+        if &self.inner.proof != proof || !proof.is_complete() {
+            return false;
+        }
+        let snapshot = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Activity can advance without a Wake when its state is unchanged.
+        // Keep its monotonic generation floor locked through the borrowed
+        // predicate: consuming an activity edge cannot make an older body current.
+        let activity = self
+            .inner
+            .activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        activity.generation <= snapshot.generation
+            && snapshot.session_id.as_deref() == session
+            && matches(&snapshot)
+    }
+
     pub(crate) fn snapshot_with_clock(&self) -> (Arc<Snapshot>, Option<SourceClock>) {
         let snapshot = self
             .inner
@@ -1219,6 +1316,17 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner());
         activity.take()
     }
+    /// Latest terminal outcome from the small activity stream, including for
+    /// hidden chats whose transcript is intentionally not subscribed.
+    pub fn activity_outcome(&self) -> Option<crate::agent::ActivityOutcome> {
+        self.inner
+            .activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .outcome
+            .clone()
+    }
+
     /// Drains what the provider reported about the account this chat runs
     /// on, oldest first.
     pub fn take_account_usage(&self) -> Vec<(LiveReport, u64)> {
@@ -1247,7 +1355,7 @@ impl ClientHandle {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected; exact reattachment is required".into());
         }
-        let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let id = next_request_id(&self.inner.next)?;
         let (reply, response) = crossbeam_channel::bounded(1);
         {
             let mut pending = self.inner.pending.lock().unwrap_or_else(|p| p.into_inner());
@@ -1299,7 +1407,7 @@ impl ClientHandle {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected; retained file pages remain readable".into());
         }
-        let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let id = next_request_id(&self.inner.next)?;
         let (reply, response) = crossbeam_channel::bounded(1);
         {
             let mut pending = self
@@ -1503,6 +1611,112 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handled_command_refusals_do_not_become_shared_snapshot_errors() {
+        for initial_error in [None, Some("previous unsolicited error".to_owned())] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let seed = initial_error.clone();
+            let (advance_send, advance_receive) = std::sync::mpsc::channel();
+            let (done_send, done_receive) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let proof = host_proof("live");
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(connect.request_id),
+                    &proof,
+                    ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                );
+                let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatStart { session, .. } = start.request else {
+                    panic!("expected chat start")
+                };
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(start.request_id),
+                    &proof,
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatAttached {
+                            session,
+                            snapshot: Snapshot {
+                                generation: 1,
+                                error: seed,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                );
+                let command: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(matches!(command.request, ClientRequest::ChatCommand { .. }));
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(command.request_id),
+                    &proof,
+                    ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                        crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+                        "Command was refused",
+                        false,
+                    )),
+                );
+                advance_receive
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    None,
+                    &proof,
+                    ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                        crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+                        "Unsolicited provider failure",
+                        false,
+                    )),
+                );
+                done_receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            let (wake_send, wake_receive) = std::sync::mpsc::channel();
+            let handle = ClientHandle::connect_on(
+                client,
+                omp_card(None, None),
+                Intent::Start,
+                None,
+                false,
+                None,
+                None,
+                move |wake| {
+                    let _ = wake_send.send(wake);
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                handle.send(Command::Compact).unwrap_err(),
+                "Command was refused"
+            );
+            assert_eq!(handle.snapshot().error, initial_error);
+            advance_send.send(()).unwrap();
+            while handle.snapshot().error.as_deref() != Some("Unsolicited provider failure") {
+                wake_receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            done_send.send(()).unwrap();
+            worker.join().unwrap();
+        }
+    }
 
     #[test]
     fn source_clock_advances_in_daemon_time_despite_delayed_hydration() {
@@ -2027,6 +2241,7 @@ mod tests {
         let mut activity = ActivityObservation {
             generation: 5,
             state: ActivityState::Working,
+            outcome: None,
             pending: false,
         };
         assert!(!activity.observe(4, ActivityState::Idle));
@@ -2039,7 +2254,7 @@ mod tests {
         assert_eq!(activity.take(), ActivityState::Working);
     }
 
-    fn host_proof(incarnation: &str) -> HostSessionProof {
+    pub(super) fn host_proof(incarnation: &str) -> HostSessionProof {
         use crate::model::{BootId, HostIncarnation, HostSessionId};
         HostSessionProof {
             host_session_id: HostSessionId::new("session"),
@@ -2050,7 +2265,7 @@ mod tests {
 
     /// The live installation's own card: a native OMP conversation whose
     /// persisted launch names its session directory and nothing else.
-    fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
+    pub(super) fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
         Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,
@@ -2908,6 +3123,397 @@ mod tests {
             matches!(&handle.snapshot().items[0].content, ItemContent::Text { text, .. } if text == "resynchronized")
         );
         advance_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn provider_output_currentness_waits_for_same_state_activity_generation_without_wake() {
+        let initial = Snapshot {
+            generation: 7,
+            session_id: Some("diagnostic-session".into()),
+            turn_generation: 2,
+            exited: true,
+            provider_exit: Some(super::super::ProviderExitDiagnostic {
+                summary: "Provider exited".into(),
+                output: "retained output".into(),
+                log: None,
+            }),
+            ..Default::default()
+        };
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("diagnostic-floor");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("start expected")
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: initial.clone(),
+                    },
+                },
+            );
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatActivity {
+                    chat_id,
+                    state: initial.activity(),
+                    generation: 8,
+                    outcome: None,
+                },
+            );
+            // This separate stream's wake is only a frame-order barrier. Its
+            // epoch is deliberately unrelated to Snapshot/Activity generation.
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatObserved { chat_id, epoch: 0 },
+            );
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(initial.clone()),
+                    },
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatObserved { chat_id, epoch: 0 },
+            );
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut caught_up = initial;
+            caught_up.generation = 8;
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(caught_up),
+                    },
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatObserved { chat_id, epoch: 0 },
+            );
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Actual EOF is not a new generation or an explicit revocation.
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        let proof = handle.diagnostic_proof().unwrap();
+        let current = || {
+            handle.diagnostic_snapshot_matches(&proof, Some("diagnostic-session"), |snapshot| {
+                snapshot.turn_generation == 2
+                    && snapshot
+                        .provider_exit
+                        .as_ref()
+                        .is_some_and(|exit| exit.output == "retained output")
+            })
+        };
+        assert!(current());
+        advance_tx.send(()).unwrap();
+        assert!(
+            matches!(
+                wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Wake::Observed
+            ),
+            "same-state generation must not need an Activity or Changed wake"
+        );
+        assert!(handle.take_observed());
+        assert_eq!(handle.snapshot().generation, 7);
+        assert_eq!(handle.inner.activity.lock().unwrap().generation, 8);
+        let invoked = std::cell::Cell::new(false);
+        assert!(
+            !handle.diagnostic_snapshot_matches(&proof, Some("diagnostic-session"), |_| {
+                invoked.set(true);
+                true
+            })
+        );
+        assert!(
+            !invoked.get(),
+            "refuse before inspecting a known-stale diagnostic body"
+        );
+        handle.take_activity();
+        assert!(
+            !current(),
+            "draining activity must retain its generation floor"
+        );
+        advance_tx.send(()).unwrap();
+        assert!(matches!(
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Wake::Observed
+        ));
+        assert!(handle.take_observed());
+        assert!(!current(), "a delayed older body must not heal the floor");
+        advance_tx.send(()).unwrap();
+        assert!(matches!(
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Wake::Observed
+        ));
+        assert!(handle.take_observed());
+        assert!(
+            current(),
+            "a caught-up body with the exact tuple is readable"
+        );
+        advance_tx.send(()).unwrap();
+        assert!(matches!(
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Wake::Disconnected(_)
+        ));
+        assert!(
+            current(),
+            "ordinary EOF alone does not revoke retained diagnostics"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn provider_output_authenticated_wire_pages_ignore_coalesced_watch_updates() {
+        let _guard = diagnostic_read::diagnostic_test_guard();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let raw = format!("{}\x1b[31mred\x1b[0m €\n", "x".repeat(256 * 1024 - 2)).into_bytes();
+        let expected = format!("{}red €\n", "x".repeat(256 * 1024 - 2));
+        let log = super::super::ProviderExitLog {
+            id: "immutable-exit".into(),
+            bytes: raw.len() as u64,
+            omitted: 17,
+        };
+        let server_log = log.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("diagnostic-host");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond =
+                |codec: &mut FrameCodec, server: &mut UnixStream, request_id, response| {
+                    codec
+                        .write(
+                            server,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id,
+                                proof: proof.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                        .unwrap();
+                };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: vec![],
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("start expected");
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerResponse::ChatAttached {
+                    session,
+                    snapshot: Snapshot::default(),
+                },
+            );
+            let mut offset = 0;
+            for generation in 1..=2 {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatProviderExitOutput {
+                    chat_id: requested_chat,
+                    log_id,
+                    offset: requested_offset,
+                } = request.request
+                else {
+                    panic!("output page expected");
+                };
+                assert_eq!(requested_chat, chat_id);
+                assert_eq!(log_id, server_log.id);
+                assert_eq!(requested_offset, offset as u64);
+                respond(
+                    &mut codec,
+                    &mut server,
+                    None,
+                    ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(Snapshot {
+                            generation,
+                            ..Default::default()
+                        }),
+                    },
+                );
+                let end = (offset + 256 * 1024).min(raw.len());
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(request.request_id),
+                    ServerResponse::ChatProviderExitOutput {
+                        chat_id,
+                        log_id,
+                        offset: requested_offset,
+                        bytes: raw[offset..end].to_vec(),
+                        next_offset: (end < raw.len()).then_some(end as u64),
+                        omitted: server_log.omitted,
+                    },
+                );
+                offset = end;
+            }
+            assert_eq!(offset, raw.len());
+            let late: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                late.request,
+                ClientRequest::ChatProviderExitOutput { .. }
+            ));
+            // Release only after the client has removed its timed-out waiter.
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            codec
+                .write(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(late.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Error(ipc::ProtocolError::new(
+                            ipc::ProtocolErrorCode::TerminalUnavailable,
+                            "Expired saved output",
+                            false,
+                        )),
+                    },
+                )
+                .unwrap();
+            codec
+                .write(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: proof.clone(),
+                        message: ServerMessage::HostShuttingDown,
+                    },
+                )
+                .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        let output = handle
+            .provider_exit_output(&log, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(output.text.as_str(), expected);
+        assert_eq!(output.omitted, 17);
+        assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());
+        handle.install_snapshot_for_test(Snapshot {
+            error: Some("Original provider crash".into()),
+            ..Default::default()
+        });
+        handle.take_activity();
+        assert!(
+            handle
+                .provider_exit_page(&log.id, 0, Duration::from_millis(10))
+                .is_err()
+        );
+        assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());
+        done_tx.send(()).unwrap();
+        loop {
+            if matches!(
+                wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Wake::Disconnected(_)
+            ) {
+                break;
+            }
+        }
+        assert_eq!(
+            handle.snapshot().error.as_deref(),
+            Some("Original provider crash")
+        );
+        done_tx.send(()).unwrap();
         worker.join().unwrap();
     }
 

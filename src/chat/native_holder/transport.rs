@@ -28,7 +28,7 @@ use std::{
 };
 
 const ARGUMENT: &str = "--cagents-native-holder";
-const PROTOCOL: u32 = 3;
+const PROTOCOL: u32 = 5;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: usize = 16 << 20;
@@ -98,7 +98,7 @@ impl Spawn {
             .envs(&self.environment)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .process_group(0);
         crate::host::descriptor_limit::inherit(&mut command);
         // The helper's signalfd owns SIGCHLD; its provider must receive the
@@ -154,6 +154,7 @@ enum Request {
         proof: HostSessionProof,
     },
     Release,
+    Diagnostic,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -173,6 +174,18 @@ enum Report {
     },
     Adopted(Recovery),
     Failed(String),
+    Diagnostic(ExitDiagnostic),
+}
+
+/// Raw transport evidence. Presentation strips escape sequences and selects a
+/// short reason; keeping this separate prevents transport errors hiding exits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ExitDiagnostic {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub stderr: String,
+    #[serde(default)]
+    pub log: Option<crate::chat::stderr_log::Descriptor>,
 }
 
 /// Dropping an intentionally closed actor releases its server. An unexpected
@@ -185,6 +198,24 @@ pub(crate) struct Holder {
 }
 
 impl Holder {
+    pub fn diagnostic(&mut self) -> Result<ExitDiagnostic, String> {
+        if !self.identity.record.build.as_ref().is_some_and(|build| {
+            build
+                .capabilities
+                .iter()
+                .any(|capability| capability == "provider-exit-diagnostics")
+        }) {
+            return Err("This older provider holder has no exit diagnostics; restart the session to update it".into());
+        }
+        let control = self.control.as_ref().ok_or("Native holder is detached")?;
+        send(control, &Request::Diagnostic, TIMEOUT)?;
+        match receive(control, TIMEOUT)? {
+            Some(Report::Diagnostic(diagnostic)) => Ok(diagnostic),
+            Some(Report::Failed(error)) => Err(error),
+            _ => Err("Native holder did not report provider exit diagnostics".into()),
+        }
+    }
+
     pub fn is_durable(&self) -> bool {
         self.durable
     }
@@ -508,7 +539,7 @@ pub(crate) fn inspect(
             record: actual,
             recovery,
             exited,
-        }) if matches!(protocol, 2 | PROTOCOL) && actual == *record => {
+        }) if matches!(protocol, 2..=PROTOCOL) && actual == *record => {
             recovery.validate(&record.boot)?;
             Ok((recovery, exited))
         }
@@ -573,6 +604,7 @@ struct Residence {
     recovery: Recovery,
     child: Server,
     child_events: ChildEvents,
+    stderr: StderrCapture,
     released: bool,
     _working_directory: Option<std::fs::File>,
 }
@@ -607,12 +639,13 @@ impl Residence {
             .map_err(|error| error.to_string())?;
         let socket = registry::socket(&directory, spawn.recovery.source.id);
         let listener = Listener::bind(socket)?;
-        let child = match spawn.command().spawn() {
+        let mut child = match spawn.command().spawn() {
             Ok(child) => Server(crate::daemon::owned_children::OwnedChildren::new(child)),
             Err(error) => {
                 return Err(error.to_string());
             }
         };
+        let stderr = StderrCapture::new(child.take_stderr(), spawn.recovery.source.id)?;
         let record = Record {
             version: 4,
             build: Some(registry::BuildIdentity::current(Kind::Native)),
@@ -630,6 +663,7 @@ impl Residence {
             recovery: spawn.recovery,
             child,
             child_events,
+            stderr,
             released: false,
             _working_directory: working_directory,
         };
@@ -686,7 +720,14 @@ impl Residence {
 
     fn attend(&mut self, control: UnixStream) -> bool {
         loop {
-            if wait_for_control(control.as_raw_fd(), &self.child, &self.child_events).is_err() {
+            if wait_for_control_with_stderr(
+                control.as_raw_fd(),
+                &self.child,
+                &self.child_events,
+                Some(&mut self.stderr),
+            )
+            .is_err()
+            {
                 return self.recovery.is_durable();
             }
             let request = match receive(&control, TIMEOUT) {
@@ -694,6 +735,39 @@ impl Residence {
                 _ => return self.recovery.is_durable(),
             };
             let response = match request {
+                Request::Diagnostic => {
+                    use std::os::unix::process::ExitStatusExt;
+                    let result = self
+                        .stderr
+                        .drain()
+                        .and_then(|()| self.child.exit_status())
+                        .and_then(|status| {
+                            if status.is_some() {
+                                // Once the leader exited, drain its remaining pipe
+                                // bytes before publishing the last meaningful line.
+                                // Descendants may retain stderr; keep this bounded.
+                                for _ in 0..16 {
+                                    self.stderr.drain()?;
+                                    if self.stderr.reader.is_none() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(status)
+                        });
+                    match result {
+                        Ok(status) => Report::Diagnostic(ExitDiagnostic {
+                            code: status.and_then(|status| status.code()),
+                            signal: status.and_then(|status| status.signal()),
+                            stderr: String::from_utf8_lossy(self.stderr.tail.make_contiguous())
+                                .into_owned(),
+                            log: status.and_then(|_| {
+                                self.stderr.log.as_ref().and_then(|log| log.share().ok())
+                            }),
+                        }),
+                        Err(error) => Report::Failed(error.to_string()),
+                    }
+                }
                 Request::Release => match self.release() {
                     Ok(()) => {
                         let _ = send(&control, &Report::Released, TIMEOUT);
@@ -775,10 +849,11 @@ impl Residence {
 
     fn orphan(&mut self) -> bool {
         loop {
-            if wait_for_control(
+            if wait_for_control_with_stderr(
                 self.listener.socket.as_raw_fd(),
                 &self.child,
                 &self.child_events,
+                Some(&mut self.stderr),
             )
             .is_err()
             {
@@ -827,6 +902,73 @@ impl Residence {
                 _ => unreachable!(),
             }
         }
+    }
+}
+
+/// One bounded ring, drained on the holder's existing poll loop. No per-agent
+/// reader thread or periodic wakeup is needed. Raw stderr is retained by default
+/// in the same private, bounded disk log as the direct provider transport.
+struct StderrCapture {
+    reader: Option<std::process::ChildStderr>,
+    tail: std::collections::VecDeque<u8>,
+    log: Option<crate::chat::stderr_log::Capture>,
+}
+impl StderrCapture {
+    fn new(
+        reader: Option<std::process::ChildStderr>,
+        _terminal: crate::model::TerminalId,
+    ) -> Result<Self, String> {
+        if let Some(reader) = &reader {
+            let fd = reader.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags == -1
+                || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
+                return Err(io::Error::last_os_error().to_string());
+            }
+        }
+        let log = crate::chat::stderr_log::Capture::new()
+            .map_err(|error| {
+                tracing::warn!(%error,"Provider diagnostic log is unavailable");
+                error
+            })
+            .ok();
+        Ok(Self {
+            reader,
+            tail: Default::default(),
+            log,
+        })
+    }
+    fn drain(&mut self) -> io::Result<()> {
+        let mut bytes = [0_u8; 8192];
+        // Bound work per poll so a noisy provider cannot starve Interrupt or
+        // ownership updates. A still-readable pipe immediately polls again.
+        for _ in 0..8 {
+            let Some(reader) = self.reader.as_mut() else {
+                break;
+            };
+            match reader.read(&mut bytes) {
+                Ok(0) => {
+                    self.reader.take();
+                    break;
+                }
+                Ok(count) => {
+                    if let Some(log) = self.log.as_mut() {
+                        log.push(&bytes[..count]);
+                    }
+                    for byte in &bytes[..count] {
+                        if self.tail.len() == 64 * 1024 {
+                            self.tail.pop_front();
+                        }
+                        self.tail.push_back(*byte);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -888,12 +1030,25 @@ impl Drop for ChildEvents {
 
 /// A child exit or control message is the only source of idle wakeups. Reap
 /// once before blocking as well, including orphans already pending at startup.
+#[cfg(test)]
 fn wait_for_control(
     fd: RawFd,
     children: &crate::daemon::owned_children::OwnedChildren,
     child_events: &ChildEvents,
 ) -> io::Result<()> {
+    wait_for_control_with_stderr(fd, children, child_events, None)
+}
+
+fn wait_for_control_with_stderr(
+    fd: RawFd,
+    children: &crate::daemon::owned_children::OwnedChildren,
+    child_events: &ChildEvents,
+    mut stderr: Option<&mut StderrCapture>,
+) -> io::Result<()> {
     loop {
+        if let Some(stderr) = stderr.as_mut() {
+            stderr.drain()?;
+        }
         if let Err(error) = children.reap_exited_descendants() {
             // A transient inspection failure must not tear down a durable server.
             eprintln!("Native holder could not reap exited tools: {error}");
@@ -906,6 +1061,14 @@ fn wait_for_control(
             },
             libc::pollfd {
                 fd: child_events.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr
+                    .as_ref()
+                    .and_then(|stderr| stderr.reader.as_ref())
+                    .map_or(-1, AsRawFd::as_raw_fd),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -1181,6 +1344,136 @@ extern "C" fn serve_if_requested() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_named_json_inspection_messages_remain_decodable() {
+        let recovery = super::super::tests::recovery();
+        let proof = recovery.source.proof.as_ref().unwrap();
+        // The actual holder codec is length-framed JSON. Its externally tagged
+        // names, rather than Rust enum ordinals, are the compatibility boundary.
+        let inspect = serde_json::json!({"Inspect":{"proof":proof}});
+        let decoded: Request = serde_json::from_value(inspect.clone()).unwrap();
+        assert!(matches!(&decoded,Request::Inspect{proof:decoded} if decoded==proof));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), inspect);
+        let record = serde_json::json!({
+            "version":3,"kind":"Native","application":"legacy-holder",
+            "boot":proof.boot_id,"terminal":recovery.source.id,
+            "holder":{"pid":123,"start":1},"root":{"pid":124,"start":2}
+        });
+        let inspected = serde_json::json!({"Inspected":{"protocol":2,"record":record,"recovery":recovery,"exited":false}});
+        let decoded: Report = serde_json::from_value(inspected).unwrap();
+        let Report::Inspected {
+            protocol,
+            record,
+            recovery: decoded,
+            exited,
+        } = decoded
+        else {
+            panic!("legacy inspection changed its JSON tag")
+        };
+        assert_eq!(protocol, 2);
+        assert_eq!(record.version, 3);
+        assert!(record.build.is_none());
+        assert!(!exited);
+        assert_eq!(decoded.source.proof.as_ref(), Some(proof));
+    }
+
+    #[test]
+    fn holder_reports_exit_status_and_captured_stderr_over_control() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_STDERR_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            use crate::process::{
+                CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+            };
+            use std::os::unix::fs::PermissionsExt as _;
+            for name in ["home", "config", "data", "cache", "runtime"] {
+                let path = directory.path().join(name);
+                std::fs::create_dir(&path).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let test = "chat::native_holder::transport::tests::holder_reports_exit_status_and_captured_stderr_over_control";
+            let spec = CommandSpec::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .cwd(directory.path())
+                .env(STAGE, "1")
+                .env("HOME", directory.path().join("home"))
+                .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                .env("XDG_RUNTIME_DIR", directory.path().join("runtime"))
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                .env("CAGENTS_LOCAL_DEBUG", "0")
+                .timeout(Duration::from_secs(60))
+                .output_limits(256 * 1024, 64 * 1024);
+            // The executor retains the original Child and bounds its pipes and
+            // wait. Whole holder/provider-family settlement is the outer test
+            // runner's responsibility, not a claim about this leader timeout.
+            let output = SystemProcessExecutor
+                .execute(&spec, &CancellationToken::new())
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.success && output.exit_code == Some(0) && output.signal.is_none(),
+                "stdout={stdout} stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("test {test} ... ok"))
+            );
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+            },
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "printf 'first diagnostic\nlast failure\n' >&2; exit 3".into(),
+            ],
+            working_directory: std::env::temp_dir(),
+            environment: Default::default(),
+        };
+        let mut holder = spawn(spec, source).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let diagnostic = loop {
+            let diagnostic = holder.diagnostic().unwrap();
+            if diagnostic.code.is_some() || diagnostic.signal.is_some() {
+                break diagnostic;
+            }
+            assert!(Instant::now() < deadline, "fixture provider did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(diagnostic.code, Some(3));
+        assert_eq!(diagnostic.signal, None);
+        assert_eq!(diagnostic.stderr, "first diagnostic\nlast failure\n");
+        assert_eq!(
+            std::fs::read_to_string(&diagnostic.log.as_ref().unwrap().path).unwrap(),
+            diagnostic.stderr
+        );
+        let frame = serde_json::to_vec(&Report::Diagnostic(diagnostic)).unwrap();
+        let Report::Diagnostic(decoded) = serde_json::from_slice(&frame).unwrap() else {
+            panic!("missing diagnostic control response")
+        };
+        assert_eq!(decoded.code, Some(3));
+        assert!(decoded.stderr.ends_with("last failure\n"));
+        holder.close().unwrap();
+    }
 
     #[test]
     fn idle_control_and_orphan_listener_reap_tools_without_reaping_or_killing_provider() {

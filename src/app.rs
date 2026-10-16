@@ -8549,10 +8549,13 @@ impl Cagents {
                 }
                 TerminalEvent::ClipboardText { request, text } => {
                     if let Some(find) = self.terminal_find.get_mut(&card)
-                        && find.pending_copy == Some(request)
+                        && find
+                            .pending_copy
+                            .as_ref()
+                            .is_some_and(|pending| pending.request == request)
                     {
-                        find.pending_copy = None;
-                        if !text.trim().is_empty() {
+                        let pending = find.pending_copy.take().unwrap();
+                        if pending.intent.current() && !text.trim().is_empty() {
                             clipboard_task = iced::clipboard::write(text).map(cosmic::Action::App);
                         }
                     }
@@ -8768,9 +8771,11 @@ impl Cagents {
                     );
                 }
                 DelegateRequest::ClipboardWrite { text } => {
+                    self.chat_ui.begin_clipboard_copy();
                     tasks.push(iced::clipboard::write(text).map(cosmic::Action::App));
                 }
                 DelegateRequest::ClipboardClear => {
+                    self.chat_ui.begin_clipboard_copy();
                     tasks.push(iced::clipboard::write(String::new()).map(cosmic::Action::App));
                 }
                 DelegateRequest::NewWindow { url: Some(url) } => {
@@ -13968,6 +13973,19 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
+                if matches!(
+                    &action,
+                    RepositoryAction::Clipboard {
+                        op: repository_widget::ClipboardOp::Copy
+                            | repository_widget::ClipboardOp::Cut,
+                        ..
+                    }
+                ) && matches!(
+                    self.cards.get(&card),
+                    Some(CardRuntime::Repository(_) | CardRuntime::PullRequests(_))
+                ) {
+                    self.chat_ui.begin_clipboard_copy();
+                }
                 let completion_character = match &action {
                     RepositoryAction::EditorAction {
                         action:
@@ -14592,11 +14610,14 @@ impl Application for Cagents {
                                 Message::FileRevealed(file_manager::reveal(&path).await)
                             })
                         }
-                        sidebar::FileCommand::CopyPath => iced::clipboard::write(
-                            key.canonical_path.join(path.as_path()).display().to_string(),
-                        )
-                        .map(cosmic::Action::App),
+                        sidebar::FileCommand::CopyPath => {
+                            self.chat_ui.begin_clipboard_copy();
+                            iced::clipboard::write(
+                                key.canonical_path.join(path.as_path()).display().to_string(),
+                            ).map(cosmic::Action::App)
+                        },
                         sidebar::FileCommand::CopyRelativePath => {
+                            self.chat_ui.begin_clipboard_copy();
                             iced::clipboard::write(path.display().into_owned())
                                 .map(cosmic::Action::App)
                         }
@@ -16643,6 +16664,13 @@ impl Application for Cagents {
             subscriptions.push(iced::time::every(Duration::from_millis(50)).map(|_| Message::BrowserProgressTick));
         }
         Subscription::batch(subscriptions)
+    }
+
+    fn native_surface<'a>(
+        &'a self,
+        surface: Element<'a, cosmic::Action<Message>>,
+    ) -> Element<'a, cosmic::Action<Message>> {
+        self.chat_ui.clipboard_surface(surface)
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
