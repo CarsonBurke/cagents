@@ -14,7 +14,7 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
     ) {
         return Err(automatic_monitor_unavailable());
     }
-    let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+    let socket = control_daemon_socket()?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
     execute_with_client(&mut client, command, Authority::from_environment())
