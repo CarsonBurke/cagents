@@ -2,9 +2,18 @@ use super::*;
 use crate::account::info::{Query, Report};
 
 mod list;
+mod removal;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountCommand {
+    /// Forget a linked account registration; managed file deletion remains unavailable.
+    Remove {
+        /// Stable account ID from account list on the selected device.
+        account: crate::account::AccountId,
+        /// Confirm removing the registration; linked files are left unchanged.
+        #[arg(long, required = true)]
+        yes: bool,
+    },
     /// List active accounts and any retained caller account from the selected daemon.
     List {
         /// Limit rows to claude, codex, or omp; never probe its CLI.
@@ -27,6 +36,7 @@ pub enum AccountCommand {
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (query, listing) = match command {
+        AccountCommand::Remove { account, yes } => return removal::execute(account, yes),
         AccountCommand::List { provider } => (list::query(provider), true),
         AccountCommand::Info {
             provider,
