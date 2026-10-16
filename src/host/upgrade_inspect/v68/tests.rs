@@ -153,6 +153,43 @@ fn terminal(owner: &HostSessionProof) -> ipc::TerminalDescriptor {
     value
 }
 
+// The historical byte oracle must serialize the complete 68 descriptor rather
+// than today's descriptor, which may append fields such as terminal titles.
+// These eleven fields/order are from source 503a331; frozen_terminal below is
+// still the independent primitive-byte fixture for the same historical layout.
+#[derive(Serialize)]
+struct Descriptor68<'a> {
+    screen_lost_after_crash: bool,
+    session: &'a crate::model::TerminalSession,
+    generation: u64,
+    event_sequence: u64,
+    oldest_event_sequence: u64,
+    attached: bool,
+    transcript: &'a Option<crate::model::TranscriptMetadata>,
+    activity: &'a Option<crate::model::TerminalOutputActivity>,
+    agent_activity: &'a Option<Activity>,
+    upgrade_sources: &'a [crate::model::TerminalSession],
+    upgrade_relaunches: &'a [ipc::UpgradeRelaunch],
+}
+
+impl<'a> From<&'a ipc::TerminalDescriptor> for Descriptor68<'a> {
+    fn from(value: &'a ipc::TerminalDescriptor) -> Self {
+        Self {
+            screen_lost_after_crash: value.screen_lost_after_crash,
+            session: &value.session,
+            generation: value.generation,
+            event_sequence: value.event_sequence,
+            oldest_event_sequence: value.oldest_event_sequence,
+            attached: value.attached,
+            transcript: &value.transcript,
+            activity: &value.activity,
+            agent_activity: &value.agent_activity,
+            upgrade_sources: &value.upgrade_sources,
+            upgrade_relaunches: &value.upgrade_relaunches,
+        }
+    }
+}
+
 fn frozen_terminal_session(owner: &HostSessionProof, bytes: &mut Vec<u8>) {
     frozen_id(2, bytes);
     frozen_listener(owner, bytes);
@@ -239,7 +276,7 @@ fn authentic_68_bytes_pin_populated_read_only_requests_and_responses() {
         frozen_session(&owner)
     );
     assert_eq!(
-        postcard::to_allocvec(&terminal(&owner)).unwrap(),
+        postcard::to_allocvec(&Descriptor68::from(&terminal(&owner))).unwrap(),
         frozen_terminal(&owner)
     );
     for (variant, request) in [
