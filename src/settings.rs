@@ -1038,19 +1038,37 @@ pub struct LanguageServerSettings {
     /// Format the current buffer before an explicitly requested save.
     #[serde(default, skip_serializing_if = "lsp_format_on_save_disabled")]
     pub format_on_save: bool,
-    #[serde(default = "default_lsp_formatting_timeout", skip_serializing_if = "lsp_formatting_timeout_is_default")]
+    #[serde(
+        default = "default_lsp_formatting_timeout",
+        skip_serializing_if = "lsp_formatting_timeout_is_default"
+    )]
     pub formatting_timeout_ms: u64,
     /// Answer workspace/configuration requests and send didChangeConfiguration.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub configuration: serde_json::Value,
 }
 
-fn lsp_format_on_save_disabled(value: &bool) -> bool { !*value }
-fn default_lsp_formatting_timeout() -> u64 { 1000 }
-fn lsp_formatting_timeout_is_default(value: &u64) -> bool { *value == default_lsp_formatting_timeout() }
+fn lsp_format_on_save_disabled(value: &bool) -> bool {
+    !*value
+}
+fn default_lsp_formatting_timeout() -> u64 {
+    1000
+}
+fn lsp_formatting_timeout_is_default(value: &u64) -> bool {
+    *value == default_lsp_formatting_timeout()
+}
 impl Default for LanguageServerSettings {
     fn default() -> Self {
-        Self { id: String::new(), languages: Vec::new(), command: Vec::new(), root_markers: Vec::new(), initialization_options: None, format_on_save: false, formatting_timeout_ms: default_lsp_formatting_timeout(), configuration: serde_json::Value::Null }
+        Self {
+            id: String::new(),
+            languages: Vec::new(),
+            command: Vec::new(),
+            root_markers: Vec::new(),
+            initialization_options: None,
+            format_on_save: false,
+            formatting_timeout_ms: default_lsp_formatting_timeout(),
+            configuration: serde_json::Value::Null,
+        }
     }
 }
 
@@ -1793,10 +1811,17 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
 
     for server in servers {
         if !(50..=10_000).contains(&server.formatting_timeout_ms) {
-            return Err(SettingsError::LanguageServer(format!("language server {} formatting_timeout_ms must be between 50 and 10000", server.id)));
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {} formatting_timeout_ms must be between 50 and 10000",
+                server.id
+            )));
         }
-        if serde_json::to_vec(&server.configuration).map_or(true, |bytes| bytes.len() > 1024 * 1024) {
-            return Err(SettingsError::LanguageServer(format!("language server {} configuration exceeds 1 MiB", server.id)));
+        if serde_json::to_vec(&server.configuration).map_or(true, |bytes| bytes.len() > 1024 * 1024)
+        {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {} configuration exceeds 1 MiB",
+                server.id
+            )));
         }
         if server.initialization_options.as_ref().is_some_and(|value| {
             serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 1024 * 1024)
@@ -2915,7 +2940,8 @@ mod tests {
         assert_eq!(settings.language_servers[0].formatting_timeout_ms, 1000);
         settings.language_servers[0].format_on_save = true;
         settings.language_servers[0].formatting_timeout_ms = 2500;
-        settings.language_servers[0].configuration = serde_json::json!({"rust-analyzer": {"checkOnSave": false}});
+        settings.language_servers[0].configuration =
+            serde_json::json!({"rust-analyzer": {"checkOnSave": false}});
         let text = toml::to_string(&settings).unwrap();
         let decoded: AppSettings = toml::from_str(&text).unwrap();
         assert_eq!(decoded.language_servers, settings.language_servers);
@@ -2925,7 +2951,8 @@ mod tests {
             assert!(settings.validate().is_err());
         }
         settings.language_servers[0].formatting_timeout_ms = 1000;
-        settings.language_servers[0].configuration = serde_json::json!({"oversized": "λ".repeat(1024 * 1024)});
+        settings.language_servers[0].configuration =
+            serde_json::json!({"oversized": "λ".repeat(1024 * 1024)});
         assert!(settings.validate().is_err());
     }
 

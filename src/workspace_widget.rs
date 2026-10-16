@@ -1783,10 +1783,24 @@ struct WorkspaceSurface<'a, Message> {
 #[derive(Default)]
 struct FocusedNativeEditor(bool);
 impl Operation for FocusedNativeEditor {
-    fn focusable(&mut self, id: Option<&widget::Id>, _bounds: Rectangle, state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable) {
-        if state.is_focused() && id.is_some_and(|id| { let id = id.to_string(); id.starts_with("repository.") && id.ends_with(".editor") }) { self.0 = true; }
+    fn focusable(
+        &mut self,
+        id: Option<&widget::Id>,
+        _bounds: Rectangle,
+        state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+    ) {
+        if state.is_focused()
+            && id.is_some_and(|id| {
+                let id = id.to_string();
+                id.starts_with("repository.") && id.ends_with(".editor")
+            })
+        {
+            self.0 = true;
+        }
     }
-    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) { operate(self); }
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
 }
 
 #[derive(Default)]
@@ -1920,11 +1934,19 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
     ) {
         let content_layout = Self::child_layout(layout);
 
-        let editor_f2 = if matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::F2), modifiers, .. } | keyboard::Event::KeyReleased { key: keyboard::Key::Named(keyboard::key::Named::F2), modifiers, .. }) if modifiers.is_empty()) {
+        let editor_f2 = if matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::F2), modifiers, .. } | keyboard::Event::KeyReleased { key: keyboard::Key::Named(keyboard::key::Named::F2), modifiers, .. }) if modifiers.is_empty())
+        {
             let mut focused = FocusedNativeEditor::default();
-            self.content.as_widget_mut().operate(&mut tree.children[0], content_layout, renderer, &mut focused);
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                content_layout,
+                renderer,
+                &mut focused,
+            );
             focused.0
-        } else { false };
+        } else {
+            false
+        };
         match event {
             Event::Keyboard(
                 keyboard::Event::KeyPressed {
@@ -1939,13 +1961,14 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
                     modifiers,
                     ..
                 },
-            ) if !editor_f2 && is_global_shortcut_chord(
-                key,
-                *physical_key,
-                *modifiers,
-                self.shortcuts,
-                self.focused_pane,
-            ) =>
+            ) if !editor_f2
+                && is_global_shortcut_chord(
+                    key,
+                    *physical_key,
+                    *modifiers,
+                    self.shortcuts,
+                    self.focused_pane,
+                ) =>
             {
                 shell.capture_event();
                 return;

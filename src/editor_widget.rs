@@ -1822,13 +1822,22 @@ where
         for index in 0..count {
             let line = internal.editor.line(index)?;
             let end = start + line.text.len();
-            while let Some(&(output, offset)) = ordered.get(request).filter(|(_, offset)| *offset <= end) {
+            while let Some(&(output, offset)) =
+                ordered.get(request).filter(|(_, offset)| *offset <= end)
+            {
                 let column = offset.checked_sub(start)?;
-                if !line.text.is_char_boundary(column) { return None; }
-                positions[output] = Position { line: index, column };
+                if !line.text.is_char_boundary(column) {
+                    return None;
+                }
+                positions[output] = Position {
+                    line: index,
+                    column,
+                };
                 request += 1;
             }
-            if request == ordered.len() { return Some(positions); }
+            if request == ordered.len() {
+                return Some(positions);
+            }
             start = end + terminator(line.ending, index + 1 == count).len();
         }
         (request == ordered.len()).then_some(positions)
@@ -1836,13 +1845,26 @@ where
 
     /// Prepares an explicit range without widening distant edits into a
     /// whole-document history entry.
-    pub fn range_change(&self, start: Position, end: Position, replacement: &str) -> Option<TextChange> {
+    pub fn range_change(
+        &self,
+        start: Position,
+        end: Position,
+        replacement: &str,
+    ) -> Option<TextChange> {
         self.range_change_with_copy(start, end, replacement, |_| {})
     }
 
-    fn range_change_with_copy(&self, start: Position, end: Position, replacement: &str, mut copied: impl FnMut(&str)) -> Option<TextChange> {
+    fn range_change_with_copy(
+        &self,
+        start: Position,
+        end: Position,
+        replacement: &str,
+        mut copied: impl FnMut(&str),
+    ) -> Option<TextChange> {
         use cosmic::iced::advanced::graphics::text::cosmic_text;
-        if (start.line, start.column) > (end.line, end.column) { return None; }
+        if (start.line, start.column) > (end.line, end.column) {
+            return None;
+        }
         let internal = self.0.borrow();
         let count = internal.editor.line_count();
         let mut removed = String::new();
@@ -1850,13 +1872,19 @@ where
         for index in start.line..=end.line {
             let line = internal.editor.line(index)?;
             let from = if index == start.line { start.column } else { 0 };
-            let to = if index == end.line { end.column } else { line.text.len() };
+            let to = if index == end.line {
+                end.column
+            } else {
+                line.text.len()
+            };
             let part = line.text.get(from..to)?;
             copied(part);
             removed.push_str(part);
             if index < end.line {
                 let ending = terminator(line.ending, index + 1 == count);
-                if ending.is_empty() { return None; }
+                if ending.is_empty() {
+                    return None;
+                }
                 copied(ending);
                 removed.push_str(ending);
                 removed_breaks.push(removed.len());
@@ -1864,9 +1892,16 @@ where
         }
         let inserted_breaks = cosmic_text::LineIter::new(replacement)
             .filter(|(_, ending)| !ending.as_str().is_empty())
-            .map(|(range, ending)| range.end + ending.as_str().len()).collect();
+            .map(|(range, ending)| range.end + ending.as_str().len())
+            .collect();
         copied(replacement);
-        Some(TextChange { start, removed, inserted: replacement.to_owned(), removed_breaks, inserted_breaks })
+        Some(TextChange {
+            start,
+            removed,
+            inserted: replacement.to_owned(),
+            removed_breaks,
+            inserted_breaks,
+        })
     }
 
     pub fn replace_range_recorded(
@@ -3641,19 +3676,46 @@ mod tests {
         let content: Content = Content::with_text(&"a".repeat(8 * 1024 * 1024));
         let mut copied = 0;
         for column in (0..8 * 1024 * 1024).step_by(4096) {
-            let change = content.range_change_with_copy(Position { line: 0, column }, Position { line: 0, column: column + 1 }, "b", |part| copied += part.len()).unwrap();
+            let change = content
+                .range_change_with_copy(
+                    Position { line: 0, column },
+                    Position {
+                        line: 0,
+                        column: column + 1,
+                    },
+                    "b",
+                    |part| copied += part.len(),
+                )
+                .unwrap();
             assert_eq!(change.removed, "a");
             assert_eq!(change.inserted, "b");
             assert!(change.removed_breaks.is_empty() && change.inserted_breaks.is_empty());
         }
-        assert_eq!(copied, 4096, "staging must not copy the unchanged eight-MiB line per edit");
+        assert_eq!(
+            copied, 4096,
+            "staging must not copy the unchanged eight-MiB line per edit"
+        );
     }
 
     #[test]
     fn workspace_offsets_preserve_order_and_refuse_unicode_or_native_ending_splits() {
         let content: Content = Content::with_text("é\r\n😀\n");
-        assert_eq!(content.positions_for_offsets(&[9, 0, 8, 4, 2]), Some(vec![Position { line: 2, column: 0 }, Position { line: 0, column: 0 }, Position { line: 1, column: 4 }, Position { line: 1, column: 0 }, Position { line: 0, column: 2 }]));
-        for offset in [1, 3, 5, 6, 7, 10] { assert!(content.positions_for_offsets(&[offset]).is_none(), "split or missing byte {offset}"); }
+        assert_eq!(
+            content.positions_for_offsets(&[9, 0, 8, 4, 2]),
+            Some(vec![
+                Position { line: 2, column: 0 },
+                Position { line: 0, column: 0 },
+                Position { line: 1, column: 4 },
+                Position { line: 1, column: 0 },
+                Position { line: 0, column: 2 }
+            ])
+        );
+        for offset in [1, 3, 5, 6, 7, 10] {
+            assert!(
+                content.positions_for_offsets(&[offset]).is_none(),
+                "split or missing byte {offset}"
+            );
+        }
         assert_eq!(content.positions_for_offsets(&[]), Some(Vec::new()));
     }
 

@@ -45,9 +45,9 @@ const QUICK_OPEN_ROW_HEIGHT: f32 = 40.0;
 const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 
 mod checkout;
+mod editor_feature_ui;
 mod notification_ui;
 mod operation_recovery_ui;
-mod editor_feature_ui;
 
 #[derive(Clone)]
 pub struct Flags {
@@ -2087,7 +2087,13 @@ impl Editor {
     }
 
     fn continue_exit(&mut self) -> Task<Message> {
-        if self.operation_recovery_pending() { self.exiting = false; self.notice = Some("Finish or resolve retained file operations before closing this window.".into()); return Task::none(); }
+        if self.operation_recovery_pending() {
+            self.exiting = false;
+            self.notice = Some(
+                "Finish or resolve retained file operations before closing this window.".into(),
+            );
+            return Task::none();
+        }
 
         if let Some(tab) = self.tabs.first() {
             return self.request_close(tab.id);
@@ -2132,7 +2138,7 @@ impl Editor {
             // Re-enabling assistance waits for these outgoing processes before
             // launching replacements under a new admission cap.
             self.editor_features.cancel_all(&mut self.lsp);
-        let predecessor = self.lsp.begin_shutdown();
+            let predecessor = self.lsp.begin_shutdown();
             self.lsp = LspManager::new(self.settings.language_servers.clone())
                 .with_lifecycle(
                     self.settings.lsp_idle_timeout_seconds,
@@ -3150,7 +3156,13 @@ impl Application for Editor {
                 if self.quick_open {
                     return self.update(Message::CloseQuickOpen);
                 }
-                if let Some(action) = self.editor_features.escape().filter(|_| !self.external_feature_modal()) { return self.update_editor_features(action); }
+                if let Some(action) = self
+                    .editor_features
+                    .escape()
+                    .filter(|_| !self.external_feature_modal())
+                {
+                    return self.update_editor_features(action);
+                }
                 if self.find_open {
                     return self.update(Message::CloseFind);
                 }
@@ -3359,7 +3371,10 @@ impl Application for Editor {
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
                     self.editor_features.cancel_all(&mut self.lsp);
-                    if self.operation_recovery_pending() { self.notice = Some("Finish or resolve retained file operations before closing this window.".into()); return Task::none(); }
+                    if self.operation_recovery_pending() {
+                        self.notice = Some("Finish or resolve retained file operations before closing this window.".into());
+                        return Task::none();
+                    }
 
                     if self
                         .checkout_dialog
@@ -3452,19 +3467,41 @@ impl Application for Editor {
                     self.handle_review(card, action)
                 }
                 Message::OperationRecovery(action) => {
-                    let task = self.operation_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner).update(action);
+                    let task = self
+                        .operation_recovery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .update(action);
 
-                    let mut tasks = vec![task.map(Message::OperationRecovery).map(cosmic::Action::App)];
-                    for tab in &mut self.tabs { tasks.push(repository_task(tab.runtime.reconcile_operation_recovery(tab.id))); }
+                    let mut tasks = vec![
+                        task.map(Message::OperationRecovery)
+                            .map(cosmic::Action::App),
+                    ];
+                    for tab in &mut self.tabs {
+                        tasks.push(repository_task(
+                            tab.runtime.reconcile_operation_recovery(tab.id),
+                        ));
+                    }
                     Task::batch(tasks)
                 }
                 Message::Repository(action) => {
                     self.retain_repository_operation(&action);
                     if let RepositoryAction::Language { card, action } = &action
-                        && let Some(action) = cagents::editor_features::language_action(*card, action) { return self.update_editor_features(action); }
-                    if let Some(format) = self.editor_format_before_save(&action) { return self.update_editor_features(format); }
-                    if matches!(&action, RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. })
-                        && !self.prepare_editor_save(action.card()) { return Task::none(); }
+                        && let Some(action) =
+                            cagents::editor_features::language_action(*card, action)
+                    {
+                        return self.update_editor_features(action);
+                    }
+                    if let Some(format) = self.editor_format_before_save(&action) {
+                        return self.update_editor_features(format);
+                    }
+                    if matches!(
+                        &action,
+                        RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. }
+                    ) && !self.prepare_editor_save(action.card())
+                    {
+                        return Task::none();
+                    }
 
                     if let RepositoryAction::DiffAnnotations {
                         identity,
@@ -3572,7 +3609,11 @@ impl Application for Editor {
                         return Self::open_external_link(uri);
                     }
                     let signature_character = match &action {
-                        RepositoryAction::EditorAction { action: EditorAction::Edit(EditorEdit::Insert(character)), .. } => Some(*character), _ => None,
+                        RepositoryAction::EditorAction {
+                            action: EditorAction::Edit(EditorEdit::Insert(character)),
+                            ..
+                        } => Some(*character),
+                        _ => None,
                     };
                     let find_preferences_changed = matches!(
                         &action,
@@ -3582,10 +3623,16 @@ impl Application for Editor {
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
-                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. } | RepositoryAction::FileLoadedAt { .. })
-                        && self.active == Some(id)
+                    let focus_loaded = matches!(
+                        action,
+                        RepositoryAction::FileLoaded { .. } | RepositoryAction::FileLoadedAt { .. }
+                    ) && self.active == Some(id)
                         && !self.modal_open();
-                    let saved = matches!(action, RepositoryAction::SaveFinished { .. } | RepositoryAction::RetainedSaveFinished { .. });
+                    let saved = matches!(
+                        action,
+                        RepositoryAction::SaveFinished { .. }
+                            | RepositoryAction::RetainedSaveFinished { .. }
+                    );
                     let back_to_files = matches!(action, RepositoryAction::BackToFiles { .. });
                     let Some(tab) = self.tab_mut(id) else {
                         return Task::none();
@@ -3682,8 +3729,16 @@ impl Application for Editor {
                     if let Some(character) = signature_character
                         && let Some(tab) = self.tab(id)
                         && let Some(doc) = tab.runtime.lsp_document()
-                        && character != ')' && (tab.runtime.signature_visible() || self.lsp.signature_trigger(doc, character)) {
-                        tasks.push(self.update_editor_features(cagents::editor_features::Action::Signature { card: id, trigger: Some(character.to_string()) }));
+                        && character != ')'
+                        && (tab.runtime.signature_visible()
+                            || self.lsp.signature_trigger(doc, character))
+                    {
+                        tasks.push(self.update_editor_features(
+                            cagents::editor_features::Action::Signature {
+                                card: id,
+                                trigger: Some(character.to_string()),
+                            },
+                        ));
                     }
                     Task::batch(tasks)
                 }
@@ -4427,7 +4482,14 @@ impl Application for Editor {
                         return Task::none();
                     }
                     if let Some(event) = event {
-                        if self.editor_features.consumes(&event) { return Task::batch([self.update_editor_features(cagents::editor_features::Action::Event(event)), self.lsp_next()]); }
+                        if self.editor_features.consumes(&event) {
+                            return Task::batch([
+                                self.update_editor_features(
+                                    cagents::editor_features::Action::Event(event),
+                                ),
+                                self.lsp_next(),
+                            ]);
+                        }
                         if let LspEvent::RootDiscovered { doc, ticket, root } = event {
                             if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
                                 && let Some(error) = language_server_failure(status)
@@ -4451,9 +4513,16 @@ impl Application for Editor {
                             | LspEvent::Progress { doc, .. }
                             | LspEvent::RequestFailed { doc, .. }
                             | LspEvent::DocumentDesynced { doc, .. } => *doc,
-                            LspEvent::PrepareRename { .. } | LspEvent::WorkspaceEdit { .. } | LspEvent::CodeActions { .. }
-                            | LspEvent::CodeActionResolved { .. } | LspEvent::SignatureHelp { .. } | LspEvent::ServerMessage { .. }
-                            | LspEvent::ApplyWorkspaceEdit { .. } | LspEvent::CommandExecuted { .. } => unreachable!("feature events route through their controller"),
+                            LspEvent::PrepareRename { .. }
+                            | LspEvent::WorkspaceEdit { .. }
+                            | LspEvent::CodeActions { .. }
+                            | LspEvent::CodeActionResolved { .. }
+                            | LspEvent::SignatureHelp { .. }
+                            | LspEvent::ServerMessage { .. }
+                            | LspEvent::ApplyWorkspaceEdit { .. }
+                            | LspEvent::CommandExecuted { .. } => {
+                                unreachable!("feature events route through their controller")
+                            }
                         };
                         let current_version = self.lsp.document_version(doc);
                         if let Some(tab) = self
@@ -4696,7 +4765,13 @@ impl Application for Editor {
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
         body.push(design::horizontal_rule().into());
-        body.push(self.operation_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner).view().map(Message::OperationRecovery));
+        body.push(
+            self.operation_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .view()
+                .map(Message::OperationRecovery),
+        );
 
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
@@ -4999,7 +5074,10 @@ impl Application for Editor {
             ));
         }
         if let Some(content) = self.editor_features.view() {
-            return Some(dialog_overlay(dialog_surface(content.map(Message::EditorFeatures), 1000.0), Message::EditorFeatures(self.editor_features.escape()?)));
+            return Some(dialog_overlay(
+                dialog_surface(content.map(Message::EditorFeatures), 1000.0),
+                Message::EditorFeatures(self.editor_features.escape()?),
+            ));
         }
         if let Some(id) = self.closing {
             let tab = self.tab(id)?;

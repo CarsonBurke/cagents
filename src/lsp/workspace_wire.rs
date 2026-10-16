@@ -32,9 +32,15 @@ struct TextEdit {
 
 impl TextEdit {
     fn into_lsp(self) -> lsp::OneOf<lsp::TextEdit, lsp::AnnotatedTextEdit> {
-        let text_edit = lsp::TextEdit { range: self.range, new_text: self.new_text };
+        let text_edit = lsp::TextEdit {
+            range: self.range,
+            new_text: self.new_text,
+        };
         match self.annotation_id.0 {
-            Some(annotation_id) => lsp::OneOf::Right(lsp::AnnotatedTextEdit { text_edit, annotation_id }),
+            Some(annotation_id) => lsp::OneOf::Right(lsp::AnnotatedTextEdit {
+                text_edit,
+                annotation_id,
+            }),
             None => lsp::OneOf::Left(text_edit),
         }
     }
@@ -65,27 +71,54 @@ struct WorkspaceFields {
 impl<'de> Deserialize<'de> for WorkspaceEdit {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let fields = WorkspaceFields::deserialize(deserializer)?;
-        let changes = fields.changes.map(|changes| {
-            changes.into_iter().map(|(uri, edits)| {
-                let edits = edits.into_iter().map(|edit| {
-                    if edit.annotation_id.0.is_some() {
-                        return Err(de::Error::custom("annotated edits require documentChanges"));
-                    }
-                    Ok(lsp::TextEdit { range: edit.range, new_text: edit.new_text })
-                }).collect::<Result<Vec<_>, D::Error>>()?;
-                Ok((uri, edits))
-            }).collect::<Result<HashMap<_, _>, D::Error>>()
-        }).transpose()?;
+        let changes = fields
+            .changes
+            .map(|changes| {
+                changes
+                    .into_iter()
+                    .map(|(uri, edits)| {
+                        let edits = edits
+                            .into_iter()
+                            .map(|edit| {
+                                if edit.annotation_id.0.is_some() {
+                                    return Err(de::Error::custom(
+                                        "annotated edits require documentChanges",
+                                    ));
+                                }
+                                Ok(lsp::TextEdit {
+                                    range: edit.range,
+                                    new_text: edit.new_text,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, D::Error>>()?;
+                        Ok((uri, edits))
+                    })
+                    .collect::<Result<HashMap<_, _>, D::Error>>()
+            })
+            .transpose()?;
         let document_changes = fields.document_changes.map(|changes| {
-            lsp::DocumentChanges::Operations(changes.into_iter().map(|change| match change {
-                DocumentChange::Resource(operation) => lsp::DocumentChangeOperation::Op(operation),
-                DocumentChange::Text(edit) => lsp::DocumentChangeOperation::Edit(lsp::TextDocumentEdit {
-                    text_document: edit.text_document,
-                    edits: edit.edits.into_iter().map(TextEdit::into_lsp).collect(),
-                }),
-            }).collect())
+            lsp::DocumentChanges::Operations(
+                changes
+                    .into_iter()
+                    .map(|change| match change {
+                        DocumentChange::Resource(operation) => {
+                            lsp::DocumentChangeOperation::Op(operation)
+                        }
+                        DocumentChange::Text(edit) => {
+                            lsp::DocumentChangeOperation::Edit(lsp::TextDocumentEdit {
+                                text_document: edit.text_document,
+                                edits: edit.edits.into_iter().map(TextEdit::into_lsp).collect(),
+                            })
+                        }
+                    })
+                    .collect(),
+            )
         });
-        Ok(Self(lsp::WorkspaceEdit { changes, document_changes, change_annotations: fields.change_annotations }))
+        Ok(Self(lsp::WorkspaceEdit {
+            changes,
+            document_changes,
+            change_annotations: fields.change_annotations,
+        }))
     }
 }
 
@@ -104,9 +137,16 @@ struct ActionFields {
 
 impl From<ActionFields> for lsp::CodeAction {
     fn from(fields: ActionFields) -> Self {
-        Self { title: fields.title, kind: fields.kind, diagnostics: fields.diagnostics,
-            edit: fields.edit.map(|edit| edit.0), command: fields.command,
-            is_preferred: fields.is_preferred, disabled: fields.disabled, data: fields.data }
+        Self {
+            title: fields.title,
+            kind: fields.kind,
+            diagnostics: fields.diagnostics,
+            edit: fields.edit.map(|edit| edit.0),
+            command: fields.command,
+            is_preferred: fields.is_preferred,
+            disabled: fields.disabled,
+            data: fields.data,
+        }
     }
 }
 
@@ -125,7 +165,9 @@ struct NoWorkspaceEdit;
 
 impl<'de> Deserialize<'de> for NoWorkspaceEdit {
     fn deserialize<D: Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
-        Err(de::Error::custom("a command cannot discard a workspace edit"))
+        Err(de::Error::custom(
+            "a command cannot discard a workspace edit",
+        ))
     }
 }
 
@@ -148,11 +190,16 @@ impl<'de> Deserialize<'de> for CodeActionOrCommand {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
-        enum Choice { Action(ActionFields), Command(CommandFields) }
+        enum Choice {
+            Action(ActionFields),
+            Command(CommandFields),
+        }
         Ok(Self(match Choice::deserialize(deserializer)? {
             Choice::Action(fields) => lsp::CodeActionOrCommand::CodeAction(fields.into()),
             Choice::Command(fields) => lsp::CodeActionOrCommand::Command(lsp::Command {
-                title: fields.title, command: fields.command, arguments: fields.arguments,
+                title: fields.title,
+                command: fields.command,
+                arguments: fields.arguments,
             }),
         }))
     }
@@ -167,7 +214,10 @@ pub(super) struct ApplyWorkspaceEditParams {
 
 impl From<ApplyWorkspaceEditParams> for lsp::ApplyWorkspaceEditParams {
     fn from(params: ApplyWorkspaceEditParams) -> Self {
-        Self { label: params.label, edit: params.edit.0 }
+        Self {
+            label: params.label,
+            edit: params.edit.0,
+        }
     }
 }
 
@@ -182,8 +232,16 @@ macro_rules! response_request {
     };
 }
 response_request!(Rename, lsp::request::Rename, Option<WorkspaceEdit>);
-response_request!(CodeActions, lsp::request::CodeActionRequest, Option<Vec<CodeActionOrCommand>>);
-response_request!(ResolveCodeAction, lsp::request::CodeActionResolveRequest, CodeAction);
+response_request!(
+    CodeActions,
+    lsp::request::CodeActionRequest,
+    Option<Vec<CodeActionOrCommand>>
+);
+response_request!(
+    ResolveCodeAction,
+    lsp::request::CodeActionResolveRequest,
+    CodeAction
+);
 
 pub(super) enum ApplyWorkspaceEdit {}
 impl Request for ApplyWorkspaceEdit {
@@ -204,9 +262,15 @@ mod tests {
     }
 
     fn annotation(edit: &lsp::WorkspaceEdit) -> &lsp::AnnotatedTextEdit {
-        let Some(lsp::DocumentChanges::Operations(items)) = &edit.document_changes else { panic!("missing document changes"); };
-        let lsp::DocumentChangeOperation::Edit(document) = &items[0] else { panic!("expected text edit"); };
-        let lsp::OneOf::Right(edit) = &document.edits[0] else { panic!("annotation was discarded"); };
+        let Some(lsp::DocumentChanges::Operations(items)) = &edit.document_changes else {
+            panic!("missing document changes");
+        };
+        let lsp::DocumentChangeOperation::Edit(document) = &items[0] else {
+            panic!("expected text edit");
+        };
+        let lsp::OneOf::Right(edit) = &document.edits[0] else {
+            panic!("annotation was discarded");
+        };
         edit
     }
 
@@ -214,14 +278,23 @@ mod tests {
     fn annotated_text_edits_survive_wire_decoding_and_serialized_round_trip() {
         let edit: WorkspaceEdit = serde_json::from_value(annotated()).unwrap();
         assert_eq!(annotation(&edit.0).annotation_id, "confirm");
-        assert_eq!(edit.0.change_annotations.as_ref().unwrap()["confirm"].needs_confirmation, Some(true));
-        let again: WorkspaceEdit = serde_json::from_value(serde_json::to_value(&edit).unwrap()).unwrap();
+        assert_eq!(
+            edit.0.change_annotations.as_ref().unwrap()["confirm"].needs_confirmation,
+            Some(true)
+        );
+        let again: WorkspaceEdit =
+            serde_json::from_value(serde_json::to_value(&edit).unwrap()).unwrap();
         assert_eq!(edit.0, again.0);
         let plain: WorkspaceEdit = serde_json::from_value(json!({"changes":{"file:///repo/a.rs":[
             {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"bar"}]}})).unwrap();
         assert_eq!(plain.0.changes.unwrap().len(), 1);
-        let resource: WorkspaceEdit = serde_json::from_value(json!({"documentChanges":[{"kind":"create","uri":"file:///repo/new.rs"}]})).unwrap();
-        assert!(matches!(&resource.0.document_changes.unwrap(), lsp::DocumentChanges::Operations(items) if matches!(items[0],lsp::DocumentChangeOperation::Op(_))));
+        let resource: WorkspaceEdit = serde_json::from_value(
+            json!({"documentChanges":[{"kind":"create","uri":"file:///repo/new.rs"}]}),
+        )
+        .unwrap();
+        assert!(
+            matches!(&resource.0.document_changes.unwrap(), lsp::DocumentChanges::Operations(items) if matches!(items[0],lsp::DocumentChangeOperation::Op(_)))
+        );
     }
 
     #[test]
@@ -232,31 +305,50 @@ mod tests {
             assert!(serde_json::from_value::<WorkspaceEdit>(value).is_err());
         }
         let mut invalid = annotated();
-        invalid["changes"] = json!({"file:///repo/a.rs":[invalid["documentChanges"][0]["edits"][0].clone()]});
-        assert!(serde_json::from_value::<WorkspaceEdit>(invalid).is_err(), "changes cannot encode annotated edits");
+        invalid["changes"] =
+            json!({"file:///repo/a.rs":[invalid["documentChanges"][0]["edits"][0].clone()]});
+        assert!(
+            serde_json::from_value::<WorkspaceEdit>(invalid).is_err(),
+            "changes cannot encode annotated edits"
+        );
     }
 
     #[test]
     fn action_and_resolve_decoders_preserve_annotated_edits_and_opaque_data() {
         let value = json!({"title":"Fix","edit":annotated(),"data":{"opaque":[7,"kept"]}});
         let choice: CodeActionOrCommand = serde_json::from_value(value.clone()).unwrap();
-        let lsp::CodeActionOrCommand::CodeAction(action) = choice.0 else { panic!("expected action"); };
-        assert_eq!(annotation(action.edit.as_ref().unwrap()).annotation_id, "confirm");
+        let lsp::CodeActionOrCommand::CodeAction(action) = choice.0 else {
+            panic!("expected action");
+        };
+        assert_eq!(
+            annotation(action.edit.as_ref().unwrap()).annotation_id,
+            "confirm"
+        );
         assert_eq!(action.data, Some(json!({"opaque":[7,"kept"]})));
         let resolved: CodeAction = serde_json::from_value(value).unwrap();
-        assert_eq!(annotation(resolved.0.edit.as_ref().unwrap()).annotation_id, "confirm");
-        let command: CodeActionOrCommand = serde_json::from_value(json!({"title":"Run","command":"fixture.run","arguments":[7],"extension":"allowed"})).unwrap();
-        assert!(matches!(command.0,lsp::CodeActionOrCommand::Command(command) if command.arguments==Some(vec![json!(7)])));
-        let mut invalid = json!({"title":"Do not discard","command":"fixture.run","edit":annotated()});
+        assert_eq!(
+            annotation(resolved.0.edit.as_ref().unwrap()).annotation_id,
+            "confirm"
+        );
+        let command: CodeActionOrCommand = serde_json::from_value(
+            json!({"title":"Run","command":"fixture.run","arguments":[7],"extension":"allowed"}),
+        )
+        .unwrap();
+        assert!(
+            matches!(command.0,lsp::CodeActionOrCommand::Command(command) if command.arguments==Some(vec![json!(7)]))
+        );
+        let mut invalid =
+            json!({"title":"Do not discard","command":"fixture.run","edit":annotated()});
         invalid["edit"]["documentChanges"][0]["edits"][0]["annotationId"] = Value::Null;
         assert!(serde_json::from_value::<CodeActionOrCommand>(invalid).is_err());
     }
 
     #[test]
     fn apply_edit_request_decodes_the_same_annotation_preserving_workspace_type() {
-        let params: ApplyWorkspaceEditParams = serde_json::from_value(json!({"label":"Server fix","edit":annotated()})).unwrap();
+        let params: ApplyWorkspaceEditParams =
+            serde_json::from_value(json!({"label":"Server fix","edit":annotated()})).unwrap();
         let params: lsp::ApplyWorkspaceEditParams = params.into();
-        assert_eq!(params.label.as_deref(),Some("Server fix"));
-        assert_eq!(annotation(&params.edit).annotation_id,"confirm");
+        assert_eq!(params.label.as_deref(), Some("Server fix"));
+        assert_eq!(annotation(&params.edit).annotation_id, "confirm");
     }
 }

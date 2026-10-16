@@ -343,14 +343,42 @@ pub enum LspIntent {
 impl PartialEq for LspIntent {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Open { absolute_path: a, worktree: w, version: v, text: t, root: r }, Self::Open { absolute_path: b, worktree: x, version: z, text: u, root: s }) => {
-                a == b && w == x && v == z && t == u && match (r, s) {
-                    (None, None) => true,
-                    (Some(r), Some(s)) => Arc::ptr_eq(r, s),
-                    _ => false,
-                }
+            (
+                Self::Open {
+                    absolute_path: a,
+                    worktree: w,
+                    version: v,
+                    text: t,
+                    root: r,
+                },
+                Self::Open {
+                    absolute_path: b,
+                    worktree: x,
+                    version: z,
+                    text: u,
+                    root: s,
+                },
+            ) => {
+                a == b
+                    && w == x
+                    && v == z
+                    && t == u
+                    && match (r, s) {
+                        (None, None) => true,
+                        (Some(r), Some(s)) => Arc::ptr_eq(r, s),
+                        _ => false,
+                    }
             }
-            (Self::Change { version: v, text: t }, Self::Change { version: w, text: u }) => v == w && t == u,
+            (
+                Self::Change {
+                    version: v,
+                    text: t,
+                },
+                Self::Change {
+                    version: w,
+                    text: u,
+                },
+            ) => v == w && t == u,
             (Self::Save { text: t }, Self::Save { text: u }) => t == u,
             (Self::Close, Self::Close) => true,
             _ => false,
@@ -361,7 +389,9 @@ impl PartialEq for LspIntent {
 #[derive(Debug, Clone)]
 pub enum EditorLspAction {
     Rename,
-    Format { selection: bool },
+    Format {
+        selection: bool,
+    },
     CodeActions,
     Signature,
     Complete,
@@ -577,7 +607,10 @@ pub enum RepositoryAction {
         ticket: u64,
         revision: u64,
         saved_text: String,
-        result: Result<crate::editor::retained_save::RetainedSaveOutcome, crate::editor::retained_save::RetainedSaveError>,
+        result: Result<
+            crate::editor::retained_save::RetainedSaveOutcome,
+            crate::editor::retained_save::RetainedSaveError,
+        >,
     },
     Reload {
         card: CardId,
@@ -764,7 +797,10 @@ impl RepositoryAction {
         }
     }
     pub fn recovery_scope(&self) -> Option<&Path> {
-        match self { Self::RetainedSaveFinished { identity, .. } => Some(&identity.worktree), _ => None }
+        match self {
+            Self::RetainedSaveFinished { identity, .. } => Some(&identity.worktree),
+            _ => None,
+        }
     }
     pub fn card(&self) -> CardId {
         match self {
@@ -952,8 +988,15 @@ struct SaveTicket {
 
 impl EditorDocument {
     fn durability_warning(&self) -> Option<&str> {
-        if self.cleanup_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) { None }
-        else { self.durability_warning.as_deref() }
+        if self
+            .cleanup_recovery
+            .as_ref()
+            .is_some_and(|authority| authority.is_resolved())
+        {
+            None
+        } else {
+            self.durability_warning.as_deref()
+        }
     }
     fn new(
         path: PathBuf,
@@ -2414,30 +2457,64 @@ impl RepositoryRuntime {
 
     /// Pure window-owned custody and negative checkout census. The worker
     /// acquires the real original-root cleanup protection before any effect.
-    pub fn configure_save_recovery(&mut self, window: crate::operation_recovery::Shared, known: Vec<PathBuf>) -> bool {
-        if known.len() > 256 || self.save_recovery_window.as_ref().is_some_and(|original| !Arc::ptr_eq(original, &window)) { return false; }
+    pub fn configure_save_recovery(
+        &mut self,
+        window: crate::operation_recovery::Shared,
+        known: Vec<PathBuf>,
+    ) -> bool {
+        if known.len() > 256
+            || self
+                .save_recovery_window
+                .as_ref()
+                .is_some_and(|original| !Arc::ptr_eq(original, &window))
+        {
+            return false;
+        }
         self.save_recovery_window = Some(window);
         self.known_checkout_paths = Some(known);
         true
     }
     pub fn has_editor_recovery(&self) -> bool {
-        self.editor_recovery.as_ref().is_some_and(|authority| !authority.is_resolved())
+        self.editor_recovery
+            .as_ref()
+            .is_some_and(|authority| !authority.is_resolved())
     }
     fn clear_resolved_operation_recovery(&mut self) {
         if let DocumentState::Editable(document) = &mut self.document
-            && document.cleanup_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) {
+            && document
+                .cleanup_recovery
+                .as_ref()
+                .is_some_and(|authority| authority.is_resolved())
+        {
             document.cleanup_recovery = None;
             document.durability_warning = None;
         }
-        if self.editor_recovery.as_ref().is_some_and(|authority| authority.is_resolved()) { self.editor_recovery = None; }
+        if self
+            .editor_recovery
+            .as_ref()
+            .is_some_and(|authority| authority.is_resolved())
+        {
+            self.editor_recovery = None;
+        }
     }
     pub fn reconcile_operation_recovery(&mut self, card: CardId) -> Task<RepositoryAction> {
         self.clear_resolved_operation_recovery();
         self.auto_save_task(card)
     }
-    pub fn retire_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) -> bool {
-        if ticket == self.next_auto_save_ticket && self.accepts_selected(identity)
-            && self.auto_save_pending == Some((identity.generation, revision)) && self.auto_save_revision() == Some(revision) { self.auto_save_pending = None; return true; }
+    pub fn retire_auto_save_due(
+        &mut self,
+        identity: &AsyncIdentity,
+        revision: u64,
+        ticket: u64,
+    ) -> bool {
+        if ticket == self.next_auto_save_ticket
+            && self.accepts_selected(identity)
+            && self.auto_save_pending == Some((identity.generation, revision))
+            && self.auto_save_revision() == Some(revision)
+        {
+            self.auto_save_pending = None;
+            return true;
+        }
         false
     }
 
@@ -3286,39 +3363,79 @@ impl RepositoryRuntime {
     }
 
     pub(crate) fn editor_selection_range(&self) -> Option<LspRange> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
         let cursor = document.content.cursor();
         let anchor = cursor.selection?;
-        let (start, end) = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) { (anchor, cursor.position) } else { (cursor.position, anchor) };
-        Some(LspRange::new(caret_position(&document.content, start)?, caret_position(&document.content, end)?))
+        let (start, end) =
+            if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) {
+                (anchor, cursor.position)
+            } else {
+                (cursor.position, anchor)
+            };
+        Some(LspRange::new(
+            caret_position(&document.content, start)?,
+            caret_position(&document.content, end)?,
+        ))
     }
     pub(crate) fn editor_text_in_range(&self, range: LspRange) -> Option<String> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
         let start = caret_for_position(&document.content, range.start)?;
         let end = caret_for_position(&document.content, range.end)?;
         Some(document.content.range_change(start, end, "")?.removed)
     }
-    pub(crate) fn editor_diagnostics(&self) -> &[crate::lsp::LspDiagnostic] { &self.language.diagnostics }
+    pub(crate) fn editor_diagnostics(&self) -> &[crate::lsp::LspDiagnostic] {
+        &self.language.diagnostics
+    }
     pub(crate) fn editor_feature_writable(&self) -> bool {
-        self.original_read_attested && !self.has_editor_recovery()
+        self.original_read_attested
+            && !self.has_editor_recovery()
             && matches!(&self.document, DocumentState::Editable(document) if document.active_save.is_none() && document.lsp_version < i32::MAX)
     }
     pub fn set_editor_feature_support(&mut self, capabilities: &crate::lsp::LspCapabilities) {
-        if !self.editor_feature_writable() { self.language.feature_support = [false; 5]; return; }
-        self.language.feature_support = [capabilities.ready && capabilities.rename, capabilities.ready && capabilities.format_document, capabilities.ready && capabilities.format_selection, capabilities.ready && capabilities.code_actions, capabilities.ready && capabilities.signature_help];
+        if !self.editor_feature_writable() {
+            self.language.feature_support = [false; 5];
+            return;
+        }
+        self.language.feature_support = [
+            capabilities.ready && capabilities.rename,
+            capabilities.ready && capabilities.format_document,
+            capabilities.ready && capabilities.format_selection,
+            capabilities.ready && capabilities.code_actions,
+            capabilities.ready && capabilities.signature_help,
+        ];
     }
     pub(crate) fn set_editor_signature(&mut self, help: Option<crate::lsp::LspSignatureHelp>) {
-        self.language.signature = help.filter(|help| help.signatures.get(help.active_signature).is_some());
+        self.language.signature =
+            help.filter(|help| help.signatures.get(help.active_signature).is_some());
     }
-    pub fn signature_visible(&self) -> bool { self.language.signature.is_some() }
-    pub(crate) fn editor_signature(&self) -> Option<&crate::lsp::LspSignatureHelp> { self.language.signature.as_ref() }
+    pub fn signature_visible(&self) -> bool {
+        self.language.signature.is_some()
+    }
+    pub(crate) fn editor_signature(&self) -> Option<&crate::lsp::LspSignatureHelp> {
+        self.language.signature.as_ref()
+    }
     pub(crate) fn set_workspace_preview(&mut self, path: PathBuf, model: DiffModel) {
         self.files = FileListState::Ready(Vec::new());
-        self.selected = Some(RepositoryFile { path, unstaged: true, ..RepositoryFile::default() });
+        self.selected = Some(RepositoryFile {
+            path,
+            unstaged: true,
+            ..RepositoryFile::default()
+        });
         self.document = DocumentState::None;
         self.source_surface = SourceSurface::Diff;
         self.diff_basis = DiffBasis::IndexToWorktree;
-        self.set_diff_state(self.diff_basis.clone(), DiffState::ready(RenderedDiff::Text { model, old_label: "Before".into(), new_label: "After applying".into() }));
+        self.set_diff_state(
+            self.diff_basis.clone(),
+            DiffState::ready(RenderedDiff::Text {
+                model,
+                old_label: "Before".into(),
+                new_label: "After applying".into(),
+            }),
+        );
     }
     pub(crate) fn workspace_commit_current(&self, applied: &AppliedWorkspaceEdit) -> bool {
         matches!(&self.document, DocumentState::Editable(document) if self.generation == applied.prepared.generation
@@ -4515,8 +4632,13 @@ impl RepositoryRuntime {
 
     pub(crate) fn workspace_edit_candidate_source(&self) -> Option<PathBuf> {
         match &self.document {
-            DocumentState::Editable(document) => Some(self.descriptor.worktree.join(&document.source)),
-            _ => self.selected.as_ref().map(|file| self.descriptor.worktree.join(&file.path)),
+            DocumentState::Editable(document) => {
+                Some(self.descriptor.worktree.join(&document.source))
+            }
+            _ => self
+                .selected
+                .as_ref()
+                .map(|file| self.descriptor.worktree.join(&file.path)),
         }
     }
 
@@ -4527,39 +4649,75 @@ impl RepositoryRuntime {
         }
     }
 
-    pub(crate) fn workspace_edit_snapshot(&self) -> Option<(PathBuf, crate::editor_workspace_edit::OpenSnapshot)> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
-        Some((self.descriptor.worktree.join(&document.source), crate::editor_workspace_edit::OpenSnapshot {
-            text: document.content.text().into(),
-            version: document.lsp_version,
-            protocol_version: None,
-            protocol_incarnation: None,
-            writable: document.active_save.is_none() && document.lsp_version < i32::MAX,
-        }))
+    pub(crate) fn workspace_edit_snapshot(
+        &self,
+    ) -> Option<(PathBuf, crate::editor_workspace_edit::OpenSnapshot)> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        Some((
+            self.descriptor.worktree.join(&document.source),
+            crate::editor_workspace_edit::OpenSnapshot {
+                text: document.content.text().into(),
+                version: document.lsp_version,
+                protocol_version: None,
+                protocol_incarnation: None,
+                writable: document.active_save.is_none() && document.lsp_version < i32::MAX,
+            },
+        ))
     }
 
     /// Stage every target before applying any of them. The controller consumes
     /// all staged transitions in the same update turn, without an await.
-    pub(crate) fn prepare_workspace_edit(&mut self, plan: &crate::editor_workspace_edit::DocumentPlan) -> Result<PreparedWorkspaceEdit, String> {
+    pub(crate) fn prepare_workspace_edit(
+        &mut self,
+        plan: &crate::editor_workspace_edit::DocumentPlan,
+    ) -> Result<PreparedWorkspaceEdit, String> {
         self.flush_lsp_change();
-        let DocumentState::Editable(document) = &self.document else { return Err("An edited buffer was closed".into()); };
+        let DocumentState::Editable(document) = &self.document else {
+            return Err("An edited buffer was closed".into());
+        };
         let source = self.descriptor.worktree.join(&document.source);
-        if !plan.open || !plan.open_paths.contains(&source) || document.active_save.is_some() || document.lsp_version == i32::MAX
-            || Some(document.lsp_version) != plan.version || !content_matches(&document.content, &plan.before) {
+        if !plan.open
+            || !plan.open_paths.contains(&source)
+            || document.active_save.is_some()
+            || document.lsp_version == i32::MAX
+            || Some(document.lsp_version) != plan.version
+            || !content_matches(&document.content, &plan.before)
+        {
             return Err("An edited buffer changed after the preview was prepared".into());
         }
         if plan.edits.is_empty() && plan.before != plan.after {
             return Err("The preview does not contain the native edits it claims".into());
         }
-        let offsets = plan.edits.iter().flat_map(|edit| [edit.range.start, edit.range.end]).collect::<Vec<_>>();
-        let positions = document.content.positions_for_offsets(&offsets).ok_or("The server edit names an invalid native boundary")?;
+        let offsets = plan
+            .edits
+            .iter()
+            .flat_map(|edit| [edit.range.start, edit.range.end])
+            .collect::<Vec<_>>();
+        let positions = document
+            .content
+            .positions_for_offsets(&offsets)
+            .ok_or("The server edit names an invalid native boundary")?;
         let mut changes = Vec::new();
         for (index, edit) in plan.edits.iter().enumerate().rev() {
-            if plan.before.get(edit.range.clone()) == Some(edit.new_text.as_str()) { continue; }
+            if plan.before.get(edit.range.clone()) == Some(edit.new_text.as_str()) {
+                continue;
+            }
             let (start, end) = (positions[index * 2], positions[index * 2 + 1]);
-            let expected = plan.before.get(edit.range.clone()).ok_or("The server edit has an invalid range")?;
-            if document.content.range_end(start, expected) != Some(end) { return Err("The server edit does not address the native buffer".into()); }
-            changes.push(document.content.range_change(start, end, &edit.new_text).ok_or("The server edit cannot be represented by the native editor")?);
+            let expected = plan
+                .before
+                .get(edit.range.clone())
+                .ok_or("The server edit has an invalid range")?;
+            if document.content.range_end(start, expected) != Some(end) {
+                return Err("The server edit does not address the native buffer".into());
+            }
+            changes.push(
+                document
+                    .content
+                    .range_change(start, end, &edit.new_text)
+                    .ok_or("The server edit cannot be represented by the native editor")?,
+            );
         }
         Ok(PreparedWorkspaceEdit {
             generation: self.generation,
@@ -4571,21 +4729,43 @@ impl RepositoryRuntime {
         })
     }
 
-    pub(crate) fn apply_workspace_edit(&mut self, prepared: PreparedWorkspaceEdit) -> Result<AppliedWorkspaceEdit, String> {
-        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
-        if self.generation != prepared.generation || self.descriptor.worktree.join(&document.source) != prepared.source
-            || document.revision != prepared.revision || document.lsp_version != prepared.version
-            || document.active_save.is_some() || !content_matches(&document.content, &prepared.before) {
+    pub(crate) fn apply_workspace_edit(
+        &mut self,
+        prepared: PreparedWorkspaceEdit,
+    ) -> Result<AppliedWorkspaceEdit, String> {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Err("An edited buffer was closed".into());
+        };
+        if self.generation != prepared.generation
+            || self.descriptor.worktree.join(&document.source) != prepared.source
+            || document.revision != prepared.revision
+            || document.lsp_version != prepared.version
+            || document.active_save.is_some()
+            || !content_matches(&document.content, &prepared.before)
+        {
             return Err("The prepared buffer edit is stale".into());
         }
         let cursor = document.content.cursor();
         let scroll = document.content.scroll_position();
-        let mut buffer = ProtocolTracked { content: &mut document.content, edits: Vec::new() };
+        let mut buffer = ProtocolTracked {
+            content: &mut document.content,
+            edits: Vec::new(),
+        };
         for (index, change) in prepared.changes.iter().enumerate() {
-            if !buffer.replace(change.start, &change.removed, &change.inserted, &change.inserted_breaks) {
+            if !buffer.replace(
+                change.start,
+                &change.removed,
+                &change.inserted,
+                &change.inserted_breaks,
+            ) {
                 let mut restored = true;
                 for previous in prepared.changes[..index].iter().rev() {
-                    restored &= buffer.replace(previous.start, &previous.inserted, &previous.removed, &previous.removed_breaks);
+                    restored &= buffer.replace(
+                        previous.start,
+                        &previous.inserted,
+                        &previous.removed,
+                        &previous.removed_breaks,
+                    );
                 }
                 buffer.content.set_cursor(cursor);
                 buffer.content.restore_scroll_position(scroll);
@@ -4597,38 +4777,76 @@ impl RepositoryRuntime {
                     document.error = Some("A workspace edit could not restore this buffer".into());
                     self.push_lsp_change(None);
                 }
-                return Err(if restored { "The prepared edit could not be applied; the buffer was preserved" } else { "The prepared edit failed and its buffer rollback could not complete" }.into());
+                return Err(if restored {
+                    "The prepared edit could not be applied; the buffer was preserved"
+                } else {
+                    "The prepared edit failed and its buffer rollback could not complete"
+                }
+                .into());
             }
         }
         document.content.set_cursor(cursor);
         document.content.restore_scroll_position(scroll);
-        Ok(AppliedWorkspaceEdit { prepared, cursor, scroll })
+        Ok(AppliedWorkspaceEdit {
+            prepared,
+            cursor,
+            scroll,
+        })
     }
 
-    pub(crate) fn commit_workspace_edit(&mut self, applied: AppliedWorkspaceEdit) -> Result<(), String> {
-        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
+    pub(crate) fn commit_workspace_edit(
+        &mut self,
+        applied: AppliedWorkspaceEdit,
+    ) -> Result<(), String> {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Err("An edited buffer was closed".into());
+        };
         if self.generation != applied.prepared.generation
             || self.descriptor.worktree.join(&document.source) != applied.prepared.source
-            || document.revision != applied.prepared.revision || document.lsp_version != applied.prepared.version {
+            || document.revision != applied.prepared.revision
+            || document.lsp_version != applied.prepared.version
+        {
             return Err("The native edit did not finish in its original update turn".into());
         }
-        if applied.prepared.changes.is_empty() { return Ok(()); }
-        document.history.record_group(applied.prepared.changes, applied.cursor, document.content.cursor(), Instant::now());
+        if applied.prepared.changes.is_empty() {
+            return Ok(());
+        }
+        document.history.record_group(
+            applied.prepared.changes,
+            applied.cursor,
+            document.content.cursor(),
+            Instant::now(),
+        );
         document.text_changed();
         self.push_lsp_change(None);
         Ok(())
     }
 
-    pub(crate) fn rollback_workspace_edit(&mut self, applied: AppliedWorkspaceEdit) -> Result<(), String> {
-        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
+    pub(crate) fn rollback_workspace_edit(
+        &mut self,
+        applied: AppliedWorkspaceEdit,
+    ) -> Result<(), String> {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Err("An edited buffer was closed".into());
+        };
         if self.generation != applied.prepared.generation
             || self.descriptor.worktree.join(&document.source) != applied.prepared.source
-            || document.revision != applied.prepared.revision || document.lsp_version != applied.prepared.version {
+            || document.revision != applied.prepared.revision
+            || document.lsp_version != applied.prepared.version
+        {
             return Err("The native rollback is no longer current".into());
         }
-        let mut buffer = ProtocolTracked { content: &mut document.content, edits: Vec::new() };
+        let mut buffer = ProtocolTracked {
+            content: &mut document.content,
+            edits: Vec::new(),
+        };
         for change in applied.prepared.changes.iter().rev() {
-            if !buffer.replace(change.start, &change.inserted, &change.removed, &change.removed_breaks) {
+            if !buffer.replace(
+                change.start,
+                &change.inserted,
+                &change.removed,
+                &change.removed_breaks,
+            ) {
                 // Preserve the actual remaining bytes as dirty, visible work
                 // instead of treating a failed rollback as a clean document.
                 document.history.clear();
@@ -5227,7 +5445,8 @@ impl RepositoryRuntime {
     }
 
     pub fn blocks_navigation(&self) -> bool {
-        self.has_editor_recovery() || self.is_dirty()
+        self.has_editor_recovery()
+            || self.is_dirty()
             || self.is_saving()
             || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning().is_some())
     }
@@ -5441,10 +5660,9 @@ impl RepositoryRuntime {
 
     pub fn save_error(&self) -> Option<&str> {
         match &self.document {
-            DocumentState::Editable(document) => document
-                .error
-                .as_deref()
-                .or(document.durability_warning()),
+            DocumentState::Editable(document) => {
+                document.error.as_deref().or(document.durability_warning())
+            }
             _ => None,
         }
     }
@@ -5521,13 +5739,29 @@ impl RepositoryRuntime {
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
         self.clear_resolved_operation_recovery();
-        if self.has_editor_recovery() { return Task::none(); }
-        let Some(root) = self.original_editor_root.clone().filter(|_| self.original_read_attested) else {
-            if let DocumentState::Editable(document) = &mut self.document { document.error = Some("The original read root is unavailable; reopen this file before saving.".into()); }
+        if self.has_editor_recovery() {
+            return Task::none();
+        }
+        let Some(root) = self
+            .original_editor_root
+            .clone()
+            .filter(|_| self.original_read_attested)
+        else {
+            if let DocumentState::Editable(document) = &mut self.document {
+                document.error = Some(
+                    "The original read root is unavailable; reopen this file before saving.".into(),
+                );
+            }
             return Task::none();
         };
-        let Some((window, known)) = self.save_recovery_window.clone().zip(self.known_checkout_paths.clone()) else {
-            if let DocumentState::Editable(document) = &mut self.document { document.error = Some("File recovery custody is unavailable; the save was refused before changing files.".into()); }
+        let Some((window, known)) = self
+            .save_recovery_window
+            .clone()
+            .zip(self.known_checkout_paths.clone())
+        else {
+            if let DocumentState::Editable(document) = &mut self.document {
+                document.error = Some("File recovery custody is unavailable; the save was refused before changing files.".into());
+            }
             return Task::none();
         };
         let (path, destination, text, disk_hash, revision, history_revision, snapshot_source) =
@@ -5548,10 +5782,16 @@ impl RepositoryRuntime {
                 }
                 _ => return Task::none(),
             };
-        let operation = match crate::operation_recovery::begin_operation(&window, self.descriptor.worktree.clone(), root.clone()) {
+        let operation = match crate::operation_recovery::begin_operation(
+            &window,
+            self.descriptor.worktree.clone(),
+            root.clone(),
+        ) {
             Ok(operation) => operation,
             Err(error) => {
-                if let DocumentState::Editable(document) = &mut self.document { document.error = Some(error); }
+                if let DocumentState::Editable(document) = &mut self.document {
+                    document.error = Some(error);
+                }
                 return Task::none();
             }
         };
@@ -5583,15 +5823,37 @@ impl RepositoryRuntime {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 operation.start();
-                let result = crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire(&root, &known)
-                    .map_err(|error| crate::editor::retained_save::RetainedSaveError::Io(error.to_string()))
-                    .and_then(|context| crate::editor::retained_save::save_file_at(&root, &destination, &text, disk_hash, overwrite, &context));
-                let authority = match &result { Ok(outcome) => outcome.recovery_authority(), Err(error) => error.recovery_authority() }.cloned();
+                let result =
+                    crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire(
+                        &root, &known,
+                    )
+                    .map_err(|error| {
+                        crate::editor::retained_save::RetainedSaveError::Io(error.to_string())
+                    })
+                    .and_then(|context| {
+                        crate::editor::retained_save::save_file_at(
+                            &root,
+                            &destination,
+                            &text,
+                            disk_hash,
+                            overwrite,
+                            &context,
+                        )
+                    });
+                let authority = match &result {
+                    Ok(outcome) => outcome.recovery_authority(),
+                    Err(error) => error.recovery_authority(),
+                }
+                .cloned();
                 operation.finish(authority);
                 result
             })
             .await
-            .map_err(|error| crate::editor::retained_save::RetainedSaveError::Io(format!("save worker failed: {error}")))
+            .map_err(|error| {
+                crate::editor::retained_save::RetainedSaveError::Io(format!(
+                    "save worker failed: {error}"
+                ))
+            })
             .and_then(|result| result);
             RepositoryAction::RetainedSaveFinished {
                 identity,
@@ -5605,11 +5867,16 @@ impl RepositoryRuntime {
 
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
         self.clear_resolved_operation_recovery();
-        if let Some(authority) = action.recovery_authority().filter(|authority| !authority.is_resolved()) {
-            self.editor_recovery = Some(match self.editor_recovery.take().filter(|old| !old.is_resolved()) {
-                Some(old) => old.combine(authority.clone()),
-                None => authority.clone(),
-            });
+        if let Some(authority) = action
+            .recovery_authority()
+            .filter(|authority| !authority.is_resolved())
+        {
+            self.editor_recovery = Some(
+                match self.editor_recovery.take().filter(|old| !old.is_resolved()) {
+                    Some(old) => old.combine(authority.clone()),
+                    None => authority.clone(),
+                },
+            );
         }
         let card = action.card();
         let task = self.update_inner(action);
@@ -5745,15 +6012,24 @@ impl RepositoryRuntime {
                 self.open_file_entry(card, file)
             }
             RepositoryAction::FileLoadedAt { identity, result } => {
-                if !self.accepts_selected(&identity) { return Task::none(); }
+                if !self.accepts_selected(&identity) {
+                    return Task::none();
+                }
                 let result = match result {
                     Ok(read) if read.worktree() == identity.worktree => {
                         let (root, result) = read.into_parts();
                         if !self.set_original_editor_root(root) {
-                            Err(FileIoError::Io("The file read belongs to another physical root; reopen the pane".into()))
-                        } else { result }
+                            Err(FileIoError::Io(
+                                "The file read belongs to another physical root; reopen the pane"
+                                    .into(),
+                            ))
+                        } else {
+                            result
+                        }
                     }
-                    Ok(_) => Err(FileIoError::Io("The file read belongs to another worktree".into())),
+                    Ok(_) => Err(FileIoError::Io(
+                        "The file read belongs to another worktree".into(),
+                    )),
                     Err(error) => Err(error),
                 };
                 let attested = result.is_ok();
@@ -6134,7 +6410,10 @@ impl RepositoryRuntime {
                     self.dismiss_editor_results();
                     // Retrigger against the new snapshot after the shell has
                     // drained this edit. A closer or a caret move dismisses it.
-                    if matches!(&action, text_editor::Action::Edit(text_editor::Edit::Insert(character)) if *character != ')') { self.language.signature = signature; }
+                    if matches!(&action, text_editor::Action::Edit(text_editor::Edit::Insert(character)) if *character != ')')
+                    {
+                        self.language.signature = signature;
+                    }
                 }
                 let moved = !matches!(
                     action,
@@ -6198,14 +6477,33 @@ impl RepositoryRuntime {
                 self.auto_save_pending = None;
                 self.request_save_inner(identity.card, false, false)
             }
-            RepositoryAction::RetainedSaveFinished { identity, ticket, revision, saved_text, result } => {
-                let cleanup = result.as_ref().ok().and_then(|outcome| outcome.recovery_authority()).cloned();
+            RepositoryAction::RetainedSaveFinished {
+                identity,
+                ticket,
+                revision,
+                saved_text,
+                result,
+            } => {
+                let cleanup = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|outcome| outcome.recovery_authority())
+                    .cloned();
                 let owns_snapshot = matches!(&self.document, DocumentState::Editable(document)
                     if document.active_save.as_ref().is_some_and(|active| active.id == ticket && active.identity == identity && active.revision == revision && active.snapshot == saved_text));
-                let result = result.map(|outcome| outcome.into_parts().0)
+                let result = result
+                    .map(|outcome| outcome.into_parts().0)
                     .map_err(|error| FileIoError::Io(error.to_string()));
-                let task = self.update_inner(RepositoryAction::SaveFinished { identity, ticket, revision, saved_text, result });
-                if owns_snapshot && let DocumentState::Editable(document) = &mut self.document { document.cleanup_recovery = cleanup; }
+                let task = self.update_inner(RepositoryAction::SaveFinished {
+                    identity,
+                    ticket,
+                    revision,
+                    saved_text,
+                    result,
+                });
+                if owns_snapshot && let DocumentState::Editable(document) = &mut self.document {
+                    document.cleanup_recovery = cleanup;
+                }
                 task
             }
             RepositoryAction::SaveFinished {
@@ -7139,7 +7437,11 @@ impl RepositoryRuntime {
         self.markdown_mode = MarkdownMode::Edit;
         self.document_tone = pdf_tone(&cosmic::theme::active());
         let identity = self.next_identity(card, path);
-        file_task(identity, self.document_tone, self.original_editor_root.clone())
+        file_task(
+            identity,
+            self.document_tone,
+            self.original_editor_root.clone(),
+        )
     }
 
     fn diff_mode_index(&self) -> usize {
@@ -7686,8 +7988,12 @@ fn file_task(
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
-        let result = tokio::task::spawn_blocking(move || crate::editor::read_file_at(&worktree, &path, tone, original))
-            .await.map_err(|error| FileIoError::Io(format!("file worker failed: {error}"))).and_then(|result| result);
+        let result = tokio::task::spawn_blocking(move || {
+            crate::editor::read_file_at(&worktree, &path, tone, original)
+        })
+        .await
+        .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")))
+        .and_then(|result| result);
         RepositoryAction::FileLoadedAt { identity, result }
     })
 }
@@ -8433,10 +8739,22 @@ impl widget::menu::Action for EditorMenuCommand {
             Self::Undo(card) => RepositoryAction::Undo { card },
             Self::Redo(card) => RepositoryAction::Redo { card },
             Self::Clipboard(card, op) => RepositoryAction::Clipboard { card, op },
-            Self::Rename(card) => RepositoryAction::Language { card, action: EditorLspAction::Rename },
-            Self::Format(card, selection) => RepositoryAction::Language { card, action: EditorLspAction::Format { selection } },
-            Self::CodeActions(card) => RepositoryAction::Language { card, action: EditorLspAction::CodeActions },
-            Self::Signature(card) => RepositoryAction::Language { card, action: EditorLspAction::Signature },
+            Self::Rename(card) => RepositoryAction::Language {
+                card,
+                action: EditorLspAction::Rename,
+            },
+            Self::Format(card, selection) => RepositoryAction::Language {
+                card,
+                action: EditorLspAction::Format { selection },
+            },
+            Self::CodeActions(card) => RepositoryAction::Language {
+                card,
+                action: EditorLspAction::CodeActions,
+            },
+            Self::Signature(card) => RepositoryAction::Language {
+                card,
+                action: EditorLspAction::Signature,
+            },
         }
     }
 }
@@ -8455,11 +8773,39 @@ fn editor_context_menu(
     };
     let ctrl = [Modifier::Ctrl];
     let entries = [
-        ("Rename symbol", EditorMenuCommand::Rename(card), KeyBind { modifiers: vec![], key: iced::keyboard::Key::Named(iced::keyboard::key::Named::F2) }, support[0]),
-        ("Format document", EditorMenuCommand::Format(card, false), chord(&[Modifier::Shift, Modifier::Alt], "f"), support[1]),
-        ("Format selection", EditorMenuCommand::Format(card, true), chord(&[Modifier::Ctrl, Modifier::Alt], "f"), support[2] && document.content.cursor().selection.is_some()),
-        ("Code actions", EditorMenuCommand::CodeActions(card), chord(&ctrl, "."), support[3]),
-        ("Signature help", EditorMenuCommand::Signature(card), chord(&[Modifier::Ctrl, Modifier::Shift], " "), support[4]),
+        (
+            "Rename symbol",
+            EditorMenuCommand::Rename(card),
+            KeyBind {
+                modifiers: vec![],
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::F2),
+            },
+            support[0],
+        ),
+        (
+            "Format document",
+            EditorMenuCommand::Format(card, false),
+            chord(&[Modifier::Shift, Modifier::Alt], "f"),
+            support[1],
+        ),
+        (
+            "Format selection",
+            EditorMenuCommand::Format(card, true),
+            chord(&[Modifier::Ctrl, Modifier::Alt], "f"),
+            support[2] && document.content.cursor().selection.is_some(),
+        ),
+        (
+            "Code actions",
+            EditorMenuCommand::CodeActions(card),
+            chord(&ctrl, "."),
+            support[3],
+        ),
+        (
+            "Signature help",
+            EditorMenuCommand::Signature(card),
+            chord(&[Modifier::Ctrl, Modifier::Shift], " "),
+            support[4],
+        ),
         (
             "Undo",
             EditorMenuCommand::Undo(card),
@@ -9653,10 +9999,36 @@ fn editable_document_view<'a>(
                 }
                 let support = runtime.language.feature_support;
                 let action = match &press.key {
-                    Key::Named(Named::F2) if press.modifiers.is_empty() => Some(EditorLspAction::Rename),
-                    Key::Character(character) if character.eq_ignore_ascii_case("f") && press.modifiers.shift() && press.modifiers.alt() && !press.modifiers.control() && !press.modifiers.logo() && support[1] => Some(EditorLspAction::Format { selection: false }),
-                    Key::Character(character) if character.as_str() == "." && press.modifiers.command() && !press.modifiers.shift() && !press.modifiers.alt() && support[3] => Some(EditorLspAction::CodeActions),
-                    Key::Character(character) if character.as_str() == " " && press.modifiers.command() && press.modifiers.shift() && support[4] => Some(EditorLspAction::Signature),
+                    Key::Named(Named::F2) if press.modifiers.is_empty() => {
+                        Some(EditorLspAction::Rename)
+                    }
+                    Key::Character(character)
+                        if character.eq_ignore_ascii_case("f")
+                            && press.modifiers.shift()
+                            && press.modifiers.alt()
+                            && !press.modifiers.control()
+                            && !press.modifiers.logo()
+                            && support[1] =>
+                    {
+                        Some(EditorLspAction::Format { selection: false })
+                    }
+                    Key::Character(character)
+                        if character.as_str() == "."
+                            && press.modifiers.command()
+                            && !press.modifiers.shift()
+                            && !press.modifiers.alt()
+                            && support[3] =>
+                    {
+                        Some(EditorLspAction::CodeActions)
+                    }
+                    Key::Character(character)
+                        if character.as_str() == " "
+                            && press.modifiers.command()
+                            && press.modifiers.shift()
+                            && support[4] =>
+                    {
+                        Some(EditorLspAction::Signature)
+                    }
                     Key::Character(character)
                         if character.as_str() == " " && press.modifiers.command() =>
                     {
@@ -9677,7 +10049,8 @@ fn editable_document_view<'a>(
                     Key::Named(Named::Escape)
                         if !runtime.language.completions.is_empty()
                             || !runtime.language.hover.is_empty()
-                            || runtime.language.hover_diagnostic.is_some() || runtime.language.signature.is_some() =>
+                            || runtime.language.hover_diagnostic.is_some()
+                            || runtime.language.signature.is_some() =>
                     {
                         Some(EditorLspAction::Dismiss)
                     }
@@ -9706,17 +10079,36 @@ fn editable_document_view<'a>(
             });
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
-        crate::interaction::context_menu(editor, editor_context_menu(card, document, runtime.language.feature_support))
+        crate::interaction::context_menu(
+            editor,
+            editor_context_menu(card, document, runtime.language.feature_support),
+        )
     };
     // Keep the named editor in the same slot when save warnings appear.
     if runtime.language.feature_support[3] && !runtime.language.diagnostics.is_empty() {
-        error_rows.push(widget::button::text("Code actions · Ctrl+.").on_press(RepositoryAction::Language { card, action: EditorLspAction::CodeActions }).into());
+        error_rows.push(
+            widget::button::text("Code actions · Ctrl+.")
+                .on_press(RepositoryAction::Language {
+                    card,
+                    action: EditorLspAction::CodeActions,
+                })
+                .into(),
+        );
     }
-    if let Some(help) = &runtime.language.signature && let Some(signature) = help.signatures.get(help.active_signature) {
+    if let Some(help) = &runtime.language.signature
+        && let Some(signature) = help.signatures.get(help.active_signature)
+    {
         let label = signature.label.chars().take(4096).collect::<String>();
         error_rows.push(crate::design::body(label).into());
-        if let Some(parameter) = signature.active_parameter.or(help.active_parameter).and_then(|index| signature.parameters.get(index)) {
-            error_rows.push(crate::design::caption(parameter.label.chars().take(4096).collect::<String>()).into());
+        if let Some(parameter) = signature
+            .active_parameter
+            .or(help.active_parameter)
+            .and_then(|index| signature.parameters.get(index))
+        {
+            error_rows.push(
+                crate::design::caption(parameter.label.chars().take(4096).collect::<String>())
+                    .into(),
+            );
         }
     }
     let error_slot = widget::column::with_children(error_rows).width(Length::Fill);
@@ -11596,25 +11988,48 @@ mod tests {
     #[test]
     fn prepared_workspace_edits_are_sparse_and_one_native_undo_group() {
         let card = CardId::new();
-        let before = format!("old();\n{}old();\n", "unchanged source line\n".repeat(16_000));
+        let before = format!(
+            "old();\n{}old();\n",
+            "unchanged source line\n".repeat(16_000)
+        );
         let after = before.replace("old()", "new_name()");
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, &before);
         let path = runtime.workspace_edit_candidate_source().unwrap();
         let last = before.rfind("old()").unwrap();
         let plan = crate::editor_workspace_edit::DocumentPlan {
-            path: path.clone(), relative: "main.rs".into(),
-            before: before.clone().into(), after: after.clone().into(),
-            before_hash: blake3::hash(before.as_bytes()), version: Some(1),
-            protocol_version: Some(1), protocol_incarnation: None,
-            open: true, open_paths: vec![path],
-            edits: [0, last].into_iter().map(|offset| crate::editor_workspace_edit::ResolvedEdit {
-                range: offset..offset + 3, new_text: "new_name".into(),
-            }).collect(),
+            path: path.clone(),
+            relative: "main.rs".into(),
+            before: before.clone().into(),
+            after: after.clone().into(),
+            before_hash: blake3::hash(before.as_bytes()),
+            version: Some(1),
+            protocol_version: Some(1),
+            protocol_incarnation: None,
+            open: true,
+            open_paths: vec![path],
+            edits: [0, last]
+                .into_iter()
+                .map(|offset| crate::editor_workspace_edit::ResolvedEdit {
+                    range: offset..offset + 3,
+                    new_text: "new_name".into(),
+                })
+                .collect(),
         };
         let prepared = runtime.prepare_workspace_edit(&plan).unwrap();
-        assert_eq!(runtime.editor_text().unwrap(), before, "preflight cannot edit the buffer");
+        assert_eq!(
+            runtime.editor_text().unwrap(),
+            before,
+            "preflight cannot edit the buffer"
+        );
         assert_eq!(prepared.changes.len(), 2);
-        assert!(prepared.changes.iter().map(|change| change.removed.len() + change.inserted.len()).sum::<usize>() < 32);
+        assert!(
+            prepared
+                .changes
+                .iter()
+                .map(|change| change.removed.len() + change.inserted.len())
+                .sum::<usize>()
+                < 32
+        );
         let applied = runtime.apply_workspace_edit(prepared).unwrap();
         runtime.commit_workspace_edit(applied).unwrap();
         assert_eq!(runtime.editor_text().unwrap(), after);
@@ -11631,14 +12046,26 @@ mod tests {
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "old");
         let path = runtime.workspace_edit_candidate_source().unwrap();
         let plan = crate::editor_workspace_edit::DocumentPlan {
-            path: path.clone(), relative: "main.rs".into(),
-            before: "old".into(), after: "new".into(), before_hash: blake3::hash(b"old"),
-            version: Some(1), protocol_version: Some(1), protocol_incarnation: None,
-            open: true, open_paths: vec![path],
-            edits: vec![crate::editor_workspace_edit::ResolvedEdit { range: 0..3, new_text: "new".into() }],
+            path: path.clone(),
+            relative: "main.rs".into(),
+            before: "old".into(),
+            after: "new".into(),
+            before_hash: blake3::hash(b"old"),
+            version: Some(1),
+            protocol_version: Some(1),
+            protocol_incarnation: None,
+            open: true,
+            open_paths: vec![path],
+            edits: vec![crate::editor_workspace_edit::ResolvedEdit {
+                range: 0..3,
+                new_text: "new".into(),
+            }],
         };
         let prepared = runtime.prepare_workspace_edit(&plan).unwrap();
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
         let actual = runtime.editor_text().unwrap();
         assert_ne!(actual, "old");
         assert!(runtime.apply_workspace_edit(prepared).is_err());
@@ -11653,17 +12080,29 @@ mod tests {
         let b = CardId::new();
         let (mut first, _) = RepositoryRuntime::lsp_open_fixture(a, "old");
         let (mut later, _) = RepositoryRuntime::lsp_open_fixture(b, "old");
-        drop(first.update(RepositoryAction::EditorAction { card: a, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        drop(first.update(RepositoryAction::EditorAction {
+            card: a,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
         let original = first.editor_text().unwrap();
         let plan = |runtime: &RepositoryRuntime| {
             let (path, snapshot) = runtime.workspace_edit_snapshot().unwrap();
             let offset = snapshot.text.find("old").unwrap();
             crate::editor_workspace_edit::DocumentPlan {
-                path: path.clone(), relative: "main.rs".into(),
-                before: Arc::clone(&snapshot.text), after: snapshot.text.replace("old", "new").into(),
-                before_hash: blake3::hash(snapshot.text.as_bytes()), version: Some(snapshot.version),
-                protocol_version: None, protocol_incarnation: None, open: true, open_paths: vec![path],
-                edits: vec![crate::editor_workspace_edit::ResolvedEdit { range: offset..offset + 3, new_text: "new".into() }],
+                path: path.clone(),
+                relative: "main.rs".into(),
+                before: Arc::clone(&snapshot.text),
+                after: snapshot.text.replace("old", "new").into(),
+                before_hash: blake3::hash(snapshot.text.as_bytes()),
+                version: Some(snapshot.version),
+                protocol_version: None,
+                protocol_incarnation: None,
+                open: true,
+                open_paths: vec![path],
+                edits: vec![crate::editor_workspace_edit::ResolvedEdit {
+                    range: offset..offset + 3,
+                    new_text: "new".into(),
+                }],
             }
         };
         let first_prepared = first.prepare_workspace_edit(&plan(&first)).unwrap();
@@ -11679,7 +12118,11 @@ mod tests {
         drop(first.update(RepositoryAction::Undo { card: a }));
         assert_eq!(first.editor_text().unwrap(), "old");
         drop(first.update(RepositoryAction::Redo { card: a }));
-        assert_eq!(first.editor_text().unwrap(), original, "a refused workspace edit must not become Redo history");
+        assert_eq!(
+            first.editor_text().unwrap(),
+            original,
+            "a refused workspace edit must not become Redo history"
+        );
     }
 
     async fn finish_navigation_task(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
@@ -11700,7 +12143,12 @@ mod tests {
         std::fs::write(a.path().join("file.rs"), "fn original_a() {}").unwrap();
         std::fs::write(b.path().join("file.rs"), "fn original_b() {}").unwrap();
         let card = CardId::new();
-        let view = |path: &Path| RepositoryView { project: ProjectId::new(), repository: path.to_owned(), worktree: path.to_owned(), selected_file: Some("file.rs".into()) };
+        let view = |path: &Path| RepositoryView {
+            project: ProjectId::new(),
+            repository: path.to_owned(),
+            worktree: path.to_owned(),
+            selected_file: Some("file.rs".into()),
+        };
         let mut runtime = RepositoryRuntime::new_directory(view(a.path()));
         let task = runtime.initial_load(card);
         finish_navigation_task(&mut runtime, task).await;
@@ -11711,11 +12159,23 @@ mod tests {
         assert!(!Arc::ptr_eq(&original_a, &original_b));
         assert_eq!(runtime.editor_text().as_deref(), Some("fn original_b() {}"));
         let intents = runtime.take_lsp_intents();
-        let roots = intents.iter().filter_map(|intent| match intent { LspIntent::Open { root: Some(root), .. } => Some(root), _ => None }).collect::<Vec<_>>();
+        let roots = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                LspIntent::Open {
+                    root: Some(root), ..
+                } => Some(root),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(roots.len(), 2);
         assert!(Arc::ptr_eq(roots[0], &original_a));
         assert!(Arc::ptr_eq(roots[1], &original_b));
-        assert!(intents.iter().any(|intent| matches!(intent, LspIntent::Close)));
+        assert!(
+            intents
+                .iter()
+                .any(|intent| matches!(intent, LspIntent::Close))
+        );
     }
 
     #[tokio::test]
@@ -11726,18 +12186,41 @@ mod tests {
         std::fs::write(b.path().join("file"), "same base").unwrap();
         let card = CardId::new();
         let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
-            project: ProjectId::new(), repository: a.path().to_owned(), worktree: a.path().to_owned(), selected_file: None,
+            project: ProjectId::new(),
+            repository: a.path().to_owned(),
+            worktree: a.path().to_owned(),
+            selected_file: None,
         });
-        assert!(runtime.set_original_editor_root(Arc::new(crate::fs_safety::Root::open(b.path()).unwrap())));
-        let task = runtime.update(RepositoryAction::OpenFile { card, path: "file".into() });
+        assert!(
+            runtime.set_original_editor_root(Arc::new(
+                crate::fs_safety::Root::open(b.path()).unwrap()
+            ))
+        );
+        let task = runtime.update(RepositoryAction::OpenFile {
+            card,
+            path: "file".into(),
+        });
         finish_navigation_task(&mut runtime, task).await;
         assert!(runtime.editor_text().is_none());
-        assert!(!runtime.take_lsp_intents().iter().any(|intent| matches!(intent, LspIntent::Open { .. })));
+        assert!(
+            !runtime
+                .take_lsp_intents()
+                .iter()
+                .any(|intent| matches!(intent, LspIntent::Open { .. }))
+        );
         let window = Default::default();
-        assert!(runtime.configure_save_recovery(window, vec![a.path().to_owned(), b.path().to_owned()]));
+        assert!(
+            runtime.configure_save_recovery(window, vec![a.path().to_owned(), b.path().to_owned()])
+        );
         assert_eq!(runtime.request_save(card, true).units(), 0);
-        assert_eq!(std::fs::read_to_string(a.path().join("file")).unwrap(), "same base");
-        assert_eq!(std::fs::read_to_string(b.path().join("file")).unwrap(), "same base");
+        assert_eq!(
+            std::fs::read_to_string(a.path().join("file")).unwrap(),
+            "same base"
+        );
+        assert_eq!(
+            std::fs::read_to_string(b.path().join("file")).unwrap(),
+            "same base"
+        );
     }
 
     #[tokio::test]
@@ -11750,9 +12233,15 @@ mod tests {
         std::fs::write(named.join("two"), "original two").unwrap();
         let card = CardId::new();
         let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
-            project: ProjectId::new(), repository: named.clone(), worktree: named.clone(), selected_file: None,
+            project: ProjectId::new(),
+            repository: named.clone(),
+            worktree: named.clone(),
+            selected_file: None,
         });
-        let task = runtime.update(RepositoryAction::OpenFile { card, path: "one".into() });
+        let task = runtime.update(RepositoryAction::OpenFile {
+            card,
+            path: "one".into(),
+        });
         finish_navigation_task(&mut runtime, task).await;
         let original = runtime.retained_editor_root().expect("actual read root");
         assert_eq!(runtime.editor_text().as_deref(), Some("original one"));
@@ -11762,12 +12251,29 @@ mod tests {
         std::fs::write(named.join("two"), "replacement two").unwrap();
         let replacement = Arc::new(crate::fs_safety::Root::open(&named).unwrap());
         assert!(!runtime.set_original_editor_root(replacement));
-        let task = runtime.update(RepositoryAction::OpenFile { card, path: "two".into() });
+        let task = runtime.update(RepositoryAction::OpenFile {
+            card,
+            path: "two".into(),
+        });
         finish_navigation_task(&mut runtime, task).await;
-        assert!(runtime.editor_text().is_none(), "replaced spelling must not publish original text as the replacement's LSP document");
-        assert!(!runtime.take_lsp_intents().iter().any(|intent| matches!(intent, LspIntent::Open { .. })));
-        assert!(Arc::ptr_eq(&original, &runtime.retained_editor_root().unwrap()));
-        assert_eq!(std::fs::read_to_string(named.join("two")).unwrap(), "replacement two");
+        assert!(
+            runtime.editor_text().is_none(),
+            "replaced spelling must not publish original text as the replacement's LSP document"
+        );
+        assert!(
+            !runtime
+                .take_lsp_intents()
+                .iter()
+                .any(|intent| matches!(intent, LspIntent::Open { .. }))
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            &runtime.retained_editor_root().unwrap()
+        ));
+        assert_eq!(
+            std::fs::read_to_string(named.join("two")).unwrap(),
+            "replacement two"
+        );
     }
 
     #[tokio::test]

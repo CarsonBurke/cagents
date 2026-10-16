@@ -42,13 +42,13 @@ pub mod document_render;
 #[cfg(feature = "ui")]
 pub mod editor;
 #[cfg(feature = "ui")]
+pub mod editor_features;
+#[cfg(feature = "ui")]
 pub(crate) mod editor_history;
 #[cfg(feature = "ui")]
 pub mod editor_search;
 #[cfg(feature = "ui")]
 pub(crate) mod editor_workspace_edit;
-#[cfg(feature = "ui")]
-pub mod editor_features;
 #[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]
@@ -85,6 +85,8 @@ pub mod location;
 pub mod lsp;
 pub mod model;
 pub mod notifications;
+#[cfg(feature = "ui")]
+pub mod operation_recovery;
 pub mod performance;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;
@@ -94,8 +96,6 @@ pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
 pub mod recovery_authority;
-#[cfg(feature = "ui")]
-pub mod operation_recovery;
 #[cfg(feature = "ui")]
 pub mod reorder;
 #[cfg(any(feature = "ui", feature = "host"))]

@@ -285,7 +285,11 @@ fn validate_read_root_for_worktree(root: &Root, worktree: &Path) -> Result<(), F
         let current = named.metadata().map_err(io_error)?;
         held.dev() == current.dev() && held.ino() == current.ino()
     };
-    if !same { return Err(FileIoError::Io("The original worktree was replaced; reopen the pane before reading or saving".into())); }
+    if !same {
+        return Err(FileIoError::Io(
+            "The original worktree was replaced; reopen the pane before reading or saving".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -298,8 +302,12 @@ pub struct FileRead {
     result: Result<LoadedFile, FileIoError>,
 }
 impl FileRead {
-    pub fn worktree(&self) -> &Path { &self.worktree }
-    pub(crate) fn into_parts(self) -> (std::sync::Arc<Root>, Result<LoadedFile, FileIoError>) { (self.root, self.result) }
+    pub fn worktree(&self) -> &Path {
+        &self.worktree
+    }
+    pub(crate) fn into_parts(self) -> (std::sync::Arc<Root>, Result<LoadedFile, FileIoError>) {
+        (self.root, self.result)
+    }
 }
 pub(crate) fn read_file_at(
     worktree: &Path,
@@ -307,11 +315,21 @@ pub(crate) fn read_file_at(
     tone: PdfTone,
     original: Option<std::sync::Arc<Root>>,
 ) -> Result<FileRead, FileIoError> {
-    let root = match original { Some(root) => root, None => std::sync::Arc::new(open_read_root(worktree)?) };
+    let root = match original {
+        Some(root) => root,
+        None => std::sync::Arc::new(open_read_root(worktree)?),
+    };
     let result = validate_read_root_for_worktree(&root, worktree)
         .and_then(|()| load_file_at_original(&root, relative, tone))
-        .and_then(|loaded| { validate_read_root_for_worktree(&root, worktree)?; Ok(loaded) });
-    Ok(FileRead { worktree: worktree.to_owned(), root, result })
+        .and_then(|loaded| {
+            validate_read_root_for_worktree(&root, worktree)?;
+            Ok(loaded)
+        });
+    Ok(FileRead {
+        worktree: worktree.to_owned(),
+        root,
+        result,
+    })
 }
 
 pub(crate) fn load_file_at(
@@ -323,7 +341,11 @@ pub(crate) fn load_file_at(
     load_file_at_original(root, relative_path, tone)
 }
 
-fn load_file_at_original(root: &Root, relative_path: &Path, tone: PdfTone) -> Result<LoadedFile, FileIoError> {
+fn load_file_at_original(
+    root: &Root,
+    relative_path: &Path,
+    tone: PdfTone,
+) -> Result<LoadedFile, FileIoError> {
     validate_repo_path(relative_path)?;
     let mut source = relative_path.to_path_buf();
     // The link `source` was reached through, with the target it holds, so a

@@ -9,18 +9,27 @@
 //! Existing-FD content/version mutations remain in scope up to the final fence;
 //! this does not claim a universal atomic content compare-and-swap protocol.
 use super::*;
-use crate::{filesystem_recovery_context::FilesystemRecoveryContext, recovery_authority::{RecoveryAuthority, RecoverySlot}};
+use crate::{
+    filesystem_recovery_context::FilesystemRecoveryContext,
+    recovery_authority::{RecoveryAuthority, RecoverySlot},
+};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RetainedSaveError {
     #[error("{0}")]
     Io(String),
     #[error("{message}")]
-    Recovery { message: String, authority: RecoveryAuthority },
+    Recovery {
+        message: String,
+        authority: RecoveryAuthority,
+    },
 }
 impl RetainedSaveError {
     pub fn recovery_authority(&self) -> Option<&RecoveryAuthority> {
-        match self { Self::Recovery { authority, .. } => Some(authority), Self::Io(_) => None }
+        match self {
+            Self::Recovery { authority, .. } => Some(authority),
+            Self::Io(_) => None,
+        }
     }
 }
 type FileIoError = RetainedSaveError;
@@ -28,8 +37,13 @@ type FileIoError = RetainedSaveError;
 #[derive(Debug, Clone)]
 enum SaveDurability {
     Durable,
-    Unconfirmed { error: String },
-    Recovery { error: String, authority: RecoveryAuthority },
+    Unconfirmed {
+        error: String,
+    },
+    Recovery {
+        error: String,
+        authority: RecoveryAuthority,
+    },
 }
 
 /// Keep the actual cleanup authority until the window has accepted it, even
@@ -40,12 +54,22 @@ pub struct RetainedSaveOutcome {
     recovery: Option<RecoveryAuthority>,
 }
 impl RetainedSaveOutcome {
-    pub fn outcome(&self) -> &SaveOutcome { &self.outcome }
-    pub fn recovery_authority(&self) -> Option<&RecoveryAuthority> { self.recovery.as_ref() }
-    pub(crate) fn into_parts(self) -> (SaveOutcome, Option<RecoveryAuthority>) { (self.outcome, self.recovery) }
+    pub fn outcome(&self) -> &SaveOutcome {
+        &self.outcome
+    }
+    pub fn recovery_authority(&self) -> Option<&RecoveryAuthority> {
+        self.recovery.as_ref()
+    }
+    pub(crate) fn into_parts(self) -> (SaveOutcome, Option<RecoveryAuthority>) {
+        (self.outcome, self.recovery)
+    }
 }
-fn io_error(error: impl std::fmt::Display) -> FileIoError { FileIoError::Io(error.to_string()) }
-fn resolve_error(error: ResolveError) -> FileIoError { io_error(error) }
+fn io_error(error: impl std::fmt::Display) -> FileIoError {
+    FileIoError::Io(error.to_string())
+}
+fn resolve_error(error: ResolveError) -> FileIoError {
+    io_error(error)
+}
 
 /// The blocking worker supplies the ORIGINAL read root and a real local
 /// outside-checkout context. No path recapture or unprotected fallback exists.
@@ -57,7 +81,16 @@ pub(crate) fn save_file_at(
     overwrite: bool,
     context: &FilesystemRecoveryContext,
 ) -> Result<RetainedSaveOutcome, RetainedSaveError> {
-    save_file_with_hooks(root, relative_path, text, expected_disk_hash, overwrite, context, || Ok(()), fs_safety::sync_directory)
+    save_file_with_hooks(
+        root,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        context,
+        || Ok(()),
+        fs_safety::sync_directory,
+    )
 }
 fn save_file_with_hooks(
     root: &Root,
@@ -69,7 +102,17 @@ fn save_file_with_hooks(
     before_publish: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<RetainedSaveOutcome, RetainedSaveError> {
-    save_file_with_read_hook(root, relative_path, text, expected_disk_hash, overwrite, context, || Ok(()), before_publish, sync_parent)
+    save_file_with_read_hook(
+        root,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        context,
+        || Ok(()),
+        before_publish,
+        sync_parent,
+    )
 }
 fn save_file_with_read_hook(
     root: &Root,
@@ -87,19 +130,30 @@ fn save_file_with_read_hook(
     let named = Root::open(root.path()).map_err(io_error)?;
     context.validate_for_source(&named).map_err(io_error)?;
     drop(named);
-    if text.len() as u64 > MAX_EDITABLE_FILE_BYTES { return Err(io_error("The edited file exceeds the save size limit")); }
-    let (parent, name) = fs_safety::open_parent_beneath(root, relative_path).map_err(resolve_error)?;
+    if text.len() as u64 > MAX_EDITABLE_FILE_BYTES {
+        return Err(io_error("The edited file exceeds the save size limit"));
+    }
+    let (parent, name) =
+        fs_safety::open_parent_beneath(root, relative_path).map_err(resolve_error)?;
     let name = Path::new(&name);
     let listed = fs_safety::metadata_beneath(&parent, name).map_err(resolve_error)?;
-    if !listed.is_file() { return Err(io_error("The save target is no longer a regular file")); }
+    if !listed.is_file() {
+        return Err(io_error("The save target is no longer a regular file"));
+    }
     let mut destination = fs_safety::open_beneath(&parent, name).map_err(resolve_error)?;
     let metadata = destination.metadata().map_err(io_error)?;
-    if !same_file(&listed, &metadata) { return Err(changed()); }
+    if !same_file(&listed, &metadata) {
+        return Err(changed());
+    }
     if !overwrite {
-        let bytes = fs_safety::read_bounded(&mut destination, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
+        let bytes =
+            fs_safety::read_bounded(&mut destination, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
         let disk_hash = blake3::hash(&bytes);
         if disk_hash != expected_disk_hash {
-            return Ok(RetainedSaveOutcome { outcome: SaveOutcome::Conflict { disk_hash }, recovery: None });
+            return Ok(RetainedSaveOutcome {
+                outcome: SaveOutcome::Conflict { disk_hash },
+                recovery: None,
+            });
         }
     }
     after_read().map_err(io_error)?;
@@ -108,19 +162,39 @@ fn save_file_with_read_hook(
     // otherwise an intervening chmod could be accepted and then overwritten.
     baseline.ensure_initial(&metadata)?;
     validate_target_parent(root, relative_path, &parent).map_err(io_error)?;
-    let durability = publish_with_hooks(&parent, name, &destination, text.as_bytes(), metadata.permissions(), &baseline, context, || {
-        before_publish()?;
-        let named = Root::open(root.path())?;
-        context.validate_for_source(&named)?;
-        validate_target_parent(root, relative_path, &parent)
-    }, |parent, _| validate_target_parent(root, relative_path, parent), |_, _| Ok(()), sync_parent)?;
+    let durability = publish_with_hooks(
+        &parent,
+        name,
+        &destination,
+        text.as_bytes(),
+        metadata.permissions(),
+        &baseline,
+        context,
+        || {
+            before_publish()?;
+            let named = Root::open(root.path())?;
+            context.validate_for_source(&named)?;
+            validate_target_parent(root, relative_path, &parent)
+        },
+        |parent, _| validate_target_parent(root, relative_path, parent),
+        |_, _| Ok(()),
+        sync_parent,
+    )?;
     let (durability, recovery) = match durability {
         SaveDurability::Durable => (super::SaveDurability::Durable, None),
-        SaveDurability::Unconfirmed { error } => (super::SaveDurability::Unconfirmed { error }, None),
-        SaveDurability::Recovery { error, authority } => (super::SaveDurability::Unconfirmed { error }, Some(authority)),
+        SaveDurability::Unconfirmed { error } => {
+            (super::SaveDurability::Unconfirmed { error }, None)
+        }
+        SaveDurability::Recovery { error, authority } => (
+            super::SaveDurability::Unconfirmed { error },
+            Some(authority),
+        ),
     };
     Ok(RetainedSaveOutcome {
-        outcome: SaveOutcome::Saved { content_hash: blake3::hash(text.as_bytes()), durability },
+        outcome: SaveOutcome::Saved {
+            content_hash: blake3::hash(text.as_bytes()),
+            durability,
+        },
         recovery,
     })
 }
@@ -128,8 +202,12 @@ fn save_file_with_read_hook(
 fn validate_target_parent(root: &Root, relative: &Path, parent: &Root) -> io::Result<()> {
     let (named_parent, _) = fs_safety::open_parent_beneath(root, relative)
         .map_err(|error| io::Error::other(error.to_string()))?;
-    if fs_safety::recovery_directory_stamp(&named_parent)? != fs_safety::recovery_directory_stamp(parent)? {
-        return Err(io::Error::other("The original save parent moved outside the selected path; no replacement was published"));
+    if fs_safety::recovery_directory_stamp(&named_parent)?
+        != fs_safety::recovery_directory_stamp(parent)?
+    {
+        return Err(io::Error::other(
+            "The original save parent moved outside the selected path; no replacement was published",
+        ));
     }
     Ok(())
 }
@@ -495,7 +573,10 @@ fn publish_with_hooks(
         after_publish,
         sync_parent,
     );
-    if holding.publication.is_removed() && holding.cleanup_sync_complete && !holding.source_sync_pending {
+    if holding.publication.is_removed()
+        && holding.cleanup_sync_complete
+        && !holding.source_sync_pending
+    {
         return result;
     }
     // Publication cleanup may have acquired an unexpected entry. Preserve the
@@ -844,16 +925,25 @@ fn clean_before_acquire(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use crate::filesystem_recovery_context::fixtures::{fixture_context, fixture_context_with_guard};
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use crate::filesystem_recovery_context::fixtures::{
+        fixture_context, fixture_context_with_guard,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     struct ResetSync;
     impl Drop for ResetSync {
-        fn drop(&mut self) { FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.set(false)); }
+        fn drop(&mut self) {
+            FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.set(false));
+        }
     }
     struct Closed(Arc<AtomicBool>);
     impl Drop for Closed {
-        fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
     }
     fn fixture() -> (tempfile::TempDir, Root) {
         let directory = tempfile::tempdir().unwrap();
@@ -866,15 +956,45 @@ mod tests {
         let (directory, root) = fixture();
         fs::set_permissions(directory.path().join("file"), Permissions::from_mode(0o640)).unwrap();
         let context = fixture_context(&root).unwrap();
-        let result = save_file_at(&root, Path::new("file"), "mine", blake3::hash(b"wrong"), false, &context).unwrap();
+        let result = save_file_at(
+            &root,
+            Path::new("file"),
+            "mine",
+            blake3::hash(b"wrong"),
+            false,
+            &context,
+        )
+        .unwrap();
         assert!(matches!(result.outcome, SaveOutcome::Conflict { .. }));
         assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"base");
-        let result = save_file_at(&root, Path::new("file"), "mine", blake3::hash(b"base"), false, &context).unwrap();
-        assert!(matches!(result.outcome, SaveOutcome::Saved { durability: super::super::SaveDurability::Durable, .. }));
+        let result = save_file_at(
+            &root,
+            Path::new("file"),
+            "mine",
+            blake3::hash(b"base"),
+            false,
+            &context,
+        )
+        .unwrap();
+        assert!(matches!(
+            result.outcome,
+            SaveOutcome::Saved {
+                durability: super::super::SaveDurability::Durable,
+                ..
+            }
+        ));
         assert!(result.recovery_authority().is_none());
         assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"mine");
-        assert_eq!(fs::metadata(directory.path().join("file")).unwrap().mode() & 0o7777, 0o640);
-        assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
+        assert_eq!(
+            fs::metadata(directory.path().join("file")).unwrap().mode() & 0o7777,
+            0o640
+        );
+        assert!(
+            fs::read_dir(context.placement().directory().path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
     #[test]
     fn chmod_during_hash_read_cannot_be_adopted_then_overwritten_by_old_permissions() {
@@ -882,13 +1002,30 @@ mod tests {
         let path = directory.path().join("file");
         fs::set_permissions(&path, Permissions::from_mode(0o640)).unwrap();
         let context = fixture_context(&root).unwrap();
-        let result = save_file_with_read_hook(&root, Path::new("file"), "mine", blake3::hash(b"base"), false, &context,
-            || fs::set_permissions(&path, Permissions::from_mode(0o600)), || Ok(()), fs_safety::sync_directory);
+        let result = save_file_with_read_hook(
+            &root,
+            Path::new("file"),
+            "mine",
+            blake3::hash(b"base"),
+            false,
+            &context,
+            || fs::set_permissions(&path, Permissions::from_mode(0o600)),
+            || Ok(()),
+            fs_safety::sync_directory,
+        );
         assert!(result.is_err());
-        assert!(result.unwrap_err().recovery_authority().is_none(), "refusal precedes holding effects");
+        assert!(
+            result.unwrap_err().recovery_authority().is_none(),
+            "refusal precedes holding effects"
+        );
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
         assert_eq!(fs::read(&path).unwrap(), b"base");
-        assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
+        assert!(
+            fs::read_dir(context.placement().directory().path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
     #[test]
     fn moved_nested_parent_cannot_publish_outside_original_root_or_into_lookalike() {
@@ -900,15 +1037,29 @@ mod tests {
         fs::write(nested.join("file"), b"base").unwrap();
         let root = Root::open(&source).unwrap();
         let context = fixture_context(&root).unwrap();
-        let result = save_file_with_hooks(&root, Path::new("nested/file"), "mine", blake3::hash(b"base"), false, &context, || {
-            fs::rename(&nested, &moved)?;
-            fs::create_dir(&nested)?;
-            fs::write(nested.join("file"), b"replacement")
-        }, fs_safety::sync_directory);
+        let result = save_file_with_hooks(
+            &root,
+            Path::new("nested/file"),
+            "mine",
+            blake3::hash(b"base"),
+            false,
+            &context,
+            || {
+                fs::rename(&nested, &moved)?;
+                fs::create_dir(&nested)?;
+                fs::write(nested.join("file"), b"replacement")
+            },
+            fs_safety::sync_directory,
+        );
         assert!(result.is_err());
         assert_eq!(fs::read(moved.join("file")).unwrap(), b"base");
         assert_eq!(fs::read(nested.join("file")).unwrap(), b"replacement");
-        assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
+        assert!(
+            fs::read_dir(context.placement().directory().path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
     #[test]
     fn original_root_save_refuses_same_name_replacement_before_effects() {
@@ -922,10 +1073,25 @@ mod tests {
         fs::rename(&named, &moved).unwrap();
         fs::create_dir(&named).unwrap();
         fs::write(named.join("file"), b"newer").unwrap();
-        assert!(save_file_at(&root, Path::new("file"), "mine", blake3::hash(b"base"), true, &context).is_err());
+        assert!(
+            save_file_at(
+                &root,
+                Path::new("file"),
+                "mine",
+                blake3::hash(b"base"),
+                true,
+                &context
+            )
+            .is_err()
+        );
         assert_eq!(fs::read(moved.join("file")).unwrap(), b"base");
         assert_eq!(fs::read(named.join("file")).unwrap(), b"newer");
-        assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
+        assert!(
+            fs::read_dir(context.placement().directory().path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
     #[test]
     fn removed_holding_sync_failure_keeps_original_owner_in_both_outer_results() {
@@ -936,8 +1102,22 @@ mod tests {
             let outside = context.placement().directory().path().to_owned();
             FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.set(true));
             let _reset = ResetSync;
-            let result = save_file_with_hooks(&root, Path::new("file"), "mine", blake3::hash(b"base"), false, &context,
-                || if committed { Ok(()) } else { Err(io::Error::other("prepublication refusal")) }, fs_safety::sync_directory);
+            let result = save_file_with_hooks(
+                &root,
+                Path::new("file"),
+                "mine",
+                blake3::hash(b"base"),
+                false,
+                &context,
+                || {
+                    if committed {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other("prepublication refusal"))
+                    }
+                },
+                fs_safety::sync_directory,
+            );
             let authority = match result {
                 Ok(result) if committed => result.recovery_authority().unwrap().clone(),
                 Err(error) if !committed => error.recovery_authority().unwrap().clone(),
@@ -951,7 +1131,14 @@ mod tests {
             authority.retry().unwrap();
             assert!(authority.is_resolved());
             assert!(released.load(Ordering::Acquire));
-            assert_eq!(fs::read(directory.path().join("file")).unwrap(), if committed { &b"mine"[..] } else { &b"base"[..] });
+            assert_eq!(
+                fs::read(directory.path().join("file")).unwrap(),
+                if committed {
+                    &b"mine"[..]
+                } else {
+                    &b"base"[..]
+                }
+            );
         }
     }
     #[test]
@@ -959,11 +1146,27 @@ mod tests {
         let (directory, root) = fixture();
         let released = Arc::new(AtomicBool::new(false));
         let context = fixture_context_with_guard(&root, Closed(released.clone())).unwrap();
-        let result = save_file_with_hooks(&root, Path::new("file"), "mine", blake3::hash(b"base"), false, &context,
-            || Ok(()), |_| Err(io::Error::other("source parent sync refused"))).unwrap();
+        let result = save_file_with_hooks(
+            &root,
+            Path::new("file"),
+            "mine",
+            blake3::hash(b"base"),
+            false,
+            &context,
+            || Ok(()),
+            |_| Err(io::Error::other("source parent sync refused")),
+        )
+        .unwrap();
         assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"mine");
-        let authority = result.recovery_authority().expect("original source parent is still unsynced");
-        assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
+        let authority = result
+            .recovery_authority()
+            .expect("original source parent is still unsynced");
+        assert!(
+            fs::read_dir(context.placement().directory().path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
         drop(context);
         assert!(!released.load(Ordering::Acquire));
         authority.retry().unwrap();
@@ -972,17 +1175,36 @@ mod tests {
     }
     #[test]
     fn saved_executable_runs_while_cleanup_authority_is_still_pending() {
-        use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+        use crate::process::{
+            CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+        };
         let (directory, root) = fixture();
         fs::set_permissions(directory.path().join("file"), Permissions::from_mode(0o700)).unwrap();
         let context = fixture_context(&root).unwrap();
         FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.set(true));
         let _reset = ResetSync;
-        let result = save_file_at(&root, Path::new("file"), "#!/bin/sh\nprintf retained-save", blake3::hash(b"base"), false, &context).unwrap();
+        let result = save_file_at(
+            &root,
+            Path::new("file"),
+            "#!/bin/sh\nprintf retained-save",
+            blake3::hash(b"base"),
+            false,
+            &context,
+        )
+        .unwrap();
         let authority = result.recovery_authority().expect("real pending sync");
-        let output = SystemProcessExecutor.execute(
-            &CommandSpec::new(directory.path().join("file")).timeout(std::time::Duration::from_secs(5)), &CancellationToken::new()).unwrap();
-        assert!(output.success, "{}", String::from_utf8_lossy(&output.stderr));
+        let output = SystemProcessExecutor
+            .execute(
+                &CommandSpec::new(directory.path().join("file"))
+                    .timeout(std::time::Duration::from_secs(5)),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(
+            output.success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(output.stdout, b"retained-save");
         assert!(!authority.is_resolved());
         authority.retry().unwrap();

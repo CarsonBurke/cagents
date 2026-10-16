@@ -109,7 +109,14 @@ impl SessionCommand {
                             .sum::<usize>()
                     })
             }
-            Self::Request(request)=>request.args.queued_bytes()+request.observed_versions.keys().map(|uri|uri.as_str().len()+4).sum::<usize>(),
+            Self::Request(request) => {
+                request.args.queued_bytes()
+                    + request
+                        .observed_versions
+                        .keys()
+                        .map(|uri| uri.as_str().len() + 4)
+                        .sum::<usize>()
+            }
             _ => 0,
         }
     }
@@ -315,7 +322,9 @@ mod tests {
                 kind: RequestKind::Hover,
                 position: lsp_types::Position::new(0, 0),
                 version: 1,
-                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: Arc::new(HashMap::new()),
+                args: RequestArgs::None,
+                timeout: Duration::from_secs(15),
+                observed_versions: Arc::new(HashMap::new()),
             }),
             SessionCommand::Close {
                 doc: LspDocumentId(1),

@@ -21,11 +21,12 @@ impl ReadRoot {
         markers: &[String],
     ) -> Result<Arc<Self>, String> {
         if original.path() != worktree || !path.starts_with(worktree) {
-            return Err("the editor's retained root does not match this document's worktree".into());
+            return Err(
+                "the editor's retained root does not match this document's worktree".into(),
+            );
         }
-        let original_identity = RootIdentity::from_metadata(
-            &original.metadata().map_err(|error| error.to_string())?,
-        );
+        let original_identity =
+            RootIdentity::from_metadata(&original.metadata().map_err(|error| error.to_string())?);
         verify_named(worktree, original_identity).map_err(refusal)?;
         let root = discover_root(path, worktree, markers);
         let relative = root.strip_prefix(worktree).map_err(|_| {
@@ -34,11 +35,12 @@ impl ReadRoot {
         let directory = if relative.as_os_str().is_empty() {
             Arc::clone(&original)
         } else {
-            Arc::new(open_directory_beneath(&original, relative).map_err(|error| error.to_string())?)
+            Arc::new(
+                open_directory_beneath(&original, relative).map_err(|error| error.to_string())?,
+            )
         };
-        let directory_identity = RootIdentity::from_metadata(
-            &directory.metadata().map_err(|error| error.to_string())?,
-        );
+        let directory_identity =
+            RootIdentity::from_metadata(&directory.metadata().map_err(|error| error.to_string())?);
         let binding = Arc::new(Self {
             original,
             directory,
@@ -94,7 +96,9 @@ impl ReadRoot {
 }
 
 fn refusal(error: io::Error) -> String {
-    format!("the original editor worktree changed; reopen the document before starting its language server: {error}")
+    format!(
+        "the original editor worktree changed; reopen the document before starting its language server: {error}"
+    )
 }
 
 fn verify_named(path: &Path, identity: RootIdentity) -> io::Result<()> {

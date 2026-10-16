@@ -1,8 +1,15 @@
 //! Window custody of the producer's existing recovery authority. No new
 //! reservation, reconstructed filesystem operation, or Drop I/O occurs here.
 use crate::recovery_authority::RecoveryAuthority;
-use std::{collections::{BTreeSet, BTreeMap}, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}};
 use cosmic::{Element, iced::Task, widget};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 pub type Shared = Arc<Mutex<State>>;
 
@@ -32,37 +39,77 @@ pub struct OperationTicket {
     state: Shared,
     id: Option<uuid::Uuid>,
 }
-pub fn begin_operation(state: &Shared, scope: PathBuf, root: Arc<crate::fs_safety::Root>) -> Result<OperationTicket, String> {
-    let mut store = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+pub fn begin_operation(
+    state: &Shared,
+    scope: PathBuf,
+    root: Arc<crate::fs_safety::Root>,
+) -> Result<OperationTicket, String> {
+    let mut store = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if store.operations.len() >= 32 || store.blocks(&scope) {
-        return Err("Resolve or finish earlier file operations before changing files in this worktree.".into());
+        return Err(
+            "Resolve or finish earlier file operations before changing files in this worktree."
+                .into(),
+        );
     }
     let id = uuid::Uuid::new_v4();
-    store.operations.insert(id, PendingOperation { scope, started: false, interrupted: false, _root: root });
-    Ok(OperationTicket { state: state.clone(), id: Some(id) })
+    store.operations.insert(
+        id,
+        PendingOperation {
+            scope,
+            started: false,
+            interrupted: false,
+            _root: root,
+        },
+    );
+    Ok(OperationTicket {
+        state: state.clone(),
+        id: Some(id),
+    })
 }
 impl OperationTicket {
     pub(crate) fn start(&self) {
         if let Some(id) = self.id {
-            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(operation) = state.operations.get_mut(&id) { operation.started = true; }
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(operation) = state.operations.get_mut(&id) {
+                operation.started = true;
+            }
         }
     }
     pub(crate) fn finish(mut self, authority: Option<RecoveryAuthority>) {
-        let Some(id) = self.id.take() else { return; };
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(operation) = state.operations.remove(&id)
             && let Some(authority) = authority
-        { state.retain(Some(operation.scope), authority); }
+        {
+            state.retain(Some(operation.scope), authority);
+        }
     }
 }
 impl Drop for OperationTicket {
     fn drop(&mut self) {
-        let Some(id) = self.id else { return; };
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(id) = self.id else {
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(operation) = state.operations.get_mut(&id) {
-            if operation.started { operation.interrupted = true; }
-            else { state.operations.remove(&id); }
+            if operation.started {
+                operation.interrupted = true;
+            } else {
+                state.operations.remove(&id);
+            }
         }
     }
 }
@@ -70,7 +117,10 @@ impl Drop for OperationTicket {
 #[derive(Debug, Clone)]
 pub enum Action {
     Retry(RecoveryAuthority),
-    Finished { receipt: RetryReceipt, result: Result<(), String> },
+    Finished {
+        receipt: RetryReceipt,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -80,16 +130,22 @@ pub struct RetryReceipt {
 }
 struct RetryGuard(Arc<AtomicBool>);
 impl Drop for RetryGuard {
-    fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 impl State {
     fn retry_running(&self) -> bool {
-        self.pending.as_ref().is_some_and(|receipt| !receipt.done.load(Ordering::Acquire))
+        self.pending
+            .as_ref()
+            .is_some_and(|receipt| !receipt.done.load(Ordering::Acquire))
     }
     /// Call before logical routing, including stale or missing pane returns.
     pub fn retain(&mut self, scope: Option<PathBuf>, authority: RecoveryAuthority) {
-        if authority.is_resolved() { return; }
+        if authority.is_resolved() {
+            return;
+        }
         if !self.authority_pending() {
             self.authority = None;
             self.scopes.clear();
@@ -100,26 +156,44 @@ impl State {
             None => authority,
         });
         match scope {
-            Some(scope) if self.scopes.len() < 32 || self.scopes.contains(&scope) => { self.scopes.insert(scope); }
+            Some(scope) if self.scopes.len() < 32 || self.scopes.contains(&scope) => {
+                self.scopes.insert(scope);
+            }
             _ => self.unknown_scope = true,
         }
-        self.message = format!("A file operation needs recovery. {}", self.authority.as_ref().unwrap().description());
+        self.message = format!(
+            "A file operation needs recovery. {}",
+            self.authority.as_ref().unwrap().description()
+        );
     }
     fn authority_pending(&self) -> bool {
-        self.authority.as_ref().is_some_and(|authority| !authority.is_resolved())
+        self.authority
+            .as_ref()
+            .is_some_and(|authority| !authority.is_resolved())
     }
     pub fn is_pending(&self) -> bool {
         self.authority_pending() || !self.operations.is_empty()
     }
     pub fn blocks(&self, scope: &Path) -> bool {
         (self.authority_pending() && (self.unknown_scope || self.scopes.contains(scope)))
-            || self.operations.values().any(|operation| operation.scope == scope)
+            || self
+                .operations
+                .values()
+                .any(|operation| operation.scope == scope)
     }
     pub fn update(&mut self, action: Action) -> Task<Action> {
         match action {
             Action::Retry(authority) => {
-                if self.authority.as_ref() != Some(&authority) || self.retry_running() || authority.is_resolved() { return Task::none(); }
-                let receipt = RetryReceipt { authority, done: Arc::new(AtomicBool::new(false)) };
+                if self.authority.as_ref() != Some(&authority)
+                    || self.retry_running()
+                    || authority.is_resolved()
+                {
+                    return Task::none();
+                }
+                let receipt = RetryReceipt {
+                    authority,
+                    done: Arc::new(AtomicBool::new(false)),
+                };
                 let guard = RetryGuard(receipt.done.clone());
                 self.pending = Some(receipt.clone());
                 cosmic::task::future(async move {
@@ -127,12 +201,21 @@ impl State {
                     let result = tokio::task::spawn_blocking(move || {
                         let _guard = guard;
                         worker.retry()
-                    }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
                     Action::Finished { receipt, result }
                 })
             }
             Action::Finished { receipt, result } => {
-                if !self.pending.as_ref().is_some_and(|pending| Arc::ptr_eq(&pending.done, &receipt.done)) { return Task::none(); }
+                if !self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(&pending.done, &receipt.done))
+                {
+                    return Task::none();
+                }
                 self.pending = None;
                 if !self.authority_pending() {
                     self.authority = None;
@@ -142,7 +225,12 @@ impl State {
                 } else {
                     self.message = match result {
                         Ok(()) => "Another retained operation still needs recovery.".into(),
-                        Err(error) => format!("Recovery is still pending; original files were kept. {error}").chars().take(4096).collect(),
+                        Err(error) => {
+                            format!("Recovery is still pending; original files were kept. {error}")
+                                .chars()
+                                .take(4096)
+                                .collect()
+                        }
                     };
                 }
                 Task::none()
@@ -152,37 +240,67 @@ impl State {
     pub fn view(&self) -> Element<'static, Action> {
         let authority = self.authority.as_ref().filter(|_| self.authority_pending());
         if authority.is_none() && self.operations.is_empty() {
-            return widget::Space::new().height(cosmic::iced::Length::Shrink).into();
+            return widget::Space::new()
+                .height(cosmic::iced::Length::Shrink)
+                .into();
         }
-        let message = if authority.is_some() { self.message.clone() }
-        else if self.operations.values().any(|operation| operation.interrupted) {
+        let message = if authority.is_some() {
+            self.message.clone()
+        } else if self
+            .operations
+            .values()
+            .any(|operation| operation.interrupted)
+        {
             "A file operation did not report a result. Closing is blocked because its disk state is unknown.".into()
-        } else { "Finishing file operations…".into() };
-        let mut controls = vec![crate::design::body(message).width(cosmic::iced::Length::Fill).into()];
+        } else {
+            "Finishing file operations…".into()
+        };
+        let mut controls = vec![
+            crate::design::body(message)
+                .width(cosmic::iced::Length::Fill)
+                .into(),
+        ];
         if let Some(authority) = authority {
-            controls.push(crate::ui_controls::button::secondary("Retry file recovery")
-                .on_press_maybe((!self.retry_running()).then(|| Action::Retry(authority.clone()))).into());
+            controls.push(
+                crate::ui_controls::button::secondary("Retry file recovery")
+                    .on_press_maybe(
+                        (!self.retry_running()).then(|| Action::Retry(authority.clone())),
+                    )
+                    .into(),
+            );
         }
         widget::container(widget::row::with_children(controls).spacing(crate::design::space::S))
-            .padding(crate::design::space::M).width(cosmic::iced::Length::Fill).into()
+            .padding(crate::design::space::M)
+            .width(cosmic::iced::Length::Fill)
+            .into()
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::recovery_authority::RecoverySlot;
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     fn leaf(ready: Arc<AtomicBool>) -> RecoveryAuthority {
-        RecoverySlot::reserve().unwrap().retain("original fixture".into(), move || {
-            if ready.load(Ordering::Acquire) { Ok(()) } else { Err("original artifact remains".into()) }
-        })
+        RecoverySlot::reserve()
+            .unwrap()
+            .retain("original fixture".into(), move || {
+                if ready.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err("original artifact remains".into())
+                }
+            })
     }
     async fn finish(state: &mut State, task: Task<Action>) {
         use cosmic::iced::futures::StreamExt;
         if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
-            while let Some(cosmic::iced::runtime::Action::Output(action)) = stream.next().await { drop(state.update(action)); }
+            while let Some(cosmic::iced::runtime::Action::Output(action)) = stream.next().await {
+                drop(state.update(action));
+            }
         }
     }
     #[test]
