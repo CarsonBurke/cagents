@@ -100,6 +100,19 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
     {
         return Err("Worktree repository changed".into());
     }
+    let admin = service
+        .git_dir(&request.path, &cancellation)
+        .map_err(|error| error.to_string())?;
+    let checkout_root =
+        crate::fs_safety::Root::open(&request.path).map_err(|error| error.to_string())?;
+    let admin_root = crate::fs_safety::Root::open(&admin).map_err(|error| error.to_string())?;
+    let common_root = crate::fs_safety::Root::open(&common).map_err(|error| error.to_string())?;
+    crate::worktree_branch::registered_heads::check_checkout_binding(
+        &checkout_root,
+        &admin_root,
+        &common_root,
+        record,
+    )?;
     let source =
         crate::github::worktree_head_repository(&request.path, &request.branch, &cancellation)
             .ok_or("Worktree source repository is unknown")?;
@@ -107,10 +120,25 @@ fn checked_record(request: &RemovalRequest) -> Result<crate::repository::Worktre
         return Err("Worktree source repository changed".into());
     }
     let status = service
-        .status(&request.path, &cancellation)
+        .status_for_removal(&request.path, &cancellation)
         .map_err(|error| error.to_string())?;
     if status.untracked_omitted || status.dirty.is_dirty() || !status.entries.is_empty() {
         return Err("Worktree has changes or untracked files".into());
+    }
+    let ignored = service
+        .notable_ignored_files(&request.path, &cancellation)
+        .map_err(|error| error.to_string())?;
+    if !ignored.is_empty() {
+        let examples = ignored
+            .iter()
+            .take(5)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "Worktree kept: {} non-disposable ignored file(s): {examples}",
+            ignored.len()
+        ));
     }
     Ok(record.clone())
 }
@@ -424,6 +452,12 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
     acquire(&crate::instance::runtime_directory()?, directory, false).map(Some)
 }
 
+/// Hold the original directory identity's exclusive protection for confirmed removal.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub fn removal_protection(directory: &Path) -> io::Result<Protection> {
+    acquire(&crate::instance::runtime_directory()?, directory, true)
+}
+
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
 #[derive(Default)]
@@ -666,7 +700,8 @@ mod tests {
         };
         git(&repository, &["init", "-b", "main"]);
         std::fs::write(repository.join("tracked"), "original").unwrap();
-        git(&repository, &["add", "tracked"]);
+        std::fs::write(repository.join(".gitignore"), ".env\ntarget/\n").unwrap();
+        git(&repository, &["add", "tracked", ".gitignore"]);
         git(
             &repository,
             &[
@@ -703,6 +738,66 @@ mod tests {
         request.repository = repository.clone();
         request.path = worktree.clone();
         request.head_oid = git(&worktree, &["rev-parse", "HEAD"]);
+        checked_record(&request).unwrap();
+        let sibling = directory.path().join("sibling");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                sibling.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let original_locator = std::fs::read(worktree.join(".git")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            std::fs::read(sibling.join(".git")).unwrap(),
+        )
+        .unwrap();
+        let refusal = PreparedRemoval::prepare(request.clone()).err()
+            .expect("automatic preparation must reject a sibling admin substituted for the selected checkout");
+        assert!(refusal.contains("backlink disagree"), "{refusal}");
+        assert!(worktree.exists() && sibling.exists());
+        std::fs::write(worktree.join(".git"), original_locator).unwrap();
+        checked_record(&request).unwrap();
+        std::fs::write(worktree.join(".env"), "private fixture secret").unwrap();
+        let error = checked_record(&request).unwrap_err();
+        assert!(error.contains("non-disposable ignored"), "{error}");
+        let prepare_refusal = PreparedRemoval::prepare(request.clone())
+            .err()
+            .expect("the real cleanup preparation must refuse ignored user data before removal");
+        assert!(
+            prepare_refusal.contains("non-disposable ignored"),
+            "{prepare_refusal}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(".env")).unwrap(),
+            "private fixture secret"
+        );
+        std::fs::remove_file(worktree.join(".env")).unwrap();
+        std::fs::create_dir_all(worktree.join("target/nested")).unwrap();
+        std::fs::write(worktree.join("target/nested/build-artifact"), "disposable").unwrap();
+        checked_record(&request).unwrap();
+        let service = crate::repository::RepositoryService::system("git");
+        let cancellation = crate::process::CancellationToken::new();
+        service
+            .set_disposable_ignored_directories(&worktree, &[], &cancellation)
+            .unwrap();
+        assert!(
+            checked_record(&request)
+                .unwrap_err()
+                .contains("non-disposable ignored")
+        );
+        service
+            .set_disposable_ignored_directories(
+                &worktree,
+                &crate::repository::default_disposable_ignored_directories(),
+                &cancellation,
+            )
+            .unwrap();
         checked_record(&request).unwrap();
         std::fs::write(worktree.join("tracked"), "changed").unwrap();
         assert!(checked_record(&request).is_err());

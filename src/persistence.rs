@@ -1919,7 +1919,8 @@ impl StateStore {
     /// Forgets an applied worktree creation, freeing its identity for a new
     /// one. Only an applied creation can be forgotten: anything unresolved
     /// still has effects to reconcile, and a rolled-back one holds nothing.
-    pub fn release_worktree_creation(&self, id: OperationId) -> Result<()> {
+    #[cfg(test)]
+    fn release_worktree_creation(&self, id: OperationId) -> Result<()> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
         let changed = inner.connection.execute(
@@ -1969,11 +1970,11 @@ impl StateStore {
     }
 
     pub fn operations_requiring_reconciliation(&self) -> Result<Vec<PendingOperation>> {
-        self.operation_rows(true, None)
+        self.operation_rows(true, None, None)
     }
 
     pub fn journaled_worktree_operations(&self) -> Result<Vec<PendingOperation>> {
-        self.operation_rows(false, None)
+        self.operation_rows(false, None, None)
     }
 
     /// Read one creation without loading every retained journal into memory.
@@ -1981,13 +1982,69 @@ impl StateStore {
         &self,
         id: OperationId,
     ) -> Result<Option<PendingOperation>> {
-        Ok(self.operation_rows(false, Some(id))?.into_iter().next())
+        Ok(self
+            .operation_rows(false, Some(id), None)?
+            .into_iter()
+            .next())
+    }
+
+    /// Bounded descriptive snapshot before deletion. Overflow retains metadata
+    /// rather than turning a partial list into permission to retire more rows.
+    pub(crate) fn worktree_creation_retirement_candidates(&self) -> Result<Vec<PendingOperation>> {
+        const LIMIT: usize = 4096;
+        let rows = self.operation_rows(false, None, Some(LIMIT + 1))?;
+        if rows.len() > LIMIT {
+            return Err(StoreError::InvalidState(
+                "Too many retained creation receipts; metadata was kept".into(),
+            ));
+        }
+        Ok(rows)
+    }
+
+    /// Retire only the exact applied row captured before the known removal.
+    /// A later creation, update or replacement is never adopted by its path.
+    pub(crate) fn release_captured_worktree_creation(
+        &self,
+        expected: &PendingOperation,
+    ) -> Result<()> {
+        if expected.entity_kind != "worktree_creation"
+            || expected.status != PendingOperationStatus::Applied
+        {
+            return Err(StoreError::InvalidState(
+                "The captured row is not an applied worktree creation".into(),
+            ));
+        }
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let changed = inner.connection.execute(
+            "DELETE FROM pending_operations WHERE operation_id=?1 AND entity_kind=?2
+             AND entity_id=?3 AND action=?4 AND base_generation=?5 AND payload_json=?6
+             AND status='applied' AND created_at_unix_ms=?7 AND updated_at_unix_ms=?8",
+            params![
+                expected.id.to_string(),
+                expected.entity_kind,
+                expected.entity_id,
+                expected.action,
+                u64_to_i64(expected.base_generation, "operation base generation")?,
+                to_json(&expected.payload)?,
+                expected.created_at_unix_ms,
+                expected.updated_at_unix_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "Captured creation {} changed or was already retired; metadata was kept",
+                expected.id
+            )));
+        }
+        Ok(())
     }
 
     fn operation_rows(
         &self,
         unresolved_only: bool,
         id: Option<OperationId>,
+        limit: Option<usize>,
     ) -> Result<Vec<PendingOperation>> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
@@ -1998,10 +2055,14 @@ impl StateStore {
              WHERE ((?1 AND status IN ('pending', 'needs_reconciliation'))
                 OR (NOT ?1 AND entity_kind = 'worktree_creation'))
                 AND (?2 IS NULL OR operation_id = ?2)
-             ORDER BY created_at_unix_ms, operation_id",
+             ORDER BY created_at_unix_ms, operation_id LIMIT ?3",
         )?;
         let rows = statement.query_map(
-            params![unresolved_only, id.map(|id| id.to_string())],
+            params![
+                unresolved_only,
+                id.map(|id| id.to_string()),
+                limit.map(|limit| limit as i64).unwrap_or(-1)
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,

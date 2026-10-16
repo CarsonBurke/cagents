@@ -140,3 +140,247 @@ fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
     }
     Ok(children)
 }
+
+/// Proof available only after the dedicated sole reaper has no children.
+/// A root exit or an empty process census cannot construct this receipt.
+pub(crate) struct ReapedFamily(());
+
+/// Kill/reap children of a dedicated single-threaded subreaper. Never call in
+/// the daemon. Orphans of killed children become this owner's children, so
+/// repeated pinned direct-child passes cover detached sessions without PGIDs.
+pub(crate) fn terminate_owned_family(deadline: Instant) -> io::Result<Option<ReapedFamily>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut subreaper = 0i32;
+    if unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &raw mut subreaper, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if subreaper != 1
+        || std::fs::read_dir("/proc/self/task")?
+            .collect::<io::Result<Vec<_>>>()?
+            .len()
+            != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Family cleanup requires its dedicated single-threaded subreaper",
+        ));
+    }
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        for pid in direct_children()? {
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if descriptor < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    continue;
+                }
+                return Err(error);
+            }
+            let descriptor = unsafe { std::fs::File::from_raw_fd(descriptor as i32) };
+            // This helper is the only reaper. The child cannot recycle its PID
+            // between the kernel's children snapshot and opening its pidfd.
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    descriptor.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            } < 0
+            {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+        match drain_children_until(deadline, |_| {})? {
+            ChildDrain::Empty => return Ok(Some(ReapedFamily(()))),
+            ChildDrain::Expired => return Ok(None),
+            ChildDrain::Pending => {}
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(None);
+        };
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChildDrain {
+    Empty,
+    Pending,
+    Expired,
+}
+
+// Only the dedicated owner may wait for all its children. An uninterrupted
+// stream of completed descendants or EINTR must not extend its caller's budget.
+fn drain_children_until(deadline: Instant, reaped: impl FnMut(i32)) -> io::Result<ChildDrain> {
+    drain_children_with(
+        deadline,
+        || {
+            let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            if pid < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(pid)
+            }
+        },
+        Instant::now,
+        reaped,
+    )
+}
+
+fn drain_children_with(
+    deadline: Instant,
+    mut wait: impl FnMut() -> io::Result<i32>,
+    mut now: impl FnMut() -> Instant,
+    mut reaped: impl FnMut(i32),
+) -> io::Result<ChildDrain> {
+    loop {
+        if now() >= deadline {
+            return Ok(ChildDrain::Expired);
+        }
+        let observed = wait();
+        // A positive wait already consumed this child's status. Record that
+        // fact even if the syscall returned after its caller's deadline.
+        if let Ok(pid) = &observed {
+            if *pid > 0 {
+                reaped(*pid);
+            }
+        }
+        if now() >= deadline {
+            return Ok(ChildDrain::Expired);
+        }
+        match observed {
+            Ok(pid) if pid > 0 => {}
+            Ok(0) => return Ok(ChildDrain::Pending),
+            Ok(_) => return Err(io::Error::other("Invalid owned-child wait result")),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                return Ok(ChildDrain::Empty);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn repeated_positive_waits_stop_at_the_original_deadline() {
+        let start = Instant::now();
+        let elapsed = Cell::new(0);
+        let mut observed = Vec::new();
+        let result = drain_children_with(
+            start + Duration::from_millis(3),
+            || {
+                elapsed.set(elapsed.get() + 1);
+                Ok(elapsed.get())
+            },
+            || start + Duration::from_millis(elapsed.get() as u64),
+            |pid| observed.push(pid),
+        )
+        .unwrap();
+        assert_eq!(result, ChildDrain::Expired);
+        // The final positive status was actually consumed; leader bookkeeping
+        // must survive expiry instead of retaining a stale original Child.
+        assert_eq!(observed, [1, 2, 3]);
+    }
+
+    #[test]
+    fn repeated_interrupted_waits_stop_at_the_original_deadline() {
+        let start = Instant::now();
+        let elapsed = Cell::new(0);
+        let result = drain_children_with(
+            start + Duration::from_millis(3),
+            || {
+                elapsed.set(elapsed.get() + 1);
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            },
+            || start + Duration::from_millis(elapsed.get()),
+            |_| panic!("interrupted waits cannot consume a child"),
+        )
+        .unwrap();
+        assert_eq!(result, ChildDrain::Expired);
+        assert_eq!(elapsed.get(), 3);
+    }
+
+    #[test]
+    fn no_children_after_expiry_does_not_produce_cleanup_proof() {
+        let start = Instant::now();
+        let elapsed = Cell::new(false);
+        let result = drain_children_with(
+            start + Duration::from_millis(1),
+            || {
+                elapsed.set(true);
+                Err(io::Error::from_raw_os_error(libc::ECHILD))
+            },
+            || start + Duration::from_millis(u64::from(elapsed.get())),
+            |_| unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(result, ChildDrain::Expired);
+    }
+
+    #[test]
+    fn only_no_children_before_expiry_completes_the_drain() {
+        let now = Instant::now();
+        for (wait, expected) in [
+            (Ok(0), ChildDrain::Pending),
+            (
+                Err(io::Error::from_raw_os_error(libc::ECHILD)),
+                ChildDrain::Empty,
+            ),
+        ] {
+            let mut wait = Some(wait);
+            assert_eq!(
+                drain_children_with(
+                    now + Duration::from_secs(1),
+                    || wait.take().unwrap(),
+                    || now,
+                    |_| unreachable!()
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn failed_wait_is_not_empty_family_proof() {
+        let now = Instant::now();
+        let error = drain_children_with(
+            now + Duration::from_secs(1),
+            || Err(io::Error::from_raw_os_error(libc::EACCES)),
+            || now,
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+    }
+
+    #[test]
+    fn expired_deadline_does_not_attempt_another_wait() {
+        let now = Instant::now();
+        assert_eq!(
+            drain_children_with(
+                now,
+                || panic!("expired wait attempted"),
+                || now,
+                |_| unreachable!()
+            )
+            .unwrap(),
+            ChildDrain::Expired
+        );
+    }
+}

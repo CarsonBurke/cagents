@@ -362,6 +362,12 @@ pub(super) fn process_request(
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
+    if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::Worktree { operation },
+    } = &request
+    {
+        return super::worktree_requests::process(host, client_id, operation.clone());
+    }
     let gate = control_gate(host);
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
@@ -379,15 +385,13 @@ pub(super) fn process_request(
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
                 super::account_lifecycle::ensure_idle(host)?;
-                prepared
-                    .remove(|windows| {
-                        host.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .allow_automatic_worktree_cleanup(client_id, windows)
-                    })
-                    .ok()
+                prepared.remove(|windows| {
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .allow_automatic_worktree_cleanup(client_id, windows)
+                })
             }
-            Err(_) => None,
+            Err(error) => Err(error),
         };
         return Ok((
             ServerResponse::DeviceOperation {

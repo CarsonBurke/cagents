@@ -48,6 +48,8 @@ use crossbeam_channel::{Receiver, Sender};
 use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+pub(super) mod release;
+
 use super::{ChildExit, close_processes::signal};
 use crate::terminal::{
     SPAWN_START_TIMEOUT as START_TIMEOUT,
@@ -58,7 +60,7 @@ use crate::terminal::{
 /// word a test filter or a person would type.
 const ARGUMENT: &str = "--cagents-terminal-holder";
 /// Protocol 1 holders could not be detached.
-const PROTOCOL: u32 = 4;
+const PROTOCOL: u32 = 5;
 /// The holders a daemon can adopt: any that speak detaching.
 const ADOPTABLE: std::ops::RangeInclusive<u32> = 2..=PROTOCOL;
 /// A spawn request carries the root's whole environment; nothing legitimate
@@ -95,6 +97,11 @@ enum Request {
         size: PtySize,
         #[serde(default)]
         recovery: Option<Recovery>,
+        /// Exactly one SCM_RIGHTS directory descriptor accompanies this spawn.
+        #[serde(default)]
+        anchored_directory: bool,
+        #[serde(default)]
+        setup_lease_identity: Option<(u64, u64)>,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -127,6 +134,8 @@ enum Request {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Report {
+    /// The dedicated holder has reaped every owned descendant.
+    CleanupProved,
     ScreenCached,
     AdoptionCommitted,
     /// Carries the PTY master, then a pidfd for the root.
@@ -180,12 +189,82 @@ pub(super) fn spawn(
     spawn_recoverable(command, size, exits, None)
 }
 
+fn validate_execution_directory(directory: &File) -> Result<(), String> {
+    let metadata = directory
+        .metadata()
+        .map_err(|error| format!("inspect terminal working directory: {error}"))?;
+    if !metadata.is_dir() || metadata.nlink() == 0 {
+        return Err("The terminal's verified working directory is no longer available".into());
+    }
+    Ok(())
+}
+
 pub(super) fn spawn_recoverable(
     command: CommandBuilder,
     size: PtySize,
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Held, String> {
+    spawn_recoverable_at_directory(command, size, exits, recovery, None)
+}
+
+pub(super) fn spawn_recoverable_with_setup_lease(
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    setup_lease: Option<std::sync::Arc<File>>,
+) -> Result<Held, String> {
+    spawn_recoverable_with_authority(command, size, exits, recovery, None, setup_lease)
+}
+
+pub(super) fn spawn_recoverable_at_directory(
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    directory: Option<std::sync::Arc<File>>,
+) -> Result<Held, String> {
+    spawn_recoverable_with_authority(command, size, exits, recovery, directory, None)
+}
+
+fn setup_lease_identity(file: &File) -> Result<(u64, u64), String> {
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err("Invalid setup execution lease descriptor".into());
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "Setup execution lease is unavailable: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+pub(super) fn spawn_recoverable_with_authority(
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    directory: Option<std::sync::Arc<File>>,
+    setup_lease: Option<std::sync::Arc<File>>,
+) -> Result<Held, String> {
+    let cleanup_source = recovery
+        .as_ref()
+        .map(|recovery| registry::cleanup::SourceReceipt::capture(&recovery.source))
+        .transpose()?;
+    if let Some(directory) = &directory {
+        validate_execution_directory(directory)?;
+    }
+    let setup_lease_identity = setup_lease
+        .as_ref()
+        .map(|file| setup_lease_identity(file))
+        .transpose()?;
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
     std::hint::black_box(&SERVE);
@@ -218,22 +297,55 @@ pub(super) fn spawn_recoverable(
     crate::host::descriptor_limit::inherit(&mut process);
     // `/proc/self/exe` runs this image even after an upgrade has replaced the
     // file it was loaded from, so a holder always matches its daemon.
+    let child_reaping = match crate::daemon::child_reaper::reserve() {
+        Ok(reservation) => reservation,
+        Err(error) if error.kind() != io::ErrorKind::WouldBlock => {
+            // Explicit new-helper admission can retry only original children
+            // whose existing descriptors still validate. Unknown owners stay
+            // suspended; no replacement pidfd is opened by a remembered PID.
+            let recovered = crate::daemon::child_reaper::retry_preserved().map_err(|reason| {
+                format!("Terminal helper cleanup remains unavailable: {reason}")
+            })?;
+            if recovered.retained != 0 {
+                return Err(format!(
+                    "{} original terminal helper owner(s) remain unconfirmed; retain their state and restart the daemon to recover",
+                    recovered.retained
+                ));
+            }
+            crate::daemon::child_reaper::reserve()
+                .map_err(|reason| format!("Reserve terminal holder cleanup: {reason}"))?
+        }
+        Err(error) => return Err(format!("Reserve terminal holder cleanup: {error}")),
+    };
     let process = process
         .spawn()
         .map_err(|error| format!("start terminal holder: {error}"))?;
     drop(remote);
     // The holder is this daemon's unreaped child until `Holder` reaps it.
     let pidfd = open_pidfd(process.id() as libc::pid_t);
-    let mut holder = Holder::new(control, Some(process));
+    let mut holder = Holder::new(
+        control,
+        Some(OwnedChild {
+            child: process,
+            reservation: child_reaping,
+        }),
+    );
     let registered_id = recovery.as_ref().map(|recovery| recovery.source.id);
-    let owner = registry::Process::read(holder.process.as_ref().unwrap().id() as i32)
-        .map_err(|error| error.to_string())?;
     holder.registered = recovery.is_some();
+    holder.cleanup_source = cleanup_source;
     holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
+    let owner = registry::Process::read(holder.process.as_ref().unwrap().child.id() as i32)
+        .map_err(|error| error.to_string())?;
 
     let command = postcard::to_stdvec(&command)
         .map(|command| STANDARD.encode(command))
         .map_err(|error| format!("encode terminal command: {error}"))?;
+    // Typed wire order: directory first, setup lease second.
+    let directory_descriptors: Vec<RawFd> = directory
+        .iter()
+        .chain(setup_lease.iter())
+        .map(|file| file.as_raw_fd())
+        .collect();
     let started = holder
         .control
         .set_read_timeout(Some(START_TIMEOUT))
@@ -245,8 +357,10 @@ pub(super) fn spawn_recoverable(
                     command,
                     size,
                     recovery,
+                    anchored_directory: directory.is_some(),
+                    setup_lease_identity,
                 },
-                &[],
+                &directory_descriptors,
             )
         })
         .and_then(|()| receive::<Report>(&holder.control))
@@ -313,6 +427,10 @@ pub(super) fn adopt_recoverable(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Adopted, String> {
+    let cleanup_source = recovery
+        .as_ref()
+        .map(|recovery| registry::cleanup::SourceReceipt::capture(&recovery.source))
+        .transpose()?;
     let evidence = registry::evidence(socket)?;
     let failed =
         |error: io::Error| format!("adopt terminal holder at {}: {error}", socket.display());
@@ -392,6 +510,7 @@ pub(super) fn adopt_recoverable(
     holder.adoption_pending = evidence.is_some();
     holder.registered = evidence.is_some();
     holder.record = evidence;
+    holder.cleanup_source = cleanup_source;
     holder.screen_lost = screen_lost;
     Ok(Adopted {
         held: watched(holder, pid, descriptors, exited, exits)?,
@@ -417,6 +536,8 @@ fn watched(
         let _ = exits.try_send(Ok(exit_status(wait_status)));
     }
     let (acknowledge, acknowledged) = crossbeam_channel::bounded(1);
+    let (cleanup, cleanup_acknowledged) = crossbeam_channel::bounded(1);
+    holder.cleanup = Some(cleanup_acknowledged);
     holder.acknowledged = Some(acknowledged);
     let reader = holder
         .control
@@ -433,6 +554,7 @@ fn watched(
         released,
         exits,
         acknowledge,
+        cleanup,
         exited.is_some(),
     )?;
     holder.release = Some(release);
@@ -449,13 +571,25 @@ fn exit_status(wait_status: libc::c_int) -> ExitStatus {
     ExitStatus::from(std::process::ExitStatus::from_raw(wait_status))
 }
 
+/// Initialize fixed cleanup services before measuring daemon readiness.
+pub(super) fn initialize_cleanup() -> Result<(), String> {
+    // Warm the fixed original-child reaper without starting any child.
+    drop(crate::daemon::child_reaper::reserve().map_err(|error| error.to_string())?);
+    release::initialize()
+}
+
+struct OwnedChild {
+    child: Child,
+    reservation: crate::daemon::child_reaper::Reservation,
+}
+
 /// The daemon's end of a holder: its control socket and its process.
 /// Dropping it releases the holder, unless the holder was detached.
 pub(super) struct Holder {
     control: UnixStream,
     /// A holder this daemon started is its child, which it reaps. An adopted
     /// holder's parent is whoever inherited it from the daemon that started it.
-    process: Option<Child>,
+    process: Option<OwnedChild>,
     pidfd: Option<File>,
     protocol: u32,
     watch: Option<Watch>,
@@ -463,21 +597,173 @@ pub(super) struct Holder {
     release: Option<std::io::PipeWriter>,
     /// The holder's answer to a detach, relayed by the watch.
     acknowledged: Option<Receiver<Result<(), String>>>,
+    /// Only Report::CleanupProved may satisfy this channel.
+    cleanup: Option<Receiver<()>>,
     detached: bool,
     adoption_pending: bool,
     registered: bool,
     screen_lost: bool,
     cleanup_proved: bool,
+    release_requested: bool,
+    cleanup_acknowledged: bool,
     record: Option<Record>,
+    cleanup_source: Option<registry::cleanup::SourceReceipt>,
 }
 
 impl Holder {
+    pub(super) fn proves_family_on_exit(&self) -> bool {
+        self.protocol >= 5
+    }
     pub(super) fn record(&self) -> Option<&Record> {
         self.record.as_ref()
     }
     pub(super) fn prove_cleanup(&mut self) {
         self.cleanup_proved = true;
     }
+    pub(super) fn close_until(&mut self, deadline: Instant) -> Result<(), String> {
+        if self.detached || self.adoption_pending {
+            return Err("Terminal holder is retained for authenticated adoption".into());
+        }
+        if self.protocol < 5 {
+            return Err("This terminal holder predates verified descendant cleanup; retain it for upgrade recovery".into());
+        }
+        if self.reconcile_cleanup_receipt(deadline)? {
+            self.cleanup_acknowledged = true;
+            self.release_requested = true;
+            return self.finish_cleanup();
+        }
+        let attempt = (|| -> Result<(), String> {
+            if !self.release_requested {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or("Terminal cleanup deadline expired")?;
+                self.control
+                    .set_write_timeout(Some(remaining))
+                    .map_err(|error| error.to_string())?;
+                send(&self.control, &Request::ReleaseProved, &[])
+                    .map_err(|error| error.to_string())?;
+                self.release_requested = true;
+            }
+            if !self.cleanup_acknowledged {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or("Terminal family cleanup remains pending")?;
+                self.cleanup
+                    .as_ref()
+                    .ok_or("Terminal cleanup acknowledgement is unavailable")?
+                    .recv_timeout(remaining)
+                    .map_err(|_| {
+                        "Terminal family cleanup remains pending; its exact holder is retained"
+                            .to_owned()
+                    })?;
+                self.cleanup_acknowledged = true;
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or("Terminal cleanup receipt is pending")?;
+            if !self
+                .pidfd
+                .as_ref()
+                .is_some_and(|fd| exits_within(fd, remaining).unwrap_or(false))
+            {
+                return Err(
+                    "Terminal cleanup receipt is pending; its exact holder is retained".into(),
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = attempt {
+            // A registered holder may durably publish its exact family proof
+            // and retire discovery before the control acknowledgement is lost.
+            // Exit alone and anonymous holders never authorize reconciliation.
+            let reconciled = self.reconcile_cleanup_receipt(deadline).map_err(|reason| {
+                format!("{error}; durable cleanup receipt could not be verified: {reason}")
+            })?;
+            if !reconciled {
+                return Err(error);
+            }
+            self.cleanup_acknowledged = true;
+            self.release_requested = true;
+        }
+        self.finish_cleanup()
+    }
+
+    fn reconcile_cleanup_receipt(&self, deadline: Instant) -> Result<bool, String> {
+        if Instant::now() >= deadline {
+            return Err("Terminal cleanup deadline expired before receipt reconciliation; retry its exact owner".into());
+        }
+        let receipt = if self.registered {
+            match self.record.as_ref().zip(self.cleanup_source.as_ref()) {
+                Some((record, source))
+                    if self
+                        .pidfd
+                        .as_ref()
+                        .is_some_and(|fd| exits_within(fd, Duration::ZERO).unwrap_or(false)) =>
+                {
+                    source.confirmed(record)?
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if Instant::now() >= deadline {
+            return Err(
+                "Terminal receipt verification exceeded its deadline; retry its exact owner".into(),
+            );
+        }
+        Ok(receipt)
+    }
+
+    fn finish_cleanup(&mut self) -> Result<(), String> {
+        if let Some(process) = self.process.as_mut() {
+            process
+                .child
+                .try_wait()
+                .map_err(|error| error.to_string())?;
+        }
+        self.detached = true;
+        drop(self.release.take());
+        Ok(())
+    }
+
+    fn retain_original_child(&mut self) {
+        let Some(OwnedChild {
+            mut child,
+            reservation,
+        }) = self.process.take()
+        else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => return, // Exact original status consumed; credit can return.
+            Ok(None) => {}
+            Err(error) => {
+                reservation.preserve_suspended(
+                    child,
+                    self.pidfd.take(),
+                    &format!("Original holder status is unavailable: {error}"),
+                );
+                return;
+            }
+        }
+        let Some(pidfd) = self.pidfd.take() else {
+            reservation.preserve_suspended(
+                child,
+                None,
+                "The original helper pidfd was not captured",
+            );
+            return;
+        };
+        if let Err((error, child, pidfd, reservation)) = reservation.retain(child, pidfd) {
+            reservation.preserve_suspended(
+                child,
+                Some(pidfd),
+                &format!("The exact helper reaper could not accept its owner: {error}"),
+            );
+        }
+    }
+
     pub(super) fn registered(&self) -> bool {
         self.registered
     }
@@ -528,7 +814,7 @@ impl Holder {
         self.adoption_pending = false;
         Ok(())
     }
-    fn new(control: UnixStream, process: Option<Child>) -> Self {
+    fn new(control: UnixStream, process: Option<OwnedChild>) -> Self {
         Self {
             control,
             process,
@@ -537,12 +823,16 @@ impl Holder {
             watch: None,
             release: None,
             acknowledged: None,
+            cleanup: None,
             detached: false,
             adoption_pending: false,
             registered: false,
             screen_lost: false,
             cleanup_proved: false,
+            release_requested: false,
+            cleanup_acknowledged: false,
             record: None,
+            cleanup_source: None,
         }
     }
 
@@ -600,57 +890,46 @@ impl Holder {
 impl Drop for Holder {
     fn drop(&mut self) {
         if self.adoption_pending {
-            // A failed emulator/reader setup must leave the original process
-            // adoptable. It never acquired authority to close that session.
-            self.detached = true;
-            let _ = self.control.shutdown(std::net::Shutdown::Both);
+            self.leave_for_successor();
         }
         if !self.detached {
-            // First, so the watch takes the holder's exit for the release it is.
-            drop(self.release.take());
-            let request = if self.cleanup_proved && self.protocol >= 4 {
-                Request::ReleaseProved
-            } else {
-                Request::Release
-            };
-            let _ = send(&self.control, &request, &[]);
-            let exited = self
-                .pidfd
-                .as_ref()
-                .is_some_and(|pidfd| exits_within(pidfd, RELEASE_GRACE).unwrap_or(false));
-            if !exited && self.cleanup_proved && self.protocol >= 4 {
-                // A proved release may still be fsyncing its receipt. Keep
-                // that exact owner alive; killing it would erase the only
-                // authority for a retry after the daemon exits.
-                if let Some(mut process) = self.process.take() {
-                    let _ = thread::Builder::new()
-                        .name("terminal-release".into())
-                        .spawn(move || {
-                            let _ = process.wait();
-                        });
+            // Destruction never performs RPC, waits for a process, or joins a
+            // watch thread. Transfer exact resources to a fixed bounded owner.
+            match self.control.try_clone() {
+                Ok(control) => {
+                    self.detached = true;
+                    let task = Holder {
+                        control,
+                        process: self.process.take(),
+                        pidfd: self.pidfd.take(),
+                        protocol: self.protocol,
+                        watch: self.watch.take(),
+                        release: self.release.take(),
+                        acknowledged: self.acknowledged.take(),
+                        cleanup: self.cleanup.take(),
+                        detached: false,
+                        adoption_pending: false,
+                        registered: self.registered,
+                        screen_lost: self.screen_lost,
+                        cleanup_proved: self.cleanup_proved,
+                        release_requested: self.release_requested,
+                        cleanup_acknowledged: self.cleanup_acknowledged,
+                        record: self.record.take(),
+                        cleanup_source: self.cleanup_source.take(),
+                    };
+                    release::request(task);
                 }
-            } else if !exited {
-                tracing::warn!("killing a terminal holder that did not exit when released");
-                match (&mut self.process, &self.pidfd) {
-                    (Some(process), _) => {
-                        let _ = process.kill();
-                    }
-                    (None, Some(pidfd)) => {
-                        let _ = signal(pidfd, libc::SIGKILL);
-                    }
-                    (None, None) => {}
+                Err(error) => {
+                    tracing::warn!(%error,"Terminal cleanup owner remains discoverable after descriptor transfer failure");
+                    self.leave_for_successor();
                 }
-            }
-            if let Some(mut process) = self.process.take() {
-                let _ = process.wait();
             }
         }
-        // A released holder is gone, and a detached one outlives this daemon,
-        // which reaps it only by exiting; either way its watch is ending.
+        self.retain_original_child();
         drop(self.release.take());
-        if let Some(watch) = self.watch.take() {
-            watch.stop();
-        }
+        // Release cancels the shared observer without waiting on the caller.
+        // Dropping its task handle is not proof of task destruction or family cleanup.
+        drop(self.watch.take());
     }
 }
 
@@ -722,6 +1001,12 @@ impl HeldChild {
     /// before this answers true was read about the root itself.
     pub(super) fn unreaped(&self) -> bool {
         signal(&self.pidfd, 0).is_ok()
+    }
+
+    pub(super) fn shutdown_pidfd(&self) -> Result<File, String> {
+        self.pidfd
+            .try_clone()
+            .map_err(|error| format!("retain child shutdown pidfd: {error}"))
     }
 
     /// Hangs the root up, as closing its terminal would. A root that already
@@ -944,17 +1229,59 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size, mut recovery) = match receive::<Request>(&control) {
-        Ok(Some((
-            Request::Spawn {
+    // This process exclusively owns/reaps the terminal tree, including tools
+    // which create another session or outlive the original PTY root.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        return fail(format!(
+            "Cannot own terminal descendants: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let (command, size, mut recovery, anchored_directory, setup_identity, descriptors) =
+        match receive::<Request>(&control) {
+            Ok(Some((
+                Request::Spawn {
+                    command,
+                    size,
+                    recovery,
+                    anchored_directory,
+                    setup_lease_identity,
+                },
+                descriptors,
+            ))) => (
                 command,
                 size,
                 recovery,
-            },
-            _,
-        ))) => (command, size, recovery),
-        _ => return 1,
+                anchored_directory,
+                setup_lease_identity,
+                descriptors,
+            ),
+            _ => return 1,
+        };
+    let expected = usize::from(anchored_directory) + usize::from(setup_identity.is_some());
+    if descriptors.len() != expected {
+        return fail("terminal spawn sent the wrong authority descriptors".into());
+    }
+    let mut descriptors = descriptors.into_iter();
+    let directory =
+        anchored_directory.then(|| File::from(descriptors.next().expect("checked directory slot")));
+    // This exact open-file description carries the original flock. Keep it
+    // through daemon loss, adoption and verified family cleanup.
+    let _setup_execution_lease = match setup_identity {
+        Some(expected) => {
+            let file = File::from(descriptors.next().expect("checked lease slot"));
+            match setup_lease_identity(&file) {
+                Ok(actual) if actual == expected => Some(file),
+                _ => return fail("Setup execution lease descriptor identity changed".into()),
+            }
+        }
+        None => None,
     };
+    if let Some(directory) = &directory {
+        if let Err(error) = validate_execution_directory(directory) {
+            return fail(error);
+        }
+    }
     if let Some(recovery) = &recovery {
         let authority = (|| {
             let boot = crate::daemon::read_boot_id()?;
@@ -978,7 +1305,7 @@ fn serve(control: UnixStream) -> i32 {
             return fail(format!("authorize terminal holder: {error}"));
         }
     }
-    let command = match STANDARD
+    let mut command = match STANDARD
         .decode(command)
         .map_err(|error| error.to_string())
         .and_then(|command| {
@@ -987,6 +1314,17 @@ fn serve(control: UnixStream) -> i32 {
         Ok(command) => command,
         Err(error) => return fail(format!("decode terminal command: {error}")),
     };
+    if let Some(directory) = &directory {
+        // portable-pty resolves relative executables before fork and closes
+        // extra child descriptors in pre_exec. Reference the holder's pinned
+        // descriptor so both cwd and relative executable resolution survive
+        // that close; spawn keeps this descriptor alive through exec success.
+        command.cwd(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            directory.as_raw_fd()
+        ));
+    }
     let program = command
         .get_argv()
         .first()
@@ -1003,6 +1341,11 @@ fn serve(control: UnixStream) -> i32 {
         Ok(child) => child,
         Err(error) => return fail(format!("spawn {program}: {error:#}")),
     };
+    // Retain the directory for this holder's entire lifetime. For a shebang
+    // program exec success only starts its interpreter; the interpreter can
+    // open argv[0] through /proc/<holder>/fd/N afterwards. Closing this pin at
+    // spawn return would race that open even though the child's cwd is valid.
+    let _execution_directory = directory;
     drop(pair.slave);
     let Some(pid) = child.process_id().map(|pid| pid as libc::pid_t) else {
         return fail(format!("spawn {program}: no process id"));
@@ -1013,10 +1356,7 @@ fn serve(control: UnixStream) -> i32 {
         Err(error) => {
             // SAFETY: as above; the root cannot be handed over, so it must
             // not outlive this failure.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, std::ptr::null_mut(), 0);
-            }
+            let _family = reap_terminal_family();
             return fail(format!("open pidfd for {program}: {error}"));
         }
     };
@@ -1030,14 +1370,7 @@ fn serve(control: UnixStream) -> i32 {
     {
         Ok(residence) => residence,
         Err(error) => {
-            // This newly spawned child has never been handed to a daemon.
-            // Closing the PTY alone cannot stop an HUP-ignoring startup job.
-            // Its unreaped PID still identifies the session's process group.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            let _ = signal(&pidfd, libc::SIGKILL);
-            let _ = reap(pid);
+            let _family = reap_terminal_family();
             return fail(format!("register terminal holder: {error}"));
         }
     };
@@ -1052,6 +1385,7 @@ fn serve(control: UnixStream) -> i32 {
     let mut pending_replay: Option<(String, Vec<u8>, bool)> = None;
     let mut control = control;
     let mut cleanup_proved = false;
+    let mut release_control = None;
     loop {
         let disposition = if lost {
             Attendance::Lost
@@ -1066,9 +1400,14 @@ fn serve(control: UnixStream) -> i32 {
             )
         };
         let (socket, screen, output, screen_lost) = match disposition {
-            Attendance::Release => break,
+            Attendance::Release => {
+                cleanup_proved = true;
+                release_control = control.try_clone().ok();
+                break;
+            }
             Attendance::ReleaseProved => {
                 cleanup_proved = true;
+                release_control = control.try_clone().ok();
                 break;
             }
             Attendance::Lost => match &residence {
@@ -1147,29 +1486,42 @@ fn serve(control: UnixStream) -> i32 {
             None => break,
         }
     }
+    // Both ordinary and proved release require independent family cleanup.
+    // Keep the master, directory pin, setup flock and discovery record while
+    // cleanup or its durable receipt is uncertain; never kill this owner.
+    let family = reap_terminal_family();
     drop(child);
-    // The master closes with the holder, hanging up whatever is left on it.
-    drop(pair.master);
     if cleanup_proved && let (Some(residence), Some(recovery)) = (&residence, &recovery) {
-        // The checked worker has already stopped its exact process family;
-        // independently require that this holder reaped the root too.
-        if exit.is_none() && exits_within(&pidfd, Duration::ZERO).unwrap_or(false) {
-            exit = reap(pid);
+        loop {
+            if registry::cleanup::publish(&residence.record, recovery, &family).is_ok()
+                && residence.retire().is_ok()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
         }
-        if exit.is_some() {
-            loop {
-                if registry::cleanup::publish(&residence.record, recovery).is_ok()
-                    && residence.retire().is_ok()
-                {
-                    break;
-                }
-                // A failed durable write retains this exact small owner;
-                // callers time out honestly and can retry its receipt.
+    }
+    if let Some(control) = release_control {
+        let _ = send(&control, &Report::CleanupProved, &[]);
+    }
+    drop(pair.master);
+    0
+}
+
+/// Uncertain cleanup retains this dedicated owner and all of its authority.
+fn reap_terminal_family() -> crate::daemon::owned_children::ReapedFamily {
+    loop {
+        match crate::daemon::owned_children::terminate_owned_family(
+            Instant::now() + Duration::from_millis(250),
+        ) {
+            Ok(Some(proof)) => return proof,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "Terminal family cleanup remains unconfirmed");
                 thread::sleep(Duration::from_millis(100));
             }
         }
     }
-    0
 }
 
 /// Serves an attached daemon until it releases the terminal, which answers
@@ -1221,6 +1573,7 @@ fn attend(
             let Some(wait_status) = reap(pid) else {
                 return Attendance::Release;
             };
+            let _family = reap_terminal_family();
             *exit = Some(wait_status);
             let _ = send(control, &Report::Exited { wait_status }, &[]);
         }
@@ -1330,6 +1683,7 @@ fn await_successor(
         if targets[1].revents != 0 {
             // As when attended: nothing to hand over is better than a spin.
             *exit = Some(reap(pid)?);
+            let _family = reap_terminal_family();
         }
         if targets[2].revents != 0 {
             let room = (DETACHED_OUTPUT - output.len()).min(buffer.len());
@@ -1841,7 +2195,7 @@ mod tests {
     }
 
     fn holder_pid(held: &Held) -> u32 {
-        held.holder.process.as_ref().unwrap().id()
+        held.holder.process.as_ref().unwrap().child.id()
     }
 
     fn alive(pid: libc::pid_t) -> bool {
@@ -2006,11 +2360,12 @@ mod tests {
             holder,
         } = spawn(command("while :; do sleep 1; done"), size(), exits).unwrap();
         let root = child.pid();
-        let holder_pid = holder.process.as_ref().unwrap().id() as libc::pid_t;
+        let holder_pid = holder.process.as_ref().unwrap().child.id() as libc::pid_t;
         // The terminal hangs up once its last master closes.
         drop(master);
         drop(holder);
-        assert!(!alive(holder_pid));
+        // Drop transfers cleanup to the bounded owner; it does not wait inline.
+        wait_gone(holder_pid);
         wait_gone(root);
     }
 
@@ -2028,7 +2383,7 @@ mod tests {
         drop(master);
         let _ = holder.control.shutdown(std::net::Shutdown::Both);
         drop(holder);
-        let status = process.wait().unwrap();
+        let status = process.child.wait().unwrap();
         assert_eq!(status.code(), Some(0));
         wait_gone(root);
     }

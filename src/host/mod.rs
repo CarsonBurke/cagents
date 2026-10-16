@@ -12,6 +12,9 @@ mod model;
 mod notifications;
 mod service;
 mod state;
+mod worktree_inspections;
+mod worktree_requests;
+mod worktree_sessions;
 
 use std::{
     fs, io,

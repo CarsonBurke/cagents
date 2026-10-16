@@ -9,6 +9,8 @@ pub enum BranchDeleteFailureKind {
     CheckedOutElsewhere,
     Unmerged,
     Other,
+    /// The original inspected repository or exact branch consent is no longer valid.
+    AuthorityChanged,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -58,15 +60,34 @@ pub fn delete_branch_checked_at(
     expected_oid: Option<&str>,
     cancellation: &crate::repository::CancellationToken,
 ) -> Result<(), BranchDeleteFailure> {
-    use crate::repository::{
-        Oid, ProcessExecutor, RepositoryService, SystemProcessExecutor, ValidatedBranchName,
-    };
+    delete_branch_checked_with(
+        repository,
+        branch,
+        force,
+        expected_oid,
+        cancellation,
+        &crate::repository::SystemProcessExecutor,
+    )
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) fn delete_branch_checked_with<
+    E: crate::repository::ProcessExecutor + Clone + 'static,
+>(
+    repository: &std::path::Path,
+    branch: &str,
+    force: bool,
+    expected_oid: Option<&str>,
+    cancellation: &crate::repository::CancellationToken,
+    executor: &E,
+) -> Result<(), BranchDeleteFailure> {
+    use crate::repository::{Oid, RepositoryService, ValidatedBranchName};
     let other = |detail: String| BranchDeleteFailure {
         kind: BranchDeleteFailureKind::Other,
         detail,
     };
     let branch = ValidatedBranchName::parse(branch).map_err(|error| other(error.to_string()))?;
-    let service = RepositoryService::system("git");
+    let service = RepositoryService::new("git", std::sync::Arc::new(executor.clone()));
     let checked_out = || -> Result<(), BranchDeleteFailure> {
         let records = service
             .list_worktrees(repository, cancellation)
@@ -90,7 +111,7 @@ pub fn delete_branch_checked_at(
     let read_oid = |revision: &str| -> Result<Oid, BranchDeleteFailure> {
         let command =
             git_command(repository).args(["rev-parse", "--verify", "--end-of-options", revision]);
-        let output = SystemProcessExecutor
+        let output = executor
             .execute(&command, cancellation)
             .and_then(|output| output.require_success(&command.program))
             .map_err(|error| other(error.reported_detail()))?;
@@ -104,9 +125,10 @@ pub fn delete_branch_checked_at(
     let full_ref = branch.full_ref();
     let observed = read_oid(&full_ref)?;
     if expected_oid.is_some_and(|expected| expected != observed.as_str()) {
-        return Err(other(
-            "The branch changed after confirmation; review it again".into(),
-        ));
+        return Err(BranchDeleteFailure {
+            kind: BranchDeleteFailureKind::AuthorityChanged,
+            detail: "The branch changed after confirmation; review it again".into(),
+        });
     }
     if !force {
         let upstream_revision = format!("{}@{{upstream}}", branch.as_str());
@@ -117,7 +139,7 @@ pub fn delete_branch_checked_at(
             "--end-of-options",
             &upstream_revision,
         ]);
-        let upstream = SystemProcessExecutor
+        let upstream = executor
             .execute(&upstream_command, cancellation)
             .map_err(|error| other(error.reported_detail()))?;
         let target = if upstream.success {
@@ -140,7 +162,7 @@ pub fn delete_branch_checked_at(
             observed.as_str(),
             target.as_str(),
         ]);
-        let output = SystemProcessExecutor
+        let output = executor
             .execute(&command, cancellation)
             .map_err(|error| other(error.reported_detail()))?;
         if output.exit_code == Some(1) {
@@ -158,7 +180,7 @@ pub fn delete_branch_checked_at(
     }
     // Fence checkout transitions in all currently registered worktrees. Git's
     // final native deletion still rechecks its complete checkout inventory.
-    let head_guards = if force {
+    let head_guards = if force || expected_oid.is_some() {
         let mut guards =
             registered_heads::RegisteredHeads::capture(&service, repository, cancellation)
                 .map_err(other)?;
@@ -168,21 +190,23 @@ pub fn delete_branch_checked_at(
         None
     };
     checked_out()?;
-    if force {
+    if force || expected_oid.is_some() {
         force_delete::delete(
             repository,
             branch.as_str(),
             &full_ref,
             observed.as_str(),
             cancellation,
+            executor,
+            force,
             head_guards
                 .as_ref()
-                .expect("force captured registered HEADs"),
+                .expect("guarded deletion captured registered HEADs"),
         )
         .map_err(other)?;
     } else {
         let command = git_command(repository).args(["branch", "-d", "--", branch.as_str()]);
-        SystemProcessExecutor
+        executor
             .execute(&command, cancellation)
             .and_then(|output| output.require_success(&command.program))
             .map_err(|error| other(error.reported_detail()))?;
@@ -257,7 +281,7 @@ mod branch_delete_tests {
         git(path, &["checkout", "-q", "main"]);
         let error =
             delete_branch_checked_at(path, "unmerged", true, Some(&first), &cancel).unwrap_err();
-        assert_eq!(error.kind, BranchDeleteFailureKind::Other);
+        assert_eq!(error.kind, BranchDeleteFailureKind::AuthorityChanged);
         assert_eq!(git(path, &["rev-parse", "refs/heads/unmerged"]), latest);
         git(
             path,
