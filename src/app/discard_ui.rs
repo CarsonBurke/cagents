@@ -445,9 +445,7 @@ mod tests {
         app.discard_ui.select(Some(key));
         let original = app.discard_ui.source().unwrap().id;
         app.context_tab = ContextTab::Changes;
-        let renderer = cosmic::Renderer::with_backend(
-            &iced::graphics::Settings::default(), None, Some("tiny-skia"),
-        ).unwrap();
+        let renderer = crate::app::tests::headless_renderer();
         let mut element = app.context_panel(None, 380.0);
         let mut tree = Tree::new(element.as_widget());
         let viewport = Rectangle::with_size(Size::new(380.0, 4_000.0));
