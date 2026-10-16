@@ -3,6 +3,8 @@ mod carry;
 mod close_processes;
 #[cfg(test)]
 mod close_tests;
+#[cfg(test)]
+mod event_dispatch_tests;
 pub(crate) mod holder;
 mod joins;
 
@@ -358,37 +360,44 @@ enum ArchivePhase {
 
 type ArchiveObserver = dyn Fn(TerminalEvent) + Send + Sync;
 
-/// Runs a completed terminal's subscriber callback on a thread of its own.
+/// Dispatches live and completed terminals' subscriber callbacks off-thread.
 ///
 /// A completed terminal has no worker, so its commands execute on whichever
 /// thread sends them, and the daemon sends them while holding the host mutex
 /// its wake and event callbacks lock. Calling either inline deadlocks that
-/// thread against itself and, behind it, every other user of the host. One
-/// shared thread keeps the notifications of all completed terminals ordered.
+/// thread against itself and, behind it, every other user of the host. The
+/// same shared thread delivers live semantic events without an idle monitor
+/// thread per terminal. Each terminal's events retain their publication order.
+type Notice = Box<dyn FnOnce() + Send>;
+
+fn event_notifier() -> Result<&'static Sender<Notice>, String> {
+    static NOTIFIER: OnceLock<Result<Sender<Notice>, String>> = OnceLock::new();
+    NOTIFIER
+        .get_or_init(|| {
+            let (notices, pending) = crossbeam_channel::unbounded::<Notice>();
+            thread::Builder::new()
+                .name("terminal-event-notify".into())
+                .spawn(move || {
+                    for notice in pending {
+                        // A subscriber panic must not lose later terminals'
+                        // metadata or completion notifications.
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice));
+                    }
+                })
+                .map_err(|error| format!("start shared terminal event monitor: {error}"))?;
+            Ok(notices)
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
 fn notify_archived(notice: impl FnOnce() + Send + 'static) {
-    type Notice = Box<dyn FnOnce() + Send>;
-    static NOTIFIER: OnceLock<Sender<Notice>> = OnceLock::new();
-    let notifier = NOTIFIER.get_or_init(|| {
-        let (notices, pending) = crossbeam_channel::unbounded::<Notice>();
-        if let Err(error) = thread::Builder::new()
-            .name("terminal-archive-notify".into())
-            .spawn(move || {
-                for notice in pending {
-                    // This thread serves every completed terminal for the life
-                    // of the process. A subscriber that panics has already
-                    // been reported by the panic hook; it must not take the
-                    // redraws and search results of all the others with it.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice));
-                }
-            })
-        {
-            tracing::error!(%error, "completed terminals cannot notify their subscribers");
+    match event_notifier() {
+        Ok(notifier) => {
+            let _ = notifier.send(Box::new(notice));
         }
-        notices
-    });
-    // Sending fails only when that thread never started, which is reported
-    // above.
-    let _ = notifier.send(Box::new(notice));
+        Err(error) => tracing::error!(%error, "terminals cannot notify their subscribers"),
+    }
 }
 
 /// Returns once every notice queued before this call has run.
@@ -432,6 +441,7 @@ struct PublishedState {
     archive: Mutex<ArchivePhase>,
     archive_ready: Condvar,
     archive_observer: OnceLock<Arc<ArchiveObserver>>,
+    event_observer: Mutex<Option<Arc<ArchiveObserver>>>,
     completed: AtomicBool,
     /// Parser completion/carry is not family cleanup. Only positive holder
     /// proof and archive publication can authorize a holder-free retry.
@@ -520,6 +530,7 @@ impl PublishedState {
             archive: Mutex::new(ArchivePhase::Live),
             archive_ready: Condvar::new(),
             archive_observer: OnceLock::new(),
+            event_observer: Mutex::new(None),
             completed: AtomicBool::new(false),
             cleanup_published: AtomicBool::new(false),
             worker_join: AtomicU8::new(0),
@@ -717,11 +728,27 @@ impl PublishedState {
         Ok(())
     }
 
+    fn emit_event(&self, events: &Sender<TerminalEvent>, event: TerminalEvent) {
+        // Registration drains the startup queue under this same lock, so an
+        // event cannot overtake the startup replay or be delivered twice.
+        let observer = self
+            .event_observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(observer) = observer.as_ref().cloned() {
+            // Callers can hold Host or agent-state locks. Only queue here;
+            // user callbacks run on the shared dispatcher after those release.
+            notify_archived(move || observer(event));
+        } else {
+            let _ = events.send(event);
+        }
+    }
+
     fn emit_archived(&self, events: &Sender<TerminalEvent>, event: TerminalEvent) {
         if let Some(observer) = self.archive_observer.get().cloned() {
             notify_archived(move || observer(event));
         } else {
-            let _ = events.send(event);
+            self.emit_event(events, event);
         }
     }
 
@@ -736,7 +763,7 @@ impl PublishedState {
             // from another thread. The weak sender cannot keep a dead worker's
             // semantic stream open through its host event receiver.
             if let Some(events) = self.semantic_events.get().and_then(Weak::upgrade) {
-                let _ = events.send(TerminalEvent::AgentActivityChanged(activity));
+                self.emit_event(&events, TerminalEvent::AgentActivityChanged(activity));
             }
         }
     }
@@ -864,6 +891,8 @@ impl TerminalHandle {
         config: TerminalConfig,
         wake: impl Fn(TerminalWake) + Send + Sync + 'static,
     ) -> Result<Self, TerminalStartError> {
+        // Acquire the shared monitor before starting any holder/provider.
+        event_notifier().map_err(TerminalStartError::Worker)?;
         let reservation = joins::reserve().map_err(TerminalStartError::Worker)?;
         let (command_tx, command_rx) = command_channel(config.command_capacity);
         // Semantic events are lossless and independent from visual wakes. They
@@ -1150,6 +1179,32 @@ impl TerminalHandle {
         self.inner.events.clone()
     }
 
+    /// Transfers this worker's semantic stream to a shared off-thread observer.
+    /// Install once the Host record is published. Startup events are replayed
+    /// before subsequent events, including an already-completed worker's tail.
+    pub(crate) fn set_event_observer(
+        &self,
+        observer: impl Fn(&TerminalHandle, TerminalEvent) + Send + Sync + 'static,
+    ) {
+        let handle = Arc::downgrade(&self.inner);
+        let observer: Arc<ArchiveObserver> = Arc::new(move |event| {
+            if let Some(inner) = handle.upgrade() {
+                observer(&TerminalHandle { inner }, event);
+            }
+        });
+        let mut current = self
+            .inner
+            .published
+            .event_observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for event in self.inner.events.try_iter() {
+            let observer = Arc::clone(&observer);
+            notify_archived(move || observer(event));
+        }
+        *current = Some(observer);
+    }
+
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
         let bytes = bytes.into();
         if bytes == [3] {
@@ -1241,6 +1296,7 @@ impl TerminalHandle {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn set_archived_event_observer(
         &self,
         observer: impl Fn(&TerminalHandle, TerminalEvent) + Send + Sync + 'static,
@@ -2395,7 +2451,7 @@ impl Worker {
             .completed
             .store(completion.ownership_released, Ordering::Release);
         if let Some(completion) = completion.event {
-            let _ = events.send(completion);
+            published.emit_event(&events, completion);
         }
     }
 
@@ -3857,7 +3913,7 @@ impl Worker {
     }
 
     fn emit(&self, event: TerminalEvent) {
-        let _ = self.events.send(event);
+        self.published.emit_event(&self.events, event);
     }
 
     fn error(&self, operation: &'static str, message: String) {
