@@ -604,6 +604,12 @@ impl Cagents {
                 self.apply_closed_project_tombstones()
             }
             ModelUpdate::Edited { sequence, edit } => {
+                // AgentsChanged carries no snapshot fields. The observer reads
+                // the complete model next; advancing this cache now would label
+                // its old views as newer than an in-flight Insert receipt.
+                if matches!(edit, ModelEdit::AgentsChanged) {
+                    return Task::none();
+                }
                 if sequence <= self.workspace_model.sequence {
                     return Task::none();
                 }
@@ -2346,11 +2352,34 @@ mod tests {
                 .apply(&change)
                 .unwrap();
             model.sequence += 1;
+            if existing_primary {
+                // The observer and publisher use distinct connections. A run
+                // edge can arrive after this Insert committed but before its
+                // reply. Its following full Read has not arrived yet.
+                drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+                    sequence: model.sequence + 1,
+                    edit: ModelEdit::AgentsChanged,
+                }));
+            }
             drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
                 scope: scope.clone(),
                 operation: Some(*operation),
-                model,
+                model: model.clone(),
             }));
+            if let Some(primary) = primary {
+                assert_eq!(
+                    app.workspace.order().collect::<Vec<_>>(),
+                    vec![primary, card]
+                );
+                assert_eq!(app.workspace.focused(), Some(primary));
+                model.sequence += 1;
+                drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
+                assert_eq!(
+                    app.workspace.order().collect::<Vec<_>>(),
+                    vec![primary, card]
+                );
+                assert_eq!(app.workspace.focused(), Some(primary));
+            }
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert!(app.chat_start_pending(card));
             assert!(
