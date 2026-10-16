@@ -425,6 +425,8 @@ pub struct SidebarChannel {
     pub activity: Option<crate::agent::ActivityState>,
     pub unread: bool,
     pub attention: AttentionSummary,
+    /// Bounded derived context from the shared notification journal.
+    pub notification_preview: Option<String>,
     pub chats: usize,
     pub has_panes: bool,
     /// The creation rank the shared registry assigned. Carried on the row
@@ -451,6 +453,19 @@ impl SidebarChannel {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn tooltip_for_test(&self) -> &str {
+        &self.tooltip
+    }
+
+    pub fn with_notification_preview(mut self, preview: Option<String>) -> Self {
+        if let Some(preview) = &preview {
+            self.tooltip = format!("{}\n{preview}", self.tooltip).into_boxed_str();
+            self.accessible_name = format!("{}, {preview}", self.accessible_name).into_boxed_str();
+        }
+        self.notification_preview = preview;
+        self
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ChannelId,
@@ -472,6 +487,7 @@ impl SidebarChannel {
             activity,
             unread,
             attention: AttentionSummary::card(activity, unread, false),
+            notification_preview: None,
             chats,
             has_panes,
             ordinal,
@@ -2951,6 +2967,33 @@ impl SidebarState {
         }
     }
 
+    /// A removed surface is no longer an attention target. This is not a
+    /// read acknowledgement: do not retain a dim row or acknowledge a journal.
+    pub fn forget_card_attention(&mut self, card: CardId) {
+        self.change_attention(card, |state| {
+            state.agent_updates.remove(&card);
+            state.failed_updates.remove(&card);
+            state.agent_activity.remove(&card);
+        });
+    }
+
+    /// The caller has proved alias and canonical are the same conversation.
+    /// Keep existing canonical attribution; otherwise await its current filing
+    /// instead of carrying the alias's historical worktree into another view.
+    pub fn transfer_card_update(&mut self, alias: CardId, canonical: CardId) {
+        if alias != canonical && self.has_card_update(alias) {
+            let failed = self.failed_updates.contains(&alias);
+            self.change_attention(alias, |state| {
+                state.agent_updates.remove(&alias);
+                state.failed_updates.remove(&alias);
+            });
+            self.change_attention(canonical, |state| {
+                state.agent_updates.entry(canonical).or_insert(None);
+                if failed { state.failed_updates.insert(canonical); }
+            });
+        }
+    }
+
     pub fn has_card_update(&self, card: CardId) -> bool {
         self.agent_updates.contains_key(&card)
     }
@@ -2978,14 +3021,16 @@ impl SidebarState {
 
     /// Only explicit, unacknowledged Failed journal evidence enters this set.
     /// Interrupted/cancelled and loss of observation do not imply failure.
-    pub fn set_failed_updates(&mut self, cards: BTreeSet<CardId>) {
+    pub fn set_failed_updates(&mut self, cards: BTreeSet<CardId>) -> bool {
         let changed: Vec<_> = self.failed_updates.symmetric_difference(&cards).copied().collect();
+        let did_change = !changed.is_empty();
         for card in changed {
             self.change_attention(card, |state| {
                 if cards.contains(&card) { state.failed_updates.insert(card); }
                 else { state.failed_updates.remove(&card); }
             });
         }
+        did_change
     }
 
     fn attention_owner(&self, card: CardId) -> Option<(ProjectId, WorktreeId)> {
@@ -12623,6 +12668,57 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn attention_forgetting_closed_surface_is_not_read_retention_and_keeps_other_updates() {
+        let mut state = SidebarState::default();
+        let closed = CardId::new();
+        let other = CardId::new();
+        let project = project_id(1);
+        let worktree = WorktreeId::new();
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.observe_agent_update(closed, project, worktree);
+        state.observe_card_update(other);
+        state.set_agent_activity(
+            closed,
+            project,
+            worktree,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Codex,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        state.forget_card_attention(closed);
+        assert!(!state.has_card_update(closed));
+        assert!(!state.has_agent_update(project, worktree));
+        assert!(state.card_activity(closed).is_none());
+        assert!(state.has_card_update(other));
+    }
+
+    #[test]
+    fn attention_alias_update_transfer_preserves_canonical_owner_without_old_worktree_attribution()
+    {
+        let mut state = SidebarState::default();
+        let alias = CardId::new();
+        let canonical = CardId::new();
+        let project = project_id(1);
+        let old = WorktreeId::new();
+        let current = WorktreeId::new();
+        state.observe_agent_update(alias, project, old);
+        state.transfer_card_update(alias, canonical);
+        assert!(!state.has_card_update(alias));
+        assert_eq!(state.agent_updates.get(&canonical), Some(&None));
+        assert!(!state.has_agent_update(project, old));
+        state.observe_agent_update(canonical, project, current);
+        state.observe_agent_update(alias, project, old);
+        state.transfer_card_update(alias, canonical);
+        assert_eq!(
+            state.agent_updates.get(&canonical),
+            Some(&Some((project, current)))
+        );
+        state.transfer_card_update(canonical, canonical);
+        assert!(state.has_card_update(canonical));
     }
 
     #[test]

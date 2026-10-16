@@ -2242,6 +2242,10 @@ impl Runtime {
             Connection::Live(handle) => Some(handle),
         }
     }
+    pub(super) fn parent_transcript_selected(&self) -> bool {
+        self.selected_subagent.is_none()
+    }
+
     /// Whether nothing has started yet, a start for the first message
     /// included.
     fn is_draft(&self) -> bool {
@@ -15605,6 +15609,61 @@ mod tests {
             Err(chat::StartFailure::fresh("fixture: daemon gone")),
         );
         assert!(app.chat_offers_fresh_conversation(card));
+    }
+
+    #[test]
+    fn attention_session_click_reveals_the_parent_before_reading_its_notice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        let target = chat_runtime(&app, card).target;
+        let source = chat_runtime(&app, card).session.clone();
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("chat fixture");
+        };
+        runtime.selected_subagent = Some("currently-viewed-child".into());
+        let id = uuid::Uuid::new_v4();
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Snapshot(crate::notifications::Snapshot {
+                notices: vec![crate::notifications::Notice {
+                    id,
+                    event: crate::notifications::Event {
+                        content: None,
+                        target: crate::notifications::Target::Session(source.id),
+                        source_session: Some(source.id),
+                        provider: Some(source.launch.provider),
+                        directory: Some(source.launch.recipe.working_directory.clone()),
+                        destination: None,
+                        evidence: crate::notifications::Evidence {
+                            key: "parent-result-with-child-visible".into(),
+                            kind: crate::notifications::Kind::Succeeded,
+                        },
+                    },
+                    delivered: true,
+                    acknowledged: false,
+                    window: None,
+                }],
+                diagnostic: None,
+            }),
+        )));
+        assert!(app.sidebar_state.has_card_update(card));
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(
+                source.id,
+            )),
+        )));
+        assert!(chat_runtime(&app, card).parent_transcript_selected());
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(app.notification_ui.acknowledged_for_test(id));
+        assert_eq!(chat_runtime(&app, card).target, target);
+        assert_eq!(chat_runtime(&app, card).session, source);
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
     }
 
     #[test]

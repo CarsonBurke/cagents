@@ -1946,7 +1946,13 @@ impl Cagents {
             children.push(tooltip(indicator, label));
         }
         if let Some(indicator) = sidebar::attention_indicator(self.sidebar_state.card_attention(id), false) {
-            children.push(indicator);
+            let preview = (self.sidebar_state.has_card_update(id) && self.settings.notifications.message_previews)
+                .then(|| card.and_then(super::notification_ui::card_session)
+                    .and_then(|session| self.notification_ui.previews.get(&session)))
+                .flatten();
+            children.push(if let Some(preview) = preview {
+                tooltip(indicator, preview.text.as_str())
+            } else { indicator });
         }
         if focused && self.chat_switch_available(id) {
             let blocker = self.chat_switch_blocker(id);

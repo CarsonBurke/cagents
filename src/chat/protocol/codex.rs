@@ -372,6 +372,8 @@ fn create_inner(
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
+            notification_turn: None,
+            notification_revision: 0,
             busy: false,
             lifecycle_revision: 0,
             suggestion_turn: None,
@@ -416,11 +418,17 @@ enum Pending {
     Skills,
     History {
         earlier: bool,
+        initial_notification_binding: Option<(u64, u64)>,
     },
     Turn {
         revision: u64,
+        notification_revision: u64,
         model: Option<String>,
         tier: Option<String>,
+        /// Completion can precede this exact request's acknowledgement.
+        /// Only the reply's turn ID may promote one of these bounded frames.
+        early: BTreeMap<String, EarlyNotification>,
+        early_bytes: usize,
     },
     /// Compaction rewrites the thread's history and its context occupancy, so
     /// its acknowledgement is what a re-read hangs off: nothing else on the
@@ -514,6 +522,10 @@ struct Codex {
     pricing: chat::pricing::CostTracker,
     turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
     turn: Option<String>,
+    /// Exact live notice authority. Scalar status and paged history must not
+    /// replace it; they can arrive after a newer turn's start.
+    notification_turn: Option<String>,
+    notification_revision: u64,
     busy: bool,
     lifecycle_revision: u64,
     suggestion_turn: Option<String>,
@@ -545,6 +557,13 @@ struct Codex {
     branch_points: Vec<chat::BranchPoint>,
     is_child: bool,
     child_buffer: BTreeMap<String, Vec<Value>>,
+}
+
+#[derive(Clone, Default)]
+struct EarlyNotification {
+    completed: Option<Value>,
+    preview: crate::chat::notification::Preview,
+    preview_transferred: bool,
 }
 
 struct Execution {
@@ -988,7 +1007,10 @@ impl Codex {
             return Err("Codex history is already loading".into());
         }
         let earlier = cursor.is_some();
-        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier })?;
+        let initial_notification_binding = (!self.history_initialized
+            && self.notification_turn.is_none())
+        .then_some((self.lifecycle_revision, self.notification_revision));
+        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier, initial_notification_binding })?;
         self.history_loading = true;
         step.events.push(if earlier {
             Event::HistoryLoading(true)
@@ -1065,7 +1087,7 @@ impl Codex {
         for turn in array(page, "data")?.iter().rev() {
             let turn_id = string(turn, "id")?;
             let active = turn["status"] == "inProgress";
-            if active && self.busy {
+            if active && self.busy && self.turn.is_none() {
                 self.turn = Some(turn_id.into());
             }
             if turn["itemsView"]
@@ -1560,7 +1582,10 @@ impl Adapter for Codex {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
-                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, model: self.selected.clone(), tier: self.service_tier.clone() })?;
+                        self.notification_revision = self.notification_revision.wrapping_add(1);
+                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, notification_revision: self.notification_revision, model: self.selected.clone(), tier: self.service_tier.clone(), early: BTreeMap::new(), early_bytes: 0 })?;
+                        self.notification_turn = None;
+                        step.notification_preview = Some(Default::default());
                         self.suggestion_turn = None;
                         self.prediction_turn = None;
                         step.events.push(Event::PromptSuggestionCleared);
@@ -1812,6 +1837,16 @@ impl Adapter for Codex {
                 // notification to release that optimistic state. Only repair
                 // the lifecycle this request observed: a newer genuine turn
                 // must retain its own activity and waiting state.
+                if let Pending::Turn {
+                    notification_revision,
+                    ..
+                } = &pending
+                    && *notification_revision != self.notification_revision
+                {
+                    // A rejected old start cannot replace a newer turn's
+                    // error. Its exact managed execution is handled below.
+                    step.suppress_current_notification = true;
+                }
                 if let Pending::Turn { revision, .. } = &pending
                     && *revision == self.lifecycle_revision
                 {
@@ -1970,6 +2005,14 @@ impl Adapter for Codex {
                     )?;
                     if result["initialTurnsPage"].is_object() {
                         self.page(&result["initialTurnsPage"], &mut step, false)?;
+                        // Only the initial coherent attach response may bind
+                        // an active history turn. Later pages are display data.
+                        if self.lifecycle_revision == 0
+                            && self.notification_revision == 0
+                            && self.notification_turn.is_none()
+                        {
+                            self.notification_turn = self.turn.clone();
+                        }
                     } else {
                         self.history(&mut step, None)?;
                     }
@@ -2172,8 +2215,18 @@ impl Adapter for Codex {
                         self.skills(&mut step)?;
                     }
                 }
-                Pending::History { earlier } => {
+                Pending::History {
+                    earlier,
+                    initial_notification_binding,
+                } => {
                     self.page(result, &mut step, earlier)?;
+                    if initial_notification_binding
+                        == Some((self.lifecycle_revision, self.notification_revision))
+                        && self.notification_turn.is_none()
+                        && self.busy
+                    {
+                        self.notification_turn = self.turn.clone();
+                    }
                     self.finish_history(&mut step)?;
                 }
                 Pending::FastMode {
@@ -2195,14 +2248,23 @@ impl Adapter for Codex {
                 }
                 Pending::Turn {
                     revision,
+                    notification_revision,
                     model,
                     tier,
+                    mut early,
+                    ..
                 } => {
                     self.materialized = true;
                     let id = string(&result["turn"], "id")?;
+                    let owns_current = notification_revision == self.notification_revision
+                        || self.notification_turn.as_deref() == Some(id);
+                    let early_completion = early.remove(id).filter(|_| owns_current);
                     self.remember_turn_pricing(id, model, tier);
                     // Notifications can finish this turn or start another before
                     // its RPC reply. An acknowledgement only fills missing state.
+                    if owns_current {
+                        self.notification_turn = Some(id.to_owned());
+                    }
                     if revision == self.lifecycle_revision {
                         self.turn = Some(id.into());
                         self.busy = true;
@@ -2232,6 +2294,23 @@ impl Adapter for Codex {
                                 });
                             }
                         }
+                    }
+                    if let Some(early) = early_completion {
+                        if !early.preview_transferred {
+                            step.notification_preview = Some(early.preview);
+                        }
+                        if let Some(completed) = early.completed {
+                            // Preserve the original final frame's context, rather
+                            // than sampling whatever the actor currently shows.
+                            self.turn = Some(id.to_owned());
+                            self.notification_turn = Some(id.to_owned());
+                            let completion = self.receive(json!({"method":"turn/completed",
+                            "params":{"threadId":self.thread,"turn":completed}}))?;
+                            step.events.extend(completion.events);
+                            step.writes.extend(completion.writes);
+                        }
+                    } else if !owns_current {
+                        step.suppress_current_notification = true;
                     }
                 }
                 // The one visible effect of compaction is the context figure,
@@ -2460,6 +2539,17 @@ impl Adapter for Codex {
             }
             return Ok(step);
         }
+        let notification_frame_turn = params["turnId"]
+            .as_str()
+            .or_else(|| params["turn"]["id"].as_str())
+            .map(str::to_owned);
+        if method != "turn/started"
+            && notification_frame_turn
+                .as_deref()
+                .is_some_and(|turn| self.notification_turn.as_deref() != Some(turn))
+        {
+            step.suppress_current_notification = true;
+        }
         match method {
             "thread/started" => {
                 if self.ready {
@@ -2528,13 +2618,51 @@ impl Adapter for Codex {
                 }
             }
             "turn/started" | "turn/completed" => {
+                let turn = &params["turn"];
+                let turn_id = string(turn, "id")?;
+                // A completed ID is current only when a start, active attach,
+                // or exact accepted request reply has established ownership.
+                let current =
+                    method == "turn/started" || self.notification_turn.as_deref() == Some(turn_id);
+                if !current {
+                    step.suppress_current_notification = true;
+                    if let Some(Pending::Turn { early, early_bytes, .. }) =
+                        self.pending.values_mut().find(|pending| matches!(pending,
+                            Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
+                    {
+                        let bytes = serde_json::to_vec(turn).map_err(|error| error.to_string())?.len();
+                        let previous = early.get(turn_id).and_then(|entry| entry.completed.as_ref()).map(serde_json::to_vec)
+                            .transpose().map_err(|error| error.to_string())?.map_or(0, |value| value.len());
+                        let next_bytes = early_bytes.saturating_sub(previous).saturating_add(bytes);
+                        if (!early.contains_key(turn_id) && early.len() >= 8)
+                            || next_bytes > crate::agent_execution::MAX_RESULT_BYTES
+                        {
+                            return Err("Codex notification completion exceeded pending request correlation capacity".into());
+                        }
+                        *early_bytes = next_bytes;
+                        early.entry(turn_id.to_owned()).or_default().completed = Some(turn.clone());
+                    }
+                }
                 if method == "turn/started" {
+                    // The observed start now proves the early stream's exact
+                    // owner. Transfer it once, before later live deltas, and
+                    // consume the saved preview so the RPC ACK cannot rewind
+                    // it. Retain any known terminal proof for that exact ACK.
+                    if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
+                        matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
+                    {
+                        if let Some(context) = early.get_mut(turn_id) {
+                            step.notification_preview = Some(std::mem::take(&mut context.preview).at_observed_start());
+                            context.preview_transferred = true;
+                        }
+                    }
+                    self.notification_revision = self.notification_revision.wrapping_add(1);
+                    self.notification_turn = Some(turn_id.to_owned());
                     self.suggestion_turn = None;
                     step.events.push(Event::TurnStarted);
                 }
                 self.materialized = true;
-                let turn = &params["turn"];
-                if method == "turn/completed" {
+                if method == "turn/completed" && current {
                     use crate::notifications::Kind;
                     let outcome = match turn["status"].as_str() {
                         Some("completed") => Some(Kind::Succeeded),
@@ -2553,7 +2681,6 @@ impl Adapter for Codex {
                         });
                     }
                 }
-                let turn_id = string(turn, "id")?;
                 if method == "turn/started" {
                     let (model, tier) = self
                         .pending
@@ -2575,8 +2702,6 @@ impl Adapter for Codex {
                 if prediction_turn {
                     self.prediction_turn = None;
                 }
-                let current =
-                    method == "turn/started" || self.turn.as_deref().is_none_or(|id| id == turn_id);
                 if current {
                     if method == "turn/completed" {
                         step.events.push(Event::TurnSettled);
@@ -2625,6 +2750,10 @@ impl Adapter for Codex {
                 }
                 if method == "turn/completed" {
                     self.finish_execution(turn, &mut step)?;
+                    if current {
+                        self.notification_revision = self.notification_revision.wrapping_add(1);
+                        self.notification_turn = None;
+                    }
                     if current
                         && prediction_turn
                         && turn["status"] == "completed"
@@ -2888,6 +3017,19 @@ impl Adapter for Codex {
             // Unknown item types are shown as tool disclosures and unknown
             // requests are visibly rejected above.
             _ => {}
+        }
+        if step.suppress_current_notification {
+            if let Some(turn) = notification_frame_turn {
+                if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
+                    matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
+                {
+                    if !early.contains_key(&turn) && early.len() >= 8 {
+                        return Err("Codex notification context exceeded pending request correlation capacity".into());
+                    }
+                    let context = early.entry(turn).or_default();
+                    for event in &step.events { context.preview.observe(event); }
+                }
+            }
         }
         Ok(step)
     }
@@ -3901,6 +4043,506 @@ mod tests {
     }
 
     #[test]
+    fn notification_questions_use_real_codex_prompts_and_same_id_revisions() {
+        let question = |id: u64, text: &str| {
+            json!({
+                "id":id, "method":"item/tool/requestUserInput",
+                "params":{"threadId":"thread-exact", "turnId":"notification-turn",
+                    "questions":[{"id":"migration", "header":"Migration", "question":text,
+                        "options":[{"label":"Keep","description":"Keep existing"},
+                            {"label":"Replace","description":"Use replacement"}]}]}
+            })
+        };
+        let frames = vec![
+            question(71, "Which config_file.rs strategy should A use?"),
+            question(72, "Which migration should B use?"),
+            json!({"method":"serverRequest/resolved",
+                "params":{"threadId":"thread-exact", "requestId":71}}),
+            question(72, "Updated B: preserve config_file.rs?"),
+            question(72, "Updated B: preserve config_file.rs?"),
+        ];
+        let receipts =
+            crate::chat::runtime::notification_frames_for_test(Box::new(adapter()), frames, false);
+        assert_eq!(
+            receipts.len(),
+            3,
+            "identical repeated metadata must not notify again"
+        );
+        for (index, expected) in [
+            "Which config_file.rs strategy should A use?",
+            "Which migration should B use?",
+            "Updated B: preserve config_file.rs?",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (evidence, content) = &receipts[index];
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(
+                content.request,
+                Some(crate::notifications::RequestType::Question)
+            );
+            assert!(content.preview.contains(expected), "{}", content.preview);
+            assert!(!content.preview.contains("waiting for your answer"));
+        }
+        assert_ne!(receipts[0].0.key, receipts[1].0.key);
+        assert_ne!(receipts[1].0.key, receipts[2].0.key);
+    }
+
+    #[test]
+    fn notification_secret_question_revisions_notify_without_exposing_prompts() {
+        let question = |wording: &str| {
+            json!({
+                "id":73, "method":"item/tool/requestUserInput",
+                "params":{"threadId":"thread-exact", "turnId":"notification-turn",
+                    "questions":[{"id":"secret", "header":"PRIVATE_HEADER", "question":wording,
+                        "isSecret":true, "options":[]}]}
+            })
+        };
+        let receipts = crate::chat::runtime::notification_frames_for_test(
+            Box::new(adapter()),
+            vec![
+                question("PRIVATE_FIRST_QUESTION"),
+                question("PRIVATE_CHANGED_QUESTION"),
+                question("PRIVATE_CHANGED_QUESTION"),
+            ],
+            false,
+        );
+        assert_eq!(
+            receipts.len(),
+            2,
+            "changed secret prompts still need fresh attention"
+        );
+        assert_ne!(receipts[0].0.key, receipts[1].0.key);
+        for (evidence, content) in receipts {
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(
+                content.request,
+                Some(crate::notifications::RequestType::Question)
+            );
+            assert_eq!(content.preview, "Codex is waiting for your answer.");
+            assert!(!content.preview.contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn notification_old_completion_preserves_current_question_topic_and_error_state() {
+        let start = json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"new-b","status":"inProgress","items":[]}}});
+        let user = json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"new-b",
+            "item":{"id":"user-b","type":"userMessage","content":[{"type":"text","text":"Review the new B migration"}]}}});
+        let question = |text| {
+            json!({"id":71,"method":"item/tool/requestUserInput",
+            "params":{"threadId":"thread-exact","turnId":"new-b",
+                "questions":[{"id":"migration","header":"Migration","question":text,"options":[]}]}})
+        };
+        let old = json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"old-a","status":"failed","error":{"message":"Old A failure must not become B's error"},
+                "items":[{"id":"old-user","type":"userMessage","content":[{"type":"text","text":"Old A private topic"}]},
+                    {"id":"old-answer","type":"agentMessage","text":"Old A final response"}]}}});
+        let old_user = json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"old-a",
+            "item":{"id":"late-old-user","type":"userMessage","content":[{"type":"text","text":"Late old A topic"}]}}});
+        let old_delta = json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"old-a","itemId":"late-old-answer","delta":"Old A delta"}});
+        let mut adapter = adapter();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "Old A".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let old_request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        let old_rejection = json!({"id":old_request,"error":{"code":-32000,"message":"Old A rejected after B started"}});
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                start,
+                user,
+                question("Choose B migration"),
+                old_user,
+                old_delta,
+                old,
+                old_rejection,
+                question("Updated B migration question"),
+            ],
+            false,
+        );
+        assert_eq!(
+            callbacks.len(),
+            2,
+            "old A must not publish current completion or another waiting revision"
+        );
+        for (evidence, content) in &callbacks {
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(content.conversation, "Review the new B migration");
+            assert!(!content.preview.contains("Old A"));
+        }
+        assert!(
+            callbacks[1]
+                .1
+                .preview
+                .contains("Updated B migration question")
+        );
+        assert_eq!(state.requests.len(), 1);
+        assert_eq!(state.requests[0].id, "71");
+        assert!(state.error.is_none());
+        assert_eq!(state.activity(), crate::agent::ActivityState::Waiting);
+    }
+
+    #[test]
+    fn notification_exact_early_ack_restores_streamed_context_without_reappending_deltas() {
+        let mut adapter = adapter();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"early-b",
+                "item":{"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]}}}),
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"early-b","itemId":"b-answer","delta":"Exact streamed B response."}}),
+                json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[]}}}),
+                json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}}),
+                json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+            ],
+            false,
+        );
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(callbacks[0].1.conversation, "Review B migration");
+        assert_eq!(callbacks[0].1.preview, "Exact streamed B response.");
+        assert_eq!(
+            state
+                .notification_content(crate::notifications::Kind::Succeeded)
+                .preview,
+            "Exact streamed B response."
+        );
+    }
+
+    #[test]
+    fn notification_observed_start_transfers_early_context_before_live_deltas_and_ack() {
+        let mut adapter = adapter();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        let delta = |text| json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"early-b","itemId":"b-answer","delta":text}});
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"early-b",
+                "item":{"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]}}}),
+                delta("First part. "),
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"inProgress","items":[]}}}),
+                delta("Second part."),
+                json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+                json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[]}}}),
+            ],
+            false,
+        );
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(callbacks[0].1.conversation, "Review B migration");
+        assert_eq!(callbacks[0].1.preview, "First part. Second part.");
+        assert_eq!(
+            state
+                .notification_content(crate::notifications::Kind::Succeeded)
+                .preview,
+            "First part. Second part."
+        );
+    }
+
+    #[test]
+    fn notification_observed_start_keeps_already_decoded_completion_for_exact_ack() {
+        let mut adapter = adapter();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        // A conservative decoder-order control, not a claim that a supported
+        // provider emits start after completion on one ordered connection.
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[
+                {"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]},
+                {"id":"b-answer","type":"agentMessage","text":"Already completed B response."}]}}}),
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"inProgress","items":[]}}}),
+                json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+            ],
+            false,
+        );
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(callbacks[0].1.conversation, "Review B migration");
+        assert_eq!(callbacks[0].1.preview, "Already completed B response.");
+        assert!(!state.is_working());
+    }
+
+    #[test]
+    fn notification_history_and_scalar_idle_cannot_replace_exact_live_turn_proof() {
+        let start = |id| {
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"inProgress","items":[]}}})
+        };
+        let mut adapter = adapter();
+        adapter.receive(start("old-a")).unwrap();
+        let mut request = Step::default();
+        adapter.history(&mut request, None).unwrap();
+        let id = request.writes[0]["id"].clone();
+        adapter.receive(start("new-b")).unwrap();
+        adapter.receive(json!({"id":id,"result":{"data":[{"id":"old-a","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+        assert_eq!(adapter.turn.as_deref(), Some("new-b"));
+        assert_eq!(adapter.notification_turn.as_deref(), Some("new-b"));
+        let old = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"old-a","status":"completed","items":[]}}})).unwrap();
+        assert!(old.suppress_current_notification);
+        adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}})).unwrap();
+        assert!(adapter.turn.is_none());
+        let current = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"new-b","status":"completed","items":[]}}})).unwrap();
+        assert!(!current.suppress_current_notification);
+        assert!(current.events.iter().any(|event| matches!(event, Event::TurnFinished { key, .. } if key.as_deref() == Some("codex:thread-exact:new-b"))));
+    }
+
+    #[test]
+    fn notification_pending_request_promotes_only_its_exact_early_completion() {
+        let start = |id| {
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"inProgress","items":[]}}})
+        };
+        let finish = |id, text| {
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"completed","items":[{"id":format!("answer-{id}"),"type":"agentMessage","text":text}]}}})
+        };
+        let mut adapter = adapter();
+        adapter.receive(start("old-a")).unwrap();
+        adapter.receive(finish("old-a", "Old A completed")).unwrap();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "New B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        let a = adapter.receive(finish("old-a", "Replayed A")).unwrap();
+        let b = adapter
+            .receive(finish("new-b", "Exact B final response"))
+            .unwrap();
+        for pending in [&a, &b] {
+            assert!(pending.suppress_current_notification);
+            assert!(
+                !pending
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnFinished { .. }))
+            );
+            assert!(
+                pending
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(_))),
+                "history still receives completed items"
+            );
+        }
+        let accepted = adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"new-b"}}}))
+            .unwrap();
+        assert!(!accepted.suppress_current_notification);
+        let outcomes = accepted
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::TurnFinished { key, outcome } => Some((key.as_deref(), *outcome)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![(
+                Some("codex:thread-exact:new-b"),
+                crate::notifications::Kind::Succeeded
+            )]
+        );
+        let projected =
+            crate::chat::notification::FrameContext::capture(&crate::chat::Snapshot::default())
+                .project(&accepted.events);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].preview, "Exact B final response");
+        assert!(!adapter.busy);
+    }
+
+    #[test]
+    fn notification_early_completion_buffer_is_bounded_and_replay_replaces_in_place() {
+        let mut adapter = adapter();
+        adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let frame = |id: &str| {
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"completed","items":[]}}})
+        };
+        for _ in 0..32 {
+            adapter.receive(frame("same-old-turn")).unwrap();
+        }
+        let (count, bytes) = adapter
+            .pending
+            .values()
+            .find_map(|pending| match pending {
+                Pending::Turn {
+                    early, early_bytes, ..
+                } => Some((early.len(), *early_bytes)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        let raw = frame("same-old-turn");
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&raw["params"]["turn"]).unwrap().len()
+        );
+        for index in 0..7 {
+            adapter
+                .receive(frame(&format!("unrelated-{index}")))
+                .unwrap();
+        }
+        let refused = adapter.receive(frame("ninth-unrelated-turn")).unwrap_err();
+        assert!(refused.contains("correlation capacity"));
+        assert!(
+            adapter
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::Turn { early, .. } if early.len() == 8))
+        );
+    }
+
+    #[test]
+    fn notification_early_managed_result_cannot_replace_a_newer_current_turn() {
+        use crate::agent_execution::ProviderEvent;
+        let mut adapter = adapter();
+        let run = crate::model::RunId::new();
+        let submitted = adapter
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "B".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"early-b","status":"completed","items":[{"id":"b-answer","type":"agentMessage","text":"B result retained"}]}}})).unwrap();
+        adapter
+            .receive(
+                json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"new-c","status":"inProgress","items":[]}}}),
+            )
+            .unwrap();
+        let accepted = adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"early-b"}}}))
+            .unwrap();
+        assert!(accepted.suppress_current_notification);
+        assert_eq!(adapter.turn.as_deref(), Some("new-c"));
+        assert!(adapter.busy);
+        assert!(!accepted.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished { .. } | Event::Status { busy: false, .. }
+        )));
+        assert!(accepted.events.iter().any(|event| matches!(event, Event::Execution { run: current, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *current == run)));
+        assert!(accepted.events.iter().any(|event| matches!(event, Event::Item(item) if matches!(&item.content, ItemContent::Text { text, .. } if text == "B result retained"))));
+    }
+
+    #[test]
+    fn notification_callback_sees_completed_frame_text_and_failed_frame_diagnosis() {
+        for (status, expected_kind, error, expected) in [
+            (
+                "completed",
+                crate::notifications::Kind::Succeeded,
+                serde_json::Value::Null,
+                "Updated notification_preview in config_file.rs.",
+            ),
+            (
+                "failed",
+                crate::notifications::Kind::Failed,
+                json!({"message":"The provider rejected this request"}),
+                "The provider rejected this request",
+            ),
+        ] {
+            let frame = json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"notification-turn","status":status,
+                "items":[{"id":"final-answer","type":"agentMessage","text":"Updated `notification_preview` in config_file.rs."}],"error":error}}});
+            for fail_store in [false, true] {
+                let mut callbacks = crate::chat::runtime::notification_frames_for_test(
+                    Box::new(adapter()),
+                    vec![
+                        json!({"method":"turn/started","params":{"threadId":"thread-exact",
+                        "turn":{"id":"notification-turn","status":"inProgress","items":[]}}}),
+                        frame.clone(),
+                    ],
+                    fail_store,
+                );
+                assert_eq!(callbacks.len(), 1);
+                let (evidence, content) = callbacks.pop().unwrap();
+                assert_eq!(
+                    evidence.kind, expected_kind,
+                    "storage failure cannot erase the provider's authoritative outcome"
+                );
+                assert_eq!(
+                    content.preview, expected,
+                    "immutable callback context must include validated final metadata independently of storage success"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn attention_requires_explicit_settlement_of_the_bound_thread() {
         use crate::notifications::Kind;
         for (status, expected) in [
@@ -3917,6 +4559,7 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, Event::TurnFinished { .. }))
             );
+            adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"inProgress","items":[]}}})).unwrap();
             let step = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"turn","status":status,"items":[]}}})).unwrap();
             let outcome = step.events.iter().find_map(|event| match event {
                 Event::TurnFinished { key, outcome } => Some((key.as_deref(), *outcome)),
@@ -4289,6 +4932,8 @@ mod tests {
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
+            notification_turn: None,
+            notification_revision: 0,
             busy: false,
             lifecycle_revision: 0,
             suggestion_turn: None,
@@ -5842,6 +6487,7 @@ mod tests {
             let mut initial = Step {
                 writes: vec![],
                 events: vec![Event::Ready(true)],
+                ..Step::default()
             };
             initial.events.extend(prompt.events);
             initial.events.extend(request.events);

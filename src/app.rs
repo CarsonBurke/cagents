@@ -2858,6 +2858,7 @@ impl SettingsField {
             Self::Notifications(Field::Waiting) => "Waiting for you",
             Self::Notifications(Field::ReviewRequests) => "Review requests",
             Self::Notifications(Field::WhileFocused) => "Notify while focused",
+            Self::Notifications(Field::MessagePreviews) => "Show message previews",
             Self::AppTheme => "App theme",
             Self::UiScale => "Interface scale",
             Self::TerminalLineHeight => "Line height",
@@ -4061,6 +4062,10 @@ pub enum Message {
     },
     Sidebar(SidebarAction),
     FocusCard(CardId),
+    AcknowledgeVisiblePane {
+        card: CardId,
+        epoch: u64,
+    },
     MovePaneToChannel {
         card: CardId,
         channel: crate::model::ChannelId,
@@ -4841,6 +4846,7 @@ pub struct Cagents {
     workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     notification_ui: notification_ui::State,
+    attention_focus_epoch: u64,
     daemon_health_ui: daemon_health_ui::State,
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
@@ -7248,9 +7254,12 @@ impl Cagents {
     }
 
     fn pane_is_active(&self, card: CardId) -> bool {
-        self.workspace.focused() == Some(card)
+        self.exit.is_none()
+            && self.refresh_ui.focused
+            && self.workspace.focused() == Some(card)
             && self.workspace_surfaces_visible()
             && !self.modal_is_open()
+            && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.parent_transcript_selected())
     }
 
     pub(super) fn observe_agent_update_for_card(&mut self, card: CardId) {
@@ -7317,7 +7326,78 @@ impl Cagents {
         }
     }
 
+    fn focus_attention_card(&mut self, id: CardId) -> Task<Message> {
+        if self.exit.is_some()
+            || self.workspace_inputs_blocked()
+            || self.focused_repository_is_saving()
+            || self.update_prepared
+        {
+            return Task::none();
+        }
+        let Some(card) = self
+            .card_state(id)
+            .filter(|card| card.existence.is_open())
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&id))
+            .map(|channel| channel.id);
+        let scope = if let Some(channel) = channel {
+            self.select_channel(channel)
+        } else {
+            let directory = self.unchanneled_card_worktree(&card).map(Path::to_path_buf);
+            directory.map_or_else(Task::none, |directory| {
+                self.select_worktree(directory, false)
+            })
+        };
+        let focus = self.focus_workspace_card(id);
+        // Attention belongs to the native parent. Reveal its transcript before
+        // acknowledging it, but only after navigation has actually succeeded.
+        let (transcript, read) = if self.workspace.focused() == Some(id) {
+            let parent = match self.cards.get(&id) {
+                Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
+                _ => None,
+            };
+            let transcript = parent.map_or_else(Task::none, |target| {
+                self.handle_chat_ui(chat_ui::Action::SelectSubagent(target, None))
+            });
+            (transcript, self.mark_cards_read(vec![id]))
+        } else {
+            (Task::none(), Task::none())
+        };
+        Task::batch([scope, focus, transcript, read])
+    }
+
+    fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
+        let tasks: Vec<_> = cards
+            .into_iter()
+            .map(|card| {
+                self.sidebar_state.acknowledge_agent_update(card);
+                self.acknowledge_card_notices(card);
+                if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+                    && let Err(error) = handle.acknowledge_updates()
+                {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not acknowledge terminal output: {error}"
+                    )));
+                }
+                self.acknowledge_chat_updates(card)
+            })
+            .collect();
+        self.refresh_sidebar_channels();
+        Task::batch(tasks)
+    }
+
     fn acknowledge_active_pane(&mut self) -> Task<Message> {
+        self.acknowledge_active_pane_with_notices(true)
+    }
+
+    fn acknowledge_active_pane_with_notices(&mut self, acknowledge_notices: bool) -> Task<Message> {
         let Some(card) = self
             .workspace
             .focused()
@@ -7335,6 +7415,9 @@ impl Cagents {
             self.status = Some(TransientNotice::error(format!(
                 "Could not acknowledge terminal output: {error}"
             )));
+        }
+        if acknowledge_notices {
+            self.acknowledge_card_notices(card);
         }
         self.acknowledge_chat_updates(card)
     }
@@ -8102,7 +8185,9 @@ impl Cagents {
         }
         let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
-        tasks.push(self.acknowledge_active_pane());
+        if focus_changed {
+            tasks.push(self.acknowledge_active_pane());
+        }
         if self.chrome_ui.tabs_focus != focused {
             self.chrome_ui.tabs_focus = focused;
             tasks.push(self.reveal_active_tab());
@@ -12891,6 +12976,7 @@ impl Application for Cagents {
             workspace_model_tx,
             activation_rx,
             notification_ui: notification_ui::State::default(),
+            attention_focus_epoch: 0,
             daemon_health_ui: daemon_health_ui::State::default(),
             session,
             save_health,
@@ -13146,6 +13232,17 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let attention_scope_changed = matches!(
+            &message,
+            Message::RepositoryLoaded { result: Ok(_), .. }
+                | Message::DeviceProjectLoaded { result: Ok(_), .. }
+                | Message::AttachedWorktreePrsResolved { .. }
+                | Message::GitUi(_)
+        );
+        // Preserve the existing dispatch layout while every return converges
+        // through the lightweight visibility/presence postlude below.
+        #[rustfmt::skip]
+        let task = (|| {
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -14163,18 +14260,9 @@ impl Application for Cagents {
                     SidebarAction::ToggleProjects => self.update_chrome(chrome_ui::Action::ToggleProjects),
                     SidebarAction::RenameChannel(id) => self.update_chrome(chrome_ui::Action::RenameChannel(id)),
                     SidebarAction::MarkChannelRead(id) => {
-                        let cards = self.durable.channels.iter().find(|channel| channel.id == id).map(|channel| channel.cards.clone()).unwrap_or_default();
-                        let tasks: Vec<_> = cards.into_iter().map(|card| {
-                            self.sidebar_state.acknowledge_agent_update(card);
-                            if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
-                                && let Err(error) = handle.acknowledge_updates()
-                            {
-                                self.status = Some(TransientNotice::error(format!("Could not acknowledge terminal output: {error}")));
-                            }
-                            self.acknowledge_chat_updates(card)
-                        }).collect();
-                        self.refresh_sidebar_channels();
-                        Task::batch(tasks)
+                        let cards = self.durable.channels.iter().find(|channel| channel.id == id)
+                            .map(|channel| channel.cards.clone()).unwrap_or_default();
+                        self.mark_cards_read(cards)
                     }
                     SidebarAction::ScrollProjects(y) => iced::widget::operation::scroll_by(
                         widget::Id::new("sidebar.projects.scroll"),
@@ -14608,6 +14696,11 @@ impl Application for Cagents {
                     | SidebarAction::SetFilter(_)
                     | SidebarAction::ToggleProject(_) => Task::none(),
                 }
+            }
+            Message::AcknowledgeVisiblePane { card, epoch } => {
+                if epoch == self.attention_focus_epoch && self.pane_is_active(card) {
+                    self.acknowledge_visible_pane()
+                } else { Task::none() }
             }
             Message::FocusCard(id) => {
                 // Explicit activation also cancels a pending entry on this same
@@ -16469,7 +16562,6 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
-        self.sync_notification_presence();
         self.sync_worktree_protections();
         self.sync_popup_keyboard_nav();
         if let Some(notice) = self.status.take()
@@ -16528,6 +16620,14 @@ impl Application for Cagents {
             notices,
             terminal_probes,
         ])
+            })();
+        if attention_scope_changed {
+            self.notification_ui.scope_changed();
+        }
+        let activation = self.retry_notification_activation();
+        let visibility = self.sync_visible_attention();
+        self.sync_notification_presence();
+        Task::batch([task, activation, visibility])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -25198,6 +25298,7 @@ mod tests {
             workspace_model_tx: async_channel::unbounded().0,
             activation_rx: async_channel::unbounded().1,
             notification_ui: notification_ui::State::default(),
+            attention_focus_epoch: 0,
             daemon_health_ui: daemon_health_ui::State::default(),
             session: None,
             save_health: None,
@@ -25326,6 +25427,11 @@ mod tests {
         use crate::agent::{Activity, ActivityState, Provider};
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
+        let window = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(window));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window, true,
+        ))));
         app.settings.focus_follows_mouse = true;
         let first = app.workspace.focused().unwrap();
         let second = terminal_card_state();

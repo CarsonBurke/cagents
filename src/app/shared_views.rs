@@ -1145,12 +1145,19 @@ impl Cagents {
                 tasks.push(self.add_default_pane(path, settings::DefaultPane::Terminal));
             }
         }
+        self.reproject_notification_unread();
         Task::batch(tasks)
     }
 
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
         self.shared_views.blocked.clear();
         let display_index = views::ManagedDisplayIndex::new(&self.workspace_model);
+        let mut attention_owners: HashMap<_, usize> = HashMap::new();
+        for pane in views.iter().flat_map(|view| &view.panes) {
+            if let Some(resource) = attention_resource(&pane.kind) {
+                *attention_owners.entry(resource).or_default() += 1;
+            }
+        }
         let managed = self
             .workspace_model
             .agents
@@ -1245,6 +1252,18 @@ impl Cagents {
                         canonical: shared.id,
                         terminal: session.id,
                     });
+            }
+            // ID equality alone is not a conversation proof. Preserve unread
+            // only for the exact logical/native source being rekeyed; a
+            // replacement process/thread must not inherit an old actor's read
+            // state. Runtime activity awaits its own fresh observation.
+            if attention_resource(&shared.kind)
+                .is_some_and(|resource| attention_owners.get(&resource) == Some(&1))
+                && self
+                    .card_state(alias)
+                    .is_some_and(|card| same_attention_update_source(&card.kind, &shared.kind))
+            {
+                self.sidebar_state.transfer_card_update(alias, shared.id);
             }
             self.detach_shared_pane(alias);
             for channel in &mut Arc::make_mut(&mut self.durable).channels {
@@ -1647,7 +1666,7 @@ impl Cagents {
         // The strip handed this pane's focus to a neighbour above, with no
         // viewport update to tell the saved state.
         self.settle_focus();
-        self.sidebar_state.clear_agent_activity(id);
+        self.sidebar_state.forget_card_attention(id);
     }
 
     /// Refresh presentation after an exact managed owner changes on first model
@@ -1786,6 +1805,41 @@ fn preserve_observed_terminal_exit(card: &CardState, incoming: &mut CardKind) {
             TerminalContinuity::RelaunchAvailable { last_exit, .. },
         ) if last_exit.is_none() => *last_exit = Some(exit.clone()),
         _ => {}
+    }
+}
+
+fn attention_resource(kind: &CardKind) -> Option<(u8, TerminalId)> {
+    match kind {
+        CardKind::Chat(session) => Some((0, session.id)),
+        CardKind::Terminal(session) => Some((1, session.id)),
+        _ => None,
+    }
+}
+
+/// Volatile alias unread requires the same observed conversation/source.
+/// Persisted journal notices use a separate, stable logical Session identity:
+/// an unseen notice can still restore generic unread after a native reattach.
+/// Neither route supplies current activity/fate or execution/cleanup authority.
+fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
+    match (left, right) {
+        (CardKind::Chat(a), CardKind::Chat(b)) => {
+            a.proof.as_ref().is_some_and(HostSessionProof::is_complete)
+                && b.proof.as_ref().is_some_and(HostSessionProof::is_complete)
+                && a.launch.session_id.as_ref().is_some_and(|session| {
+                    !session.is_empty() && b.launch.session_id.as_ref() == Some(session)
+                })
+                && crate::agent_execution::same_chat_process(a, b)
+        }
+        (CardKind::Terminal(a), CardKind::Terminal(b)) => {
+            a.continuity
+                .live_proof()
+                .is_some_and(|proof| proof.is_complete())
+                && b.continuity
+                    .live_proof()
+                    .is_some_and(|proof| proof.is_complete())
+                && crate::agent_execution::same_terminal_process(a, b)
+        }
+        _ => false,
     }
 }
 
@@ -3976,6 +4030,224 @@ mod tests {
         app.workspace_model.views[0].panes.clear();
         drop(app.reconcile_shared_views());
         assert!(!app.card_state(first.id).unwrap().existence.is_open());
+    }
+
+    fn attention_terminal_source() -> TerminalSession {
+        let mut session =
+            fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("attention-owner"),
+            boot_id: crate::model::BootId::new("attention-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("attention-host"),
+        };
+        session
+    }
+
+    #[test]
+    fn attention_passive_shared_removal_forgets_closed_unread_without_retaining_a_ghost() {
+        let (mut app, channel, _, _) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        drop(app.insert_terminal_card(attention_terminal_source(), None));
+        let closed = app.workspace.focused().unwrap();
+        drop(app.insert_terminal_card(attention_terminal_source(), None));
+        let other = app.workspace.focused().unwrap();
+        let retained = Pane::from_card(app.card_state(other).unwrap(), None).unwrap();
+        let project = ProjectId::new();
+        let worktree = crate::model::WorktreeId::new();
+        app.sidebar_state
+            .apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
+        app.sidebar_state
+            .observe_agent_update(closed, project, worktree);
+        app.sidebar_state.observe_card_update(other);
+        app.sidebar_state.set_agent_activity(
+            closed,
+            project,
+            worktree,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Codex,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        app.shared_views.pending.clear();
+        let mut view = View::empty(channel);
+        view.panes.push(retained);
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        assert!(!app.card_state(closed).unwrap().existence.is_open());
+        assert!(app.card_state(other).unwrap().existence.is_open());
+        assert!(!app.sidebar_state.has_card_update(closed));
+        assert!(!app.sidebar_state.has_agent_update(project, worktree));
+        assert!(app.sidebar_state.has_card_update(other));
+    }
+
+    #[test]
+    fn attention_passive_shared_close_forgets_surface_without_acknowledging_unseen_notice() {
+        let (mut app, channel, _, _) = fixture();
+        app.refresh_ui.focused = false;
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        let session = attention_terminal_source();
+        drop(app.insert_terminal_card(session.clone(), None));
+        let card = app.workspace.focused().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let snapshot = crate::notifications::Snapshot {
+            diagnostic: None,
+            notices: vec![crate::notifications::Notice {
+                id,
+                delivered: true,
+                acknowledged: false,
+                window: None,
+                event: crate::notifications::Event {
+                    content: None,
+                    target: crate::notifications::Target::Session(session.id),
+                    source_session: Some(session.id),
+                    provider: Some(crate::agent::Provider::Codex),
+                    directory: Some(session.launch.working_directory.clone()),
+                    destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "unseen-before-passive-close".into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                },
+            }],
+        };
+        drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot.clone())));
+        assert!(app.sidebar_state.has_card_update(card));
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+        app.shared_views.pending.clear();
+        app.workspace_model.views = vec![View::empty(channel)];
+        drop(app.reconcile_shared_views());
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(
+            !app.notification_ui.acknowledged_for_test(id),
+            "surface retirement is not evidence the user read its content"
+        );
+        assert!(!app.notification_ui.snapshot.notices[0].acknowledged);
+        // The durable journal may keep the unseen notice. A later broker
+        // snapshot cannot recreate a live sidebar entry for its closed pane.
+        drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot)));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+    }
+
+    #[test]
+    fn attention_alias_adoption_preserves_unread_only_for_the_exact_complete_native_source() {
+        for source in 0..5 {
+            let (mut app, channel, _, _) = fixture();
+            app.active_workspace = Some(PathBuf::from("/repo"));
+            Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+            drop(app.insert_terminal_card(attention_terminal_source(), None));
+            let alias = app.workspace.focused().unwrap();
+            app.chat_ui =
+                chat_ui::State::with_drafts(HashMap::from([(alias, "retained draft".into())]));
+            let mut canonical = Pane::from_card(app.card_state(alias).unwrap(), None).unwrap();
+            canonical.id = CardId::new();
+            let CardKind::Terminal(current) = &mut canonical.kind else {
+                unreachable!()
+            };
+            match source {
+                0 => {}
+                1 => {
+                    if let TerminalContinuity::Live {
+                        host_incarnation, ..
+                    } = &mut current.continuity
+                    {
+                        *host_incarnation = crate::model::HostIncarnation::new("replacement-owner");
+                    }
+                }
+                2 => {
+                    current.continuity = TerminalContinuity::RelaunchAvailable {
+                        recipe: current.launch.clone(),
+                        last_exit: None,
+                    }
+                }
+                3 => {
+                    if let TerminalContinuity::Live { boot_id, .. } = &mut current.continuity {
+                        *boot_id = crate::model::BootId::new("");
+                    }
+                }
+                4 => {}
+                _ => unreachable!(),
+            }
+            app.sidebar_state.observe_card_update(alias);
+            app.shared_views.pending.clear();
+            let mut view = View::empty(channel);
+            view.panes.push(canonical.clone());
+            let duplicate = if source == 4 {
+                let mut duplicate = canonical.clone();
+                duplicate.id = CardId::new();
+                let id = duplicate.id;
+                view.panes.push(duplicate);
+                Some(id)
+            } else {
+                None
+            };
+            app.workspace_model.views = vec![view];
+            drop(app.reconcile_shared_views());
+            assert!(!app.card_state(alias).unwrap().existence.is_open());
+            assert!(app.card_state(canonical.id).unwrap().existence.is_open());
+            assert!(!app.sidebar_state.has_card_update(alias));
+            assert_eq!(
+                app.sidebar_state.has_card_update(canonical.id),
+                source == 0,
+                "source case{source}"
+            );
+            if let Some(duplicate) = duplicate {
+                assert!(
+                    !app.sidebar_state.has_card_update(duplicate),
+                    "ambiguous ownership is not first-row routing"
+                );
+            }
+            assert_eq!(
+                app.persistent_workspace()
+                    .chat_drafts
+                    .get(&canonical.id)
+                    .map(String::as_str),
+                Some("retained draft")
+            );
+        }
+    }
+
+    #[test]
+    fn attention_chat_alias_proof_does_not_follow_another_native_thread_or_unknown_identity() {
+        let source = attention_terminal_source();
+        let proof = source.continuity.live_proof().unwrap();
+        let a = crate::chat::Session {
+            id: source.id,
+            proof: Some(proof),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                session_id: Some("original-thread".into()),
+                recipe: source.launch.clone(),
+            },
+        };
+        assert!(same_attention_update_source(
+            &CardKind::Chat(a.clone()),
+            &CardKind::Chat(a.clone())
+        ));
+        let mut b = a.clone();
+        b.launch.session_id = Some("successor-thread".into());
+        assert!(!same_attention_update_source(
+            &CardKind::Chat(a.clone()),
+            &CardKind::Chat(b)
+        ));
+        let mut unknown = a.clone();
+        unknown.launch.session_id = None;
+        assert!(!same_attention_update_source(
+            &CardKind::Chat(unknown.clone()),
+            &CardKind::Chat(unknown)
+        ));
+        let mut missing = a.clone();
+        missing.proof = None;
+        assert!(!same_attention_update_source(
+            &CardKind::Chat(missing.clone()),
+            &CardKind::Chat(missing)
+        ));
     }
 
     #[test]
