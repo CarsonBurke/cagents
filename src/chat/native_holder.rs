@@ -30,13 +30,24 @@ pub(crate) struct Recovery {
 
 impl Recovery {
     fn validate(&self, boot: &BootId) -> Result<(), String> {
+        self.validate_pair_role(boot, crate::instance::APPLICATION_ID, false)
+    }
+
+    /// An adopted holder keeps its original role/Record. Its paired terminal
+    /// must belong to that role or the authenticated production successor.
+    fn validate_original_role(&self, boot: &BootId, application: &str) -> Result<(), String> {
+        self.validate_pair_role(boot, application, true)
+    }
+
+    fn validate_pair_role(&self, boot: &BootId, application: &str, adopted: bool) -> Result<(), String> {
         if self.paired_holder.as_ref().is_some_and(|record| {
             self.source
                 .terminal
                 .as_ref()
                 .is_none_or(|terminal| terminal.id != record.terminal)
                 || record.kind != crate::daemon::holder_registry::Kind::Terminal
-                || record.application != crate::instance::APPLICATION_ID
+                || (record.application != application
+                    && !(adopted && crate::daemon::holder_registry::production_role_pair(&record.application, application)))
                 || &record.boot != boot
         }) {
             return Err("Native holder has inconsistent terminal holder identity".into());
@@ -168,17 +179,29 @@ impl Recovery {
         Ok(())
     }
 
+    #[cfg(test)]
     fn update_source(
         &mut self,
         source: super::Session,
         execution_console: Option<crate::model::LaunchRecipe>,
         paired_holder: Option<crate::terminal::holder::Record>,
     ) -> Result<(), String> {
+        self.update_source_for_role(source, execution_console, paired_holder, crate::instance::APPLICATION_ID)
+    }
+
+    fn update_source_for_role(
+        &mut self,
+        source: super::Session,
+        execution_console: Option<crate::model::LaunchRecipe>,
+        paired_holder: Option<crate::terminal::holder::Record>,
+        owner_application: &str,
+    ) -> Result<(), String> {
         if source.terminal.is_some() != paired_holder.is_some()
             || paired_holder.as_ref().is_some_and(|record| {
                 record.terminal != source.id
                     || record.kind != crate::daemon::holder_registry::Kind::Terminal
-                    || record.application != crate::instance::APPLICATION_ID
+                    || (record.application != crate::instance::APPLICATION_ID
+                        && record.application != owner_application)
                     || source
                         .proof
                         .as_ref()

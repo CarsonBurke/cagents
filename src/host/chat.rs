@@ -736,7 +736,7 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
     }
     use crate::daemon::holder_registry::{self as registry, Kind};
     let directory = registry::directory(Kind::Native).map_err(unavailable)?;
-    registry::evidence(&registry::socket(&directory, session.id), Kind::Native)
+    registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)
         .map(|record| record.is_some())
         .map_err(unavailable)
 }

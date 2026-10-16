@@ -79,6 +79,68 @@ pub(crate) struct Record {
     pub root: Process,
 }
 
+/// Read-only recovery intake may inspect the other production package's original
+/// holder. This is not adoption or cleanup authority: those paths must retain
+/// an authenticated exact-record transition after checking live issued lineage.
+fn recovery_role(application: &str) -> bool {
+    production_role_pair(application, crate::instance::APPLICATION_ID)
+}
+
+pub(crate) fn production_role_pair(original: &str, successor: &str) -> bool {
+    matches!((original, successor),
+        ("dev.cagents.Cagents", "dev.cagents.Cagents.Browserless") |
+        ("dev.cagents.Cagents.Browserless", "dev.cagents.Cagents"))
+}
+
+/// Private, process-local custody established only after authenticated Inspect
+/// or an exact durable cleanup receipt, and exact issued-source matching. It never changes the original Record.
+#[derive(Clone)]
+pub(crate) struct OriginalRole {
+    record: Record,
+    original: crate::model::HostSessionProof,
+    successor: crate::model::HostSessionProof,
+    application: &'static str,
+}
+
+impl OriginalRole {
+    pub(crate) fn authenticated(
+        record: &Record,
+        original: &crate::model::HostSessionProof,
+        successor: &crate::model::HostSessionProof,
+    ) -> Result<Option<Self>, String> {
+        if record.application == crate::instance::APPLICATION_ID {
+            return Ok(None);
+        }
+        if !recovery_role(&record.application)
+            || !original.is_complete() || !successor.is_complete()
+            || original.boot_id != record.boot || successor.boot_id != record.boot
+        {
+            return Err("Holder role transition lacks exact same-boot issued ownership".into());
+        }
+        let paths = crate::daemon::RuntimePaths::discover().map_err(|e| e.to_string())?;
+        if crate::daemon::lease_owner(&paths.lock, successor).map_err(|e| e.to_string())?
+            != std::process::id()
+        {
+            return Err("Holder role transition caller no longer owns the daemon lease".into());
+        }
+        Ok(Some(Self {
+            record: record.clone(), original: original.clone(), successor: successor.clone(),
+            application: crate::instance::APPLICATION_ID,
+        }))
+    }
+
+    pub(crate) fn matches(&self, record: &Record, proof: &crate::model::HostSessionProof) -> bool {
+        self.application == crate::instance::APPLICATION_ID && self.matches_original(record, proof)
+    }
+
+    fn matches_original(&self, record: &Record, proof: &crate::model::HostSessionProof) -> bool {
+        self.record == *record && self.successor == *proof
+            && self.original.is_complete() && self.original.boot_id == record.boot
+            && proof.is_complete() && proof.boot_id == record.boot
+            && production_role_pair(&record.application, self.application)
+    }
+}
+
 pub(crate) fn directory(kind: Kind) -> Result<PathBuf, String> {
     crate::daemon::RuntimePaths::discover()
         .map(|paths| {
@@ -321,6 +383,16 @@ pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
 }
 
 pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
+    evidence_inner(socket, kind, false)
+}
+
+/// Untrusted routing evidence for the recovery Inspect handshake only. Ordinary
+/// discovery stays application-exact; no caller may infer adoption from this.
+pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
+    evidence_inner(socket, kind, true)
+}
+
+fn evidence_inner(socket: &Path, kind: Kind, recovery: bool) -> Result<Option<Record>, String> {
     let path = socket.with_extension("json");
     let record = match read(&path) {
         Ok(record) => record,
@@ -330,7 +402,8 @@ pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, Stri
     let boot = crate::daemon::read_boot_id().map_err(|error| error.to_string())?;
     if !record.supported_version()
         || record.kind != kind
-        || record.application != crate::instance::APPLICATION_ID
+        || (record.application != crate::instance::APPLICATION_ID
+            && !(recovery && recovery_role(&record.application)))
         || record.boot != boot
         || socket.file_name() != Some(std::ffi::OsStr::new(&record.terminal.to_string()))
     {
@@ -383,6 +456,14 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
 }
 
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
+    discover_inner(directory, boot, kind, false)
+}
+
+pub(crate) fn recovery_candidates(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
+    discover_inner(directory, boot, kind, true)
+}
+
+fn discover_inner(directory: &Path, boot: &BootId, kind: Kind, recovery: bool) -> Result<Vec<Record>, String> {
     crate::secure_file::prepare_private_directory(directory).map_err(|error| error.to_string())?;
     let mut records = Vec::new();
     for (index, entry) in fs::read_dir(directory)
@@ -405,7 +486,8 @@ pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Ve
         };
         if !record.supported_version()
             || record.kind != kind
-            || record.application != crate::instance::APPLICATION_ID
+            || (record.application != crate::instance::APPLICATION_ID
+                && !(recovery && recovery_role(&record.application)))
             || record.path(directory) != path
             || &record.boot != boot
         {
@@ -428,6 +510,51 @@ pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Ve
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn recovery_roles_are_only_the_two_distinct_production_packages() {
+        let full = "dev.cagents.Cagents";
+        let browserless = "dev.cagents.Cagents.Browserless";
+        assert!(production_role_pair(full, browserless));
+        assert!(production_role_pair(browserless, full));
+        for unrelated in ["dev.cagents.Cagents.Development", "another-installation", "", full] {
+            assert!(!production_role_pair(full, unrelated));
+            assert!(!production_role_pair(unrelated, full));
+        }
+    }
+
+    #[test]
+    fn retained_role_capability_cannot_move_to_another_record_or_daemon() {
+        // Pure capability/data oracle. This does not impersonate a production
+        // executable or claim the real cross-package/native qualification.
+        let mut original = record();
+        original.application = "dev.cagents.Cagents.Browserless".into();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("original-role-test"),
+            host_incarnation: crate::model::HostIncarnation::new("successor"),
+            boot_id: original.boot.clone(),
+        };
+        let role = OriginalRole {
+            record: original.clone(), original: proof.clone(), successor: proof.clone(),
+            application: "dev.cagents.Cagents",
+        };
+        assert!(role.matches_original(&original, &proof));
+        let mut changed = original.clone(); changed.root.start += 1;
+        assert!(!role.matches_original(&changed, &proof));
+        changed = original.clone(); changed.holder.start += 1;
+        assert!(!role.matches_original(&changed, &proof));
+        changed = original.clone(); changed.terminal = TerminalId::new();
+        assert!(!role.matches_original(&changed, &proof));
+        changed = original.clone(); changed.application = "dev.cagents.Cagents".into();
+        assert!(!role.matches_original(&changed, &proof));
+        let mut other = proof.clone();
+        other.host_incarnation = crate::model::HostIncarnation::new("different-daemon");
+        assert!(!role.matches_original(&original, &other));
+        if crate::instance::IS_DEVELOPMENT {
+            assert!(!role.matches(&original, &proof), "production capability entered development");
+            assert!(OriginalRole::authenticated(&original, &proof, &proof).is_err());
+        }
+    }
 
     fn record() -> Record {
         let process = Process::read(std::process::id() as i32).unwrap();

@@ -15,6 +15,7 @@ pub(crate) struct Detached {
     pub record: Record,
     pub source: super::super::Session,
     pub proof: HostSessionProof,
+    pub(crate) original_role: Option<registry::OriginalRole>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +91,15 @@ fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
 }
 
 impl Detached {
+    /// Used only after find_source has authenticated the exact durable receipt
+    /// and full issued-source digest; never from an untrusted candidate record.
+    pub(crate) fn from_receipt(record: Record, source: crate::chat::Session, proof: HostSessionProof) -> Result<Self, String> {
+        let receipt = find_source(&source, &proof)?.ok_or("The native cleanup receipt is unavailable")?;
+        if receipt.record != record { return Err("Native cleanup receipt changed".into()); }
+        let original_role = registry::OriginalRole::authenticated(&record, &receipt.proof, &proof)?;
+        Ok(Self { record, source, proof, original_role })
+    }
+
     pub fn close(&self) -> Result<(), String> {
         self.close_inner(false)
     }
@@ -128,7 +138,9 @@ impl Detached {
             self.record.terminal,
             &self.record.holder,
             retain,
-            |receipt| receipt.record == self.record && receipt.proof == self.proof,
+            |receipt| receipt.record == self.record && receipt.proof == self.proof
+                && (receipt.record.application == crate::instance::APPLICATION_ID
+                    || self.original_role.as_ref().is_some_and(|role| role.matches(&receipt.record, &self.proof))),
         )
     }
 }
@@ -236,7 +248,7 @@ fn find_source(
         return Err("Native cleanup caller does not own the daemon lease".into());
     }
     let directory = registry::directory(Kind::Native)?;
-    let current = registry::evidence(&registry::socket(&directory, source.id), Kind::Native)?;
+    let current = registry::recovery_candidate(&registry::socket(&directory, source.id), Kind::Native)?;
     let digest = source_digest(source)?;
     let prefix = format!("{}-", source.id);
     let mut candidates = 0;
@@ -267,7 +279,9 @@ fn find_source(
                 && receipt.record.terminal == source.id
                 && receipt.record.holder == holder
                 && receipt.record.kind == Kind::Native
-                && receipt.record.application == crate::instance::APPLICATION_ID
+                && (receipt.record.application == crate::instance::APPLICATION_ID
+                    || (source.proof.as_ref().is_some_and(|issued| issued.is_complete() && issued.boot_id == receipt.record.boot)
+                        && registry::OriginalRole::authenticated(&receipt.record, &receipt.proof, proof).is_ok()))
                 && receipt.record.boot == proof.boot_id
                 && receipt.proof.boot_id == proof.boot_id
                 && receipt.proof.is_complete()

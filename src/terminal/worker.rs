@@ -379,6 +379,7 @@ struct PublishedState {
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
+    original_holder_role: OnceLock<crate::daemon::holder_registry::OriginalRole>,
     // The source descriptors pin both identities through terminal retirement;
     // numeric inode receipts alone cannot distinguish later inode reuse.
     transcript_location: OnceLock<crate::transcript_location::ValidatedTranscript>,
@@ -423,6 +424,7 @@ impl PublishedState {
             shutdown_requested: AtomicBool::new(false),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
+            original_holder_role: OnceLock::new(),
             transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
@@ -1312,7 +1314,7 @@ impl TerminalHandle {
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if super::holder::cleanup::confirmed(source, expected, proof)? {
+            if super::holder::cleanup::confirmed_with_role(source, expected, proof, self.inner.published.original_holder_role.get())? {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -1800,6 +1802,9 @@ impl Worker {
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
         held.holder.commit_adoption()?;
+        if let Some(role) = held.holder.original_role() {
+            let _ = published.original_holder_role.set(role.clone());
+        }
         if let Some(record) = held.holder.record() {
             let _ = published.holder_identity.set(record.clone());
         }

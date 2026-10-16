@@ -2495,10 +2495,12 @@ fn carry_terminals(
         // Completion can race the carry, or VT serialization can fail while
         // its process still runs. A registered holder can keep either result
         // without converting ownership into permission to execute a recipe.
-        if crate::terminal::holder::evidence(&holder_socket(holders, id))
+        if crate::daemon::holder_registry::recovery_candidate(
+            &holder_socket(holders, id), crate::daemon::holder_registry::Kind::Terminal,
+        )
             .ok()
             .flatten()
-            .is_some_and(|record| record.holder.is_current())
+            .is_some_and(|record| handle.holder_identity() == Some(&record) && record.holder.is_current())
             && handle.preserve_for_restart().is_ok()
         {
             tracing::warn!(terminal = %id, %error,
@@ -2637,7 +2639,9 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .clone();
-    let records = crate::terminal::holder::discover(&directory, &proof.boot_id)?;
+    let records = crate::daemon::holder_registry::recovery_candidates(
+        &directory, &proof.boot_id, crate::daemon::holder_registry::Kind::Terminal,
+    )?;
     for record in records {
         if crate::daemon::termination_requested() {
             break;
@@ -3145,7 +3149,9 @@ fn adopt_carried_terminal(
         let socket = holder_socket(holders, id);
         for attempt in 1..=ADOPTION_ATTEMPTS {
             let previous = (|| {
-                if let Some(record) = crate::terminal::holder::evidence(&socket)? {
+                if let Some(record) = crate::daemon::holder_registry::recovery_candidate(
+                    &socket, crate::daemon::holder_registry::Kind::Terminal,
+                )? {
                     let proof = host
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
