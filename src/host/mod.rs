@@ -10,10 +10,10 @@ pub(crate) mod descriptor_limit;
 mod lock;
 mod model;
 mod notifications;
-mod service;
-mod state;
 #[cfg(all(test, target_os = "linux"))]
 mod provider_shutdown_tests;
+mod service;
+mod state;
 
 use std::{
     fs, io,
