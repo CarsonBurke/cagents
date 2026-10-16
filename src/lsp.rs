@@ -6525,11 +6525,15 @@ mod tests {
             let triggers = vec!["(".to_owned(), ",".to_owned(), "λ".to_owned()];
             let retriggers = vec!["，".to_owned()];
             let mut manager = rust_manager();
-            let slot = install_fake(&mut manager, json!({
-                "textDocumentSync":2,
-                "executeCommandProvider":{"commands":commands},
-                "signatureHelpProvider":{"triggerCharacters":triggers,"retriggerCharacters":retriggers}
-            }), |_| Vec::new());
+            let slot = install_fake(
+                &mut manager,
+                json!({
+                    "textDocumentSync":2,
+                    "executeCommandProvider":{"commands":commands},
+                    "signatureHelpProvider":{"triggerCharacters":triggers,"retriggerCharacters":retriggers}
+                }),
+                |_| Vec::new(),
+            );
             let events = manager.events();
             let doc = LspDocumentId(911);
             manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "foo()");
@@ -6546,18 +6550,39 @@ mod tests {
             for _ in 0..32 {
                 let next = manager.capabilities(doc);
                 assert!(next.ready);
-                assert!(Arc::ptr_eq(&initial.execute_commands, &next.execute_commands));
-                assert!(Arc::ptr_eq(&initial.signature_triggers, &next.signature_triggers));
-                assert!(Arc::ptr_eq(&initial.signature_retriggers, &next.signature_retriggers));
+                assert!(Arc::ptr_eq(
+                    &initial.execute_commands,
+                    &next.execute_commands
+                ));
+                assert!(Arc::ptr_eq(
+                    &initial.signature_triggers,
+                    &next.signature_triggers
+                ));
+                assert!(Arc::ptr_eq(
+                    &initial.signature_retriggers,
+                    &next.signature_retriggers
+                ));
             }
             let reference = &manager.documents[&doc];
             manager.sessions[&reference.session].request_retirement();
             let retired = manager.capabilities(doc);
             assert!(!retired.ready);
-            assert!(Arc::ptr_eq(&initial.execute_commands, &retired.execute_commands));
-            assert!(Arc::ptr_eq(&initial.signature_triggers, &retired.signature_triggers));
-            assert!(Arc::ptr_eq(&initial.signature_retriggers, &retired.signature_retriggers));
-            assert!(initial.ready, "each query still returns its own current readiness value");
+            assert!(Arc::ptr_eq(
+                &initial.execute_commands,
+                &retired.execute_commands
+            ));
+            assert!(Arc::ptr_eq(
+                &initial.signature_triggers,
+                &retired.signature_triggers
+            ));
+            assert!(Arc::ptr_eq(
+                &initial.signature_retriggers,
+                &retired.signature_retriggers
+            ));
+            assert!(
+                initial.ready,
+                "each query still returns its own current readiness value"
+            );
             manager.begin_shutdown().await;
             server.wait_for("exit").await;
             assert!(!manager.capabilities(doc).ready);

@@ -567,9 +567,47 @@ impl LspManager {
     }
 }
 
-pub(super) fn negotiate(c:&lsp_types::ServerCapabilities)->LspCapabilities {
-    fn enabled<T>(v:&Option<lsp_types::OneOf<bool,T>>)->bool{!matches!(v,None|Some(lsp_types::OneOf::Left(false)))}
-    LspCapabilities {ready:true,completion:c.completion_provider.is_some(),definition:enabled(&c.definition_provider),references:enabled(&c.references_provider),hover:!matches!(c.hover_provider,None|Some(lsp_types::HoverProviderCapability::Simple(false))),rename:enabled(&c.rename_provider),prepare_rename:matches!(&c.rename_provider,Some(lsp_types::OneOf::Right(o)) if o.prepare_provider==Some(true)),format_document:enabled(&c.document_formatting_provider),format_selection:enabled(&c.document_range_formatting_provider),code_actions:!matches!(c.code_action_provider,None|Some(lsp_types::CodeActionProviderCapability::Simple(false))),code_action_resolve:matches!(&c.code_action_provider,Some(lsp_types::CodeActionProviderCapability::Options(o)) if o.resolve_provider==Some(true)),execute_commands:c.execute_command_provider.as_ref().map(|o|Arc::<[String]>::from(o.commands.clone())).unwrap_or_default(),signature_help:c.signature_help_provider.is_some(),signature_triggers:c.signature_help_provider.as_ref().and_then(|o|o.trigger_characters.clone()).map(Arc::<[String]>::from).unwrap_or_default(),signature_retriggers:c.signature_help_provider.as_ref().and_then(|o|o.retrigger_characters.clone()).map(Arc::<[String]>::from).unwrap_or_default()}
+pub(super) fn negotiate(c: &lsp_types::ServerCapabilities) -> LspCapabilities {
+    fn enabled<T>(v: &Option<lsp_types::OneOf<bool, T>>) -> bool {
+        !matches!(v, None | Some(lsp_types::OneOf::Left(false)))
+    }
+    LspCapabilities {
+        ready: true,
+        completion: c.completion_provider.is_some(),
+        definition: enabled(&c.definition_provider),
+        references: enabled(&c.references_provider),
+        hover: !matches!(
+            c.hover_provider,
+            None | Some(lsp_types::HoverProviderCapability::Simple(false))
+        ),
+        rename: enabled(&c.rename_provider),
+        prepare_rename: matches!(&c.rename_provider,Some(lsp_types::OneOf::Right(o)) if o.prepare_provider==Some(true)),
+        format_document: enabled(&c.document_formatting_provider),
+        format_selection: enabled(&c.document_range_formatting_provider),
+        code_actions: !matches!(
+            c.code_action_provider,
+            None | Some(lsp_types::CodeActionProviderCapability::Simple(false))
+        ),
+        code_action_resolve: matches!(&c.code_action_provider,Some(lsp_types::CodeActionProviderCapability::Options(o)) if o.resolve_provider==Some(true)),
+        execute_commands: c
+            .execute_command_provider
+            .as_ref()
+            .map(|o| Arc::<[String]>::from(o.commands.clone()))
+            .unwrap_or_default(),
+        signature_help: c.signature_help_provider.is_some(),
+        signature_triggers: c
+            .signature_help_provider
+            .as_ref()
+            .and_then(|o| o.trigger_characters.clone())
+            .map(Arc::<[String]>::from)
+            .unwrap_or_default(),
+        signature_retriggers: c
+            .signature_help_provider
+            .as_ref()
+            .and_then(|o| o.retrigger_characters.clone())
+            .map(Arc::<[String]>::from)
+            .unwrap_or_default(),
+    }
 }
 
 pub(super) async fn perform_feature(
