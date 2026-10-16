@@ -6,6 +6,8 @@ mod close_tests;
 #[cfg(test)]
 mod event_dispatch_tests;
 pub(crate) mod holder;
+#[cfg(test)]
+mod pty_reader_tests;
 
 use close_processes::{FrozenFamily, RootIdentity};
 
@@ -73,6 +75,10 @@ const CHILD_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 /// immediately in every case we can construct; this only bounds the ones we
 /// cannot, because a hung join here wedges the daemon's dispatch thread.
 const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+/// A full parser inbox must not hide closure of the reader's original wake
+/// pipe. Keep backpressure lossless while the owner is running, and check its
+/// cancellation between bounded channel waits.
+const READER_SEND_POLL: Duration = Duration::from_millis(10);
 /// How long a synchronized update (DEC mode 2026) may withhold output from the
 /// published grid. A program brackets a frame it has to emit in several writes
 /// - clearing the screen, then repainting it - so that no half-drawn frame is
@@ -732,6 +738,7 @@ impl TerminalHandle {
     ) -> Result<Self, TerminalStartError> {
         // Acquire the shared monitor before starting any holder/provider.
         event_notifier().map_err(TerminalStartError::Worker)?;
+        super::reactor::runtime().map_err(TerminalStartError::Worker)?;
         let (command_tx, command_rx) = command_channel(config.command_capacity);
         // Semantic events are lossless and independent from visual wakes. They
         // are low-volume metadata; an unbounded queue avoids either dropping a
@@ -1485,6 +1492,9 @@ struct Worker {
     /// Disconnects when the reader thread returns, so shutdown can wait for
     /// it with a deadline instead of joining unconditionally.
     reader_done: Receiver<()>,
+    /// Destructive teardown can abandon an undelivered read. Carry leaves
+    /// this false and drains every byte already consumed from the PTY.
+    reader_discard_pending: Arc<AtomicBool>,
     pty_capacity: usize,
 }
 
@@ -1496,6 +1506,7 @@ struct Reader {
     wake: OwnedFd,
     done: Receiver<()>,
     output: Receiver<PtyMessage>,
+    discard_pending: Arc<AtomicBool>,
 }
 
 impl Reader {
@@ -1538,12 +1549,20 @@ impl Reader {
         }
         let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
         let (start, started) = crossbeam_channel::bounded(1);
+        let discard_pending = Arc::new(AtomicBool::new(false));
+        let reader_discard_pending = Arc::clone(&discard_pending);
         let thread = thread::Builder::new()
             .name(format!("terminal-pty-reader-{terminal_id:?}"))
             .spawn(move || {
                 let _done = done_tx;
                 if started.recv().is_ok() {
-                    read_pty(&mut reader, &pty_tx, readiness, wake_rx);
+                    read_pty(
+                        &mut reader,
+                        &pty_tx,
+                        readiness,
+                        wake_rx,
+                        &reader_discard_pending,
+                    );
                 }
             })
             .map_err(|error| format!("start PTY reader: {error}"))?;
@@ -1553,6 +1572,7 @@ impl Reader {
             wake,
             done,
             output,
+            discard_pending,
         })
     }
 
@@ -1823,6 +1843,7 @@ impl Worker {
             reader: Some(reader.thread),
             reader_wake: Some(reader.wake),
             reader_done: reader.done,
+            reader_discard_pending: reader.discard_pending,
         })
     }
 
@@ -1958,6 +1979,7 @@ impl Worker {
         // that wait: a reader still stuck on a descriptor a disowned
         // grandchild holds open is abandoned rather than joined forever,
         // because a hung join here wedges the daemon's dispatch thread.
+        self.reader_discard_pending.store(true, Ordering::Release);
         drop(self.reader_wake.take());
         if let Some(reader) = self.reader.take() {
             match self.reader_done.recv_timeout(READER_SHUTDOWN_GRACE) {
@@ -2829,6 +2851,7 @@ impl Worker {
                     self.reader = Some(reader.thread);
                     self.reader_wake = Some(reader.wake);
                     self.reader_done = reader.done;
+                    self.reader_discard_pending = reader.discard_pending;
                     self.pty_rx = reader.output;
                 }
                 Err(restart) => self.error("resume reading terminal", restart),
@@ -3485,41 +3508,96 @@ fn wait_readable(readiness: &OwnedFd, wake: &OwnedFd) -> Readiness {
     }
 }
 
-fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>, readiness: OwnedFd, wake: OwnedFd) {
+fn read_pty(
+    reader: &mut dyn Read,
+    sender: &Sender<PtyMessage>,
+    readiness: OwnedFd,
+    wake: OwnedFd,
+    discard_pending: &AtomicBool,
+) {
     let mut buffer = vec![0u8; PTY_READ_SIZE];
     loop {
         match wait_readable(&readiness, &wake) {
             Readiness::Readable => {}
             Readiness::Shutdown => return,
             Readiness::Failed(error) => {
-                let _ = sender.send(PtyMessage::Error(error));
+                send_pty_message(sender, PtyMessage::Error(error), &wake, discard_pending);
                 return;
             }
         }
         match reader.read(&mut buffer) {
             Ok(0) => {
-                let _ = sender.send(PtyMessage::Eof);
+                send_pty_message(sender, PtyMessage::Eof, &wake, discard_pending);
                 return;
             }
             // A PTY master reads EIO, not end of file, once its terminal's
             // last slave closes: the ordinary end of a terminal.
             Err(error) if error.raw_os_error() == Some(libc::EIO) => {
-                let _ = sender.send(PtyMessage::Eof);
+                send_pty_message(sender, PtyMessage::Eof, &wake, discard_pending);
                 return;
             }
             Ok(read) => {
-                if sender
-                    .send(PtyMessage::Bytes(buffer[..read].to_vec()))
-                    .is_err()
-                {
+                if !send_pty_message(
+                    sender,
+                    PtyMessage::Bytes(buffer[..read].to_vec()),
+                    &wake,
+                    discard_pending,
+                ) {
                     return;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            // A duplicate shares file-status flags with the writer. If that
+            // owner uses nonblocking I/O, another read/line-discipline change
+            // can consume readiness before this read. Re-arm the original
+            // descriptor instead of treating EAGAIN as terminal failure.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
             Err(error) => {
-                let _ = sender.send(PtyMessage::Error(error.to_string()));
+                send_pty_message(
+                    sender,
+                    PtyMessage::Error(error.to_string()),
+                    &wake,
+                    discard_pending,
+                );
                 return;
             }
+        }
+    }
+}
+
+fn send_pty_message(
+    sender: &Sender<PtyMessage>,
+    mut message: PtyMessage,
+    wake: &OwnedFd,
+    discard_pending: &AtomicBool,
+) -> bool {
+    loop {
+        // Carry must deliver the already-read message even if checking a
+        // cancellation descriptor fails. Only destructive teardown permits
+        // discarding it; ordinary delivery needs no extra poll syscall.
+        if discard_pending.load(Ordering::Acquire) {
+            let mut cancellation = libc::pollfd {
+                fd: wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut cancellation, 1, 0) } < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return false;
+            }
+            if cancellation.revents != 0 {
+                return false;
+            }
+        }
+        match sender.send_timeout(message, READER_SEND_POLL) {
+            Ok(()) => return true,
+            Err(crossbeam_channel::SendTimeoutError::Timeout(pending)) => message = pending,
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return false,
         }
     }
 }
@@ -3981,7 +4059,13 @@ mod tests {
         let readiness = held.master.duplicate().unwrap();
         let (wake_rx, _wake_tx) = wake_pipe().unwrap();
         let (sender, messages) = crossbeam_channel::unbounded();
-        read_pty(&mut reader, &sender, readiness, wake_rx);
+        read_pty(
+            &mut reader,
+            &sender,
+            readiness,
+            wake_rx,
+            &AtomicBool::new(false),
+        );
 
         let messages: Vec<_> = messages.try_iter().collect();
         let output: Vec<u8> = messages
