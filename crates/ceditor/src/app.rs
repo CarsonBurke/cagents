@@ -45,7 +45,9 @@ const QUICK_OPEN_ROW_HEIGHT: f32 = 40.0;
 const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 
 mod checkout;
+mod editor_feature_ui;
 mod notification_ui;
+mod operation_recovery_ui;
 
 #[derive(Clone)]
 pub struct Flags {
@@ -80,10 +82,9 @@ struct Tab {
     files_loaded: bool,
     git: bool,
     diagnostics: Vec<LspDiagnostic>,
-    /// The document version the server computed `diagnostics` for, as it
-    /// stamped them. Compared against the manager's current version and never
-    /// against a count of this side's own edits: the manager re-opens a
-    /// document on a restart or respawn, neither of which is an edit here.
+    /// The manager version these diagnostics currently describe. Exact local
+    /// edits rebase the standing set to the manager's new version; publishes
+    /// replace it only when their version still matches that manager state.
     diagnostics_version: Option<i32>,
     completions: Vec<LspCompletionItem>,
     hover: Option<String>,
@@ -95,6 +96,15 @@ struct Tab {
     /// lists the GitHub repository the worktree's remotes name and drives
     /// `runtime` through the files of whichever pull request is open.
     review: pull_request_review::State,
+}
+
+impl Tab {
+    /// The diagnostics list and native editor marks/navigation share one set.
+    fn set_diagnostics(&mut self, items: Vec<LspDiagnostic>, version: Option<i32>) {
+        self.runtime.set_editor_diagnostics(items.clone());
+        self.diagnostics = items;
+        self.diagnostics_version = version;
+    }
 }
 
 /// The GitHub repository a worktree's remotes name, `origin` first, for the
@@ -199,6 +209,8 @@ pub enum Message {
     SettingsSaved(Result<(), String>),
     FileRevealed(Result<cagents::file_manager::RevealOutcome, String>),
     Lsp(u64, Option<LspEvent>),
+    EditorFeatures(cagents::editor_features::Action),
+    OperationRecovery(cagents::operation_recovery::Action),
     Complete,
     Hover,
     Completion(CardId, usize),
@@ -497,8 +509,10 @@ pub struct Editor {
     exiting: bool,
     window_focused: bool,
     lsp: LspManager,
+    editor_features: cagents::editor_features::State,
     language_server_assistance: bool,
     next_document: u64,
+    operation_recovery: cagents::operation_recovery::Shared,
     restoring_session: bool,
     saved_session: crate::preferences::Session,
     sidebar_open: bool,
@@ -678,12 +692,15 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectoryListed { .. }
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::FileLoadedAt { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::FindLoaded { .. }
+            | RepositoryAction::FindReplacementLoaded { .. }
             | RepositoryAction::SaveFinished { .. }
+            | RepositoryAction::RetainedSaveFinished { .. }
             | RepositoryAction::PdfPageRendered { .. }
             | RepositoryAction::DiagramsRendered { .. }
             | RepositoryAction::MarkdownDue { .. }
@@ -1008,6 +1025,10 @@ impl Editor {
     }
 
     fn modal_open(&self) -> bool {
+        self.editor_features.dialog_open() || self.external_feature_modal()
+    }
+
+    fn external_feature_modal(&self) -> bool {
         self.settings_open
             || self.quick_open
             || self.closing.is_some()
@@ -1444,6 +1465,10 @@ impl Editor {
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_line_height(self.settings.terminal_line_height);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+        runtime.set_find_preferences(
+            self.settings.editor_find_options,
+            self.settings.editor_replace_preserve_case,
+        );
         let mut sidebar = SidebarModel::ready(
             SidebarMode::Expanded,
             vec![SidebarProject::new(
@@ -1929,6 +1954,7 @@ impl Editor {
             return Task::none();
         };
         let intents = tab.runtime.take_lsp_intents();
+        let edits = tab.runtime.take_lsp_edits();
         let autosave = repository_task(tab.runtime.auto_save_task(id));
         let working_diff = repository_task(tab.runtime.working_diff_task(id));
         for intent in intents {
@@ -1938,6 +1964,7 @@ impl Editor {
                     worktree,
                     version,
                     text,
+                    root,
                 } => {
                     // The intent names the file the bytes belong to. A link's
                     // buffer is the target, which is not the row that was clicked.
@@ -1948,9 +1975,12 @@ impl Editor {
                     if let Some(language) = self.lsp.language_for(&absolute_path) {
                         let doc = LspDocumentId(self.next_document);
                         self.next_document += 1;
-                        let status =
-                            self.lsp
-                                .open(doc, &absolute_path, &worktree, language, version, &text);
+                        let status = match (text, root) {
+                            (repository_widget::LspChangeText::Snapshot(source), Some(root)) => self.lsp.open_snapshot_with_root(doc, &absolute_path, &worktree, language, version, source, root),
+                            (repository_widget::LspChangeText::Text(_), Some(_)) => LspStatus::Unavailable { reason: "Original-root language registration requires the actual native snapshot".into() },
+                            (repository_widget::LspChangeText::Text(text), None) => self.lsp.open(doc, &absolute_path, &worktree, language, version, &text),
+                            (repository_widget::LspChangeText::Snapshot(source), None) => self.lsp.open_snapshot(doc, &absolute_path, &worktree, language, version, source),
+                        };
                         if let Some(tab) = self.tab_mut(id) {
                             tab.runtime.set_lsp_document(Some(doc));
                             if let Some(error) = language_server_failure(status) {
@@ -1961,13 +1991,24 @@ impl Editor {
                 }
                 LspIntent::Change { version, text } => {
                     if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
-                        self.lsp.change(doc, version, &[], &text);
+                        match text {
+                            cagents::repository_widget::LspChangeText::Text(text) => {
+                                self.lsp.change(doc, version, &edits, &text)
+                            }
+                            cagents::repository_widget::LspChangeText::Snapshot(source) => {
+                                self.lsp.change_snapshot(doc, version, &edits, source)
+                            }
+                        }
                     }
+                    let synchronized_version = self
+                        .tab(id)
+                        .and_then(|tab| tab.runtime.lsp_document())
+                        .and_then(|doc| self.lsp.document_version(doc));
                     if let Some(tab) = self.tab_mut(id) {
                         tab.completions.clear();
                         tab.hover = None;
-                        tab.diagnostics.clear();
-                        tab.diagnostics_version = None;
+                        cagents::lsp::shift_diagnostics(&mut tab.diagnostics, &edits);
+                        tab.set_diagnostics(tab.diagnostics.clone(), synchronized_version);
                     }
                 }
                 LspIntent::Save { text } => {
@@ -1978,6 +2019,7 @@ impl Editor {
                 LspIntent::Close => self.close_document(id),
             }
         }
+        self.refresh_editor_feature_support();
         Task::batch([autosave, working_diff])
     }
 
@@ -1987,8 +2029,7 @@ impl Editor {
         }
         if let Some(tab) = self.tab_mut(id) {
             tab.runtime.set_lsp_document(None);
-            tab.diagnostics.clear();
-            tab.diagnostics_version = None;
+            tab.set_diagnostics(Vec::new(), None);
             tab.completions.clear();
             tab.hover = None;
         }
@@ -2046,6 +2087,14 @@ impl Editor {
     }
 
     fn continue_exit(&mut self) -> Task<Message> {
+        if self.operation_recovery_pending() {
+            self.exiting = false;
+            self.notice = Some(
+                "Finish or resolve retained file operations before closing this window.".into(),
+            );
+            return Task::none();
+        }
+
         if let Some(tab) = self.tabs.first() {
             return self.request_close(tab.id);
         }
@@ -2086,9 +2135,16 @@ impl Editor {
             for id in ids {
                 self.close_document(id);
             }
-            // The manager's shutdown owns its reaper even when this future is dropped.
-            drop(self.lsp.begin_shutdown());
-            self.lsp = LspManager::new(self.settings.language_servers.clone());
+            // Re-enabling assistance waits for these outgoing processes before
+            // launching replacements under a new admission cap.
+            self.editor_features.cancel_all(&mut self.lsp);
+            let predecessor = self.lsp.begin_shutdown();
+            self.lsp = LspManager::new(self.settings.language_servers.clone())
+                .with_lifecycle(
+                    self.settings.lsp_idle_timeout_seconds,
+                    self.settings.lsp_max_sessions,
+                )
+                .after_shutdown(predecessor);
             tasks.push(self.lsp_next());
         }
         if self.settings_writable {
@@ -2920,7 +2976,8 @@ impl Application for Editor {
             notice = Some(format!("Cannot safely open editor folders yet: {error}"));
             startup_paths.clear();
         }
-        let lsp = LspManager::new(settings.language_servers.clone());
+        let lsp = LspManager::new(settings.language_servers.clone())
+            .with_lifecycle(settings.lsp_idle_timeout_seconds, settings.lsp_max_sessions);
         let line_height_draft = settings.terminal_line_height.to_string();
         let sidebar_open = saved_session.sidebar_open;
         let mut app = Self {
@@ -2965,8 +3022,10 @@ impl Application for Editor {
             exiting: false,
             window_focused: false,
             lsp,
+            editor_features: Default::default(),
             language_server_assistance,
             next_document: 1,
+            operation_recovery: Default::default(),
             restoring_session: !startup_paths.is_empty(),
             saved_session,
             sidebar_open,
@@ -3096,6 +3155,13 @@ impl Application for Editor {
                 }
                 if self.quick_open {
                     return self.update(Message::CloseQuickOpen);
+                }
+                if let Some(action) = self
+                    .editor_features
+                    .escape()
+                    .filter(|_| !self.external_feature_modal())
+                {
+                    return self.update_editor_features(action);
                 }
                 if self.find_open {
                     return self.update(Message::CloseFind);
@@ -3304,6 +3370,12 @@ impl Application for Editor {
                 }
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
+                    self.editor_features.cancel_all(&mut self.lsp);
+                    if self.operation_recovery_pending() {
+                        self.notice = Some("Finish or resolve retained file operations before closing this window.".into());
+                        return Task::none();
+                    }
+
                     if self
                         .checkout_dialog
                         .as_ref()
@@ -3394,7 +3466,43 @@ impl Application for Editor {
                 Message::Repository(RepositoryAction::Review { card, action }) => {
                     self.handle_review(card, action)
                 }
+                Message::OperationRecovery(action) => {
+                    let task = self
+                        .operation_recovery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .update(action);
+
+                    let mut tasks = vec![
+                        task.map(Message::OperationRecovery)
+                            .map(cosmic::Action::App),
+                    ];
+                    for tab in &mut self.tabs {
+                        tasks.push(repository_task(
+                            tab.runtime.reconcile_operation_recovery(tab.id),
+                        ));
+                    }
+                    Task::batch(tasks)
+                }
                 Message::Repository(action) => {
+                    self.retain_repository_operation(&action);
+                    if let RepositoryAction::Language { card, action } = &action
+                        && let Some(action) =
+                            cagents::editor_features::language_action(*card, action)
+                    {
+                        return self.update_editor_features(action);
+                    }
+                    if let Some(format) = self.editor_format_before_save(&action) {
+                        return self.update_editor_features(format);
+                    }
+                    if matches!(
+                        &action,
+                        RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. }
+                    ) && !self.prepare_editor_save(action.card())
+                    {
+                        return Task::none();
+                    }
+
                     if let RepositoryAction::DiffAnnotations {
                         identity,
                         review_revision,
@@ -3500,13 +3608,31 @@ impl Application for Editor {
                         };
                         return Self::open_external_link(uri);
                     }
+                    let signature_character = match &action {
+                        RepositoryAction::EditorAction {
+                            action: EditorAction::Edit(EditorEdit::Insert(character)),
+                            ..
+                        } => Some(*character),
+                        _ => None,
+                    };
+                    let find_preferences_changed = matches!(
+                        &action,
+                        RepositoryAction::FindOptionsChanged { .. }
+                            | RepositoryAction::PreserveCaseChanged { .. }
+                    );
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
-                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. })
-                        && self.active == Some(id)
+                    let focus_loaded = matches!(
+                        action,
+                        RepositoryAction::FileLoaded { .. } | RepositoryAction::FileLoadedAt { .. }
+                    ) && self.active == Some(id)
                         && !self.modal_open();
-                    let saved = matches!(action, RepositoryAction::SaveFinished { .. });
+                    let saved = matches!(
+                        action,
+                        RepositoryAction::SaveFinished { .. }
+                            | RepositoryAction::RetainedSaveFinished { .. }
+                    );
                     let back_to_files = matches!(action, RepositoryAction::BackToFiles { .. });
                     let Some(tab) = self.tab_mut(id) else {
                         return Task::none();
@@ -3569,6 +3695,18 @@ impl Application for Editor {
                     if focus_loaded {
                         tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
                     }
+                    if find_preferences_changed {
+                        let (options, preserve) = self.tab(id).unwrap().runtime.find_preferences();
+                        self.settings.editor_find_options = options;
+                        self.settings.editor_replace_preserve_case = preserve;
+                        for tab in &mut self.tabs {
+                            tasks.push(repository_task(
+                                tab.runtime
+                                    .update_find_preferences(tab.id, options, preserve),
+                            ));
+                        }
+                        tasks.push(self.save_settings());
+                    }
                     tasks.push(self.drain(id));
                     if loaded || saved {
                         tasks.push(self.resume_pending_files());
@@ -3587,6 +3725,20 @@ impl Application for Editor {
                             }
                             tasks.push(self.refresh_snapshot(id, true));
                         }
+                    }
+                    if let Some(character) = signature_character
+                        && let Some(tab) = self.tab(id)
+                        && let Some(doc) = tab.runtime.lsp_document()
+                        && character != ')'
+                        && (tab.runtime.signature_visible()
+                            || self.lsp.signature_trigger(doc, character))
+                    {
+                        tasks.push(self.update_editor_features(
+                            cagents::editor_features::Action::Signature {
+                                card: id,
+                                trigger: Some(character.to_string()),
+                            },
+                        ));
                     }
                     Task::batch(tasks)
                 }
@@ -4059,6 +4211,18 @@ impl Application for Editor {
                         tab.runtime
                             .set_syntax_theme(self.settings.editor_syntax_theme);
                     }
+                    let options = self.settings.editor_find_options;
+                    let preserve = self.settings.editor_replace_preserve_case;
+                    let find_tasks = self
+                        .tabs
+                        .iter_mut()
+                        .map(|tab| {
+                            repository_task(
+                                tab.runtime
+                                    .update_find_preferences(tab.id, options, preserve),
+                            )
+                        })
+                        .collect::<Vec<_>>();
                     let shortcuts =
                         self.capture_preference(PreferenceWrite::Shortcuts(self.shortcuts.clone()));
                     Task::batch([
@@ -4066,6 +4230,7 @@ impl Application for Editor {
                         self.appearance(),
                         self.save_settings(),
                         preference_task(shortcuts),
+                        Task::batch(find_tasks),
                     ])
                 }
                 Message::ShortcutChanged(action, value) => {
@@ -4311,13 +4476,36 @@ impl Application for Editor {
                     }
                     self.close_notices()
                 }
+                Message::EditorFeatures(action) => self.update_editor_features(action),
                 Message::Lsp(generation, event) => {
                     if generation != self.lsp.generation() {
                         return Task::none();
                     }
                     if let Some(event) = event {
+                        if self.editor_features.consumes(&event) {
+                            return Task::batch([
+                                self.update_editor_features(
+                                    cagents::editor_features::Action::Event(event),
+                                ),
+                                self.lsp_next(),
+                            ]);
+                        }
+                        if let LspEvent::RootDiscovered { doc, ticket, root } = event {
+                            if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
+                                && let Some(error) = language_server_failure(status)
+                                && let Some(tab) = self
+                                    .tabs
+                                    .iter_mut()
+                                    .find(|tab| tab.runtime.lsp_document() == Some(doc))
+                            {
+                                tab.lsp_error = Some(error);
+                            }
+                            return self.lsp_next();
+                        }
                         let doc = match &event {
-                            LspEvent::Diagnostics { doc, .. }
+                            LspEvent::RootDiscovered { doc, .. }
+                            | LspEvent::Resources { doc }
+                            | LspEvent::Diagnostics { doc, .. }
                             | LspEvent::Completion { doc, .. }
                             | LspEvent::Hover { doc, .. }
                             | LspEvent::Locations { doc, .. }
@@ -4325,16 +4513,28 @@ impl Application for Editor {
                             | LspEvent::Progress { doc, .. }
                             | LspEvent::RequestFailed { doc, .. }
                             | LspEvent::DocumentDesynced { doc, .. } => *doc,
+                            LspEvent::PrepareRename { .. }
+                            | LspEvent::WorkspaceEdit { .. }
+                            | LspEvent::CodeActions { .. }
+                            | LspEvent::CodeActionResolved { .. }
+                            | LspEvent::SignatureHelp { .. }
+                            | LspEvent::ServerMessage { .. }
+                            | LspEvent::ApplyWorkspaceEdit { .. }
+                            | LspEvent::CommandExecuted { .. } => {
+                                unreachable!("feature events route through their controller")
+                            }
                         };
+                        let current_version = self.lsp.document_version(doc);
                         if let Some(tab) = self
                             .tabs
                             .iter_mut()
                             .find(|tab| tab.runtime.lsp_document() == Some(doc))
                         {
                             match event {
-                                LspEvent::Diagnostics { items, version, .. } => {
-                                    tab.diagnostics = items;
-                                    tab.diagnostics_version = Some(version);
+                                LspEvent::Diagnostics { items, version, .. }
+                                    if current_version == Some(version) =>
+                                {
+                                    tab.set_diagnostics(items, Some(version));
                                 }
                                 LspEvent::Completion { items, .. } => tab.completions = items,
                                 LspEvent::Hover { markdown, .. } => tab.hover = markdown,
@@ -4351,13 +4551,13 @@ impl Application for Editor {
                                 LspEvent::DocumentDesynced { error, .. } => {
                                     tab.completions.clear();
                                     tab.hover = None;
-                                    tab.diagnostics.clear();
-                                    tab.diagnostics_version = None;
+                                    tab.set_diagnostics(Vec::new(), None);
                                     tab.lsp_error = Some(error.to_string());
                                 }
                                 _ => {}
                             }
                         }
+                        self.refresh_editor_feature_support();
                         self.lsp_next()
                     } else {
                         Task::none()
@@ -4565,6 +4765,14 @@ impl Application for Editor {
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
         body.push(design::horizontal_rule().into());
+        body.push(
+            self.operation_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .view()
+                .map(Message::OperationRecovery),
+        );
+
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
             let mut toolbar_controls = Vec::new();
@@ -4666,7 +4874,7 @@ impl Application for Editor {
                         widget::button::custom(
                             widget::column::with_children(vec![
                                 design::caption(row.label).into(),
-                                design::body(row.message)
+                                design::body(row.message.into_owned())
                                     .wrapping(iced::widget::text::Wrapping::Word)
                                     .into(),
                             ])
@@ -4676,6 +4884,14 @@ impl Application for Editor {
                         .width(Length::Fill)
                         .on_press(Message::Jump(tab.id, row.at))
                         .into(),
+                    );
+                    results.push(
+                        widget::button::text("Copy full diagnostic")
+                            .on_press(Message::Repository(RepositoryAction::CopyDiagnostic {
+                                card: tab.id,
+                                diagnostic: row.diagnostic.clone(),
+                            }))
+                            .into(),
                     );
                 }
                 if withheld > 0 {
@@ -4855,6 +5071,12 @@ impl Application for Editor {
             return Some(dialog_overlay(
                 dialog_surface(widget::column::with_children(content).spacing(12), 480.0),
                 Message::CancelFileOperation,
+            ));
+        }
+        if let Some(content) = self.editor_features.view() {
+            return Some(dialog_overlay(
+                dialog_surface(content.map(Message::EditorFeatures), 1000.0),
+                Message::EditorFeatures(self.editor_features.escape()?),
             ));
         }
         if let Some(id) = self.closing {
@@ -5892,8 +6114,10 @@ mod tests {
             exiting: false,
             window_focused: false,
             lsp: LspManager::new(Vec::new()),
+            editor_features: Default::default(),
             language_server_assistance: false,
             next_document: 1,
+            operation_recovery: Default::default(),
             restoring_session: false,
             saved_session: crate::preferences::Session::default(),
             sidebar_open: true,
@@ -6537,6 +6761,133 @@ mod tests {
     }
 
     #[test]
+    fn lsp_diagnostics_reach_standalone_editor_navigation_and_follow_edits() {
+        use cagents::lsp::{LspError, LspRange, LspSeverity};
+        use cagents::repository_widget::EditorLspAction;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let directory = tempfile::tempdir().unwrap();
+        let original = "first\nsecond\nthird\n";
+        std::fs::write(directory.path().join("a.rs"), original).unwrap();
+        let mut app = editor();
+        app.language_server_assistance = true;
+        app.lsp = LspManager::new(app.settings.language_servers.clone());
+        let id = add(&mut app, directory.path().to_str().unwrap(), Some("a.rs"));
+        file_loaded(&mut app, id, directory.path(), "a.rs");
+        let doc = app.tab(id).unwrap().runtime.lsp_document().unwrap();
+        // Discovery stays pending: this tests real application routing and
+        // protocol version fences without launching any language server.
+        assert_eq!(app.lsp.document_version(doc), Some(1));
+        let generation = app.lsp.generation();
+        let diagnostic = |line| {
+            LspDiagnostic::new(
+                LspRange::new(LspPosition::new(line, 0), LspPosition::new(line, 3)),
+                LspSeverity::Error,
+                "standing error".into(),
+                None,
+                None,
+            )
+        };
+        let publish = |version, line| {
+            Message::Lsp(
+                generation,
+                Some(LspEvent::Diagnostics {
+                    doc,
+                    version,
+                    items: vec![diagnostic(line)],
+                }),
+            )
+        };
+        let next = || {
+            Message::Repository(RepositoryAction::Language {
+                card: id,
+                action: EditorLspAction::Diagnostic(true),
+            })
+        };
+        drop(app.update(publish(1, 2)));
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
+        drop(app.update(next()));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(2, 0))
+        );
+
+        app.tab_mut(id)
+            .unwrap()
+            .runtime
+            .move_cursor_to(LspPosition::new(0, 0));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("// before\n".into()),
+                )),
+            })),
+        );
+        assert_eq!(app.lsp.document_version(doc), Some(2));
+        assert_eq!(
+            app.tab(id).unwrap().diagnostics[0].range.start,
+            LspPosition::new(3, 0)
+        );
+        drop(app.update(next()));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(3, 0))
+        );
+
+        drop(app.update(publish(1, 0)));
+        assert_eq!(
+            app.tab(id).unwrap().diagnostics[0].range.start,
+            LspPosition::new(3, 0)
+        );
+        drop(app.update(publish(2, 1)));
+        drop(app.update(next()));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(1, 0))
+        );
+        drop(app.update(Message::Lsp(
+            generation,
+            Some(LspEvent::DocumentDesynced {
+                doc,
+                version: 2,
+                error: LspError::InconsistentEdits,
+            }),
+        )));
+        assert!(app.tab(id).unwrap().diagnostics.is_empty());
+        assert!(
+            !app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
+        drop(app.update(publish(2, 1)));
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
+        app.close_document(id);
+        assert!(app.tab(id).unwrap().diagnostics.is_empty());
+        assert!(
+            !app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
+    }
+
+    #[test]
     fn a_jump_into_stale_diagnostics_is_refused_and_explained() {
         let mut app = editor();
         let id = add(&mut app, "/workspace", Some("a.rs"));
@@ -6552,6 +6903,83 @@ mod tests {
         assert_eq!(
             app.notice.as_deref(),
             Some("these diagnostics describe an earlier version of the file"),
+        );
+    }
+
+    #[test]
+    fn find_preferences_load_share_persist_and_reset_across_standalone_tabs() {
+        use cagents::ui_controls::FindOption;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            std::fs::write(root.join(name), "foo FOO\n").unwrap();
+        }
+        let mut app = configured(&directory);
+        app.settings_writable = true;
+        app.settings.editor_find_options.case_sensitive = true;
+        app.settings.editor_replace_preserve_case = true;
+        let first = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        load_selected(&mut app, first);
+        let second = add(&mut app, root.to_str().unwrap(), Some("b.rs"));
+        load_selected(&mut app, second);
+        for id in [first, second] {
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_preferences(),
+                (app.settings.editor_find_options, true)
+            );
+        }
+        let task = app.update(Message::Repository(RepositoryAction::FindOptionsChanged {
+            card: first,
+            option: FindOption::Regex,
+            enabled: true,
+        }));
+        run_tasks(&mut app, task);
+        let task = app.update(Message::Repository(RepositoryAction::PreserveCaseChanged {
+            card: first,
+            enabled: false,
+        }));
+        run_tasks(&mut app, task);
+        let persisted = settings::load(&app.settings_path).unwrap();
+        assert!(persisted.editor_find_options.case_sensitive);
+        assert!(persisted.editor_find_options.regex);
+        assert!(!persisted.editor_replace_preserve_case);
+        let third = add(&mut app, root.to_str().unwrap(), Some("c.rs"));
+        load_selected(&mut app, third);
+        for id in [first, second, third] {
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_preferences(),
+                (persisted.editor_find_options, false)
+            );
+        }
+        let mut reopened = configured(&directory);
+        reopened.settings_writable = true;
+        reopened.settings = persisted;
+        let fourth = add(&mut reopened, root.to_str().unwrap(), Some("d.rs"));
+        load_selected(&mut reopened, fourth);
+        assert_eq!(
+            reopened.tab(fourth).unwrap().runtime.find_preferences(),
+            (app.settings.editor_find_options, false)
+        );
+        app.settings_open = true;
+        drop(app.update(Message::ResetSettings));
+        let task = app.update(Message::ResetSettings);
+        run_tasks(&mut app, task);
+        let defaults = AppSettings::default();
+        for id in [first, second, third] {
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_preferences(),
+                (
+                    defaults.editor_find_options,
+                    defaults.editor_replace_preserve_case
+                )
+            );
+        }
+        let reset = settings::load(&app.settings_path).unwrap();
+        assert_eq!(reset.editor_find_options, defaults.editor_find_options);
+        assert_eq!(
+            reset.editor_replace_preserve_case,
+            defaults.editor_replace_preserve_case
         );
     }
 
@@ -7474,10 +7902,17 @@ mod tests {
     fn a_modal_refuses_editor_input_but_never_an_async_completion() {
         let card = CardId::new();
         assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::FindReplacementLoaded {
+                card,
+                ticket: card.as_uuid(),
+                result: Ok(None)
+            }
+        ));
+        assert!(repository_action_allowed_while_modal(
             &RepositoryAction::FindLoaded {
                 card,
                 ticket: card.as_uuid(),
-                result: Ok(Some(Vec::new())),
+                result: Ok(Some(Default::default())),
             }
         ));
         assert!(!repository_action_allowed_while_modal(
