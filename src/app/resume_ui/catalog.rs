@@ -200,8 +200,9 @@ impl Cache {
         let header = match cached {
             Some(header) => header,
             None => {
-                let header = header_with_cancel(provider, &candidate.path, cancel);
-                if cancel.load(Ordering::Relaxed) {
+                let mut covered = true;
+                let header = header_with_cancel(provider, &candidate.path, cancel, &mut covered);
+                if !covered || cancel.load(Ordering::Relaxed) {
                     return None;
                 }
                 let mut cache = self.0.lock().ok()?;
@@ -306,10 +307,17 @@ pub fn names(seeds: &[chat::Session]) -> Vec<Arc<HashMap<String, String>>> {
 /// a resumable top-level conversation.
 #[cfg(test)]
 fn header(provider: Provider, path: &Path) -> Option<Header> {
-    header_with_cancel(provider, path, &AtomicBool::new(false))
+    let mut covered = true;
+    header_with_cancel(provider, path, &AtomicBool::new(false), &mut covered)
 }
 
-fn header_with_cancel(provider: Provider, path: &Path, cancel: &AtomicBool) -> Option<Header> {
+// An interrupted metadata pass must not become a cached negative lookup.
+fn header_with_cancel(
+    provider: Provider,
+    path: &Path,
+    cancel: &AtomicBool,
+    covered: &mut bool,
+) -> Option<Header> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let mut identity = None;
@@ -321,6 +329,7 @@ fn header_with_cancel(provider: Provider, path: &Path, cancel: &AtomicBool) -> O
     // only when its text could hold what is still missing.
     loop {
         if cancel.load(Ordering::Relaxed) {
+            *covered = false;
             return None;
         }
         line.clear();
@@ -362,15 +371,16 @@ fn header_with_cancel(provider: Provider, path: &Path, cancel: &AtomicBool) -> O
         use crate::chat::claude_metadata::{Lines, Names};
         let mut lines = Lines::default();
         let mut names = Names::default();
-        let complete = lines
-            .scan(
+        if !matches!(
+            lines.scan(
                 &mut file,
                 len,
                 || cancel.load(Ordering::Relaxed),
                 |line| names.note(line, &id, &directory),
-            )
-            .ok()?;
-        if !complete {
+            ),
+            Ok(true)
+        ) {
+            *covered = false;
             return None;
         }
         let name = names.title().map(str::to_owned);

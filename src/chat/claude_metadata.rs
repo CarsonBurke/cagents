@@ -19,7 +19,7 @@ pub(crate) struct Lines {
 
 impl Lines {
     /// Read through the caller's original EOF, retaining an incomplete line
-    /// for a later append. `false` means cancellation, not complete coverage.
+    /// for a later append. Cancellation or a truncated snapshot returns `false`.
     pub(crate) fn scan(
         &mut self,
         file: &mut File,
@@ -35,15 +35,20 @@ impl Lines {
             }
             let available = reader.fill_buf()?;
             if available.is_empty() {
-                return Ok(true);
+                return Ok(self.offset == end);
             }
             let newline = available.iter().position(|byte| *byte == b'\n');
             let count = newline.map_or(available.len(), |index| index + 1);
             if !self.oversized {
-                if self.pending.len() + count <= MAX_LINE_BYTES {
+                let required = self.pending.len() + count;
+                if required <= MAX_LINE_BYTES {
+                    if self.pending.capacity() < required {
+                        let target = required.next_power_of_two().min(MAX_LINE_BYTES);
+                        self.pending.reserve_exact(target - self.pending.len());
+                    }
                     self.pending.extend_from_slice(&available[..count]);
                 } else {
-                    self.pending.clear();
+                    self.pending = Vec::new();
                     self.oversized = true;
                 }
             }
@@ -196,5 +201,36 @@ mod tests {
         );
         assert_eq!(notes, 1);
         assert_eq!(lines.offset, end);
+    }
+
+    #[test]
+    fn same_file_truncation_cannot_report_complete_snapshot_coverage() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"{}\n").unwrap();
+        file.write_all(&vec![b'x'; 4 * MAX_LINE_BYTES]).unwrap();
+        file.write_all(b"\n").unwrap();
+        let truncate = file.try_clone().unwrap();
+        let end = file.metadata().unwrap().len();
+        let mut lines = Lines::default();
+        let mut truncated = false;
+        let complete = lines
+            .scan(
+                &mut file,
+                end,
+                || false,
+                |_| {
+                    if !truncated {
+                        truncate.set_len(0).unwrap();
+                        truncated = true;
+                    }
+                },
+            )
+            .unwrap();
+        assert!(truncated);
+        assert!(
+            !complete,
+            "Early EOF after truncation is not the captured EOF"
+        );
+        assert!(lines.offset < end);
     }
 }

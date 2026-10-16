@@ -84,6 +84,7 @@ impl ClaudeTitles {
                 || saved.device != metadata.dev()
                 || saved.inode != metadata.ino()
                 || metadata.len() < saved.lines.offset
+                || metadata.len() < saved.len
                 || (metadata.len() == saved.len && changed != saved.changed)
         }) {
             self.transcript = Some(Transcript {
