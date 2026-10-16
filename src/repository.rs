@@ -4719,7 +4719,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             remove_fsmonitor_override(&mut command);
             let output = self.run(&command, cancellation)?;
             cache.fsmonitor = if output.success {
-                trusted_fsmonitor(&output.stdout, &observation_root)
+                trusted_fsmonitor_with_roots(&output.stdout, worktree, &observation_root)
             } else if output.exit_code == Some(1) {
                 None
             } else {
@@ -6823,6 +6823,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         ),
         RepositoryError,
     > {
+        let observation_root = self
+            .authority
+            .as_ref()
+            .map(|source| source.anchored_read_path())
+            .unwrap_or_else(|| worktree.to_owned());
         if system_root.is_none() {
             let command = self.git_read(worktree, ["var", "GIT_CONFIG_SYSTEM"]);
             let output = self.run(&command, cancellation)?;
@@ -6850,7 +6855,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let system = root.path.as_deref();
         let system_known = root.known;
         let (_, _, mut seed) =
-            parse_observed_publication_config(worktree, b"", system, system_known)?;
+            parse_observed_publication_config(&observation_root, b"", system, system_known)?;
         for path in admin.keys().filter(|path| {
             matches!(
                 path.file_name().and_then(OsStr::to_str),
@@ -6902,7 +6907,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return Err(git_failure(&command, output).into());
             }
             let (remotes, selection, mut after) = invalid_output(
-                parse_observed_publication_config(worktree, &output.stdout, system, system_known),
+                parse_observed_publication_config(
+                    &observation_root,
+                    &output.stdout,
+                    system,
+                    system_known,
+                ),
                 output,
             )?;
             for path in &base {
@@ -7893,7 +7903,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 /// not select a hook program. Programs explicitly configured by the user in
 /// global/system configuration may retain authority when their absolute
 /// executable is outside repository content and contains no shell syntax.
+#[cfg(test)]
 fn trusted_fsmonitor(output: &[u8], worktree: &Path) -> Option<OsString> {
+    trusted_fsmonitor_with_roots(output, worktree, worktree)
+}
+fn trusted_fsmonitor_with_roots(
+    output: &[u8],
+    worktree: &Path,
+    held_worktree: &Path,
+) -> Option<OsString> {
     let text = std::str::from_utf8(output).ok()?.trim_end_matches('\n');
     let (scope, value) = text.split_once('\t')?;
     match value.to_ascii_lowercase().as_str() {
@@ -7914,11 +7932,17 @@ fn trusted_fsmonitor(output: &[u8], worktree: &Path) -> Option<OsString> {
                 return None;
             }
             let executable = fs::canonicalize(value).ok()?;
-            let worktree = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+            let named_worktree = worktree;
+            let canonical_worktree =
+                fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+            let held_worktree =
+                fs::canonicalize(held_worktree).unwrap_or_else(|_| held_worktree.to_path_buf());
             // Git receives the canonical path as a command string, so a safe
             // symlink name must not introduce shell syntax through its target.
             if !is_command_path(&executable)
-                || executable.starts_with(&worktree)
+                || executable.starts_with(named_worktree)
+                || executable.starts_with(&canonical_worktree)
+                || executable.starts_with(&held_worktree)
                 || executable
                     .ancestors()
                     .skip(1)
@@ -9981,6 +10005,61 @@ mod tests {
                 fs::read(root.join("untracked")).unwrap(),
                 b"original\nsecond\n"
             );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn original_discard_reader_keeps_relative_config_and_both_monitor_exclusions_under_substitution()
+         {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("checkout");
+            let saved = parent.path().join("original");
+            fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]);
+            fs::write(root.join("config"), "original config\n").unwrap();
+            fs::write(root.join("tool"), "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(root.join("tool"), fs::Permissions::from_mode(0o700)).unwrap();
+            let authority = WorktreeAuthority::capture(&root).unwrap();
+            let held = authority.anchored_read_path();
+            let original = fs::metadata(root.join("config")).unwrap();
+            fs::rename(&root, &saved).unwrap();
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("config"), "foreign config\n").unwrap();
+            fs::write(root.join("tool"), "#!/bin/sh\nexit 1\n").unwrap();
+            fs::set_permissions(root.join("tool"), fs::Permissions::from_mode(0o700)).unwrap();
+            let (_, _, dependencies) = parse_observed_publication_config(
+                &held,
+                b"file:config\0remote.origin.url\nhttps://example.invalid/original.git\0",
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                dependencies.files[&held.join("config")],
+                Some(file_identity(&original))
+            );
+            for inside in [&root, &saved] {
+                let configured = format!("global\t{}\n", inside.join("tool").display());
+                assert_eq!(
+                    trusted_fsmonitor_with_roots(configured.as_bytes(), &root, &held),
+                    None
+                );
+            }
+            let outside = parent.path().join("trusted-monitor");
+            fs::write(&outside, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+            let configured = format!("global\t{}\n", outside.display());
+            assert_eq!(
+                trusted_fsmonitor_with_roots(configured.as_bytes(), &root, &held),
+                Some(outside.into_os_string())
+            );
+            assert_eq!(fs::read(root.join("config")).unwrap(), b"foreign config\n");
+            fs::remove_file(root.join("config")).unwrap();
+            fs::remove_file(root.join("tool")).unwrap();
+            fs::remove_dir(&root).unwrap();
+            fs::rename(saved, &root).unwrap();
+            authority.validate().unwrap();
         }
 
         #[derive(Default)]
