@@ -180,7 +180,12 @@ mod tests {
             },
         ));
         runtime.connection = Connection::Live(handle.clone());
-        runtime.refresh();
+        // The test renders a visible completed report. Hidden runtimes defer
+        // snapshot hydration, just as they do in the actual UI.
+        runtime.show(true);
+        assert_eq!(runtime.snapshot.finished_at, Some(42));
+        assert_eq!(runtime.snapshot.items.len(), 1);
+        assert_eq!(runtime.snapshot.items[0].id, "completed-report");
         runtime.replace_draft(text_editor::Content::with_text(draft));
         let target = runtime.target;
         let state = app.card_state_mut(card).unwrap();
