@@ -60,7 +60,6 @@ wrong-provider and known conflicting accounts. A concurrent edit requires a
 fresh explicit command; the CLI does not retry a failed preference write.
 Agent-authenticated callers cannot change defaults. Omp chooses its own accounts
 and accepts only `automatic`. Existing conversations keep their recorded account.
-Running windows adopt external changes when their Accounts surface refreshes.
 
 New installations use **Automatic** for each provider. Add each subscription
 once with its provider's browser or device-code sign-in. Thereafter the CLI
