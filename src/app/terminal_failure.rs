@@ -1136,6 +1136,7 @@ mod ownership_tests {
             agent_activity: None,
             upgrade_sources: Vec::new(),
             upgrade_relaunches: Vec::new(),
+            title: None,
         };
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {

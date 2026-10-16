@@ -388,7 +388,10 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
-    if matches!(&update, Update::Attention(_)) {
+    if matches!(
+        &update,
+        Update::Attention(_) | Update::AttentionContext { .. }
+    ) {
         // Scheduled outcomes belong to the accepted run, not its temporary
         // provider process. The scheduler publishes committed run evidence.
         // Read outside HostState; a failed ownership read cannot safely turn
@@ -429,16 +432,20 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     {
         courier.wake();
     }
-    if let Update::Attention(evidence) = &update {
+    if let Update::Attention(evidence) | Update::AttentionContext { evidence, .. } = &update {
         if let Some(record) = state.chats.get(&id)
             && let Some(notifications) = &state.notifications
         {
-            notifications.record(crate::notifications::Event::session(
+            let mut event = crate::notifications::Event::session(
                 id,
                 record.session.launch.provider,
                 record.session.launch.recipe.working_directory.clone(),
                 evidence.clone(),
-            ));
+            );
+            if let Update::AttentionContext { content, .. } = &update {
+                event.content = content.clone();
+            }
+            notifications.record(event);
         }
         return;
     }
@@ -4900,6 +4907,8 @@ for line in sys.stdin:
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![
                         Event::Ready(true),
@@ -4983,6 +4992,8 @@ done
         process_recipe.program = "/bin/cat".into();
         let spec = ProcessSpec::from(&process_recipe);
         let mut initial = Step {
+            suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![json!({"ready": true})],
             events: vec![
                 Event::Ready(true),
@@ -5117,12 +5128,16 @@ done
             }
             fn command(&mut self, _: Command) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![json!({"id":"saved-conversation"})],
                     events: Vec::new(),
                 })
             }
             fn receive(&mut self, value: Value) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![Event::Session {
                         id: value["id"].as_str().unwrap().to_owned(),
@@ -5181,6 +5196,8 @@ done
         }
         fn command(&mut self, command: Command) -> Result<Step, String> {
             Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: Vec::new(),
                 events: if matches!(command, Command::Interrupt) {
                     vec![Event::Status {
@@ -5286,6 +5303,8 @@ done
         };
         let spec = ProcessSpec::from(&recipe);
         let mut initial = Step {
+            suppress_current_notification: false,
+            notification_preview: None,
             writes: Vec::new(),
             events: vec![Event::Status {
                 busy: true,
@@ -5465,6 +5484,8 @@ done
         }
         fn command(&mut self, _: Command) -> Result<Step, String> {
             Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: vec![json!({"tick": true})],
                 events: Vec::new(),
             })
@@ -5472,6 +5493,8 @@ done
         fn receive(&mut self, _: Value) -> Result<Step, String> {
             self.0 = !self.0;
             Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: Vec::new(),
                 events: vec![Event::Waiting(self.0)],
             })
@@ -5511,12 +5534,16 @@ done
             fn command(&mut self, command: Command) -> Result<Step, String> {
                 assert_eq!(command, Command::Interrupt);
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![json!({"interrupt": true})],
                     events: Vec::new(),
                 })
             }
             fn receive(&mut self, value: Value) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![if value.get("ready").is_some() {
                         Event::Session {

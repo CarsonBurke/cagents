@@ -27,6 +27,7 @@ mod automations;
 mod completions;
 pub use automations::AutomationCommand;
 mod sessions;
+mod terminal_list;
 pub use sessions::SessionsArgs;
 mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
@@ -296,8 +297,20 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum TerminalCommand {
-    /// List terminal descriptors known to the daemon.
-    List,
+    /// List running terminals with their observed state and title.
+    List {
+        /// Include retained terminals that are not running.
+        #[arg(long, conflicts_with = "exited")]
+        all: bool,
+        /// Show only terminals with a recorded process exit.
+        #[arg(long)]
+        exited: bool,
+    },
+    /// Read one terminal's full descriptor, including launch and recovery details.
+    Show {
+        /// The daemon terminal ID.
+        terminal_id: TerminalId,
+    },
     /// Spawn a terminal with an optional argv-based command.
     Spawn {
         /// Working directory for the terminal (defaults to the current directory).
@@ -3155,18 +3168,19 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         client.authenticate(authority).map_err(protocol_error)?;
     }
     match command {
-        TerminalCommand::List => {
+        TerminalCommand::List { all, exited } => {
             let terminals = client.list().map_err(protocol_error)?;
-            let human = terminals
+            Ok(terminal_list::list(&terminals, client.proof(), all, exited))
+        }
+        TerminalCommand::Show { terminal_id } => {
+            let terminals = client.list().map_err(protocol_error)?;
+            let terminal = terminals
                 .iter()
-                .map(descriptor_line)
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(CommandOutput {
-                command: "terminal.list",
-                data: json!({ "terminals": terminals }),
-                human,
-            })
+                .find(|terminal| terminal.session.id == terminal_id)
+                .ok_or_else(|| {
+                    AppError::new("not_found", format!("Unknown terminal {terminal_id}"))
+                })?;
+            Ok(terminal_list::show(terminal, client.proof()))
         }
         TerminalCommand::Spawn { cwd, argv } => {
             let cwd = absolute_working_directory(cwd)
