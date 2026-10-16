@@ -2257,6 +2257,7 @@ fn creation_request(
     let request = CreateWorktreeRequest {
         repository: fixture.root.clone(),
         managed_root: root.clone(),
+        managed_ignore_root: None,
         destination: root.join("reviewed"),
         branch: ValidatedBranchName::parse("reviewed").unwrap(),
         base: if track {

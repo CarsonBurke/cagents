@@ -818,6 +818,7 @@ mod tests {
             let request = CreateWorktreeRequest {
                 repository: "/repo".into(),
                 managed_root: "/worktrees".into(),
+                managed_ignore_root: None,
                 destination: "/worktrees/feature".into(),
                 branch: ValidatedBranchName::parse("feature").unwrap(),
                 base: BaseRevision::remote_ref("refs/remotes/origin/feature").unwrap(),
