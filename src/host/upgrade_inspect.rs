@@ -2,6 +2,7 @@
 //! The helper does not take a daemon admission lease, migrate SQLite, attach,
 //! restart providers, or publish a replacement descriptor.
 mod current;
+mod v68;
 mod v77;
 
 use crate::install_guard::SourceInspectionRequest as Request;
@@ -58,6 +59,7 @@ pub(super) fn entry() -> Option<Result<(), String>> {
 enum Reader {
     Current(current::Client),
     Legacy(v77::Client),
+    Legacy68(v68::Client),
 }
 
 impl Reader {
@@ -65,24 +67,30 @@ impl Reader {
         match self {
             Self::Current(client) => client.list(),
             Self::Legacy(client) => client.list(),
+            Self::Legacy68(client) => client.list(),
         }
     }
     fn terminals(&mut self) -> Result<Vec<v77::Terminal>, String> {
         match self {
             Self::Current(client) => client.terminals(),
             Self::Legacy(client) => client.terminals(),
+            Self::Legacy68(client) => client.terminals(),
         }
     }
     fn resolve(&mut self, source: &Session) -> Result<Session, String> {
         match self {
             Self::Current(client) => client.resolve(source),
             Self::Legacy(client) => client.resolve(source),
+            Self::Legacy68(client) => client.resolve(source),
         }
     }
 }
 
 fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
-    if request.protocol != crate::terminal_ipc::PROTOCOL_VERSION && request.protocol != 77 {
+    if request.protocol != crate::terminal_ipc::PROTOCOL_VERSION
+        && request.protocol != 77
+        && request.protocol != 68
+    {
         return Err(
             "Source protocol has no qualified migration inspector; source windows remain usable"
                 .into(),
@@ -97,6 +105,8 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
         .map_err(|_| "Source service namespace is unavailable")?;
     if request.protocol == crate::terminal_ipc::PROTOCOL_VERSION {
         current::Client::connect(&socket, proof, deadline).map(Reader::Current)
+    } else if request.protocol == 68 {
+        v68::Client::connect(&socket, proof, deadline).map(Reader::Legacy68)
     } else {
         v77::Client::connect(&socket, proof, deadline).map(Reader::Legacy)
     }
