@@ -1207,6 +1207,31 @@ extern "C" fn serve_if_requested() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_adopt_json_keeps_exact_source_and_proof_without_claiming_a_new_role() {
+        let source = super::super::tests::recovery().source;
+        let proof = source.proof.clone().unwrap();
+        let legacy = serde_json::json!({"Adopt": {"source": source, "proof": proof}});
+        let decoded: Request = serde_json::from_value(legacy.clone()).unwrap();
+        let Request::Adopt { source: actual, proof: actual_proof, application } = decoded else {
+            panic!("legacy request changed operation");
+        };
+        assert_eq!(actual, source);
+        assert_eq!(actual_proof, proof);
+        assert!(application.is_none(), "legacy request invented successor-role authority");
+        let mut current = legacy.clone();
+        current["Adopt"]["application"] = serde_json::json!(crate::instance::APPLICATION_ID);
+        let Request::Adopt { source: actual, proof: actual_proof, application } = serde_json::from_value::<Request>(current).unwrap() else {
+            panic!("current request changed operation");
+        };
+        assert_eq!(actual, source);
+        assert_eq!(actual_proof, proof);
+        assert_eq!(application.as_deref(), Some(crate::instance::APPLICATION_ID));
+        let mut missing_proof = legacy;
+        missing_proof["Adopt"].as_object_mut().unwrap().remove("proof");
+        assert!(serde_json::from_value::<Request>(missing_proof).is_err());
+    }
+
     use super::*;
 
     #[test]

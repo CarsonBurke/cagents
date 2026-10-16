@@ -560,6 +560,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ordinary_discovery_refuses_other_production_role_without_mutating_it() {
+        // This is on-disk untrusted evidence, never a spawned/renamed helper.
+        // Actual cross-role adoption requires separately built real products.
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut foreign = record();
+        foreign.application = if crate::instance::APPLICATION_ID == "dev.cagents.Cagents.Browserless" {
+            "dev.cagents.Cagents"
+        } else {
+            "dev.cagents.Cagents.Browserless"
+        }.into();
+        assert_ne!(foreign.application, crate::instance::APPLICATION_ID);
+        foreign.create(directory.path()).unwrap();
+        let endpoint = socket(directory.path(), foreign.terminal);
+        let path = foreign.path(directory.path());
+        let before = fs::read(&path).unwrap();
+        assert!(evidence(&endpoint, Kind::Terminal).is_err());
+        assert!(discover(directory.path(), &foreign.boot, Kind::Terminal).unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        if crate::instance::IS_DEVELOPMENT {
+            assert!(recovery_candidate(&endpoint, Kind::Terminal).is_err());
+            assert!(recovery_candidates(directory.path(), &foreign.boot, Kind::Terminal).unwrap().is_empty());
+        } else {
+            assert_eq!(recovery_candidate(&endpoint, Kind::Terminal).unwrap(), Some(foreign.clone()));
+            assert_eq!(recovery_candidates(directory.path(), &foreign.boot, Kind::Terminal).unwrap(), vec![foreign.clone()]);
+            let missing = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new(""),
+                host_incarnation: crate::model::HostIncarnation::new(""),
+                boot_id: foreign.boot.clone(),
+            };
+            assert!(OriginalRole::authenticated(&foreign, &missing, &missing).is_err(), "candidate became authority without issued proof");
+        }
+        assert_eq!(read(&path).unwrap(), foreign);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
     fn record() -> Record {
         let process = Process::read(std::process::id() as i32).unwrap();
         Record {
