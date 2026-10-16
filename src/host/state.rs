@@ -2496,12 +2496,14 @@ fn carry_terminals(
         // its process still runs. A registered holder can keep either result
         // without converting ownership into permission to execute a recipe.
         if crate::daemon::holder_registry::recovery_candidate(
-            &holder_socket(holders, id), crate::daemon::holder_registry::Kind::Terminal,
+            &holder_socket(holders, id),
+            crate::daemon::holder_registry::Kind::Terminal,
         )
-            .ok()
-            .flatten()
-            .is_some_and(|record| handle.holder_identity() == Some(&record) && record.holder.is_current())
-            && handle.preserve_for_restart().is_ok()
+        .ok()
+        .flatten()
+        .is_some_and(|record| {
+            handle.holder_identity() == Some(&record) && record.holder.is_current()
+        }) && handle.preserve_for_restart().is_ok()
         {
             tracing::warn!(terminal = %id, %error,
                 "upgrade preserves the registered holder without a new parser snapshot");
@@ -2640,7 +2642,9 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
         .proof()
         .clone();
     let records = crate::daemon::holder_registry::recovery_candidates(
-        &directory, &proof.boot_id, crate::daemon::holder_registry::Kind::Terminal,
+        &directory,
+        &proof.boot_id,
+        crate::daemon::holder_registry::Kind::Terminal,
     )?;
     for record in records {
         if crate::daemon::termination_requested() {
@@ -3150,7 +3154,8 @@ fn adopt_carried_terminal(
         for attempt in 1..=ADOPTION_ATTEMPTS {
             let previous = (|| {
                 if let Some(record) = crate::daemon::holder_registry::recovery_candidate(
-                    &socket, crate::daemon::holder_registry::Kind::Terminal,
+                    &socket,
+                    crate::daemon::holder_registry::Kind::Terminal,
                 )? {
                     let proof = host
                         .lock()

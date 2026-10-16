@@ -1314,7 +1314,12 @@ impl TerminalHandle {
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if super::holder::cleanup::confirmed_with_role(source, expected, proof, self.inner.published.original_holder_role.get())? {
+            if super::holder::cleanup::confirmed_with_role(
+                source,
+                expected,
+                proof,
+                self.inner.published.original_holder_role.get(),
+            )? {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {

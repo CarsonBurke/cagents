@@ -116,7 +116,9 @@ pub(crate) fn confirmed_with_role(
     proof: &HostSessionProof,
     role: Option<&crate::daemon::holder_registry::OriginalRole>,
 ) -> Result<bool, String> {
-    if source.id != expected.terminal { return Ok(false); }
+    if source.id != expected.terminal {
+        return Ok(false);
+    }
     confirmed_receipt(expected, proof, Some(digest(source)?), role)
 }
 
@@ -136,7 +138,6 @@ pub(crate) fn confirmed_owner_with_role(
     confirmed_receipt(expected, proof, None, role)
 }
 
-
 fn confirmed_receipt(
     expected: &Record,
     proof: &HostSessionProof,
@@ -146,8 +147,11 @@ fn confirmed_receipt(
     authorize(proof)?;
     let directory = super::directory()?;
     if crate::daemon::holder_registry::recovery_candidate(
-        &super::socket(&directory, expected.terminal), Kind::Terminal,
-    )?.is_some() {
+        &super::socket(&directory, expected.terminal),
+        Kind::Terminal,
+    )?
+    .is_some()
+    {
         return Ok(false);
     }
     let path = directory.join(format!(

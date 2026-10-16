@@ -314,24 +314,39 @@ pub(super) fn adopt_recoverable(
     recovery: Option<Recovery>,
 ) -> Result<Adopted, String> {
     let evidence = crate::daemon::holder_registry::recovery_candidate(
-        socket, crate::daemon::holder_registry::Kind::Terminal,
+        socket,
+        crate::daemon::holder_registry::Kind::Terminal,
     )?;
     let mut original_role = None;
     if let Some(record) = &evidence
         && record.application != crate::instance::APPLICATION_ID
     {
-        let next = recovery.as_ref().ok_or("Cross-role adoption requires issued recovery lineage")?;
-        let proof = next.source.continuity.live_proof().ok_or("Cross-role adoption has no successor proof")?;
+        let next = recovery
+            .as_ref()
+            .ok_or("Cross-role adoption requires issued recovery lineage")?;
+        let proof = next
+            .source
+            .continuity
+            .live_proof()
+            .ok_or("Cross-role adoption has no successor proof")?;
         let (original, _) = inspect(socket, record, &proof)?;
         if next.execution_recipe != original.execution_recipe
             || next.execution_environment != original.execution_environment
             || next.source.launch != original.source.launch
             || (next.source != original.source && !next.previous_sources.contains(&original.source))
         {
-            return Err("Cross-role adoption does not retain the holder's exact issued source".into());
+            return Err(
+                "Cross-role adoption does not retain the holder's exact issued source".into(),
+            );
         }
         original_role = crate::daemon::holder_registry::OriginalRole::authenticated(
-            record, &original.source.continuity.live_proof().ok_or("Original holder source has no proof")?, &proof,
+            record,
+            &original
+                .source
+                .continuity
+                .live_proof()
+                .ok_or("Original holder source has no proof")?,
+            &proof,
         )?;
     }
     let failed =
@@ -1564,13 +1579,17 @@ fn hand_over(
         )?;
         if next.source.launch != current.source.launch
             || next.execution_recipe != current.execution_recipe
-            || (next.source != current.source && !next.previous_sources.iter().any(|source| {
-                source.id == current.source.id
-                    && source.launch == current.source.launch
-                    && source.continuity.live_proof() == current.source.continuity.live_proof()
-            }))
+            || (next.source != current.source
+                && !next.previous_sources.iter().any(|source| {
+                    source.id == current.source.id
+                        && source.launch == current.source.launch
+                        && source.continuity.live_proof() == current.source.continuity.live_proof()
+                }))
             || (next.source == current.source
-                && !current.previous_sources.iter().all(|source| next.previous_sources.contains(source)))
+                && !current
+                    .previous_sources
+                    .iter()
+                    .all(|source| next.previous_sources.contains(source)))
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -2387,9 +2406,15 @@ mod tests {
             // already returned in Attached as well as the surviving process.
             drop(attempt);
             assert_eq!(next.source, retry_source);
-            assert_eq!(crate::daemon::holder_registry::recovery_candidate(
-                &socket, crate::daemon::holder_registry::Kind::Terminal,
-            ).unwrap(), Some(record.clone()), "adoption rewrote the original holder role/identity");
+            assert_eq!(
+                crate::daemon::holder_registry::recovery_candidate(
+                    &socket,
+                    crate::daemon::holder_registry::Kind::Terminal,
+                )
+                .unwrap(),
+                Some(record.clone()),
+                "adoption rewrote the original holder role/identity"
+            );
             if replayed {
                 break;
             }

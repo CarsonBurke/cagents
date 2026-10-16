@@ -130,8 +130,13 @@ fn restore_reserved(
     proof: &HostSessionProof,
 ) -> Result<ServerResponse, String> {
     let directory = registry::directory(Kind::Native)?;
-    let record = registry::recovery_candidate(&registry::socket(&directory, source.id), Kind::Native)?
-        .ok_or("The durable native holder is unavailable; this conversation was not restarted or resent")?;
+    let record = registry::recovery_candidate(
+        &registry::socket(&directory, source.id),
+        Kind::Native,
+    )?
+    .ok_or(
+        "The durable native holder is unavailable; this conversation was not restarted or resent",
+    )?;
     let (recovery, exited) = chat::native_holder::inspect(&record, proof)?;
     if exited {
         return Err("The retained native server exited; explicitly resume the conversation to start another server".into());

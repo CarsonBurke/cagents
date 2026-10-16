@@ -87,9 +87,11 @@ fn recovery_role(application: &str) -> bool {
 }
 
 pub(crate) fn production_role_pair(original: &str, successor: &str) -> bool {
-    matches!((original, successor),
-        ("dev.cagents.Cagents", "dev.cagents.Cagents.Browserless") |
-        ("dev.cagents.Cagents.Browserless", "dev.cagents.Cagents"))
+    matches!(
+        (original, successor),
+        ("dev.cagents.Cagents", "dev.cagents.Cagents.Browserless")
+            | ("dev.cagents.Cagents.Browserless", "dev.cagents.Cagents")
+    )
 }
 
 /// Private, process-local custody established only after authenticated Inspect
@@ -112,8 +114,10 @@ impl OriginalRole {
             return Ok(None);
         }
         if !recovery_role(&record.application)
-            || !original.is_complete() || !successor.is_complete()
-            || original.boot_id != record.boot || successor.boot_id != record.boot
+            || !original.is_complete()
+            || !successor.is_complete()
+            || original.boot_id != record.boot
+            || successor.boot_id != record.boot
         {
             return Err("Holder role transition lacks exact same-boot issued ownership".into());
         }
@@ -124,7 +128,9 @@ impl OriginalRole {
             return Err("Holder role transition caller no longer owns the daemon lease".into());
         }
         Ok(Some(Self {
-            record: record.clone(), original: original.clone(), successor: successor.clone(),
+            record: record.clone(),
+            original: original.clone(),
+            successor: successor.clone(),
             application: crate::instance::APPLICATION_ID,
         }))
     }
@@ -134,9 +140,12 @@ impl OriginalRole {
     }
 
     fn matches_original(&self, record: &Record, proof: &crate::model::HostSessionProof) -> bool {
-        self.record == *record && self.successor == *proof
-            && self.original.is_complete() && self.original.boot_id == record.boot
-            && proof.is_complete() && proof.boot_id == record.boot
+        self.record == *record
+            && self.successor == *proof
+            && self.original.is_complete()
+            && self.original.boot_id == record.boot
+            && proof.is_complete()
+            && proof.boot_id == record.boot
             && production_role_pair(&record.application, self.application)
     }
 }
@@ -459,11 +468,20 @@ pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Ve
     discover_inner(directory, boot, kind, false)
 }
 
-pub(crate) fn recovery_candidates(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
+pub(crate) fn recovery_candidates(
+    directory: &Path,
+    boot: &BootId,
+    kind: Kind,
+) -> Result<Vec<Record>, String> {
     discover_inner(directory, boot, kind, true)
 }
 
-fn discover_inner(directory: &Path, boot: &BootId, kind: Kind, recovery: bool) -> Result<Vec<Record>, String> {
+fn discover_inner(
+    directory: &Path,
+    boot: &BootId,
+    kind: Kind,
+    recovery: bool,
+) -> Result<Vec<Record>, String> {
     crate::secure_file::prepare_private_directory(directory).map_err(|error| error.to_string())?;
     let mut records = Vec::new();
     for (index, entry) in fs::read_dir(directory)
@@ -521,7 +539,12 @@ mod tests {
         let browserless = "dev.cagents.Cagents.Browserless";
         assert!(production_role_pair(full, browserless));
         assert!(production_role_pair(browserless, full));
-        for unrelated in ["dev.cagents.Cagents.Development", "another-installation", "", full] {
+        for unrelated in [
+            "dev.cagents.Cagents.Development",
+            "another-installation",
+            "",
+            full,
+        ] {
             assert!(!production_role_pair(full, unrelated));
             assert!(!production_role_pair(unrelated, full));
         }
@@ -539,23 +562,32 @@ mod tests {
             boot_id: original.boot.clone(),
         };
         let role = OriginalRole {
-            record: original.clone(), original: proof.clone(), successor: proof.clone(),
+            record: original.clone(),
+            original: proof.clone(),
+            successor: proof.clone(),
             application: "dev.cagents.Cagents",
         };
         assert!(role.matches_original(&original, &proof));
-        let mut changed = original.clone(); changed.root.start += 1;
+        let mut changed = original.clone();
+        changed.root.start += 1;
         assert!(!role.matches_original(&changed, &proof));
-        changed = original.clone(); changed.holder.start += 1;
+        changed = original.clone();
+        changed.holder.start += 1;
         assert!(!role.matches_original(&changed, &proof));
-        changed = original.clone(); changed.terminal = TerminalId::new();
+        changed = original.clone();
+        changed.terminal = TerminalId::new();
         assert!(!role.matches_original(&changed, &proof));
-        changed = original.clone(); changed.application = "dev.cagents.Cagents".into();
+        changed = original.clone();
+        changed.application = "dev.cagents.Cagents".into();
         assert!(!role.matches_original(&changed, &proof));
         let mut other = proof.clone();
         other.host_incarnation = crate::model::HostIncarnation::new("different-daemon");
         assert!(!role.matches_original(&original, &other));
         if crate::instance::IS_DEVELOPMENT {
-            assert!(!role.matches(&original, &proof), "production capability entered development");
+            assert!(
+                !role.matches(&original, &proof),
+                "production capability entered development"
+            );
             assert!(OriginalRole::authenticated(&original, &proof, &proof).is_err());
         }
     }
@@ -567,31 +599,50 @@ mod tests {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let mut foreign = record();
-        foreign.application = if crate::instance::APPLICATION_ID == "dev.cagents.Cagents.Browserless" {
-            "dev.cagents.Cagents"
-        } else {
-            "dev.cagents.Cagents.Browserless"
-        }.into();
+        foreign.application =
+            if crate::instance::APPLICATION_ID == "dev.cagents.Cagents.Browserless" {
+                "dev.cagents.Cagents"
+            } else {
+                "dev.cagents.Cagents.Browserless"
+            }
+            .into();
         assert_ne!(foreign.application, crate::instance::APPLICATION_ID);
         foreign.create(directory.path()).unwrap();
         let endpoint = socket(directory.path(), foreign.terminal);
         let path = foreign.path(directory.path());
         let before = fs::read(&path).unwrap();
         assert!(evidence(&endpoint, Kind::Terminal).is_err());
-        assert!(discover(directory.path(), &foreign.boot, Kind::Terminal).unwrap().is_empty());
+        assert!(
+            discover(directory.path(), &foreign.boot, Kind::Terminal)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(fs::read(&path).unwrap(), before);
         if crate::instance::IS_DEVELOPMENT {
             assert!(recovery_candidate(&endpoint, Kind::Terminal).is_err());
-            assert!(recovery_candidates(directory.path(), &foreign.boot, Kind::Terminal).unwrap().is_empty());
+            assert!(
+                recovery_candidates(directory.path(), &foreign.boot, Kind::Terminal)
+                    .unwrap()
+                    .is_empty()
+            );
         } else {
-            assert_eq!(recovery_candidate(&endpoint, Kind::Terminal).unwrap(), Some(foreign.clone()));
-            assert_eq!(recovery_candidates(directory.path(), &foreign.boot, Kind::Terminal).unwrap(), vec![foreign.clone()]);
+            assert_eq!(
+                recovery_candidate(&endpoint, Kind::Terminal).unwrap(),
+                Some(foreign.clone())
+            );
+            assert_eq!(
+                recovery_candidates(directory.path(), &foreign.boot, Kind::Terminal).unwrap(),
+                vec![foreign.clone()]
+            );
             let missing = crate::model::HostSessionProof {
                 host_session_id: crate::model::HostSessionId::new(""),
                 host_incarnation: crate::model::HostIncarnation::new(""),
                 boot_id: foreign.boot.clone(),
             };
-            assert!(OriginalRole::authenticated(&foreign, &missing, &missing).is_err(), "candidate became authority without issued proof");
+            assert!(
+                OriginalRole::authenticated(&foreign, &missing, &missing).is_err(),
+                "candidate became authority without issued proof"
+            );
         }
         assert_eq!(read(&path).unwrap(), foreign);
         assert_eq!(fs::read(&path).unwrap(), before);

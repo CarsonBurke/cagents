@@ -533,7 +533,9 @@ pub(crate) fn adopt(
         return Err("Native role transition does not recognize the exact issued source".into());
     }
     let original_role = registry::OriginalRole::authenticated(
-        record, source.proof.as_ref().ok_or("Native source has no proof")?, proof,
+        record,
+        source.proof.as_ref().ok_or("Native source has no proof")?,
+        proof,
     )?;
     let control = connect(record)?;
     if record.is_outdated() {
@@ -735,10 +737,12 @@ impl Residence {
                     source,
                     execution_console,
                     paired_holder,
-                } => match self
-                    .recovery
-                    .update_source_for_role(source, execution_console, paired_holder, &self.owner_application)
-                {
+                } => match self.recovery.update_source_for_role(
+                    source,
+                    execution_console,
+                    paired_holder,
+                    &self.owner_application,
+                ) {
                     Ok(()) => Report::SourceUpdated,
                     Err(error) => Report::Failed(error),
                 },
@@ -830,27 +834,37 @@ impl Residence {
                         TIMEOUT,
                     );
                 }
-                Request::Adopt { source, proof, application } => {
-                    let application = application.unwrap_or_else(|| self.record.application.clone());
+                Request::Adopt {
+                    source,
+                    proof,
+                    application,
+                } => {
+                    let application =
+                        application.unwrap_or_else(|| self.record.application.clone());
                     if application != self.record.application
                         && !registry::production_role_pair(&self.record.application, &application)
                     {
-                        let _ = send(&control, &Report::Failed("Unsupported original holder role transition".into()), TIMEOUT);
+                        let _ = send(
+                            &control,
+                            &Report::Failed("Unsupported original holder role transition".into()),
+                            TIMEOUT,
+                        );
                         continue;
                     }
                     match self.recovery.adopt(&source, proof) {
-                    Ok(()) => {
-                        self.owner_application = application;
-                        if send(&control, &Report::Adopted(self.recovery.clone()), TIMEOUT).is_ok()
-                        {
-                            return self.attend(control);
+                        Ok(()) => {
+                            self.owner_application = application;
+                            if send(&control, &Report::Adopted(self.recovery.clone()), TIMEOUT)
+                                .is_ok()
+                            {
+                                return self.attend(control);
+                            }
+                        }
+                        Err(error) => {
+                            let _ = send(&control, &Report::Failed(error), TIMEOUT);
                         }
                     }
-                    Err(error) => {
-                        let _ = send(&control, &Report::Failed(error), TIMEOUT);
-                    }
-                    }
-                },
+                }
                 _ => unreachable!(),
             }
         }
@@ -1213,22 +1227,41 @@ mod tests {
         let proof = source.proof.clone().unwrap();
         let legacy = serde_json::json!({"Adopt": {"source": source, "proof": proof}});
         let decoded: Request = serde_json::from_value(legacy.clone()).unwrap();
-        let Request::Adopt { source: actual, proof: actual_proof, application } = decoded else {
+        let Request::Adopt {
+            source: actual,
+            proof: actual_proof,
+            application,
+        } = decoded
+        else {
             panic!("legacy request changed operation");
         };
         assert_eq!(actual, source);
         assert_eq!(actual_proof, proof);
-        assert!(application.is_none(), "legacy request invented successor-role authority");
+        assert!(
+            application.is_none(),
+            "legacy request invented successor-role authority"
+        );
         let mut current = legacy.clone();
         current["Adopt"]["application"] = serde_json::json!(crate::instance::APPLICATION_ID);
-        let Request::Adopt { source: actual, proof: actual_proof, application } = serde_json::from_value::<Request>(current).unwrap() else {
+        let Request::Adopt {
+            source: actual,
+            proof: actual_proof,
+            application,
+        } = serde_json::from_value::<Request>(current).unwrap()
+        else {
             panic!("current request changed operation");
         };
         assert_eq!(actual, source);
         assert_eq!(actual_proof, proof);
-        assert_eq!(application.as_deref(), Some(crate::instance::APPLICATION_ID));
+        assert_eq!(
+            application.as_deref(),
+            Some(crate::instance::APPLICATION_ID)
+        );
         let mut missing_proof = legacy;
-        missing_proof["Adopt"].as_object_mut().unwrap().remove("proof");
+        missing_proof["Adopt"]
+            .as_object_mut()
+            .unwrap()
+            .remove("proof");
         assert!(serde_json::from_value::<Request>(missing_proof).is_err());
     }
 

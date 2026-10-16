@@ -175,7 +175,11 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                     pair.source.as_ref().expect("captured worker source"),
                     &proof,
                 )?;
-            } else if !crate::terminal::holder::cleanup::confirmed_owner_with_role(&pair.holder, &proof, pair.original_role.as_ref())? {
+            } else if !crate::terminal::holder::cleanup::confirmed_owner_with_role(
+                &pair.holder,
+                &proof,
+                pair.original_role.as_ref(),
+            )? {
                 return Err(
                     "Paired terminal teardown is not proved; its ownership was retained".into(),
                 );
@@ -329,7 +333,12 @@ fn retained_pair(
     // The caller has already matched this native source against the live
     // holder's full recovery or its exact durable source-digest receipt.
     let original_role = registry::OriginalRole::authenticated(
-        holder, native_source.proof.as_ref().ok_or("Paired native source has no proof")?, proof,
+        holder,
+        native_source
+            .proof
+            .as_ref()
+            .ok_or("Paired native source has no proof")?,
+        proof,
     )?;
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(current) = state.terminals.get(&holder.terminal) {
@@ -360,7 +369,11 @@ fn retained_pair(
     drop(state);
     // The native holder's authenticated recovery/receipt owns this exact
     // terminal incarnation, even when the caller predates pair publication.
-    if !crate::terminal::holder::cleanup::confirmed_owner_with_role(holder, proof, original_role.as_ref())? {
+    if !crate::terminal::holder::cleanup::confirmed_owner_with_role(
+        holder,
+        proof,
+        original_role.as_ref(),
+    )? {
         return Err(
             "The original paired terminal is unavailable and its teardown is not proved".into(),
         );
