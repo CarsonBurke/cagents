@@ -6735,7 +6735,11 @@ fn file_task(
                     Err(error) => return (None, Err(error)),
                 },
             };
-            let result = crate::editor::load_file_at(&root, &path, tone);
+            let result = crate::editor::load_file_at(&root, &path, tone)
+                .and_then(|loaded| {
+                    crate::editor::validate_read_root_named(&root)?;
+                    Ok(loaded)
+                });
             (Some(root), result)
         })
         .await
@@ -10562,6 +10566,7 @@ mod tests {
         finish_navigation_task(&mut runtime, task).await;
         let original = runtime.retained_editor_root().expect("actual read root");
         assert_eq!(runtime.editor_text().as_deref(), Some("original one"));
+        runtime.take_lsp_intents();
         std::fs::rename(&named, &moved).unwrap();
         std::fs::create_dir(&named).unwrap();
         std::fs::write(named.join("two"), "replacement two").unwrap();
@@ -10569,7 +10574,8 @@ mod tests {
         assert!(!runtime.set_original_editor_root(replacement));
         let task = runtime.update(RepositoryAction::OpenFile { card, path: "two".into() });
         finish_navigation_task(&mut runtime, task).await;
-        assert_eq!(runtime.editor_text().as_deref(), Some("original two"));
+        assert!(runtime.editor_text().is_none(), "replaced spelling must not publish original text as the replacement's LSP document");
+        assert!(!runtime.take_lsp_intents().iter().any(|intent| matches!(intent, LspIntent::Open { .. })));
         assert!(Arc::ptr_eq(&original, &runtime.retained_editor_root().unwrap()));
         assert_eq!(std::fs::read_to_string(named.join("two")).unwrap(), "replacement two");
     }

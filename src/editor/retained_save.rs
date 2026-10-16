@@ -89,11 +89,16 @@ fn save_file_with_hooks(
         }
     }
     let baseline = SaveBaseline::capture(&destination, (!overwrite).then_some(expected_disk_hash))?;
-    let durability = publish_replacement(&parent, name, &destination, text.as_bytes(), metadata.permissions(), &baseline, context, || {
+    // The policy captured before hashing must still be the coherent baseline;
+    // otherwise an intervening chmod could be accepted and then overwritten.
+    baseline.ensure_initial(&metadata)?;
+    validate_target_parent(root, relative_path, &parent).map_err(io_error)?;
+    let durability = publish_with_hooks(&parent, name, &destination, text.as_bytes(), metadata.permissions(), &baseline, context, || {
+        before_publish()?;
         let named = Root::open(root.path())?;
         context.validate_for_source(&named)?;
-        before_publish()
-    }, sync_parent)?;
+        validate_target_parent(root, relative_path, &parent)
+    }, |parent, _| validate_target_parent(root, relative_path, parent), |_, _| Ok(()), sync_parent)?;
     let (durability, recovery) = match durability {
         SaveDurability::Durable => (super::SaveDurability::Durable, None),
         SaveDurability::Unconfirmed { error } => (super::SaveDurability::Unconfirmed { error }, None),
@@ -103,6 +108,15 @@ fn save_file_with_hooks(
         outcome: SaveOutcome::Saved { content_hash: blake3::hash(text.as_bytes()), durability },
         recovery,
     })
+}
+
+fn validate_target_parent(root: &Root, relative: &Path, parent: &Root) -> io::Result<()> {
+    let (named_parent, _) = fs_safety::open_parent_beneath(root, relative)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if fs_safety::recovery_directory_stamp(&named_parent)? != fs_safety::recovery_directory_stamp(parent)? {
+        return Err(io::Error::other("The original save parent moved outside the selected path; no replacement was published"));
+    }
+    Ok(())
 }
 
 use std::{

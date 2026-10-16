@@ -270,11 +270,32 @@ pub(crate) fn open_read_root(worktree: &Path) -> Result<Root, FileIoError> {
     worktree_root(worktree)
 }
 
+pub(crate) fn validate_read_root_named(root: &Root) -> Result<(), FileIoError> {
+    let named = worktree_root(root.path())?;
+    #[cfg(target_os = "linux")]
+    let same = fs_safety::recovery_directory_stamp(root).map_err(io_error)?
+        == fs_safety::recovery_directory_stamp(&named).map_err(io_error)?;
+    #[cfg(not(target_os = "linux"))]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        let held = root.metadata().map_err(io_error)?;
+        let current = named.metadata().map_err(io_error)?;
+        held.dev() == current.dev() && held.ino() == current.ino()
+    };
+    if !same { return Err(FileIoError::Io("The original worktree was replaced; reopen the pane before reading or saving".into())); }
+    Ok(())
+}
+
 pub(crate) fn load_file_at(
     root: &Root,
     relative_path: &Path,
     tone: PdfTone,
 ) -> Result<LoadedFile, FileIoError> {
+    validate_read_root_named(root)?;
+    load_file_at_original(root, relative_path, tone)
+}
+
+fn load_file_at_original(root: &Root, relative_path: &Path, tone: PdfTone) -> Result<LoadedFile, FileIoError> {
     validate_repo_path(relative_path)?;
     let mut source = relative_path.to_path_buf();
     // The link `source` was reached through, with the target it holds, so a
