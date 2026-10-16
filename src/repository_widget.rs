@@ -317,7 +317,7 @@ impl PartialEq for LspChangeText {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum LspIntent {
     /// The buffer became the card's open document. `absolute_path` is
     /// resolvable on disk; [`AsyncIdentity::path`] is worktree-relative and a
@@ -327,6 +327,8 @@ pub enum LspIntent {
         worktree: PathBuf,
         version: i32,
         text: LspChangeText,
+        /// SAME original file-read directory, carried through delayed ingress.
+        root: Option<Arc<crate::fs_safety::Root>>,
     },
     /// The buffer changed. Exact ranges accompany an immutable text root;
     /// only full/inexact synchronization materializes that root on a worker.
@@ -336,6 +338,24 @@ pub enum LspIntent {
     /// The buffer is gone: another file was opened over it, or the card
     /// returned to its file list.
     Close,
+}
+
+impl PartialEq for LspIntent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Open { absolute_path: a, worktree: w, version: v, text: t, root: r }, Self::Open { absolute_path: b, worktree: x, version: z, text: u, root: s }) => {
+                a == b && w == x && v == z && t == u && match (r, s) {
+                    (None, None) => true,
+                    (Some(r), Some(s)) => Arc::ptr_eq(r, s),
+                    _ => false,
+                }
+            }
+            (Self::Change { version: v, text: t }, Self::Change { version: w, text: u }) => v == w && t == u,
+            (Self::Save { text: t }, Self::Save { text: u }) => t == u,
+            (Self::Close, Self::Close) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4256,6 +4276,7 @@ impl RepositoryRuntime {
             worktree: worktree.to_path_buf(),
             version: document.lsp_version,
             text: LspChangeText::Snapshot(document.content.text_snapshot()),
+            root: self.original_editor_root.clone(),
         });
     }
 
@@ -15894,6 +15915,7 @@ mod tests {
                 // document URI can be built from it alone.
                 absolute_path: PathBuf::from("/repo/notes.txt"),
                 worktree: PathBuf::from("/repo"),
+                root: None,
                 version: 1,
                 text: "fn main() {}\n".into(),
             }]
@@ -16778,6 +16800,7 @@ mod tests {
             vec![LspIntent::Open {
                 absolute_path: PathBuf::from("/repo/notes.txt"),
                 worktree: PathBuf::from("/repo"),
+                root: None,
                 version: 1,
                 text: "fn main() {}\n".into(),
             }]

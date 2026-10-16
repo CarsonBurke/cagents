@@ -10294,12 +10294,14 @@ impl Cagents {
                     worktree,
                     version,
                     text,
-                } => tasks.push(self.open_lsp_document(
+                    root,
+                } => tasks.push(self.open_lsp_document_with_root(
                     card,
                     &absolute_path,
                     &worktree,
                     version,
                     &text,
+                    root,
                 )),
                 LspIntent::Change { version, text } => {
                     let Some(doc) = self.lsp_document(card) else {
@@ -10369,6 +10371,17 @@ impl Cagents {
         version: i32,
         text: &repository_widget::LspChangeText,
     ) -> Task<Message> {
+        self.open_lsp_document_with_root(card, path, worktree, version, text, None)
+    }
+    fn open_lsp_document_with_root(
+        &mut self,
+        card: CardId,
+        path: &Path,
+        worktree: &Path,
+        version: i32,
+        text: &repository_widget::LspChangeText,
+        root: Option<Arc<crate::fs_safety::Root>>,
+    ) -> Task<Message> {
         // A previous buffer's document is closed first even without a `Close`
         // intent, because the two are one transition for the user: opening a
         // second file over the first leaves the server holding a document for
@@ -10388,14 +10401,12 @@ impl Cagents {
         };
         let doc = LspDocumentId(self.next_lsp_document);
         self.next_lsp_document += 1;
-        let status = match text {
-            repository_widget::LspChangeText::Text(text) => {
-                self.lsp.open(doc, path, worktree, language, version, text)
-            }
-            repository_widget::LspChangeText::Snapshot(source) => {
-                self.lsp
-                    .open_snapshot(doc, path, worktree, language, version, source.clone())
-            }
+        let status = match (text, root) {
+            (repository_widget::LspChangeText::Snapshot(source), Some(root)) => self.lsp
+                .open_snapshot_with_root(doc, path, worktree, language, version, source.clone(), root),
+            (repository_widget::LspChangeText::Text(_), Some(_)) => LspStatus::Unavailable { reason: "Original-root language registration requires the actual native snapshot".into() },
+            (repository_widget::LspChangeText::Text(text), None) => self.lsp.open(doc, path, worktree, language, version, text),
+            (repository_widget::LspChangeText::Snapshot(source), None) => self.lsp.open_snapshot(doc, path, worktree, language, version, source.clone()),
         };
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(doc));

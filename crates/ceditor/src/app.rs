@@ -1957,6 +1957,7 @@ impl Editor {
                     worktree,
                     version,
                     text,
+                    root,
                 } => {
                     // The intent names the file the bytes belong to. A link's
                     // buffer is the target, which is not the row that was clicked.
@@ -1967,25 +1968,11 @@ impl Editor {
                     if let Some(language) = self.lsp.language_for(&absolute_path) {
                         let doc = LspDocumentId(self.next_document);
                         self.next_document += 1;
-                        let status = match text {
-                            repository_widget::LspChangeText::Text(text) => self.lsp.open(
-                                doc,
-                                &absolute_path,
-                                &worktree,
-                                language,
-                                version,
-                                &text,
-                            ),
-                            repository_widget::LspChangeText::Snapshot(source) => {
-                                self.lsp.open_snapshot(
-                                    doc,
-                                    &absolute_path,
-                                    &worktree,
-                                    language,
-                                    version,
-                                    source,
-                                )
-                            }
+                        let status = match (text, root) {
+                            (repository_widget::LspChangeText::Snapshot(source), Some(root)) => self.lsp.open_snapshot_with_root(doc, &absolute_path, &worktree, language, version, source, root),
+                            (repository_widget::LspChangeText::Text(_), Some(_)) => LspStatus::Unavailable { reason: "Original-root language registration requires the actual native snapshot".into() },
+                            (repository_widget::LspChangeText::Text(text), None) => self.lsp.open(doc, &absolute_path, &worktree, language, version, &text),
+                            (repository_widget::LspChangeText::Snapshot(source), None) => self.lsp.open_snapshot(doc, &absolute_path, &worktree, language, version, source),
                         };
                         if let Some(tab) = self.tab_mut(id) {
                             tab.runtime.set_lsp_document(Some(doc));
