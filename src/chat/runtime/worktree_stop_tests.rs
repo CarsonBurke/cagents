@@ -1,6 +1,7 @@
 //! Actual whole-session Stop admission and cleanup contracts.
 use super::*;
 use crate::chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 struct Quiet;

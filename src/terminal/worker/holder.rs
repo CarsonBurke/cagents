@@ -2291,7 +2291,7 @@ mod tests {
     }
 
     fn holder_pid(held: &Held) -> u32 {
-        held.holder.process.as_ref().unwrap().id()
+        held.holder.process.as_ref().unwrap().child.id()
     }
 
     fn alive(pid: libc::pid_t) -> bool {
@@ -2456,7 +2456,7 @@ mod tests {
             holder,
         } = spawn(command("while :; do sleep 1; done"), size(), exits).unwrap();
         let root = child.pid();
-        let holder_pid = holder.process.as_ref().unwrap().id() as libc::pid_t;
+        let holder_pid = holder.process.as_ref().unwrap().child.id() as libc::pid_t;
         // The terminal hangs up once its last master closes.
         drop(master);
         drop(holder);
@@ -2478,7 +2478,7 @@ mod tests {
         drop(master);
         let _ = holder.control.shutdown(std::net::Shutdown::Both);
         drop(holder);
-        let status = process.wait().unwrap();
+        let status = process.child.wait().unwrap();
         assert_eq!(status.code(), Some(0));
         wait_gone(root);
     }
