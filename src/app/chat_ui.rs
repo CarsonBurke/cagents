@@ -293,6 +293,7 @@ pub enum Action {
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
     PermissionPicker(Target, bool),
+    FooterPicker(Target, bool),
     ModelQuery(Target, String),
 }
 
@@ -449,6 +450,7 @@ impl Phase {
 }
 
 pub(super) struct State {
+    channel_names: HashMap<Target, ChannelNameObservation>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -491,6 +493,7 @@ impl Default for State {
         let (sender, receiver) = async_channel::unbounded();
         Self {
             image_viewer: None,
+            channel_names: HashMap::new(),
             files: HashMap::new(),
             sender,
             receiver,
@@ -1350,9 +1353,16 @@ fn snapshot_channel_name(
         .and_then(crate::workspace_model::channel_title)
         .map(|title| (title, crate::model::ChannelTitleSource::Provider))
         .or_else(|| {
+            // A bounded recent window cannot establish the conversation's
+            // first task. Keep its saved name until the actual head or a
+            // supported provider title is available; never page just to name.
+            if snapshot.has_earlier {
+                return None;
+            }
             snapshot
                 .items
                 .iter()
+                .take(128)
                 .find_map(|item| match (&item.role, &item.content) {
                     (chat::Role::User, ItemContent::Text { text, .. }) => {
                         crate::workspace_model::channel_title_from_prompt(text)
@@ -1361,6 +1371,52 @@ fn snapshot_channel_name(
                     _ => None,
                 })
         })
+}
+
+/// Prompt discovery is bounded and runs once per turn/history edge, rather
+/// than scanning retained history for every streamed token. Provider names
+/// remain cheap to observe and may improve throughout the same session.
+#[derive(Default)]
+struct ChannelNameObservation {
+    session: Option<String>,
+    scanned: Option<(u64, usize, Option<String>, bool)>,
+    title: Option<(String, crate::model::ChannelTitleSource)>,
+    pending: bool,
+    last_view: Option<(crate::model::ChannelId, u64)>,
+}
+impl ChannelNameObservation {
+    fn observe(
+        &mut self,
+        snapshot: &Snapshot,
+    ) -> Option<(String, crate::model::ChannelTitleSource)> {
+        if self.session != snapshot.session_id {
+            *self = Self {
+                session: snapshot.session_id.clone(),
+                ..Self::default()
+            };
+        }
+        let previous = self.title.clone();
+        if let Some(title) = snapshot
+            .title
+            .as_deref()
+            .and_then(crate::workspace_model::channel_title)
+        {
+            self.title = Some((title, crate::model::ChannelTitleSource::Provider));
+        } else if self.title.is_none() {
+            let stamp = (
+                snapshot.turn_generation,
+                snapshot.items.len(),
+                snapshot.items.first().map(|item| item.id.clone()),
+                snapshot.has_earlier,
+            );
+            if self.scanned.as_ref() != Some(&stamp) {
+                self.scanned = Some(stamp);
+                self.title = snapshot_channel_name(snapshot);
+            }
+        }
+        self.pending |= self.title != previous;
+        self.pending.then(|| self.title.clone()).flatten()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1576,6 +1632,7 @@ pub(super) struct Runtime {
     failures: Vec<(Option<String>, String)>,
     reasoning_picker: bool,
     permission_picker: bool,
+    footer_picker: bool,
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
     account_picker: bool,
@@ -2140,6 +2197,7 @@ impl Runtime {
             failures: Vec::new(),
             reasoning_picker: false,
             permission_picker: false,
+            footer_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
             picker_focus: 0,
@@ -4074,6 +4132,13 @@ impl Cagents {
         self.new_native_chat(self.preferred_chat_provider(), None)
     }
 
+    /// Row actions preserve their selected directory even if a focused shell
+    /// last reported a different cwd. Provider/account choices use the newly
+    /// selected workspace, through the ordinary configured draft constructor.
+    pub(super) fn new_native_thread_at(&mut self, directory: PathBuf) -> Task<Message> {
+        self.new_native_chat(self.preferred_chat_provider(), Some(directory))
+    }
+
     fn preferred_chat_provider(&self) -> Provider {
         self.workspace
             .focused()
@@ -4316,11 +4381,13 @@ impl Cagents {
         let open = runtime.model_picker.take().is_some()
             || runtime.reasoning_picker
             || runtime.permission_picker
+            || runtime.footer_picker
             || runtime.account_picker
             || runtime.composer_actions
             || runtime.branch_picker;
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
+        runtime.footer_picker = false;
         runtime.account_picker = false;
         runtime.composer_actions = false;
         runtime.branch_picker = false;
@@ -4426,15 +4493,17 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: chat_card_title(session.launch.provider).into(),
-            width_fraction: beside
-                .and_then(|(source, _)| self.card_state(source))
-                .map_or(self.settings.default_native_pane_fraction, |source| {
-                    if matches!(source.kind, CardKind::Chat(_)) {
-                        source.width_fraction
-                    } else {
-                        self.settings.default_native_pane_fraction
-                    }
-                }),
+            width_fraction: self.new_pane_fraction(
+                beside
+                    .and_then(|(source, _)| self.card_state(source))
+                    .map_or(self.settings.default_native_pane_fraction, |source| {
+                        if matches!(source.kind, CardKind::Chat(_)) {
+                            source.width_fraction
+                        } else {
+                            self.settings.default_native_pane_fraction
+                        }
+                    }),
+            ),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -4753,6 +4822,11 @@ impl Cagents {
     }
     /// The control and its handler share the reason a handoff cannot start.
     pub(super) fn chat_switch_blocker(&self, card: CardId) -> Option<Cow<'static, str>> {
+        if self.pane_transfer_pending(card) {
+            return Some(Cow::Borrowed(
+                "This pane is moving to a channel. Wait for the move to finish before changing views.",
+            ));
+        }
         if let Some(phase) = self.chat_ui.phases.get(&card) {
             return Some(Cow::Borrowed(match phase {
                 Phase::Starting(_) => {
@@ -5285,6 +5359,165 @@ impl Cagents {
             _ => None,
         }
     }
+    fn observe_channel_name(
+        &mut self,
+        target: Target,
+        snapshot: &Snapshot,
+    ) -> Option<(String, crate::model::ChannelTitleSource)> {
+        if !self.chat_ui.channel_names.contains_key(&target) {
+            self.chat_ui
+                .channel_names
+                .retain(|previous, _| previous.card != target.card);
+        }
+        self.chat_ui
+            .channel_names
+            .entry(target)
+            .or_default()
+            .observe(snapshot)
+    }
+
+    fn publish_observed_channel_name(
+        &mut self,
+        target: Target,
+        title: String,
+        source: crate::model::ChannelTitleSource,
+    ) {
+        let proof = self
+            .workspace_model
+            .views
+            .iter()
+            .find_map(|view| match view.scope {
+                crate::workspace_model::views::Scope::Channel(id)
+                    if view.primary_chat() == Some(target.card) =>
+                {
+                    Some((id, view.revision))
+                }
+                _ => None,
+            });
+        let settled = self.durable.channels.iter().any(|channel| {
+            channel.cards.contains(&target.card)
+                && (channel.title_source == crate::model::ChannelTitleSource::Manual
+                    && !channel.title.is_empty()
+                    || channel.title == title && channel.title_source == source)
+        });
+        if (settled || self.suggest_channel_title(target.card, title, source))
+            && let Some(observation) = self.chat_ui.channel_names.get_mut(&target)
+        {
+            observation.pending = false;
+            observation.last_view = proof;
+        }
+    }
+
+    pub(super) fn defer_channel_title_suggestion(
+        &mut self,
+        edit: &crate::workspace_model::ModelEdit,
+    ) {
+        let crate::workspace_model::ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title,
+            source,
+        } = edit
+        else {
+            return;
+        };
+        for (target, observation) in &mut self.chat_ui.channel_names {
+            if target.card == *card
+                && observation.last_view == Some((*id, *expected_revision))
+                && observation
+                    .title
+                    .as_ref()
+                    .is_some_and(|(current, kind)| current == title && kind == source)
+            {
+                observation.pending = true;
+            }
+        }
+        // No task is emitted: a future genuine Wake or changed view proof
+        // samples/adopts current metadata before another optional publication.
+    }
+
+    /// A title may precede its pane's first shared-view acknowledgement. Retry
+    /// the retained candidate after projection, with the newly accepted proof.
+    pub(super) fn refresh_channel_title_suggestions(&mut self) {
+        for target in self
+            .chat_ui
+            .channel_names
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            if self.chat_runtime_mut(target).is_none() {
+                self.chat_ui.channel_names.remove(&target);
+            }
+        }
+        let proofs = self
+            .workspace_model
+            .views
+            .iter()
+            .filter_map(|view| match view.scope {
+                crate::workspace_model::views::Scope::Channel(id) => {
+                    view.primary_chat().map(|card| (card, (id, view.revision)))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        // A refused original revision is never rewritten in the publisher.
+        // A newly accepted projection can make a fresh suggestion from the
+        // current runtime; unchanged proofs do not create a retry loop.
+        for (card, proof) in &proofs {
+            if !self.channel_needs_name(*card) {
+                continue;
+            }
+            let runtime = match self.cards.get(card) {
+                Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+                _ => self.chat_ui.parked.get(card).map(Box::as_ref),
+            };
+            let Some(runtime) = runtime else {
+                continue;
+            };
+            let target = runtime.target;
+            if self
+                .chat_ui
+                .channel_names
+                .get(&target)
+                .is_some_and(|observation| observation.last_view == Some(*proof))
+            {
+                continue;
+            }
+            // A secondary conversation may have received its name while no
+            // channel was eligible. Sample the current cached client snapshot
+            // once at this new proof; do not wait for another provider wake.
+            let Some(snapshot) = runtime.handle().map(|handle| handle.snapshot()) else {
+                continue;
+            };
+            self.observe_channel_name(target, &snapshot);
+            if let Some(observation) = self.chat_ui.channel_names.get_mut(&target) {
+                observation.pending = observation.title.is_some();
+                observation.last_view = Some(*proof);
+            }
+        }
+        let candidates = self
+            .chat_ui
+            .channel_names
+            .iter()
+            .filter_map(|(target, observation)| {
+                observation
+                    .pending
+                    .then(|| observation.title.clone())
+                    .flatten()
+                    .map(|(title, source)| (*target, title, source))
+            })
+            .collect::<Vec<_>>();
+        for (target, title, source) in candidates {
+            if self.chat_runtime_mut(target).is_some() {
+                self.publish_observed_channel_name(target, title, source);
+            } else {
+                self.chat_ui.channel_names.remove(&target);
+            }
+        }
+    }
+
     fn chat_runtime_mut(&mut self, target: Target) -> Option<&mut Runtime> {
         match self.cards.get_mut(&target.card) {
             Some(CardRuntime::Chat(runtime)) if runtime.target == target => Some(runtime),
@@ -5766,6 +5999,7 @@ impl Cagents {
         let restore = match &action {
             Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
+            | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
@@ -5858,6 +6092,7 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 }
             }
             Action::DispatchQueued(target) => {
@@ -6243,8 +6478,8 @@ impl Cagents {
                         let mut session = handle.session();
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
-                        let channel_name = snapshot_channel_name(&snapshot);
-                        let title = snapshot.title.clone();
+                        let channel_name = self.observe_channel_name(target, &snapshot);
+                        let title = channel_name.as_ref().map(|(title, _)| title.clone());
                         let activity = Activity {
                             provider: session.launch.provider,
                             state: handle.take_activity(),
@@ -6308,7 +6543,7 @@ impl Cagents {
                             self.persist();
                         }
                         if let Some((name, source)) = channel_name {
-                            self.suggest_channel_title(target.card, name, source);
+                            self.publish_observed_channel_name(target, name, source);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         // Reports that raced the attachment woke nothing.
@@ -6566,9 +6801,9 @@ impl Cagents {
                 if let Some(runtime) = self.chat_ui.parked.get_mut(&target.card)
                     && runtime.target == target
                 {
-                    let name = match runtime.handle() {
+                    let snapshot = match runtime.handle() {
                         Some(handle) if needs_name && matches!(wake, Wake::Changed) => {
-                            snapshot_channel_name(&handle.snapshot())
+                            Some(handle.snapshot())
                         }
                         _ => None,
                     };
@@ -6576,8 +6811,10 @@ impl Cagents {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
-                    if let Some((name, source)) = name {
-                        self.suggest_channel_title(target.card, name, source);
+                    if let Some((name, source)) =
+                        snapshot.and_then(|snapshot| self.observe_channel_name(target, &snapshot))
+                    {
+                        self.publish_observed_channel_name(target, name, source);
                     }
                     return Task::none();
                 }
@@ -6616,12 +6853,13 @@ impl Cagents {
                         };
                         let session = runtime.session.clone();
                         let snapshot = handle.snapshot();
-                        let channel_name = needs_name
-                            .then(|| snapshot_channel_name(&snapshot))
-                            .flatten();
-                        let title = snapshot.title.clone();
-                        if let Some((name, source)) = channel_name {
-                            self.suggest_channel_title(target.card, name, source);
+                        // Pane names use the same bounded observation cache as
+                        // channel names, including secondary conversations. Only
+                        // the current primary may publish a channel suggestion.
+                        let observed_name = self.observe_channel_name(target, &snapshot);
+                        let title = observed_name.as_ref().map(|(title, _)| title.clone());
+                        if needs_name && let Some((name, source)) = observed_name {
+                            self.publish_observed_channel_name(target, name, source);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         self.commit_chat_session(target.card, session);
@@ -7166,12 +7404,23 @@ impl Cagents {
                     runtime.recall(true);
                 }
             }
+            Action::FooterPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.footer_picker = open;
+                    runtime.model_picker = None;
+                    runtime.reasoning_picker = false;
+                    runtime.account_picker = false;
+                    runtime.permission_picker = false;
+                    runtime.composer_actions = false;
+                }
+            }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
                     runtime.permission_picker = open;
+                    runtime.footer_picker = false;
                     if open {
                         runtime.model_picker = None;
                         runtime.reasoning_picker = false;
@@ -7230,6 +7479,7 @@ impl Cagents {
                     runtime.history_stash = None;
                     runtime.replace_draft(text_editor::Content::with_text(&draft));
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                     return iced::widget::operation::focus(card_control_id(
                         target.card,
                         "chat-composer",
@@ -8017,6 +8267,7 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.permission_picker = false;
+                runtime.footer_picker = false;
                 if !runtime
                     .snapshot
                     .capabilities
@@ -8419,6 +8670,7 @@ impl Cagents {
                 runtime.reasoning_picker = false;
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
+                runtime.footer_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -8444,6 +8696,7 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.account_picker = false;
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 }
             }
         }
@@ -9842,11 +10095,142 @@ mod tests {
                 crate::model::ChannelTitleSource::Provider
             ))
         );
+        for title in ["1341", "🔐", "🧑‍💻"] {
+            snapshot.title = Some(title.into());
+            assert_eq!(
+                snapshot_channel_name(&snapshot),
+                Some((title.into(), crate::model::ChannelTitleSource::Provider))
+            );
+        }
         snapshot.title = Some("\u{202e}\u{2066}".into());
         assert_eq!(
             snapshot_channel_name(&snapshot).unwrap().0,
             "Implement the requested feature"
         );
+    }
+
+    #[test]
+    fn automatic_channel_names_observe_metadata_without_replaying_old_snapshots() {
+        let mut observation = ChannelNameObservation::default();
+        let mut snapshot = Snapshot {
+            session_id: Some("session-a".into()),
+            ..Default::default()
+        };
+        assert!(observation.observe(&snapshot).is_none());
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "first-task".into(),
+            role: chat::Role::User,
+            content: text("Review bundle encryption and performance"),
+            started_at: None,
+            at: None,
+        }));
+        assert_eq!(
+            observation.observe(&snapshot).unwrap().0,
+            "Review bundle encryption and performance"
+        );
+        observation.pending = false;
+        // Streaming assistant changes and newer shared-model reads must not
+        // re-publish an older name over a newer name from another window.
+        snapshot.generation += 1;
+        assert!(observation.observe(&snapshot).is_none());
+        snapshot.title = Some("Bundle encryption audit".into());
+        assert_eq!(
+            observation.observe(&snapshot).unwrap().1,
+            crate::model::ChannelTitleSource::Provider
+        );
+        observation.pending = false;
+        assert!(observation.observe(&snapshot).is_none());
+        snapshot.title = Some("Encryption and throughput".into());
+        assert_eq!(
+            observation.observe(&snapshot).unwrap().0,
+            "Encryption and throughput"
+        );
+        snapshot.session_id = Some("successor-session".into());
+        snapshot.title = None;
+        snapshot.items.clear();
+        assert!(observation.observe(&snapshot).is_none());
+        assert!(observation.title.is_none());
+    }
+
+    #[test]
+    fn tail_only_history_cannot_replace_a_channels_first_task() {
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::workspace_model::views::{Pane, Scope, View};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+            id,
+            project_id: ProjectId::new(),
+            title: "Review original encryption task".into(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 0,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        }];
+        app.workspace_model.views = vec![View {
+            scope: Scope::Channel(id),
+            revision: 1,
+            retired: Vec::new(),
+            panes: vec![
+                Pane::from_card(
+                    app.card_state(card).unwrap(),
+                    Some(FIXTURE_DIRECTORY.into()),
+                )
+                .unwrap(),
+            ],
+        }];
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.title = None;
+        snapshot.has_earlier = true;
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: "visible-window-edge".into(),
+            role: chat::Role::User,
+            content: text("Fix a later unrelated task"),
+            started_at: None,
+            at: None,
+        })];
+        handle.publish_snapshot_for_test(snapshot.clone());
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(
+            app.durable.channels[0].title,
+            "Review original encryption task"
+        );
+        assert!(app.chat_ui.channel_names[&target].title.is_none());
+        // A confirmed provider name does not require the first history page.
+        let mut provider = snapshot.clone();
+        provider.title = Some("Provider encryption audit".into());
+        assert_eq!(
+            snapshot_channel_name(&provider).unwrap(),
+            (
+                "Provider encryption audit".into(),
+                ChannelTitleSource::Provider
+            )
+        );
+        // The same edge can become a complete head after a provider/history
+        // observation; neither a new turn nor another item identity is needed.
+        snapshot.has_earlier = false;
+        let observed = app.observe_channel_name(target, &snapshot).unwrap();
+        assert_eq!(
+            observed,
+            (
+                "Fix a later unrelated task".into(),
+                ChannelTitleSource::Prompt
+            )
+        );
+        // Unavailable content is also never an instruction to erase a manual name.
+        let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
+        channel.title = "My manual channel".into();
+        channel.title_source = ChannelTitleSource::Manual;
+        snapshot.has_earlier = true;
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(app.durable.channels[0].title, "My manual channel");
     }
 
     fn text(body: &str) -> ItemContent {
@@ -12577,6 +12961,254 @@ mod tests {
         settle(app, card, Ok(()));
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[test]
+    fn deferred_title_marker_only_rearms_the_exact_current_candidate_without_an_eager_task() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let id = crate::model::ChannelId::new();
+        app.chat_ui.channel_names.insert(
+            target,
+            ChannelNameObservation {
+                session: Some(KNOWN_THREAD.into()),
+                title: Some((
+                    "Encryption review".into(),
+                    crate::model::ChannelTitleSource::Provider,
+                )),
+                last_view: Some((id, 17)),
+                ..Default::default()
+            },
+        );
+        let candidate =
+            |revision, name: &str| crate::workspace_model::ModelEdit::SuggestConversationTitle {
+                id,
+                card,
+                expected_revision: revision,
+                title: name.into(),
+                source: crate::model::ChannelTitleSource::Provider,
+            };
+        app.defer_channel_title_suggestion(&candidate(16, "Encryption review"));
+        app.defer_channel_title_suggestion(&candidate(17, "Older name"));
+        assert!(!app.chat_ui.channel_names[&target].pending);
+        let task = app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::TitleDeferred(candidate(
+                17,
+                "Encryption review",
+            )),
+        );
+        assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+        assert!(app.chat_ui.channel_names[&target].pending);
+    }
+
+    #[test]
+    fn a_secondary_title_wake_is_used_when_it_becomes_primary_without_another_wake() {
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::workspace_model::views::{Pane, Scope, View};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let a = live_chat(&mut app, Some(KNOWN_THREAD));
+        let b = live_chat(&mut app, Some("0299a2b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b"));
+        let target = chat_runtime(&app, b).target;
+        let original = app.card_state(b).unwrap().kind.clone();
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel {
+            id,
+            project_id: ProjectId::new(),
+            title: "First conversation".into(),
+            title_source: ChannelTitleSource::Provider,
+            ordinal: 0,
+            shared: true,
+            cards: vec![a, b],
+            focused: Some(b),
+        }];
+        app.workspace_model.views = vec![View {
+            scope: Scope::Channel(id),
+            revision: 1,
+            retired: Vec::new(),
+            panes: [a, b]
+                .into_iter()
+                .map(|card| {
+                    Pane::from_card(
+                        app.card_state(card).unwrap(),
+                        Some(FIXTURE_DIRECTORY.into()),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        }];
+        let handle = chat_runtime(&app, b).handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.title = Some("Secondary encryption review".into());
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(app.durable.channels[0].title, "First conversation");
+        assert_eq!(
+            app.chat_ui.channel_names[&target]
+                .title
+                .as_ref()
+                .map(|(title, _)| title.as_str()),
+            Some("Secondary encryption review"),
+            "the secondary pane caches its own title without renaming the primary channel"
+        );
+        // These are the accepted host projection values after its primary
+        // changed and its automatic old name was cleared in the same TX.
+        app.workspace_model.views[0].panes.swap(0, 1);
+        app.workspace_model.views[0].revision += 1;
+        let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
+        channel.cards = vec![b, a];
+        channel.title.clear();
+        channel.title_source = ChannelTitleSource::Prompt;
+        app.refresh_channel_title_suggestions();
+        assert_eq!(app.durable.channels[0].title, "Secondary encryption review");
+        assert_eq!(
+            app.durable.channels[0].title_source,
+            ChannelTitleSource::Provider
+        );
+        assert_eq!(
+            app.card_state(b).unwrap().kind,
+            original,
+            "naming does not change launch or conversation identity"
+        );
+    }
+
+    #[test]
+    fn prompt_and_provider_titles_name_the_chat_tab_and_window() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = Snapshot {
+            ready: true,
+            ..Snapshot::default()
+        };
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "prompt".into(),
+            role: chat::Role::User,
+            content: text("Implement conversation titles"),
+            started_at: None,
+            at: None,
+        }));
+        for title in [None, Some("Provider summary".to_owned())] {
+            snapshot.title = title.clone();
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot.clone());
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            drop(app.sync_chrome());
+            let expected = title.as_deref().unwrap_or("Implement conversation titles");
+            assert_eq!(
+                app.card_display_title(app.card_state(card).unwrap()),
+                expected
+            );
+            assert_eq!(app.card_chrome[&card].title, expected);
+            assert_eq!(app.core.window.header_title, expected);
+            assert_eq!(
+                app.title(window::Id::RESERVED),
+                format!("{expected}{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
+            );
+        }
+    }
+
+    #[test]
+    fn manual_channel_name_titles_its_main_chat_without_hiding_sibling_titles() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        app.card_state_mut(card).unwrap().title = "Provider conversation summary".into();
+        let mut sibling = app.card_state(card).unwrap().clone();
+        sibling.id = CardId::new();
+        sibling.title = "Sibling conversation".into();
+        let sibling_id = sibling.id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(sibling);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: crate::model::ChannelId::new(),
+            project_id: crate::model::ProjectId::new(),
+            title: "My renamed conversation".into(),
+            title_source: crate::model::ChannelTitleSource::Manual,
+            ordinal: 1,
+            shared: false,
+            cards: vec![card, sibling_id],
+            focused: Some(card),
+        });
+        assert_eq!(
+            app.card_display_title(app.card_state(card).unwrap()),
+            "My renamed conversation"
+        );
+        assert_eq!(
+            app.card_display_title(app.card_state(sibling_id).unwrap()),
+            "Sibling conversation"
+        );
+        drop(app.sync_chrome());
+        assert_eq!(app.core.window.header_title, "My renamed conversation");
+    }
+
+    #[test]
+    fn manual_channel_title_survives_provider_updates_after_utility_and_closing_panes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let terminal = crate::app::tests::terminal_card_state();
+        let terminal_id = terminal.id;
+        let mut closing = app.card_state(card).unwrap().clone();
+        closing.id = CardId::new();
+        closing.existence = Existence::Closing {
+            operation_id: crate::model::OperationId::new(),
+        };
+        let closing_id = closing.id;
+        let mut sibling = app.card_state(card).unwrap().clone();
+        sibling.id = CardId::new();
+        sibling.title = "Sibling conversation".into();
+        let sibling_id = sibling.id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.extend([terminal, closing, sibling]);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: crate::model::ChannelId::new(),
+            project_id: crate::model::ProjectId::new(),
+            title: "My renamed conversation".into(),
+            title_source: crate::model::ChannelTitleSource::Manual,
+            ordinal: 1,
+            shared: false,
+            cards: vec![CardId::new(), terminal_id, closing_id, card, sibling_id],
+            focused: Some(card),
+        });
+        assert_eq!(
+            app.channel_primary_chat(app.durable.channels.last().unwrap()),
+            Some(card)
+        );
+        let snapshot = Snapshot {
+            ready: true,
+            title: Some("New provider conversation summary".into()),
+            generation: 1,
+            ..Snapshot::default()
+        };
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        drop(app.sync_chrome());
+        assert_eq!(
+            app.card_state(card).unwrap().title,
+            "New provider conversation summary"
+        );
+        assert_eq!(app.card_chrome[&card].title, "My renamed conversation");
+        assert_eq!(app.core.window.header_title, "My renamed conversation");
+        assert_eq!(
+            app.title(window::Id::RESERVED),
+            format!("My renamed conversation{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
+        );
+        assert_eq!(
+            app.card_display_title(app.card_state(sibling_id).unwrap()),
+            "Sibling conversation"
+        );
+        app.chrome_ui
+            .user_titles
+            .insert(card, "Explicit pane name".into());
+        assert_eq!(
+            app.card_display_title(app.card_state(card).unwrap()),
+            "Explicit pane name"
+        );
     }
 
     #[test]
