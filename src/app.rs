@@ -14678,7 +14678,12 @@ impl Application for Cagents {
                         let Some(operation)=self.begin_mutation(&key,MutationKind::Discard,None) else {
                             slot.cancel_before_start();return Task::none();
                         };
-                        let known=self.sidebar_model.projects.iter().flat_map(|project|project.worktrees.iter().map(|worktree|worktree.path.clone())).collect::<Vec<_>>();
+                        let mut known=self.sidebar_model.projects.iter().flat_map(|project|project.worktrees.iter().map(|worktree|worktree.path.clone())).collect::<Vec<_>>();
+                        known.extend(self.cards.values().filter_map(|runtime|match runtime {
+                            CardRuntime::Repository(runtime)=>Some(runtime.descriptor.worktree.clone()),_=>None,
+                        }));
+                        known.extend(self.active_workspace.iter().cloned());
+                        known.sort();known.dedup();
                         let completed=slot.clone();
                         cosmic::task::future(async move {
                             let joined=tokio::task::spawn_blocking(move ||slot.finish_discard(request,known)).await;
