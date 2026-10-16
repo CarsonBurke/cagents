@@ -369,7 +369,7 @@ mod tests {
                         let refused = (role == 2 && step == 1) || (role == 1 && step == 2);
                         let message = if refused {
                             ServerMessage::Error(ProtocolError::new(
-                                ProtocolErrorCode::InvalidRequest,
+                                ProtocolErrorCode::PermissionDenied,
                                 "Synthetic caller role refused; no allowance effect admitted", false,
                             ))
                         } else { ServerMessage::Response { response } };
