@@ -762,11 +762,21 @@ mod tests {
                     .update(pull_request_review::Action::Open(target)),
             );
             let generation = pane.review.selection_generation();
+            // This app owns a real review cache. Complete its miss before
+            // answering the live load that the cache completion starts.
+            drop(pane.review.update(pull_request_review::Action::Cached {
+                generation,
+                result: Ok(None),
+            }));
             drop(pane.review.update(pull_request_review::Action::Loaded {
                 generation,
                 load: 1,
                 result: Ok(Arc::new(loaded.clone())),
             }));
+            assert!(matches!(
+                pane.review.load_state(),
+                pull_request_review::LoadState::Ready
+            ));
             drop(pane.review.take_effects());
             drop(pane.review.update(pull_request_review::Action::Checkout));
             let effects = pane.review.take_effects();

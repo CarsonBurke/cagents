@@ -531,14 +531,28 @@ mod tests {
     fn missing_push_permission_uses_a_stable_read_only_branch_and_explains_it() {
         let (target, mut head, git) = fixture();
         head.can_push = false;
-        let plan = plan(&target, &head, &git).unwrap();
-        assert_eq!(plan.branch_input, "pr/7");
-        assert_eq!(plan.base, target.head.as_str());
-        assert!(plan.notice.contains("do not have permission"));
-        assert_eq!(git.added.borrow().len(), 1);
-        let consent = plan.creation_consent.as_ref().unwrap();
+        let prepared = plan(&target, &head, &git).unwrap();
+        assert_eq!(prepared.branch_input, "pr/7");
+        assert_eq!(prepared.base, target.head.as_str());
+        assert!(prepared.notice.contains("do not have permission"));
+        assert!(git.added.borrow().is_empty());
+        let consent = prepared.creation_consent.as_ref().unwrap();
         assert_eq!(consent.expected_head(), &target.head);
+        assert_eq!(consent.remote(), "origin");
         assert!(!consent.tracks_remote());
+
+        let (target, mut head, mut git) = fixture();
+        head.can_push = false;
+        git.remotes.clear();
+        let prepared = plan(&target, &head, &git).unwrap();
+        assert_eq!(
+            git.added.borrow().as_slice(),
+            &[("pr-owner".into(), head.clone_url)]
+        );
+        assert_eq!(
+            prepared.creation_consent.as_ref().unwrap().remote(),
+            "pr-owner"
+        );
     }
 
     #[test]
