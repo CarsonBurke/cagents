@@ -5,6 +5,9 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, io::Read, path::PathBuf};
 
+#[path = "linear_output.rs"]
+mod human;
+
 #[derive(Debug, Args)]
 pub struct LinearCommand {
     /// Credential workspace alias (CAGENTS_LINEAR_API_KEY_<ALIAS>).
@@ -423,8 +426,11 @@ fn convert(error: linear::Error) -> AppError {
         details: error.details,
     }
 }
-fn output(command: &'static str, data: Value) -> CommandOutput {
-    let human = serde_json::to_string_pretty(&data).unwrap_or_default();
+fn output(command: &'static str, data: Value, list: Option<human::List>) -> CommandOutput {
+    let human = match list {
+        Some(list) => human::render(list, &data),
+        None => serde_json::to_string_pretty(&data).unwrap_or_default(),
+    };
     CommandOutput {
         command,
         data,
@@ -921,7 +927,25 @@ fn update(client: &Client, id: &str, input: Value) -> Result<Value, AppError> {
     )?)
 }
 
+fn list_kind(command: &Operation) -> Option<human::List> {
+    match command {
+        Operation::List { .. } | Operation::Search { .. } | Operation::Children { .. } => Some(human::List::Issues),
+        Operation::Comments { .. } => Some(human::List::Comments),
+        Operation::Attachments { .. } => Some(human::List::Attachments),
+        Operation::Relations { .. } => Some(human::List::Relations),
+        Operation::Team { command } => Some(match command {
+            TeamCommand::List { .. } => human::List::Teams,
+            TeamCommand::States { .. } => human::List::States,
+            TeamCommand::Labels { .. } => human::List::Labels,
+            TeamCommand::Members { .. } => human::List::Members,
+        }),
+        Operation::Project { .. } => Some(human::List::Projects),
+        _ => None,
+    }
+}
+
 pub(super) fn execute(args: LinearCommand) -> Result<CommandOutput, AppError> {
+    let list = list_kind(&args.command);
     let workspace = args.workspace;
     let (name, data) = match args.command {
         Operation::Unlink => {
@@ -1219,7 +1243,7 @@ pub(super) fn execute(args: LinearCommand) -> Result<CommandOutput, AppError> {
             }
         },
     };
-    Ok(output(name, data))
+    Ok(output(name, data, list))
 }
 fn issue_connection(
     t: Target,
@@ -1341,6 +1365,36 @@ fn save_issue(save: Save, mut workspace: Option<String>) -> Result<Value, AppErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readable_linear_actual_commands_select_columns_and_preserve_json() {
+        use clap::Parser;
+        let data = json!({"nodes":[{"id":"one","identifier":"ENG-7","title":"Issue","name":"A name","key":"ENG","type":"started","state":{"name":"In progress"},"assignee":null}],"opaque":{"Provider":"Claude","raw_ms":123}});
+        for (args, header) in [
+            (vec!["list"], "ISSUE"),
+            (vec!["search", "a query"], "ISSUE"),
+            (vec!["children", "--id", "ENG-1"], "ISSUE"),
+            (vec!["comments", "--id", "ENG-1"], "COMMENT"),
+            (vec!["attachments", "--id", "ENG-1"], "ATTACHMENT"),
+            (vec!["relations", "--id", "ENG-1"], "RELATION"),
+            (vec!["team", "list"], "TEAM"),
+            (vec!["team", "states", "ENG"], "STATE"),
+            (vec!["team", "labels", "ENG"], "LABEL"),
+            (vec!["team", "members", "ENG"], "MEMBER"),
+            (vec!["project", "list"], "PROJECT"),
+        ] {
+            let cli = super::super::Cli::try_parse_from(["cagents", "linear"].into_iter().chain(args)).unwrap();
+            let super::super::TopCommand::Linear(command) = cli.command else { panic!("expected Linear"); };
+            let result = output("linear.test", data.clone(), list_kind(&command.command));
+            assert!(result.human.starts_with(header), "{}", result.human);
+            assert_eq!(result.data, data);
+        }
+        let cli = super::super::Cli::try_parse_from(["cagents", "linear", "set", "--id", "ENG-1", "title", "New title"]).unwrap();
+        let super::super::TopCommand::Linear(command) = cli.command else { panic!("expected Linear"); };
+        let result = output("linear.set", data.clone(), list_kind(&command.command));
+        assert_eq!(result.human, serde_json::to_string_pretty(&data).unwrap());
+        assert_eq!(result.data, data);
+    }
+
     #[test]
     fn dates_validate_calendar() {
         for d in ["2024-02-29", "2026-10-09"] {
