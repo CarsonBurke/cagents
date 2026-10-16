@@ -25427,6 +25427,11 @@ mod tests {
         use crate::agent::{Activity, ActivityState, Provider};
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
+        let window = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(window));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window, true,
+        ))));
         app.settings.focus_follows_mouse = true;
         let first = app.workspace.focused().unwrap();
         let second = terminal_card_state();
