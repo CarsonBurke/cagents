@@ -374,11 +374,22 @@ fn prepare_in(
 }
 
 impl Batch {
+    #[cfg(test)]
     pub(in crate::repository) fn discard(
         &mut self,
         path: &RepoPath,
         live: &LiveDiscardRecovery,
         cancellation: &CancellationToken,
+    ) -> Result<TrashReceipt, String> {
+        self.discard_observing(path, live, cancellation, || {})
+    }
+
+    pub(in crate::repository) fn discard_observing(
+        &mut self,
+        path: &RepoPath,
+        live: &LiveDiscardRecovery,
+        cancellation: &CancellationToken,
+        after_source_acquire: impl FnOnce(),
     ) -> Result<TrashReceipt, String> {
         let position = self
             .prepared
@@ -456,7 +467,7 @@ impl Batch {
             context,
             slot: Some(slot),
         };
-        match owner.move_to_trash(cancellation) {
+        match owner.move_to_trash(cancellation, after_source_acquire) {
             Ok(warning) => {
                 let receipt = TrashReceipt {
                     path: path.clone(),
@@ -633,6 +644,7 @@ impl Owner {
     fn move_to_trash(
         &mut self,
         cancellation: &CancellationToken,
+        after_source_acquire: impl FnOnce(),
     ) -> Result<Option<String>, String> {
         self.validate_native()?;
         self.validate_holding()?;
@@ -679,6 +691,7 @@ impl Owner {
             OsStr::new("payload"),
         )?;
         self.payload_in_holding = true;
+        after_source_acquire();
         let h = self.holding().try_clone().map_err(error)?;
         self.preimage
             .verify_at(&h, OsStr::new("payload"), true, cancellation)?;
@@ -1046,6 +1059,87 @@ fn identity(root: &fs_safety::Root) -> Result<(u64, u64), String> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    #[test]
+    fn native_discard_acquired_writer_change_reports_unknown_and_stops_remaining_paths() {
+        use std::os::unix::fs::FileExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let base = RepositoryService::system("git");
+        let mut init = base.git_mutation(source.path(), ["init", "--quiet"]);
+        for (key, _) in std::env::vars_os() {
+            if key.as_bytes().starts_with(b"GIT_") {
+                init = init.env_remove(key);
+            }
+        }
+        init = init.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null");
+        base.run_checked(&init, &CancellationToken::new()).unwrap();
+        let authority = WorktreeAuthority::capture(source.path()).unwrap();
+        let root = authority.retained_worktree_root();
+        let service = base.with_worktree_authority(authority).unwrap();
+        let path = RepoPath::parse("original").unwrap();
+        let later = RepoPath::parse("later").unwrap();
+        let file = source.path().join(path.as_path());
+        fs::write(&file, b"original data\n").unwrap();
+        fs::write(source.path().join(later.as_path()), b"later untouched\n").unwrap();
+        let original = fs::metadata(&file).unwrap();
+        // An independently held writer remains an in-scope content change,
+        // even after our source acquisition has moved the original inode.
+        let writer = fs::File::options().write(true).open(&file).unwrap();
+        let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
+        let live = LiveDiscardRecovery::default();
+        let mut batch = prepare_in(
+            root.clone(), &[path.clone(), later.clone()], &context, &live,
+            &CancellationToken::new(), data.path().to_owned(),
+        ).unwrap();
+        let mut trashed = Vec::new();
+        let mut acquired = Vec::new();
+        let outcome = service.discard_recovery_mutation_observing(
+            &DiscardRequest {
+                worktree: source.path().to_owned(), tracked: Vec::new(),
+                untracked: vec![path.clone(), later.clone()], confirmed: true,
+            },
+            &CancellationToken::new(), &mut trashed, &root, &BTreeMap::new(),
+            &mut batch, &live, &mut |acquired_path| {
+                acquired.push(acquired_path.clone());
+                assert!(!file.exists());
+                writer.write_all_at(b"newer FD edit\n", 0).unwrap();
+                writer.sync_all().unwrap();
+            },
+        ).unwrap();
+        assert!(matches!(outcome, MutationOutcome::OutcomeUnknown { .. }), "{outcome:?}");
+        assert_eq!(acquired, vec![path]);
+        assert!(trashed.is_empty());
+        assert!(live.needs_resolution());
+        assert!(live.is_uncertain());
+        assert!(!file.exists());
+        assert_eq!(fs::read(source.path().join(later.as_path())).unwrap(), b"later untouched\n");
+        assert!(!source.path().join(".git/index.lock").exists());
+        let holding = fs::read_dir(context.placement().directory().path()).unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().as_bytes().starts_with(b".cagents-trash-"))
+            .unwrap();
+        let payload = holding.join("payload");
+        let retained = fs::metadata(&payload).unwrap();
+        assert_eq!((retained.dev(), retained.ino()), (original.dev(), original.ino()));
+        assert_eq!(fs::read(&payload).unwrap(), b"newer FD edit\n");
+        let retry = live.authority().unwrap();
+        assert!(retry.retry().is_err(), "newer original bytes must not be adopted or rolled back");
+        assert_eq!(fs::read(&payload).unwrap(), b"newer FD edit\n");
+        assert!(!file.exists());
+        // Explicit operator disposal of BOTH originals is a supported terminal
+        // route; moving or modifying the retained payload is not settlement.
+        fs::remove_file(&payload).unwrap();
+        let info = fs::read_dir(data.path().join("Trash/info")).unwrap()
+            .map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+        assert_eq!(info.len(), 1);
+        fs::remove_file(&info[0]).unwrap();
+        retry.retry().unwrap();
+        assert!(retry.is_resolved());
+        assert!(!holding.exists());
+        assert_eq!(fs::read(source.path().join(later.as_path())).unwrap(), b"later untouched\n");
+    }
+
     #[test]
     fn native_restore_post_rename_cancellation_retries_original_proof_and_acknowledges_exact_path()
     {

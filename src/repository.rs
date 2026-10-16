@@ -4855,6 +4855,29 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         native_batch: &mut Option<recovery::native_trash::Batch>,
         live: &recovery::LiveDiscardRecovery,
     ) -> Result<MutationOutcome, RepositoryError> {
+        self.discard_recovery_mutation_observing(
+            request,
+            cancellation,
+            trashed,
+            captured_root,
+            captured_versions,
+            native_batch,
+            live,
+            &mut |_| {},
+        )
+    }
+
+    fn discard_recovery_mutation_observing(
+        &self,
+        request: &DiscardRequest,
+        cancellation: &CancellationToken,
+        trashed: &mut Vec<TrashReceipt>,
+        captured_root: &fs_safety::Root,
+        captured_versions: &recovery::CaptureVersions,
+        native_batch: &mut Option<recovery::native_trash::Batch>,
+        live: &recovery::LiveDiscardRecovery,
+        after_native_acquire: &mut impl FnMut(&RepoPath),
+    ) -> Result<MutationOutcome, RepositoryError> {
         // The caller already holds the original context/Protection in the
         // nonserializable receipt; never reacquire a path-only substitute.
         if !request.confirmed {
@@ -4951,7 +4974,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // remaining batch, whose paths are still known untouched.
             let mut failures = Vec::new();
             for (position, path) in untracked.iter().enumerate() {
-                let protected = if cancellation.is_cancelled() {
+                let protected = if live.needs_resolution() {
+                    Err("An earlier native Trash move needs recovery; this path was not changed".to_owned())
+                } else if cancellation.is_cancelled() {
                     Err("discard cancelled before deletion".to_owned())
                 } else {
                     index_lock.check()
@@ -4971,7 +4996,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 match native_batch
                     .as_mut()
                     .ok_or_else(|| "No reserved native Trash batch".to_owned())
-                    .and_then(|batch| batch.discard(path, live, cancellation))
+                    .and_then(|batch| {
+                        batch.discard_observing(path, live, cancellation, || {
+                            after_native_acquire(path)
+                        })
+                    })
                 {
                     Ok(receipt) => {
                         if let Some(reason) = &receipt.warning {
@@ -5003,6 +5032,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             } else {
                 failures.push(MutationFailure::Rejected { reason: cleanup });
             }
+        }
+        if live.is_uncertain() {
+            return Ok(MutationOutcome::OutcomeUnknown {
+                failure: MutationFailure::Reconciliation {
+                    reason: format!(
+                        "Native Trash acquisition or publication remains unresolved; {} earlier paths were confirmed changed. The original receipt retains live recovery authority. {}",
+                        applied.len(),
+                        failures
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                },
+            });
         }
         Ok(report_discard(applied, failures))
     }
