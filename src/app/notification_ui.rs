@@ -337,6 +337,7 @@ impl Cagents {
                         .iter()
                         .any(|notice| notice.id == *id && !notice.acknowledged)
                 });
+                let mut failed = BTreeSet::new();
                 for notice in &snapshot.notices {
                     if !notice.acknowledged
                         && !self.notification_ui.acknowledged.contains(&notice.id)
@@ -351,8 +352,12 @@ impl Cagents {
                             .map(|card| card.id)
                     {
                         self.observe_agent_update_for_card(card);
+                        if notice.event.evidence.kind == crate::notifications::Kind::Failed {
+                            failed.insert(card);
+                        }
                     }
                 }
+                self.sidebar_state.set_failed_updates(failed);
                 self.notification_ui.snapshot = snapshot;
                 self.notification_ui.last_focus = None;
                 self.sync_notification_presence();
@@ -542,6 +547,53 @@ pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_attention_failed_news_is_distinct_from_working_and_unconfirmed_loss() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.durable.cards[0].id;
+        let session = card_session(&app.durable.cards[0]).unwrap();
+        let project = ProjectId::new();
+        let channel = ChannelId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(),
+            "Attention".into(), "/repo".into(), Vec::new(), Vec::new()));
+        Arc::make_mut(&mut app.durable).channels.push(ProjectChannel {
+            title_source: Default::default(), id: channel, project_id: project,
+            title: "Agent".into(), ordinal: 0, shared: false, cards: vec![card], focused: Some(card),
+        });
+        app.sidebar_state.set_card_activity(card, crate::agent::Activity {
+            provider: crate::agent::Provider::Codex, state: crate::agent::ActivityState::Working,
+        });
+        let notice = |kind, key: &str| crate::notifications::Notice {
+            id: uuid::Uuid::new_v4(), acknowledged: false, delivered: true, window: None,
+            event: crate::notifications::Event::session(session, crate::agent::Provider::Codex,
+                "/repo".into(), crate::notifications::Evidence { key: key.into(), kind }),
+        };
+        let failed = notice(crate::notifications::Kind::Failed, "known-failed-turn");
+        let loss = notice(crate::notifications::Kind::Interrupted, "observation-ended");
+        let cancelled = notice(crate::notifications::Kind::Cancelled, "known-cancelled-turn");
+        drop(app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
+            notices: vec![failed.clone(), loss.clone(), cancelled.clone()], diagnostic: None,
+        }))));
+        let summary = app.sidebar_state.project_attention(project);
+        assert_eq!(summary.unread, 1, "three journal events still name one conversation");
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.working, 1, "historical failure does not stop live work");
+        assert_eq!(summary.state(), Some(sidebar::AttentionState::Failed));
+        assert_eq!(app.sidebar_model.projects[0].channels[0].attention, summary);
+        let mut read_failed = failed; read_failed.acknowledged = true;
+        drop(app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
+            notices: vec![read_failed, loss, cancelled], diagnostic: None,
+        }))));
+        let summary = app.sidebar_state.project_attention(project);
+        assert_eq!(summary.failed, 0, "an empty failed projection replaces the old one");
+        assert_eq!(summary.unread, 1);
+        assert_eq!(summary.state(), Some(sidebar::AttentionState::Working));
+        assert_eq!(app.sidebar_state.card_activity(card).unwrap().state, crate::agent::ActivityState::Working);
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 0);
+        assert_eq!(app.sidebar_state.card_attention(card).failed, 0);
+    }
+
     use super::*;
 
     fn live_session(app: &mut Cagents) -> TerminalSession {

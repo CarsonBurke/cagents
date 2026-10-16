@@ -68,6 +68,12 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   emphasized until acknowledged. **Waiting for input** stays visible until the
   agent resumes or finishes. The All, Attention, and Pull requests views keep separate
   scroll positions.
+- The compact Projects rail keeps project initials and an attention badge when
+  child rows are hidden. Waiting takes priority over unread failed updates and
+  working activity. The number counts unread conversations, including while an
+  agent is working; several notices for one conversation count once. A failed
+  update describes unread news, so newer work in that conversation can continue.
+  Hover or keyboard focus exposes the full project status and unread count.
 - Right-click project or worktree rows for their actions. Icon tooltips appear
   after 300 milliseconds.
 - Deleting a worktree warns about uncommitted files and unsaved editor changes.

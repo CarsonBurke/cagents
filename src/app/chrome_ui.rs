@@ -1945,30 +1945,8 @@ impl Cagents {
             };
             children.push(tooltip(indicator, label));
         }
-        if self.sidebar_state.has_card_update(id) {
-            children.push(tooltip(
-                Icon::Attention
-                    .handle()
-                    .icon()
-                    .size(design::TAB_STATUS_ICON_SIZE),
-                "Needs attention",
-            ));
-        } else if let Some(activity) = self.sidebar_state.card_activity(id) {
-            match activity.state {
-                crate::agent::ActivityState::Working => children.push(tooltip(
-                    crate::ui_controls::activity_spinner(
-                        design::TAB_STATUS_ICON_SIZE as f32,
-                        design::warning_color,
-                    ),
-                    "Working",
-                )),
-                crate::agent::ActivityState::Waiting => children.push(sidebar::status_icon(
-                    Icon::Warning,
-                    "Waiting for input",
-                    sidebar::BadgeTone::Warning,
-                )),
-                _ => {}
-            }
+        if let Some(indicator) = sidebar::attention_indicator(self.sidebar_state.card_attention(id), false) {
+            children.push(indicator);
         }
         if focused && self.chat_switch_available(id) {
             let blocker = self.chat_switch_blocker(id);
