@@ -442,6 +442,9 @@ impl Cagents {
     }
 
     pub(super) fn window_update_blocker(&self) -> Option<&'static str> {
+        if let Some(reason) = self.discard_ui.close_block_reason() {
+            return Some(reason);
+        }
         if self.other_modal_is_open()
             || self.has_active_worktree_operations()
             || self.project_ui.deletion_running()

@@ -157,6 +157,29 @@ fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_
     let other = ActiveWorktreeKey { worktree_id: crate::model::WorktreeId::new(), canonical_path: root.with_file_name("other"), ..key };
     app.discard_ui.select(Some(other.clone()));
     app.sidebar_model.source_control = Some(SourceControlModel::loading(other.clone()));
+    let (response, receiver) = std::sync::mpsc::sync_channel(1);
+    drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+        action: instance::UiUpdateAction::Prepare, response,
+    })));
+    assert!(receiver.try_recv().unwrap().starts_with("error:"));
+    assert!(!app.update_prepared, "navigation cannot hide A's worker from updater Prepare");
+    // Also exercise the actual commit/flush boundaries if a background
+    // operation appears after the initial preflight of an update.
+    app.update_prepared = true;
+    let (response, receiver) = std::sync::mpsc::sync_channel(1);
+    drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+        action: instance::UiUpdateAction::Commit, response,
+    })));
+    assert!(receiver.try_recv().unwrap().starts_with("error:"));
+    let (response, receiver) = std::sync::mpsc::sync_channel(1);
+    drop(app.update(Message::UiUpdateFlushed {
+        generation: app.update_generation, committing: true, response,
+        saved: Err("No settings save in this boundary control".into()), result: Ok(()),
+    }));
+    assert!(receiver.try_recv().unwrap().starts_with("error:"));
+    assert!(!app.update_prepared);
+    assert!(!app.update_committed);
+    assert!(app.exit.is_none());
     let finished = crate::app::tests::task_app_message(task);
     assert!(matches!(&finished, Message::DiscardFinished { .. }));
     assert!(!app.discard_ui.has_inflight());
@@ -173,6 +196,13 @@ fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_
     drop(app.update(finished));
     assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().key, other);
     assert!(app.discard_ui.slot(slot.id()).is_some());
+    app.update_prepared = true;
+    drop(app.update(Message::DiscardUndo { id: slot.id(), resolve: false }));
+    drop(app.update(Message::DiscardUndo { id: slot.id(), resolve: true }));
+    assert!(!app.discard_ui.has_inflight(), "prepared update rejects both Undo and Resolve admission");
+    assert_eq!(receipt.remaining_paths(), 5);
+    assert!(!untracked.exists());
+    app.update_prepared = false;
     let undo = app.update(Message::DiscardUndo { id: slot.id(), resolve: false });
     assert!(app.discard_ui.has_inflight());
     let undone = crate::app::tests::task_app_message(undo);
