@@ -295,6 +295,7 @@ pub(crate) struct HostState {
     pub(super) agent_activity_wake: Arc<super::activity::Wake>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
+    pub(super) account_lifecycle: super::account_lifecycle::Reservations,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
@@ -324,6 +325,7 @@ impl HostState {
     pub(crate) fn new(proof: HostSessionProof) -> Self {
         Self {
             recover_holders: false,
+            account_lifecycle: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
@@ -600,23 +602,56 @@ impl HostState {
             scope,
             expected_revision,
             operation,
-            ..
+            change,
         } = &edit
         {
             let registry = self.registry()?;
-            if !registry
+            let seen = registry
                 .view_operation_seen(*operation)
-                .map_err(model_unavailable)?
-                && registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision
-            {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::ViewConflict,
-                    "The workspace view changed; rebase this pane mutation on the current revision",
-                    true,
-                ));
+                .map_err(model_unavailable)?;
+            if !seen {
+                if let Some(reason) = registry
+                    .view_change_refusal(scope, change)
+                    .map_err(model_unavailable)?
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        reason,
+                        false,
+                    ));
+                }
+                if registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ViewConflict,
+                        "The workspace view changed; rebase this pane mutation on the current revision",
+                        true,
+                    ));
+                }
             }
         }
-        let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
+        let registry = self.registry()?;
+        let applied = registry.apply(&edit).map_err(|error| {
+            if error == super::model::Registry::VIEW_SOURCE_CONFLICT {
+                return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
+            }
+            // An execution writer can close a view after the preflight read.
+            // apply has rolled back; inspect authoritative membership again
+            // rather than making the client retry a permanently invalid edit.
+            if let ModelEdit::ChangeView { scope, change, .. } = &edit {
+                match registry.view_change_refusal(scope, change) {
+                    Ok(Some(reason)) => {
+                        return ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            reason,
+                            false,
+                        );
+                    }
+                    Err(storage) => return model_unavailable(storage),
+                    Ok(None) => {}
+                }
+            }
+            model_unavailable(error)
+        })?;
         if applied.changed {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
         }
@@ -1383,6 +1418,16 @@ impl HostState {
         client: ClientId,
         windows: &[crate::instance::VerifiedWindow],
     ) -> Result<(), String> {
+        // Account probes/creation now retain a physical reservation instead
+        // of the global writer. They can still own operands inside this tree.
+        if !self
+            .account_lifecycle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+        {
+            return Err("An account operation is still using its credential directories".into());
+        }
         let verified = |id: &ClientId| {
             self.client_pids
                 .get(id)
@@ -3458,6 +3503,23 @@ fn start_terminal_view_owned(
     if let Some(environment) = &mut execution_environment {
         session.launch.remove_unset_environment(&mut environment.0);
     }
+    if adoption.is_some() {
+        super::account_lifecycle::ensure_terminal_adoption(
+            shared,
+            execution_environment.as_ref().map(|value| &value.0),
+            &crate::account::launch_credential_overrides(&session.launch),
+        )?;
+    }
+    super::account_lifecycle::ensure_launch(
+        shared,
+        &session.launch.working_directory,
+        execution_environment
+            .as_ref()
+            .map(|value| &value.0)
+            .unwrap_or(&session.launch.environment),
+        &crate::account::launch_credential_overrides(&session.launch),
+        execution_environment.is_none(),
+    )?;
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
@@ -3637,7 +3699,6 @@ fn start_terminal_view_owned(
     handle
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
 
-    let event_rx = handle.events();
     let redraw_handle = handle.clone();
     let descriptor = {
         let mut state = shared
@@ -3705,44 +3766,15 @@ fn start_terminal_view_owned(
     );
     redraw_handle.set_agent_process_observer(move || activity_wake.notify());
     let event_host = Arc::downgrade(shared);
-    let archived_host = Arc::downgrade(shared);
-    redraw_handle.set_archived_event_observer(move |handle, event| {
-        record_event_from(&archived_host, terminal_id, event, Some(handle));
-    });
-    let completion_handle = redraw_handle.clone();
-    let event_thread = thread::Builder::new()
-        .name(format!("cagentsd-events-{terminal_id}"))
-        .spawn(move || {
-            while let Ok(event) = event_rx.recv() {
-                let completed = matches!(event, TerminalEvent::Completed { .. });
-                record_event_from(&event_host, terminal_id, event, Some(&completion_handle));
-                if completed {
-                    break;
-                }
-            }
-            // The final grid is captured after the exit event and may race a
-            // reveal queued just as the worker stops accepting commands.
-            // Notify only visible subscribers once teardown has preserved it.
-            broadcast_redraw(&event_host, terminal_id, completion_handle.generation());
-        });
-    if let Err(error) = event_thread {
-        let _ = redraw_handle.shutdown();
-        let mut state = shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state
-            .terminals
-            .get(&terminal_id)
-            .is_some_and(|record| record.handle.same_worker(&redraw_handle))
-        {
-            state.retire_terminal(terminal_id);
+    redraw_handle.set_event_observer(move |handle, event| {
+        let completed = matches!(event, TerminalEvent::Completed { .. });
+        record_event_from(&event_host, terminal_id, event, Some(handle));
+        if completed {
+            // Completed is emitted only after the final grid and parser
+            // teardown. Notify visible subscribers from that exact worker.
+            broadcast_redraw(&event_host, terminal_id, handle.generation());
         }
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::Internal,
-            format!("could not start terminal event monitor: {error}"),
-            true,
-        ));
-    }
+    });
     Ok((descriptor, redraw_handle))
 }
 
@@ -5260,7 +5292,14 @@ for line in sys.stdin:
     #[test]
     fn a_carried_terminal_keeps_its_process_across_an_upgrade() {
         use crate::upgrade::handoff::Store;
-        let directory = tempfile::tempdir().unwrap();
+        let mut directory = tempfile::tempdir().unwrap();
+        // Preserve the exact detached socket/checkpoint namespace on success
+        // and panic until the outer original-family guardian has settled it.
+        directory.disable_cleanup(true);
+        eprintln!(
+            "Retained terminal carry fixture: {}",
+            directory.path().display()
+        );
         let holders = directory.path().join("holders");
         let empty_proc = directory.path().join("proc");
         fs::create_dir(&empty_proc).unwrap();

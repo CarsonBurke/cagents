@@ -989,6 +989,30 @@ struct CachedItem {
     /// What the step did to work with other agents, where it did.
     coordination: Option<Box<coordination::Coordinated>>,
 }
+/// Format a recorded message time once when its metadata changes. The
+/// current day only chooses the short label; it never supplies a missing time.
+fn recorded_message_stamp(
+    at: u64,
+    today: Option<&chat::LocalTime>,
+) -> Option<(u64, String, String)> {
+    let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
+    let full = format!(
+        "{:04}-{:02}-{:02} {}",
+        time.year + 1900,
+        time.month + 1,
+        time.day,
+        time.clock()
+    );
+    let label = if today
+        .is_some_and(|today| today.year == time.year && today.day_of_year == time.day_of_year)
+    {
+        time.clock()
+    } else {
+        full.clone()
+    };
+    Some((at, label, full))
+}
+
 impl CachedItem {
     fn next_revision() -> u64 {
         static REVISION: AtomicU64 = AtomicU64::new(1);
@@ -1011,6 +1035,7 @@ impl CachedItem {
         coordination: Option<chat::coordination::Coordination>,
     ) -> Self {
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
+        let stamp = previous.as_ref().and_then(|cached| cached.stamp.clone());
         let (
             image,
             image_source,
@@ -1092,7 +1117,7 @@ impl CachedItem {
             blocks: HashMap::new(),
             open: None,
             detail: None,
-            stamp: None,
+            stamp,
             image,
             image_source,
             image_item,
@@ -2426,33 +2451,18 @@ impl Runtime {
         }
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
-        for item in snapshot.items.iter() {
+        let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
+        for item in snapshot
+            .items
+            .iter()
+            .chain(snapshot.subagents.iter().flat_map(|agent| &agent.items))
+        {
             if let Some(cached) = self.cache.get_mut(&item.id)
-                && let Some(at) = item.at
-                && cached
-                    .stamp
-                    .as_ref()
-                    .is_none_or(|(cached_at, _, _)| *cached_at != at)
+                && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
             {
-                if let Some(time) = chat::local_time(i64::try_from(at / 1000).unwrap_or(i64::MAX)) {
-                    let full = format!(
-                        "{:04}-{:02}-{:02} {}",
-                        time.year + 1900,
-                        time.month + 1,
-                        time.day,
-                        time.clock()
-                    );
-                    let today =
-                        chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
-                    let label = if today.is_some_and(|today| {
-                        today.year == time.year && today.day_of_year == time.day_of_year
-                    }) {
-                        time.clock()
-                    } else {
-                        full.clone()
-                    };
-                    cached.stamp = Some((at, label, full));
-                }
+                cached.stamp = item
+                    .at
+                    .and_then(|at| recorded_message_stamp(at, today.as_ref()));
             }
         }
         for request in &snapshot.requests {
@@ -4838,6 +4848,20 @@ impl Cagents {
             .values()
             .find_map(|runtime| runtime.restart_blocker())
     }
+    /// Whether closing or a close-after-return already owns this card.
+    pub(super) fn chat_close_owned(&self, card: CardId) -> bool {
+        matches!(
+            self.chat_ui.phases.get(&card),
+            Some(
+                Phase::Closing { restart: None, .. }
+                    | Phase::Returning {
+                        close_requested: true,
+                        ..
+                    }
+            )
+        )
+    }
+
     /// Closes a chat card, in whatever state its conversation is.
     ///
     /// The card leaves at once. What the conversation holds in the daemon is
@@ -4855,6 +4879,12 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        if self.pane_transfer_pending(card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane is moving to a channel. Wait for the move to finish before closing it.",
+            ));
+            return Task::none();
+        }
         if matches!(
             self.chat_ui.phases.get(&card),
             Some(Phase::Closing { restart: None, .. })
@@ -7319,7 +7349,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7414,7 +7445,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -11147,14 +11179,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11173,7 +11210,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
@@ -12750,6 +12790,89 @@ mod tests {
             Ok(()),
         )));
         assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    #[test]
+    fn retained_chat_close_and_channel_move_do_not_overtake_each_other() {
+        use crate::{
+            model::{ChannelId, ProjectChannel, ProjectId},
+            workspace_model::{
+                ModelChannel, ModelEdit,
+                views::{Change, Pane, Scope, View},
+            },
+        };
+        for close_first in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let saved = app.chat_return_session(card).unwrap();
+            let repository = saved.launch.recipe.working_directory.clone();
+            let source = ChannelId::new();
+            let destination = ChannelId::new();
+            let project = ProjectId::new();
+            app.workspace_model.identity = uuid::Uuid::new_v4();
+            app.workspace_model.channels = [source, destination]
+                .into_iter()
+                .map(|id| ModelChannel {
+                    id,
+                    repository: repository.clone(),
+                    title: "Chat moves".into(),
+                    title_source: Default::default(),
+                    ordinal: 0,
+                })
+                .collect();
+            let mut view = View::empty(source);
+            view.panes
+                .push(Pane::from_card(app.card_state(card).unwrap(), None).unwrap());
+            app.workspace_model.views = vec![view, View::empty(destination)];
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.active_channel = Some(source);
+            for id in [source, destination] {
+                durable.channels.push(ProjectChannel {
+                    id,
+                    project_id: project,
+                    title: "Chat moves".into(),
+                    title_source: Default::default(),
+                    ordinal: 0,
+                    shared: true,
+                    cards: if id == source { vec![card] } else { vec![] },
+                    focused: (id == source).then_some(card),
+                });
+            }
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            assert!(app.can_move_pane_to_channel(card, destination));
+            if close_first {
+                drop(app.begin_chat_close(card));
+                let target = app.chat_ui.phases[&card].target();
+                assert!(app.chat_close_owned(card));
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert!(app.pane_move_destinations(card).is_empty());
+                drop(app.move_pane_to_channel(card, destination));
+                assert!(rx.try_recv().is_err());
+                assert!(!app.pane_transfer_pending(card));
+                // An exact failed cleanup releases that close intent without
+                // deleting or replacing the native descriptor.
+                drop(app.update(Message::ChatUi(Action::RetainedCloseFinished(
+                    target,
+                    saved.clone(),
+                    Err("fixture retains native owner".into()),
+                ))));
+                assert!(!app.chat_close_owned(card));
+                assert_eq!(app.chat_return_session(card), Some(saved));
+                assert!(app.can_move_pane_to_channel(card, destination));
+            } else {
+                drop(app.move_pane_to_channel(card, destination));
+                assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+                    change: Change::Transfer { id, .. }, ..
+                } if id == card));
+                drop(app.begin_chat_close(card));
+                assert!(!app.chat_close_owned(card));
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert_eq!(app.chat_return_session(card), Some(saved));
+                assert!(app.pane_transfer_pending(card));
+                assert!(rx.try_recv().is_err());
+            }
+        }
     }
 
     #[test]
@@ -15482,6 +15605,84 @@ mod tests {
             Err(chat::StartFailure::fresh("fixture: daemon gone")),
         );
         assert!(app.chat_offers_fresh_conversation(card));
+    }
+
+    #[test]
+    fn chat_descriptor_unchanged_observed_wakes_keep_the_retained_workspace_allocation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let source = chat_runtime(&app, card).session.clone();
+        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        app.lifecycle
+            .register(card, Exposure::Offscreen, Residency::Hot, Instant::now());
+        // The writer and cached projections can retain a durable snapshot.
+        // An unchanged observation must not copy that whole workspace.
+        let retained = app.durable.clone();
+        let weak = Arc::downgrade(&retained);
+        for _ in 0..16 {
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Observed)));
+            assert!(Arc::ptr_eq(&retained, &app.durable));
+            assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &app.durable));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+        }
+        assert!(
+            app.lifecycle.state(card).is_none(),
+            "attachment still completes hydration"
+        );
+        assert_eq!(chat_runtime(&app, card).target, target);
+        assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn chat_descriptor_unchanged_attachment_still_promotes_cold_residency() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = chat_runtime(&app, card).session.clone();
+        app.card_state_mut(card).unwrap().residency = Residency::Cold;
+        app.lifecycle
+            .register(card, Exposure::Offscreen, Residency::Cold, Instant::now());
+        let retained = app.durable.clone();
+        assert_eq!(app.install_chat_session(card, source.clone()), None);
+        assert!(!Arc::ptr_eq(&retained, &app.durable));
+        assert_eq!(
+            retained
+                .cards
+                .iter()
+                .find(|state| state.id == card)
+                .unwrap()
+                .residency,
+            Residency::Cold
+        );
+        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
+        assert!(app.lifecycle.state(card).is_none());
+    }
+
+    #[test]
+    fn chat_descriptor_changed_source_still_replaces_the_retained_workspace_source() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let original = chat_runtime(&app, card).session.clone();
+        let mut changed = original.clone();
+        changed.launch.session_id = Some("new-provider-confirmed-thread".into());
+        let retained = app.durable.clone();
+        assert_eq!(app.install_chat_session(card, changed.clone()), Some(false));
+        assert!(!Arc::ptr_eq(&retained, &app.durable));
+        assert_eq!(
+            retained
+                .cards
+                .iter()
+                .find(|state| state.id == card)
+                .unwrap()
+                .kind,
+            CardKind::Chat(original)
+        );
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(changed));
+        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
     }
 
     #[test]
