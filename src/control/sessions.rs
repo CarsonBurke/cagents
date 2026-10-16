@@ -86,7 +86,7 @@ fn current_directory() -> Result<PathBuf, AppError> {
 }
 
 fn read(scope: Scope) -> Result<Directory, AppError> {
-    let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+    let socket = control_daemon_socket()?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
     match client
