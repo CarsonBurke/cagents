@@ -11,94 +11,136 @@ pub enum AutomationCommand {
     /// Save exact launch settings for approval in cagents, without creating a schedule.
     Propose {
         #[arg(long)]
+        #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
         request_id: Uuid,
         #[arg(long)]
+        #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
         /// Wait for the decision. Exit: 0 approved, 3 timeout, 4 declined.
         #[arg(long)]
         wait: bool,
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        #[arg(help = "Maximum seconds to wait (1 through 3600).")]
         wait_seconds: u64,
     },
     /// Read only this conversation's immutable approval request.
     Proposal {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Wait for the user decision before returning.")]
         wait: bool,
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        #[arg(help = "Maximum seconds to wait (1 through 3600).")]
         wait_seconds: u64,
     },
     /// Create a disabled automation from a JSON definition (use - for stdin).
     Create {
         #[arg(long)]
+        #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
     },
-    /// List definitions, with a cursor for the next page.
+    /// List up to 100 definitions, ordered by ID; use --after for the next page.
     List {
         #[arg(long)]
+        #[arg(help = "Continue after the last automation UUID in the previous page.")]
         after: Option<Uuid>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
+        #[arg(help = "Maximum page size (1 through 100); larger values are refused.")]
         limit: usize,
     },
+    /// Read the current definition and its revisions.
     Show {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
     },
     /// Replace a definition at the exact revision shown by `show`.
     Edit {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
         #[arg(long)]
+        #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
     },
     /// Confirm unattended execution of the displayed definition revision.
     Enable {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
         #[arg(long)]
+        #[arg(help = "Confirm unattended execution of the displayed settings.")]
         confirm: bool,
     },
+    /// Disable an automation at its exact revision.
     Disable {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
     },
     /// Remove a definition. Past runs remain in history.
     Remove {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
     },
     /// Run the exact execution revision once; reuse request-id for safe retry.
     RunNow {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact approved execution revision to run.")]
         execution_revision: u64,
         #[arg(long)]
+        #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
         request_id: Uuid,
         #[arg(long)]
+        #[arg(help = "Confirm unattended execution of the displayed settings.")]
         confirm: bool,
     },
+    /// Request cancellation of one firing.
     Cancel {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "The firing ID reported by history.")]
         firing: Uuid,
     },
+    /// List immutable past firings, newest first.
     History {
         /// Omit to include all automations, including removed definitions.
         id: Option<Uuid>,
         #[arg(long, requires = "before_id")]
+        #[arg(help = "Creation time from the last history row; pair with --before-id.")]
         before_ms: Option<u64>,
         #[arg(long, requires = "before_ms")]
+        #[arg(help = "ID from the last history row; pair with --before-ms.")]
         before_id: Option<Uuid>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
+        #[arg(help = "Maximum page size (1 through 100); larger values are refused.")]
         limit: usize,
     },
     /// Read one immutable firing, including its bounded execution result.
     Run {
+        #[arg(help = "The firing ID reported by history.")]
         firing: Uuid,
     },
+}
+
+fn parse_page_limit(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| (1..=100).contains(value))
+        .ok_or_else(|| "Choose a page size from 1 through 100".into())
 }
 
 impl ControlClient {
@@ -157,7 +199,7 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "An inherited agent capability cannot alter unattended schedules; use automation propose for user approval",
         ));
     }
-    let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+    let socket = control_daemon_socket()?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
     let mut reply = client

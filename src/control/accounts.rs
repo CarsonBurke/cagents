@@ -5,7 +5,7 @@ use crate::account::info::{Query, Report};
 pub enum AccountCommand {
     /// Read caller context and configured account plan allowances without probing.
     Info {
-        /// Limit account rows to this provider.
+        /// Limit account rows to claude, codex, or omp.
         #[arg(long, value_parser = crate::control::agents::parse_provider)]
         provider: Option<crate::agent::Provider>,
         /// Select a stable provider/account ID from this report.
@@ -23,7 +23,7 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
         account,
         refresh,
     } = command;
-    let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+    let socket = control_daemon_socket()?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
     let deadline = refresh.then(|| Instant::now() + Duration::from_secs(90));

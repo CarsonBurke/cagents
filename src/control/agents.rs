@@ -13,7 +13,10 @@ use crate::{
 pub enum AgentCommand {
     /// The terminal presentation of an already hosted execution agent.
     #[command(hide = true)]
-    Console { agent_id: AgentId },
+    Console {
+        #[arg(help = "The hosted agent ID.")]
+        agent_id: AgentId,
+    },
     /// Start a provider session on one prompt, accepted durably.
     ///
     /// The provider defaults to the calling session's, the directory to the
@@ -41,12 +44,19 @@ pub enum AgentCommand {
         #[arg(long)]
         channel: Option<ChannelId>,
         #[arg(long)]
+        #[arg(help = "Stable account ID (provider/system or provider/UUID).")]
         account: Option<AccountId>,
         #[arg(long, default_value = "chat", value_parser = ["chat", "terminal"])]
+        #[arg(help = "Presentation surface for the provider session.")]
         surface: String,
         #[arg(long)]
+        #[arg(
+            help = "Provider model ID (Claude: haiku/sonnet/opus; Codex: exact provider catalog ID; OMP: provider/model). Omit to use the provider default; the native chat model picker lists available IDs."
+        )]
         model: Option<String>,
         #[arg(long)]
+        #[arg(help = "Permission policy (Claude: default/manual/auto/acceptEdits/plan/dontAsk/bypassPermissions; Codex: untrusted/on-failure/on-request/never; OMP: always-ask/write/yolo).",
+            value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
         permission_mode: Option<String>,
         /// The provider's effort name, such as low or high; omit for its default.
         #[arg(long)]
@@ -73,6 +83,7 @@ pub enum AgentCommand {
     },
     /// Read an owned agent and its latest run.
     Status {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         #[command(flatten)]
         show: ShowArgs,
@@ -89,19 +100,25 @@ pub enum AgentCommand {
     /// the first ready run; otherwise failure outranks input, then timeout.
     Wait {
         #[arg(required = true, value_name = "AGENT_OR_RUN")]
+        #[arg(help = "Agent or run handles to wait for.")]
         handles: Vec<String>,
         /// Return as soon as any of them is ready, rather than all.
         #[arg(long)]
         any: bool,
         #[arg(long, default_value = "60", value_parser = parse_positive_seconds)]
+        #[arg(help = "Maximum time to wait, in seconds.")]
         timeout: f64,
         #[command(flatten)]
         show: ShowArgs,
     },
     /// List the questions and approvals an owned agent is waiting on.
-    Requests { agent: String },
+    Requests {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        agent: String,
+    },
     /// Answer one of an owned agent's requests with one of its actions.
     Answer {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         /// The request ID `requests` lists.
         request: String,
@@ -113,13 +130,17 @@ pub enum AgentCommand {
     },
     /// Interrupt an owned agent's active run.
     Interrupt {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         /// Permit the interrupt to stop the provider's running background subagents.
         #[arg(long)]
         including_subagents: bool,
     },
     /// Stop and close an agent, including its background subagents.
-    Close { agent: String },
+    Close {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        agent: String,
+    },
 }
 
 /// A prompt given as an argument, in a file, or on standard input.
@@ -132,6 +153,7 @@ pub struct PromptArgs {
     /// Read the prompt from this file.
     #[arg(long, value_name = "FILE", conflicts_with = "text")]
     pub(super) prompt_file: Option<PathBuf>,
+    /// Legacy named prompt; prefer the positional prompt or --prompt-file.
     #[arg(long = "prompt", hide = true, conflicts_with_all = ["text", "prompt_file"])]
     pub(super) flag: Option<String>,
 }
@@ -657,8 +679,7 @@ impl Session {
     /// Connects on first use, starting the daemon if it is not running.
     fn client(&mut self) -> Result<&mut ControlClient, AppError> {
         if self.connection.is_none() {
-            let socket =
-                terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+            let socket = control_daemon_socket()?;
             let client = ControlClient::connect(&socket)
                 .map_err(|e| AppError::new("daemon_connection", e))?;
             self.connection = Some((client, socket));

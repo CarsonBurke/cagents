@@ -1,10 +1,10 @@
 use super::*;
-#[cfg(feature = "ui")]
-use crate::chat::coordination::{Received, Receipt};
 use crate::agent_execution::{
     Authority, Operation, Reply,
     mailbox::{Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, State, To, short},
 };
+#[cfg(feature = "ui")]
+use crate::chat::coordination::{Receipt, Received};
 
 /// How often a waiting caller asks the daemon for a reply.
 const REPLY_POLL: Duration = Duration::from_millis(500);
@@ -65,6 +65,7 @@ pub struct ReplyArgs {
     /// Wait for the answer to this reply, as `ask` does.
     #[arg(long)]
     pub(super) wait: bool,
+    /// Maximum time to wait for a message or reply, in seconds.
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait, requires = "wait")]
     timeout: f64,
 }
@@ -78,6 +79,7 @@ pub struct InboxArgs {
     /// Wait for a message if none is new.
     #[arg(long, conflicts_with = "all")]
     pub(super) wait: bool,
+    /// Maximum time to wait for a message or reply, in seconds.
     #[arg(long, default_value = DEFAULT_WAIT, value_parser = parse_wait, requires = "wait")]
     timeout: f64,
 }
@@ -307,8 +309,12 @@ pub(super) fn read_messages(output: &str) -> Vec<Received> {
         if id.is_empty() || id.contains(char::is_whitespace) {
             continue;
         }
-        let from = from.strip_suffix(" (waiting for your reply)").unwrap_or(from);
-        let from = from.rsplit_once(", replying to ").map_or(from, |(from, _)| from);
+        let from = from
+            .strip_suffix(" (waiting for your reply)")
+            .unwrap_or(from);
+        let from = from
+            .rsplit_once(", replying to ")
+            .map_or(from, |(from, _)| from);
         messages.push(Received {
             id: id.into(),
             from: from.into(),
@@ -366,8 +372,7 @@ struct Mailbox {
 
 impl Mailbox {
     fn connect() -> Result<Self, AppError> {
-        let socket =
-            terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+        let socket = control_daemon_socket()?;
         let client =
             ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
         Ok(Self {
@@ -613,7 +618,9 @@ mod tests {
         let mut answer = message.clone();
         answer.reply_to = Some(crate::model::MessageId::new());
         let printed = [message_lines(&message), message_lines(&answer)].join("\n\n");
-        let read = read_messages(&format!("{printed}\n\nAnswer one with: cagents reply <id> \"…\""));
+        let read = read_messages(&format!(
+            "{printed}\n\nAnswer one with: cagents reply <id> \"…\""
+        ));
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].id, short(message.id));
         assert_eq!(read[1].from, message.from.label());
