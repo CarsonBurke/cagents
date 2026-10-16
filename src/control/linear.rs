@@ -929,7 +929,9 @@ fn update(client: &Client, id: &str, input: Value) -> Result<Value, AppError> {
 
 fn list_kind(command: &Operation) -> Option<human::List> {
     match command {
-        Operation::List { .. } | Operation::Search { .. } | Operation::Children { .. } => Some(human::List::Issues),
+        Operation::List { .. } | Operation::Search { .. } | Operation::Children { .. } => {
+            Some(human::List::Issues)
+        }
         Operation::Comments { .. } => Some(human::List::Comments),
         Operation::Attachments { .. } => Some(human::List::Attachments),
         Operation::Relations { .. } => Some(human::List::Relations),
@@ -1382,14 +1384,29 @@ mod tests {
             (vec!["team", "members", "ENG"], "MEMBER"),
             (vec!["project", "list"], "PROJECT"),
         ] {
-            let cli = super::super::Cli::try_parse_from(["cagents", "linear"].into_iter().chain(args)).unwrap();
-            let super::super::TopCommand::Linear(command) = cli.command else { panic!("expected Linear"); };
+            let cli =
+                super::super::Cli::try_parse_from(["cagents", "linear"].into_iter().chain(args))
+                    .unwrap();
+            let super::super::TopCommand::Linear(command) = cli.command else {
+                panic!("expected Linear");
+            };
             let result = output("linear.test", data.clone(), list_kind(&command.command));
             assert!(result.human.starts_with(header), "{}", result.human);
             assert_eq!(result.data, data);
         }
-        let cli = super::super::Cli::try_parse_from(["cagents", "linear", "set", "--id", "ENG-1", "title", "New title"]).unwrap();
-        let super::super::TopCommand::Linear(command) = cli.command else { panic!("expected Linear"); };
+        let cli = super::super::Cli::try_parse_from([
+            "cagents",
+            "linear",
+            "set",
+            "--id",
+            "ENG-1",
+            "title",
+            "New title",
+        ])
+        .unwrap();
+        let super::super::TopCommand::Linear(command) = cli.command else {
+            panic!("expected Linear");
+        };
         let result = output("linear.set", data.clone(), list_kind(&command.command));
         assert_eq!(result.human, serde_json::to_string_pretty(&data).unwrap());
         assert_eq!(result.data, data);
