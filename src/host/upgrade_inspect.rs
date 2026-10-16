@@ -1,6 +1,7 @@
 //! Read-only source qualification after source windows flush, before close.
 //! The helper does not take a daemon admission lease, migrate SQLite, attach,
 //! restart providers, or publish a replacement descriptor.
+mod current;
 mod v77;
 
 use crate::install_guard::SourceInspectionRequest as Request;
@@ -54,10 +55,34 @@ pub(super) fn entry() -> Option<Result<(), String>> {
     })())
 }
 
-type Reader = v77::Client;
+enum Reader {
+    Current(current::Client),
+    Legacy(v77::Client),
+}
+
+impl Reader {
+    fn list(&mut self) -> Result<Vec<Session>, String> {
+        match self {
+            Self::Current(client) => client.list(),
+            Self::Legacy(client) => client.list(),
+        }
+    }
+    fn terminals(&mut self) -> Result<Vec<v77::Terminal>, String> {
+        match self {
+            Self::Current(client) => client.terminals(),
+            Self::Legacy(client) => client.terminals(),
+        }
+    }
+    fn resolve(&mut self, source: &Session) -> Result<Session, String> {
+        match self {
+            Self::Current(client) => client.resolve(source),
+            Self::Legacy(client) => client.resolve(source),
+        }
+    }
+}
 
 fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
-    if request.protocol != 77 {
+    if request.protocol != crate::terminal_ipc::PROTOCOL_VERSION && request.protocol != 77 {
         return Err(
             "Source protocol has no qualified migration inspector; source windows remain usable"
                 .into(),
@@ -70,7 +95,11 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
         .ok_or("Saved conversations have no authenticated source service")?;
     let socket = crate::terminal::ipc::daemon_socket_path()
         .map_err(|_| "Source service namespace is unavailable")?;
-    Reader::connect(&socket, proof, deadline)
+    if request.protocol == crate::terminal_ipc::PROTOCOL_VERSION {
+        current::Client::connect(&socket, proof, deadline).map(Reader::Current)
+    } else {
+        v77::Client::connect(&socket, proof, deadline).map(Reader::Legacy)
+    }
 }
 
 fn inspect(request: Request) -> Result<(), String> {
