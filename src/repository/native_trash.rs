@@ -839,6 +839,14 @@ impl Owner {
             self.validate_native()?;
             self.preimage
                 .verify_at(&self.files, &self.id, true, &CancellationToken::new())?;
+            if self.restore_parent.is_some() {
+                // The original discard/source sync was already settled and
+                // compacted. This Undo installed a new holding but never
+                // acquired the native payload. Dispose only that empty H;
+                // the original native entry remains available for Undo.
+                self.verify_info(&self.info, &self.info_name, false)?;
+                return self.remove_empty_holding();
+            }
             return self.finish_trash();
         }
         if self.payload_in_holding {
@@ -922,6 +930,7 @@ pub(super) fn restore(
         cancellation,
         context,
         || Ok(()),
+        || Ok(()),
     )
 }
 fn restore_observing(
@@ -931,6 +940,7 @@ fn restore_observing(
     name: &OsStr,
     cancellation: &CancellationToken,
     context: &FilesystemRecoveryContext,
+    before_native_acquire: impl FnOnce() -> Result<(), String>,
     after_source_rename: impl FnOnce() -> Result<(), String>,
 ) -> Result<Option<String>, String> {
     let mut owner = receipt.owner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1013,6 +1023,7 @@ fn restore_observing(
             .validate_payload_root(owner.holding())
             .map_err(error)?;
         owner.validate_native()?;
+        before_native_acquire()?;
         rename(
             &owner.files,
             &owner.id,
@@ -1278,6 +1289,78 @@ mod tests {
     }
 
     #[test]
+    fn native_compact_receipt_resolves_preacquisition_undo_failure_then_retries_same_public_undo() {
+        let source = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let base = RepositoryService::system("git");
+        let mut init = base.git_mutation(source.path(), ["init", "--quiet"]);
+        for (key, _) in std::env::vars_os() {
+            if key.as_bytes().starts_with(b"GIT_") { init = init.env_remove(key); }
+        }
+        init = init.env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null");
+        base.run_checked(&init, &CancellationToken::new()).unwrap();
+        let authority = WorktreeAuthority::capture(source.path()).unwrap();
+        let root = authority.retained_worktree_root();
+        let service = base.with_worktree_authority(authority.clone()).unwrap();
+        let file = source.path().join("original");
+        fs::write(&file, b"original native bytes\n").unwrap();
+        let original = fs::metadata(&file).unwrap();
+        let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
+        let live = LiveDiscardRecovery::default();
+        let path = RepoPath::parse("original").unwrap();
+        let mut batch = prepare_in(root.clone(), &[path.clone()], &context, &live,
+            &CancellationToken::new(), data.path().to_owned()).unwrap().unwrap();
+        let receipt = batch.discard(&path, &live, &CancellationToken::new()).unwrap();
+        drop(batch);
+        assert!(!receipt.owner.lock().unwrap().preimage.has_source_parent());
+        let directory = root.metadata().unwrap();
+        let recovery = DiscardRecovery {
+            live_recovery: live,
+            custody: Some(Arc::new(DiscardCustody {
+                git: service.git.clone(), executor: service.creation_executor.clone(),
+                source: authority, context: context.clone(),
+            })),
+            worktree: source.path().to_owned(),
+            worktree_identity: (directory.dev(), directory.ino()),
+            directories: BTreeMap::new(),
+            entries: vec![DiscardRecoveryEntry {
+                path: path.clone(), before: SavedEntry::Trashed, after: SavedEntry::Absent,
+                after_version: None, trash: Some(receipt.clone()),
+            }],
+            expires_unix_ms: u64::MAX,
+        };
+        let failed = restore_observing(&receipt, &recovery, &root, OsStr::new("original"),
+            &CancellationToken::new(), &context,
+            || Err("injected failure after new holding, before native acquisition".into()),
+            || Ok(()));
+        assert!(failed.is_err());
+        assert!(!file.exists());
+        assert!(recovery.live_recovery.needs_resolution());
+        {
+            let owner = receipt.owner.lock().unwrap();
+            assert!(owner.publication.is_some());
+            assert!(owner.restore_parent.is_some());
+            assert!(owner.payload_in_trash);
+            assert!(!owner.preimage.has_source_parent());
+        }
+        let resolved = service.resolve_discard_recovery(&recovery, &CancellationToken::new()).unwrap();
+        assert_eq!(resolved.remaining_paths, 1);
+        assert!(!recovery.live_recovery.needs_resolution());
+        assert!(!confirmed_restore(&receipt));
+        assert!(!file.exists());
+        assert_eq!(fs::read_dir(data.path().join("Trash/files")).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(context.placement().directory().path()).unwrap().count(), 0);
+        let undo = service.undo_discard(&recovery, &CancellationToken::new()).unwrap();
+        assert!(matches!(undo, MutationOutcome::Applied { .. }), "{undo:?}");
+        assert_eq!(recovery.remaining_paths(), 0);
+        assert_eq!(fs::read(&file).unwrap(), b"original native bytes\n");
+        let restored = fs::metadata(file).unwrap();
+        assert_eq!((restored.dev(), restored.ino()), (original.dev(), original.ino()));
+        assert_eq!(fs::read_dir(data.path().join("Trash/files")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(data.path().join("Trash/info")).unwrap().count(), 0);
+    }
+
+    #[test]
     fn native_restore_post_rename_cancellation_retries_original_proof_and_acknowledges_exact_path()
     {
         for change_after_rename in [false, true] {
@@ -1330,6 +1413,7 @@ mod tests {
                 OsStr::new("original"),
                 &cancelled,
                 &context,
+                || Ok(()),
                 || {
                     cancelled.cancel();
                     Ok(())
