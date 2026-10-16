@@ -495,7 +495,11 @@ fn discover_inner(directory: &Path, boot: &BootId, kind: Kind, recovery: bool) -
             continue;
         }
         if !record.holder.is_current() {
-            record.remove(directory);
+            // Candidate intake grants no mutation authority over the other
+            // package's evidence, including an unresolved orphan root.
+            if record.application == crate::instance::APPLICATION_ID {
+                record.remove(directory);
+            }
             continue;
         }
         records.push(record);
