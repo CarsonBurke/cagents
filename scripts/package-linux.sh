@@ -61,7 +61,7 @@ case $VARIANT in
         DESKTOP_ID=dev.cagents.Cagents
         CHECKSUM_NAME=SHA256SUMS
         SIZE_NAME=cagents-$VERSION-sizes.txt
-        EXTRA_DEPENDS=
+        EXTRA_DEPENDS=', libegl1'
         OTHER_PACKAGE=cagents-browserless
         ;;
     browserless)

@@ -768,6 +768,49 @@ pub(crate) struct FallbackSurface {
     pub lease: Box<dyn WaylandSubsurfaceLease>,
 }
 
+#[link(name = "EGL")]
+unsafe extern "C" {
+    fn eglGetCurrentDisplay() -> *mut c_void;
+    fn eglGetCurrentSurface(which: i32) -> *mut c_void;
+    fn eglQuerySurface(
+        display: *mut c_void,
+        surface: *mut c_void,
+        attribute: i32,
+        value: *mut i32,
+    ) -> u32;
+    fn eglChooseConfig(
+        display: *mut c_void,
+        attributes: *const i32,
+        configs: *mut *mut c_void,
+        config_size: i32,
+        count: *mut i32,
+    ) -> u32;
+    fn eglGetConfigAttrib(
+        display: *mut c_void,
+        config: *mut c_void,
+        attribute: i32,
+        value: *mut i32,
+    ) -> u32;
+    fn eglSwapInterval(display: *mut c_void, interval: i32) -> u32;
+    fn eglGetError() -> u32;
+}
+
+const EGL_CONFIG_ID: i32 = 0x3028;
+const EGL_MIN_SWAP_INTERVAL: i32 = 0x303b;
+const EGL_MAX_SWAP_INTERVAL: i32 = 0x303c;
+const EGL_NONE: i32 = 0x3038;
+const EGL_DRAW: i32 = 0x3059;
+
+fn require_zero_swap_interval(minimum: i32, maximum: i32) -> Result<(), BrowserError> {
+    if minimum <= 0 && maximum >= 0 {
+        Ok(())
+    } else {
+        Err(BrowserError::Wayland(format!(
+            "Servo EGL draw surface requires swap interval {minimum}..={maximum}; interval zero is required to keep hidden browser cards responsive"
+        )))
+    }
+}
+
 impl FallbackSurface {
     pub(crate) fn create(
         factory: &Arc<dyn WaylandSubsurfaceFactory>,
@@ -787,16 +830,109 @@ impl FallbackSurface {
             dpi::PhysicalSize::new(viewport.width, viewport.height),
         )
         .map_err(|error| BrowserError::Wayland(format!("hardware Servo context: {error:?}")))?;
-        Ok(Self {
+        let rendering = Self {
             context: Rc::new(context),
             lease,
-        })
+        };
+        rendering.prepare_for_paint()?;
+        rendering.validate_swap_interval()?;
+        Ok(rendering)
+    }
+
+    /// EGL silently clamps a requested swap interval to the selected config's
+    /// range. A successful eglSwapInterval(0) is therefore insufficient: reject
+    /// a surface that requires frame pacing before any page can paint into it.
+    fn validate_swap_interval(&self) -> Result<(), BrowserError> {
+        // SAFETY: prepare_for_paint selected our live EGL draw surface on this
+        // thread. Every output pointer below refers to a live initialized
+        // local, and each attribute array is terminated with EGL_NONE.
+        unsafe {
+            let display = eglGetCurrentDisplay();
+            let surface = eglGetCurrentSurface(EGL_DRAW);
+            let mut config_id = 0;
+            if display.is_null()
+                || surface.is_null()
+                || eglQuerySurface(display, surface, EGL_CONFIG_ID, &mut config_id) == 0
+            {
+                return Err(BrowserError::Wayland(format!(
+                    "query Servo EGL draw-surface config: {:#x}",
+                    eglGetError()
+                )));
+            }
+            let attributes = [EGL_CONFIG_ID, config_id, EGL_NONE];
+            let mut config = std::ptr::null_mut();
+            let mut count = 0;
+            if eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count) == 0
+                || count != 1
+                || config.is_null()
+            {
+                return Err(BrowserError::Wayland(format!(
+                    "resolve Servo EGL draw-surface config: {:#x}",
+                    eglGetError()
+                )));
+            }
+            let mut minimum = 0;
+            let mut maximum = 0;
+            if eglGetConfigAttrib(display, config, EGL_MIN_SWAP_INTERVAL, &mut minimum) == 0
+                || eglGetConfigAttrib(display, config, EGL_MAX_SWAP_INTERVAL, &mut maximum) == 0
+            {
+                return Err(BrowserError::Wayland(format!(
+                    "query Servo EGL swap-interval range: {:#x}",
+                    eglGetError()
+                )));
+            }
+            require_zero_swap_interval(minimum, maximum)
+        }
+    }
+
+    /// Keep presentation independent of a compositor frame callback. A hidden
+    /// Wayland child is allowed to retain such a callback indefinitely. Waiting
+    /// for it in EGL would block the shared Servo thread, including the command
+    /// that makes the child visible again and every other browser card.
+    ///
+    /// Servo's new-frame notifications and the engine animation cadence already
+    /// pace paints. Interval zero makes Mesa use a display sync callback instead
+    /// of a visibility-dependent surface callback. Apply it before the first
+    /// paint and each later paint because resizing can recreate the EGL surface
+    /// with its default swap interval.
+    pub(crate) fn prepare_for_paint(&self) -> Result<(), BrowserError> {
+        use servo::RenderingContext;
+
+        self.context.make_current().map_err(|error| {
+            BrowserError::Wayland(format!("make Servo context current: {error:?}"))
+        })?;
+        // SAFETY: WindowRenderingContext is an EGL Wayland context, owned by
+        // this browser thread, and make_current above selected its live draw
+        // surface. EGL handles are opaque; no pointer is dereferenced here.
+        unsafe {
+            let display = eglGetCurrentDisplay();
+            if display.is_null() || eglSwapInterval(display, 0) == 0 {
+                return Err(BrowserError::Wayland(format!(
+                    "disable visibility-dependent EGL swap throttling: {:#x}",
+                    eglGetError()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draw_surface_must_support_zero_before_any_paint() {
+        assert!(require_zero_swap_interval(0, 1).is_ok());
+        assert!(require_zero_swap_interval(0, 0).is_ok());
+
+        // EGL reports success when zero is clamped to this config's minimum.
+        // Accepting it would keep the shared engine's hidden-surface deadlock.
+        let error = require_zero_swap_interval(1, 1).unwrap_err();
+        assert!(error.to_string().contains("requires swap interval 1..=1"));
+        assert!(require_zero_swap_interval(2, 4).is_err());
+        assert!(require_zero_swap_interval(-1, -1).is_err());
+    }
 
     fn clipped(
         source_x: u32,
