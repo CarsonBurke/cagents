@@ -121,6 +121,53 @@ mod tests {
     }
 
     #[test]
+    fn bound_agent_device_requests_refuse_before_allowance_target_lookup() {
+        use crate::{
+            agent_execution::Lineage,
+            device_service::Operation,
+            terminal_ipc::{ClientRequest, ProtocolErrorCode},
+        };
+        let host = Arc::new(super::super::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
+                host_session_id: HostSessionId::new("private-allowance-caller-policy"),
+                boot_id: BootId::new("private-boot"),
+                host_incarnation: HostIncarnation::new("private-incarnation"),
+            }),
+        ));
+        const USER: u64 = 1;
+        const AGENT: u64 = 2;
+        {
+            let mut state = host.lock().unwrap();
+            state.register_client(USER);
+            state.register_client(AGENT);
+            // Explicit unit-test precondition: this is the bound lineage read
+            // by actual admission, not proof of token mint/authentication.
+            // The separate framed CLI fixture covers Authenticate ordering.
+            state.agent_clients.insert(AGENT, Lineage(TerminalId::new()));
+        }
+        for action in [
+            Action::Inspect,
+            Action::Redeem {
+                expected: account(), credit_id: "private-credit".into(),
+                authorized: true, condition: None,
+            },
+        ] {
+            let request = ClientRequest::DeviceOperation {
+                operation: Operation::AccountAllowance {
+                    request: Request { session: TerminalId::new(), action },
+                },
+            };
+            let denied = super::super::client::process_request(&host, AGENT, request.clone())
+                .unwrap_err();
+            assert_eq!(denied.code, ProtocolErrorCode::PermissionDenied);
+            let target = super::super::client::process_request(&host, USER, request).unwrap_err();
+            assert_eq!(target.code, ProtocolErrorCode::InvalidRequest);
+            assert!(target.message.contains("not an existing live native conversation"));
+        }
+        assert!(host.lock().unwrap().chats.is_empty());
+    }
+
+    #[test]
     fn conditional_redemption_refuses_before_source_lookup_or_durable_storage() {
         let host = Arc::new(super::super::state::HostLock::new(
             super::super::state::HostState::new(HostSessionProof {

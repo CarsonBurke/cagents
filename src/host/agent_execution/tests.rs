@@ -3418,33 +3418,6 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
     // Everything outside the terminal surface stays with the user.
     denied(request_as(AGENT, ClientRequest::ChatList));
     denied(request_as(AGENT, ClientRequest::Shutdown));
-    // Allowance inspection and explicit reset intent are user-only device
-    // operations too. The real authenticated agent is refused before target
-    // lookup; the user reaches the missing-target check without provider I/O.
-    for action in [
-        crate::account::reset::request::Action::Inspect,
-        crate::account::reset::request::Action::Redeem {
-            expected: crate::account::reset::ProviderAccount {
-                account_id: "private-policy-account".into(),
-                backend_origin: "https://chatgpt.com".into(),
-            },
-            credit_id: "private-policy-credit".into(),
-            authorized: true,
-            condition: None,
-        },
-    ] {
-        let allowance = ClientRequest::DeviceOperation {
-            operation: crate::device_service::Operation::AccountAllowance {
-                request: crate::account::reset::request::Request {
-                    session: TerminalId::new(), action,
-                },
-            },
-        };
-        denied(request_as(AGENT, allowance.clone()));
-        let error = request_as(USER, allowance).unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
-        assert!(error.message.contains("not an existing live native conversation"));
-    }
     // Including a request that would carry the user's own authority.
     denied(request_as(
         AGENT,
