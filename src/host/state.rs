@@ -6564,7 +6564,7 @@ for line in sys.stdin:
                     .lock()
                     .unwrap()
                     .descriptor(1, id)
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.message)?
                     .title;
                 if title.as_deref() == Some("Native terminal title") {
                     return Ok(title);
