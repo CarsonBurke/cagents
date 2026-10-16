@@ -448,7 +448,8 @@ impl SidebarChannel {
         let description = attention.description();
         if !description.is_empty() {
             self.tooltip = format!("{}\n{description}", self.tooltip).into_boxed_str();
-            self.accessible_name = format!("{}, {description}", self.accessible_name).into_boxed_str();
+            self.accessible_name =
+                format!("{}, {description}", self.accessible_name).into_boxed_str();
         }
         self
     }
@@ -2771,7 +2772,11 @@ struct AttentionProjection {
     worktrees: BTreeMap<(ProjectId, WorktreeId), AttentionSummary>,
 }
 impl PartialEq for AttentionProjection {
-    fn eq(&self, other: &Self) -> bool { self.inventory == other.inventory && self.projects == other.projects && self.worktrees == other.worktrees }
+    fn eq(&self, other: &Self) -> bool {
+        self.inventory == other.inventory
+            && self.projects == other.projects
+            && self.worktrees == other.worktrees
+    }
 }
 impl Eq for AttentionProjection {}
 
@@ -2943,11 +2948,15 @@ impl SidebarState {
     /// Records unread attention without requiring a repository-owned pane.
     /// Ordinary terminal output and activity alone never call this.
     pub fn observe_card_update(&mut self, card: CardId) {
-        self.change_attention(card, |state| { state.agent_updates.entry(card).or_insert(None); });
+        self.change_attention(card, |state| {
+            state.agent_updates.entry(card).or_insert(None);
+        });
     }
 
     pub fn observe_agent_update(&mut self, card: CardId, project: ProjectId, worktree: WorktreeId) {
-        self.change_attention(card, |state| { state.agent_updates.insert(card, Some((project, worktree))); });
+        self.change_attention(card, |state| {
+            state.agent_updates.insert(card, Some((project, worktree)));
+        });
     }
 
     pub fn acknowledge_agent_update(&mut self, card: CardId) {
@@ -2957,12 +2966,24 @@ impl SidebarState {
         });
     }
 
-    pub fn restore_agent_updates(&mut self, updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>) {
-        let cards: BTreeSet<_> = self.agent_updates.keys().chain(updates.keys()).copied().collect();
+    pub fn restore_agent_updates(
+        &mut self,
+        updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
+    ) {
+        let cards: BTreeSet<_> = self
+            .agent_updates
+            .keys()
+            .chain(updates.keys())
+            .copied()
+            .collect();
         for card in cards {
             self.change_attention(card, |state| {
-                if let Some(owner) = updates.get(&card) { state.agent_updates.insert(card, *owner); }
-                else { state.agent_updates.remove(&card); state.failed_updates.remove(&card); }
+                if let Some(owner) = updates.get(&card) {
+                    state.agent_updates.insert(card, *owner);
+                } else {
+                    state.agent_updates.remove(&card);
+                    state.failed_updates.remove(&card);
+                }
             });
         }
     }
@@ -2989,7 +3010,9 @@ impl SidebarState {
             });
             self.change_attention(canonical, |state| {
                 state.agent_updates.entry(canonical).or_insert(None);
-                if failed { state.failed_updates.insert(canonical); }
+                if failed {
+                    state.failed_updates.insert(canonical);
+                }
             });
         }
     }
@@ -3015,26 +3038,38 @@ impl SidebarState {
     }
 
     pub fn card_attention(&self, card: CardId) -> AttentionSummary {
-        AttentionSummary::card(self.card_activity(card).map(|activity| activity.state),
-            self.has_card_update(card), self.failed_updates.contains(&card))
+        AttentionSummary::card(
+            self.card_activity(card).map(|activity| activity.state),
+            self.has_card_update(card),
+            self.failed_updates.contains(&card),
+        )
     }
 
     /// Only explicit, unacknowledged Failed journal evidence enters this set.
     /// Interrupted/cancelled and loss of observation do not imply failure.
     pub fn set_failed_updates(&mut self, cards: BTreeSet<CardId>) -> bool {
-        let changed: Vec<_> = self.failed_updates.symmetric_difference(&cards).copied().collect();
+        let changed: Vec<_> = self
+            .failed_updates
+            .symmetric_difference(&cards)
+            .copied()
+            .collect();
         let did_change = !changed.is_empty();
         for card in changed {
             self.change_attention(card, |state| {
-                if cards.contains(&card) { state.failed_updates.insert(card); }
-                else { state.failed_updates.remove(&card); }
+                if cards.contains(&card) {
+                    state.failed_updates.insert(card);
+                } else {
+                    state.failed_updates.remove(&card);
+                }
             });
         }
         did_change
     }
 
     fn attention_owner(&self, card: CardId) -> Option<(ProjectId, WorktreeId)> {
-        self.agent_activity.get(&card).and_then(|entry| entry.owner)
+        self.agent_activity
+            .get(&card)
+            .and_then(|entry| entry.owner)
             .or_else(|| self.agent_updates.get(&card).copied().flatten())
     }
 
@@ -3042,132 +3077,251 @@ impl SidebarState {
         let before = (self.attention_owner(card), self.card_attention(card));
         change(self);
         let after = (self.attention_owner(card), self.card_attention(card));
-        if before == after { return; }
+        if before == after {
+            return;
+        }
         if let Some(owner) = before.0 {
-            self.worktree_attention.entry(owner).or_default().remove(before.1);
-            self.raw_project_attention.entry(owner.0).or_default().remove(before.1);
-            if self.worktree_attention.get(&owner) == Some(&AttentionSummary::default()) { self.worktree_attention.remove(&owner); }
-            if self.raw_project_attention.get(&owner.0) == Some(&AttentionSummary::default()) { self.raw_project_attention.remove(&owner.0); }
+            self.worktree_attention
+                .entry(owner)
+                .or_default()
+                .remove(before.1);
+            self.raw_project_attention
+                .entry(owner.0)
+                .or_default()
+                .remove(before.1);
+            if self.worktree_attention.get(&owner) == Some(&AttentionSummary::default()) {
+                self.worktree_attention.remove(&owner);
+            }
+            if self.raw_project_attention.get(&owner.0) == Some(&AttentionSummary::default()) {
+                self.raw_project_attention.remove(&owner.0);
+            }
         }
         if let Some(owner) = after.0.filter(|_| after.1 != AttentionSummary::default()) {
-            self.worktree_attention.entry(owner).or_default().add(after.1);
-            self.raw_project_attention.entry(owner.0).or_default().add(after.1);
+            self.worktree_attention
+                .entry(owner)
+                .or_default()
+                .add(after.1);
+            self.raw_project_attention
+                .entry(owner.0)
+                .or_default()
+                .add(after.1);
         }
         self.attention_projection = None;
     }
 
     pub fn clear_agent_activity(&mut self, card: CardId) {
-        self.change_attention(card, |state| { state.agent_activity.remove(&card); });
+        self.change_attention(card, |state| {
+            state.agent_activity.remove(&card);
+        });
     }
 
     pub fn set_card_activity(&mut self, card: CardId, activity: crate::agent::Activity) {
         self.change_attention(card, |state| {
-            state.agent_activity.insert(card, PaneActivity { owner: None, activity });
-            if let Some(owner) = state.agent_updates.get_mut(&card) { *owner = None; }
+            state.agent_activity.insert(
+                card,
+                PaneActivity {
+                    owner: None,
+                    activity,
+                },
+            );
+            if let Some(owner) = state.agent_updates.get_mut(&card) {
+                *owner = None;
+            }
         });
     }
 
-    pub fn set_agent_activity(&mut self, card: CardId, project: ProjectId, worktree: WorktreeId,
-        activity: crate::agent::Activity) {
+    pub fn set_agent_activity(
+        &mut self,
+        card: CardId,
+        project: ProjectId,
+        worktree: WorktreeId,
+        activity: crate::agent::Activity,
+    ) {
         self.change_attention(card, |state| {
             let owner = Some((project, worktree));
-            state.agent_activity.insert(card, PaneActivity { owner, activity });
-            if let Some(attribution) = state.agent_updates.get_mut(&card) { *attribution = owner; }
+            state
+                .agent_activity
+                .insert(card, PaneActivity { owner, activity });
+            if let Some(attribution) = state.agent_updates.get_mut(&card) {
+                *attribution = owner;
+            }
         });
     }
 
     fn worktree_attention_map(&self) -> &BTreeMap<(ProjectId, WorktreeId), AttentionSummary> {
-        self.attention_projection.as_ref().map(|projection| &projection.worktrees).unwrap_or(&self.worktree_attention)
+        self.attention_projection
+            .as_ref()
+            .map(|projection| &projection.worktrees)
+            .unwrap_or(&self.worktree_attention)
     }
     pub fn worktree_attention(&self, project: ProjectId, worktree: WorktreeId) -> AttentionSummary {
-        self.worktree_attention_map().get(&(project, worktree)).copied().unwrap_or_default()
+        self.worktree_attention_map()
+            .get(&(project, worktree))
+            .copied()
+            .unwrap_or_default()
     }
 
     fn project_attention_map(&self) -> &BTreeMap<ProjectId, AttentionSummary> {
-        self.attention_projection.as_ref().map(|projection| &projection.projects).unwrap_or(&self.raw_project_attention)
+        self.attention_projection
+            .as_ref()
+            .map(|projection| &projection.projects)
+            .unwrap_or(&self.raw_project_attention)
     }
     pub fn project_attention(&self, project: ProjectId) -> AttentionSummary {
-        self.project_attention_map().get(&project).copied().unwrap_or_default()
+        self.project_attention_map()
+            .get(&project)
+            .copied()
+            .unwrap_or_default()
     }
 
-    pub fn agent_activity(&self, project: ProjectId, worktree: WorktreeId)
-        -> Option<crate::agent::ActivityState> {
+    pub fn agent_activity(
+        &self,
+        project: ProjectId,
+        worktree: WorktreeId,
+    ) -> Option<crate::agent::ActivityState> {
         self.worktree_attention(project, worktree).activity()
     }
 
     /// Fold open conversation metadata only when attention or membership changes.
     /// No transcript/history access, and compact rendering reads these counters.
-    pub fn refresh_attention_projection(&mut self, durable: &Arc<crate::model::WorkspaceState>,
-        projects: &[SidebarProject]) {
-        let inventory: Vec<_> = projects.iter().map(|project| (project.id,
-            project.worktrees.iter().map(|row| (row.id, row.path.clone()))
-                .chain(project.folder_key().map(|key| (key.worktree_id, key.canonical_path))).collect::<Vec<_>>())).collect();
-        if self.attention_projection.as_ref().is_some_and(|cache|
-            cache.source.upgrade().is_some_and(|old| Arc::ptr_eq(&old, durable)) && cache.inventory == inventory) {
+    pub fn refresh_attention_projection(
+        &mut self,
+        durable: &Arc<crate::model::WorkspaceState>,
+        projects: &[SidebarProject],
+    ) {
+        let inventory: Vec<_> = projects
+            .iter()
+            .map(|project| {
+                (
+                    project.id,
+                    project
+                        .worktrees
+                        .iter()
+                        .map(|row| (row.id, row.path.clone()))
+                        .chain(
+                            project
+                                .folder_key()
+                                .map(|key| (key.worktree_id, key.canonical_path)),
+                        )
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        if self.attention_projection.as_ref().is_some_and(|cache| {
+            cache
+                .source
+                .upgrade()
+                .is_some_and(|old| Arc::ptr_eq(&old, durable))
+                && cache.inventory == inventory
+        }) {
             return;
         }
         #[cfg(test)]
-        { self.attention_projection_rebuilds += 1; }
+        {
+            self.attention_projection_rebuilds += 1;
+        }
         let loaded: BTreeSet<_> = projects.iter().map(|project| project.id).collect();
-        let loaded_worktrees: BTreeSet<_> = inventory.iter().flat_map(|(project, paths)| paths.iter().map(move |(id, _)| (*project, *id))).collect();
+        let loaded_worktrees: BTreeSet<_> = inventory
+            .iter()
+            .flat_map(|(project, paths)| paths.iter().map(move |(id, _)| (*project, *id)))
+            .collect();
         let mut roots = BTreeMap::new();
         for (project, paths) in &inventory {
             for (worktree, path) in paths {
                 let owner = (*project, *worktree);
-                roots.entry(path.as_path()).and_modify(|old| {
-                    if *old != Some(owner) { *old = None; }
-                }).or_insert(Some(owner));
+                roots
+                    .entry(path.as_path())
+                    .and_modify(|old| {
+                        if *old != Some(owner) {
+                            *old = None;
+                        }
+                    })
+                    .or_insert(Some(owner));
             }
         }
         let mut channels = BTreeMap::new();
         for channel in &durable.channels {
             for card in &channel.cards {
                 let owner = (channel.project_id, channel.id);
-                channels.entry(*card).and_modify(|old| { if *old != Some(owner) { *old = None; } }).or_insert(Some(owner));
+                channels
+                    .entry(*card)
+                    .and_modify(|old| {
+                        if *old != Some(owner) {
+                            *old = None;
+                        }
+                    })
+                    .or_insert(Some(owner));
             }
         }
         // Shared native/console recipes can have one logical Session UUID.
         // Count it once, and refuse conflicting project attribution.
-        let mut conversations: BTreeMap<_, Option<(ProjectId, Option<WorktreeId>, AttentionSummary)>> = BTreeMap::new();
+        let mut conversations: BTreeMap<
+            _,
+            Option<(ProjectId, Option<WorktreeId>, AttentionSummary)>,
+        > = BTreeMap::new();
         for card in durable.cards.iter().filter(|card| card.existence.is_open()) {
             let summary = self.card_attention(card.id);
             // Inventory-only draft aliases carry no attention evidence. They
             // cannot veto the canonical card selected by journal attribution.
-            if summary == AttentionSummary::default() { continue; }
+            if summary == AttentionSummary::default() {
+                continue;
+            }
             let owner = if let Some(channel) = channels.get(&card.id) {
                 channel.map(|owner| owner.0)
             } else if let Some(scope) = durable.card_scopes.get(&card.id) {
-                roots.get(scope.as_path()).copied().flatten().map(|owner| owner.0)
-            } else { self.attention_owner(card.id).map(|owner| owner.0) };
-            let Some(owner) = owner.filter(|owner| loaded.contains(owner)) else { continue; };
+                roots
+                    .get(scope.as_path())
+                    .copied()
+                    .flatten()
+                    .map(|owner| owner.0)
+            } else {
+                self.attention_owner(card.id).map(|owner| owner.0)
+            };
+            let Some(owner) = owner.filter(|owner| loaded.contains(owner)) else {
+                continue;
+            };
             let worktree = if let Some(scope) = durable.card_scopes.get(&card.id) {
                 roots.get(scope.as_path()).copied().flatten()
-            } else { self.attention_owner(card.id) }.filter(|(project, _)| *project == owner)
-                .filter(|owner| loaded_worktrees.contains(owner))
-                .map(|(_, worktree)| worktree);
+            } else {
+                self.attention_owner(card.id)
+            }
+            .filter(|(project, _)| *project == owner)
+            .filter(|owner| loaded_worktrees.contains(owner))
+            .map(|(_, worktree)| worktree);
             let resource = match &card.kind {
                 crate::model::CardKind::Chat(session) => (0, session.id.as_uuid()),
                 crate::model::CardKind::Terminal(session) => (0, session.id.as_uuid()),
                 _ => (1, card.id.as_uuid()),
             };
-            conversations.entry(resource).and_modify(|old| {
-                if let Some((project, current_worktree, current)) = old {
-                    if *project != owner { *old = None; }
-                    else {
-                        if *current_worktree != worktree { *current_worktree = None; }
-                        current.union(summary);
+            conversations
+                .entry(resource)
+                .and_modify(|old| {
+                    if let Some((project, current_worktree, current)) = old {
+                        if *project != owner {
+                            *old = None;
+                        } else {
+                            if *current_worktree != worktree {
+                                *current_worktree = None;
+                            }
+                            current.union(summary);
+                        }
                     }
-                }
-            }).or_insert(Some((owner, worktree, summary)));
+                })
+                .or_insert(Some((owner, worktree, summary)));
         }
         let mut summaries: BTreeMap<ProjectId, AttentionSummary> = BTreeMap::new();
         let mut worktrees: BTreeMap<(ProjectId, WorktreeId), AttentionSummary> = BTreeMap::new();
         for (owner, worktree, summary) in conversations.into_values().flatten() {
             summaries.entry(owner).or_default().add(summary);
-            if let Some(worktree) = worktree { worktrees.entry((owner, worktree)).or_default().add(summary); }
+            if let Some(worktree) = worktree {
+                worktrees.entry((owner, worktree)).or_default().add(summary);
+            }
         }
         self.attention_projection = Some(AttentionProjection {
-            source: Arc::downgrade(durable), inventory, projects: summaries, worktrees,
+            source: Arc::downgrade(durable),
+            inventory,
+            projects: summaries,
+            worktrees,
         });
     }
 
@@ -5322,7 +5476,9 @@ fn project_view<'a>(
         .align_y(Alignment::Center)
         .width(Length::Fill);
     if !expanded {
-        if let Some(indicator) = attention_indicator(project.state.project_attention(project_id), false) {
+        if let Some(indicator) =
+            attention_indicator(project.state.project_attention(project_id), false)
+        {
             identity = identity.push(indicator);
         }
         identity = identity.push(design::caption(
@@ -5410,8 +5566,8 @@ fn project_view<'a>(
                             .group_size(SelectionRow::Worktree(project_id, worktree.id)),
                         &project.state.query,
                         !project.state.hide_worktree_changes_icons,
-                    project.state.worktree_attention(project_id, worktree.id),
-),
+                        project.state.worktree_attention(project_id, worktree.id),
+                    ),
                     SelectionRow::Worktree(project_id, worktree.id),
                     project.state,
                     !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
@@ -5505,11 +5661,17 @@ fn compact_project_attention(
 ) -> CompactProjectAttention {
     use crate::agent::ActivityState;
     let worktrees: BTreeSet<_> = project.worktrees.iter().map(|row| row.id).collect();
-    let waiting_worktrees = worktrees.into_iter().filter(|worktree|
-        state.worktree_attention(project.id, *worktree).waiting != 0).collect();
+    let waiting_worktrees = worktrees
+        .into_iter()
+        .filter(|worktree| state.worktree_attention(project.id, *worktree).waiting != 0)
+        .collect();
     let summary = state.project_attention(project.id);
-    CompactProjectAttention { summary, activity: summary.activity(), unread: summary.unread != 0, waiting_worktrees }
-
+    CompactProjectAttention {
+        summary,
+        activity: summary.activity(),
+        unread: summary.unread != 0,
+        waiting_worktrees,
+    }
 }
 
 fn compact_project_identity(
@@ -5714,8 +5876,8 @@ fn compact_project<'a>(
                         .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
                     &project.state.query,
                     !project.state.hide_worktree_changes_icons,
-                project.state.worktree_attention(entity.id, worktree.id),
-),
+                    project.state.worktree_attention(entity.id, worktree.id),
+                ),
                 SelectionRow::Worktree(entity.id, worktree.id),
                 project.state,
                 !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
@@ -5835,34 +5997,60 @@ fn worktree_glyph_tone(
 /// Attention outranks the chat count: a channel whose agent is working or
 /// waiting is the reason to look at the sidebar at all, and the count stays in
 /// the row's accessible name and tooltip either way.
-fn channel_indicator(channel: &SidebarChannel, compact: bool) -> Option<Element<'static, SidebarAction>> {
+fn channel_indicator(
+    channel: &SidebarChannel,
+    compact: bool,
+) -> Option<Element<'static, SidebarAction>> {
     attention_indicator(channel.attention, compact)
         .or_else(|| (channel.chats > 1).then(|| design::caption(channel.chats.to_string()).into()))
 }
 
 /// Waiting is a live state, independent of whether its notification was read.
 /// Channels and worktrees share the same vocabulary and priority.
-fn agent_indicator(activity: Option<crate::agent::ActivityState>, unread: bool)
-    -> Option<Element<'static, SidebarAction>> {
+fn agent_indicator(
+    activity: Option<crate::agent::ActivityState>,
+    unread: bool,
+) -> Option<Element<'static, SidebarAction>> {
     attention_indicator(AttentionSummary::card(activity, unread, false), false)
 }
 
-pub fn attention_indicator<Message: Clone + 'static>(summary: AttentionSummary, compact: bool)
-    -> Option<Element<'static, Message>> {
+pub fn attention_indicator<Message: Clone + 'static>(
+    summary: AttentionSummary,
+    compact: bool,
+) -> Option<Element<'static, Message>> {
     let state = summary.state()?;
     let indicator: Element<'static, Message> = match state {
-        AttentionState::Waiting => status_icon(Icon::Warning, "An agent is waiting for input", BadgeTone::Warning),
-        AttentionState::Failed => status_icon(Icon::Error, "Unread failed agent update", BadgeTone::Danger),
+        AttentionState::Waiting => status_icon(
+            Icon::Warning,
+            "An agent is waiting for input",
+            BadgeTone::Warning,
+        ),
+        AttentionState::Failed => {
+            status_icon(Icon::Error, "Unread failed agent update", BadgeTone::Danger)
+        }
         AttentionState::Working => crate::interaction::tooltip(
             crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::warning_color),
-            "An agent is actively working"),
-        AttentionState::Unread => status_icon(Icon::Attention, "Unread agent update", BadgeTone::Neutral),
+            "An agent is actively working",
+        ),
+        AttentionState::Unread => {
+            status_icon(Icon::Attention, "Unread agent update", BadgeTone::Neutral)
+        }
     };
-    if summary.unread == 0 { return Some(indicator); }
-    let label = if summary.unread > 99 { "99+".to_owned() } else { summary.unread.to_string() };
+    if summary.unread == 0 {
+        return Some(indicator);
+    }
+    let label = if summary.unread > 99 {
+        "99+".to_owned()
+    } else {
+        summary.unread.to_string()
+    };
     let count: Element<'static, Message> = widget::text(label).size(9).into();
-    let counted: Element<'static, Message> = if compact && state == AttentionState::Unread { count } else {
-        widget::column::with_children(vec![indicator, count]).align_x(Alignment::Center).into()
+    let counted: Element<'static, Message> = if compact && state == AttentionState::Unread {
+        count
+    } else {
+        widget::column::with_children(vec![indicator, count])
+            .align_x(Alignment::Center)
+            .into()
     };
     Some(crate::interaction::tooltip(counted, summary.description()))
 }
@@ -6249,8 +6437,15 @@ fn worktree_view<'a>(
     let indicator = match deletion {
         Some(RowDeletion::Deleting) => Some(deleting_indicator()),
         Some(RowDeletion::Failed(reason)) if compact => Some(deletion_failed_badge(reason)),
-        _ => attention_indicator(attention, compact).or_else(|| worktree_indicator(
-            worktree, agent_update, activity, compact, show_changes_icons)),
+        _ => attention_indicator(attention, compact).or_else(|| {
+            worktree_indicator(
+                worktree,
+                agent_update,
+                activity,
+                compact,
+                show_changes_icons,
+            )
+        }),
     };
     let glyph = if deleting {
         widget::container(widget::icon(worktree_icon()).size(CHILD_ROW_ICON_SIZE))
@@ -11585,29 +11780,94 @@ pub(crate) mod tests {
             state.observe_agent_update(card, project.id, worktree);
         }
         state.set_failed_updates(BTreeSet::from([failed]));
-        state.set_agent_activity(working, project.id, worktree, Activity { provider: Provider::Codex, state: ActivityState::Working });
-        assert_eq!(state.card_attention(failed).state(), Some(AttentionState::Failed));
-        assert_eq!(state.worktree_attention(project.id, worktree).state(), Some(AttentionState::Failed));
+        state.set_agent_activity(
+            working,
+            project.id,
+            worktree,
+            Activity {
+                provider: Provider::Codex,
+                state: ActivityState::Working,
+            },
+        );
+        assert_eq!(
+            state.card_attention(failed).state(),
+            Some(AttentionState::Failed)
+        );
+        assert_eq!(
+            state.worktree_attention(project.id, worktree).state(),
+            Some(AttentionState::Failed)
+        );
         assert_eq!(state.project_attention(project.id).unread, 3);
-        assert_eq!(state.project_attention(project.id).state(), Some(AttentionState::Failed));
-        let channel = SidebarChannel::new(ChannelId::new(), "Mixed".into(), false,
-            Some(ActivityState::Working), true, 3, true, 0).with_attention(state.project_attention(project.id));
-        assert_eq!(channel.attention.state(), state.worktree_attention(project.id, worktree).state());
-        let names = accessible_names(&headless_renderer(), compact_project_identity(&project, false, false, &state));
-        assert!(names.iter().any(|name| name.contains("3 unread conversations") && name.contains("unread failed updates")), "{names:?}");
+        assert_eq!(
+            state.project_attention(project.id).state(),
+            Some(AttentionState::Failed)
+        );
+        let channel = SidebarChannel::new(
+            ChannelId::new(),
+            "Mixed".into(),
+            false,
+            Some(ActivityState::Working),
+            true,
+            3,
+            true,
+            0,
+        )
+        .with_attention(state.project_attention(project.id));
+        assert_eq!(
+            channel.attention.state(),
+            state.worktree_attention(project.id, worktree).state()
+        );
+        let names = accessible_names(
+            &headless_renderer(),
+            compact_project_identity(&project, false, false, &state),
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.contains("3 unread conversations")
+                    && name.contains("unread failed updates")),
+            "{names:?}"
+        );
         let prefix = format!("{}:", project.worktrees[0].label());
-        assert!(names.iter().any(|name| name.lines().any(|line|
-            line.starts_with(&prefix) && line.contains("unread failed updates"))), "{names:?}");
-        state.set_agent_activity(waiting, project.id, worktree, Activity { provider: Provider::Claude, state: ActivityState::Waiting });
-        assert_eq!(state.project_attention(project.id).state(), Some(AttentionState::Waiting));
-        assert_eq!(state.worktree_attention(project.id, worktree).state(), Some(AttentionState::Waiting));
+        assert!(
+            names.iter().any(|name| name
+                .lines()
+                .any(|line| line.starts_with(&prefix) && line.contains("unread failed updates"))),
+            "{names:?}"
+        );
+        state.set_agent_activity(
+            waiting,
+            project.id,
+            worktree,
+            Activity {
+                provider: Provider::Claude,
+                state: ActivityState::Waiting,
+            },
+        );
+        assert_eq!(
+            state.project_attention(project.id).state(),
+            Some(AttentionState::Waiting)
+        );
+        assert_eq!(
+            state.worktree_attention(project.id, worktree).state(),
+            Some(AttentionState::Waiting)
+        );
         state.acknowledge_agent_update(failed);
         assert_eq!(state.project_attention(project.id).failed, 0);
         assert_eq!(state.project_attention(project.id).unread, 2);
-        assert_eq!(state.card_activity(working).unwrap().state, ActivityState::Working);
-        assert_eq!(state.card_activity(waiting).unwrap().state, ActivityState::Waiting);
+        assert_eq!(
+            state.card_activity(working).unwrap().state,
+            ActivityState::Working
+        );
+        assert_eq!(
+            state.card_activity(waiting).unwrap().state,
+            ActivityState::Waiting
+        );
         state.clear_agent_activity(waiting);
-        assert_eq!(state.project_attention(project.id).state(), Some(AttentionState::Working));
+        assert_eq!(
+            state.project_attention(project.id).state(),
+            Some(AttentionState::Working)
+        );
         state.restore_agent_updates(BTreeMap::from([(working, Some((project.id, worktree)))]));
         assert_eq!(state.worktree_attention(project.id, worktree).unread, 1);
         assert_eq!(state.project_attention(project.id).unread, 1);
@@ -11616,45 +11876,77 @@ pub(crate) mod tests {
     fn compact_attention_terminal(id: CardId) -> crate::model::CardState {
         let launch = crate::model::LaunchRecipe::shell("/repo".into()).unwrap();
         crate::model::CardState {
-            id, generation: 0, title: "Agent".into(), width_fraction: 0.5,
+            id,
+            generation: 0,
+            title: "Agent".into(),
+            width_fraction: 0.5,
             existence: crate::model::Existence::Open,
             exposure: crate::model::Exposure::Visible,
             residency: crate::model::Residency::Hot,
             kind: crate::model::CardKind::Terminal(crate::model::TerminalSession {
-                id: crate::model::TerminalId::new(), launch: launch.clone(),
-                owned_codex_listener: None, recovery_origin: None, predecessor: None,
-                transcript_path: None, resume_hint: None,
-                continuity: crate::model::TerminalContinuity::RelaunchAvailable { recipe: launch, last_exit: None },
+                id: crate::model::TerminalId::new(),
+                launch: launch.clone(),
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                transcript_path: None,
+                resume_hint: None,
+                continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                    recipe: launch,
+                    last_exit: None,
+                },
             }),
         }
     }
 
     #[test]
-    fn compact_attention_projection_counts_open_logical_conversations_once_and_reuses_unchanged_metadata() {
+    fn compact_attention_projection_counts_open_logical_conversations_once_and_reuses_unchanged_metadata()
+     {
         let project = project();
-        let other = { let mut other = project.clone(); other.id = project_id(99); other };
+        let other = {
+            let mut other = project.clone();
+            other.id = project_id(99);
+            other
+        };
         let first = compact_attention_terminal(CardId::new());
-        let mut alias = first.clone(); alias.id = CardId::new();
+        let mut alias = first.clone();
+        alias.id = CardId::new();
         let mut closed = compact_attention_terminal(CardId::new());
-        closed.existence = crate::model::Existence::Closed { tombstone: crate::model::Tombstone {
-            operation_id: None, closed_at_unix_ms: 0, reason: Some("closed".into()),
-        } };
-        let channel = crate::model::ProjectChannel { title_source: Default::default(),
-            id: ChannelId::new(), project_id: project.id, title: "Mixed".into(), ordinal: 0,
-            shared: false, cards: vec![first.id, alias.id, closed.id], focused: None };
+        closed.existence = crate::model::Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 0,
+                reason: Some("closed".into()),
+            },
+        };
+        let channel = crate::model::ProjectChannel {
+            title_source: Default::default(),
+            id: ChannelId::new(),
+            project_id: project.id,
+            title: "Mixed".into(),
+            ordinal: 0,
+            shared: false,
+            cards: vec![first.id, alias.id, closed.id],
+            focused: None,
+        };
         let mut durable = Arc::new(crate::model::WorkspaceState {
-            cards: vec![first.clone(), alias.clone(), closed.clone()], channels: vec![channel],
+            cards: vec![first.clone(), alias.clone(), closed.clone()],
+            channels: vec![channel],
             ..Default::default()
         });
         let mut state = SidebarState::default();
-        for card in [first.id, alias.id, closed.id] { state.observe_card_update(card); }
+        for card in [first.id, alias.id, closed.id] {
+            state.observe_card_update(card);
+        }
         state.set_failed_updates(BTreeSet::from([first.id]));
         let projects = vec![project.clone(), other.clone()];
         state.refresh_attention_projection(&durable, &projects);
         assert_eq!(state.project_attention(project.id).unread, 1);
         assert_eq!(state.project_attention(project.id).failed, 1);
         let rebuilt = state.attention_projection_rebuilds;
-        for _ in 0..20 { state.refresh_attention_projection(&durable, &projects); }
+        for _ in 0..20 {
+            state.refresh_attention_projection(&durable, &projects);
+        }
         assert_eq!(state.attention_projection_rebuilds, rebuilt);
         state.acknowledge_agent_update(first.id);
         state.acknowledge_agent_update(alias.id);
@@ -11667,7 +11959,9 @@ pub(crate) mod tests {
         assert_eq!(state.project_attention(project.id).unread, 0);
         assert_eq!(state.project_attention(other.id).unread, 1);
         // Conflicting logical conversation filing is unavailable, not first-project routing.
-        let mut conflict = durable.channels[0].clone(); conflict.id = ChannelId::new(); conflict.project_id = project.id;
+        let mut conflict = durable.channels[0].clone();
+        conflict.id = ChannelId::new();
+        conflict.project_id = project.id;
         Arc::make_mut(&mut durable).channels.push(conflict);
         state.refresh_attention_projection(&durable, &projects);
         assert_eq!(state.project_attention(other.id).unread, 0);
@@ -12248,8 +12542,8 @@ pub(crate) mod tests {
                     None,
                     "",
                     show,
-                AttentionSummary::default(),
-)
+                    AttentionSummary::default(),
+                )
             };
             let counts = [true, false].map(|show| {
                 let mut element = row(show);
@@ -12310,8 +12604,8 @@ pub(crate) mod tests {
                 Some(1),
                 "",
                 true,
-            AttentionSummary::default(),
-);
+                AttentionSummary::default(),
+            );
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -12843,8 +13137,8 @@ pub(crate) mod tests {
                 None,
                 query,
                 true,
-            AttentionSummary::default(),
-);
+                AttentionSummary::default(),
+            );
             let mut tree = Tree::new(&element);
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
             let node = element.as_widget_mut().layout(
@@ -15808,8 +16102,8 @@ pub(crate) mod tests {
                 None,
                 "",
                 true,
-            AttentionSummary::default(),
-);
+                AttentionSummary::default(),
+            );
             let mut tree = Tree::new(&element);
             let viewport = Rectangle::with_size(Size::new(460.0, WORKTREE_ROW_HEIGHT));
             let node = element.as_widget_mut().layout(

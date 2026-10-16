@@ -859,7 +859,8 @@ impl Cagents {
 
     /// Refresh cached rows after state changes, never during rendering.
     pub(super) fn refresh_sidebar_channels(&mut self) {
-        self.sidebar_state.refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
+        self.sidebar_state
+            .refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
         let durable = &self.durable;
         let cards: HashMap<_, _> = durable.cards.iter().map(|card| (card.id, card)).collect();
         let previews = &self.notification_ui.previews;
@@ -885,14 +886,17 @@ impl Cagents {
                 let title = channel_display_title(channel);
                 let selected = durable.active_channel == Some(channel.id);
                 let deletion = channel_ui.row_deletion(channel.id);
-                let mut conversations = std::collections::BTreeMap::<_, sidebar::AttentionSummary>::new();
+                let mut conversations =
+                    std::collections::BTreeMap::<_, sidebar::AttentionSummary>::new();
                 let mut chats = 0;
                 let mut has_panes = false;
                 let mut notification_preview: Option<&super::notification_ui::Preview> = None;
                 for id in &channel.cards {
                     // A visiting utility pane is not what the channel holds.
-                    let Some(card) = cards.get(id).filter(|card|
-                        card.existence.is_open() && !card.kind.is_utility()) else {
+                    let Some(card) = cards
+                        .get(id)
+                        .filter(|card| card.existence.is_open() && !card.kind.is_utility())
+                    else {
                         continue;
                     };
                     has_panes = true;
@@ -920,10 +924,15 @@ impl Cagents {
                         CardKind::Terminal(session) => (0, session.id.as_uuid()),
                         _ => (1, card.id.as_uuid()),
                     };
-                    conversations.entry(resource).or_default().union(state.card_attention(*id));
+                    conversations
+                        .entry(resource)
+                        .or_default()
+                        .union(state.card_attention(*id));
                 }
                 let mut attention = sidebar::AttentionSummary::default();
-                for conversation in conversations.into_values() { attention.add(conversation); }
+                for conversation in conversations.into_values() {
+                    attention.add(conversation);
+                }
                 let activity = attention.activity();
                 let unread = attention.unread != 0;
                 let notification_preview = notification_preview
@@ -952,7 +961,8 @@ impl Cagents {
                         chats,
                         has_panes,
                         channel.ordinal,
-                    ).with_attention(attention);
+                    )
+                    .with_attention(attention);
                     row.deletion = deletion;
                     row = row.with_notification_preview(notification_preview.cloned());
                     if index < project.channels.len() {

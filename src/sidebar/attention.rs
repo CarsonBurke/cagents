@@ -80,13 +80,21 @@ impl Summary {
             parts.push(format!("{} waiting for input", self.waiting));
         }
         if self.failed != 0 {
-            parts.push(format!("{} conversation{} with unread failed updates", self.failed, if self.failed == 1 { "" } else { "s" }));
+            parts.push(format!(
+                "{} conversation{} with unread failed updates",
+                self.failed,
+                if self.failed == 1 { "" } else { "s" }
+            ));
         }
         if self.working != 0 {
             parts.push(format!("{} working", self.working));
         }
         if self.unread != 0 {
-            parts.push(format!("{} unread conversation{}", self.unread, if self.unread == 1 { "" } else { "s" }));
+            parts.push(format!(
+                "{} unread conversation{}",
+                self.unread,
+                if self.unread == 1 { "" } else { "s" }
+            ));
         }
         parts.join(", ")
     }
@@ -107,15 +115,18 @@ mod tests {
                         working: usize::from(working),
                         unread: 3,
                     };
-                    assert_eq!(summary.state(), Some(if waiting {
-                        State::Waiting
-                    } else if failed {
-                        State::Failed
-                    } else if working {
-                        State::Working
-                    } else {
-                        State::Unread
-                    }));
+                    assert_eq!(
+                        summary.state(),
+                        Some(if waiting {
+                            State::Waiting
+                        } else if failed {
+                            State::Failed
+                        } else if working {
+                            State::Working
+                        } else {
+                            State::Unread
+                        })
+                    );
                     assert!(summary.description().contains("3 unread conversations"));
                 }
             }
