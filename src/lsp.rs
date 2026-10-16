@@ -5681,6 +5681,19 @@ impl LspManager {
         tests::open_ready_format_on_save(self, doc, path, worktree, text).await;
     }
 
+    /// Rooted, framed peer for controller tests whose source starts with
+    /// `foo`. Rename honors newName; formatting replaces that prefix with
+    /// `bar`. Code actions offer fixture.command, then the same quick fix.
+    #[cfg(test)]
+    pub(crate) async fn fixture_ready_editor_features(
+        doc: LspDocumentId,
+        path: &Path,
+        root: Arc<crate::fs_safety::Root>,
+        text: &str,
+    ) -> Self {
+        tests::ready_editor_features(doc, path, root, text).await
+    }
+
     /// Real framed test server for controller command-context regressions.
     /// No provider process or production capability bypass is involved.
     #[cfg(test)]
@@ -6108,6 +6121,65 @@ mod tests {
         await_ready(&events, doc).await;
         assert!(manager.capabilities(doc).ready && manager.capabilities(doc).format_document);
         assert_eq!(manager.formatting_settings(doc).map(|(enabled, _)| enabled), Some(true));
+        manager
+    }
+
+    pub(super) async fn ready_editor_features(
+        doc: LspDocumentId,
+        path: &Path,
+        root: Arc<crate::fs_safety::Root>,
+        text: &str,
+    ) -> LspManager {
+        assert!(text.starts_with("foo"), "fixture edits replace the leading foo");
+        let worktree = root.path().to_path_buf();
+        let uri = Url::from_file_path(path).expect("fixture file URI");
+        let prefix = json!({"start":{"line":0,"character":0},"end":{"line":0,"character":3}});
+        let edit = json!({"changes":{uri.as_str():[{"range":prefix,"newText":"bar"}]}});
+        let mut manager = rust_manager();
+        manager.servers[0].format_on_save = true;
+        let slot = install_fake(&mut manager, json!({
+            "textDocumentSync": 2,
+            "renameProvider": {"prepareProvider": true},
+            "documentFormattingProvider": true,
+            "documentRangeFormattingProvider": true,
+            "codeActionProvider": true,
+            "executeCommandProvider": {"commands":["fixture.command"]},
+            "signatureHelpProvider": {"triggerCharacters":["(",","],"retriggerCharacters":[","]}
+        }), move |incoming| {
+            let result = match incoming.method.as_str() {
+                "textDocument/prepareRename" => json!({"range":prefix,"placeholder":"foo"}),
+                "textDocument/rename" => json!({"changes":{uri.as_str():[{
+                    "range":prefix,"newText":incoming.params["newName"]
+                }]}}),
+                "textDocument/formatting" | "textDocument/rangeFormatting" => json!([
+                    {"range":prefix,"newText":"bar"}
+                ]),
+                "textDocument/codeAction" => json!([
+                    {"title":"Run fixture command","command":"fixture.command"},
+                    {"title":"Replace foo with bar","kind":"quickfix","edit":edit}
+                ]),
+                "workspace/executeCommand" => Value::Null,
+                "textDocument/signatureHelp" => json!({
+                    "signatures":[{"label":"call(value: i32)","parameters":[{"label":"value: i32"}]}],
+                    "activeSignature":0,"activeParameter":0
+                }),
+                _ => return Vec::new(),
+            };
+            vec![json!({"jsonrpc":"2.0","id":incoming.id,"result":result})]
+        });
+        let events = manager.events();
+        manager.open_snapshot_with_root(doc, path, &worktree, rust_language(), 1, native_source(text), Arc::clone(&root));
+        let status = finish_original_root_discovery(&mut manager, &events, doc).await;
+        assert!(matches!(status, LspStatus::Starting | LspStatus::Ready), "fixture root admission failed: {status:?}");
+        let handle = handle_of(&slot).await;
+        await_ready(&events, doc).await;
+        let opened = handle.wait_for("textDocument/didOpen").await;
+        assert_eq!(opened.params["textDocument"]["text"], text);
+        assert!(Arc::ptr_eq(manager.documents[&doc].owner.original_root.as_ref().unwrap(), &root));
+        let capabilities = manager.capabilities(doc);
+        assert!(capabilities.ready && capabilities.prepare_rename && capabilities.rename
+            && capabilities.format_document && capabilities.format_selection
+            && capabilities.code_actions && capabilities.signature_help);
         manager
     }
 
