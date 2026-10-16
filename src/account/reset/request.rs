@@ -1,8 +1,10 @@
-//! Proposed bounded device request/report shape. Not registered in the public
-//! protocol until the matched-set owner allocates its epoch.
+//! Bounded device request/report shape for the allocated matched protocol.
+//! Requested intent never substitutes for provider or source authority.
 use super::{Allowance, Outcome, ProviderAccount, identifier_str};
 use crate::{agent::Provider, model::TerminalId};
 use serde::{Deserialize, Serialize};
+
+pub(crate) const AUTOMATIC_ADMISSION_UNAVAILABLE: &str = "This implementation currently cannot prevent concurrent automatic monitors on different devices from selecting different credits for the same exhausted allowance. Use read-only monitoring and explicitly redeem one named credit; retries of that same credit retain their original key.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
@@ -73,6 +75,9 @@ impl Request {
                     "Redeeming a provider reset credit requires explicit --authorize authorization"
                         .into(),
                 );
+            }
+            if condition.is_some() {
+                return Err(AUTOMATIC_ADMISSION_UNAVAILABLE.into());
             }
         }
         Ok(())
@@ -148,5 +153,32 @@ mod tests {
         *consent = true;
         *credit_id = "x".repeat(1025);
         assert!(authorized.validate().is_err());
+    }
+    #[test]
+    fn conditional_automatic_redemption_is_unavailable_but_named_manual_intent_remains_valid() {
+        let mut request = Request {
+            session: TerminalId::new(),
+            action: Action::Redeem {
+                expected: ProviderAccount {
+                    account_id: "actual-account".into(),
+                    backend_origin: "https://chatgpt.com".into(),
+                },
+                credit_id: "named-credit".into(),
+                authorized: true,
+                condition: None,
+            },
+        };
+        request.validate().unwrap();
+        let Action::Redeem { condition, .. } = &mut request.action else {
+            panic!()
+        };
+        *condition = Some(Threshold {
+            used_percent: 90,
+            max_age_ms: 30_000,
+        });
+        assert_eq!(
+            request.validate().unwrap_err(),
+            AUTOMATIC_ADMISSION_UNAVAILABLE
+        );
     }
 }

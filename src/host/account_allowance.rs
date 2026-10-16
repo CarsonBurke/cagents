@@ -120,6 +120,34 @@ mod tests {
         assert!(state.chat_handoffs.is_empty());
     }
 
+    #[test]
+    fn conditional_redemption_refuses_before_source_lookup_or_durable_storage() {
+        let host = Arc::new(super::super::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
+                host_session_id: HostSessionId::new("private-automatic-refusal"),
+                boot_id: BootId::new("private-boot"),
+                host_incarnation: HostIncarnation::new("private-incarnation"),
+            }),
+        ));
+        let mut request = redeem(TerminalId::new());
+        let Action::Redeem { condition, .. } = &mut request.action else {
+            panic!()
+        };
+        *condition = Some(crate::account::reset::request::Threshold {
+            used_percent: 90,
+            max_age_ms: 30_000,
+        });
+        let error = execute_with_storage(&host, request, || {
+            panic!("unsupported automatic admission cannot open or mutate storage")
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            crate::account::reset::request::AUTOMATIC_ADMISSION_UNAVAILABLE
+        );
+        assert!(host.lock().unwrap().chats.is_empty());
+    }
+
     /// The real actor owns/reaps /bin/cat through the production runtime. Only
     /// allowance responses are modeled; no provider binary or credit is used.
     struct Model {

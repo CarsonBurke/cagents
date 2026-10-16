@@ -83,26 +83,29 @@ matched CLI/daemon protocol; an old deployed daemon reports incompatibility and
 never falls back to a local account. This feature does not deploy or upgrade a
 remote installation automatically.
 
-A foreground monitor can observe without spending, or receive a finite explicit
-reset authorization:
+A finite foreground monitor observes shared allowance without spending:
 
 ```sh
 cagents account monitor --session "$SESSION" --threshold 90 --checks 720
 cagents --device fw16 account monitor --session "$SESSION" --threshold 90 \
-  --interval-seconds 30 --checks 720 --max-redemptions 1 --authorize --json
+  --interval-seconds 30 --checks 720 --json
 ```
 
-Without `--authorize`, the monitor only inspects. The threshold applies to any
-provider-reported primary or secondary allowance window; token counts never
-trigger redemption. An authorized monitor pins the first actual provider account and
-stops if it changes. The owning daemon checks the threshold again against fresh
-shared-account usage before sending consumption. Other sessions using the same
-provider account share the daemon's durable attempt history and nonblocking
-account lock. Successful resets stop at `--max-redemptions`; unknown/stale state,
-missing credit details, exhausted inventory, failures and uncertain outcomes are
-reported explicitly. Check progress is written to stderr; `--json` returns the
-normal final CLI envelope on stdout. Ctrl-C stops the foreground monitor and
-leaves the pane's work running. No background monitor is installed.
+The threshold highlights provider-reported primary or secondary allowance;
+conversation token counts never trigger an action. Unknown/stale state, missing
+credit details, exhausted inventory and provider failures are reported explicitly.
+Progress goes to stderr; `--json` returns the final CLI envelope on stdout.
+Ctrl-C stops this foreground monitor and leaves the pane running.
+
+`account monitor --authorize` is currently refused before contacting the daemon.
+This implementation cannot yet guarantee account-wide automatic reset admission
+across devices: different monitors can receive different capped credit lists,
+while provider idempotency identifies one logical attempt. Local account locks
+and a fresh percentage check do not provide that cross-device admission. A custom
+client's conditional automatic redemption request is refused too. This is an
+implementation limitation, not a claim that the provider can never support an
+appropriate mechanism. Automatic redemption remains unfinished; use read-only
+monitoring and explicitly redeem one named credit when appropriate.
 
 A concrete credit keeps one provider idempotency key across retries, sessions,
 local home aliases and daemon restarts. The durable intent is saved before any
@@ -110,9 +113,8 @@ consuming request. A timeout never authorizes another credit or another key.
 Acknowledgement is followed by fresh identity, allowance and inventory reads.
 `nothingToReset` and `noCredit` are non-consuming observations; a later fresh
 available credit may retry with its original key. A lost response remains
-uncertain until reconciled. If current usage no longer meets a monitor condition,
-monitoring stops visibly with that uncertainty intact; explicitly redeeming the
-original account/credit reconciles the same key. Different devices have separate
+uncertain until reconciled. Explicitly redeeming the original account/credit
+reconciles the same key. Different devices have separate
 local locks; the provider's same-key handling deduplicates the same concrete
 credit, not a global distributed lock over different credits.
 

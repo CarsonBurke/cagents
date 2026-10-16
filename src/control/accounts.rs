@@ -28,12 +28,12 @@ pub enum AccountCommand {
         #[arg(long, required = true)]
         authorize: bool,
     },
-    /// Watch a live pane's shared allowance; optionally authorize limited resets.
+    /// Watch a live pane's shared allowance without consuming reset credits.
     Monitor {
         /// Exact native session UUID on the selected device.
         #[arg(long)]
         session: TerminalId,
-        /// Minimum provider-reported used percentage before redeeming.
+        /// Provider-reported used percentage to highlight while observing.
         #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
         threshold: u8,
         /// Seconds between checks; Ctrl-C stops only this monitor.
@@ -42,10 +42,10 @@ pub enum AccountCommand {
         /// Maximum checks before this foreground monitor exits.
         #[arg(long, default_value_t = 720, value_parser = clap::value_parser!(u32).range(1..=1000000))]
         checks: u32,
-        /// Maximum successful credit redemptions authorized by this invocation.
+        /// Requested automatic budget; automatic redemption is currently refused.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=100))]
         max_redemptions: u16,
-        /// Explicitly authorize resets; absent means inspect without spending.
+        /// Request automatic redemption (currently refused: admission is unavailable).
         #[arg(long)]
         authorize: bool,
     },
