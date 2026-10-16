@@ -171,7 +171,9 @@ exit 7
 #[cfg(target_os = "linux")]
 #[test]
 fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
-    use cagents::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+    use cagents::process::{
+        CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+    };
     use std::{os::unix::fs::DirBuilderExt, path::Path};
 
     let directory = tempfile::tempdir().unwrap();
@@ -194,23 +196,35 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log).unwrap())
-            .spawn().unwrap(),
+            .spawn()
+            .unwrap(),
     );
-    let socket = runtime.join(cagents::instance::RUNTIME_SUBDIRECTORY)
+    let socket = runtime
+        .join(cagents::instance::RUNTIME_SUBDIRECTORY)
         .join(cagents::terminal_ipc::SOCKET_FILE_NAME);
     let deadline = Instant::now() + DEADLINE;
     let observed = (|| -> Result<_, String> {
         let mut control = loop {
-            if let Ok(control) = ControlClient::connect(&socket) { break control; }
-            if daemon.0.try_wait().map_err(|e| e.to_string())?.is_some() {
-                return Err(format!("private daemon exited: {}", fs::read_to_string(&log).unwrap_or_default()));
+            if let Ok(control) = ControlClient::connect(&socket) {
+                break control;
             }
-            if Instant::now() >= deadline { return Err("private daemon readiness timed out".into()); }
+            if daemon.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+                return Err(format!(
+                    "private daemon exited: {}",
+                    fs::read_to_string(&log).unwrap_or_default()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err("private daemon readiness timed out".into());
+            }
             thread::sleep(Duration::from_millis(10));
         };
         let recipe = LaunchRecipe {
             program: "/bin/sh".into(),
-            arguments: vec!["-c".into(), r#"printf '\033]2;CLI inventory title\007'; exec /bin/cat"#.into()],
+            arguments: vec![
+                "-c".into(),
+                r#"printf '\033]2;CLI inventory title\007'; exec /bin/cat"#.into(),
+            ],
             working_directory: root.into(),
             environment: BTreeMap::from([
                 ("HOME".into(), home.to_str().unwrap().into()),
@@ -220,41 +234,69 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
         };
         let id = TerminalId::new();
         let session = TerminalSession {
-            id, launch: recipe.clone(), owned_codex_listener: None,
-            predecessor: None, recovery_origin: None, transcript_path: None, resume_hint: None,
-            continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None },
+            id,
+            launch: recipe.clone(),
+            owned_codex_listener: None,
+            predecessor: None,
+            recovery_origin: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
         };
-        control.spawn(session, Default::default()).map_err(|e| e.to_string())?;
+        control
+            .spawn(session, Default::default())
+            .map_err(|e| e.to_string())?;
         loop {
             let rows = control.list().map_err(|e| e.to_string())?;
-            if rows.iter().any(|row| row.session.id == id && row.title.as_deref() == Some("CLI inventory title")) { break; }
-            if Instant::now() >= deadline { return Err("production daemon never published its PTY title".into()); }
+            if rows.iter().any(|row| {
+                row.session.id == id && row.title.as_deref() == Some("CLI inventory title")
+            }) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("production daemon never published its PTY title".into());
+            }
             thread::sleep(Duration::from_millis(10));
         }
         let cli = |args: &[&str], json: bool| -> Result<String, String> {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() { return Err("inventory CLI deadline expired".into()); }
+            if remaining.is_zero() {
+                return Err("inventory CLI deadline expired".into());
+            }
             let executable = Path::new(env!("CARGO_BIN_EXE_cagents"));
-            let mut command = CommandSpec::new(executable).args(["--device", "local"])
+            let mut command = CommandSpec::new(executable)
+                .args(["--device", "local"])
                 .args(args.iter().copied())
-                .env("HOME", &home).env("XDG_RUNTIME_DIR", &runtime)
+                .env("HOME", &home)
+                .env("XDG_RUNTIME_DIR", &runtime)
                 .env("XDG_STATE_HOME", root.join("state"))
                 .env("XDG_CONFIG_HOME", root.join("config"))
                 .env("XDG_DATA_HOME", root.join("data"))
                 .env("XDG_CACHE_HOME", root.join("cache"))
-                .timeout(remaining.min(Duration::from_secs(5))).output_limits(64 * 1024, 64 * 1024);
-            if json { command = command.arg("--json"); }
-            let output = SystemProcessExecutor.execute(&command, &CancellationToken::new())
-                .and_then(|output| output.require_success(executable)).map_err(|e| e.to_string())?;
+                .timeout(remaining.min(Duration::from_secs(5)))
+                .output_limits(64 * 1024, 64 * 1024);
+            if json {
+                command = command.arg("--json");
+            }
+            let output = SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .and_then(|output| output.require_success(executable))
+                .map_err(|e| e.to_string())?;
             String::from_utf8(output.stdout).map_err(|e| e.to_string())
         };
         let human = cli(&["terminal", "list", "--all"], false)?;
-        let listed: serde_json::Value = serde_json::from_str(&cli(&["terminal", "list"], true)?).map_err(|e| e.to_string())?;
-        let shown: serde_json::Value = serde_json::from_str(&cli(&["terminal", "show", &id.to_string()], true)?).map_err(|e| e.to_string())?;
+        let listed: serde_json::Value =
+            serde_json::from_str(&cli(&["terminal", "list"], true)?).map_err(|e| e.to_string())?;
+        let shown: serde_json::Value =
+            serde_json::from_str(&cli(&["terminal", "show", &id.to_string()], true)?)
+                .map_err(|e| e.to_string())?;
         Ok((id, human, listed, shown))
     })();
-    // Close original control/CLI connections and settle the exact private
-    // daemon (and its PTY) before inspecting any assertion outcome.
+    // Close original control/CLI connections and reap the exact private daemon
+    // before assertions. The outer family guardian checks descendant settlement.
     drop(daemon);
     let (id, human, listed, shown) = observed.unwrap();
     assert!(human.starts_with("TERMINAL"), "{human}");
@@ -264,7 +306,12 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
     assert_eq!(row["id"], id.to_string());
     assert_eq!(row["state"], "running");
     assert_eq!(row["title"], "CLI inventory title");
-    for field in ["session", "launch", "environment", "recipe", "resume_hint"] { assert!(row.get(field).is_none()); }
+    for field in ["session", "launch", "environment", "recipe", "resume_hint"] {
+        assert!(row.get(field).is_none());
+    }
     assert_eq!(shown["data"]["terminal"]["session"]["id"], id.to_string());
-    assert_eq!(shown["data"]["terminal"]["session"]["launch"]["environment"]["FIXTURE_DISPLAY_ONLY"], "full descriptor only");
+    assert_eq!(
+        shown["data"]["terminal"]["session"]["launch"]["environment"]["FIXTURE_DISPLAY_ONLY"],
+        "full descriptor only"
+    );
 }
