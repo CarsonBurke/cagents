@@ -201,6 +201,16 @@ any statuses already received and reports the unread IDs in `data.unresolved_run
 Spawn/send retain their durable acceptance when that first status is unavailable.
 No run outcome is invented from missing status evidence.
 
+## Reads without startup
+
+Add the global `--no-start` flag, or set `CAGENTS_NO_START=1`, when a read should
+connect only to an already-running daemon. Missing local and selected-device
+daemons produce a `daemon_not_running` error instead of starting services.
+Transport failures remain errors and are distinguished from daemon absence.
+
+`cagents daemon stop` never starts a daemon. When the selected daemon is absent,
+it exits successfully; JSON output contains `data.state = "already_stopped"`.
+
 ## Shell completions
 
 Generate completions from the installed command grammar. This does not contact
