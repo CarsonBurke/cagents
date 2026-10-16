@@ -525,3 +525,44 @@ fn local_tracked_undo_refuses_parent_moved_during_actual_blob_materialization() 
         b"precious nested original\n"
     );
 }
+
+#[test]
+fn local_linked_discard_undo_keeps_original_private_index_and_common_objects() {
+    const NAME: &str = "local_linked_discard_undo_keeps_original_private_index_and_common_objects";
+    if isolated(NAME, false) {
+        return;
+    }
+    let primary = setup();
+    let linked = primary.with_file_name("linked-checkout");
+    git(&primary, &["worktree", "add", "-q", "-b", "linked-fixture", linked.to_str().unwrap()]);
+    fs::write(linked.join("modified"), b"linked precious work\n").unwrap();
+    fs::write(linked.join("linked new file"), b"linked untracked original\n").unwrap();
+    let native_original = fs::metadata(linked.join("linked new file")).unwrap();
+    let original = service(&linked);
+    let discarded = original.discard_recoverable(
+        &request(&linked, &["modified"], &["linked new file"]),
+        &CancellationToken::new(), &[primary.clone(), linked.clone()],
+    ).unwrap();
+    assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }), "{:?}", discarded.outcome);
+    assert_eq!(fs::read(linked.join("modified")).unwrap(), b"base modified\n");
+    assert!(!linked.join("linked new file").exists());
+    assert_eq!(fs::read(primary.join("modified")).unwrap(), b"precious modified\n");
+    // The current caller may point at a sibling: only the receipt's original
+    // private index/common-object authority can select the Undo destination.
+    let undone = service(&primary).undo_discard(
+        &discarded.recovery, &CancellationToken::new(),
+    ).unwrap();
+    assert!(matches!(undone, MutationOutcome::Applied { .. }), "{undone:?}");
+    assert_eq!(discarded.recovery.remaining_paths(), 0);
+    assert_eq!(fs::read(linked.join("modified")).unwrap(), b"linked precious work\n");
+    assert_eq!(fs::read(linked.join("linked new file")).unwrap(), b"linked untracked original\n");
+    let restored = fs::metadata(linked.join("linked new file")).unwrap();
+    assert_eq!((restored.dev(), restored.ino()), (native_original.dev(), native_original.ino()));
+    assert_eq!(fs::read(primary.join("modified")).unwrap(), b"precious modified\n");
+    let gitfile = fs::read_to_string(linked.join(".git")).unwrap();
+    let private = PathBuf::from(gitfile.trim().strip_prefix("gitdir: ").unwrap());
+    assert!(!private.join("index.lock").exists());
+    assert!(!primary.join(".git/index.lock").exists());
+    assert_eq!(fs::read_dir(trash().join("files")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(trash().join("info")).unwrap().count(), 0);
+}
