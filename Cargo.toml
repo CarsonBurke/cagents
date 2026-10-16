@@ -41,6 +41,7 @@ host = [
     "dep:portable-pty",
     "dep:rusqlite",
     "dep:tokio",
+    "tokio/net",
     "dep:tracing-subscriber",
     "dep:tungstenite",
 ]
