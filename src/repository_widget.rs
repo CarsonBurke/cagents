@@ -10641,6 +10641,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pure_foreign_root_candidate_cannot_publish_text_or_admit_save() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("file"), "same base").unwrap();
+        std::fs::write(b.path().join("file"), "same base").unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(), repository: a.path().to_owned(), worktree: a.path().to_owned(), selected_file: None,
+        });
+        assert!(runtime.set_original_editor_root(Arc::new(crate::fs_safety::Root::open(b.path()).unwrap())));
+        let task = runtime.update(RepositoryAction::OpenFile { card, path: "file".into() });
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(runtime.editor_text().is_none());
+        assert!(!runtime.take_lsp_intents().iter().any(|intent| matches!(intent, LspIntent::Open { .. })));
+        let window = Default::default();
+        assert!(runtime.configure_save_recovery(window, vec![a.path().to_owned(), b.path().to_owned()]));
+        assert_eq!(runtime.request_save(card, true).units(), 0);
+        assert_eq!(std::fs::read_to_string(a.path().join("file")).unwrap(), "same base");
+        assert_eq!(std::fs::read_to_string(b.path().join("file")).unwrap(), "same base");
+    }
+
+    #[tokio::test]
     async fn file_worker_retains_original_root_across_later_reads_and_rejects_rebinding() {
         let parent = tempfile::tempdir().unwrap();
         let named = parent.path().join("checkout");
