@@ -321,7 +321,7 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
     let session = terminal(&root);
     let pty = TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    let pid: u32 = loop {
+    let pid: i32 = loop {
         if let Ok(text) = fs::read_to_string(root.join("root-pid")) {
             if let Ok(pid) = text.parse() {
                 break pid;
