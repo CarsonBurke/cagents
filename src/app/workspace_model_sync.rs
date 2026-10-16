@@ -2276,12 +2276,35 @@ mod tests {
             crate::workspace_model::views::managed_display(&original_only, &agent).unwrap();
         assert!(app.adopt_execution_agent_display(&agent, display).is_some());
         let directory = tempfile::tempdir().unwrap();
-        let (mut runtime, _) = crate::session::SessionRuntime::open(
-            &directory.path().join("managed-closure.sqlite3"),
-            crate::model::BootId::new("managed-closure"),
-        )
-        .unwrap();
+        let path = directory.path().join("managed-closure.sqlite3");
+        let boot = crate::model::BootId::new("managed-closure");
+        // A genuinely empty history has an authoritative negative lookup.
+        // Commit an unrelated closure before reopening, so this requested
+        // identity requires the worker that is then deliberately stopped.
+        let store = crate::persistence::StateStore::open(&path, boot.clone()).unwrap();
+        let mut closed = super::super::tests::terminal_card_state();
+        closed.existence = super::super::project_ui::removed_existence("unrelated prior close");
+        let closed_id = closed.id;
+        assert_ne!(closed_id, pane.id);
+        let history = crate::model::WorkspaceState {
+            cards: vec![closed],
+            ..Default::default()
+        };
+        store
+            .save_workspace(
+                &history,
+                crate::persistence::SnapshotBase {
+                    workspace: 0,
+                    cards: &std::collections::BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        assert!(store.card_was_closed(closed_id));
+        store.shutdown().unwrap();
+        drop(store);
+        let (mut runtime, _) = crate::session::SessionRuntime::open(&path, boot).unwrap();
         runtime.shutdown();
+        assert_eq!(runtime.card_closure_observation(pane.id), None);
         assert!(
             runtime.card_was_closed(pane.id),
             "unknown lookup refuses new adoption"
