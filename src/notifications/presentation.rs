@@ -46,21 +46,22 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
             context.clone()
         }
     });
-    let mut body = outcome.to_owned();
+    let excerpt = content
+        .map(|content| plain_preview(&content.preview))
+        .filter(|value| !value.is_empty());
+    // Some desktop servers show only the first body line. Put the useful
+    // context beside its event distinction, ahead of secondary attribution.
+    let mut body = match &excerpt {
+        Some(excerpt) => format!("{outcome}: {excerpt}"),
+        None => outcome.to_owned(),
+    };
     if inbox {
         body.push('\n');
         body.push_str(&super::context(event));
     }
     if !context.is_empty() && context != title {
-        body.push_str(" · ");
+        body.push_str(if excerpt.is_some() { "\n" } else { " · " });
         body.push_str(&context);
-    }
-    if let Some(excerpt) = content
-        .map(|content| plain_preview(&content.preview))
-        .filter(|value| !value.is_empty())
-    {
-        body.push('\n');
-        body.push_str(&excerpt);
     }
     Message {
         title,
@@ -250,13 +251,87 @@ mod tests {
         assert!(!private.body.contains("login"));
         let rich = message(&event, true);
         assert_eq!(rich.title, "Refactor authentication");
-        assert!(
-            rich.body
-                .starts_with("Approval needed · Codex · worktree\n")
+        assert_eq!(
+            rich.body,
+            "Approval needed: May I edit the login handler?\nCodex · worktree"
         );
-        assert!(rich.body.ends_with("May I edit the login handler?"));
         assert_eq!(rich.action, "Open conversation");
         assert!(rich.needs_input);
+    }
+
+    #[test]
+    fn collapsed_desktop_captions_keep_the_outcome_and_useful_excerpt_together() {
+        use crate::notifications::{Content, Event, Evidence, Kind, RequestType};
+        for (kind, request, excerpt, expected) in [
+            (
+                Kind::Succeeded,
+                None,
+                "Migration ready. Preserved config_file.rs and verified the rollback plan.",
+                "Response ready: Migration ready. Preserved config_file.rs and verified the rollback plan.",
+            ),
+            (
+                Kind::Waiting,
+                Some(RequestType::Question),
+                "Updated B: preserve config_file.rs?",
+                "Question for you: Updated B: preserve config_file.rs?",
+            ),
+            (
+                Kind::Failed,
+                None,
+                "Migration validation failed: config_file.rs contains an incompatible schema.",
+                "Run failed: Migration validation failed: config_file.rs contains an incompatible schema.",
+            ),
+        ] {
+            let mut event = Event::session(
+                crate::model::TerminalId::new(),
+                crate::agent::Provider::Codex,
+                "/project/worktree".into(),
+                Evidence {
+                    key: "caption".into(),
+                    kind,
+                },
+            );
+            event.content = Some(Content {
+                conversation: "Migration review A".into(),
+                preview: excerpt.into(),
+                request,
+            });
+            let rich = message(&event, true);
+            assert_eq!(rich.title, "Migration review A");
+            assert_eq!(rich.body.lines().next(), Some(expected));
+            assert_eq!(rich.body.lines().nth(1), Some("Codex · worktree"));
+            // Privacy-off output remains the original generic presentation.
+            let private = message(&event, false);
+            assert!(!private.body.contains(excerpt));
+            assert!(!private.title.contains("Migration"));
+        }
+    }
+
+    #[test]
+    fn empty_or_disabled_previews_keep_the_original_body_layout() {
+        use crate::notifications::{Content, Event, Evidence, Kind};
+        let mut event = Event::session(
+            crate::model::TerminalId::new(),
+            crate::agent::Provider::Codex,
+            "/project/worktree".into(),
+            Evidence {
+                key: "empty-caption".into(),
+                kind: Kind::Succeeded,
+            },
+        );
+        let original = message(&event, false);
+        assert_eq!(original.title, "Codex · worktree");
+        assert_eq!(original.body, "Response ready");
+        event.content = Some(Content {
+            conversation: "Migration review A".into(),
+            preview: String::new(),
+            request: None,
+        });
+        assert_eq!(message(&event, false), original);
+        assert_eq!(
+            message(&event, true).body,
+            "Response ready · Codex · worktree"
+        );
     }
 
     #[test]
