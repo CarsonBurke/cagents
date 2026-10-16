@@ -47,6 +47,20 @@ for the reported limit and usage. Unlimited, missing, or incompatible values
 remain unknown. Conversation token counts and API-equivalent cost estimates
 are never converted into subscription plan allowance.
 
+## Choosing defaults from the CLI
+
+`cagents account list` prints the stable IDs accepted by
+`cagents account default claude claude/ACCOUNT-UUID`. Use `claude/system` to
+pin the system account, or `cagents account default claude automatic` to restore
+automatic routing. These commands use the selected daemon, including `--device`;
+the client never supplies an account home or replaces the account registry.
+
+The daemon checks the current registry revision and refuses removed, archived,
+wrong-provider and known conflicting accounts. A concurrent edit requires a
+fresh explicit command; the CLI does not retry a failed preference write.
+Agent-authenticated callers cannot change defaults. Omp chooses its own accounts
+and accepts only `automatic`. Existing conversations keep their recorded account.
+
 New installations use **Automatic** for each provider. Add each subscription
 once with its provider's browser or device-code sign-in. Thereafter the CLI
 uses its saved login and refreshes its own tokens; cagents never reads or
