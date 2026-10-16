@@ -5332,7 +5332,14 @@ for line in sys.stdin:
     #[test]
     fn a_carried_terminal_keeps_its_process_across_an_upgrade() {
         use crate::upgrade::handoff::Store;
-        let directory = tempfile::tempdir().unwrap();
+        let mut directory = tempfile::tempdir().unwrap();
+        // Preserve the exact detached socket/checkpoint namespace on success
+        // and panic until the outer original-family guardian has settled it.
+        directory.disable_cleanup(true);
+        eprintln!(
+            "Retained terminal carry fixture: {}",
+            directory.path().display()
+        );
         let holders = directory.path().join("holders");
         let empty_proc = directory.path().join("proc");
         fs::create_dir(&empty_proc).unwrap();
