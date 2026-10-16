@@ -271,7 +271,10 @@ pub(crate) fn open_read_root(worktree: &Path) -> Result<Root, FileIoError> {
 }
 
 pub(crate) fn validate_read_root_named(root: &Root) -> Result<(), FileIoError> {
-    let named = worktree_root(root.path())?;
+    validate_read_root_for_worktree(root, root.path())
+}
+fn validate_read_root_for_worktree(root: &Root, worktree: &Path) -> Result<(), FileIoError> {
+    let named = worktree_root(worktree)?;
     #[cfg(target_os = "linux")]
     let same = fs_safety::recovery_directory_stamp(root).map_err(io_error)?
         == fs_safety::recovery_directory_stamp(&named).map_err(io_error)?;
@@ -284,6 +287,31 @@ pub(crate) fn validate_read_root_named(root: &Root) -> Result<(), FileIoError> {
     };
     if !same { return Err(FileIoError::Io("The original worktree was replaced; reopen the pane before reading or saving".into())); }
     Ok(())
+}
+
+/// A completed read from one original physical scope. Only the worker can
+/// construct this association; a pure root setter alone cannot admit Save.
+#[derive(Debug, Clone)]
+pub struct FileRead {
+    worktree: PathBuf,
+    root: std::sync::Arc<Root>,
+    result: Result<LoadedFile, FileIoError>,
+}
+impl FileRead {
+    pub fn worktree(&self) -> &Path { &self.worktree }
+    pub(crate) fn into_parts(self) -> (std::sync::Arc<Root>, Result<LoadedFile, FileIoError>) { (self.root, self.result) }
+}
+pub(crate) fn read_file_at(
+    worktree: &Path,
+    relative: &Path,
+    tone: PdfTone,
+    original: Option<std::sync::Arc<Root>>,
+) -> Result<FileRead, FileIoError> {
+    let root = match original { Some(root) => root, None => std::sync::Arc::new(open_read_root(worktree)?) };
+    let result = validate_read_root_for_worktree(&root, worktree)
+        .and_then(|()| load_file_at_original(&root, relative, tone))
+        .and_then(|loaded| { validate_read_root_for_worktree(&root, worktree)?; Ok(loaded) });
+    Ok(FileRead { worktree: worktree.to_owned(), root, result })
 }
 
 pub(crate) fn load_file_at(

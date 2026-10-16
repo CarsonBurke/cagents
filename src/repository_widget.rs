@@ -449,8 +449,7 @@ pub enum RepositoryAction {
     /// Actual file-worker completion, carrying the root used for the read.
     FileLoadedAt {
         identity: AsyncIdentity,
-        root: Option<Arc<crate::fs_safety::Root>>,
-        result: Result<LoadedFile, FileIoError>,
+        result: Result<crate::editor::FileRead, FileIoError>,
     },
     /// Turn to a page of the open document, or re-render the current one after
     /// the reader changes how its colors are adapted or how large it is drawn.
@@ -1874,6 +1873,7 @@ pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
     worktree_protection: Option<crate::worktree_cleanup::Protection>,
     original_editor_root: Option<Arc<crate::fs_safety::Root>>,
+    original_read_attested: bool,
     save_recovery_window: Option<crate::operation_recovery::Shared>,
     known_checkout_paths: Option<Vec<PathBuf>>,
     editor_recovery: Option<crate::recovery_authority::RecoveryAuthority>,
@@ -2100,6 +2100,7 @@ impl RepositoryRuntime {
             descriptor,
             worktree_protection: None,
             original_editor_root: None,
+            original_read_attested: false,
             save_recovery_window: None,
             known_checkout_paths: None,
             editor_recovery: None,
@@ -4711,7 +4712,7 @@ impl RepositoryRuntime {
     ) -> Task<RepositoryAction> {
         self.clear_resolved_operation_recovery();
         if self.has_editor_recovery() { return Task::none(); }
-        let Some(root) = self.original_editor_root.clone() else {
+        let Some(root) = self.original_editor_root.clone().filter(|_| self.original_read_attested) else {
             if let DocumentState::Editable(document) = &mut self.document { document.error = Some("The original read root is unavailable; reopen this file before saving.".into()); }
             return Task::none();
         };
@@ -4921,24 +4922,28 @@ impl RepositoryRuntime {
                 }
                 self.open_file_entry(card, file)
             }
-            RepositoryAction::FileLoadedAt { identity, root, result } => {
-                if !self.accepts_selected(&identity) {
-                    return Task::none();
-                }
-                if let Some(root) = root
-                    && !self.set_original_editor_root(root)
-                {
-                    return self.update_inner(RepositoryAction::FileLoaded {
-                        identity,
-                        result: Err(FileIoError::Io("The file read belongs to another physical root; reopen the pane".into())),
-                    });
-                }
-                self.update_inner(RepositoryAction::FileLoaded { identity, result })
+            RepositoryAction::FileLoadedAt { identity, result } => {
+                if !self.accepts_selected(&identity) { return Task::none(); }
+                let result = match result {
+                    Ok(read) if read.worktree() == identity.worktree => {
+                        let (root, result) = read.into_parts();
+                        if !self.set_original_editor_root(root) {
+                            Err(FileIoError::Io("The file read belongs to another physical root; reopen the pane".into()))
+                        } else { result }
+                    }
+                    Ok(_) => Err(FileIoError::Io("The file read belongs to another worktree".into())),
+                    Err(error) => Err(error),
+                };
+                let attested = result.is_ok();
+                let task = self.update_inner(RepositoryAction::FileLoaded { identity, result });
+                self.original_read_attested = attested;
+                task
             }
             RepositoryAction::FileLoaded { identity, result } => {
                 if !self.accepts_selected(&identity) {
                     return Task::none();
                 }
+                self.original_read_attested = false;
                 let restored_focus = self
                     .restores_editor_navigation(&identity)
                     .then(|| identity.clone());
@@ -6265,6 +6270,7 @@ impl RepositoryRuntime {
         self.committed_selection = None;
         self.selected = Some(file.clone());
         self.document = DocumentState::Loading;
+        self.original_read_attested = false;
         self.diffs.clear();
         self.basis_resolution = None;
         self.apply_diff_viewport(
@@ -6826,24 +6832,9 @@ fn file_task(
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
-        let (root, result) = tokio::task::spawn_blocking(move || {
-            let root = match original {
-                Some(root) => root,
-                None => match crate::editor::open_read_root(&worktree) {
-                    Ok(root) => Arc::new(root),
-                    Err(error) => return (None, Err(error)),
-                },
-            };
-            let result = crate::editor::load_file_at(&root, &path, tone)
-                .and_then(|loaded| {
-                    crate::editor::validate_read_root_named(&root)?;
-                    Ok(loaded)
-                });
-            (Some(root), result)
-        })
-        .await
-        .unwrap_or_else(|error| (None, Err(FileIoError::Io(format!("file worker failed: {error}")))));
-        RepositoryAction::FileLoadedAt { identity, root, result }
+        let result = tokio::task::spawn_blocking(move || crate::editor::read_file_at(&worktree, &path, tone, original))
+            .await.map_err(|error| FileIoError::Io(format!("file worker failed: {error}"))).and_then(|result| result);
+        RepositoryAction::FileLoadedAt { identity, result }
     })
 }
 
