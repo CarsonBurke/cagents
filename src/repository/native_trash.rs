@@ -17,11 +17,16 @@ pub(in crate::repository) struct Batch {
     files_metadata: fs::Metadata,
     info_metadata: fs::Metadata,
     mount: Option<PathBuf>,
+    transaction: Option<FilesystemRecoveryReservation>,
+    // Last: every outstanding preimage/receipt keeps the entire pin charge.
+    _pins: Arc<PinBudget>,
+}
+struct PinBudget {
+    _slots: Vec<RecoverySlot>,
 }
 struct Prepared {
     proof: NativePreimage,
-    admission: FilesystemRecoveryReservation,
-    retry_slot: RecoverySlot,
+    pins: Arc<PinBudget>,
 }
 #[derive(Clone)]
 pub struct TrashReceipt {
@@ -46,7 +51,7 @@ impl Eq for TrashReceipt {}
 // All native owners precede their SAME charged slot. The whole Owner moves
 // into retained retry closures; no disjoint-field capture loses original FDs.
 struct Owner {
-    publication: fs_safety::DirectoryPublication,
+    publication: Option<fs_safety::DirectoryPublication>,
     preimage: NativePreimage,
     files: Arc<fs_safety::Root>,
     info: Arc<fs_safety::Root>,
@@ -71,6 +76,7 @@ struct Owner {
     restore_name: Option<OsString>,
     context: FilesystemRecoveryContext,
     slot: Option<RecoverySlot>,
+    _pins: Arc<PinBudget>,
 }
 
 fn error(error: impl fmt::Display) -> String {
@@ -250,18 +256,18 @@ fn prepare_in(
     if paths.is_empty() {
         return Ok(None);
     }
-    if paths.len() > 8 {
-        return Err(
-            "Select at most8 untracked files for one recoverable discard; no file was changed"
-                .into(),
-        );
+    if paths.len() > 128 {
+        return Err("Select at most128 untracked files per recoverable discard; no file was changed".into());
     }
-    // Charge the complete source batch and bounded bootstrap BEFORE mkdir,
-    // .trashinfo creation or source acquisition. Failed reservation has no effect.
-    let mut admissions = VecDeque::new();
-    for _ in paths {
-        admissions.push_back((context.reserve_directory()?, context.reserve()?));
+    // Two pins per entry: before effects, source parent+payload; after a
+    // fully synced move, original payload+info. The shared Trash root pair
+    // adds two. One separate slot covers the active staging transaction.
+    let mut slots = Vec::new();
+    for _ in 0..(2 * paths.len() + 2).div_ceil(crate::recovery_authority::MAX_RECOVERY_DESCRIPTORS) {
+        slots.push(context.reserve()?);
     }
+    let pins = Arc::new(PinBudget { _slots: slots });
+    let transaction = context.reserve_directory()?;
     let mut bootstrap = VecDeque::new();
     for _ in 0..8 {
         bootstrap.push_back(context.reserve()?);
@@ -269,12 +275,7 @@ fn prepare_in(
     let mut prepared = VecDeque::new();
     for path in paths {
         let proof = NativePreimage::capture(root.clone(), path.clone(), cancellation)?;
-        let (admission, retry) = admissions.pop_front().unwrap();
-        prepared.push_back(Prepared {
-            proof,
-            admission,
-            retry_slot: retry,
-        });
+        prepared.push_back(Prepared { proof, pins: pins.clone() });
     }
     if !data.is_absolute() {
         return Err("Native Trash data directory must be absolute".into());
@@ -370,6 +371,8 @@ fn prepare_in(
         files_metadata,
         info_metadata,
         mount,
+        transaction: Some(transaction),
+        _pins: pins,
     }))
 }
 
@@ -427,10 +430,10 @@ impl Batch {
             return Err("Native Trash original-path metadata exceeds the bounded limit".into());
         }
         let directory = fs_safety::prepare_recovery_directory_with_owner(
-            prepared.admission,
+            self.transaction.take().ok_or("Resolve the previous native Trash transaction before continuing")?,
             OsStr::new(&format!(".cagents-trash-{}", Uuid::new_v4())),
             || cancellation.is_cancelled(),
-            prepared.proof,
+            (prepared.proof, prepared.pins),
         )
         .map_err(|cause| match cause {
             fs_safety::RecoveryDirectoryError::Rejected(e) => e.to_string(),
@@ -439,10 +442,9 @@ impl Batch {
                 cause.to_string()
             }
         })?;
-        let (publication, preimage, private_metadata, context, slot) = directory.into_parts();
-        let retry_slot = prepared.retry_slot;
+        let (publication, (preimage, pins), private_metadata, context, slot) = directory.into_parts();
         let mut owner = Owner {
-            publication,
+            publication: Some(publication),
             preimage,
             files: self.files.clone(),
             info: self.info.clone(),
@@ -466,16 +468,23 @@ impl Batch {
             restore_name: None,
             context,
             slot: Some(slot),
+            _pins: pins,
         };
         match owner.move_to_trash(cancellation, after_source_acquire) {
             Ok(warning) => {
+                if warning.is_none() {
+                    owner.compact_completed();
+                    let slot = owner.slot.take().expect("active transaction charge");
+                    self.transaction = Some(owner.context.recycle_directory_slot(slot)
+                        .unwrap_or_else(|_| unreachable!("same original context")));
+                }
                 let receipt = TrashReceipt {
                     path: path.clone(),
                     warning: warning.clone(),
                     owner: Arc::new(Mutex::new(owner)),
                 };
                 if warning.is_some() {
-                    retain_shared(&receipt, live, retry_slot);
+                    retain_shared(&receipt, live);
                 }
                 Ok(receipt)
             }
@@ -487,13 +496,14 @@ impl Batch {
                     warning: Some(reason),
                     owner: Arc::new(Mutex::new(owner)),
                 };
-                retain_shared(&receipt, live, retry_slot);
+                retain_shared(&receipt, live);
                 Ok(receipt)
             }
             Err(reason) => {
                 let reason = owner.recovery_diagnostic(&reason);
                 live.set_uncertain(true);
-                live.retain(retry_slot.retain(
+                let slot = owner.slot.take().expect("active transaction charge");
+                live.retain(slot.retain(
                     format!("Native Trash recovery for {path}: {reason}"),
                     move || owner.retry(),
                 ));
@@ -503,8 +513,10 @@ impl Batch {
     }
 }
 
-fn retain_shared(receipt: &TrashReceipt, live: &LiveDiscardRecovery, slot: RecoverySlot) {
+fn retain_shared(receipt: &TrashReceipt, live: &LiveDiscardRecovery) {
     let owner = receipt.owner.clone();
+    let slot = owner.lock().unwrap_or_else(|e| e.into_inner()).slot.take()
+        .expect("active transaction charge");
     let authority = slot.retain(
         format!("Native Trash cleanup for {}", receipt.path),
         move || owner.lock().unwrap_or_else(|e| e.into_inner()).retry(),
@@ -524,7 +536,7 @@ impl Owner {
         )
     }
     fn holding(&self) -> &fs_safety::Root {
-        self.publication.directory()
+        self.publication.as_ref().expect("active private holding").directory()
     }
     fn validate_native(&self) -> Result<(), String> {
         verify_native_spelling(&self.files)?;
@@ -731,10 +743,11 @@ impl Owner {
         self.remove_empty_holding()
     }
     fn remove_empty_holding(&mut self) -> Result<(), String> {
-        if !self.publication.is_removed() {
+        if self.publication.as_ref().is_some_and(|p| !p.is_removed()) {
             self.validate_holding()?;
-            self.publication.resolve_recovery().map_err(error)?;
-            self.publication.cleanup_empty().map_err(error)?;
+            let publication = self.publication.as_mut().unwrap();
+            publication.resolve_recovery().map_err(error)?;
+            publication.cleanup_empty().map_err(error)?;
         }
         fs_safety::sync_directory(self.context.placement().directory()).map_err(error)
     }
@@ -792,7 +805,20 @@ impl Owner {
         self.info_in_holding = false;
         fs_safety::sync_directory(&self.info).map_err(error)
     }
+    // Called only after all native/source and holding-parent syncs succeeded.
+    // Every exact payload/info pin stays in this owner, charged by pins LAST.
+    fn compact_completed(&mut self) {
+        debug_assert!(self.publication.as_ref().is_none_or(|p| p.is_removed()));
+        self.publication = None;
+        self.preimage.retire_source_parent();
+        self.restore_parent = None;
+    }
     fn retry(&mut self) -> Result<(), String> {
+        self.retry_active()?;
+        self.compact_completed();
+        Ok(())
+    }
+    fn retry_active(&mut self) -> Result<(), String> {
         // Explicit manual disposal may retire uncertainty only when BOTH
         // original native inodes are positively unlinked; moving them out of
         // the holding or observing pathname absence does not establish this.
@@ -824,7 +850,7 @@ impl Owner {
             let target = self
                 .restore_parent
                 .as_ref()
-                .unwrap_or(self.preimage.parent());
+                .unwrap_or_else(|| self.preimage.parent());
             let name = self.restore_name.as_deref().unwrap_or(self.preimage.name());
             verify_source_target(&self.preimage, target, name)?;
             rename(self.holding(), OsStr::new("payload"), target, name)?;
@@ -833,7 +859,7 @@ impl Owner {
             let parent = self
                 .restore_parent
                 .as_ref()
-                .unwrap_or(self.preimage.parent())
+                .unwrap_or_else(|| self.preimage.parent())
                 .try_clone()
                 .map_err(error)?;
             let name = self
@@ -852,7 +878,7 @@ impl Owner {
             let parent = self
                 .restore_parent
                 .as_ref()
-                .unwrap_or(self.preimage.parent())
+                .unwrap_or_else(|| self.preimage.parent())
                 .try_clone()
                 .map_err(error)?;
             let name = self
@@ -871,6 +897,10 @@ impl Owner {
         }
         if self.info_file.is_some() {
             self.remove_info()?;
+        }
+        if self.restored {
+            let target = self.restore_parent.as_ref().unwrap_or_else(|| self.preimage.parent());
+            fs_safety::sync_directory(target).map_err(error)?;
         }
         self.remove_empty_holding()
     }
@@ -930,11 +960,10 @@ fn restore_observing(
     owner.verify_info(&owner.info, &owner.info_name, false)?;
     // The previous empty holding may have been positively removed. Acquire a
     // new local holding with capacity reserved BEFORE any public Trash move.
-    if !owner.publication.is_removed() {
+    if owner.publication.as_ref().is_some_and(|p| !p.is_removed()) {
         return Err("Resolve previous native Trash holding before Undo".into());
     }
     let admission = context.reserve_directory()?;
-    let retry_slot = context.reserve()?;
     let new = fs_safety::prepare_recovery_directory_with_owner(
         admission,
         OsStr::new(&format!(".cagents-trash-undo-{}", Uuid::new_v4())),
@@ -969,7 +998,7 @@ fn restore_observing(
     };
     // Immediately transfer the complete new native aggregate BEFORE effects;
     // all refusal paths retain this actual holding in the original receipt.
-    owner.publication = h.publication;
+    owner.publication = Some(h.publication);
     owner.private_metadata = h.private;
     owner.restore_parent = Some(h.parent);
     owner.restore_name = Some(name.to_owned());
@@ -1017,7 +1046,11 @@ fn restore_observing(
         owner.remove_empty_holding()
     })();
     match result {
-        Ok(()) => Ok(None),
+        Ok(()) => {
+            owner.compact_completed();
+            owner.slot = None;
+            Ok(None)
+        },
         Err(reason) => {
             // Original receipt stays installed in the UI before this task.
             // Retain the actual new holding even when publication is uncertain.
@@ -1025,9 +1058,10 @@ fn restore_observing(
                 .live_recovery
                 .set_uncertain(!owner.restored_verified);
             let shared = receipt.owner.clone();
+            let slot = owner.slot.take().expect("active restore transaction charge");
             recovery
                 .live_recovery
-                .retain(retry_slot.retain(reason.clone(), move || {
+                .retain(slot.retain(reason.clone(), move || {
                     shared.lock().unwrap_or_else(|e| e.into_inner()).retry()
                 }));
             if owner.restored_verified {
@@ -1072,6 +1106,50 @@ fn identity(root: &fs_safety::Root) -> Result<(u64, u64), String> {
 mod tests {
     use super::*;
     #[test]
+    fn native_batch_128_compacts_only_completed_entries_and_keeps_shared_pins_through_clones() {
+        let source = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let root = Arc::new(fs_safety::Root::open(source.path()).unwrap());
+        let paths = (0..128).map(|index| RepoPath::parse(format!("entry-{index}")).unwrap())
+            .collect::<Vec<_>>();
+        let originals = paths.iter().enumerate().map(|(index, path)| {
+            fs::write(source.path().join(path.as_path()), format!("original-{index}")).unwrap();
+            fs::symlink_metadata(source.path().join(path.as_path())).unwrap()
+        }).collect::<Vec<_>>();
+        let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
+        let live = LiveDiscardRecovery::default();
+        let mut batch = prepare_in(root.clone(), &paths, &context, &live,
+            &CancellationToken::new(), data.path().to_owned()).unwrap().unwrap();
+        assert_eq!(batch._pins._slots.len(), 17);
+        let pins = Arc::downgrade(&batch._pins);
+        let mut receipts = Vec::new();
+        for (path, original) in paths.iter().zip(&originals) {
+            let receipt = batch.discard(path, &live, &CancellationToken::new()).unwrap();
+            assert!(receipt.warning.is_none());
+            assert!(batch.transaction.is_some());
+            let owner = receipt.owner.lock().unwrap();
+            assert!(owner.publication.is_none());
+            assert!(owner.slot.is_none());
+            assert!(!owner.preimage.has_source_parent());
+            let actual = owner.preimage.payload().metadata().unwrap();
+            assert_eq!((actual.dev(), actual.ino()), (original.dev(), original.ino()));
+            assert_eq!(owner.info_file.as_ref().unwrap().metadata().unwrap().nlink(), 1);
+            drop(owner);
+            receipts.push(receipt);
+        }
+        assert!(!live.needs_resolution());
+        assert_eq!(fs::read_dir(context.placement().directory().path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(data.path().join("Trash/files")).unwrap().count(), 128);
+        assert_eq!(fs::read_dir(data.path().join("Trash/info")).unwrap().count(), 128);
+        let clone = receipts[0].clone();
+        drop(receipts);
+        drop(batch);
+        assert!(pins.upgrade().is_some(), "indexed receipt clone owns the entire shared charge");
+        drop(clone);
+        assert!(pins.upgrade().is_none());
+    }
+
+    #[test]
     fn native_discard_acquired_writer_change_reports_unknown_and_stops_remaining_paths() {
         use std::os::unix::fs::FileExt;
 
@@ -1100,16 +1178,24 @@ mod tests {
         let writer = fs::File::options().write(true).open(&file).unwrap();
         let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
         let live = LiveDiscardRecovery::default();
+        let mut paths = vec![path.clone(), later.clone()];
+        for index in 2..128 {
+            let next = RepoPath::parse(format!("later-{index}")).unwrap();
+            fs::write(source.path().join(next.as_path()), b"later untouched\n").unwrap();
+            paths.push(next);
+        }
         let mut batch = prepare_in(
-            root.clone(), &[path.clone(), later.clone()], &context, &live,
+            root.clone(), &paths, &context, &live,
             &CancellationToken::new(), data.path().to_owned(),
         ).unwrap();
         let mut trashed = Vec::new();
+        let pins = Arc::downgrade(&batch.as_ref().unwrap()._pins);
+        assert_eq!(pins.upgrade().unwrap()._slots.len(), 17);
         let mut acquired = Vec::new();
         let outcome = service.discard_recovery_mutation_observing(
             &DiscardRequest {
                 worktree: source.path().to_owned(), tracked: Vec::new(),
-                untracked: vec![path.clone(), later.clone()], confirmed: true,
+                untracked: paths.clone(), confirmed: true,
             },
             &CancellationToken::new(), &mut trashed, &root, &BTreeMap::new(),
             &mut batch, &live, &mut |acquired_path| {
@@ -1141,6 +1227,11 @@ mod tests {
         let retained = fs::metadata(&payload).unwrap();
         assert_eq!((retained.dev(), retained.ino()), (original.dev(), original.ino()));
         assert_eq!(fs::read(&payload).unwrap(), b"newer FD edit\n");
+        drop(batch);
+        assert!(pins.upgrade().is_some(), "active failed entry keeps the full batch pin charge");
+        for path in &paths[1..] {
+            assert_eq!(fs::read(source.path().join(path.as_path())).unwrap(), b"later untouched\n");
+        }
         let retry = live.authority().unwrap();
         assert!(retry.retry().is_err(), "newer original bytes must not be adopted or rolled back");
         assert_eq!(fs::read(&payload).unwrap(), b"newer FD edit\n");
@@ -1154,6 +1245,7 @@ mod tests {
         fs::remove_file(&info[0]).unwrap();
         retry.retry().unwrap();
         assert!(retry.is_resolved());
+        assert!(pins.upgrade().is_none(), "only actual settlement releases original failed owner and shared charge");
         assert!(!holding.exists());
         assert_eq!(fs::read(source.path().join(later.as_path())).unwrap(), b"later untouched\n");
     }

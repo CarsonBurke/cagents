@@ -10,7 +10,7 @@ use super::*;
 pub(super) struct NativePreimage {
     source: Arc<fs_safety::Root>,
     path: RepoPath,
-    parent: Arc<fs_safety::Root>,
+    parent: Option<Arc<fs_safety::Root>>,
     name: OsString,
     payload: Arc<fs::File>,
     metadata: fs::Metadata,
@@ -100,7 +100,7 @@ impl NativePreimage {
         let proof = Self {
             source,
             path,
-            parent: Arc::new(parent),
+            parent: Some(Arc::new(parent)),
             name,
             payload,
             metadata,
@@ -117,7 +117,16 @@ impl NativePreimage {
         &self.path
     }
     pub(super) fn parent(&self) -> &fs_safety::Root {
-        &self.parent
+        self.parent.as_deref().expect("active original source parent")
+    }
+    /// Only after the original source and both Trash directories are synced.
+    /// Payload identity is never reopened or released here.
+    #[cfg(test)]
+    pub(super) fn has_source_parent(&self) -> bool {
+        self.parent.is_some()
+    }
+    pub(super) fn retire_source_parent(&mut self) {
+        self.parent = None;
     }
     pub(super) fn name(&self) -> &OsStr {
         &self.name
@@ -191,7 +200,7 @@ impl NativePreimage {
         }
         let (parent, name) = fs_safety::open_parent_beneath(&self.source, self.path.as_path())
             .map_err(|error| error.to_string())?;
-        if name != self.name || !same_directory(&parent, &self.parent)? {
+        if name != self.name || !same_directory(&parent, self.parent())? {
             return Err("The original native Trash source parent was replaced".into());
         }
         Ok(())
@@ -210,7 +219,7 @@ impl NativePreimage {
             return Err("Native Trash preparation cancelled".into());
         }
         self.verify_location()?;
-        let named = fs_safety::metadata_beneath(&self.parent, Path::new(&self.name))
+        let named = fs_safety::metadata_beneath(self.parent(), Path::new(&self.name))
             .map_err(|error| error.to_string())?;
         if !same_version(&self.metadata, &named)
             || !same_version(
@@ -242,7 +251,7 @@ impl NativePreimage {
             return Err("Native Trash preparation cancelled".into());
         }
         self.verify_location()?;
-        let named = fs_safety::metadata_beneath(&self.parent, Path::new(&self.name))
+        let named = fs_safety::metadata_beneath(self.parent(), Path::new(&self.name))
             .map_err(|error| error.to_string())?;
         if !same_version(&self.metadata, &named)
             || !same_version(

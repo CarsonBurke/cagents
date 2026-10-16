@@ -135,6 +135,17 @@ impl FilesystemRecoveryContext {
             slot,
         })
     }
+    /// Reuse a completed transaction's original charge, never a foreign
+    /// context's slot. The caller must have removed and synced its old holding.
+    pub(crate) fn recycle_directory_slot(
+        &self,
+        slot: RecoverySlot,
+    ) -> Result<FilesystemRecoveryReservation, RecoverySlot> {
+        if !slot.belongs_to(&self.context) {
+            return Err(slot);
+        }
+        Ok(FilesystemRecoveryReservation { context: self.clone(), slot })
+    }
     pub(crate) fn reserve(&self) -> Result<RecoverySlot, String> {
         self.placement
             .validate()

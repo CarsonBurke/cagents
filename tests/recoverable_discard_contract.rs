@@ -240,6 +240,64 @@ fn local_discard_native_mixed_roundtrip_and_empty_parent_pruning() {
     assert_eq!(fs::read_dir(trash().join("info")).unwrap().count(), 0);
 }
 #[test]
+fn local_discard_128_native_and_tracked_roundtrip_keeps_newer_entries_per_path() {
+    const NAME: &str = "local_discard_128_native_and_tracked_roundtrip_keeps_newer_entries_per_path";
+    if isolated(NAME, false) { return; }
+    let root = setup();
+    fs::create_dir(root.join("many")).unwrap();
+    let names = (0..128).map(|index| format!("many/entry-{index}")).collect::<Vec<_>>();
+    let originals = names.iter().enumerate().map(|(index, name)| {
+        let file = root.join(name);
+        if index % 7 == 0 {
+            symlink("../modified", &file).unwrap();
+        } else {
+            fs::write(&file, format!("original native {index}\n")).unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        fs::symlink_metadata(&file).unwrap()
+    }).collect::<Vec<_>>();
+    let source = service(&root);
+    let requested = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let result = source.discard_recoverable(
+        &request(&root, &["modified", "deleted", "executable"], &requested),
+        &CancellationToken::new(), &[root.clone()]).unwrap();
+    applied(&result.outcome);
+    assert!(!root.join("many").exists());
+    assert_eq!(fs::read_dir(trash().join("files")).unwrap().count(), 128);
+    assert_eq!(fs::read_dir(trash().join("info")).unwrap().count(), 128);
+    // A newer destination refuses independently while the other127 original
+    // Trash inodes and all tracked preimages are restored by the real service.
+    fs::create_dir(root.join("many")).unwrap();
+    fs::write(root.join(&names[1]), b"newer user work\n").unwrap();
+    let undo = source.undo_discard(&result.recovery, &CancellationToken::new()).unwrap();
+    assert!(matches!(undo, MutationOutcome::PartiallyApplied { .. }), "{undo:?}");
+    assert_eq!(result.recovery.remaining_paths(), 1);
+    for (index, (name, original)) in names.iter().zip(&originals).enumerate() {
+        let file = root.join(name);
+        if index == 1 { assert_eq!(fs::read(&file).unwrap(), b"newer user work\n"); continue; }
+        let actual = fs::symlink_metadata(&file).unwrap();
+        assert_eq!((actual.dev(), actual.ino()), (original.dev(), original.ino()));
+        assert_eq!(actual.mode() & 0o7777, original.mode() & 0o7777);
+        if index % 7 == 0 { assert_eq!(fs::read_link(file).unwrap(), Path::new("../modified")); }
+        else { assert_eq!(fs::read(file).unwrap(), format!("original native {index}\n").as_bytes()); }
+    }
+    assert_eq!(fs::read(root.join("modified")).unwrap(), b"precious modified\n");
+    assert!(!root.join("deleted").exists());
+    assert_eq!(Command::new(root.join("executable")).status().unwrap().code(), Some(7));
+    assert_eq!(fs::read_dir(trash().join("files")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(trash().join("info")).unwrap().count(), 1);
+    fs::remove_file(root.join(&names[1])).unwrap();
+    applied(&source.undo_discard(&result.recovery, &CancellationToken::new()).unwrap());
+    assert_eq!(result.recovery.remaining_paths(), 0);
+    let restored = fs::metadata(root.join(&names[1])).unwrap();
+    assert_eq!((restored.dev(), restored.ino()), (originals[1].dev(), originals[1].ino()));
+    assert_eq!(fs::read(root.join(&names[1])).unwrap(), b"original native 1\n");
+    assert_eq!(fs::read_dir(trash().join("files")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(trash().join("info")).unwrap().count(), 0);
+    assert!(!root.join(".git/index.lock").exists());
+}
+
+#[test]
 fn local_discard_undo_preserves_newer_file_per_path() {
     const NAME: &str = "local_discard_undo_preserves_newer_file_per_path";
     if isolated(NAME, false) {
