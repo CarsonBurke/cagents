@@ -2,9 +2,18 @@ use super::*;
 use crate::account::info::{Query, Report};
 
 mod list;
+mod preferences;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountCommand {
+    /// Choose the selected daemon's account for new conversations.
+    Default {
+        /// Provider whose default changes: claude, codex, or omp (automatic only).
+        #[arg(value_parser = crate::control::agents::parse_provider)]
+        provider: crate::agent::Provider,
+        /// A full ID from account list (for example claude/system), or automatic.
+        selection: crate::account::preferences::DefaultSelection,
+    },
     /// List active accounts and any retained caller account from the selected daemon.
     List {
         /// Limit rows to claude, codex, or omp; never probe its CLI.
@@ -27,6 +36,7 @@ pub enum AccountCommand {
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (query, listing) = match command {
+        AccountCommand::Default { provider, selection } => return preferences::execute(provider, selection),
         AccountCommand::List { provider } => (list::query(provider), true),
         AccountCommand::Info {
             provider,

@@ -8,6 +8,17 @@ pub enum DefaultSelection {
     Account(AccountId),
 }
 
+impl std::str::FromStr for DefaultSelection {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("automatic") {
+            Ok(Self::Automatic)
+        } else {
+            value.parse().map(Self::Account)
+        }
+    }
+}
+
 /// Resolves and validates under the same registry mutation lease as the write.
 /// Cached observations can refuse a known conflict; absent observations never
 /// claim that the login was verified and never trigger a provider probe.
