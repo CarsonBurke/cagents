@@ -89,6 +89,8 @@ pub mod project_location;
 pub mod pull_request_review;
 pub mod recovery_authority;
 #[cfg(feature = "ui")]
+pub mod operation_recovery;
+#[cfg(feature = "ui")]
 pub mod reorder;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod repository;
