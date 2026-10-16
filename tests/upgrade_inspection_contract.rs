@@ -231,8 +231,8 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             program:"/bin/sh".into(), arguments:vec!["-c".into(),
                 "printf '%s\\n' \"$$\" > \"$1\"; while IFS= read -r line; do case \"$line\" in before) printf 'SOURCE-PTY-OK\\n';; after) printf 'SUCCESSOR-PTY-OK\\n';; esac; done".into(),
                 "private-fixture".into(),pid_path.to_string_lossy().into_owned()],
-            working_directory:root.clone(),environment:std::env::vars().filter(|(key,_)|
-                ["HOME","PATH","XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_STATE_HOME","XDG_CACHE_HOME"].contains(&key.as_str())).collect(),
+            working_directory:root.clone(),environment:["HOME","PATH","XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_STATE_HOME","XDG_CACHE_HOME"]
+                .into_iter().filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(),value))).collect(),
             unset_environment:Default::default(),
         };
         let id = TerminalId::new();
