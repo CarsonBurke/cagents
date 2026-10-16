@@ -138,6 +138,7 @@ mod tests {
         CreateWorktreeRequest {
             repository: root.join("repo"),
             managed_root: root.join("managed"),
+            managed_ignore_root: None,
             destination: root.join("managed/topic"),
             branch: ValidatedBranchName::parse("topic").unwrap(),
             base: BaseRevision::object_id("a".repeat(40)).unwrap(),

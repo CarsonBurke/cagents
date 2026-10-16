@@ -1081,6 +1081,7 @@ mod tests {
             setup_intent: None,
             repository: "/repo".into(),
             managed_root: "/".into(),
+            managed_ignore_root: None,
             destination: "/one".into(),
             branch: crate::repository::ValidatedBranchName::parse("feature/one").unwrap(),
             base: crate::repository::BaseRevision::object_id("a".repeat(40)).unwrap(),

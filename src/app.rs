@@ -2863,6 +2863,7 @@ impl SettingsField {
             Self::Notifications(Field::Waiting) => "Waiting for you",
             Self::Notifications(Field::ReviewRequests) => "Review requests",
             Self::Notifications(Field::WhileFocused) => "Notify while focused",
+            Self::Notifications(Field::MessagePreviews) => "Show message previews",
             Self::AppTheme => "App theme",
             Self::UiScale => "Interface scale",
             Self::TerminalLineHeight => "Line height",
@@ -4066,6 +4067,10 @@ pub enum Message {
     },
     Sidebar(SidebarAction),
     FocusCard(CardId),
+    AcknowledgeVisiblePane {
+        card: CardId,
+        epoch: u64,
+    },
     MovePaneToChannel {
         card: CardId,
         channel: crate::model::ChannelId,
@@ -4600,6 +4605,32 @@ struct CardLabels {
     unavailable: &'static str,
 }
 
+/// Inputs that can change a terminal's presentation. Ordinary runtime wakes
+/// reuse the numbered title instead of allocating it again for every pane.
+struct TerminalTitleSource {
+    reported: String,
+    directory: PathBuf,
+    program: String,
+    ordinal: u32,
+    fallback: bool,
+}
+
+impl TerminalTitleSource {
+    fn fallback(title: &str) -> bool {
+        // The host supplies a process/cwd fallback when OSC is absent. A
+        // nonempty reported title is authoritative even if it is a basename.
+        title.is_empty()
+    }
+
+    fn describes(&self, title: &str, directory: &Path, program: &str, ordinal: u32) -> bool {
+        let fallback = Self::fallback(title);
+        self.reported == title
+            && self.ordinal == ordinal
+            && self.fallback == fallback
+            && (!fallback || (self.directory == directory && self.program == program))
+    }
+}
+
 /// Widget ids and accessible names for one card.
 ///
 /// Both embed the card id and title, so they are built when a card appears or
@@ -4609,6 +4640,7 @@ struct CardChrome {
     tooltip: String,
     focus_id: widget::Id,
     title_id: widget::Id,
+    tab_id: widget::Id,
     container_id: widget::Id,
     close_id: widget::Id,
     resize_id: widget::Id,
@@ -4621,6 +4653,10 @@ struct CardChrome {
     browser_address_id: widget::Id,
     type_label: &'static str,
     title: String,
+    title_width: f32,
+    compact_title: Option<String>,
+    terminal_ordinal_suffix: Option<String>,
+    terminal_title_source: Option<TerminalTitleSource>,
     focused_name: String,
     caption: String,
     unfocused_name: String,
@@ -4638,6 +4674,7 @@ impl CardChrome {
             },
             focus_id: workspace_widget::card_focus_id(id),
             title_id: card_control_id(id, "title"),
+            tab_id: card_control_id(id, "tab"),
             container_id: workspace_widget::card_widget_id(id),
             close_id: card_control_id(id, "close"),
             resize_id: card_control_id(id, "resize"),
@@ -4650,6 +4687,10 @@ impl CardChrome {
             browser_address_id: card_control_id(id, "browser.address"),
             type_label,
             title: title.to_owned(),
+            title_width: chrome_ui::measure_tab_title(title),
+            compact_title: None,
+            terminal_ordinal_suffix: None,
+            terminal_title_source: None,
             caption: caption.to_owned(),
             focused_name: card_accessible_name(type_label, title, caption, true),
             unfocused_name: card_accessible_name(type_label, title, caption, false),
@@ -4858,6 +4899,7 @@ pub struct Cagents {
     workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     notification_ui: notification_ui::State,
+    attention_focus_epoch: u64,
     daemon_health_ui: daemon_health_ui::State,
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
@@ -5763,6 +5805,15 @@ impl Cagents {
         }
     }
 
+    fn new_pane_fraction(&self, configured: f32) -> f32 {
+        let width = self.workspace.viewport_width();
+        if width > 0.0 && width < design::NARROW_WORKSPACE_WIDTH {
+            1.0
+        } else {
+            configured
+        }
+    }
+
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
         let mut launch = match LaunchRecipe::shell(working_directory.clone()) {
             Ok(launch) => launch,
@@ -5846,7 +5897,7 @@ impl Cagents {
                 .file_name()
                 .and_then(|name| normalize_card_name(&name.to_string_lossy()))
                 .unwrap_or_else(|| "Terminal".into()),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_column_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hydrating { epoch: 1 },
@@ -6393,7 +6444,7 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_native_pane_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -6421,7 +6472,9 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     title,
-                    CardWidth::Fraction(self.settings.default_native_pane_fraction),
+                    CardWidth::Fraction(
+                        self.new_pane_fraction(self.settings.default_native_pane_fraction),
+                    ),
                 )
                 .expect("pull request card is valid"),
                 index,
@@ -6863,7 +6916,7 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_native_pane_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -6881,7 +6934,9 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     title,
-                    CardWidth::Fraction(self.settings.default_native_pane_fraction),
+                    CardWidth::Fraction(
+                        self.new_pane_fraction(self.settings.default_native_pane_fraction),
+                    ),
                 )
                 .expect("repository card is valid"),
                 index,
@@ -6956,6 +7011,7 @@ impl Cagents {
         } else {
             self.cards.insert(card_id, CardRuntime::Loading);
         }
+        let width_fraction = self.new_pane_fraction(self.settings.default_column_fraction);
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.push(CardState {
             id: card_id,
@@ -6964,7 +7020,7 @@ impl Cagents {
                 .host_str()
                 .and_then(normalize_card_name)
                 .unwrap_or_else(|| "Browser".into()),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction,
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hydrating {
@@ -6992,7 +7048,9 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     "Browser",
-                    CardWidth::Fraction(self.settings.default_column_fraction),
+                    CardWidth::Fraction(
+                        self.new_pane_fraction(self.settings.default_column_fraction),
+                    ),
                 )
                 .expect("browser card is valid"),
                 index,
@@ -7264,9 +7322,12 @@ impl Cagents {
     }
 
     fn pane_is_active(&self, card: CardId) -> bool {
-        self.workspace.focused() == Some(card)
+        self.exit.is_none()
+            && self.refresh_ui.focused
+            && self.workspace.focused() == Some(card)
             && self.workspace_surfaces_visible()
             && !self.modal_is_open()
+            && !matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if !runtime.parent_transcript_selected())
     }
 
     pub(super) fn observe_agent_update_for_card(&mut self, card: CardId) {
@@ -7333,7 +7394,78 @@ impl Cagents {
         }
     }
 
+    fn focus_attention_card(&mut self, id: CardId) -> Task<Message> {
+        if self.exit.is_some()
+            || self.workspace_inputs_blocked()
+            || self.focused_repository_is_saving()
+            || self.update_prepared
+        {
+            return Task::none();
+        }
+        let Some(card) = self
+            .card_state(id)
+            .filter(|card| card.existence.is_open())
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&id))
+            .map(|channel| channel.id);
+        let scope = if let Some(channel) = channel {
+            self.select_channel(channel)
+        } else {
+            let directory = self.unchanneled_card_worktree(&card).map(Path::to_path_buf);
+            directory.map_or_else(Task::none, |directory| {
+                self.select_worktree(directory, false)
+            })
+        };
+        let focus = self.focus_workspace_card(id);
+        // Attention belongs to the native parent. Reveal its transcript before
+        // acknowledging it, but only after navigation has actually succeeded.
+        let (transcript, read) = if self.workspace.focused() == Some(id) {
+            let parent = match self.cards.get(&id) {
+                Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
+                _ => None,
+            };
+            let transcript = parent.map_or_else(Task::none, |target| {
+                self.handle_chat_ui(chat_ui::Action::SelectSubagent(target, None))
+            });
+            (transcript, self.mark_cards_read(vec![id]))
+        } else {
+            (Task::none(), Task::none())
+        };
+        Task::batch([scope, focus, transcript, read])
+    }
+
+    fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
+        let tasks: Vec<_> = cards
+            .into_iter()
+            .map(|card| {
+                self.sidebar_state.acknowledge_agent_update(card);
+                self.acknowledge_card_notices(card);
+                if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+                    && let Err(error) = handle.acknowledge_updates()
+                {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not acknowledge terminal output: {error}"
+                    )));
+                }
+                self.acknowledge_chat_updates(card)
+            })
+            .collect();
+        self.refresh_sidebar_channels();
+        Task::batch(tasks)
+    }
+
     fn acknowledge_active_pane(&mut self) -> Task<Message> {
+        self.acknowledge_active_pane_with_notices(true)
+    }
+
+    fn acknowledge_active_pane_with_notices(&mut self, acknowledge_notices: bool) -> Task<Message> {
         let Some(card) = self
             .workspace
             .focused()
@@ -7351,6 +7483,9 @@ impl Cagents {
             self.status = Some(TransientNotice::error(format!(
                 "Could not acknowledge terminal output: {error}"
             )));
+        }
+        if acknowledge_notices {
+            self.acknowledge_card_notices(card);
         }
         self.acknowledge_chat_updates(card)
     }
@@ -7391,28 +7526,6 @@ impl Cagents {
         if self.chrome_ui.user_titles.contains_key(&id) {
             return false;
         }
-        let title = if title.starts_with('/') || title.starts_with("~/") {
-            self.card_state(id)
-                .and_then(|state| match &state.kind {
-                    CardKind::Terminal(session) => {
-                        let process = Path::new(&session.launch.program)
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        let directory = session
-                            .launch
-                            .working_directory
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        Some(format!("{process} · {directory}"))
-                    }
-                    _ => None,
-                })
-                .unwrap_or(title)
-        } else {
-            title
-        };
         let Some(title) = normalize_card_name(&title) else {
             return false;
         };
@@ -7451,6 +7564,45 @@ impl Cagents {
                 .enumerate()
                 .map(|(index, card)| (card.id, index)),
         );
+        // A moved worktree keeps its pane numbers. Reconcile its new scope's
+        // counter before minting a number, including when insertion precedes
+        // an existing pane in the saved order.
+        if self.durable.cards.iter().any(|card| {
+            matches!(card.kind, CardKind::Terminal(_))
+                && !self.chrome_ui.terminal_ordinals.contains_key(&card.id)
+        }) {
+            for card in &self.durable.cards {
+                if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id).copied() {
+                    let scope = self
+                        .unchanneled_card_worktree(card)
+                        .unwrap_or_else(|| Path::new(""))
+                        .to_owned();
+                    let next = self
+                        .chrome_ui
+                        .terminal_next_ordinals
+                        .entry(scope)
+                        .or_default();
+                    *next = (*next).max(ordinal);
+                }
+            }
+        }
+        for card in &self.durable.cards {
+            if matches!(card.kind, CardKind::Terminal(_))
+                && !self.chrome_ui.terminal_ordinals.contains_key(&card.id)
+            {
+                let scope = self
+                    .unchanneled_card_worktree(card)
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_owned();
+                let next = self
+                    .chrome_ui
+                    .terminal_next_ordinals
+                    .entry(scope)
+                    .or_default();
+                *next += 1;
+                self.chrome_ui.terminal_ordinals.insert(card.id, *next);
+            }
+        }
         let mut presentation_updates = Vec::new();
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
@@ -7482,7 +7634,30 @@ impl Cagents {
                 .get(&card.id)
                 .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption))
             {
-                let chrome = CardChrome::new(card.id, type_label, &title, &caption);
+                let mut chrome = CardChrome::new(card.id, type_label, &title, &caption);
+                if matches!(card.kind, CardKind::Terminal(_))
+                    && !self.chrome_ui.user_titles.contains_key(&card.id)
+                    && let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
+                {
+                    let suffix = format!(" ({ordinal})");
+                    let base = title.strip_suffix(&suffix).unwrap_or(&title);
+                    chrome.compact_title = Some(format!("{ordinal} {base}"));
+                    chrome.terminal_ordinal_suffix = Some(suffix);
+                    if let CardKind::Terminal(session) = &card.kind {
+                        let reported = self.card_display_title(card);
+                        let directory = self
+                            .terminal_working_directories
+                            .get(&card.id)
+                            .unwrap_or(&session.launch.working_directory);
+                        chrome.terminal_title_source = Some(TerminalTitleSource {
+                            reported: reported.to_owned(),
+                            directory: directory.clone(),
+                            program: session.launch.program.clone(),
+                            ordinal: *ordinal,
+                            fallback: TerminalTitleSource::fallback(reported),
+                        });
+                    }
+                }
                 self.card_chrome.insert(card.id, chrome);
             }
         }
@@ -7491,6 +7666,9 @@ impl Cagents {
         }
         if self.card_chrome.len() != self.durable.cards.len() {
             self.card_chrome
+                .retain(|id, _| self.card_indices.contains_key(id));
+            self.chrome_ui
+                .terminal_ordinals
                 .retain(|id, _| self.card_indices.contains_key(id));
         }
         self.sync_window_title()
@@ -7516,7 +7694,38 @@ impl Cagents {
                 )),
             );
         }
-        (Cow::Borrowed(self.card_display_title(card)), None)
+        let title = self.card_display_title(card);
+        if let CardKind::Terminal(session) = &card.kind
+            && !self.chrome_ui.user_titles.contains_key(&card.id)
+        {
+            let directory = self
+                .terminal_working_directories
+                .get(&card.id)
+                .unwrap_or(&session.launch.working_directory);
+            if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
+                && let Some(chrome) = self.card_chrome.get(&card.id)
+                && chrome.terminal_title_source.as_ref().is_some_and(|source| {
+                    source.describes(title, directory, &session.launch.program, *ordinal)
+                })
+            {
+                return (Cow::Borrowed(chrome.title.as_str()), None);
+            }
+            let basename = directory.file_name().unwrap_or_default().to_string_lossy();
+            let title = if TerminalTitleSource::fallback(title) {
+                let process = Path::new(&session.launch.program)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                Cow::Owned(format!("{process} · {basename}"))
+            } else {
+                Cow::Borrowed(title)
+            };
+            if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id) {
+                return (Cow::Owned(format!("{title} ({ordinal})")), None);
+            }
+            return (title, None);
+        }
+        (Cow::Borrowed(title), None)
     }
 
     /// Provider activity belongs in the status icon, including restored titles.
@@ -7526,6 +7735,18 @@ impl Cagents {
         }
         if matches!(card.kind, CardKind::Browser(_)) {
             return browser_host::TITLE;
+        }
+        if let CardKind::Chat(session) = &card.kind
+            && let Some(channel) = self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty())
+            && (card.title == chat_ui::chat_card_title(session.launch.provider)
+                || (channel.title_source == crate::model::ChannelTitleSource::Manual
+                    && self.channel_primary_chat(channel) == Some(card.id)))
+        {
+            return &channel.title;
         }
         let title = crate::agent::codex_title_without_status(&card.title);
         // Provider recognition can only change an empty or status-prefixed
@@ -7575,9 +7796,14 @@ impl Cagents {
                 .durable
                 .focused
                 .and_then(|id| self.card_state(id))
-                .map(|card| self.card_display_title(card).trim())
-                .filter(|title| !title.is_empty())
-                .unwrap_or(APPLICATION_NAME);
+                .map(|card| self.repository_chrome(card).0)
+                .unwrap_or(Cow::Borrowed(APPLICATION_NAME));
+            let showing = showing.trim();
+            let showing = if showing.is_empty() {
+                APPLICATION_NAME
+            } else {
+                showing
+            };
             if self.core.window.header_title == showing {
                 return Task::none();
             }
@@ -8119,7 +8345,9 @@ impl Cagents {
         }
         let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
-        tasks.push(self.acknowledge_active_pane());
+        if focus_changed {
+            tasks.push(self.acknowledge_active_pane());
+        }
         if self.chrome_ui.tabs_focus != focused {
             self.chrome_ui.tabs_focus = focused;
             tasks.push(self.reveal_active_tab());
@@ -11838,9 +12066,29 @@ impl Cagents {
     }
 
     fn activate_main_window(&self, token: Option<String>) -> Task<Message> {
-        iced::Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Activate(
-            token.unwrap_or_default(),
-        )))
+        self.activate_main_window_on_backend(cosmic::app::cosmic::windowing_system(), token)
+    }
+
+    fn activate_main_window_on_backend(
+        &self,
+        backend: Option<cosmic::app::cosmic::WindowingSystem>,
+        token: Option<String>,
+    ) -> Task<Message> {
+        let Some(window) = self.core.main_window_id() else {
+            return Task::none();
+        };
+        if backend == Some(cosmic::app::cosmic::WindowingSystem::Wayland) {
+            // Preserve the compositor's token decision on an actual Wayland
+            // surface. Compiling Wayland support does not make an X11 window
+            // capable of receiving that platform-specific activation command.
+            iced::Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Activate(
+                token.unwrap_or_default(),
+            )))
+        } else {
+            iced::window::minimize(window, false)
+                .chain(iced::window::gain_focus(window))
+                .map(cosmic::Action::App)
+        }
     }
 
     fn window_close_transient_blocker(&self) -> Option<&'static str> {
@@ -12114,7 +12362,7 @@ impl Cagents {
             id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_native_pane_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -12908,6 +13156,7 @@ impl Application for Cagents {
             workspace_model_tx,
             activation_rx,
             notification_ui: notification_ui::State::default(),
+            attention_focus_epoch: 0,
             daemon_health_ui: daemon_health_ui::State::default(),
             session,
             save_health,
@@ -13163,6 +13412,17 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let attention_scope_changed = matches!(
+            &message,
+            Message::RepositoryLoaded { result: Ok(_), .. }
+                | Message::DeviceProjectLoaded { result: Ok(_), .. }
+                | Message::AttachedWorktreePrsResolved { .. }
+                | Message::GitUi(_)
+        );
+        // Preserve the existing dispatch layout while every return converges
+        // through the lightweight visibility/presence postlude below.
+        #[rustfmt::skip]
+        let task = (|| {
         self.reconcile_terminal_review_owner();
         self.cancel_stale_pr_creations();
         if let Some(notice) = crate::diagnostics::take_notice() {
@@ -14181,18 +14441,9 @@ impl Application for Cagents {
                     SidebarAction::ToggleProjects => self.update_chrome(chrome_ui::Action::ToggleProjects),
                     SidebarAction::RenameChannel(id) => self.update_chrome(chrome_ui::Action::RenameChannel(id)),
                     SidebarAction::MarkChannelRead(id) => {
-                        let cards = self.durable.channels.iter().find(|channel| channel.id == id).map(|channel| channel.cards.clone()).unwrap_or_default();
-                        let tasks: Vec<_> = cards.into_iter().map(|card| {
-                            self.sidebar_state.acknowledge_agent_update(card);
-                            if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
-                                && let Err(error) = handle.acknowledge_updates()
-                            {
-                                self.status = Some(TransientNotice::error(format!("Could not acknowledge terminal output: {error}")));
-                            }
-                            self.acknowledge_chat_updates(card)
-                        }).collect();
-                        self.refresh_sidebar_channels();
-                        Task::batch(tasks)
+                        let cards = self.durable.channels.iter().find(|channel| channel.id == id)
+                            .map(|channel| channel.cards.clone()).unwrap_or_default();
+                        self.mark_cards_read(cards)
                     }
                     SidebarAction::ScrollProjects(y) => iced::widget::operation::scroll_by(
                         widget::Id::new("sidebar.projects.scroll"),
@@ -14626,6 +14877,11 @@ impl Application for Cagents {
                     | SidebarAction::SetFilter(_)
                     | SidebarAction::ToggleProject(_) => Task::none(),
                 }
+            }
+            Message::AcknowledgeVisiblePane { card, epoch } => {
+                if epoch == self.attention_focus_epoch && self.pane_is_active(card) {
+                    self.acknowledge_visible_pane()
+                } else { Task::none() }
             }
             Message::FocusCard(id) => {
                 // Explicit activation also cancels a pending entry on this same
@@ -16516,7 +16772,6 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
-        self.sync_notification_presence();
         self.sync_worktree_protections();
         self.sync_popup_keyboard_nav();
         if let Some(notice) = self.status.take()
@@ -16575,6 +16830,14 @@ impl Application for Cagents {
             notices,
             terminal_probes,
         ])
+            })();
+        if attention_scope_changed {
+            self.notification_ui.scope_changed();
+        }
+        let activation = self.retry_notification_activation();
+        let visibility = self.sync_visible_attention();
+        self.sync_notification_presence();
+        Task::batch([task, activation, visibility])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -18625,6 +18888,24 @@ mod tests {
             arguments: Vec::new(),
             working_directory: working_directory.into(),
             environment: Default::default(),
+        }
+    }
+
+    #[test]
+    fn new_pane_width_adapts_without_rewriting_existing_panes() {
+        let mut app = context_inspector_test_app(true);
+        let existing = app.workspace.focused().unwrap();
+        let width = app.card_state(existing).unwrap().width_fraction;
+        for (viewport, expected) in [(900.0, 1.0), (1100.0, 0.5), (1600.0, 0.5)] {
+            app.workspace.resize_viewport(viewport);
+            assert_eq!(app.new_pane_fraction(0.5), expected);
+            drop(app.add_utility_card(CardKind::Settings));
+            let added = app.workspace.focused().unwrap();
+            assert_eq!(
+                app.card_state(added).unwrap().width_fraction,
+                app.new_pane_fraction(app.settings.default_native_pane_fraction)
+            );
+            assert_eq!(app.card_state(existing).unwrap().width_fraction, width);
         }
     }
 
@@ -25402,6 +25683,7 @@ mod tests {
             workspace_model_tx: async_channel::unbounded().0,
             activation_rx: async_channel::unbounded().1,
             notification_ui: notification_ui::State::default(),
+            attention_focus_epoch: 0,
             daemon_health_ui: daemon_health_ui::State::default(),
             session: None,
             save_health: None,
@@ -25530,6 +25812,11 @@ mod tests {
         use crate::agent::{Activity, ActivityState, Provider};
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
+        let window = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(window));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window, true,
+        ))));
         app.settings.focus_follows_mouse = true;
         let first = app.workspace.focused().unwrap();
         let second = terminal_card_state();
@@ -26263,6 +26550,62 @@ mod tests {
         assert_eq!(app.workspace.take_widget_focus_request(), None);
         let _ = app.apply_viewport(update, true, false);
         assert_ne!(app.workspace.focused(), Some(first));
+    }
+
+    #[test]
+    fn notification_activation_unminimizes_and_focuses_actual_x11_window() {
+        use cosmic::app::cosmic::WindowingSystem;
+        use iced::runtime::{Action, window::Action as WindowAction};
+        let mut app = context_inspector_test_app(true);
+        let window = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(window));
+        for backend in [
+            Some(WindowingSystem::Xlib),
+            Some(WindowingSystem::Xcb),
+            None,
+        ] {
+            let task = app.activate_main_window_on_backend(backend, Some("portal-token".into()));
+            let stream = iced::runtime::task::into_stream(task).unwrap();
+            let effects = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(stream.collect::<Vec<_>>());
+            assert_eq!(effects.len(), 2);
+            assert!(
+                matches!(effects[0], Action::Window(WindowAction::Minimize(id, false)) if id == window)
+            );
+            assert!(
+                matches!(effects[1], Action::Window(WindowAction::GainFocus(id)) if id == window)
+            );
+        }
+    }
+
+    #[test]
+    fn notification_activation_keeps_actual_wayland_token_and_refusal_semantics() {
+        use cosmic::app::cosmic::WindowingSystem;
+        let mut app = context_inspector_test_app(true);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        for token in [Some("portal-token".to_owned()), None] {
+            let expected = token.clone().unwrap_or_default();
+            let task = app.activate_main_window_on_backend(Some(WindowingSystem::Wayland), token);
+            let stream = iced::runtime::task::into_stream(task).unwrap();
+            let effects = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(stream.collect::<Vec<_>>());
+            assert_eq!(effects.len(), 1);
+            assert!(
+                matches!(&effects[0], iced::runtime::Action::Output(cosmic::Action::Cosmic(cosmic::app::Action::Activate(actual))) if actual == &expected)
+            );
+        }
+        app.core.set_main_window_id(None);
+        assert!(
+            iced::runtime::task::into_stream(app.activate_main_window_on_backend(
+                Some(WindowingSystem::Wayland),
+                Some("portal-token".into())
+            ))
+            .is_none()
+        );
     }
 
     pub(super) fn task_app_message(task: Task<Message>) -> Message {
