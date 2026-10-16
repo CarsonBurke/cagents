@@ -181,3 +181,76 @@ impl Write for DeadlineStream<'_> {
         self.stream.flush()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proof() -> HostSessionProof {
+        HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("private-source"),
+            boot_id: crate::model::BootId::new("private-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("private-owner"),
+        }
+    }
+
+    #[test]
+    fn current_response_refuses_changed_protocol_owner_and_request_identity() {
+        for mismatch in 0..3 {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let worker = std::thread::spawn(move || {
+                let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(request.request, ClientRequest::ChatList));
+                let mut envelope = ServerEnvelope {
+                    version: ipc::PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::ChatListed {
+                            sessions: Vec::new(),
+                        },
+                    },
+                };
+                match mismatch {
+                    0 => envelope.version = 77,
+                    1 => envelope.request_id = Some(request.request_id + 1),
+                    _ => {
+                        envelope.proof.host_incarnation =
+                            crate::model::HostIncarnation::new("foreign-owner")
+                    }
+                }
+                ipc::write_frame(&mut peer, &envelope).unwrap();
+            });
+            let mut client = Client {
+                stream,
+                proof: proof(),
+                next: 1,
+                deadline: Instant::now() + Duration::from_secs(2),
+            };
+            let result = client.list();
+            drop(client);
+            let joined = worker.join();
+            joined.unwrap();
+            assert!(result.unwrap_err().contains("identity changed"));
+        }
+    }
+
+    #[test]
+    fn expired_current_inspection_sends_no_request() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut client = Client {
+            stream,
+            proof: proof(),
+            next: 1,
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+        let refused = client.list().is_err();
+        let observed = peer.read(&mut [0u8; 1]).unwrap_err().kind();
+        assert!(refused);
+        assert_eq!(observed, io::ErrorKind::WouldBlock);
+    }
+}
