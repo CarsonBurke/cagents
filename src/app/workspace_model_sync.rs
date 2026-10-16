@@ -915,12 +915,6 @@ impl Cagents {
         agent: &crate::agent_execution::Agent,
         display: crate::workspace_model::views::ManagedDisplay,
     ) -> Option<Task<Message>> {
-        let placement = &display.scope;
-        if agent.closed
-            || matches!(placement, crate::agent_execution::Placement::Channel(channel) if self.channel_ui.is_deleting(*channel) || self.channel_ui.was_deleted(*channel))
-        {
-            return None;
-        }
         let session = match display.pane.as_ref().map(|pane| &pane.kind) {
             Some(CardKind::Chat(session)) => {
                 crate::agent_execution::HostedSession::Chat(session.clone())
@@ -934,6 +928,55 @@ impl Cagents {
             }
             None => agent.session.clone()?,
         };
+        self.adopt_execution_agent_resolved_session(agent, display, session)
+    }
+
+    pub(super) fn adopt_execution_agent_activation_display(
+        &mut self,
+        agent: &crate::agent_execution::Agent,
+        display: crate::workspace_model::views::ManagedDisplay,
+        session: crate::agent_execution::HostedSession,
+    ) -> Option<Task<Message>> {
+        use crate::agent_execution::HostedSession;
+        if !session.has_complete_proof() {
+            return None;
+        }
+        let owned = agent
+            .session
+            .as_ref()
+            .is_some_and(|current| current.same_process(&session))
+            || agent.console.as_ref().is_some_and(|current| {
+                HostedSession::Terminal(current.clone()).same_process(&session)
+            });
+        let saved_matches = match display.pane.as_ref().map(|pane| &pane.kind) {
+            Some(CardKind::Chat(current)) => {
+                HostedSession::Chat(current.clone()).same_process(&session)
+            }
+            Some(CardKind::Terminal(current)) => {
+                HostedSession::Terminal(current.clone()).same_process(&session)
+            }
+            Some(_) => false,
+            None => true,
+        };
+        if !owned || !saved_matches {
+            return None;
+        }
+        self.adopt_execution_agent_resolved_session(agent, display, session)
+    }
+
+    fn adopt_execution_agent_resolved_session(
+        &mut self,
+        agent: &crate::agent_execution::Agent,
+        display: crate::workspace_model::views::ManagedDisplay,
+        session: crate::agent_execution::HostedSession,
+    ) -> Option<Task<Message>> {
+        let placement = &display.scope;
+        if !session.has_complete_proof()
+            || agent.closed
+            || matches!(placement, crate::agent_execution::Placement::Channel(channel) if self.channel_ui.is_deleting(*channel) || self.channel_ui.was_deleted(*channel))
+        {
+            return None;
+        }
         let channel_index = match placement {
             crate::agent_execution::Placement::Channel(id) => Some(
                 self.durable
@@ -2763,6 +2806,33 @@ mod tests {
         ];
         app.workspace_model.agents.push(agent.clone());
         (app, agent, pane, destination)
+    }
+
+    #[test]
+    fn attention_unpublished_managed_adoption_requires_complete_source_proof() {
+        let (mut app, mut agent, _, _) = managed_display_fixture();
+        app.workspace_model.views.clear();
+        let crate::agent_execution::HostedSession::Terminal(source) =
+            agent.session.as_mut().unwrap()
+        else {
+            panic!("terminal fixture");
+        };
+        source.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new(""),
+            boot_id: crate::model::BootId::new(""),
+            host_incarnation: crate::model::HostIncarnation::new(""),
+        };
+        agent.console.as_mut().unwrap().continuity = source.continuity.clone();
+        app.workspace_model.agents = vec![agent.clone()];
+        let original = app.durable.clone();
+        let count = app.cards.len();
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        assert!(Arc::ptr_eq(&original, &app.durable));
+        assert_eq!(app.cards.len(), count);
+        assert!(
+            app.card_state(CardId::from_uuid(agent.id.as_uuid()))
+                .is_none()
+        );
     }
 
     #[test]

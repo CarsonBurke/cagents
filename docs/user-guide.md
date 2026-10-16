@@ -579,10 +579,15 @@ account registries prevent this orphan cleanup.
 
 **Notifications** controls background agent completion, failure or cancellation,
 and requests for attention. Alerts are suppressed while their pane is focused
-unless **Notify while focused** is enabled. They name the provider and
-folder, without copying prompts or output. **Send test notification** reports
+unless **Notify while focused** is enabled. By default, they name the provider and
+folder without copying prompts or output. **Show message previews** optionally
+adds bounded message context. **Send test notification** reports
 whether the desktop portal accepted the request; desktop settings control its
 presentation and sound.
+
+Clicking an alert selects its conversation or request. Your desktop decides
+whether to bring the window to the front. If it remains behind another window,
+select cagents with your desktop's window switcher.
 
 If the daemon stops replying, a persistent banner shows when the interruption
 began and how long the reply was allowed to take. Repeated transport notices
