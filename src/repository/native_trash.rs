@@ -480,6 +480,7 @@ impl Batch {
                 Ok(receipt)
             }
             Err(reason) if owner.payload_in_trash => {
+                let reason = owner.recovery_diagnostic(&reason);
                 live.set_uncertain(true);
                 let receipt = TrashReceipt {
                     path: path.clone(),
@@ -490,6 +491,7 @@ impl Batch {
                 Ok(receipt)
             }
             Err(reason) => {
+                let reason = owner.recovery_diagnostic(&reason);
                 live.set_uncertain(true);
                 live.retain(retry_slot.retain(
                     format!("Native Trash recovery for {path}: {reason}"),
@@ -511,6 +513,16 @@ fn retain_shared(receipt: &TrashReceipt, live: &LiveDiscardRecovery, slot: Recov
 }
 
 impl Owner {
+    fn recovery_diagnostic(&self, reason: &str) -> String {
+        // These are opened spellings for inspection, never retry authority.
+        // Actual Resolve continues to use only this owner's retained handles.
+        format!(
+            "{reason}. Recovery locations (opened spellings; directories may have moved): private holding {}; native Trash {}; original-path metadata {}",
+            self.holding().path().display(),
+            self.files.path().join(&self.id).display(),
+            self.info.path().join(&self.info_name).display(),
+        )
+    }
     fn holding(&self) -> &fs_safety::Root {
         self.publication.directory()
     }
@@ -1119,6 +1131,12 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .find(|path| path.file_name().unwrap().as_bytes().starts_with(b".cagents-trash-"))
             .unwrap();
+        let report = match &outcome {
+            MutationOutcome::OutcomeUnknown { failure } => failure.to_string(),
+            _ => unreachable!(),
+        };
+        assert!(report.contains(holding.to_string_lossy().as_ref()));
+        assert!(report.contains("opened spellings"));
         let payload = holding.join("payload");
         let retained = fs::metadata(&payload).unwrap();
         assert_eq!((retained.dev(), retained.ino()), (original.dev(), original.ino()));
