@@ -1291,7 +1291,13 @@ mod tests {
     fn focused_native_overlay_owns_ignored_ime_but_leaves_unowned_input_available() {
         use cosmic::iced::advanced::{clipboard, widget::operation::focusable};
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
-        for kind in ["button", "editable-on-focus", "no-handler", "editable", "unfocused"] {
+        for kind in [
+            "button",
+            "editable-on-focus",
+            "no-handler",
+            "editable",
+            "unfocused",
+        ] {
             let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
             let trace = InputTrace::default();
             let raw_id = cosmic::iced::widget::Id::unique();

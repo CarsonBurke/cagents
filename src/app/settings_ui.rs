@@ -1625,7 +1625,10 @@ mod keyboard_table_tests {
     fn default_shortcut_rows_keep_chips_and_controls_on_one_line() {
         use iced::{
             Rectangle, Size,
-            advanced::{Layout, layout, widget::{Operation, Tree, operation::Focusable}},
+            advanced::{
+                Layout, layout,
+                widget::{Operation, Tree, operation::Focusable},
+            },
         };
         #[derive(Default)]
         struct Controls {
@@ -1636,7 +1639,12 @@ mod keyboard_table_tests {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
             }
-            fn focusable(&mut self, _: Option<&widget::Id>, bounds: Rectangle, _: &mut dyn Focusable) {
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
                 self.buttons.push(bounds);
             }
             fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
@@ -1658,10 +1666,16 @@ mod keyboard_table_tests {
                 .unwrap()
                 .1;
             let row = shortcut_input(
-                field.label(), value, field, &draft.keyboard_shortcuts, &invalid,
+                field.label(),
+                value,
+                field,
+                &draft.keyboard_shortcuts,
+                &invalid,
             );
             let mut element = settings_group("Keyboard", "", vec![row])
-                .compact().view("Keyboard", "").unwrap();
+                .compact()
+                .view("Keyboard", "")
+                .unwrap();
             let mut tree = Tree::new(element.as_widget());
             let layout = element.as_widget_mut().layout(
                 &mut tree,
@@ -1670,27 +1684,54 @@ mod keyboard_table_tests {
             );
             let mut controls = Controls::default();
             element.as_widget_mut().operate(
-                &mut tree, Layout::new(&layout), &renderer, &mut controls,
+                &mut tree,
+                Layout::new(&layout),
+                &renderer,
+                &mut controls,
             );
             // Every chip plus Record and even the disabled Reset exposes its
             // actual native button bounds. A checkbox may also be focusable.
-            assert!(controls.buttons.len() >= settings::parse_chords(value).len() + 2,
-                "{field:?}: {:?}", controls.buttons);
+            assert!(
+                controls.buttons.len() >= settings::parse_chords(value).len() + 2,
+                "{field:?}: {:?}",
+                controls.buttons
+            );
             let center = controls.buttons[0].center_y();
             for bounds in &controls.buttons {
                 assert!(bounds.width > 0.0 && bounds.height > 0.0);
-                assert!((bounds.center_y() - center).abs() < 0.1,
-                    "{field:?} controls wrapped: {:?}", controls.buttons);
+                assert!(
+                    (bounds.center_y() - center).abs() < 0.1,
+                    "{field:?} controls wrapped: {:?}",
+                    controls.buttons
+                );
                 assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= 560.1);
             }
             for adjacent in controls.buttons.windows(2) {
-                assert!(adjacent[0].x + adjacent[0].width <= adjacent[1].x + 0.1,
-                    "{field:?} controls overlap or reorder: {:?}", controls.buttons);
+                assert!(
+                    adjacent[0].x + adjacent[0].width <= adjacent[1].x + 0.1,
+                    "{field:?} controls overlap or reorder: {:?}",
+                    controls.buttons
+                );
             }
-            if matches!(field, SettingsField::ShortcutMovePaneLeft | SettingsField::ShortcutMovePaneRight | SettingsField::ShortcutReopenPane) {
-                let caption = controls.advisory.expect("the editing advisory must remain visible");
-                assert!(caption.height > 0.0 && caption.y + caption.height <= layout.size().height + 0.1);
-                assert!(controls.buttons.iter().all(|button| button.y + button.height <= caption.y + 0.1));
+            if matches!(
+                field,
+                SettingsField::ShortcutMovePaneLeft
+                    | SettingsField::ShortcutMovePaneRight
+                    | SettingsField::ShortcutReopenPane
+            ) {
+                let caption = controls
+                    .advisory
+                    .expect("the editing advisory must remain visible");
+                assert!(
+                    caption.height > 0.0
+                        && caption.y + caption.height <= layout.size().height + 0.1
+                );
+                assert!(
+                    controls
+                        .buttons
+                        .iter()
+                        .all(|button| button.y + button.height <= caption.y + 0.1)
+                );
             }
         }
     }

@@ -7123,7 +7123,9 @@ mod tests {
         let mut presented = Vec::new();
         element.as_widget_mut().update(
             &mut tree,
-            &iced::Event::Window(iced::window::Event::RedrawRequested(std::time::Instant::now())),
+            &iced::Event::Window(iced::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            )),
             Layout::new(&node),
             mouse::Cursor::Unavailable,
             &renderer,
@@ -7131,10 +7133,13 @@ mod tests {
             &mut Shell::new(&mut presented),
             &viewport,
         );
-        let reported: Vec<_> = presented.iter().map(|message| match message {
-            Message::ChatUi(Action::Scrolled(target, None, _, false)) => *target,
-            _ => panic!("unexpected initial frame message: {message:?}"),
-        }).collect();
+        let reported: Vec<_> = presented
+            .iter()
+            .map(|message| match message {
+                Message::ChatUi(Action::Scrolled(target, None, _, false)) => *target,
+                _ => panic!("unexpected initial frame message: {message:?}"),
+            })
+            .collect();
         assert_eq!(reported.len(), 2);
         assert!(reported.contains(&first.target) && reported.contains(&second.target));
         for (target, expected) in [
