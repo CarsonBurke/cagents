@@ -201,7 +201,8 @@ impl Recovery {
                 record.terminal != source.id
                     || record.kind != crate::daemon::holder_registry::Kind::Terminal
                     || (record.application != crate::instance::APPLICATION_ID
-                        && record.application != owner_application)
+                        && record.application != owner_application
+                        && self.paired_holder.as_ref() != Some(record))
                     || source
                         .proof
                         .as_ref()
@@ -491,6 +492,49 @@ mod tests {
             .unwrap();
         assert_eq!(recovery.execution_console, Some(recipe));
         recovery.validate(&successor.boot_id).unwrap();
+        assert!(recovery.previous_sources.contains(&paired));
+    }
+
+    #[test]
+    fn returning_owner_keeps_the_exact_pair_from_its_previous_role() {
+        // Pure private-recovery state transition, not a production executable
+        // or helper authentication claim. Actual roles require real artifacts.
+        let mut recovery = recovery();
+        recovery.confirm("role-return".into(), server_identity(),
+            crate::daemon::holder_registry::Process { pid: 42, start: 1 }).unwrap();
+        let mut paired = recovery.source.clone();
+        let proof = paired.proof.clone().unwrap();
+        paired.terminal = Some(crate::model::TerminalSession {
+            id: paired.id,
+            launch: paired.launch.recipe.clone(),
+            continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            },
+            owned_codex_listener: paired.owned_codex_listener.clone(),
+            transcript_path: None, resume_hint: None, recovery_origin: None, predecessor: None,
+        });
+        let mut holder = terminal_holder(&paired);
+        holder.application = "dev.cagents.Cagents".into();
+        recovery.update_source_for_role(paired.clone(), None, Some(holder.clone()),
+            "dev.cagents.Cagents").unwrap();
+        let mut successor = proof.clone();
+        successor.host_incarnation = crate::model::HostIncarnation::new("returning-original-role");
+        recovery.adopt(&paired, successor.clone()).unwrap();
+        let mut updated = recovery.source.clone();
+        updated.terminal.as_mut().unwrap().continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: successor.host_session_id.clone(), boot_id: successor.boot_id.clone(),
+            host_incarnation: successor.host_incarnation.clone(),
+        };
+        recovery.update_source_for_role(updated.clone(), None, Some(holder.clone()),
+            "dev.cagents.Cagents.Browserless").unwrap();
+        let mut replaced = holder.clone(); replaced.root.start += 1;
+        assert!(recovery.update_source_for_role(updated.clone(), None, Some(replaced),
+            "dev.cagents.Cagents.Browserless").is_err());
+        let mut relabelled = holder.clone(); relabelled.application = "dev.cagents.Cagents.Browserless".into();
+        assert!(recovery.update_source_for_role(updated, None, Some(relabelled),
+            "dev.cagents.Cagents.Browserless").is_err());
+        assert_eq!(recovery.paired_holder, Some(holder));
         assert!(recovery.previous_sources.contains(&paired));
     }
 
