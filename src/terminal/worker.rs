@@ -703,6 +703,63 @@ pub struct TerminalHandle {
     inner: Arc<HandleInner>,
 }
 
+/// Callback identity without retaining the worker through its own wake closure.
+pub(crate) struct WeakTerminalHandle {
+    inner: Weak<HandleInner>,
+}
+
+/// Real publication and callback machinery without a PTY, child or worker thread.
+/// This fixture tests callback identity, not process retirement or native output.
+#[cfg(test)]
+pub(crate) struct RenderStreamFixture {
+    pub(crate) handle: TerminalHandle,
+    events: Arc<Sender<TerminalEvent>>,
+    commands: Receiver<Command>,
+}
+
+#[cfg(test)]
+impl RenderStreamFixture {
+    pub(crate) fn new(wake: impl Fn(TerminalWake) + Send + Sync + 'static) -> Self {
+        let (commands, pending) = command_channel(64);
+        let (events, received) = crossbeam_channel::unbounded();
+        let events = Arc::new(events);
+        let published = Arc::new(PublishedState::new(true, Arc::new(wake)));
+        let _ = published.semantic_events.set(Arc::downgrade(&events));
+        Self {
+            handle: TerminalHandle {
+                inner: Arc::new(HandleInner {
+                    commands,
+                    events: received,
+                    published,
+                    worker: Mutex::new(None),
+                }),
+            },
+            events,
+            commands: pending,
+        }
+    }
+
+    pub(crate) fn publish(&self, generation: u64) {
+        let mut snapshot = RenderSnapshot::empty();
+        snapshot.generation = generation;
+        self.handle.inner.published.publish(Arc::new(snapshot));
+    }
+
+    pub(crate) fn emit(&self, event: TerminalEvent) {
+        self.handle.inner.published.emit_event(&self.events, event);
+    }
+
+    pub(crate) fn queued_commands(&self) -> usize {
+        self.commands.len()
+    }
+}
+
+impl WeakTerminalHandle {
+    pub(crate) fn upgrade(&self) -> Option<TerminalHandle> {
+        self.inner.upgrade().map(|inner| TerminalHandle { inner })
+    }
+}
+
 impl std::fmt::Debug for TerminalHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -940,6 +997,12 @@ impl TerminalHandle {
     }
     pub(crate) fn same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakTerminalHandle {
+        WeakTerminalHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     pub fn generation(&self) -> u64 {

@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, Weak},
+    sync::{Arc, Mutex, OnceLock, RwLock, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -3664,7 +3664,11 @@ fn start_terminal_view_owned(
     } else {
         Default::default()
     };
-    let weak = Arc::downgrade(shared);
+    let redraw = Arc::new(TerminalRedraw {
+        host: Arc::downgrade(shared),
+        terminal_id,
+        worker: OnceLock::new(),
+    });
     let config = TerminalConfig {
         agent_authority,
         columns: options.columns,
@@ -3679,8 +3683,9 @@ fn start_terminal_view_owned(
         holder_recovery,
         ..TerminalConfig::default()
     };
+    let wake_redraw = Arc::clone(&redraw);
     let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
-        broadcast_redraw(&weak, terminal_id, wake.generation);
+        wake_redraw.publish(wake.generation);
     }) {
         Ok(handle) => handle,
         Err(error) => {
@@ -3695,6 +3700,9 @@ fn start_terminal_view_owned(
             ));
         }
     };
+    // Bind before publishing the Host record. Pre-binding captures are covered
+    // by the initial Spawn snapshot and acknowledge below, never by an ID lookup.
+    let _ = redraw.worker.set(handle.downgrade());
     let output_host = Arc::downgrade(shared);
     handle
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
@@ -3772,7 +3780,7 @@ fn start_terminal_view_owned(
         if completed {
             // Completed is emitted only after the final grid and parser
             // teardown. Notify visible subscribers from that exact worker.
-            broadcast_redraw(&event_host, terminal_id, handle.generation());
+            broadcast_redraw(&event_host, terminal_id, handle.generation(), handle);
         }
     });
     Ok((descriptor, redraw_handle))
@@ -3897,7 +3905,22 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
     }
 }
 
-/// Publishes a repaint to every visible subscriber of `terminal_id`.
+/// Binds redraw wakes before Host publication without a strong callback cycle.
+struct TerminalRedraw {
+    host: Weak<HostLock>,
+    terminal_id: TerminalId,
+    worker: OnceLock<crate::terminal::WeakTerminalHandle>,
+}
+
+impl TerminalRedraw {
+    fn publish(&self, generation: u64) {
+        if let Some(worker) = self.worker.get().and_then(|worker| worker.upgrade()) {
+            broadcast_redraw(&self.host, self.terminal_id, generation, &worker);
+        }
+    }
+}
+
+/// Publishes a repaint to every visible subscriber of this exact worker.
 ///
 /// A subscriber for which the daemon already recorded the exact capture it last
 /// delivered receives the repaint itself, diff-encoded against that capture,
@@ -3914,13 +3937,28 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
 /// every delta chained to the previous delivery; an unapplicable delta is
 /// detected by `base_generation` and answered with a full repaint, so a client
 /// that misses a push still recovers.
-fn broadcast_redraw(host: &Weak<HostLock>, terminal_id: TerminalId, generation: u64) {
+fn broadcast_redraw(
+    host: &Weak<HostLock>,
+    terminal_id: TerminalId,
+    generation: u64,
+    worker: &TerminalHandle,
+) {
     let Some(host) = host.upgrade() else {
         return;
     };
     let mut pending = Vec::new();
     {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Retirement does not drain queued callbacks. Validate the original
+        // worker under the same lock as visibility, viewport and capture work;
+        // an earlier identity check could race a same-ID replacement.
+        if !state
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|record| record.handle.same_worker(worker))
+        {
+            return;
+        }
         let visible = state
             .subscriptions
             .by_terminal
@@ -4121,6 +4159,8 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
 mod native_upgrade_tests;
 #[cfg(test)]
 mod strict_upgrade_tests;
+#[cfg(test)]
+mod redraw_identity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5800,9 +5840,10 @@ for line in sys.stdin:
     fn redraw_delivery_excludes_hidden_and_hibernated_subscribers() {
         let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let terminal_id = TerminalId::new();
+        let stream = crate::terminal::RenderStreamFixture::new(|_| {});
         let deliveries = {
             let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
-            [
+            let deliveries = [
                 TerminalVisibility::Visible,
                 TerminalVisibility::Hidden,
                 TerminalVisibility::Hibernated,
@@ -5817,16 +5858,21 @@ for line in sys.stdin:
                     .attach(client_id, terminal_id, visibility);
                 delivery
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+            state.reserve_spawn(terminal_id).unwrap();
+            state.finish_spawn(
+                1, redraw_identity_tests::session(terminal_id), stream.handle.clone(), true,
+            ).unwrap();
+            deliveries
         };
 
-        broadcast_redraw(&Arc::downgrade(&shared), terminal_id, 7);
+        broadcast_redraw(&Arc::downgrade(&shared), terminal_id, 7, &stream.handle);
         for delivery in &deliveries {
             delivery.close_after_drain();
         }
         assert!(matches!(
             deliveries[0].pop().unwrap().message,
-            ServerMessage::Redraw { generation: 7, .. }
+            ServerMessage::Snapshot { snapshot, .. } if snapshot.generation == 7
         ));
         assert!(deliveries[1].pop().is_none());
         assert!(deliveries[2].pop().is_none());
@@ -5885,7 +5931,7 @@ for line in sys.stdin:
             thread::sleep(Duration::from_millis(10));
         }
 
-        broadcast_redraw(&Arc::downgrade(&shared), id, handle.generation());
+        broadcast_redraw(&Arc::downgrade(&shared), id, handle.generation(), &handle);
         delivery.close_after_drain();
         let mut pushed = None;
         while let Some(message) = delivery.pop() {
