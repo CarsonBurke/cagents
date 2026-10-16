@@ -303,6 +303,18 @@ fn checkout(project: &Path) -> PathBuf {
     }
 }
 
+pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str {
+    match state {
+        crate::agent_execution::State::Accepted => "Queued",
+        crate::agent_execution::State::Running => "Running",
+        crate::agent_execution::State::Waiting => "Waiting for input",
+        crate::agent_execution::State::Succeeded => "Succeeded",
+        crate::agent_execution::State::Failed => "Failed",
+        crate::agent_execution::State::Cancelled => "Cancelled",
+        crate::agent_execution::State::Interrupted => "Outcome uncertain",
+    }
+}
+
 fn list_human(summaries: &[Summary]) -> String {
     super::format::table(
         ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"],
@@ -312,16 +324,7 @@ fn list_human(summaries: &[Summary]) -> String {
                 [
                     short(summary.agent.id),
                     summary.agent.spec.provider.executable().into(),
-                    match summary.state {
-                        crate::agent_execution::State::Accepted => "Queued",
-                        crate::agent_execution::State::Running => "Running",
-                        crate::agent_execution::State::Waiting => "Waiting for input",
-                        crate::agent_execution::State::Succeeded => "Succeeded",
-                        crate::agent_execution::State::Failed => "Failed",
-                        crate::agent_execution::State::Cancelled => "Cancelled",
-                        crate::agent_execution::State::Interrupted => "Outcome uncertain",
-                    }
-                    .into(),
+                    state_label(summary.state).into(),
                     short(summary.run),
                     summary.agent.spec.target.directory.display().to_string(),
                     summary.agent.name.clone().unwrap_or_default(),
