@@ -83,9 +83,13 @@ The daemon delivers live and completed terminals' semantic events on one shared
 `terminal-event-notify` thread. Registering a terminal replays its startup events
 before later metadata and completion events; callbacks never run under the
 publishing worker's locks. This removes the per-terminal `cagentsd-events-*`
-monitor. PTY parsing, PTY readers, holder observers, and UI socket transport
-still have separate thread costs; this change alone does not meet a total
-idle-plus-one-thread-per-terminal budget.
+monitor. Holder-control reports also use one `terminal-io` reactor thread.
+Each watcher retains its authenticated original socket and root pidfd; a partial
+frame or idle holder cannot block other watchers. Reads use per-call
+`MSG_DONTWAIT`, preserving the control writer's blocking descriptor flags.
+PTY parsing, PTY readers, and UI socket transport still have separate thread
+costs; these changes alone do not meet a total idle-plus-one-thread-per-terminal
+budget.
 
 For multi-terminal memory comparisons, report daemon and UI RSS separately
 and use PSS for holder processes: their executable mappings are shared, so

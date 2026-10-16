@@ -23,6 +23,9 @@
 //! ignored by a holder that predates it, and descriptors travel as
 //! `SCM_RIGHTS` on a message's first byte.
 
+mod watch;
+use watch::Watch;
+
 use std::{
     fs::File,
     io::{self, Read},
@@ -36,7 +39,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    thread::{self, JoinHandle},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -68,9 +71,6 @@ const MAX_DESCRIPTORS: usize = 4;
 /// How long a released holder has to exit before it is killed. It exits as
 /// soon as it reads the release, so this only bounds a wedged one.
 const RELEASE_GRACE: Duration = Duration::from_millis(500);
-/// How long a released holder's watch waits to see its release, which a
-/// concurrent fork can hold up.
-const RELEASE_SETTLE: Duration = Duration::from_millis(100);
 
 /// What process listings show for a holder, within the kernel's 15 bytes.
 const PROCESS_NAME: &std::ffi::CStr = c"cagents-holder";
@@ -539,26 +539,26 @@ fn watched(
     let (cleanup, cleanup_acknowledged) = crossbeam_channel::bounded(1);
     holder.cleanup = Some(cleanup_acknowledged);
     holder.acknowledged = Some(acknowledged);
-    let watching = (|| {
-        let reader = holder.control.try_clone()?;
-        let root = root.try_clone()?;
-        let (released, release) = std::io::pipe()?;
-        holder.release = Some(release);
-        thread::Builder::new()
-            .name(format!("terminal-holder-{pid}"))
-            .spawn(move || {
-                watch(
-                    &reader,
-                    &root,
-                    &released,
-                    &exits,
-                    &acknowledge,
-                    &cleanup,
-                    exited.is_some(),
-                );
-            })
-    })();
-    holder.watch = Some(watching.map_err(|error| format!("watch terminal holder: {error}"))?);
+    let reader = holder
+        .control
+        .try_clone()
+        .map_err(|error| format!("watch terminal holder: {error}"))?;
+    let watched_root = root
+        .try_clone()
+        .map_err(|error| format!("watch terminal root: {error}"))?;
+    let (released, release) =
+        std::io::pipe().map_err(|error| format!("watch terminal release: {error}"))?;
+    let watch = Watch::start(
+        reader,
+        watched_root,
+        released,
+        exits,
+        acknowledge,
+        cleanup,
+        exited.is_some(),
+    )?;
+    holder.release = Some(release);
+    holder.watch = Some(watch);
     Ok(Held {
         master: PtyMaster(master),
         child: HeldChild { pid, pidfd: root },
@@ -569,83 +569,6 @@ fn watched(
 fn exit_status(wait_status: libc::c_int) -> ExitStatus {
     use std::os::unix::process::ExitStatusExt;
     ExitStatus::from(std::process::ExitStatus::from_raw(wait_status))
-}
-
-/// Delivers the root's exit and the holder's answers to a detach, then waits
-/// for the holder to go away.
-///
-/// A holder that vanishes first - killed, or crashed - leaves its root
-/// running on a terminal this daemon still reads. That root has not exited,
-/// so its exit is reported only once its pidfd says so, with the status the
-/// holder took with it unknown. `released` hanging up ends the wait.
-fn watch(
-    control: &UnixStream,
-    root: &File,
-    released: &std::io::PipeReader,
-    exits: &Sender<ChildExit>,
-    acknowledge: &Sender<Result<(), String>>,
-    cleanup: &Sender<()>,
-    mut reported: bool,
-) {
-    loop {
-        match receive::<Report>(control) {
-            Ok(Some((Report::Exited { wait_status }, _))) if !reported => {
-                reported = true;
-                let _ = exits.try_send(Ok(exit_status(wait_status)));
-            }
-            // The holder keeps the terminal for a successor; nothing it does
-            // from here concerns this daemon.
-            Ok(Some((Report::Detached, _))) => {
-                let _ = acknowledge.try_send(Ok(()));
-                return;
-            }
-            Ok(Some((Report::CleanupProved, _))) => {
-                let _ = cleanup.try_send(());
-                return;
-            }
-            Ok(Some((Report::ScreenCached | Report::AdoptionCommitted, _))) => {
-                let _ = acknowledge.try_send(Ok(()));
-            }
-            Ok(Some((Report::Failed(message), _))) => {
-                let _ = acknowledge.try_send(Err(message));
-            }
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => break,
-        }
-    }
-    // A root already reported leaves nothing to wait for, and a holder this
-    // daemon released ends its connection too.
-    if reported || hung_up(released) {
-        return;
-    }
-    tracing::warn!("a terminal holder ended before its root process; the terminal stays attached");
-    let mut targets = [
-        libc::pollfd {
-            fd: root.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: released.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    loop {
-        // SAFETY: both pollfds live for the duration of the call.
-        match unsafe { libc::poll(targets.as_mut_ptr(), 2, -1) } {
-            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
-            -1 => return,
-            _ if targets[1].revents != 0 => return,
-            _ if targets[0].revents != 0 => {
-                let _ = exits.try_send(Err(
-                    "the terminal's holder ended before it, so its exit status is unknown".into(),
-                ));
-                return;
-            }
-            _ => return,
-        }
-    }
 }
 
 /// Initialize fixed cleanup services before measuring daemon readiness.
@@ -669,7 +592,7 @@ pub(super) struct Holder {
     process: Option<OwnedChild>,
     pidfd: Option<File>,
     protocol: u32,
-    watch: Option<JoinHandle<()>>,
+    watch: Option<Watch>,
     /// Dropping this ends a watch still waiting on a root its holder left.
     release: Option<std::io::PipeWriter>,
     /// The holder's answer to a detach, relayed by the watch.
@@ -964,26 +887,6 @@ impl Holder {
     }
 }
 
-/// Whether the write end of `pipe` closes within [`RELEASE_SETTLE`].
-///
-/// A release closes it before the holder can exit, but a fork elsewhere in
-/// the daemon can briefly hold a copy until that child execs.
-fn hung_up(pipe: &std::io::PipeReader) -> bool {
-    let mut target = libc::pollfd {
-        fd: pipe.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout = RELEASE_SETTLE.as_millis() as libc::c_int;
-    loop {
-        // SAFETY: one live pollfd for the duration of the call.
-        match unsafe { libc::poll(&mut target, 1, timeout) } {
-            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
-            ready => return ready == 1,
-        }
-    }
-}
-
 impl Drop for Holder {
     fn drop(&mut self) {
         if self.adoption_pending {
@@ -1024,7 +927,8 @@ impl Drop for Holder {
         }
         self.retain_original_child();
         drop(self.release.take());
-        // JoinHandle drop detaches: is_finished does not prove TLS completion.
+        // Release cancels the shared observer without waiting on the caller.
+        // Dropping its task handle is not proof of task destruction or family cleanup.
         drop(self.watch.take());
     }
 }
@@ -2961,7 +2865,14 @@ mod tests {
 
     #[test]
     fn a_holder_can_be_detached_again_by_its_successor() {
-        let directory = tempfile::tempdir().unwrap();
+        let mut directory = tempfile::tempdir().unwrap();
+        // Preserve the exact detached socket/checkpoint namespace on success
+        // and panic until the outer original-family guardian has settled it.
+        directory.disable_cleanup(true);
+        eprintln!(
+            "Retained terminal carry fixture: {}",
+            directory.path().display()
+        );
         let (socket, root) = detached("echo ready; read line; exit 2", directory.path());
         let (exits, _exited) = crossbeam_channel::bounded(1);
         let held = adopt(&socket, exits).unwrap().held;
