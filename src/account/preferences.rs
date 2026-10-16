@@ -76,13 +76,28 @@ pub(crate) fn set_default(
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
-    use crate::{account::{Account, Identity, UsageSnapshot, UsageStatus, cache::Entry, home::Homes, registry::{Registered, Store}}, agent::Provider};
+    use crate::{
+        account::{
+            Account, Identity, UsageSnapshot, UsageStatus,
+            cache::Entry,
+            home::Homes,
+            registry::{Registered, Store},
+        },
+        agent::Provider,
+    };
     use std::{collections::BTreeMap, fs};
     use uuid::Uuid;
 
     fn registered(key: Uuid, email: &str) -> Registered {
-        Registered { key, provider: Provider::Claude, linked_home: None,
-            label: None, email: Some(email.into()), organization: None, added_at: 1 }
+        Registered {
+            key,
+            provider: Provider::Claude,
+            linked_home: None,
+            label: None,
+            email: Some(email.into()),
+            organization: None,
+            added_at: 1,
+        }
     }
 
     #[test]
@@ -91,13 +106,50 @@ mod tests {
         let store = Store::at(directory.path());
         let homes = Homes::at(directory.path().join("homes"));
         let key = Uuid::new_v4();
-        let (original, ()) = store.update(|registry| { registry.register(registered(key, "one@example.com"), &[]).unwrap(); }).unwrap();
+        let (original, ()) = store
+            .update(|registry| {
+                registry
+                    .register(registered(key, "one@example.com"), &[])
+                    .unwrap();
+            })
+            .unwrap();
         let account = Account::managed(Provider::Claude, key, homes.path(Provider::Claude, key));
-        let saved = set_default(&store, Some(&homes), &BTreeMap::new(), original.revision(), Provider::Claude, &DefaultSelection::Account(account.id())).unwrap();
-        assert_eq!(store.load().unwrap().default_account(Provider::Claude, Some(&homes)).id(), account.id());
-        let system = set_default(&store, Some(&homes), &BTreeMap::new(), saved.revision(), Provider::Claude, &DefaultSelection::Account(Account::system(Provider::Claude).id())).unwrap();
+        let saved = set_default(
+            &store,
+            Some(&homes),
+            &BTreeMap::new(),
+            original.revision(),
+            Provider::Claude,
+            &DefaultSelection::Account(account.id()),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .default_account(Provider::Claude, Some(&homes))
+                .id(),
+            account.id()
+        );
+        let system = set_default(
+            &store,
+            Some(&homes),
+            &BTreeMap::new(),
+            saved.revision(),
+            Provider::Claude,
+            &DefaultSelection::Account(Account::system(Provider::Claude).id()),
+        )
+        .unwrap();
         assert!(!system.automatic(Provider::Claude));
-        let automatic = set_default(&store, Some(&homes), &BTreeMap::new(), system.revision(), Provider::Claude, &DefaultSelection::Automatic).unwrap();
+        let automatic = set_default(
+            &store,
+            Some(&homes),
+            &BTreeMap::new(),
+            system.revision(),
+            Provider::Claude,
+            &DefaultSelection::Automatic,
+        )
+        .unwrap();
         assert!(automatic.automatic(Provider::Claude));
         assert_eq!(automatic.registered(), original.registered());
         assert_eq!(store.load().unwrap(), automatic);
@@ -109,25 +161,80 @@ mod tests {
         let store = Store::at(directory.path());
         let homes = Homes::at(directory.path().join("homes"));
         let key = Uuid::new_v4();
-        let (registry, ()) = store.update(|registry| { registry.register(registered(key, "one@example.com"), &[]).unwrap(); }).unwrap();
+        let (registry, ()) = store
+            .update(|registry| {
+                registry
+                    .register(registered(key, "one@example.com"), &[])
+                    .unwrap();
+            })
+            .unwrap();
         let before = fs::read(directory.path().join("accounts.toml")).unwrap();
         for (revision, provider, selection, reason) in [
-            (registry.revision() - 1, Provider::Claude, DefaultSelection::Automatic, "changed"),
-            (registry.revision(), Provider::Codex, DefaultSelection::Account(Account::system(Provider::Claude).id()), "different provider"),
-            (registry.revision(), Provider::Claude, DefaultSelection::Account(Account::managed(Provider::Claude, Uuid::new_v4(), "/unused".into()).id()), "No active"),
-            (registry.revision(), Provider::Omp, DefaultSelection::Account(Account::system(Provider::Omp).id()), "OMP chooses"),
+            (
+                registry.revision() - 1,
+                Provider::Claude,
+                DefaultSelection::Automatic,
+                "changed",
+            ),
+            (
+                registry.revision(),
+                Provider::Codex,
+                DefaultSelection::Account(Account::system(Provider::Claude).id()),
+                "different provider",
+            ),
+            (
+                registry.revision(),
+                Provider::Claude,
+                DefaultSelection::Account(
+                    Account::managed(Provider::Claude, Uuid::new_v4(), "/unused".into()).id(),
+                ),
+                "No active",
+            ),
+            (
+                registry.revision(),
+                Provider::Omp,
+                DefaultSelection::Account(Account::system(Provider::Omp).id()),
+                "OMP chooses",
+            ),
         ] {
-            let error = set_default(&store, Some(&homes), &BTreeMap::new(), revision, provider, &selection).unwrap_err();
+            let error = set_default(
+                &store,
+                Some(&homes),
+                &BTreeMap::new(),
+                revision,
+                provider,
+                &selection,
+            )
+            .unwrap_err();
             assert!(error.contains(reason), "{error}");
-            assert_eq!(fs::read(directory.path().join("accounts.toml")).unwrap(), before);
+            assert_eq!(
+                fs::read(directory.path().join("accounts.toml")).unwrap(),
+                before
+            );
         }
-        let (archived, ()) = store.update(|registry| {
-            assert!(registry.archive_duplicate(key, &Account::system(Provider::Claude)));
-        }).unwrap();
+        let (archived, ()) = store
+            .update(|registry| {
+                assert!(registry.archive_duplicate(key, &Account::system(Provider::Claude)));
+            })
+            .unwrap();
         let before = fs::read(directory.path().join("accounts.toml")).unwrap();
         let hidden = Account::managed(Provider::Claude, key, homes.path(Provider::Claude, key));
-        assert!(set_default(&store, Some(&homes), &BTreeMap::new(), archived.revision(), Provider::Claude, &DefaultSelection::Account(hidden.id())).unwrap_err().contains("No active"));
-        assert_eq!(fs::read(directory.path().join("accounts.toml")).unwrap(), before);
+        assert!(
+            set_default(
+                &store,
+                Some(&homes),
+                &BTreeMap::new(),
+                archived.revision(),
+                Provider::Claude,
+                &DefaultSelection::Account(hidden.id())
+            )
+            .unwrap_err()
+            .contains("No active")
+        );
+        assert_eq!(
+            fs::read(directory.path().join("accounts.toml")).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -136,17 +243,58 @@ mod tests {
         let store = Store::at(directory.path());
         let homes = Homes::at(directory.path().join("homes"));
         let keys = [Uuid::new_v4(), Uuid::new_v4()];
-        let (registry, ()) = store.update(|registry| { for (key, email) in keys.into_iter().zip(["one@example.com", "two@example.com"]) { registry.register(registered(key, email), &[]).unwrap(); } }).unwrap();
-        let accounts = keys.map(|key| Account::managed(Provider::Claude, key, homes.path(Provider::Claude, key)));
-        let entry = |email: &str| Entry { identity: Some(Identity { email: Some(email.into()), ..Default::default() }), snapshot: UsageSnapshot::state(UsageStatus::Unavailable, "fixture", 1) };
+        let (registry, ()) = store
+            .update(|registry| {
+                for (key, email) in keys.into_iter().zip(["one@example.com", "two@example.com"]) {
+                    registry.register(registered(key, email), &[]).unwrap();
+                }
+            })
+            .unwrap();
+        let accounts = keys
+            .map(|key| Account::managed(Provider::Claude, key, homes.path(Provider::Claude, key)));
+        let entry = |email: &str| Entry {
+            identity: Some(Identity {
+                email: Some(email.into()),
+                ..Default::default()
+            }),
+            snapshot: UsageSnapshot::state(UsageStatus::Unavailable, "fixture", 1),
+        };
         let before = fs::read(directory.path().join("accounts.toml")).unwrap();
-        let mut cache = BTreeMap::from([(accounts[0].cache_key().unwrap(), entry("changed@example.com"))]);
+        let mut cache = BTreeMap::from([(
+            accounts[0].cache_key().unwrap(),
+            entry("changed@example.com"),
+        )]);
         let choose = DefaultSelection::Account(accounts[0].id());
-        assert!(set_default(&store, Some(&homes), &cache, registry.revision(), Provider::Claude, &choose).unwrap_err().contains("different login"));
+        assert!(
+            set_default(
+                &store,
+                Some(&homes),
+                &cache,
+                registry.revision(),
+                Provider::Claude,
+                &choose
+            )
+            .unwrap_err()
+            .contains("different login")
+        );
         cache.insert(accounts[0].cache_key().unwrap(), entry("one@example.com"));
         cache.insert(accounts[1].cache_key().unwrap(), entry("one@example.com"));
-        assert!(set_default(&store, Some(&homes), &cache, registry.revision(), Provider::Claude, &choose).unwrap_err().contains("same login"));
-        assert_eq!(fs::read(directory.path().join("accounts.toml")).unwrap(), before);
+        assert!(
+            set_default(
+                &store,
+                Some(&homes),
+                &cache,
+                registry.revision(),
+                Provider::Claude,
+                &choose
+            )
+            .unwrap_err()
+            .contains("same login")
+        );
+        assert_eq!(
+            fs::read(directory.path().join("accounts.toml")).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -156,16 +304,32 @@ mod tests {
         let shared = directory.path().join("linked");
         fs::create_dir(&shared).unwrap();
         let keys = [Uuid::new_v4(), Uuid::new_v4()];
-        let (registry, ()) = store.update(|registry| {
-            for (key, email) in keys.into_iter().zip(["one@example.com", "two@example.com"]) {
-                let mut row = registered(key, email);
-                row.linked_home = Some(shared.clone());
-                registry.register(row, &[]).unwrap();
-            }
-        }).unwrap();
+        let (registry, ()) = store
+            .update(|registry| {
+                for (key, email) in keys.into_iter().zip(["one@example.com", "two@example.com"]) {
+                    let mut row = registered(key, email);
+                    row.linked_home = Some(shared.clone());
+                    registry.register(row, &[]).unwrap();
+                }
+            })
+            .unwrap();
         let before = fs::read(directory.path().join("accounts.toml")).unwrap();
         let account = Account::linked(Provider::Claude, keys[0], shared);
-        assert!(set_default(&store, None, &BTreeMap::new(), registry.revision(), Provider::Claude, &DefaultSelection::Account(account.id())).unwrap_err().contains("same home"));
-        assert_eq!(fs::read(directory.path().join("accounts.toml")).unwrap(), before);
+        assert!(
+            set_default(
+                &store,
+                None,
+                &BTreeMap::new(),
+                registry.revision(),
+                Provider::Claude,
+                &DefaultSelection::Account(account.id())
+            )
+            .unwrap_err()
+            .contains("same home")
+        );
+        assert_eq!(
+            fs::read(directory.path().join("accounts.toml")).unwrap(),
+            before
+        );
     }
 }

@@ -36,7 +36,10 @@ pub enum AccountCommand {
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (query, listing) = match command {
-        AccountCommand::Default { provider, selection } => return preferences::execute(provider, selection),
+        AccountCommand::Default {
+            provider,
+            selection,
+        } => return preferences::execute(provider, selection),
         AccountCommand::List { provider } => (list::query(provider), true),
         AccountCommand::Info {
             provider,

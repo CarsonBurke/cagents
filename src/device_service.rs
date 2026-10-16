@@ -182,17 +182,29 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             navigation(repository, kind).map(Reply::ProjectNavigation)
         }
         Operation::AccountsRead => accounts(),
-        Operation::AccountDefault { expected_revision, provider, selection } => {
+        Operation::AccountDefault {
+            expected_revision,
+            provider,
+            selection,
+        } => {
             let store = crate::account::registry::Store::installation()
                 .ok_or("remote account registry is unavailable")?;
             let homes = crate::account::home::Homes::installation();
             let now = crate::chat::now_ms().unwrap_or_default();
             let cached = crate::account::cache::Cache::installation()
-                .map(|cache| cache.load(now)).unwrap_or_default();
+                .map(|cache| cache.load(now))
+                .unwrap_or_default();
             let registry = crate::account::preferences::set_default(
-                &store, homes.as_ref(), &cached, expected_revision, provider, &selection,
+                &store,
+                homes.as_ref(),
+                &cached,
+                expected_revision,
+                provider,
+                &selection,
             )?;
-            serde_json::to_value(registry).map(Reply::AccountRegistry).map_err(|error| error.to_string())
+            serde_json::to_value(registry)
+                .map(Reply::AccountRegistry)
+                .map_err(|error| error.to_string())
         }
         Operation::AccountLifecycle { operation } => {
             crate::account::remote::execute(operation).map(Reply::AccountLifecycle)
@@ -1564,12 +1576,16 @@ mod wire_tests {
         for request in [
             Operation::AccountsRead,
             Operation::AccountDefault {
-                expected_revision: 3, provider: crate::agent::Provider::Claude,
+                expected_revision: 3,
+                provider: crate::agent::Provider::Claude,
                 selection: crate::account::preferences::DefaultSelection::Automatic,
             },
             Operation::AccountDefault {
-                expected_revision: 3, provider: crate::agent::Provider::Codex,
-                selection: crate::account::preferences::DefaultSelection::Account("codex/system".parse().unwrap()),
+                expected_revision: 3,
+                provider: crate::agent::Provider::Codex,
+                selection: crate::account::preferences::DefaultSelection::Account(
+                    "codex/system".parse().unwrap(),
+                ),
             },
             Operation::AccountsCache {
                 reports: json.clone(),
