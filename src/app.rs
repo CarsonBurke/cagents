@@ -7390,18 +7390,18 @@ impl Cagents {
             return;
         }
         self.sidebar_state.retain_card_attention(card);
-        if let Some(channel) = self.durable.channels.iter()
-            .find(|channel| channel.cards.contains(&card))
-        {
-            self.sidebar_state.retain_attention_channel(channel.id);
-        }
     }
 
     fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
+        self.sidebar_state.refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
+        // Capture all current rows before the first ACK invalidates the
+        // projection. This is one metadata pass even for a bulk read.
+        for card in &cards {
+            self.retain_attention_for_read(*card);
+        }
         let tasks: Vec<_> = cards
             .into_iter()
             .map(|card| {
-                self.retain_attention_for_read(card);
                 self.sidebar_state.acknowledge_agent_update(card);
                 self.acknowledge_card_notices(card);
                 if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
@@ -7433,6 +7433,7 @@ impl Cagents {
         if !self.sidebar_state.has_card_update(card) {
             return Task::none();
         }
+        self.sidebar_state.refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
         self.retain_attention_for_read(card);
         self.sidebar_state.acknowledge_agent_update(card);
         if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
@@ -25546,6 +25547,79 @@ mod tests {
         assert!(app.focus_save_pending);
         let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, true);
         assert!(!app.focus_save_pending);
+    }
+
+    #[test]
+    fn attention_read_retention_uses_current_filing_before_bulk_acknowledgement() {
+        let mut app = context_inspector_test_app(true);
+        let first = app.workspace.focused().unwrap();
+        let second = terminal_card_state();
+        let second_id = second.id;
+        let unavailable = terminal_card_state();
+        let unavailable_id = unavailable.id;
+        let project = crate::model::ProjectId::new();
+        let old = crate::model::WorktreeId::new();
+        let next = crate::model::WorktreeId::new();
+        let third = crate::model::WorktreeId::new();
+        let row = |id, path: &str| sidebar::SidebarWorktree::new(
+            id, path.into(), Some(path.into()), false, false, None, None, None,
+        );
+        app.sidebar_model = SidebarModel::ready(SidebarMode::Expanded, vec![
+            SidebarProject::new(project, crate::model::RepositoryId::new(),
+                "Current filing".into(), "/repo".into(), vec![
+                    row(old, "/repo/old"), row(next, "/repo/next"), row(third, "/repo/third"),
+                ], Vec::new()),
+        ]);
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.extend([second, unavailable]);
+        durable.card_scopes.extend([
+            (first, PathBuf::from("/repo/next")),
+            (second_id, PathBuf::from("/repo/third")),
+            (unavailable_id, PathBuf::from("/unloaded")),
+        ]);
+        // Both the old activity owner and derived UI cache can lag an explicit
+        // filing. Retain the rows actually displayed, not those historical roots.
+        for card in [first, second_id, unavailable_id] {
+            app.sidebar_state.observe_agent_update(card, project, old);
+            app.worktree_owners.insert(card, PathBuf::from("/repo/old"));
+        }
+        app.sidebar_state.apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
+        app.refresh_sidebar_channels();
+        let old_row = sidebar::SelectionRow::Worktree(project, old);
+        let next_row = sidebar::SelectionRow::Worktree(project, next);
+        let third_row = sidebar::SelectionRow::Worktree(project, third);
+        let before = sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
+        assert!(!before.contains(&old_row));
+        assert!(before.contains(&next_row) && before.contains(&third_row));
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 2);
+
+        drop(app.mark_cards_read(vec![first, second_id, unavailable_id]));
+        assert_eq!(sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false), before);
+        assert!(!app.sidebar_state.attention_retained(old_row));
+        assert!(app.sidebar_state.attention_retained(next_row));
+        assert!(app.sidebar_state.attention_retained(third_row), "the first ACK must not discard the second card's current rows");
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 0);
+        assert!(app.persistent_workspace().agent_updates.is_empty());
+        assert!([first, second_id, unavailable_id].iter().all(|card| !app.sidebar_state.has_card_update(*card)));
+        app.sidebar_state.apply(&SidebarAction::SetFilter(sidebar::SidebarFilter::Attention));
+        assert!(sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false).is_empty());
+
+        // Swapping two filings preserves every aggregate count. The read must
+        // still refresh its source-bound rows before capturing one target.
+        for card in [first, second_id] {
+            app.sidebar_state.observe_agent_update(card, project, old);
+        }
+        app.refresh_sidebar_channels();
+        Arc::make_mut(&mut app.durable).card_scopes.extend([
+            (first, PathBuf::from("/repo/third")),
+            (second_id, PathBuf::from("/repo/next")),
+        ]);
+        drop(app.mark_cards_read(vec![first]));
+        assert!(!app.sidebar_state.attention_retained(next_row));
+        assert!(app.sidebar_state.attention_retained(third_row));
+        assert_eq!(app.sidebar_state.worktree_attention(project, next).unread, 1);
+        assert_eq!(app.sidebar_state.worktree_attention(project, third).unread, 0);
+        assert!(app.sidebar_state.has_card_update(second_id));
     }
 
     #[test]

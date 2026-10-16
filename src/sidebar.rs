@@ -2770,12 +2770,14 @@ struct AttentionProjection {
     inventory: Vec<(ProjectId, Vec<(WorktreeId, PathBuf)>)>,
     projects: BTreeMap<ProjectId, AttentionSummary>,
     worktrees: BTreeMap<(ProjectId, WorktreeId), AttentionSummary>,
+    card_rows: BTreeMap<CardId, Vec<SelectionRow>>,
 }
 impl PartialEq for AttentionProjection {
     fn eq(&self, other: &Self) -> bool {
         self.inventory == other.inventory
             && self.projects == other.projects
             && self.worktrees == other.worktrees
+            && self.card_rows == other.card_rows
     }
 }
 impl Eq for AttentionProjection {}
@@ -3021,6 +3023,21 @@ impl SidebarState {
     /// Capture the row before a user read removes its unread owner. Closing
     /// or retiring a card deliberately does not call this method.
     pub fn retain_card_attention(&mut self, card: CardId) {
+        if self.filter != SidebarFilter::Attention
+            || (!self.has_card_update(card)
+                && self.card_activity(card).is_none_or(|activity| {
+                    activity.state != crate::agent::ActivityState::Waiting
+                }))
+        {
+            return;
+        }
+        if let Some(projection) = &self.attention_projection {
+            if let Some(rows) = projection.card_rows.get(&card) {
+                self.retained_attention.extend(rows.iter().copied());
+            }
+            return;
+        }
+        // Legacy standalone state has no loaded workspace projection yet.
         let owner = self.agent_updates.get(&card).copied().flatten().or_else(|| {
             self.agent_activity.get(&card).and_then(|entry| {
                 (entry.activity.state == crate::agent::ActivityState::Waiting)
@@ -3319,6 +3336,8 @@ impl SidebarState {
             _,
             Option<(ProjectId, Option<WorktreeId>, AttentionSummary)>,
         > = BTreeMap::new();
+        let mut card_resources = BTreeMap::new();
+        let mut card_rows: BTreeMap<CardId, Vec<SelectionRow>> = BTreeMap::new();
         for card in durable.cards.iter().filter(|card| card.existence.is_open()) {
             let summary = self.card_attention(card.id);
             // Inventory-only draft aliases carry no attention evidence. They
@@ -3353,6 +3372,10 @@ impl SidebarState {
                 crate::model::CardKind::Terminal(session) => (0, session.id.as_uuid()),
                 _ => (1, card.id.as_uuid()),
             };
+            card_resources.insert(card.id, resource);
+            if let Some(Some((_, channel))) = channels.get(&card.id) {
+                card_rows.entry(card.id).or_default().push(SelectionRow::Channel(*channel));
+            }
             conversations
                 .entry(resource)
                 .and_modify(|old| {
@@ -3369,6 +3392,13 @@ impl SidebarState {
                 })
                 .or_insert(Some((owner, worktree, summary)));
         }
+        // Retention uses the same loaded, deduplicated filing as the badge.
+        // Historical activity owners must not retain a row the user never saw.
+        for (card, resource) in card_resources {
+            if let Some(Some((project, Some(worktree), _))) = conversations.get(&resource) {
+                card_rows.entry(card).or_default().push(SelectionRow::Worktree(*project, *worktree));
+            }
+        }
         let mut summaries: BTreeMap<ProjectId, AttentionSummary> = BTreeMap::new();
         let mut worktrees: BTreeMap<(ProjectId, WorktreeId), AttentionSummary> = BTreeMap::new();
         for (owner, worktree, summary) in conversations.into_values().flatten() {
@@ -3382,6 +3412,7 @@ impl SidebarState {
             inventory,
             projects: summaries,
             worktrees,
+            card_rows,
         });
     }
 
