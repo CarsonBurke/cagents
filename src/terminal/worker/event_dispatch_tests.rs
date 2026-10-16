@@ -17,7 +17,7 @@ fn stream() -> (TerminalHandle, Arc<Sender<TerminalEvent>>) {
             commands,
             events: received,
             published,
-            worker: Mutex::new(None),
+            worker: Arc::new(Mutex::new(None)),
         }),
     };
     (handle, events)
