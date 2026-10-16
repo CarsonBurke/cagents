@@ -635,7 +635,14 @@ impl Handle {
             &self.0.commands
         };
         sender
-            .try_send((ActorCommand::Provider { run: None, command, decline_only: false }, reply))
+            .try_send((
+                ActorCommand::Provider {
+                    run: None,
+                    command,
+                    decline_only: false,
+                },
+                reply,
+            ))
             .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
         self.wake();
         Ok(response)
@@ -718,7 +725,14 @@ impl Handle {
             &self.0.commands
         };
         sender
-            .try_send((ActorCommand::Provider { run, command, decline_only }, reply))
+            .try_send((
+                ActorCommand::Provider {
+                    run,
+                    command,
+                    decline_only,
+                },
+                reply,
+            ))
             .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
         self.wake();
         response
