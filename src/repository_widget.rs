@@ -360,6 +360,10 @@ impl PartialEq for LspIntent {
 
 #[derive(Debug, Clone)]
 pub enum EditorLspAction {
+    Rename,
+    Format { selection: bool },
+    CodeActions,
+    Signature,
     Complete,
     CompleteAt {
         doc: LspDocumentId,
@@ -381,6 +385,8 @@ pub enum EditorLspAction {
 
 #[derive(Default)]
 struct EditorLanguageState {
+    signature: Option<crate::lsp::LspSignatureHelp>,
+    feature_support: [bool; 5],
     diagnostics: Vec<crate::lsp::LspDiagnostic>,
     selected_diagnostic: Option<usize>,
     hover_diagnostic: Option<crate::lsp::LspDiagnostic>,
@@ -3276,6 +3282,41 @@ impl RepositoryRuntime {
             return None;
         };
         caret_position(&document.content, document.content.cursor().position)
+    }
+
+    pub(crate) fn editor_selection_range(&self) -> Option<LspRange> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        let cursor = document.content.cursor();
+        let anchor = cursor.selection?;
+        let (start, end) = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) { (anchor, cursor.position) } else { (cursor.position, anchor) };
+        Some(LspRange::new(caret_position(&document.content, start)?, caret_position(&document.content, end)?))
+    }
+    pub(crate) fn editor_text_in_range(&self, range: LspRange) -> Option<String> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        let start = caret_for_position(&document.content, range.start)?;
+        let end = caret_for_position(&document.content, range.end)?;
+        Some(document.content.range_change(start, end, "")?.removed)
+    }
+    pub(crate) fn editor_diagnostics(&self) -> &[crate::lsp::LspDiagnostic] { &self.language.diagnostics }
+    pub fn set_editor_feature_support(&mut self, capabilities: &crate::lsp::LspCapabilities) {
+        self.language.feature_support = [capabilities.ready && capabilities.rename, capabilities.ready && capabilities.format_document, capabilities.ready && capabilities.format_selection, capabilities.ready && capabilities.code_actions, capabilities.ready && capabilities.signature_help];
+    }
+    pub(crate) fn set_editor_signature(&mut self, help: Option<crate::lsp::LspSignatureHelp>) {
+        self.language.signature = help.filter(|help| help.signatures.get(help.active_signature).is_some());
+    }
+    pub(crate) fn editor_signature(&self) -> Option<&crate::lsp::LspSignatureHelp> { self.language.signature.as_ref() }
+    pub(crate) fn set_workspace_preview(&mut self, path: PathBuf, model: DiffModel) {
+        self.files = FileListState::Ready(Vec::new());
+        self.selected = Some(RepositoryFile { path, unstaged: true, ..RepositoryFile::default() });
+        self.document = DocumentState::None;
+        self.source_surface = SourceSurface::Diff;
+        self.diff_basis = DiffBasis::IndexToWorktree;
+        self.set_diff_state(self.diff_basis.clone(), DiffState::ready(RenderedDiff::Text { model, old_label: "Before".into(), new_label: "After applying".into() }));
+    }
+    pub(crate) fn workspace_commit_current(&self, applied: &AppliedWorkspaceEdit) -> bool {
+        matches!(&self.document, DocumentState::Editable(document) if self.generation == applied.prepared.generation
+            && self.descriptor.worktree.join(&document.source) == applied.prepared.source
+            && document.revision == applied.prepared.revision && document.lsp_version == applied.prepared.version)
     }
 
     pub fn diagnostic_navigation_available(&self) -> bool {
