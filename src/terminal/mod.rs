@@ -2,6 +2,8 @@
 pub(crate) mod holder;
 mod hosted;
 pub mod ipc;
+#[cfg(feature = "host")]
+mod reactor;
 mod search;
 mod snapshot;
 pub use search::SearchMatch;
