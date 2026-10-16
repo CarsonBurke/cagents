@@ -269,6 +269,7 @@ struct Holding {
     slot: Option<RecoverySlot>,
     // Removal and parent durability are distinct irreversible phases.
     cleanup_sync_complete: bool,
+    source_sync_pending: bool,
 }
 impl Holding {
     fn create(
@@ -301,6 +302,7 @@ impl Holding {
             slot: Some(slot),
             files: vec![source],
             cleanup_sync_complete: false,
+            source_sync_pending: false,
         })
     }
     fn root(&self) -> &Root {
@@ -408,7 +410,10 @@ impl Holding {
         }
         fs_safety::sync_directory(self.context.placement().directory())
             .map_err(|e| e.to_string())?;
-        fs_safety::sync_directory(&self.parent).map_err(|e| e.to_string())
+        fs_safety::sync_directory(&self.parent).map_err(|e| e.to_string())?;
+        self.source_sync_pending = false;
+        self.cleanup_sync_complete = true;
+        Ok(())
     }
     fn location(&self) -> String {
         format!(
@@ -490,7 +495,7 @@ fn publish_with_hooks(
         after_publish,
         sync_parent,
     );
-    if holding.publication.is_removed() && holding.cleanup_sync_complete {
+    if holding.publication.is_removed() && holding.cleanup_sync_complete && !holding.source_sync_pending {
         return result;
     }
     // Publication cleanup may have acquired an unexpected entry. Preserve the
@@ -673,6 +678,7 @@ fn publish_in_holding(
             resolve_error(error),
         ));
     }
+    holding.source_sync_pending = true;
     let acquired_identity = fs_safety::metadata_beneath(holding.root(), Path::new(previous));
     let verify: Result<(File, fs::Metadata), FileIoError> = (|| {
         acquired_identity
@@ -728,7 +734,10 @@ fn publish_in_holding(
             match put_back {
                 Ok(()) => {
                     message.push_str("the acquired entry was restored without replacing newer work");
-                    if let Err(error) = fs_safety::sync_directory(parent) { message.push_str(&format!("; restoration durability unconfirmed: {error}")); }
+                    match fs_safety::sync_directory(parent) {
+                        Ok(()) => holding.source_sync_pending = false,
+                        Err(error) => message.push_str(&format!("; restoration durability unconfirmed: {error}")),
+                    }
                     if let Err(error) = holding.remove_empty(parent) { message.push_str(&format!("; {error}")); }
                 }
                 Err(error) => message.push_str(&format!("the recovery entry remains as previous in {}; destination left intact: {error}", holding.location())),
@@ -771,8 +780,9 @@ fn publish_in_holding(
     for attribute in lost {
         tracing::warn!(path = %parent.path().join(name).display(), %attribute, "saved file did not receive one of its extended attributes");
     }
-    if let Err(error) = sync_parent(parent) {
-        warnings.push(format!("replacement durability unconfirmed: {error}"));
+    match sync_parent(parent) {
+        Ok(()) => holding.source_sync_pending = false,
+        Err(error) => warnings.push(format!("replacement durability unconfirmed: {error}")),
     }
     if warnings.is_empty() {
         Ok(SaveDurability::Durable)
@@ -943,6 +953,22 @@ mod tests {
             assert!(released.load(Ordering::Acquire));
             assert_eq!(fs::read(directory.path().join("file")).unwrap(), if committed { &b"mine"[..] } else { &b"base"[..] });
         }
+    }
+    #[test]
+    fn source_parent_sync_failure_retains_original_cleanup_until_actual_retry() {
+        let (directory, root) = fixture();
+        let released = Arc::new(AtomicBool::new(false));
+        let context = fixture_context_with_guard(&root, Closed(released.clone())).unwrap();
+        let result = save_file_with_hooks(&root, Path::new("file"), "mine", blake3::hash(b"base"), false, &context,
+            || Ok(()), |_| Err(io::Error::other("source parent sync refused"))).unwrap();
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"mine");
+        let authority = result.recovery_authority().expect("original source parent is still unsynced");
+        assert!(fs::read_dir(context.placement().directory().path()).unwrap().next().is_none());
+        drop(context);
+        assert!(!released.load(Ordering::Acquire));
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert!(released.load(Ordering::Acquire));
     }
     #[test]
     fn saved_executable_runs_while_cleanup_authority_is_still_pending() {
