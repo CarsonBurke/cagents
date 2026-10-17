@@ -678,6 +678,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectoryListed { .. }
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::BinaryPageLoaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
@@ -2313,9 +2314,15 @@ impl Editor {
     /// Hands a link to the desktop's opener. The exit status comes back as a
     /// notice because the shell has no browser of its own.
     fn open_external_link(uri: String) -> Task<Message> {
+        Self::open_external_target(uri.into())
+    }
+
+    fn open_external_target(target: std::ffi::OsString) -> Task<Message> {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let status = std::process::Command::new("xdg-open").arg(uri).status()?;
+                let status = std::process::Command::new("xdg-open")
+                    .arg(target)
+                    .status()?;
                 if status.success() {
                     Ok(())
                 } else {
@@ -3421,6 +3428,25 @@ impl Application for Editor {
                         && !repository_action_allowed_while_modal(&action)
                     {
                         return Task::none();
+                    }
+                    if matches!(
+                        &action,
+                        RepositoryAction::OpenSystem { .. } | RepositoryAction::RevealFile { .. }
+                    ) {
+                        let Some(path) = self.tab(id).and_then(|tab| {
+                            tab.runtime
+                                .selected_path()
+                                .map(|path| tab.runtime.descriptor.worktree.join(path))
+                        }) else {
+                            return Task::none();
+                        };
+                        return if matches!(action, RepositoryAction::RevealFile { .. }) {
+                            cosmic::task::future(async move {
+                                Message::FileRevealed(cagents::file_manager::reveal(&path).await)
+                            })
+                        } else {
+                            Self::open_external_target(path.into_os_string())
+                        };
                     }
                     if let RepositoryAction::Save { card, .. } = &action {
                         if self.tab(*card).is_some_and(|tab| self.tab_is_untitled(tab)) {
@@ -7656,6 +7682,112 @@ mod tests {
                     cagents::editor::PdfTone::Original,
                 ),
             })),
+        );
+    }
+
+    #[test]
+    fn binary_desktop_actions_schedule_shell_work_and_refuse_modal_or_missing_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("bytes.bin"), [0_u8; 16]).unwrap();
+        let mut app = configured(&directory);
+        let task = app.add(
+            Opened {
+                root: directory.path().into(),
+                file: Some("bytes.bin".into()),
+                snapshot: None,
+            },
+            true,
+        );
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        for reveal in [false, true] {
+            let action = |card| {
+                if reveal {
+                    RepositoryAction::RevealFile { card }
+                } else {
+                    RepositoryAction::OpenSystem { card }
+                }
+            };
+            // Keep the real desktop effect lazy: ordinary tests verify actual
+            // dispatcher admission without launching a user's file manager.
+            assert!(app.update(Message::Repository(action(card))).units() > 0);
+            app.settings_open = true;
+            // iced batch/map may retain a stream even for zero scheduled work.
+            assert_eq!(app.update(Message::Repository(action(card))).units(), 0);
+            app.settings_open = false;
+            assert_eq!(
+                app.update(Message::Repository(action(CardId::new())))
+                    .units(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn binary_page_worker_finishes_behind_settings_and_updates_the_mounted_range() {
+        use cosmic::iced::advanced::{Layout, layout, renderer::Headless, widget::Tree};
+        let directory = tempfile::tempdir().unwrap();
+        let page = cagents::editor::BINARY_PREVIEW_BYTES;
+        std::fs::write(
+            directory.path().join("bytes.bin"),
+            vec![0; page as usize + 1],
+        )
+        .unwrap();
+        let mut app = configured(&directory);
+        let task = app.add(
+            Opened {
+                root: directory.path().into(),
+                file: Some("bytes.bin".into()),
+                snapshot: None,
+            },
+            true,
+        );
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        let task = app.update(Message::Repository(RepositoryAction::BinaryPage {
+            card,
+            offset: page,
+        }));
+        app.settings_open = true;
+        run_tasks(&mut app, task);
+        app.settings_open = false;
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                cosmic::iced::Font::MONOSPACE,
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("headless renderer");
+        let mut element = cagents::repository_widget::view(card, &app.tab(card).unwrap().runtime);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(
+                cosmic::iced::Size::ZERO,
+                cosmic::iced::Size::new(1000.0, 700.0),
+            ),
+        );
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            cosmic::iced::mouse::Cursor::Unavailable,
+        );
+        let expected = format!("bytes {}–{}", page, page + 1);
+        assert!(
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .any(|node| node
+                    .node()
+                    .label()
+                    .is_some_and(|label| label.contains(&expected))),
+            "the actual completed second page must replace the first page behind a modal"
         );
     }
 
