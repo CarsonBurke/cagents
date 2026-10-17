@@ -12712,6 +12712,38 @@ mod tests {
     }
 
     #[test]
+    fn native_composer_up_keeps_whitespace_drafts_out_of_queue_take_back() {
+        let renderer = crate::app::tests::headless_renderer();
+        for text in [" ".repeat(1200), "\n\n\n".into()] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("whitespace-queue"));
+            write(&mut app, card, &text);
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.followups.push(Followup {
+                id: 1,
+                text: "waiting follow-up".into(),
+                attachments: Vec::new(),
+            });
+            runtime
+                .composer
+                .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+            let before = runtime.composer.cursor();
+            composer_history_key(
+                &mut app,
+                card,
+                240.0,
+                keyboard::key::Named::ArrowUp,
+                &renderer,
+            );
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), text);
+            assert_eq!(runtime.followups.len(), 1);
+            assert_ne!(runtime.composer.cursor(), before);
+        }
+    }
+
+    #[test]
     fn multiline_prompt_history_restores_the_exact_unsent_draft_and_attachments() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("history"));

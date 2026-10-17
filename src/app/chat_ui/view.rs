@@ -1965,7 +1965,7 @@ impl Runtime {
                             target, mode,
                         ))));
                     }
-                    if take_back && queue_key(&press, !has_text) {
+                    if take_back && queue_key(&press, self.composer.is_empty()) {
                         return Some(text_editor::Binding::Custom(action(
                             Action::TakeBackQueued(target, None),
                         )));
@@ -7297,10 +7297,10 @@ mod tests {
     }
 
     #[test]
-    fn up_reaches_the_queue_from_the_first_line_and_alt_up_from_anywhere() {
+    fn up_reaches_the_queue_from_an_empty_draft_and_alt_up_from_anywhere() {
         use keyboard::Modifiers;
         use keyboard::key::Named;
-        for (named, modifiers, first_line, expected) in [
+        for (named, modifiers, empty, expected) in [
             (Named::ArrowUp, Modifiers::empty(), true, true),
             (Named::ArrowUp, Modifiers::empty(), false, false),
             (Named::ArrowUp, Modifiers::ALT, false, true),
@@ -7317,9 +7317,9 @@ mod tests {
             (Named::ArrowDown, Modifiers::ALT, true, false),
         ] {
             assert_eq!(
-                queue_key(&key(named, modifiers), first_line),
+                queue_key(&key(named, modifiers), empty),
                 expected,
-                "{named:?} {modifiers:?} first_line={first_line}"
+                "{named:?} {modifiers:?} empty={empty}"
             );
         }
         let mut unfocused = key(Named::ArrowUp, Modifiers::empty());
