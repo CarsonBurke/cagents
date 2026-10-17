@@ -5974,6 +5974,38 @@ mod tests {
     }
 
     #[test]
+    fn initial_scalar_activation_before_early_completion_keeps_exact_ack_authority() {
+        for managed in [false, true] {
+            let mut adapter = adapter();
+            let run = crate::model::RunId::new();
+            let command = Command::Prompt {
+                text: "Owned prompt".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            };
+            let submitted = if managed {
+                adapter.command_for_run(run, command).unwrap()
+            } else {
+                adapter.command(command).unwrap()
+            };
+            adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+            adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"owned","status":"completed","items":[{"id":"answer","type":"agentMessage","text":"Owned answer"}]}}})).unwrap();
+            adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}})).unwrap();
+            let acknowledged = adapter
+                .receive(json!({"id":submitted.writes[0]["id"],"result":{"turn":{"id":"owned"}}}))
+                .unwrap();
+            assert!(!acknowledged.suppress_current_notification);
+            assert!(acknowledged.events.iter().any(|event| matches!(event,
+                Event::TurnFinished { key, outcome: crate::notifications::Kind::Succeeded } if key.as_deref() == Some("codex:thread-exact:owned")
+            )));
+            assert!(!adapter.busy);
+            assert_eq!(acknowledged.events.iter().filter(|event| matches!(event,
+                Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *actual == run
+            )).count(), usize::from(managed));
+        }
+    }
+
+    #[test]
     fn superseded_early_completion_cannot_reclaim_notification_authority_after_idle() {
         for supersession in ["active", "metadata-active", "systemError", "closed"] {
             for managed in [false, true] {
