@@ -1190,6 +1190,7 @@ dependencies = [
  "blake3",
  "cagents-browser-import",
  "clap",
+ "clap_complete",
  "cookie 0.18.2",
  "croner",
  "crossbeam-channel",
@@ -1216,6 +1217,7 @@ dependencies = [
  "notify",
  "portable-pty",
  "postcard",
+ "pulldown-cmark",
  "raw-window-handle",
  "resvg",
  "roxmltree",
@@ -1484,6 +1486,15 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.5.61"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39615915e2ece2550c0149addac32fb5bd312c657f43845bb9088cb9c8a7c992"
+dependencies = [
+ "clap",
 ]
 
 [[package]]
@@ -5757,8 +5768,6 @@ dependencies = [
 [[package]]
 name = "libsqlite3-sys"
 version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
 dependencies = [
  "cc",
  "pkg-config",

@@ -32,6 +32,21 @@ pub(super) struct ActiveWorktreeOperation {
 }
 
 impl ActiveWorktreeOperation {
+    #[cfg(test)]
+    pub(super) fn pr_cancellation_for_test(&self) -> Option<&CancellationToken> {
+        self.token.as_ref()
+    }
+
+    pub(super) fn pr_creation_running(&self, card: CardId) -> bool {
+        !self.finished && self.pr_origin().is_some_and(|origin| origin.card == card)
+    }
+
+    pub(super) fn pr_origin(&self) -> Option<&super::pr_checkout_ui::PrCheckoutOrigin> {
+        self.draft
+            .as_ref()
+            .and_then(|draft| draft.pr_checkout.as_ref())
+    }
+
     pub(super) fn project(&self) -> ProjectId {
         self.project
     }
@@ -170,6 +185,16 @@ impl Cagents {
         request: CreateWorktreeRequest,
         draft: Option<WorktreeDraft>,
     ) -> Task<Message> {
+        let origin = draft.as_ref().and_then(|draft| draft.pr_checkout.clone());
+        if origin
+            .as_ref()
+            .is_some_and(|origin| !self.pr_creation_origin_is_current(origin))
+        {
+            self.status = Some(TransientNotice::warning(
+                "The owning PR changed. Prepare checkout again.",
+            ));
+            return Task::none();
+        }
         let Some(session) = self.session.as_ref() else {
             self.status = Some(TransientNotice::error(
                 "Worktree creation requires an available durable journal. No Git mutation was started.",
@@ -205,8 +230,19 @@ impl Cagents {
         self.sync_worktree_operation_rows();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .create_worktree_journaled(&store, &request, generation, &token, &sender)
+                let service = RepositoryService::system("git");
+                match origin {
+                    Some(origin) => service.create_worktree_journaled_for_pr(
+                        &store,
+                        &request,
+                        &origin.consent,
+                        generation,
+                        &token,
+                        &sender,
+                    ),
+                    None => service
+                        .create_worktree_journaled(&store, &request, generation, &token, &sender),
+                }
             })
             .await
             .map_err(|error| {
@@ -301,6 +337,7 @@ impl Cagents {
         operation.token = None;
         operation.receiver = None;
         let project_id = operation.project;
+        let origin = operation.pr_origin().cloned();
         let repository = operation
             .request
             .as_ref()
@@ -324,16 +361,30 @@ impl Cagents {
             }
         };
         self.sync_worktree_operation_rows();
+        let close = self.complete_closed_projects();
         if let (Some(repository), Some(outcome @ WorktreeCreationOutcome::Created { .. })) =
             (repository, outcome)
         {
-            return cosmic::task::message(Message::WorktreeCreated {
-                project_id,
-                repository,
-                result: Ok(outcome),
-            });
+            if let Some(origin) = origin {
+                return Task::batch([
+                    close,
+                    cosmic::task::message(Message::PrWorktreeCreated {
+                        origin,
+                        repository,
+                        outcome,
+                    }),
+                ]);
+            }
+            return Task::batch([
+                close,
+                cosmic::task::message(Message::WorktreeCreated {
+                    project_id,
+                    repository,
+                    result: Ok(outcome),
+                }),
+            ]);
         }
-        Task::none()
+        close
     }
     pub(super) fn rehydrate_worktree_operations(&self) -> Task<Message> {
         let Some(session) = self.session.as_ref() else {

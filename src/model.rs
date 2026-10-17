@@ -1108,8 +1108,8 @@ pub struct ProjectChannel {
     pub focused: Option<CardId>,
 }
 
-/// Legacy nonempty names remain authoritative; inferred names may improve
-/// only until a provider supplies a title or a person explicitly renames it.
+/// Legacy nonempty names and explicit renames remain authoritative. Automatic
+/// names may refresh only with the current conversation's shared-view proof.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ChannelTitleSource {
     Prompt,
@@ -1121,6 +1121,12 @@ pub enum ChannelTitleSource {
 impl ChannelTitleSource {
     pub fn accepts(self, title: &str, suggested: Self) -> bool {
         suggested != Self::Manual && (title.is_empty() || suggested > self)
+    }
+
+    /// Refreshes from the same conversation only after its shared ownership has
+    /// been checked. Legacy unproven suggestions retain the stricter upgrade rule.
+    pub fn accepts_refresh(self, title: &str, suggested: Self) -> bool {
+        suggested != Self::Manual && (title.is_empty() || suggested >= self)
     }
 }
 

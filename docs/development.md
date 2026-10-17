@@ -354,11 +354,19 @@ built executable.
 Desktop alerts are sent through the notification portal under the daemon's
 application ID. When the portal accepts that ID, the daemon owns it on the session
 bus and receives clicks as `org.freedesktop.Application.ActivateAction` calls
-carrying the notification server's activation token, so the compositor raises
-the window. The portal only accepts IDs with an installed desktop entry; without
+carrying the notification server's activation token, which the compositor
+validates before granting foreground activation. The portal only accepts IDs with an installed desktop entry; without
 `dev.cagents.Cagents.Development.desktop`, development alerts fall back to the
 portal's `ActionInvoked` signal, which still selects the pane but may carry no
 token, and Wayland compositors such as niri then leave the window unraised.
+
+Successful registration and action routing do not guarantee foreground activation.
+Native validation with KWin 6.4.4 and COSMIC Notifications alpha 7 observed the
+correct conversation and acknowledgment while the notification service returned
+a refused activation token and ordinary X11 activation requests left the window
+behind the active window. The existing-window X11 path does not yet propagate an
+X11 startup-notification ID; granted foreground activation on this combination
+remains unverified. Focus remains subject to the compositor's policy.
 
 Standalone Ceditor review alerts use the shared daemon notification broker. The
 `--review-alerts` runner builds the CLI, daemon, and editor in separate feature

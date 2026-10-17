@@ -6,6 +6,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 pub mod claude;
 mod claude_edits;
 mod claude_permissions;
+mod claude_titles;
 pub mod codex;
 pub mod omp;
 mod terminal_output;
@@ -192,6 +193,15 @@ impl ProcessSpec {
 }
 #[derive(Debug, Default)]
 pub struct Step {
+    /// The decoder has not qualified this frame as the current turn. Its
+    /// transcript and exact managed execution evidence remain valid, but it
+    /// cannot replace the current conversation's notification context/error.
+    /// This transport-local flag never enters the shared wire codec.
+    pub suppress_current_notification: bool,
+    /// Bounded pre-acknowledgement context selected by the exact accepted
+    /// provider turn. Restores only notification metadata, never transcript
+    /// deltas that would otherwise be appended a second time.
+    pub notification_preview: Option<super::notification::Preview>,
     /// Written in order before the next incoming frame is processed.
     pub writes: Vec<Value>,
     pub events: Vec<Event>,
@@ -209,6 +219,11 @@ pub struct ServerIdentity {
 pub trait Adapter: Send {
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
+    /// Whether this exact pending answer refuses work. Providers with opaque
+    /// action IDs must inspect their retained decision, never its UI label.
+    fn answer_declines(&self, _request_id: &str, action: &str) -> bool {
+        super::declines(action)
+    }
     fn command_for_run(
         &mut self,
         _run: crate::model::RunId,

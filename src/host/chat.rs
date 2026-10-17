@@ -388,7 +388,10 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
-    if matches!(&update, Update::Attention(_)) {
+    if matches!(
+        &update,
+        Update::Attention(_) | Update::AttentionContext { .. }
+    ) {
         // Scheduled outcomes belong to the accepted run, not its temporary
         // provider process. The scheduler publishes committed run evidence.
         // Read outside HostState; a failed ownership read cannot safely turn
@@ -429,16 +432,20 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     {
         courier.wake();
     }
-    if let Update::Attention(evidence) = &update {
+    if let Update::Attention(evidence) | Update::AttentionContext { evidence, .. } = &update {
         if let Some(record) = state.chats.get(&id)
             && let Some(notifications) = &state.notifications
         {
-            notifications.record(crate::notifications::Event::session(
+            let mut event = crate::notifications::Event::session(
                 id,
                 record.session.launch.provider,
                 record.session.launch.recipe.working_directory.clone(),
                 evidence.clone(),
-            ));
+            );
+            if let Update::AttentionContext { content, .. } = &update {
+                event.content = content.clone();
+            }
+            notifications.record(event);
         }
         return;
     }
@@ -752,6 +759,30 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    super::account_lifecycle::ensure_launch(
+        host,
+        &session.launch.recipe.working_directory,
+        &session.launch.recipe.environment,
+        &crate::account::launch_credential_overrides(&session.launch.recipe),
+        true,
+    )?;
+    // Main has no immutable captured-home authority for legacy/native
+    // reattachment. Refuse that path during mutation rather than infer it.
+    let already_hosted = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .contains_key(&session.id);
+    if already_hosted
+        || source.is_some()
+        || session.terminal.is_some()
+        || !matches!(
+            session.native_continuity,
+            chat::NativeContinuity::ReconnectOnly
+        )
+    {
+        super::account_lifecycle::ensure_idle(host)?;
+    }
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
     // the account-wide list of conversations.
@@ -964,11 +995,64 @@ fn start_with_execution(
             "Native restart launch differs from its issued conversation",
         ));
     }
-    let process_launch = restart_launch.unwrap_or(&session.launch);
+    let recorded_process_launch = restart_launch.unwrap_or(&session.launch);
+    // Retain the original recorded-selector admission independently of the
+    // private environment used by constructors and the eventual process.
+    super::account_lifecycle::ensure_launch(
+        host,
+        &recorded_process_launch.recipe.working_directory,
+        &recorded_process_launch.recipe.environment,
+        &Default::default(),
+        true,
+    )?;
+    // History/title/account-root construction must see the same effective
+    // environment as the process. Keep this launch private: neither transient
+    // values nor normalized restart arguments rewrite the issued descriptor.
+    // Saved read-only history receives recorded removals, never fresh defaults
+    // or transient execution credentials.
+    let empty_execution_environment = BTreeMap::new();
+    let process_launch = prepare_native_process_launch(
+        recorded_process_launch,
+        (!saved_history_only && source.is_none()).then(|| {
+            crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false)
+        }),
+        if saved_history_only {
+            &empty_execution_environment
+        } else {
+            &execution_environment.0
+        },
+        if saved_history_only {
+            None
+        } else {
+            source_execution.as_ref()
+        },
+    )?;
+    if process_launch.provider != Provider::Codex && !saved_history_only {
+        check_launch_account(&process_launch)?;
+    }
+    // This map is fully materialized. Match env_clear: absent selectors stay
+    // absent, and constructor admission uses the same captured removals.
+    super::account_lifecycle::ensure_launch_at_directory(
+        host,
+        &process_launch.recipe.working_directory,
+        &process_launch.recipe.environment,
+        &process_launch.recipe.unset_environment,
+        false,
+        execution
+            .as_ref()
+            .and_then(|context| context.directory.as_deref()),
+    )?;
+    super::account_lifecycle::ensure_launch(
+        host,
+        &process_launch.recipe.working_directory,
+        &process_launch.recipe.environment,
+        &process_launch.recipe.unset_environment,
+        false,
+    )?;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
-        chat::protocol::codex::create_with_listener(process_launch, owned_socket)
+        chat::protocol::codex::create_with_listener(&process_launch, owned_socket)
     } else {
-        chat::protocol::create(process_launch)
+        chat::protocol::create(&process_launch)
     }
     .map_err(|message| {
         // Removal may have won after the early check while the adapter
@@ -996,48 +1080,21 @@ fn start_with_execution(
     ) {
         check_launch_account(&session.launch)?;
     }
-    if source.is_none() && !matches!(spec.transport, chat::protocol::TransportSpec::History) {
-        // A conversation with no proven source has no proven environment to
-        // preserve, so it starts from the daemon's own native configuration
-        // whether or not it names a stopped terminal. Requiring the absence of
-        // a descriptor here left a conversation converted from a stopped agent
-        // terminal with nothing but that terminal's recorded recipe, which is
-        // empty for a terminal whose resume hint was discarded when its agent
-        // exited.
-        //
-        // Standalone conversations also receive transient execution
-        // configuration from the GUI, including credentials unavailable in the
-        // daemon environment. Keep these values in the process spec only,
-        // never the durable session. Explicit selected configuration takes
-        // precedence over daemon defaults, and the recipe's own environment
-        // takes precedence over both.
-        if execution_environment.0.iter().any(|(name, value)| {
-            !crate::model::agent_recovery::fresh_environment_key(
-                session.launch.provider,
-                name,
-                value,
-                false,
-            )
-        }) {
-            return Err(error(
-                "Native execution environment contains an unrelated or private variable",
-            ));
-        }
-        spec.environment = sourceless_environment(
-            crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false),
-            execution_environment.0,
-            std::mem::take(&mut spec.environment),
-        );
-    }
-    if let Some(environment) = &source_execution {
-        spec.environment = environment.clone();
-    }
+    // Provider-specific process fields derive from the prepared launch.
+    // No environment overlay may follow constructor history/title reads.
     spec.remove_unset_environment();
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .mailbox_seal
         .clone();
+    super::account_lifecycle::ensure_launch(
+        host,
+        &spec.working_directory,
+        &spec.environment,
+        &spec.unset_environment,
+        false,
+    )?;
     let mut initial = adapter.initialize().map_err(error)?;
     let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
     if terminate_source && source.is_none() {
@@ -2276,6 +2333,7 @@ fn process_inner(
             Ok(response)
         }
         ClientRequest::ChatReturnTerminal { chat_id } => {
+            super::account_lifecycle::ensure_idle(host)?;
             let (handle, mut session) = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.shutting_down {
@@ -2469,15 +2527,17 @@ fn process_inner(
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatClose { chat_id } => {
-            let handle = {
+            let (handle, source) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.chat_handoffs.contains_key(&chat_id) {
                     return Err(error(
                         "This chat already returned to terminal; complete the retained handoff before closing its card",
                     ));
                 }
-                attached(&state, client, chat_id)?.handle.clone()
+                let record = attached(&state, client, chat_id)?;
+                (record.handle.clone(), record.session.clone())
             };
+            super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
             handle.close_for_resume().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
             let (retained, pending_cleanup) = {
@@ -2737,6 +2797,51 @@ fn sourceless_environment(
     environment
 }
 
+/// Materialize the exact constructor/process environment once, off HostLock.
+/// Source execution replaces the recorded map; sourceless precedence remains
+/// daemon, selected configuration, then recipe. Explicit and legacy account
+/// removals are applied before any adapter/history/title constructor runs.
+fn prepare_native_process_launch(
+    launch: &chat::Launch,
+    daemon: Option<BTreeMap<String, String>>,
+    selected: &BTreeMap<String, String>,
+    source: Option<&BTreeMap<String, String>>,
+) -> Result<chat::Launch, ProtocolError> {
+    let mut spec = chat::protocol::ProcessSpec::from(&launch.recipe);
+    if let Some(daemon) = daemon {
+        if selected.iter().any(|(name, value)| {
+            !crate::model::agent_recovery::fresh_environment_key(
+                launch.provider,
+                name,
+                value,
+                false,
+            )
+        }) {
+            return Err(error(
+                "Native execution environment contains an unrelated or private variable",
+            ));
+        }
+        spec.environment = sourceless_environment(daemon, selected.clone(), spec.environment);
+    }
+    if let Some(source) = source {
+        spec.environment = source.clone();
+    }
+    let mut process_launch = launch.clone();
+    process_launch.recipe.environment = spec.environment;
+    process_launch.recipe.unset_environment = spec.unset_environment;
+    // The effective home itself can select legacy managed-home removals.
+    // Resolve those now too, so ProcessSpec::from cannot later scrub a
+    // credential which a constructor already observed in the private launch.
+    process_launch.recipe.unset_environment =
+        crate::account::launch_credential_overrides(&process_launch.recipe);
+    let removed = &process_launch.recipe.unset_environment;
+    process_launch
+        .recipe
+        .environment
+        .retain(|name, _| !removed.contains(name));
+    Ok(process_launch)
+}
+
 /// The environment `restore_upgrade` will start `launch` with in the next
 /// daemon. A conversation whose terminal the successor restores before it
 /// restarts from that terminal; any other, including one that merely names a
@@ -2748,14 +2853,16 @@ fn upgrade_environment(
     hosted_source: bool,
     daemon: BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, String> {
-    let (spec, _) = chat::protocol::create(launch)?;
-    let mut environment = if hosted_source {
-        spec.environment
-    } else {
-        sourceless_environment(daemon, BTreeMap::new(), spec.environment)
-    };
-    launch.recipe.remove_unset_environment(&mut environment);
-    Ok(environment)
+    let process_launch = prepare_native_process_launch(
+        launch,
+        (!hosted_source && !launch.needs_read_only_history()).then_some(daemon),
+        &BTreeMap::new(),
+        None,
+    )
+    .map_err(|error| error.message)?;
+    let (mut spec, _) = chat::protocol::create(&process_launch)?;
+    spec.remove_unset_environment();
+    Ok(spec.environment)
 }
 
 pub(super) fn validate_upgrade_environment(
@@ -2924,6 +3031,51 @@ pub(super) fn owns_codex_listener(session: &Session) -> bool {
     session.owns_codex_listener()
 }
 
+/// Check a paired managed presentation before the terminal worker itself can
+/// stop. This is read-only; the actor path repeats its checks after teardown.
+pub(super) fn preflight_for_terminal_close(
+    host: &SharedHost,
+    terminal_id: TerminalId,
+    expected: &crate::terminal::TerminalHandle,
+) -> Result<(), ProtocolError> {
+    let source = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .chats
+            .get(&terminal_id)
+            .filter(|record| {
+                (record.session.launch.provider == Provider::Codex
+                    || record.owns_execution_console())
+                    && record
+                        .session
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|source| source.id == terminal_id)
+            })
+            .map(|record| {
+                if !record
+                    .paired_terminal
+                    .as_ref()
+                    .is_some_and(|handle| handle.same_worker(expected))
+                    || !state
+                        .terminals
+                        .get(&terminal_id)
+                        .is_some_and(|current| current.handle.same_worker(expected))
+                {
+                    return Err(unavailable(
+                        "The terminal worker no longer belongs to this provider pairing",
+                    ));
+                }
+                Ok(record.session.clone())
+            })
+            .transpose()?
+    };
+    if let Some(source) = source {
+        super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
+    }
+    Ok(())
+}
+
 /// A terminal card restored after a GUI restart has no parked UI runtime, but
 /// the daemon still owns its exact native actor. Explicit card close retires both.
 pub(super) fn close_for_terminal(
@@ -2973,6 +3125,16 @@ pub(super) fn close_terminal_actor(
     terminal_id: TerminalId,
     handle: &Handle,
 ) -> Result<(), ProtocolError> {
+    let source = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&terminal_id)
+        .filter(|record| record.handle.same_actor(handle))
+        .map(|record| record.session.clone());
+    if let Some(source) = source {
+        super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
+    }
     handle.close().map_err(unavailable)?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let removed = if state
@@ -3003,6 +3165,302 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn native_constructor_environment_is_private_once_and_preserves_precedence_and_removals() {
+        let root = tempfile::tempdir().unwrap();
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let mut launch = chat::Launch {
+                provider,
+                session_id: None,
+                recipe: LaunchRecipe {
+                    program: "private-fixture".into(),
+                    arguments: vec![],
+                    working_directory: root.path().into(),
+                    environment: [
+                        ("HOME".into(), root.path().to_str().unwrap().into()),
+                        ("PATH".into(), "/recipe/bin".into()),
+                    ]
+                    .into(),
+                    unset_environment: ["HTTPS_PROXY".into()].into(),
+                },
+            };
+            let issued = launch.clone();
+            let daemon = [
+                ("PATH".into(), "/daemon/bin".into()),
+                ("HTTPS_PROXY".into(), "daemon-proxy".into()),
+            ]
+            .into();
+            let selected = [("PATH".into(), "/selected/bin".into())].into();
+            let prepared =
+                prepare_native_process_launch(&launch, Some(daemon), &selected, None).unwrap();
+            assert_eq!(prepared.recipe.environment["PATH"], "/recipe/bin");
+            assert!(!prepared.recipe.environment.contains_key("HTTPS_PROXY"));
+            assert_eq!(launch, issued);
+            let source = [
+                ("HOME".into(), root.path().to_str().unwrap().into()),
+                ("PATH".into(), "/source/bin".into()),
+            ]
+            .into();
+            let prepared =
+                prepare_native_process_launch(&launch, None, &BTreeMap::new(), Some(&source))
+                    .unwrap();
+            assert_eq!(prepared.recipe.environment, source);
+            let spec = chat::protocol::ProcessSpec::from(&prepared.recipe);
+            assert_eq!(spec.environment, prepared.recipe.environment);
+            assert_eq!(spec.unset_environment, prepared.recipe.unset_environment);
+            assert_eq!(launch, issued);
+            launch.recipe.environment.remove("PATH");
+            assert!(
+                prepare_native_process_launch(
+                    &launch,
+                    Some(BTreeMap::new()),
+                    &[(
+                        "UNRELATED_PRIVATE_FIXTURE_KEY".into(),
+                        "do-not-admit".into()
+                    )]
+                    .into(),
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_constructor_history_uses_effective_source_selected_and_unset_home_without_reading_issued_home()
+     {
+        use std::{
+            io::Read,
+            os::fd::{AsRawFd, FromRawFd},
+        };
+        const CONVERSATION: &str = "12345678-1234-4234-8234-123456789abc";
+        for mode in ["source", "selected", "unset"] {
+            let root = tempfile::tempdir().unwrap();
+            let cwd = root.path().join("project");
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.canonicalize().unwrap();
+            let project: String = cwd
+                .to_str()
+                .unwrap()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let issued_home = root.path().join("issued-home");
+            let actual_home = root.path().join("actual-home");
+            let issued_config = issued_home.join(".claude");
+            let actual_config = actual_home.join(".claude");
+            let mut issued_file = None;
+            for (config, body) in [
+                (&issued_config, "issued-A-body"),
+                (&actual_config, "effective-B-body"),
+            ] {
+                let path = config
+                    .join("projects")
+                    .join(&project)
+                    .join(format!("{CONVERSATION}.jsonl"));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, format!("{}\n{}\n",
+                    json!({"type":"user","uuid":"private-prompt","parentUuid":null,"sessionId":CONVERSATION,"cwd":cwd,"message":{"role":"user","content":body}}),
+                    json!({"type":"custom-title","sessionId":CONVERSATION,"customTitle":format!("{body} title")}))).unwrap();
+                if config == &issued_config {
+                    issued_file = Some(path);
+                }
+            }
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0);
+            let mut watcher = unsafe { std::fs::File::from_raw_fd(fd) };
+            let path = std::ffi::CString::new(issued_file.unwrap().as_os_str().as_encoded_bytes())
+                .unwrap();
+            assert!(
+                unsafe {
+                    libc::inotify_add_watch(
+                        watcher.as_raw_fd(),
+                        path.as_ptr(),
+                        libc::IN_OPEN | libc::IN_ACCESS,
+                    )
+                } >= 0
+            );
+            let mut launch = chat::Launch {
+                provider: Provider::Claude,
+                session_id: Some(CONVERSATION.into()),
+                recipe: LaunchRecipe {
+                    program: "private-claude-not-executed".into(),
+                    arguments: vec!["--resume".into(), CONVERSATION.into()],
+                    working_directory: cwd,
+                    environment: [
+                        ("HOME".into(), issued_home.to_str().unwrap().into()),
+                        (
+                            "CLAUDE_CONFIG_DIR".into(),
+                            issued_config.to_str().unwrap().into(),
+                        ),
+                    ]
+                    .into(),
+                    unset_environment: Default::default(),
+                },
+            };
+            let source = [
+                ("HOME".into(), actual_home.to_str().unwrap().into()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    actual_config.to_str().unwrap().into(),
+                ),
+            ]
+            .into();
+            let selected = if mode == "selected" {
+                launch.recipe.environment.remove("CLAUDE_CONFIG_DIR");
+                [(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    actual_config.to_str().unwrap().into(),
+                )]
+                .into()
+            } else {
+                BTreeMap::new()
+            };
+            if mode == "unset" {
+                launch
+                    .recipe
+                    .environment
+                    .insert("HOME".into(), actual_home.to_str().unwrap().into());
+                launch
+                    .recipe
+                    .unset_environment
+                    .insert("CLAUDE_CONFIG_DIR".into());
+            }
+            let issued = launch.clone();
+            let prepared = prepare_native_process_launch(
+                &launch,
+                (mode != "source").then(BTreeMap::new),
+                &selected,
+                (mode == "source").then_some(&source),
+            )
+            .unwrap();
+            assert_eq!(
+                Provider::Claude.session_root(&prepared.recipe),
+                Some(actual_config.clone())
+            );
+            let (spec, mut adapter) = chat::protocol::create(&prepared).unwrap();
+            assert_eq!(spec.environment, prepared.recipe.environment);
+            assert_eq!(spec.unset_environment, prepared.recipe.unset_environment);
+            let initial = adapter.initialize().unwrap();
+            let items: Vec<_> = initial
+                .events
+                .iter()
+                .filter_map(|event| {
+                    if let chat::Event::History { items, .. } = event {
+                        Some(items)
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+                .collect();
+            assert!(items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text {text, ..} if text == "effective-B-body")));
+            assert!(!items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text {text, ..} if text == "issued-A-body")));
+            // The real adapter's confirmed result samples its title reader.
+            // The same prepared origin must supply both history and metadata.
+            let result = adapter
+                .receive(json!({"type":"result","session_id":CONVERSATION}))
+                .unwrap();
+            assert!(result.events.iter().any(|event| matches!(event,
+                chat::Event::Session {id, title:Some(title)}
+                    if id == CONVERSATION && title == "effective-B-body title")));
+            assert!(!result.events.iter().any(|event| matches!(event,
+                chat::Event::Session {title:Some(title), ..} if title == "issued-A-body title")));
+            let mut bytes = [0_u8; 256];
+            assert_eq!(
+                watcher.read(&mut bytes).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "issued transcript must never be opened/indexed"
+            );
+            assert_eq!(launch, issued);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upgrade_history_validation_keeps_recorded_home_after_live_working_directory_disappears() {
+        use std::{
+            io::Read,
+            os::fd::{AsRawFd, FromRawFd},
+        };
+        const ID: &str = "12345678-1234-4234-8234-123456789abc";
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("now-missing-project");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let home_a = root.path().join("recorded-home");
+        let home_b = root.path().join("daemon-home");
+        let mut watches = Vec::new();
+        for (home, body) in [(&home_a, "recorded-A"), (&home_b, "unrelated-B")] {
+            let file = home
+                .join(".claude/projects")
+                .join(&project)
+                .join(format!("{ID}.jsonl"));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, json!({"type":"user","uuid":"private-prompt","parentUuid":null,"sessionId":ID,"message":{"role":"user","content":body}}).to_string()+"\n").unwrap();
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0);
+            let watcher = unsafe { std::fs::File::from_raw_fd(fd) };
+            let path = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
+            assert!(
+                unsafe {
+                    libc::inotify_add_watch(
+                        watcher.as_raw_fd(),
+                        path.as_ptr(),
+                        libc::IN_OPEN | libc::IN_ACCESS,
+                    )
+                } >= 0
+            );
+            watches.push(watcher);
+        }
+        let launch = chat::Launch {
+            provider: Provider::Claude,
+            session_id: Some(ID.into()),
+            recipe: LaunchRecipe {
+                program: "private-provider-not-executed".into(),
+                arguments: vec!["--resume".into(), ID.into()],
+                working_directory: cwd,
+                environment: [("HOME".into(), home_a.to_str().unwrap().into())].into(),
+                unset_environment: Default::default(),
+            },
+        };
+        std::fs::create_dir(&launch.recipe.working_directory).unwrap();
+        assert!(!launch.needs_read_only_history());
+        std::fs::remove_dir(&launch.recipe.working_directory).unwrap();
+        assert!(launch.needs_read_only_history());
+        let issued = launch.clone();
+        let restored = upgrade_environment(
+            &launch,
+            false,
+            [
+                ("HOME".into(), home_b.to_str().unwrap().into()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    home_b.join(".claude").to_str().unwrap().into(),
+                ),
+            ]
+            .into(),
+        )
+        .unwrap();
+        assert_eq!(restored, launch.recipe.environment);
+        let mut bytes = [0_u8; 256];
+        assert!(
+            watches[0].read(&mut bytes).unwrap() > 0,
+            "actual upgrade factory must read recorded A"
+        );
+        assert_eq!(
+            watches[1].read(&mut bytes).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "upgrade validation must not read daemon B"
+        );
+        assert_eq!(launch, issued);
+    }
 
     #[test]
     fn removed_claude_account_is_reported_before_missing_resume_history() {
@@ -4023,6 +4481,8 @@ for line in sys.stdin:
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![
                         Event::Ready(true),
@@ -4106,6 +4566,8 @@ done
         process_recipe.program = "/bin/cat".into();
         let spec = ProcessSpec::from(&process_recipe);
         let mut initial = Step {
+            suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![json!({"ready": true})],
             events: vec![
                 Event::Ready(true),
@@ -4240,12 +4702,16 @@ done
             }
             fn command(&mut self, _: Command) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![json!({"id":"saved-conversation"})],
                     events: Vec::new(),
                 })
             }
             fn receive(&mut self, value: Value) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![Event::Session {
                         id: value["id"].as_str().unwrap().to_owned(),
@@ -4304,6 +4770,8 @@ done
         }
         fn command(&mut self, command: Command) -> Result<Step, String> {
             Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: Vec::new(),
                 events: if matches!(command, Command::Interrupt) {
                     vec![Event::Status {
@@ -4409,6 +4877,8 @@ done
         };
         let spec = ProcessSpec::from(&recipe);
         let mut initial = Step {
+            suppress_current_notification: false,
+            notification_preview: None,
             writes: Vec::new(),
             events: vec![Event::Status {
                 busy: true,
@@ -4588,6 +5058,8 @@ done
         }
         fn command(&mut self, _: Command) -> Result<Step, String> {
             Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: vec![json!({"tick": true})],
                 events: Vec::new(),
             })
@@ -4595,6 +5067,8 @@ done
         fn receive(&mut self, _: Value) -> Result<Step, String> {
             self.0 = !self.0;
             Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: Vec::new(),
                 events: vec![Event::Waiting(self.0)],
             })
@@ -4634,12 +5108,16 @@ done
             fn command(&mut self, command: Command) -> Result<Step, String> {
                 assert_eq!(command, Command::Interrupt);
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![json!({"interrupt": true})],
                     events: Vec::new(),
                 })
             }
             fn receive(&mut self, value: Value) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![if value.get("ready").is_some() {
                         Event::Session {

@@ -395,12 +395,26 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
             && candidate.handle.cached_agent_process().as_ref() == Some(&candidate.process)
             && let Some(notifications) = &state.notifications
         {
-            notifications.record(crate::notifications::Event::session(
+            let mut event = crate::notifications::Event::session(
                 candidate.id,
                 candidate.process.provider,
                 candidate.process.launch.working_directory.clone(),
                 evidence,
-            ));
+            );
+            let title = observation.title.as_deref().or_else(|| {
+                state
+                    .terminals
+                    .get(&candidate.id)
+                    .and_then(|record| record.conversation_title())
+            });
+            if let Some(title) = title {
+                event.content = Some(crate::notifications::Content {
+                    conversation: crate::notifications::presentation::title(title),
+                    preview: String::new(),
+                    request: None,
+                });
+            }
+            notifications.record(event);
         }
     }
     candidate.handle.apply_agent_activity(

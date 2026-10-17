@@ -36,6 +36,7 @@ pub mod info;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod login;
 pub mod omp;
+pub mod preferences;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]

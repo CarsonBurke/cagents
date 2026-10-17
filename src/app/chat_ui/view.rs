@@ -847,14 +847,11 @@ impl Cagents {
                 .iter()
                 .find(|channel| channel.cards.contains(&card))
                 .map(|channel| {
-                    if channel.title.trim().is_empty() {
-                        format!(
-                            "Channel {}",
-                            channel.id.to_string().chars().take(8).collect::<String>()
-                        )
-                    } else {
-                        channel.title.clone()
-                    }
+                    channel_ui::channel_display_title(
+                        channel,
+                        self.sidebar_model.project(channel.project_id),
+                    )
+                    .into_owned()
                 }),
             name: directory
                 .file_name()
@@ -2149,7 +2146,8 @@ impl Runtime {
         );
         let usage = &snapshot.usage;
         // Prefer a wider chat over hiding its status and settings behind a
-        // scrollbar. The footer wraps only when the pane itself is too narrow.
+        // scrollbar. Narrow panes keep the primary status on one line and move
+        // secondary details into the overflow control.
         // The line always says what the conversation is doing, idle
         // included: a reader glancing at a card should never have to infer
         // its state from the absence of a word. The order is the order of
@@ -2187,6 +2185,7 @@ impl Runtime {
                 .into(),
             );
         }
+        let primary_status_count = status.len();
         if let Some(channel) = &place.channel {
             status.push(
                 crate::interaction::tooltip(
@@ -2267,17 +2266,28 @@ impl Runtime {
             let (label, tooltip) = cost_estimate_label(estimate);
             spend.push(crate::interaction::tooltip(design::caption(label), tooltip));
         }
+        let compact_footer = content_width < 600.0;
+        let mut secondary = if compact_footer {
+            status.split_off(primary_status_count)
+        } else {
+            Vec::new()
+        };
         let mut footer = status;
         if let Some(notice) = permissions::notice(snapshot) {
             footer.push(
                 widget::button::custom(
-                    widget::row::with_children(vec![
-                        crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
-                        design::caption(notice)
-                            .class(cosmic::theme::Text::Custom(design::warning_text))
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .into(),
-                    ])
+                    widget::row::with_children(
+                        std::iter::once(crate::ui_controls::passive_icon(
+                            Icon::Warning,
+                            design::COMPACT_ICON_SIZE,
+                        ))
+                        .chain((!compact_footer).then(|| {
+                            design::caption(notice)
+                                .class(cosmic::theme::Text::Custom(design::warning_text))
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .into()
+                        })),
+                    )
                     .spacing(step::GAP_XS)
                     .align_y(Alignment::Center),
                 )
@@ -2294,16 +2304,53 @@ impl Runtime {
                 .into(),
             );
         }
-        footer.push(
-            widget::row::with_children(spend)
+        let spend = widget::row::with_children(spend)
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
+            .into();
+        if compact_footer {
+            // Model/reasoning/account popovers are anchored inside this
+            // overflow. Keyboard shortcuts can open them while More is closed.
+            let details_open = self.footer_picker
+                || self.model_picker.is_some()
+                || self.reasoning_picker
+                || self.account_picker;
+            secondary.push(spend);
+            footer.push(widget::Space::new().width(Length::Fill).into());
+            footer.push(crate::ui_controls::popover(
+                crate::ui_controls::icon_button(Icon::More, "Conversation details and settings")
+                    .id(card_control_id(target.card, "chat-footer-details"))
+                    .on_press(action(Action::FooterPicker(target, !details_open))),
+                details_open.then(|| {
+                    widget::container(
+                        widget::flex_row(secondary)
+                            .spacing(step::GAP_S as u16)
+                            .align_items(Alignment::Center),
+                    )
+                    .padding(space::S)
+                    .width((content_width - 32.0).max(200.0))
+                    .into()
+                }),
+                widget::popover::Position::Top,
+                action(Action::FooterPicker(target, false)),
+            ));
+        } else {
+            footer.push(spend);
+        }
+        let footer_row: Element<'_, Message> = if compact_footer {
+            widget::row::with_children(footer)
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
-                .into(),
-        );
-        let footer = crate::ui_controls::popover(
+                .width(Length::Fill)
+                .into()
+        } else {
             widget::flex_row(footer)
                 .spacing(step::GAP_S as u16)
-                .align_items(Alignment::Center),
+                .align_items(Alignment::Center)
+                .into()
+        };
+        let footer = crate::ui_controls::popover(
+            footer_row,
             self.permission_picker
                 .then(|| self.permissions_view(available, content_width - 32.0)),
             widget::popover::Position::Top,
@@ -2325,6 +2372,7 @@ impl Runtime {
             .width(Length::Fill)
             .into(),
             widget::container(footer)
+                .id(card_control_id(target.card, "chat-footer"))
                 .padding(
                     iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
                 )
@@ -2618,6 +2666,7 @@ impl Runtime {
                     selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
                 ))
                 .name("Choose reasoning effort")
+                .id(card_control_id(target.card, "chat-reasoning-picker"))
                 .class(crate::ui_controls::control_style(open, None))
                 .padding(CONTROL_PADDING)
                 .on_press(action(Action::ReasoningPicker(target, !open)));
@@ -2629,6 +2678,11 @@ impl Runtime {
                             .enumerate()
                             .map(|(index, reasoning)| {
                                 widget::button::custom(design::body(reasoning.as_str()))
+                                    .name(reasoning.as_str())
+                                    .id(card_control_id(
+                                        target.card,
+                                        &format!("chat-reasoning-choice-{index}"),
+                                    ))
                                     .class(crate::ui_controls::control_style(
                                         Some(index) == selected,
                                         None,
@@ -2888,6 +2942,7 @@ impl Runtime {
             .align_y(Alignment::Center),
         )
         .name("Choose a model")
+        .id(card_control_id(target.card, "chat-model-picker"))
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::ModelPicker(target, !open)));
@@ -3094,6 +3149,9 @@ impl Runtime {
                     (
                         cached.token,
                         cached.revision,
+                        // Fixed footer strings change only when the displayed
+                        // minute/date changes, not on every provider heartbeat.
+                        cached.stamp.as_ref().map(|(_, label, full)| (label, full)),
                         cached.image.as_ref().map(iced::widget::image::Handle::id),
                         cached.image_source.is_some(),
                         self.preview_request.as_deref() == Some(item.id.as_str()),
@@ -3467,7 +3525,7 @@ impl Runtime {
     }
 
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
-        small_icon(
+        let mut controls = vec![small_icon(
             if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
                 Icon::Check
             } else {
@@ -3475,7 +3533,27 @@ impl Runtime {
             },
             "Copy this message",
             Action::Copy(self.target, item.id.clone(), CopyPart::Text),
-        )
+        )];
+        if let Some((at, stamp, full)) = self
+            .cache
+            .get(&item.id)
+            .and_then(|cached| cached.stamp.as_ref())
+            && item.at == Some(*at)
+        {
+            controls.push(
+                widget::tooltip(
+                    design::caption(stamp.clone())
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
+                    design::caption(full.clone()),
+                    widget::tooltip::Position::Top,
+                )
+                .into(),
+            );
+        }
+        widget::row::with_children(controls)
+            .spacing(step::GAP_XS)
+            .align_y(Alignment::Center)
+            .into()
     }
 
     /// A draft's first message while its conversation starts.
@@ -3929,44 +4007,12 @@ impl Runtime {
             .width(Length::Fill)
             .into();
         }
-        // An answer's hover footer dates the message and offers to copy it, and
-        // nothing else: a reader of an answer reaches for those two, and the
-        // Markdown source of a rendered answer was a developer's control on a
-        // reader's surface.
-        // The controls lead and the time follows, muted like the time: a
-        // reader reaches for copy far more often than they read the stamp,
-        // and an icon in the text color beside a muted stamp was the one
-        // thing on the row that looked like it wanted attention.
-        let mut controls: Vec<Element<'static, Message>> = vec![small_icon(
-            if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
-                Icon::Check
-            } else {
-                Icon::Copy
-            },
-            "Copy this message",
-            Action::Copy(target, item.id.clone(), CopyPart::Text),
-        )];
-
-        if let Some((_, stamp, full)) = &cached.stamp {
-            controls.push(
-                widget::tooltip(
-                    design::caption(stamp.clone())
-                        .class(cosmic::theme::Text::Custom(design::muted_text)),
-                    design::caption(full.clone()),
-                    widget::tooltip::Position::Top,
-                )
-                .into(),
-            );
-        }
         // The answer is bare prose on the pane's own surface. Wrapping it in
         // a panel would put a frame around the one thing the reader came for,
         // and would make it look like just another block.
         widget::container(message_actions(
             prose::view(cached, settings, self.target, self.find.as_deref()),
-            widget::row::with_children(controls)
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
-                .into(),
+            self.message_copy(item),
             Alignment::Start,
         ))
         .max_width(design::READABLE_MEASURE)
@@ -4584,6 +4630,13 @@ fn model_list<'a>(
                     .align_y(Alignment::Center),
                 )
                 .name(name)
+                .id(card_control_id(
+                    target.card,
+                    &match id {
+                        Some(id) => format!("chat-model-choice-{provider:?}-named-{id}"),
+                        None => format!("chat-model-choice-{provider:?}-default"),
+                    },
+                ))
                 .class(crate::ui_controls::control_style(selected, None))
                 .selected(selected)
                 .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
@@ -4641,6 +4694,383 @@ mod frame_cost;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_message_timestamp_format_uses_message_metadata() {
+        let at = 1_700_000_000_000;
+        let local = chat::local_time((at / 1000) as i64).unwrap();
+        let same_day = chat::local_time((at / 1000 + 60) as i64).unwrap();
+        let full = format!(
+            "{:04}-{:02}-{:02} {}",
+            local.year + 1900,
+            local.month + 1,
+            local.day,
+            local.clock()
+        );
+        let stamp = recorded_message_stamp(at, Some(&same_day)).unwrap();
+        assert_eq!(stamp, (at, local.clock(), full.clone()));
+        let other_day = chat::local_time((at / 1000 + 172_800) as i64).unwrap();
+        assert_eq!(
+            recorded_message_stamp(at, Some(&other_day)),
+            Some((at, full.clone(), full.clone()))
+        );
+        assert_eq!(
+            recorded_message_stamp(at, None),
+            Some((at, full.clone(), full))
+        );
+    }
+
+    #[test]
+    fn recorded_timestamp_changes_refresh_retained_footer_without_heartbeat_churn() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let at = 1_700_000_000_000;
+        let item = chat::Item {
+            id: "dated-retained-answer".into(),
+            role: chat::Role::Assistant,
+            at: Some(at),
+            started_at: Some(at - 120_000),
+            content: ItemContent::Text {
+                text: "Finished answer".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        };
+        let (mut runtime, handle) = frame_cost::live_runtime(&[item]);
+        let mut before = runtime.turn_fingerprint(&runtime.turns[0], false);
+        let revision = runtime.cache["dated-retained-answer"].revision;
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(runtime.find_turn_view_for_test().as_widget());
+        let inspect = |runtime: &Runtime, tree: &mut Tree| {
+            let mut element = runtime.find_turn_view_for_test();
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1000.0)),
+            );
+            let mut texts = Texts::default();
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut texts);
+            texts.0
+        };
+        let initial = runtime.cache["dated-retained-answer"]
+            .stamp
+            .as_ref()
+            .unwrap()
+            .1
+            .clone();
+        assert!(inspect(&runtime, &mut tree).contains(&initial));
+        let mut previous_label = Some(initial);
+        for (recorded, changes_label) in [
+            (Some(at + 1), false),
+            (Some(at + 60_000), true),
+            (None, true),
+        ] {
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            Arc::make_mut(&mut snapshot.items[0]).at = recorded;
+            handle.publish_snapshot_for_test(snapshot);
+            runtime.refresh();
+            assert_eq!(
+                runtime.cache["dated-retained-answer"].revision, revision,
+                "unchanged message body keeps prepared cache"
+            );
+            let after = runtime.turn_fingerprint(&runtime.turns[0], false);
+            assert_eq!(
+                after != before,
+                changes_label,
+                "retained footer tracks its visible time, not subminute observations"
+            );
+            before = after;
+            let texts = inspect(&runtime, &mut tree);
+            let label = runtime.cache["dated-retained-answer"]
+                .stamp
+                .as_ref()
+                .map(|stamp| stamp.1.clone());
+            if let Some(label) = &label {
+                assert!(
+                    texts.contains(label),
+                    "same retained Tree draws current recorded label"
+                );
+            }
+            if let Some(previous) = &previous_label
+                && label.as_ref() != Some(previous)
+            {
+                assert!(
+                    !texts.contains(previous),
+                    "same retained Tree withdraws obsolete recorded time"
+                );
+            }
+            previous_label = label;
+        }
+    }
+
+    #[test]
+    fn recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<(String, iced::Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
+        let at = 1_700_000_000_000;
+        let parent = chat::Item {
+            id: "dated-prompt".into(),
+            role: chat::Role::User,
+            at: Some(at),
+            started_at: None,
+            content: ItemContent::Text {
+                text: "Recorded prompt".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        };
+        let (mut runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&parent));
+        let child = chat::Item {
+            id: "dated-child-answer".into(),
+            role: chat::Role::Assistant,
+            at: Some(at + 120_000),
+            content: ItemContent::Text {
+                text: "Recorded child answer".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            ..parent.clone()
+        };
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents.push(chat::Subagent {
+            items: vec![Arc::new(child.clone())],
+            ..native_child_fixture()
+        });
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        let renderer = crate::app::tests::headless_renderer();
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        for item in [&parent, &child] {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let expected = runtime.cache[&item.id]
+                .stamp
+                .clone()
+                .expect("parent and child retain recorded time");
+            assert_eq!(expected.0, item.at.unwrap());
+            let before = runtime.snapshot.clone();
+            // Actual disclosure actions rebuild the cache without any new
+            // provider publication. The recorded label stays available.
+            drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert!(Arc::ptr_eq(&before, &runtime.snapshot));
+            assert_eq!(runtime.cache[&item.id].stamp.as_ref(), Some(&expected));
+            let mut footer = runtime.message_copy(item);
+            let mut tree = Tree::new(footer.as_widget());
+            let node = footer.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 100.0)),
+            );
+            let mut texts = Texts::default();
+            footer
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+            let (_, stamp_bounds) = texts
+                .0
+                .iter()
+                .find(|(text, _)| text == &expected.1)
+                .expect("real footer contains recorded label");
+            let accessible = footer.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let copy = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some("Copy this message")
+                })
+                .expect("actual Copy action remains accessible");
+            let bounds = copy.node().bounds().unwrap();
+            assert!(
+                stamp_bounds.x >= bounds.x1 as f32,
+                "timestamp follows Copy in the same footer"
+            );
+            let cursor = iced::Point::new(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 100.0));
+            let mut messages = Vec::new();
+            for button in [
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+            ] {
+                footer.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(button),
+                    Layout::new(&node),
+                    iced::mouse::Cursor::Available(cursor),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert_eq!(messages.len(), 1);
+            assert!(
+                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text)) if *target == runtime.target && id == &item.id)
+            );
+        }
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        Arc::make_mut(&mut snapshot.items[0]).at = None;
+        Arc::make_mut(&mut snapshot.subagents[0].items[0]).at = None;
+        handle.publish_snapshot_for_test(snapshot);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        assert!(runtime.cache[&parent.id].stamp.is_none());
+        assert!(
+            runtime.cache[&child.id].stamp.is_none(),
+            "missing recorded time never falls back to the current clock"
+        );
+    }
+
+    #[test]
+    fn recorded_tool_timestamp_reserves_hover_space_at_narrow_and_wide_widths() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        let item = chat::Item {
+            id: "dated-tool-command".into(),
+            role: chat::Role::Assistant,
+            at: Some(1_700_000_000_000),
+            started_at: None,
+            content: ItemContent::Command {
+                label: "Run focused tests".into(),
+                command: "cargo test --lib recorded_timestamp".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: Some(1000),
+                output: "all tests passed".into(),
+            },
+        };
+        let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        let renderer = crate::app::tests::headless_renderer();
+        for width in [160.0, 240.0, 600.0] {
+            let mut element = runtime.step_header(&item, &runtime.cache[&item.id], false);
+            let mut tree = Tree::new(element.as_widget());
+            let limits =
+                layout::Limits::new(iced::Size::new(width, 0.0), iced::Size::new(width, 1000.0));
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let layout = Layout::new(&node);
+            let mut children = layout.children();
+            let header = children.next().unwrap().bounds();
+            let actions = children.next().unwrap().bounds();
+            assert!(
+                header.intersection(&actions).is_none(),
+                "recorded time and Copy never cover the command/status"
+            );
+            assert!(actions.x >= 0.0 && actions.x + actions.width <= width + 0.1);
+            if width == 160.0 {
+                assert!(
+                    actions.y >= header.y + header.height,
+                    "narrow history dates use their own reserved line"
+                );
+            } else if width == 600.0 {
+                assert!(
+                    actions.x >= header.x + header.width,
+                    "wide rows keep actions beside the header"
+                );
+            }
+            let accessible =
+                element
+                    .as_widget()
+                    .a11y_nodes(layout, &tree, iced::mouse::Cursor::Unavailable);
+            let copy = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some("Copy this message")
+                })
+                .unwrap()
+                .node()
+                .bounds()
+                .unwrap();
+            let cursor = iced::Point::new(
+                ((copy.x0 + copy.x1) / 2.0) as f32,
+                ((copy.y0 + copy.y1) / 2.0) as f32,
+            );
+            let viewport = iced::Rectangle::with_size(iced::Size::new(width, 1000.0));
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: cursor }),
+                layout,
+                iced::mouse::Cursor::Available(cursor),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            for button in [
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(button),
+                    layout,
+                    iced::mouse::Cursor::Available(cursor),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert_eq!(messages.len(), 1);
+            assert!(
+                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text)) if *target == runtime.target && id == &item.id)
+            );
+            let after = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            assert_eq!(
+                node.size(),
+                after.size(),
+                "hover/copy does not change the reserved row height"
+            );
+        }
+    }
 
     fn native_child_fixture() -> chat::Subagent {
         chat::Subagent {
@@ -5709,6 +6139,220 @@ mod tests {
         assert_eq!(bounds.x, 0.0);
         assert_eq!(bounds.y, 0.0);
         assert_eq!(bounds.width, 600.0);
+    }
+
+    #[test]
+    fn compact_chat_footer_is_one_line_at_four_hundred_fifty_pixels() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct FooterBounds {
+            id: widget::Id,
+            bounds: Option<iced::Rectangle>,
+        }
+        impl Operation for FooterBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                if id == Some(&self.id) {
+                    self.bounds = Some(bounds);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let items = frame_cost::transcript(1);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        Arc::make_mut(&mut runtime.snapshot).usage.context_limit = 200_000;
+        Arc::make_mut(&mut runtime.snapshot).usage.context_tokens = 100_000;
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut element = runtime.view(
+            None,
+            false,
+            true,
+            &shortcuts,
+            450.0,
+            Place {
+                channel: Some("A long conversation name".into()),
+                name: "A long repository name".into(),
+                branch: Some("feature/a-long-branch-name".into()),
+            },
+            true,
+            None,
+            vec![],
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(450.0, 700.0)),
+        );
+        let mut probe = FooterBounds {
+            id: card_control_id(runtime.target.card, "chat-footer"),
+            bounds: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        let bounds = probe.bounds.expect("footer mounted");
+        assert!(
+            bounds.height <= design::PRIMARY_CONTROL_SIZE + step::GAP_M + 1.0,
+            "footer wrapped: {bounds:?}"
+        );
+        assert!(bounds.width <= 450.0);
+    }
+
+    #[test]
+    fn compact_footer_keeps_nested_model_and_reasoning_pickers_interactive() {
+        use iced::advanced::{
+            clipboard,
+            widget::{Operation, operation::Focusable},
+        };
+        use iced::runtime::{UserInterface, user_interface::Cache};
+
+        fn click(
+            app: &Cagents,
+            target: Target,
+            cache: Cache,
+            renderer: &mut cosmic::Renderer,
+            role: &str,
+        ) -> (Cache, Vec<Message>) {
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
+                panic!("chat");
+            };
+            let view = runtime.view(
+                None,
+                false,
+                true,
+                &app.settings.keyboard_shortcuts,
+                450.0,
+                Place {
+                    name: "fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                Vec::new(),
+            );
+            let mut ui = UserInterface::build(view, iced::Size::new(450.0, 700.0), cache, renderer);
+            struct Bounds {
+                id: widget::Id,
+                rect: Option<iced::Rectangle>,
+            }
+            impl Operation for Bounds {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    bounds: iced::Rectangle,
+                    _: &mut dyn Focusable,
+                ) {
+                    if id == Some(&self.id) {
+                        self.rect = Some(bounds);
+                    }
+                }
+            }
+            let mut bounds = Bounds {
+                id: card_control_id(target.card, role),
+                rect: None,
+            };
+            // Unlike a11y_nodes in pinned COSMIC, operate also traverses the
+            // actual nested overlay layouts and their live focusable controls.
+            ui.operate(renderer, &mut bounds);
+            let rect = bounds
+                .rect
+                .unwrap_or_else(|| panic!("missing mounted control {role}"));
+            let pointer = iced::Point::new(rect.center_x(), rect.center_y());
+            let mut messages = Vec::new();
+            ui.update(
+                &[
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    )),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )),
+                ],
+                iced::mouse::Cursor::Available(pointer),
+                renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            (ui.into_cache(), messages)
+        }
+        fn apply(app: &mut Cagents, messages: Vec<Message>) {
+            for message in messages {
+                drop(app.update(message));
+            }
+        }
+
+        let (mut live, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let mut target = live.target;
+        target.card = app.workspace.focused().unwrap();
+        live.target = target;
+        let snapshot = Arc::make_mut(&mut live.snapshot);
+        snapshot.capabilities.model_selection = true;
+        snapshot.capabilities.reasoning_selection = true;
+        snapshot.models = vec![
+            chat::Model {
+                id: "model-a".into(),
+                label: "Fixture model A".into(),
+                reasoning: vec!["low".into(), "high".into()],
+            },
+            model("model-b", "Fixture model B"),
+        ];
+        snapshot.selected_model = Some("model-a".into());
+        snapshot.reasoning = Some("low".into());
+        app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(live)));
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut cache = Cache::new();
+        for picker in ["chat-model-picker", "chat-reasoning-picker"] {
+            let (next, messages) = click(&app, target, cache, &mut renderer, "chat-footer-details");
+            cache = next;
+            apply(&mut app, messages);
+            let (next, messages) = click(&app, target, cache, &mut renderer, picker);
+            cache = next;
+            apply(&mut app, messages);
+            let label = if picker == "chat-model-picker" {
+                "chat-model-choice-Claude-named-model-b"
+            } else {
+                "chat-reasoning-choice-1"
+            };
+            let (next, messages) = click(&app, target, cache, &mut renderer, label);
+            cache = next;
+            assert!(
+                messages.iter().any(|message| match message {
+                    Message::ChatUi(Action::Model(actual, id)) =>
+                        *actual == target && id == "model-b",
+                    Message::ChatUi(Action::Reasoning(actual, id, effort)) =>
+                        *actual == target && id == "model-a" && effort == "high",
+                    _ => false,
+                }),
+                "nested picker must publish its selection"
+            );
+            drop(app.handle_chat_ui(Action::FooterPicker(target, false)));
+        }
+        // The keyboard command must mount More's anchor and the model popup
+        // even though the overflow has not been opened with the pointer.
+        drop(app.open_chat_control(crate::workspace_widget::GlobalShortcut::ChatModel));
+        let (_, messages) = click(
+            &app,
+            target,
+            cache,
+            &mut renderer,
+            "chat-model-choice-Claude-named-model-b",
+        );
+        assert!(messages.iter().any(|message| matches!(message,
+            Message::ChatUi(Action::Model(actual, id)) if *actual == target && id == "model-b")));
     }
 
     #[test]

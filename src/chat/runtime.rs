@@ -44,6 +44,7 @@ enum ActorCommand {
     Provider {
         run: Option<crate::model::RunId>,
         command: Command,
+        decline_only: bool,
     },
     CloseIfIdle {
         generation: u64,
@@ -88,6 +89,12 @@ pub(crate) enum Update {
         update: crate::agent_execution::Update,
     },
     Attention(crate::notifications::Evidence),
+    /// Immutable same-frame context; optional only when the frame context
+    /// budget is exhausted. Never resample a later Snapshot for this outcome.
+    AttentionContext {
+        evidence: crate::notifications::Evidence,
+        content: Option<crate::notifications::Content>,
+    },
     Presentation,
     Observed {
         generation: u64,
@@ -126,6 +133,12 @@ impl Handle {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TitleUnavailable {
+    Busy,
+    Poisoned,
+}
+
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
@@ -169,6 +182,23 @@ impl Handle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         Self::start_inner(spec, adapter, initial, store, session_id, None, notify)
+    }
+
+    /// Retain an actual native holder after closing the fixture's local actor.
+    /// Cleanup still requires the real holder protocol and receipt.
+    #[cfg(test)]
+    pub(crate) fn fixture_retained_native_holder(
+        &self,
+        holder: super::native_holder::Holder,
+        reason: String,
+    ) {
+        assert!(self.is_completed(), "fixture requires a closed actor");
+        assert!(self.0.worker.lock().unwrap().is_none());
+        let mut retained = self.0.retained_native.lock().unwrap();
+        assert!(retained.is_none());
+        *retained = Some(holder);
+        *self.0.failure.lock().unwrap() = Some(reason);
+        self.0.completed.store(false, Ordering::Release);
     }
 
     pub(crate) fn start_owned(
@@ -370,6 +400,7 @@ impl Handle {
                     attention: TurnAttention::default(),
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
+                    waiting_fingerprint: None,
                     last_present: Instant::now(),
                     first_frame: false,
                     started: Instant::now(),
@@ -425,12 +456,12 @@ impl Handle {
                 if let Err(error) = result {
                     // A lost local actor does not prove that the retained
                     // provider turn failed. Recovery must obtain its outcome.
-                    if !actor.attention.settled && !preserve_holder {
-                        (actor.notify)(Update::Attention(crate::notifications::Evidence {
+                    let attention = (!actor.attention.settled && !preserve_holder).then(|| {
+                        crate::notifications::Evidence {
                             key: actor.attention.key.clone(),
-                            kind: crate::notifications::Kind::Failed,
-                        }));
-                    }
+                            kind: crate::notifications::Kind::Interrupted,
+                        }
+                    });
                     *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
                     let stderr =
                         String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned();
@@ -443,6 +474,11 @@ impl Handle {
                         message,
                         fatal: true,
                     });
+                    // Publish the bounded diagnosis before attention samples
+                    // it, while keeping retained native outcomes unconfirmed.
+                    if let Some(evidence) = attention {
+                        actor.publish_current_attention(evidence);
+                    }
                 }
                 let mut direct_closed = true;
                 let code = actor.child.as_mut().and_then(|child| {
@@ -525,13 +561,14 @@ impl Handle {
         Ok(handle)
     }
     pub fn command(&self, command: Command) -> Result<(), String> {
-        self.submit_command(None, command).map_err(String::from)
+        self.submit_command(None, command, false)
+            .map_err(String::from)
     }
 
     /// Like [`Self::command`], but tells a refusal, after which the command
     /// may be offered again, from a timeout, after which it may still run.
     pub(crate) fn try_command(&self, command: Command) -> Result<(), Rejection> {
-        self.submit_command(None, command)
+        self.submit_command(None, command, false)
     }
 
     pub(crate) fn command_for_run(
@@ -539,7 +576,13 @@ impl Handle {
         run: crate::model::RunId,
         command: Command,
     ) -> Result<(), String> {
-        self.submit_command(Some(run), command)
+        self.submit_command(Some(run), command, false)
+            .map_err(String::from)
+    }
+
+    /// Resolve only a current refusal, checked by the provider actor itself.
+    pub(crate) fn decline_answer(&self, command: Command) -> Result<(), String> {
+        self.submit_command(None, command, true)
             .map_err(String::from)
     }
 
@@ -547,6 +590,7 @@ impl Handle {
         &self,
         run: Option<crate::model::RunId>,
         command: Command,
+        decline_only: bool,
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
@@ -590,7 +634,14 @@ impl Handle {
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
-            .try_send((ActorCommand::Provider { run, command }, reply))
+            .try_send((
+                ActorCommand::Provider {
+                    run,
+                    command,
+                    decline_only,
+                },
+                reply,
+            ))
             .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
         self.wake();
         response
@@ -731,6 +782,17 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .usage
             .clone()
+    }
+    /// Bounded resident metadata only; never reads or hydrates transcript pages.
+    pub(crate) fn notification_content(
+        &self,
+        kind: crate::notifications::Kind,
+    ) -> crate::notifications::Content {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notification_content(kind)
     }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
@@ -1016,6 +1078,18 @@ impl Handle {
             .map(|agent| agent.id.clone())
             .collect()
     }
+    /// A coherent resident naming projection. Never opens the transcript Store,
+    /// pages history or touches the filesystem; safe at host admission points.
+    pub(crate) fn conversation_title(
+        &self,
+    ) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
+        let state = self.0.state.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => TitleUnavailable::Busy,
+            std::sync::TryLockError::Poisoned(_) => TitleUnavailable::Poisoned,
+        })?;
+        Ok((state.session_id.clone(), state.title.clone()))
+    }
+
     /// The provider-reported title, read without loading the transcript.
     pub(crate) fn title(&self) -> Option<String> {
         self.0
@@ -1543,6 +1617,7 @@ struct Actor {
     attention: TurnAttention,
     execution: execution::Tracker,
     attention_baselined: bool,
+    waiting_fingerprint: Option<String>,
     last_present: Instant,
     first_frame: bool,
     started: Instant,
@@ -1912,7 +1987,33 @@ impl Actor {
                 continue;
             }
             let (run, command) = match command {
-                ActorCommand::Provider { run, command } => (run, command),
+                ActorCommand::Provider {
+                    run,
+                    command,
+                    decline_only,
+                } => {
+                    if decline_only {
+                        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                        let valid = match &command {
+                            Command::Answer {
+                                request_id, action, ..
+                            } => {
+                                state.requests.iter().any(|request| {
+                                    request.id == *request_id
+                                        && request.actions.iter().any(|choice| choice.id == *action)
+                                }) && self.adapter.answer_declines(request_id, action)
+                            }
+                            _ => false,
+                        };
+                        if !valid {
+                            let _ = reply.send(Err(
+                                "A settled run may only decline a current pending request".into(),
+                            ));
+                            continue;
+                        }
+                    }
+                    (run, command)
+                }
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
                     let result = self
                         .native_holder
@@ -2038,7 +2139,9 @@ impl Actor {
                 | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
                 Command::UpdatePermissionSettings { .. } => true,
-                Command::Answer { action, .. } => !super::declines(action),
+                Command::Answer {
+                    request_id, action, ..
+                } => !self.adapter.answer_declines(request_id, action),
                 _ => false,
             };
             if authorizes_work
@@ -2173,6 +2276,15 @@ impl Actor {
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
     fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
+        let suppress_current_notification = step.suppress_current_notification;
+        if !suppress_current_notification {
+            if let Some(preview) = &step.notification_preview {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .notification_preview = Arc::new(preview.clone());
+            }
+        }
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable
         // even if the approved directory disappears or is replaced.
@@ -2210,6 +2322,19 @@ impl Actor {
             _ => None,
         });
         let mut execution_events = Vec::new();
+        let frame_context = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            super::notification::FrameContext::capture(&state)
+        };
+        let mut frame_contents = if suppress_current_notification {
+            Default::default()
+        } else {
+            frame_context.project(&step.events)
+        };
+        // Preserve decoded outcomes even when the transcript cache fails.
+        // Stop further Store writes, then report the original error after
+        // this bounded frame's semantic proof has been published.
+        let mut frame_error = None;
         for event in step.events {
             if let Event::Execution { run, event } = event {
                 if let crate::agent_execution::ProviderEvent::Started { key } = event {
@@ -2237,26 +2362,92 @@ impl Actor {
                 } => Some(message.clone()),
                 _ => None,
             };
-            let events = self
-                .store
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .apply(event)?;
-            if events.is_empty() {
-                self.touch();
+            // The disk-backed transcript store consumes text/tool items. Keep
+            // their bounded live excerpt before that boundary, without ever
+            // hydrating the page a window happens to be reading.
+            if !suppress_current_notification
+                && matches!(
+                    &event,
+                    Event::Item(_)
+                        | Event::TextDelta { .. }
+                        | Event::TurnStarted
+                        | Event::Reset { .. }
+                )
+            {
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                Arc::make_mut(&mut state.notification_preview).observe(&event);
+            }
+            // Only clone semantic metadata, never transcript/tool bodies.
+            let authority = matches!(
+                &event,
+                Event::TurnStarted
+                    | Event::TurnSettled
+                    | Event::TurnFinished { .. }
+                    | Event::Usage(_)
+                    | Event::Session { .. }
+            )
+            .then(|| event.clone());
+            let events = if frame_error.is_some() {
+                None
             } else {
-                for event in events {
-                    self.apply(event);
+                match self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .apply(event)
+                {
+                    Ok(events) => Some(events),
+                    Err(error) => {
+                        frame_error = Some(error);
+                        None
+                    }
                 }
+            };
+            if let Some(events) = events {
+                if events.is_empty() || suppress_current_notification {
+                    self.touch();
+                }
+                for event in events {
+                    // Preserve history and independently identified children
+                    // and requests. Old parent-turn scalar metadata cannot
+                    // replace the current turn's state or notification input.
+                    if suppress_current_notification
+                        && matches!(
+                            &event,
+                            Event::Error { .. }
+                                | Event::Usage(_)
+                                | Event::Plan { .. }
+                                | Event::Status { .. }
+                                | Event::Waiting(_)
+                                | Event::TurnStarted
+                                | Event::TurnSettled
+                                | Event::TurnFinished { .. }
+                        )
+                    {
+                        continue;
+                    }
+                    let content = matches!(&event, Event::TurnFinished { .. })
+                        .then(|| frame_contents.pop_front())
+                        .flatten();
+                    self.apply_with_attention(event, content, true);
+                }
+            } else if let Some(event) = authority {
+                if suppress_current_notification {
+                    continue;
+                }
+                let content = matches!(&event, Event::TurnFinished { .. })
+                    .then(|| frame_contents.pop_front())
+                    .flatten();
+                self.apply_with_attention(event, content, true);
             }
             if self.retained > STATE_LIMIT {
-                return Err(
+                frame_error.get_or_insert_with(|| {
                     "Provider request/model metadata exceeds native IPC presentation capacity"
-                        .into(),
-                );
+                        .into()
+                });
             }
             if let Some(message) = fatal {
-                return Err(message);
+                frame_error.get_or_insert(message);
             }
         }
         // An outcome is acted on as soon as it is published, and its reader
@@ -2290,15 +2481,37 @@ impl Actor {
             }
         }
         self.publish_activity();
-        Ok(())
+        match frame_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    fn publish_current_attention(&self, evidence: crate::notifications::Evidence) {
+        let content = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notification_content(evidence.kind);
+        (self.notify)(Update::AttentionContext {
+            evidence,
+            content: Some(content),
+        });
     }
     fn apply(&mut self, event: Event) {
+        self.apply_with_attention(event, None, false);
+    }
+    fn apply_with_attention(
+        &mut self,
+        event: Event,
+        content: Option<crate::notifications::Content>,
+        preview_observed: bool,
+    ) {
         if matches!(
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
         ) {
             if let Some(evidence) = self.attention.apply(&event) {
-                (self.notify)(Update::Attention(evidence));
+                (self.notify)(Update::AttentionContext { evidence, content });
             }
             if !matches!(event, Event::TurnStarted) {
                 return;
@@ -2314,7 +2527,7 @@ impl Actor {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
-        apply_event(&mut state, &mut self.indices, event);
+        apply_projected_event(&mut state, &mut self.indices, event, preview_observed);
         // Only metadata is resident independently of the disk-backed window.
         let items = std::mem::take(&mut state.items);
         let child_items: Vec<_> = state
@@ -2346,21 +2559,32 @@ impl Actor {
         }
         let activity = state.activity();
         let generation = state.generation;
+        let waiting_fingerprint = if activity == ActivityState::Waiting {
+            state.waiting_fingerprint()
+        } else {
+            None
+        };
+        let waiting_changed = waiting_fingerprint != self.waiting_fingerprint;
+        self.waiting_fingerprint = waiting_fingerprint;
         let became_ready = state.ready && !self.ready;
         self.ready = state.ready;
         drop(state);
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
-        if activity != self.activity {
+        let activity_changed = activity != self.activity;
+        if activity_changed {
             self.activity = activity;
             if let Some((run, update)) = self.execution.activity(activity) {
                 (self.notify)(Update::Execution { run, update });
             }
-            if activity == ActivityState::Waiting && baselined {
-                (self.notify)(Update::Attention(crate::notifications::Evidence {
-                    key: format!("{}:waiting:{generation}", self.attention.key),
-                    kind: crate::notifications::Kind::Waiting,
-                }));
-            }
+        }
+        if activity == ActivityState::Waiting && baselined && (activity_changed || waiting_changed)
+        {
+            self.publish_current_attention(crate::notifications::Evidence {
+                key: format!("{}:waiting:{generation}", self.attention.key),
+                kind: crate::notifications::Kind::Waiting,
+            });
+        }
+        if activity_changed {
             (self.notify)(Update::Activity {
                 state: activity,
                 generation,
@@ -2490,7 +2714,22 @@ fn recover_history_error(
     }
 }
 
+#[cfg(test)]
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
+    apply_projected_event(state, indices, event, false);
+}
+
+fn apply_projected_event(
+    state: &mut Snapshot,
+    indices: &mut BTreeMap<String, usize>,
+    event: Event,
+    preview_observed: bool,
+) {
+    // Frame events have already reached the resident preview before Store.
+    // Do not consume a restored start boundary or append a delta twice.
+    if !preview_observed {
+        Arc::make_mut(&mut state.notification_preview).observe(&event);
+    }
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     let child_changed = matches!(
         &event,
@@ -2583,9 +2822,12 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::Session { id, title } => {
             if state.session_id.as_deref() != Some(id.as_str()) {
                 state.prompt_suggestion = None;
+                state.title = title;
+            } else if title.is_some() {
+                // Identity-only frames carry no new naming information.
+                state.title = title;
             }
             state.session_id = Some(id);
-            state.title = title;
         }
         Event::Plan { steps } => state.plan = steps,
         // About the account rather than the conversation: `step` forwards it
@@ -3009,8 +3251,572 @@ fn trim_subagent(agent: &mut Subagent) {
     }
 }
 
+/// Exercise a real protocol adapter through the live actor/store callback,
+/// sampling content at attention publication rather than after the command.
+#[cfg(test)]
+pub(crate) fn notification_frame_for_test(
+    adapter: Box<dyn Adapter>,
+    frame: serde_json::Value,
+    fail_store: bool,
+) -> (
+    crate::notifications::Evidence,
+    crate::notifications::Content,
+) {
+    let mut receipts = notification_frames_for_test(adapter, vec![frame], fail_store);
+    assert!(!receipts.is_empty(), "one authoritative outcome expected");
+    receipts.remove(0)
+}
+
+/// A real provider adapter keeps its pending request map across frames, while
+/// the actual actor/store publishes semantic waiting-context revisions.
+#[cfg(test)]
+pub(crate) fn notification_frames_for_test(
+    adapter: Box<dyn Adapter>,
+    frames: Vec<serde_json::Value>,
+    fail_store: bool,
+) -> Vec<(
+    crate::notifications::Evidence,
+    crate::notifications::Content,
+)> {
+    notification_frames_with_snapshot_for_test(adapter, frames, fail_store).0
+}
+
+#[cfg(test)]
+pub(crate) fn notification_frames_with_snapshot_for_test(
+    adapter: Box<dyn Adapter>,
+    frames: Vec<serde_json::Value>,
+    fail_store: bool,
+) -> (
+    Vec<(
+        crate::notifications::Evidence,
+        crate::notifications::Content,
+    )>,
+    Snapshot,
+) {
+    assert!(!frames.is_empty() && frames.len() <= 32);
+    let count = frames.len();
+    struct Frame {
+        adapter: Box<dyn Adapter>,
+        frames: std::collections::VecDeque<serde_json::Value>,
+    }
+    impl Adapter for Frame {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![Event::Ready(true), Event::TurnStarted],
+                ..Default::default()
+            })
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            self.adapter
+                .receive(self.frames.pop_front().ok_or("fixture frames consumed")?)
+        }
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let spec = ProcessSpec {
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: vec![],
+        working_directory: directory.path().into(),
+        environment: BTreeMap::new(),
+    };
+    let mut adapter: Box<dyn Adapter> = Box::new(Frame {
+        adapter,
+        frames: frames.into(),
+    });
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let (send, receive) = crossbeam_channel::bounded(64);
+    let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        if let Update::AttentionContext { evidence, content } = update {
+            let _ = send.try_send((
+                evidence,
+                content.expect("fixture fits the bounded frame context budget"),
+            ));
+        }
+    })
+    .unwrap();
+    handle.check_update_readiness().unwrap();
+    if fail_store {
+        handle.0.store.lock().unwrap().read_only_for_test().unwrap();
+    }
+    let commands: Vec<_> = (0..count)
+        .map(|_| handle.command(Command::Refresh))
+        .collect();
+    let first = receive.recv_timeout(Duration::from_secs(2));
+    let later: Vec<_> = receive.try_iter().collect();
+    let snapshot = handle.0.state.lock().unwrap().clone();
+    // Retire the actual process before asserting any result, including the
+    // missing-callback/error paths, just as the one-frame fixture did.
+    let closed = handle.close();
+    for (index, command) in commands.into_iter().enumerate() {
+        if fail_store && index + 1 == count {
+            let error =
+                command.expect_err("readonly SQLite must reject the final write-bearing item");
+            assert!(
+                error.contains("readonly") || error.contains("read-only"),
+                "unexpected injected store failure: {error}"
+            );
+        } else {
+            command.unwrap();
+        }
+    }
+    closed.unwrap();
+    assert!(
+        handle.is_completed(),
+        "real fixture process teardown must still be proved"
+    );
+    let mut receipts = vec![first.expect("real adapter must publish an outcome through the actor")];
+    receipts.extend(later);
+    (receipts, snapshot)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_title_matches_resident_session_identity_across_metadata_only_frames() {
+        struct Names;
+        impl Adapter for Names {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture uses actual decoded metadata frames".into())
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                let index = frame.as_u64().ok_or("expected fixture frame index")?;
+                let session = |id: &str, title: Option<&str>| Event::Session {
+                    id: id.into(),
+                    title: title.map(str::to_owned),
+                };
+                let mut events = vec![Event::TurnStarted];
+                events.extend(match index {
+                    0 => vec![session("native-a", Some("Provider A"))],
+                    1 => vec![session("native-a", None)],
+                    2 => vec![session("native-b", None)],
+                    3 => vec![
+                        session("native-b", Some("Provider B")),
+                        session("native-b", None),
+                    ],
+                    4 => vec![
+                        Event::Reset {
+                            reason: "Explicit new conversation".into(),
+                        },
+                        session("native-b", None),
+                    ],
+                    _ => return Err("unexpected fixture frame".into()),
+                });
+                events.extend([
+                    Event::TurnSettled,
+                    Event::TurnFinished {
+                        key: Some(format!("completed-{index}")),
+                        outcome: crate::notifications::Kind::Succeeded,
+                    },
+                ]);
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
+            }
+        }
+        // The real Actor/Store callback captures each immutable completion
+        // frame before the next command, then retires its actual cat child.
+        let (receipts, snapshot) = notification_frames_with_snapshot_for_test(
+            Box::new(Names),
+            (0..5).map(|index| serde_json::json!(index)).collect(),
+            false,
+        );
+        assert_eq!(receipts.len(), 5);
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|(_, content)| content.conversation.as_str())
+                .collect::<Vec<_>>(),
+            ["Provider A", "Provider A", "", "Provider B", ""]
+        );
+        assert_eq!(snapshot.session_id.as_deref(), Some("native-b"));
+        assert_eq!(snapshot.title, None);
+    }
+
+    #[test]
+    fn notification_local_worker_loss_is_unconfirmed_without_reclassifying_known_provider_failure()
+    {
+        struct LostTransport {
+            emit_terminal: bool,
+        }
+        impl Adapter for LostTransport {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![serde_json::json!({"fixture":"receive"})],
+                    events: vec![Event::Ready(true), Event::TurnStarted],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture uses its actual pipe".into())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                if std::mem::take(&mut self.emit_terminal) {
+                    return Ok(Step {
+                        writes: vec![serde_json::json!({"fixture":"disconnect-after-proof"})],
+                        events: vec![
+                            Event::TurnSettled,
+                            Event::Error {
+                                message: "Provider reported migration failure".into(),
+                                fatal: false,
+                            },
+                            Event::TurnFinished {
+                                key: Some("confirmed-failed-turn".into()),
+                                outcome: crate::notifications::Kind::Failed,
+                            },
+                        ],
+                        ..Default::default()
+                    });
+                }
+                Err("Fixture local transport failed before further terminal proof".into())
+            }
+        }
+        for known_failure in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/cat".into(),
+                arguments: vec![],
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut adapter: Box<dyn Adapter> = Box::new(LostTransport {
+                emit_terminal: known_failure,
+            });
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let (send, receive) = crossbeam_channel::bounded(8);
+            let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+                if let Update::AttentionContext { evidence, content } = update {
+                    let _ = send.try_send((evidence, content));
+                }
+            })
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !handle.is_completed() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let finished_before_close = handle.is_completed();
+            let failure = handle.failure();
+            let closed = handle.close();
+            // Original process/worker retirement precedes every assertion.
+            closed.unwrap();
+            assert!(handle.is_completed());
+            assert!(
+                finished_before_close,
+                "fixture must actually reach its failing receive before close"
+            );
+            assert!(
+                failure
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Fixture local transport failed"))
+            );
+            let notices = receive.try_iter().collect::<Vec<_>>();
+            assert_eq!(notices.len(), 1);
+            let (evidence, content) = &notices[0];
+            if known_failure {
+                assert_eq!(evidence.kind, crate::notifications::Kind::Failed);
+                assert_eq!(
+                    content.as_ref().unwrap().preview,
+                    "Provider reported migration failure"
+                );
+            } else {
+                assert_eq!(evidence.kind, crate::notifications::Kind::Interrupted);
+                assert!(
+                    content
+                        .as_ref()
+                        .unwrap()
+                        .preview
+                        .contains("Fixture local transport failed")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure() {
+        struct FinalFrame {
+            run: Option<crate::model::RunId>,
+        }
+        impl Adapter for FinalFrame {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("use a correlated run".into())
+            }
+            fn command_for_run(
+                &mut self,
+                run: crate::model::RunId,
+                _: Command,
+            ) -> Result<Step, String> {
+                self.run = Some(run);
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: vec![serde_json::json!({"final":true})],
+                    events: vec![
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Started {
+                                key: "confirmed-provider-turn".into(),
+                            },
+                        },
+                        Event::TurnStarted,
+                    ],
+                })
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                assert_eq!(frame, serde_json::json!({"final":true}));
+                let run = self.run.take().unwrap();
+                Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
+                    writes: Vec::new(),
+                    events: vec![
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Scope,
+                        },
+                        Event::TextDelta {
+                            id: "answer".into(),
+                            role: Role::Assistant,
+                            thinking: false,
+                            delta: "Partial response".into(),
+                        },
+                        // Store flushes the pending delta here and fails. The
+                        // remaining typed provider proof must still be processed.
+                        Event::TurnSettled,
+                        Event::Item(crate::chat::Item {
+                            id: "answer".into(),
+                            role: Role::Assistant,
+                            started_at: None,
+                            at: None,
+                            content: ItemContent::Text {
+                                text: "Exact final response".into(),
+                                thinking: false,
+                                phase: Phase::Final,
+                            },
+                        }),
+                        Event::Usage(Default::default()),
+                        Event::TurnFinished {
+                            key: Some("confirmed-provider-turn".into()),
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Settled,
+                        },
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Finished {
+                                outcome: crate::notifications::Kind::Succeeded,
+                            },
+                        },
+                    ],
+                })
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(FinalFrame { run: None });
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (updates, receiver) = crossbeam_channel::unbounded();
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = updates.send(update);
+        })
+        .unwrap();
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.0.state.lock().unwrap().ready && Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ready = handle.0.state.lock().unwrap().ready;
+        if !ready {
+            let closed = handle.close();
+            assert!(
+                ready,
+                "actual actor initialization must complete; close: {closed:?}"
+            );
+        }
+        handle.0.store.lock().unwrap().read_only_for_test().unwrap();
+        let run = crate::model::RunId::new();
+        handle
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "One accepted prompt".into(),
+                    attachments: Vec::new(),
+                    mode: crate::chat::PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_completed() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let completed = handle.is_completed();
+        let closed = handle.close();
+        assert!(
+            completed,
+            "the real actor must settle after reporting its cache failure"
+        );
+        closed.unwrap();
+        let updates = receiver.try_iter().collect::<Vec<_>>();
+        let finished = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::Execution {
+                    run: actual,
+                    update: crate::agent_execution::Update::Finished { state, result },
+                } if *actual == run => Some((state, result)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finished.len(),
+            1,
+            "the cache failure cannot synthesize a second terminal outcome: {updates:?}"
+        );
+        assert_eq!(*finished[0].0, crate::agent_execution::State::Succeeded);
+        assert_eq!(finished[0].1.text, "Exact final response");
+        let evidence = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::AttentionContext { evidence, content } => Some((evidence, content)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            evidence.len(),
+            1,
+            "known success must not be replaced by a cache-error failure alert"
+        );
+        assert_eq!(evidence[0].0.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(
+            evidence[0].1.as_ref().unwrap().preview,
+            "Exact final response"
+        );
+        assert!(
+            handle.failure().is_some(),
+            "the transcript I/O failure remains visible independently of provider success"
+        );
+    }
+
+    #[test]
+    fn resident_title_admission_refuses_without_waiting_for_the_state_owner() {
+        struct Idle;
+        impl Adapter for Idle {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::History,
+            program: "unused-history-reader".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+        let state = handle.0.state.lock().unwrap();
+        let probe = handle.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || sender.send(probe.conversation_title()).unwrap());
+        let outcome = receiver.recv_timeout(Duration::from_millis(250));
+        // Release before joining/asserting: the old blocking implementation
+        // fails the test without stranding its thread or the runtime worker.
+        drop(state);
+        worker.join().unwrap();
+        handle.close().unwrap();
+        assert_eq!(outcome.unwrap(), Err(TitleUnavailable::Busy));
+    }
+
+    #[test]
+    fn identity_only_frames_preserve_a_name_until_actual_session_change_or_reset() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "a".into(),
+                title: Some("Bundle review".into()),
+            },
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "a".into(),
+                title: None,
+            },
+        );
+        assert_eq!(state.title.as_deref(), Some("Bundle review"));
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "b".into(),
+                title: None,
+            },
+        );
+        assert!(state.title.is_none());
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Session {
+                id: "b".into(),
+                title: Some("New task".into()),
+            },
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Reset {
+                reason: "Reset".into(),
+            },
+        );
+        assert!(state.title.is_none());
+    }
+
     #[test]
     fn prompt_suggestion_metadata_cannot_survive_a_turn_session_or_process_boundary() {
         let mut state = Snapshot {
@@ -3207,6 +4013,7 @@ mod tests {
             .send((
                 ActorCommand::Provider {
                     run: None,
+                    decline_only: false,
                     command: Command::Prompt {
                         text: "accepted work".into(),
                         attachments: Vec::new(),
@@ -3500,6 +4307,7 @@ mod tests {
             .send((
                 ActorCommand::Provider {
                     run: None,
+                    decline_only: false,
                     command: Command::Compact,
                 },
                 reply,
@@ -4364,6 +5172,8 @@ mod tests {
     impl Adapter for Echo {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: vec![json!({"text": "hello"})],
                 events: Vec::new(),
             })
@@ -4373,12 +5183,16 @@ mod tests {
                 return Err("fixture only supports refresh".into());
             }
             Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: vec![json!({"text": " world"})],
                 events: Vec::new(),
             })
         }
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: Vec::new(),
                 events: vec![Event::TextDelta {
                     id: "echo".into(),
@@ -4475,6 +5289,270 @@ mod tests {
         assert_eq!(handle.snapshot(None).unwrap().finished_at, None);
         handle.command(Command::Refresh).unwrap();
         assert!(handle.snapshot(None).unwrap().finished_at.unwrap() >= first);
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn notification_preview_uses_live_store_events_without_paging_or_tool_output() {
+        struct NotificationFixture(usize);
+        impl Adapter for NotificationFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.0 += 1;
+                let events = match self.0 {
+                    1 => vec![
+                        Event::Session {
+                            id: "notification-fixture".into(),
+                            title: Some("Repair authentication".into()),
+                        },
+                        Event::TurnStarted,
+                        Event::Item(Item {
+                            id: "tool".into(),
+                            role: Role::Assistant,
+                            at: None,
+                            started_at: None,
+                            content: ItemContent::Tool {
+                                name: "test".into(),
+                                input: "private arguments".into(),
+                                output: "raw-tool-garbage".repeat(10000),
+                                status: ToolStatus::Succeeded,
+                            },
+                        }),
+                        Event::TextDelta {
+                            id: "answer".into(),
+                            role: Role::Assistant,
+                            thinking: false,
+                            delta: format!(
+                                "## Done\nRepaired authentication.\n```sh\nraw-code-garbage\n```\nAll tests passed. {}",
+                                "More result. ".repeat(10000)
+                            ),
+                        },
+                        Event::TurnFinished {
+                            key: Some("one".into()),
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
+                    ],
+                    2 => vec![Event::History {
+                        items: vec![text("old", "Historical answer must not notify")],
+                        has_earlier: false,
+                    }],
+                    3 => vec![Event::Request(super::super::Request {
+                        kind: super::super::RequestKind::Question,
+                        id: "question".into(),
+                        title: "Migration strategy".into(),
+                        description: "Choose the migration strategy?".into(),
+                        fields: vec![super::super::Field {
+                            id: "secret".into(),
+                            label: "Secret".into(),
+                            description: String::new(),
+                            choices: vec![],
+                            multiple: false,
+                            secret: true,
+                            initial: "fixture-secret".into(),
+                        }],
+                        actions: vec![],
+                    })],
+                    4 => vec![
+                        Event::RequestResolved {
+                            id: "question".into(),
+                        },
+                        Event::TurnStarted,
+                        Event::Item(Item {
+                            id: "long-command".into(),
+                            role: Role::Assistant,
+                            at: None,
+                            started_at: None,
+                            content: ItemContent::Command {
+                                label: "Long command label ".repeat(1000),
+                                command: "private arguments".into(),
+                                working_directory: String::new(),
+                                action: super::super::CommandAction::Run,
+                                status: ToolStatus::Succeeded,
+                                exit_code: Some(0),
+                                duration_ms: None,
+                                output: "raw output".into(),
+                            },
+                        }),
+                        Event::TurnFinished {
+                            key: Some("two".into()),
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
+                    ],
+                    _ => return Err("fixture exhausted".into()),
+                };
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: vec![],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(NotificationFixture(0));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle.command(Command::Refresh).unwrap();
+        let response = handle.notification_content(crate::notifications::Kind::Succeeded);
+        assert_eq!(response.conversation, "Repair authentication");
+        assert!(
+            response
+                .preview
+                .starts_with("Done Repaired authentication. All tests passed.")
+        );
+        assert!(!response.preview.contains("garbage"));
+        assert!(
+            response.preview.chars().count() <= crate::notifications::presentation::PREVIEW_LIMIT
+        );
+        handle.command(Command::Refresh).unwrap();
+        assert_eq!(
+            handle.notification_content(crate::notifications::Kind::Succeeded),
+            response
+        );
+        handle.command(Command::Refresh).unwrap();
+        let waiting = handle.notification_content(crate::notifications::Kind::Waiting);
+        assert_eq!(
+            waiting.request,
+            Some(crate::notifications::RequestType::Question)
+        );
+        assert_eq!(waiting.preview, "Choose the migration strategy?");
+        assert!(!waiting.preview.contains("fixture-secret"));
+        handle.command(Command::Refresh).unwrap();
+        let content = handle.notification_content(crate::notifications::Kind::Succeeded);
+        assert!(
+            content
+                .preview
+                .starts_with("Command completed: Long command label")
+        );
+        assert!(
+            content.preview.chars().count() <= crate::notifications::presentation::PREVIEW_LIMIT
+        );
+        let mut event = crate::notifications::Event::session(
+            crate::model::TerminalId::new(),
+            crate::agent::Provider::Codex,
+            directory.path().into(),
+            crate::notifications::Evidence {
+                key: "long-command".into(),
+                kind: crate::notifications::Kind::Succeeded,
+            },
+        );
+        event.content = Some(content);
+        event.validate().unwrap();
+        assert!(
+            !crate::notifications::presentation::message(&event, false)
+                .body
+                .contains("Long command")
+        );
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn notification_waiting_context_revises_without_an_activity_transition() {
+        struct Requests(usize);
+        impl Adapter for Requests {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.0 += 1;
+                let request = |id: &str, description: &str| {
+                    Event::Request(super::super::Request {
+                        kind: super::super::RequestKind::Question,
+                        id: id.into(),
+                        title: "Question".into(),
+                        description: description.into(),
+                        fields: vec![],
+                        actions: vec![],
+                    })
+                };
+                let events = match self.0 {
+                    1 => vec![
+                        Event::TurnStarted,
+                        request("a", "First question?"),
+                        request("b", "Second question?"),
+                    ],
+                    2 => vec![Event::RequestResolved { id: "a".into() }],
+                    3 => vec![request("b", "Updated second question?")],
+                    4 => vec![Event::Status {
+                        busy: false,
+                        detail: "Unrelated metadata".into(),
+                    }],
+                    _ => return Err("fixture exhausted".into()),
+                };
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: vec![],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Requests(0));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::bounded(8);
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            if let Update::AttentionContext { evidence, .. } = update {
+                let _ = send.try_send(evidence);
+            }
+        })
+        .unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        let mut keys = Vec::new();
+        for expected in [
+            "First question?",
+            "Second question?",
+            "Updated second question?",
+        ] {
+            handle.command(Command::Refresh).unwrap();
+            let evidence = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(handle.notification_content(evidence.kind).preview, expected);
+            assert_eq!(
+                handle.snapshot(None).unwrap().activity(),
+                ActivityState::Waiting
+            );
+            keys.push(evidence.key);
+        }
+        assert!(keys[0] != keys[1] && keys[1] != keys[2]);
+        handle.command(Command::Refresh).unwrap();
+        assert!(
+            receive.try_recv().is_err(),
+            "unrelated metadata must not repeat an actionable alert"
+        );
         handle.close().unwrap();
     }
 
@@ -4738,6 +5816,8 @@ mod tests {
         impl Adapter for Reporter {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![json!({})],
                     events: Vec::new(),
                 })
@@ -4747,6 +5827,8 @@ mod tests {
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![Event::AccountUsage(report())],
                 })
@@ -4810,6 +5892,8 @@ mod tests {
         impl Adapter for WholeTurn {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![json!({})],
                     events: Vec::new(),
                 })
@@ -4820,6 +5904,8 @@ mod tests {
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 let execution = |event| Event::Execution { run: self.0, event };
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: Vec::new(),
                     events: vec![
                         Event::Session {
@@ -4979,6 +6065,8 @@ mod tests {
         fn command(&mut self, command: Command) -> Result<Step, String> {
             if command == Command::Interrupt {
                 Ok(Step {
+                    suppress_current_notification: false,
+                    notification_preview: None,
                     writes: vec![json!({"interrupt": true})],
                     events: Vec::new(),
                 })
@@ -5110,6 +6198,7 @@ mod tests {
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
                 | Update::Attention(_)
+                | Update::AttentionContext { .. }
                 | Update::Ready
                 | Update::Execution { .. } => None,
             })
