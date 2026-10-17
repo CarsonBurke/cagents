@@ -16,6 +16,7 @@ use std::sync::{
 mod auth_recovery;
 mod changes;
 mod clipboard_image;
+mod closed_draft;
 mod completion;
 mod coordination;
 mod find;
@@ -28,6 +29,7 @@ mod monospace;
 mod permissions;
 mod prose;
 mod retained;
+pub(super) use closed_draft::closed_draft_source_matches;
 mod scroll;
 mod selectable_prose;
 mod selection;
@@ -168,6 +170,8 @@ pub enum Action {
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
+    CopyClosedDraft(Target, u64),
+    DiscardClosedDraft(Target, u64),
     SignIn(Target, Account),
     ResumeAfterSignIn(Target),
     /// Starts a new conversation in the same session directory and working
@@ -369,6 +373,7 @@ impl Action {
             | Self::ResumeAfterSignIn(target)
             | Self::AcceptSuggestion(target, _)
             | Self::Submit(target, _)
+            | Self::DiscardClosedDraft(target, _)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
             | Self::Interrupt(target)
@@ -1555,6 +1560,8 @@ pub(super) struct Runtime {
     pub(super) target: Target,
     pub(super) session: chat::Session,
     connection: Connection,
+    /// Set only by exact shared-view retirement, independently of transport failure.
+    closed_elsewhere: bool,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
@@ -2151,6 +2158,7 @@ impl Runtime {
             source_clock: None,
             finished_stamp: None,
             connection,
+            closed_elsewhere: false,
             queued: None,
             followups: Vec::new(),
             next_followup: 0,
@@ -4310,6 +4318,14 @@ impl Cagents {
                 }
             }
         }
+        // Unread state belongs to the saved workspace, not its visible strip.
+        // Update durable before the unchanged-snapshot fast path so reads also
+        // persist when no draft or editor navigation changed.
+        let mut agent_updates = self.sidebar_state.unread_updates().clone();
+        agent_updates.retain(|card, _| open_cards.contains(card));
+        if agent_updates != self.durable.agent_updates {
+            Arc::make_mut(&mut self.durable).agent_updates = agent_updates;
+        }
         if defaults.is_empty()
             && chat_drafts == self.durable.chat_drafts
             && repository_navigation == self.durable.repository_navigation
@@ -4653,7 +4669,9 @@ impl Cagents {
             _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
         };
         runtime.is_some_and(|runtime| {
-            !runtime.unsent_text().is_empty() || runtime.transition_blocker().is_some()
+            runtime.closed_elsewhere
+                || runtime.has_unsent_text()
+                || runtime.transition_blocker().is_some()
         }) || self
             .chat_ui
             .drafts
@@ -5895,7 +5913,7 @@ impl Cagents {
         clear_draft: bool,
         step: Option<QueuedStep>,
     ) -> Task<Message> {
-        if self.chat_start_pending(target.card) {
+        if self.chat_start_pending(target.card) || self.chat_closed_elsewhere(target.card) {
             return Task::none();
         }
         let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -6003,6 +6021,10 @@ impl Cagents {
         })
     }
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
+        let closed_refresh = match &action {
+            Action::Ready(target, _) => Some(target.card),
+            _ => None,
+        };
         let restore = match &action {
             Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
@@ -6025,6 +6047,9 @@ impl Cagents {
             _ => None,
         };
         let task = self.handle_chat_ui_inner(action);
+        if let Some(card) = closed_refresh {
+            self.sync_closed_chat_draft(card);
+        }
         if let Some(target) = restore
             && let Some(runtime) = self.chat_runtime_mut(target)
             && !runtime.account_picker
@@ -6069,11 +6094,20 @@ impl Cagents {
             return Task::none();
         }
         if let Some(card) = action.starts_session()
-            && self.refuse_for_deleting_card(card)
+            && (self.chat_closed_elsewhere(card) || self.refuse_for_deleting_card(card))
         {
             return Task::none();
         }
+        if matches!(&action, Action::Submit(target, _) if self.chat_closed_elsewhere(target.card)) {
+            return Task::none();
+        }
         match action {
+            Action::CopyClosedDraft(target, revision) => {
+                return self.copy_closed_chat_draft(target, revision);
+            }
+            Action::DiscardClosedDraft(target, revision) => {
+                return self.discard_closed_chat_draft(target, revision);
+            }
             Action::DraftModel(target, provider, model) => {
                 return self.choose_draft_model(target, provider, model);
             }
@@ -11758,11 +11792,12 @@ mod tests {
     #[test]
     fn account_picker_keyboard_reaches_manage_accounts_and_activates_it() {
         use crate::workspace_widget::GlobalShortcut;
-        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
-        use cosmic::iced::{Event, Rectangle, Size};
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Size, futures::StreamExt, mouse};
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.account_ui.add_managed_fixture(Provider::Codex, 22);
-        let renderer = crate::app::tests::headless_renderer();
+        let mut renderer = crate::app::tests::headless_renderer();
         let card = draft_chat(&mut app);
         drop(app.open_chat_control(GlobalShortcut::ChatAccount));
         let press = |key, code| keyboard::Event::KeyPressed {
@@ -11791,49 +11826,50 @@ mod tests {
         assert_eq!(chat_runtime(&app, card).picker_focus, choices);
         assert!(app.chat_picker_key(&down).is_some());
         assert_eq!(chat_runtime(&app, card).picker_focus, 0);
+        let mut navigation = None;
         for _ in 0..choices {
-            assert!(app.chat_picker_key(&down).is_some());
+            navigation = Some(app.chat_picker_key(&down).expect("next account control"));
         }
         assert_eq!(chat_runtime(&app, card).picker_focus, choices);
         let mut messages = Vec::new();
         {
-            let mut element = app.chat_view(card);
-            let mut tree = Tree::new(element.as_widget());
-            let viewport = Rectangle::with_size(Size::new(320.0, 600.0));
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
+            let mut ui = UserInterface::build(
+                app.chat_view(card),
+                Size::new(320.0, 600.0),
+                Cache::new(),
+                &mut renderer,
             );
-            let mut overlay = element
-                .as_widget_mut()
-                .overlay(
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                    &viewport,
-                    iced::Vector::ZERO,
+            // At compact widths the account menu is nested inside More.
+            // UserInterface traverses those live overlays when applying the
+            // actual arrow-navigation task and dispatching Enter.
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            executor.block_on(async {
+                let mut stream = cosmic::iced::runtime::task::into_stream(
+                    navigation.expect("the account ring has a next control"),
                 )
-                .expect("account menu overlay");
-            let popup = overlay.as_overlay_mut().layout(&renderer, viewport.size());
-            overlay.as_overlay_mut().operate(
-                Layout::new(&popup),
-                &renderer,
-                &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
-                    card,
-                    "chat-manage-accounts",
-                )),
-            );
-            overlay.as_overlay_mut().update(
-                &Event::Keyboard(press(
+                .expect("navigation produces a widget operation");
+                let mut applied = false;
+                while let Ok(Some(cosmic::iced::runtime::Action::Widget(mut operation))) =
+                    tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+                {
+                    ui.operate(&renderer, operation.as_mut());
+                    applied = true;
+                }
+                assert!(applied, "apply the native account-navigation operation");
+            });
+            executor.shutdown_background();
+            ui.update(
+                &[Event::Keyboard(press(
                     keyboard::key::Named::Enter,
                     keyboard::key::Code::Enter,
-                )),
-                Layout::new(&popup),
+                ))],
                 mouse::Cursor::Unavailable,
-                &renderer,
+                &mut renderer,
                 &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
+                &mut messages,
             );
         }
         assert!(messages.iter().any(|message| matches!(

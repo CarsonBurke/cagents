@@ -74,6 +74,10 @@ pub(super) struct State {
     requested_transfers: HashMap<uuid::Uuid, CardId>,
     pub attached: HashSet<CardId>,
     retained: HashSet<CardId>,
+    /// Exact chat identity retired by an authoritative view, never inferred from EOF.
+    pub closed_chats: HashMap<CardId, crate::chat::Session>,
+    /// Last actual canonical descriptors, before optimistic local edits.
+    observed_chats: HashMap<CardId, crate::chat::Session>,
     applying: bool,
     pub creating_default: bool,
     pub deferred_default: Option<PathBuf>,
@@ -1108,6 +1112,46 @@ impl Cagents {
         // transfer response arrives. Rebase before either snapshot projects.
         self.retarget_transferred_pane_updates(None);
         self.shared_views.prune_restoration_requests(&self.durable);
+        // A delayed tombstone must not borrow a newer local actor's identity.
+        // Record only raw authoritative panes, never the pending overlay below.
+        let local_cards = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .map(|card| card.id)
+            .collect::<HashSet<_>>();
+        self.shared_views
+            .observed_chats
+            .retain(|id, _| local_cards.contains(id));
+        self.shared_views
+            .closed_chats
+            .retain(|id, _| local_cards.contains(id));
+        let mut seen = HashSet::new();
+        let mut ambiguous = HashSet::new();
+        for pane in self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .filter(|pane| local_cards.contains(&pane.id))
+        {
+            if !seen.insert(pane.id) {
+                ambiguous.insert(pane.id);
+            }
+            if let CardKind::Chat(session) = &pane.kind {
+                if self.shared_views.observed_chats.get(&pane.id) != Some(session) {
+                    self.shared_views
+                        .observed_chats
+                        .insert(pane.id, session.clone());
+                }
+            } else {
+                self.shared_views.observed_chats.remove(&pane.id);
+            }
+        }
+        for id in ambiguous {
+            self.shared_views.observed_chats.remove(&id);
+        }
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
         let mut views = self.workspace_model.views.clone();
@@ -1438,6 +1482,17 @@ impl Cagents {
                 || self.shared_chat_has_local_work(id)
             {
                 self.retain_local_pane(id);
+                if view.retired.contains(&id)
+                    && !self.chat_start_pending(id)
+                    && let Some(source) = self.shared_views.observed_chats.get(&id)
+                    && matches!(self.card_state(id).map(|card| &card.kind), Some(CardKind::Chat(session)) if super::chat_ui::closed_draft_source_matches(source, session))
+                {
+                    if self.shared_views.closed_chats.get(&id) != Some(source) {
+                        let source = source.clone();
+                        self.shared_views.closed_chats.insert(id, source);
+                    }
+                    self.sync_closed_chat_draft(id);
+                }
                 self.status = Some(TransientNotice::warning(
                     "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it.",
                 ));
@@ -1446,6 +1501,8 @@ impl Cagents {
             self.detach_shared_pane(id);
         }
         for shared in &view.panes {
+            self.shared_views.closed_chats.remove(&shared.id);
+            self.sync_closed_chat_draft(shared.id);
             self.prepare_terminal_restoration(shared);
             let mut projected = shared.clone();
             if let Scope::Worktree { path, .. } = &view.scope {
