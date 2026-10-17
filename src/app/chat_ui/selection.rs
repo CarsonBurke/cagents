@@ -1213,6 +1213,109 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_drag_paints_and_copies_mixed_blocks_in_both_directions() {
+        use iced::advanced::renderer::{Headless, Renderer};
+
+        let source = "# Heading\n\nParagraph α with **bold** and `inline`.\n\n- First item\n- Second item\n\n> Quoted text\n\n| A | B |\n|---|---|\n| left | right |\n\n```rust\nlet value = 42;\n```\n\nLast paragraph.";
+        let expected = "Heading\n\nParagraph α with bold and inline.\n\n- First item\n- Second item\n\nQuoted text\n\nA\tB\nleft\tright\n\nlet value = 42;\n\n\nLast paragraph.";
+        for reverse in [false, true] {
+            let mut renderer = crate::app::tests::headless_renderer();
+            let mut element = surface(rendered_markdown(source, |_| {}));
+            let mut tree = Tree::new(&element);
+            let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 1400.0));
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let viewport = Rectangle::with_size(Size::new(600.0, 1400.0));
+            let mut read = Read::new(None);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+            assert_eq!(read.blocks.len(), 11, "fixture must mount each block type");
+            let first = read.blocks.first().unwrap().bounds;
+            let last = read.blocks.last().unwrap().bounds;
+            let beginning = Point::new(first.x, first.y + 1.0);
+            let end = Point::new(last.x + last.width - 0.1, last.y + last.height - 1.0);
+            let (start, end) = if reverse {
+                (end, beginning)
+            } else {
+                (beginning, end)
+            };
+            let mut clipboard = ClipboardText::default();
+            for (event, point) in [
+                (
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    start,
+                ),
+                (
+                    Event::Mouse(mouse::Event::CursorMoved { position: end }),
+                    end,
+                ),
+                (
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    end,
+                ),
+            ] {
+                let mut messages = Vec::new();
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Available(point),
+                    &renderer,
+                    &mut clipboard,
+                    &mut shell,
+                    &viewport,
+                );
+                assert!(
+                    shell.is_event_captured(),
+                    "drag must use transcript selection"
+                );
+                if shell.is_layout_invalid() {
+                    node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                }
+            }
+            let state = tree.state.downcast_ref::<State>();
+            let ranges = read
+                .ranges(state.anchor.unwrap(), state.end.unwrap())
+                .unwrap();
+            assert_eq!(read.copy(&ranges), expected);
+            renderer.reset(viewport);
+            element.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &cosmic::theme::active(),
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &viewport,
+            );
+            let pixels = renderer.screenshot(Size::new(600, 1400), 1.0, iced::Color::WHITE);
+            let selected = design::accent_color(&cosmic::theme::active()).into_rgba8();
+            for block in &read.blocks {
+                let y = (block.bounds.y + 1.0) as usize;
+                let painted = (block.bounds.x.ceil() as usize
+                    ..(block.bounds.x + block.bounds.width).floor() as usize)
+                    .any(|x| {
+                        pixels[(y * 600 + x) * 4..][..4]
+                            .iter()
+                            .zip(selected)
+                            .all(|(actual, expected)| actual.abs_diff(expected) <= 1)
+                    });
+                assert!(
+                    painted,
+                    "selected block has no visible highlight (reverse={reverse}): {}",
+                    block.plain
+                );
+            }
+        }
+    }
+
     fn rendered_markdown(
         body: &str,
         change: impl FnOnce(&mut Vec<markdown::Item>),
