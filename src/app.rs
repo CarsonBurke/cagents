@@ -38,6 +38,7 @@ mod session_recovery;
 mod settings_ui;
 mod shared_views;
 mod sidebar_selection_ui;
+mod startup_gate;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
@@ -4111,6 +4112,8 @@ pub enum Message {
     },
     StartupWindowOpened(window::Id),
     StartupReported(Result<(), String>),
+    VerifyStartupPanes,
+    StartupPanesSaved(Result<SettingsSaved, String>, Result<(), String>),
     UiUpdate(instance::UiUpdateRequest),
     UiUpdateWatchdog(u64),
     UiUpdateFlushed {
@@ -4819,6 +4822,7 @@ struct SourceControlMutation {
 }
 
 pub struct Cagents {
+    startup_gate: startup_gate::State,
     device_ui: device_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
@@ -13123,6 +13127,7 @@ impl Application for Cagents {
                 .take(WORKSPACE_HISTORY_LIMIT),
         );
         let mut app = Self {
+            startup_gate: startup_gate::State::default(),
             core,
             workspace,
             durable: Arc::new(durable),
@@ -15016,14 +15021,7 @@ impl Application for Cagents {
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();
                 }
-                let report = cosmic::task::future(async {
-                    let result =
-                        tokio::task::spawn_blocking(|| instance::report_ui_startup(&Ok(())))
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result.map_err(|error| error.to_string()));
-                    Message::StartupReported(result)
-                });
+                let report = self.begin_startup_gate();
                 // window::run silently drops callbacks for windows that have not
                 // opened yet. Initialize only after iced acknowledges this one.
                 #[cfg(feature = "integrated-browser")]
@@ -15031,10 +15029,22 @@ impl Application for Cagents {
                 #[cfg(not(feature = "integrated-browser"))]
                 report
             }
+            Message::VerifyStartupPanes => self.verify_startup_gate(),
+            Message::StartupPanesSaved(settings, saved) => {
+                self.startup_panes_saved(settings, saved)
+            }
             Message::StartupReported(result) => match result {
                 Ok(()) => Task::none(),
                 Err(error) => {
                     tracing::error!(%error, "could not acknowledge UI startup");
+                    if self.startup_gate.window_opened() {
+                        // The updater may have timed out and retained this
+                        // usable recovery window while closing its pipe.
+                        self.status = Some(TransientNotice::warning(format!(
+                            "The updater could not verify this window's recovery: {error}. Your chats and drafts remain available; verify them and save before updating again."
+                        )));
+                        return Task::none();
+                    }
                     iced::exit()
                 }
             },
@@ -23049,6 +23059,48 @@ mod tests {
     }
 
     #[test]
+    fn startup_qualification_attaches_offscreen_shell_omp_and_custom_terminal_owners_serially() {
+        let mut app = context_inspector_test_app(false);
+        let terminals = ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"]
+            .map(|program| restored_live_terminal(program, Exposure::Offscreen));
+        app.durable = Arc::new(WorkspaceState {
+            cards: terminals.to_vec(),
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.initialize_runtimes());
+        assert_eq!(
+            app.terminal_starts_in_flight(),
+            0,
+            "ordinary offscreen lifecycle stays deferred"
+        );
+        assert!(app.restored_agent_attaches.is_empty());
+        drop(app.qualify_startup_terminals());
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        assert_eq!(app.restored_agent_attaches.len(), 2);
+        assert_eq!(app.startup_pane_check(), Ok(false));
+        let CardKind::Terminal(first) = &terminals[0].kind else {
+            unreachable!()
+        };
+        drop(app.update(Message::RestoredAgentAttached {
+            card: terminals[0].id,
+            terminal: first.id,
+            result: Ok(None),
+        }));
+        assert_eq!(
+            app.terminal_starts_in_flight(),
+            1,
+            "one next attach uses the existing bounded queue"
+        );
+        assert_eq!(app.restored_agent_attaches.len(), 1);
+        assert_ne!(
+            app.startup_pane_check(),
+            Ok(true),
+            "unattached owners never qualify"
+        );
+    }
+
+    #[test]
     fn a_queued_agent_attach_yields_to_the_cards_own_start() {
         let mut app = context_inspector_test_app(false);
         let agent = restored_live_terminal("/usr/bin/claude", Exposure::Offscreen);
@@ -25671,6 +25723,7 @@ mod tests {
         core.window.border_padding = Some(0);
 
         Cagents {
+            startup_gate: startup_gate::State::default(),
             workspace,
             durable,
             terminal_working_directories: HashMap::new(),

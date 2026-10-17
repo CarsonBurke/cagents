@@ -313,7 +313,42 @@ pub(super) fn adopt_recoverable(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Adopted, String> {
-    let evidence = registry::evidence(socket)?;
+    let evidence = crate::daemon::holder_registry::recovery_candidate(
+        socket,
+        crate::daemon::holder_registry::Kind::Terminal,
+    )?;
+    let mut original_role = None;
+    if let Some(record) = &evidence
+        && record.application != crate::instance::APPLICATION_ID
+    {
+        let next = recovery
+            .as_ref()
+            .ok_or("Cross-role adoption requires issued recovery lineage")?;
+        let proof = next
+            .source
+            .continuity
+            .live_proof()
+            .ok_or("Cross-role adoption has no successor proof")?;
+        let (original, _) = inspect(socket, record, &proof)?;
+        if next.execution_recipe != original.execution_recipe
+            || next.execution_environment != original.execution_environment
+            || next.source.launch != original.source.launch
+            || (next.source != original.source && !next.previous_sources.contains(&original.source))
+        {
+            return Err(
+                "Cross-role adoption does not retain the holder's exact issued source".into(),
+            );
+        }
+        original_role = crate::daemon::holder_registry::OriginalRole::authenticated(
+            record,
+            &original
+                .source
+                .continuity
+                .live_proof()
+                .ok_or("Original holder source has no proof")?,
+            &proof,
+        )?;
+    }
     let failed =
         |error: io::Error| format!("adopt terminal holder at {}: {error}", socket.display());
     let control = crate::daemon::holder_registry::connect(socket).map_err(failed)?;
@@ -392,6 +427,7 @@ pub(super) fn adopt_recoverable(
     holder.adoption_pending = evidence.is_some();
     holder.registered = evidence.is_some();
     holder.record = evidence;
+    holder.original_role = original_role;
     holder.screen_lost = screen_lost;
     Ok(Adopted {
         held: watched(holder, pid, descriptors, exited, exits)?,
@@ -469,9 +505,13 @@ pub(super) struct Holder {
     screen_lost: bool,
     cleanup_proved: bool,
     record: Option<Record>,
+    original_role: Option<crate::daemon::holder_registry::OriginalRole>,
 }
 
 impl Holder {
+    pub(super) fn original_role(&self) -> Option<&crate::daemon::holder_registry::OriginalRole> {
+        self.original_role.as_ref()
+    }
     pub(super) fn record(&self) -> Option<&Record> {
         self.record.as_ref()
     }
@@ -543,6 +583,7 @@ impl Holder {
             screen_lost: false,
             cleanup_proved: false,
             record: None,
+            original_role: None,
         }
     }
 
@@ -1445,11 +1486,18 @@ fn hand_over(
                 .ok_or(io::ErrorKind::PermissionDenied)?,
         )?;
         if next.source.launch != current.source.launch
-            || !next.previous_sources.iter().any(|source| {
-                source.id == current.source.id
-                    && source.launch == current.source.launch
-                    && source.continuity.live_proof() == current.source.continuity.live_proof()
-            })
+            || next.execution_recipe != current.execution_recipe
+            || (next.source != current.source
+                && !next.previous_sources.iter().any(|source| {
+                    source.id == current.source.id
+                        && source.launch == current.source.launch
+                        && source.continuity.live_proof() == current.source.continuity.live_proof()
+                }))
+            || (next.source == current.source
+                && !current
+                    .previous_sources
+                    .iter()
+                    .all(|source| next.previous_sources.contains(source)))
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -2086,6 +2134,7 @@ mod tests {
                 relaunches: Vec::new(),
                 options: crate::terminal::TerminalSpawnOptions::default(),
                 execution_environment: None,
+                execution_recipe: None,
             };
             let (exits, _exited) = crossbeam_channel::bounded(1);
             assert!(
@@ -2252,8 +2301,9 @@ mod tests {
             boot_id: boot.clone(),
             host_incarnation: crate::model::HostIncarnation::new("third"),
         };
-        // The same successor can retry allocation under its existing lease.
-        next.previous_sources.push(next.source.clone());
+        // The same successor can retry the identical allocation under its
+        // existing lease, without fabricating a self-alias after a lost ACK.
+        let retry_source = next.source.clone();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let (exits, _) = crossbeam_channel::bounded(1);
@@ -2263,6 +2313,16 @@ mod tests {
             // No commit: dropping failed parser setup must preserve every byte
             // already returned in Attached as well as the surviving process.
             drop(attempt);
+            assert_eq!(next.source, retry_source);
+            assert_eq!(
+                crate::daemon::holder_registry::recovery_candidate(
+                    &socket,
+                    crate::daemon::holder_registry::Kind::Terminal,
+                )
+                .unwrap(),
+                Some(record.clone()),
+                "adoption rewrote the original holder role/identity"
+            );
             if replayed {
                 break;
             }

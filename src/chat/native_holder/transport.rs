@@ -152,6 +152,8 @@ enum Request {
     Adopt {
         source: Session,
         proof: HostSessionProof,
+        #[serde(default)]
+        application: Option<String>,
     },
     Release,
 }
@@ -458,6 +460,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
                 record,
                 proof: source_proof.clone(),
                 source: retained_source,
+                original_role: None,
             },
         }),
         Err(error) => {
@@ -473,7 +476,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
 fn connect(record: &Record) -> Result<UnixStream, String> {
     let directory = registry::directory(Kind::Native)?;
     let socket = registry::socket(&directory, record.terminal);
-    if registry::evidence(&socket, Kind::Native)?.as_ref() != Some(record)
+    if registry::recovery_candidate(&socket, Kind::Native)?.as_ref() != Some(record)
         || !record.holder.is_current()
     {
         return Err("Native holder discovery evidence changed".into());
@@ -509,7 +512,7 @@ pub(crate) fn inspect(
             recovery,
             exited,
         }) if matches!(protocol, 2 | PROTOCOL) && actual == *record => {
-            recovery.validate(&record.boot)?;
+            recovery.validate_original_role(&record.boot, &record.application)?;
             Ok((recovery, exited))
         }
         Some(Report::Failed(error)) => Err(error),
@@ -522,6 +525,18 @@ pub(crate) fn adopt(
     source: &Session,
     proof: &HostSessionProof,
 ) -> Result<(Holder, Recovery), String> {
+    // Inspect is read-only. A candidate role does not authorize Adopt: first
+    // authenticate this live holder's complete issued source on its own lease-
+    // checked channel, and retain the exact original Record through cleanup.
+    let (original, _) = inspect(record, proof)?;
+    if &original.source != source && !original.previous_sources.contains(source) {
+        return Err("Native role transition does not recognize the exact issued source".into());
+    }
+    let original_role = registry::OriginalRole::authenticated(
+        record,
+        source.proof.as_ref().ok_or("Native source has no proof")?,
+        proof,
+    )?;
     let control = connect(record)?;
     if record.is_outdated() {
         tracing::warn!(terminal = %record.terminal, holder_pid = record.holder.pid,
@@ -535,12 +550,13 @@ pub(crate) fn adopt(
         &Request::Adopt {
             source: source.clone(),
             proof: proof.clone(),
+            application: Some(crate::instance::APPLICATION_ID.into()),
         },
         TIMEOUT,
     )?;
     match receive(&control, TIMEOUT)? {
         Some(Report::Adopted(recovery)) => {
-            recovery.validate(&record.boot)?;
+            recovery.validate_original_role(&record.boot, &record.application)?;
             if recovery.source.id != source.id
                 || recovery.source.proof.as_ref() != Some(proof)
                 || (&recovery.source != source && !recovery.previous_sources.contains(source))
@@ -556,6 +572,7 @@ pub(crate) fn adopt(
                         record: record.clone(),
                         source: recovery.source.clone(),
                         proof: proof.clone(),
+                        original_role,
                     },
                 },
                 recovery,
@@ -575,6 +592,7 @@ struct Residence {
     child_events: ChildEvents,
     released: bool,
     _working_directory: Option<std::fs::File>,
+    owner_application: String,
 }
 
 impl Residence {
@@ -624,6 +642,7 @@ impl Residence {
             root: Process::read(child.id()).map_err(|error| error.to_string())?,
         };
         let residence = Self {
+            owner_application: crate::instance::APPLICATION_ID.into(),
             directory,
             listener,
             record,
@@ -718,10 +737,12 @@ impl Residence {
                     source,
                     execution_console,
                     paired_holder,
-                } => match self
-                    .recovery
-                    .update_source(source, execution_console, paired_holder)
-                {
+                } => match self.recovery.update_source_for_role(
+                    source,
+                    execution_console,
+                    paired_holder,
+                    &self.owner_application,
+                ) {
                     Ok(()) => Report::SourceUpdated,
                     Err(error) => Report::Failed(error),
                 },
@@ -813,17 +834,37 @@ impl Residence {
                         TIMEOUT,
                     );
                 }
-                Request::Adopt { source, proof } => match self.recovery.adopt(&source, proof) {
-                    Ok(()) => {
-                        if send(&control, &Report::Adopted(self.recovery.clone()), TIMEOUT).is_ok()
-                        {
-                            return self.attend(control);
+                Request::Adopt {
+                    source,
+                    proof,
+                    application,
+                } => {
+                    let application =
+                        application.unwrap_or_else(|| self.record.application.clone());
+                    if application != self.record.application
+                        && !registry::production_role_pair(&self.record.application, &application)
+                    {
+                        let _ = send(
+                            &control,
+                            &Report::Failed("Unsupported original holder role transition".into()),
+                            TIMEOUT,
+                        );
+                        continue;
+                    }
+                    match self.recovery.adopt(&source, proof) {
+                        Ok(()) => {
+                            self.owner_application = application;
+                            if send(&control, &Report::Adopted(self.recovery.clone()), TIMEOUT)
+                                .is_ok()
+                            {
+                                return self.attend(control);
+                            }
+                        }
+                        Err(error) => {
+                            let _ = send(&control, &Report::Failed(error), TIMEOUT);
                         }
                     }
-                    Err(error) => {
-                        let _ = send(&control, &Report::Failed(error), TIMEOUT);
-                    }
-                },
+                }
                 _ => unreachable!(),
             }
         }
@@ -1180,6 +1221,50 @@ extern "C" fn serve_if_requested() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_adopt_json_keeps_exact_source_and_proof_without_claiming_a_new_role() {
+        let source = super::super::tests::recovery().source;
+        let proof = source.proof.clone().unwrap();
+        let legacy = serde_json::json!({"Adopt": {"source": source, "proof": proof}});
+        let decoded: Request = serde_json::from_value(legacy.clone()).unwrap();
+        let Request::Adopt {
+            source: actual,
+            proof: actual_proof,
+            application,
+        } = decoded
+        else {
+            panic!("legacy request changed operation");
+        };
+        assert_eq!(actual, source);
+        assert_eq!(actual_proof, proof);
+        assert!(
+            application.is_none(),
+            "legacy request invented successor-role authority"
+        );
+        let mut current = legacy.clone();
+        current["Adopt"]["application"] = serde_json::json!(crate::instance::APPLICATION_ID);
+        let Request::Adopt {
+            source: actual,
+            proof: actual_proof,
+            application,
+        } = serde_json::from_value::<Request>(current).unwrap()
+        else {
+            panic!("current request changed operation");
+        };
+        assert_eq!(actual, source);
+        assert_eq!(actual_proof, proof);
+        assert_eq!(
+            application.as_deref(),
+            Some(crate::instance::APPLICATION_ID)
+        );
+        let mut missing_proof = legacy;
+        missing_proof["Adopt"]
+            .as_object_mut()
+            .unwrap()
+            .remove("proof");
+        assert!(serde_json::from_value::<Request>(missing_proof).is_err());
+    }
+
     use super::*;
 
     #[test]

@@ -743,7 +743,7 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
     }
     use crate::daemon::holder_registry::{self as registry, Kind};
     let directory = registry::directory(Kind::Native).map_err(unavailable)?;
-    registry::evidence(&registry::socket(&directory, session.id), Kind::Native)
+    registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)
         .map(|record| record.is_some())
         .map_err(unavailable)
 }
@@ -838,6 +838,7 @@ fn start_with_execution(
     }
     let reservation_id = session.id;
     let mut source_process = None;
+    let mut resolved_restart_recipe = None;
     let mut source_fresh = None;
     let mut source_environment = BTreeMap::new();
     let mut source_transient = None;
@@ -897,8 +898,21 @@ fn start_with_execution(
             }
         }
         source_process = Some(process);
-        session.launch.recipe = recipe;
-        session.launch.session_id = fresh.is_none().then_some(id);
+        if let Some(restart) = restart_launch {
+            if fresh.is_some()
+                || restart.provider != session.launch.provider
+                || restart.session_id.as_deref() != Some(id.as_str())
+                || restart.terminal_recipe().as_ref() != Some(&recipe)
+            {
+                return Err(error(
+                    "Restored source differs from its exact confirmed restart recipe",
+                ));
+            }
+            resolved_restart_recipe = Some(recipe);
+        } else {
+            session.launch.recipe = recipe;
+            session.launch.session_id = fresh.is_none().then_some(id);
+        }
         source_fresh = fresh;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(Some(proof), state.proof())?;
@@ -1193,7 +1207,21 @@ fn start_with_execution(
                 ));
             }
             let handle = record.handle.clone();
-            session.terminal = Some(record.session.clone());
+            // Capture this worker's current daemon proof, not the raw launch
+            // continuity retained before it was first attached.
+            let current = state.descriptor(client, session.id)?.session;
+            session.terminal = Some(if restart_launch.is_some() {
+                restored_terminal_source(
+                    session
+                        .terminal
+                        .as_ref()
+                        .ok_or_else(|| error("Upgrade pair source is missing"))?,
+                    &current,
+                )
+                .map_err(error)?
+            } else {
+                current
+            });
             Some(handle)
         } else {
             if state.terminals.contains_key(&session.id) && !recovering {
@@ -1227,7 +1255,10 @@ fn start_with_execution(
                     source_transient.as_ref().map(|environment| &environment.0),
                 )?;
             if source_process.as_ref() != Some(&current_process)
-                || current_recipe != session.launch.recipe
+                || &current_recipe
+                    != resolved_restart_recipe
+                        .as_ref()
+                        .unwrap_or(&session.launch.recipe)
                 || current_fresh != source_fresh
                 || current_execution != source_execution
             {
@@ -2644,6 +2675,7 @@ fn process_inner(
                 super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
             }
             drop(record);
+            super::state::retire_recovered_upgrade_chat(host, chat_id);
             Ok(ServerResponse::ChatClosed { chat_id, snapshot })
         }
         _ => Err(error("Not a native chat request")),
@@ -2654,55 +2686,47 @@ pub(super) fn resolve_upgrade(
     host: &SharedHost,
     source: &Session,
 ) -> Result<Session, ProtocolError> {
-    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let sources = state.upgrade_chats.get(&source.id).ok_or_else(|| {
-        unavailable(
-            state
-                .native_adoption_failures
-                .get(source)
-                .unwrap_or("No durable upgrade replacement exists for this native chat"),
+    let (sources, evidence, session) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state.chats.get(&source.id).ok_or_else(|| unavailable(
+            state.native_adoption_failures.get(source).unwrap_or(
+                "The exact upgraded provider is unavailable. Its recovery evidence was retained; reopen this conversation from the provider's saved sessions."
+            )))?;
+        if !record.handle.owns_work() {
+            return Err(unavailable(
+                "Restored native provider has closed; no writer was restarted",
+            ));
+        }
+        let mut session = record.session.clone();
+        session.launch.session_id = record.handle.session_id();
+        session.native_continuity = record.handle.native_continuity();
+        (
+            state.upgrade_chats.get(&source.id).cloned(),
+            state.upgrade_evidence.clone(),
+            session,
         )
-    })?;
-    if !sources.iter().any(|previous| {
-        let saved = &previous.source;
-        !(source.proof.is_none()
-        || saved.proof != source.proof
-        // Presentation identities can be stale on hidden cards. The old proof,
-        // actor ID and immutable launch bind that descriptor to this lineage;
-        // only the daemon's checkpoint chooses the replacement conversation.
-        || saved.launch.provider != source.launch.provider
-        || saved.launch.recipe != source.launch.recipe
-        || saved.terminal.as_ref().map(|terminal| {
-            (
-                &terminal.id,
-                &terminal.launch,
-                terminal.continuity.live_proof(),
-            )
-        }) != source.terminal.as_ref().map(|terminal| {
-            (
-                &terminal.id,
-                &terminal.launch,
-                terminal.continuity.live_proof(),
-            )
-        }))
+    };
+    if sources.as_ref().is_some_and(|sources| {
+        sources
+            .iter()
+            .any(|previous| crate::upgrade::handoff::issued_chat_source_matches(previous, source))
     }) {
-        return Err(error(
-            "Native upgrade source does not match the exact former daemon conversation",
-        ));
+        return Ok(session);
     }
-    let record = state
-        .chats
-        .get(&source.id)
-        .ok_or_else(|| unavailable("Restored native chat is no longer hosted"))?;
-    if !record.handle.owns_work() {
-        return Err(unavailable(
-            "Restored native provider has closed; no writer was restarted",
-        ));
+    // An unvisited pane can predate the current in-memory checkpoint's aliases.
+    // Completed durable evidence remains authoritative only for this exact live
+    // replacement, even when the RAM map already contains newer source proofs.
+    if let Some(evidence) = evidence
+        && evidence
+            .recovered_sources(source, &session)
+            .map_err(unavailable)?
+            .is_some()
+    {
+        return Ok(session);
     }
-    let mut session = record.session.clone();
-    session.launch.session_id = record.handle.session_id();
-    session.native_continuity = record.handle.native_continuity();
-    Ok(session)
+    Err(error(
+        "Native upgrade source does not match the exact former daemon conversation",
+    ))
 }
 
 pub(super) fn paired_upgrade_recipe(
@@ -2892,6 +2916,29 @@ pub(super) fn validate_upgrade_environment(
     Ok(())
 }
 
+/// Preserve the exact paired descriptor already issued to the saved pane.
+/// Resume hints are live observations; they do not replace that descriptor's
+/// historical metadata. The exact process/thread is checked independently.
+pub(super) fn restored_terminal_source(
+    issued: &crate::model::TerminalSession,
+    current: &crate::model::TerminalSession,
+) -> Result<crate::model::TerminalSession, String> {
+    let mut owner = current.clone();
+    owner.continuity = issued.continuity.clone();
+    owner.resume_hint = issued.resume_hint.clone();
+    if owner != *issued
+        || current
+            .continuity
+            .live_proof()
+            .is_none_or(|proof| !proof.is_complete())
+    {
+        return Err("The exact paired terminal owner changed during upgrade".into());
+    }
+    let mut replacement = issued.clone();
+    replacement.continuity = current.continuity.clone();
+    Ok(replacement)
+}
+
 pub(super) fn restore_upgrade(
     host: &SharedHost,
     saved: &crate::upgrade::handoff::Chat,
@@ -2907,25 +2954,20 @@ pub(super) fn restore_upgrade(
         return Err("The saved Claude working directory is unavailable. No provider was restarted; open the saved pane to read its conversation history.".into());
     }
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut session = saved.source.clone();
-    session.launch = saved.launch.clone();
-    // Claude/OMP restart their process, but the conversation descriptor keeps
-    // its issued recipe. Publishing the normalized resume argv instead makes
-    // the next ordinary window save look like a different conversation.
-    let restart_launch = matches!(session.launch.provider, Provider::Claude | Provider::Omp)
-        .then_some(&saved.launch);
-    if restart_launch.is_some() {
-        session.launch.recipe = saved.source.launch.recipe.clone();
-    }
+    let mut session = crate::upgrade::handoff::restored_chat(&saved.source, &saved.launch)?;
+    // Every provider keeps the descriptor already issued to windows. The
+    // checkpoint's normalized resume arguments are execution context only.
+    let restart_launch = Some(&saved.launch);
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         session.proof = Some(state.proof().clone());
         if let Some(terminal) = session.terminal.as_mut() {
             if state.terminals.contains_key(&terminal.id) {
-                *terminal = state
+                let current = state
                     .descriptor(0, terminal.id)
                     .map_err(|error| error.message)?
                     .session;
+                *terminal = restored_terminal_source(terminal, &current)?;
             } else {
                 terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
                     recipe: session
@@ -3149,6 +3191,7 @@ pub(super) fn close_terminal_actor(
     };
     drop(state);
     if let Some(record) = removed {
+        super::state::retire_recovered_upgrade_chat(host, record.session.id);
         super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
     }
     Ok(())
@@ -3680,7 +3723,90 @@ mod tests {
                 paired_upgrade_recipe(&other_account, &other_account, &launch, Some(SELECTED))
                     .is_err()
             );
+            for mutation in 0..5 {
+                let mut changed = process.clone();
+                match mutation {
+                    0 => changed.recovery.program = "/other/codex".into(),
+                    1 => changed.recovery.working_directory = "/other".into(),
+                    2 => changed
+                        .recovery
+                        .arguments
+                        .extend(["--model".into(), "other".into()]),
+                    3 => {
+                        changed
+                            .recovery
+                            .unset_environment
+                            .insert("CODEX_API_KEY".into());
+                    }
+                    _ => changed
+                        .recovery
+                        .arguments
+                        .extend(["--remote".into(), "unix:///other".into()]),
+                }
+                assert!(
+                    paired_upgrade_recipe(&changed, &changed, &launch, Some(SELECTED)).is_err()
+                );
+            }
         }
+    }
+
+    #[test]
+    fn paired_upgrade_preserves_issued_metadata_and_refuses_owner_changes() {
+        let proof = |name| HostSessionProof {
+            host_session_id: HostSessionId::new(name),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new(name),
+        };
+        let continuity = |proof: HostSessionProof| crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id,
+            boot_id: proof.boot_id,
+            host_incarnation: proof.host_incarnation,
+        };
+        let mut issued = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            LaunchRecipe::shell("/project".into()).unwrap(),
+            None,
+        )
+        .session;
+        issued.continuity = continuity(proof("old"));
+        issued.resume_hint = Some("original issued observation".into());
+        let mut current = issued.clone();
+        current.continuity = continuity(proof("new"));
+        current.resume_hint = Some("current worker observation".into());
+        let mut restored = restored_terminal_source(&issued, &current).unwrap();
+        assert_eq!(restored.continuity, current.continuity);
+        restored.continuity = issued.continuity.clone();
+        assert_eq!(restored, issued);
+        for mutation in 0..9 {
+            let mut changed = current.clone();
+            match mutation {
+                0 => changed.id = TerminalId::new(),
+                1 => changed.launch.program = "/another".into(),
+                2 => changed.launch.arguments.push("another".into()),
+                3 => changed.launch.working_directory = "/another".into(),
+                4 => {
+                    changed
+                        .launch
+                        .environment
+                        .insert("CODEX_HOME".into(), "/another".into());
+                }
+                5 => {
+                    changed
+                        .launch
+                        .unset_environment
+                        .insert("CODEX_API_KEY".into());
+                }
+                6 => changed.transcript_path = Some("/another".into()),
+                7 => changed.recovery_origin = Some(TerminalId::new()),
+                _ => changed.predecessor = Some(TerminalId::new()),
+            }
+            assert!(restored_terminal_source(&issued, &changed).is_err());
+        }
+        current.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe: current.launch.clone(),
+            last_exit: None,
+        };
+        assert!(restored_terminal_source(&issued, &current).is_err());
     }
 
     #[test]
@@ -4417,6 +4543,9 @@ for line in sys.stdin:
         let mut wrong_source = saved.source.clone();
         wrong_source.proof = restored.proof;
         assert!(resolve_upgrade(&host, &wrong_source).is_err());
+        let mut unrelated_thread = saved.source.clone();
+        unrelated_thread.launch.session_id = Some("98765432-1234-4234-8234-123456789abc".into());
+        assert!(resolve_upgrade(&host, &unrelated_thread).is_err());
         assert!(restore_upgrade(&host, &saved).is_err());
         let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&saved.source.id]
             .handle
@@ -4444,6 +4573,303 @@ for line in sys.stdin:
             handle.failure().is_some(),
             "the rejected session remains diagnosed"
         );
+    }
+
+    #[test]
+    fn terminal_close_retires_only_the_exact_closed_actors_recovered_pane_aliases() {
+        let (directory, host, saved) = upgrade_fixture();
+        restore_upgrade(&host, &saved).unwrap();
+        let replacement = resolve_upgrade(&host, &saved.source).unwrap();
+        let evidence = Arc::new(crate::upgrade::handoff::Store::open(directory.path()).unwrap());
+        evidence
+            .record_recovered(&[crate::upgrade::handoff::RecoveredChat {
+                evidence: saved.clone(),
+                replacement: replacement.clone(),
+                aliases: Vec::new(),
+            }])
+            .unwrap();
+        let handle = {
+            let mut state = host.lock().unwrap();
+            state.upgrade_evidence = Some(evidence.clone());
+            state.chats[&saved.source.id].handle.clone()
+        };
+        assert!(
+            evidence
+                .recovered_sources(&saved.source, &replacement)
+                .unwrap()
+                .is_some()
+        );
+        close_terminal_actor(&host, saved.source.id, &handle).unwrap();
+        assert!(!host.lock().unwrap().chats.contains_key(&saved.source.id));
+        assert!(
+            evidence
+                .recovered_sources(&saved.source, &replacement)
+                .unwrap()
+                .is_none()
+        );
+        // An old close receipt must not clear evidence for another live actor.
+        restore_upgrade(&host, &saved).unwrap();
+        let replacement = resolve_upgrade(&host, &saved.source).unwrap();
+        evidence
+            .record_recovered(&[crate::upgrade::handoff::RecoveredChat {
+                evidence: saved.clone(),
+                replacement: replacement.clone(),
+                aliases: Vec::new(),
+            }])
+            .unwrap();
+        close_terminal_actor(&host, saved.source.id, &handle).unwrap();
+        assert!(
+            evidence
+                .recovered_sources(&saved.source, &replacement)
+                .unwrap()
+                .is_some()
+        );
+        let current = host.lock().unwrap().chats[&saved.source.id].handle.clone();
+        close_terminal_actor(&host, saved.source.id, &current).unwrap();
+    }
+
+    #[test]
+    fn upgrade_resolution_checks_durable_older_aliases_when_ram_has_only_newer_sources() {
+        let (directory, host, mut saved) = upgrade_fixture();
+        saved.launch.recipe = saved.launch.terminal_recipe().unwrap();
+        restore_upgrade(&host, &saved).unwrap();
+        let restored = resolve_upgrade(&host, &saved.source).unwrap();
+        let evidence = Arc::new(crate::upgrade::handoff::Store::open(directory.path()).unwrap());
+        evidence
+            .record_recovered(&[crate::upgrade::handoff::RecoveredChat {
+                evidence: saved.clone(),
+                replacement: restored.clone(),
+                aliases: Vec::new(),
+            }])
+            .unwrap();
+        let mut newer = saved.clone();
+        newer.source.proof.as_mut().unwrap().host_incarnation =
+            HostIncarnation::new("intermediate-daemon");
+        {
+            let mut state = host.lock().unwrap();
+            state.upgrade_evidence = Some(evidence);
+            state.upgrade_chats.insert(
+                saved.source.id,
+                vec![crate::upgrade::handoff::ChatSource {
+                    source: newer.source,
+                    launch: newer.launch,
+                }],
+            );
+        }
+        assert_eq!(resolve_upgrade(&host, &saved.source).unwrap(), restored);
+        for mutation in 0..4 {
+            let mut changed = saved.source.clone();
+            match mutation {
+                0 => {
+                    changed.proof.as_mut().unwrap().host_incarnation =
+                        HostIncarnation::new("unrelated-daemon")
+                }
+                1 => {
+                    changed
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("HOME".into(), "/another-account".into());
+                }
+                2 => {
+                    changed.launch.session_id = Some("98765432-1234-4234-8234-123456789abc".into())
+                }
+                _ => changed
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--changed-listener".into()),
+            }
+            assert!(resolve_upgrade(&host, &changed).is_err());
+        }
+        let handle = host.lock().unwrap().chats[&saved.source.id].handle.clone();
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn legacy_codex_upgrade_publishes_issued_arguments_and_hydrates_the_exact_thread() {
+        const CHILD: &str = "CAGENTS_LEGACY_CODEX_UPGRADE_CONTRACT";
+        let exact = thread::current()
+            .name()
+            .expect("named owning contract")
+            .to_owned();
+        if std::env::var(CHILD).as_deref() != Ok(exact.as_str()) {
+            use crate::repository::{
+                CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+            };
+            // Keep private evidence on success AND failure; a child result does
+            // not establish that every descendant has positively retired.
+            let root = tempfile::Builder::new()
+                .prefix("cagents-legacy-upgrade-")
+                .tempdir_in("/var/tmp")
+                .unwrap()
+                .keep();
+            for name in ["home", "run", "data", "config", "cache"] {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::create_dir(root.join(name)).unwrap();
+                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            eprintln!(
+                "legacy upgrade owning evidence retained at {}",
+                root.display()
+            );
+            let command = CommandSpec::new(std::env::current_exe().unwrap())
+                .args(["--exact", exact.as_str(), "--nocapture", "--test-threads=1"])
+                .env(CHILD, &exact)
+                .env("HOME", root.join("home"))
+                .env("XDG_RUNTIME_DIR", root.join("run"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .timeout(Duration::from_secs(35))
+                .output_limits(128 * 1024, 128 * 1024);
+            let output = SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap();
+            std::fs::write(root.join("stdout.log"), &output.stdout).unwrap();
+            std::fs::write(root.join("stderr.log"), &output.stderr).unwrap();
+            let output = output.require_success(&command.program).unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.lines().any(|line| line == "running 1 test")
+                    && stdout
+                        .lines()
+                        .any(|line| line == format!("test {exact} ... ok"))
+                    && stdout
+                        .lines()
+                        .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+                "exact owning contract did not execute; retained evidence {}",
+                root.display()
+            );
+            return;
+        }
+        use std::os::unix::net::UnixListener;
+        let (directory, host, mut saved) = upgrade_fixture();
+        let socket = directory.path().join("codex.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let home = directory.path().join("codex-home");
+        std::fs::create_dir(&home).unwrap();
+        let identity = saved.launch.session_id.clone().unwrap();
+        let expected = identity.clone();
+        let reported_home = home.clone();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "exact Codex peer never connected"
+                        );
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("fixture accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            loop {
+                assert!(Instant::now() < deadline, "exact Codex peer did not close");
+                let message = match socket.read() {
+                    Ok(message) => message,
+                    Err(tungstenite::Error::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let tungstenite::Message::Text(text) = message else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                if frame.get("id").is_none() {
+                    continue;
+                }
+                let result = match frame["method"].as_str().unwrap() {
+                    "initialize" => {
+                        serde_json::json!({"userAgent":"cagents/0.1.0", "codexHome":reported_home})
+                    }
+                    "thread/resume" => {
+                        assert_eq!(frame["params"]["threadId"], expected);
+                        serde_json::json!({"thread":{"id":expected,"canAcceptDirectInput":true,"status":{"type":"idle"}},
+                            "model":"fixture-luna", "initialTurnsPage":{"data":[{"id":"saved-turn","status":"completed","items":[
+                                {"type":"userMessage","id":"saved-prompt","content":[{"type":"text","text":"existing prompt"}]},
+                                {"type":"agentMessage","id":"saved-answer","text":"existing exact-thread answer","phase":"final_answer"}
+                            ]}],"nextCursor":null}})
+                    }
+                    "model/list" | "skills/list" | "thread/list" | "thread/queue/list" => {
+                        serde_json::json!({"data":[],"nextCursor":null})
+                    }
+                    method => panic!("unexpected fixture method {method}"),
+                };
+                if socket
+                    .send(tungstenite::Message::Text(
+                        serde_json::json!({"id":frame["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = finished.send(());
+        });
+        saved.source.launch.provider = Provider::Codex;
+        saved.source.launch.recipe.program = "codex".into();
+        saved.source.launch.recipe.arguments =
+            vec!["--remote".into(), format!("unix://{}", socket.display())];
+        saved
+            .source
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), home.display().to_string());
+        saved.launch = saved.source.launch.clone();
+        saved.launch.recipe = saved.launch.terminal_recipe().unwrap();
+        assert_ne!(saved.launch.recipe, saved.source.launch.recipe);
+        restore_upgrade(&host, &saved).unwrap();
+        let (replacement, handle) = {
+            let state = host.lock().unwrap();
+            let record = &state.chats[&saved.source.id];
+            (record.session.clone(), record.handle.clone())
+        };
+        assert_eq!(replacement.launch.recipe, saved.source.launch.recipe);
+        assert_eq!(replacement.launch.session_id, Some(identity));
+        assert!(chat::is_upgrade_recovery(&saved.source, &replacement));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            let snapshot = handle.snapshot(None).unwrap();
+            if snapshot.ready && !snapshot.history_loading {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "exact-thread fixture did not become ready: {snapshot:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(snapshot.ready);
+        assert!(snapshot.items.iter().any(|item| matches!(&item.content,
+            chat::ItemContent::Text { text, .. } if text == "existing exact-thread answer")));
+        handle.close().unwrap();
+        completion
+            .recv_timeout(Duration::from_secs(3))
+            .expect("bounded Codex fixture completion");
+        server.join().unwrap();
     }
 
     #[test]

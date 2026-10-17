@@ -121,7 +121,17 @@ pub(super) fn perform(
         "Saving and closing application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    let windows = guard.prepare_and_close_windows(Duration::from_secs(45))?;
+    crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
+    let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+        crate::install_guard::preflight_source_panes(guard,
+            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
+        let latest = observe(confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
+            .map_err(io::Error::other)?;
+        if !confirmed.preserves_consent(&latest) || digest(root).map_err(io::Error::other)? != staged.identity.digest {
+            return Err(io::Error::other("The installed build or session ownership changed during pane inspection; existing windows were kept open"));
+        }
+        Ok(())
+    })?;
     let result = (|| {
         let current = observe(
             confirmed
