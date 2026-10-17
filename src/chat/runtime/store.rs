@@ -79,6 +79,12 @@ pub(crate) struct Store {
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
 impl Store {
+    #[cfg(test)]
+    pub(super) fn read_only_for_test(&mut self) -> Result<(), String> {
+        self.db
+            .pragma_update(None, "query_only", true)
+            .map_err(|error| error.to_string())
+    }
     /// Decode once at ingestion. Snapshots carry a small path, never megabytes
     /// of base64, and identical payloads share the same private file.
     fn image_file(&self, url: &str) -> Result<String, String> {

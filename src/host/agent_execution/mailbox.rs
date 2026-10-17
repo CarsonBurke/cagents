@@ -242,6 +242,7 @@ fn terminal_attention(
             let id = owner?;
             let message = heads.get(&lineage)?;
             Some(Event {
+                content: None,
                 target: Target::SessionInbox(lineage),
                 source_session: Some(id),
                 provider: None,

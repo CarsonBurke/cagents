@@ -21,11 +21,13 @@ mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
 mod channels;
+mod format;
 pub use agents::AgentCommand;
 mod automations;
 mod completions;
 pub use automations::AutomationCommand;
 mod sessions;
+mod terminal_list;
 pub use sessions::SessionsArgs;
 mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
@@ -88,6 +90,9 @@ pub struct Cli {
     /// Emit stable JSON envelopes for automation.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Connect to an existing daemon without starting one (also CAGENTS_NO_START=1).
+    #[arg(long, global = true)]
+    pub no_start: bool,
 
     #[command(subcommand)]
     pub command: TopCommand,
@@ -289,8 +294,20 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum TerminalCommand {
-    /// List terminal descriptors known to the daemon.
-    List,
+    /// List running terminals with their observed state and title.
+    List {
+        /// Include retained terminals that are not running.
+        #[arg(long, conflicts_with = "exited")]
+        all: bool,
+        /// Show only terminals with a recorded process exit.
+        #[arg(long)]
+        exited: bool,
+    },
+    /// Read one terminal's full descriptor, including launch and recovery details.
+    Show {
+        /// The daemon terminal ID.
+        terminal_id: TerminalId,
+    },
     /// Spawn a terminal with an optional argv-based command.
     Spawn {
         /// Working directory for the terminal (defaults to the current directory).
@@ -1982,6 +1999,63 @@ impl AppError {
     }
 }
 
+static NO_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn daemon_autostart_disabled() -> bool {
+    NO_START.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+struct StartPolicy(bool);
+impl Drop for StartPolicy {
+    fn drop(&mut self) {
+        NO_START.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn control_daemon_socket() -> Result<PathBuf, AppError> {
+    if !daemon_autostart_disabled() {
+        return terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e));
+    }
+    let socket = daemon_socket_path().map_err(|e| AppError::new("socket_path", e))?;
+    match UnixStream::connect(&socket) {
+        Ok(_) => Ok(socket),
+        Err(error) if daemon_missing(&error) => {
+            confirm_daemon_absent(&socket)?;
+            Err(AppError::new(
+                "daemon_not_running",
+                "The daemon is not running; omit --no-start to start it",
+            ))
+        }
+        Err(error) => Err(AppError::new("daemon_connection", error)),
+    }
+}
+
+fn daemon_missing(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
+}
+
+fn confirm_daemon_absent(socket: &Path) -> Result<(), AppError> {
+    match crate::daemon::HostLease::is_held_at(socket) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(AppError::new(
+            "daemon_busy",
+            "The daemon still owns its inventory lease but is not accepting connections; retry after startup or shutdown completes",
+        )),
+        Err(error) => Err(AppError::new("daemon_connection", error)),
+    }
+}
+
+fn already_stopped() -> CommandOutput {
+    CommandOutput {
+        command: "daemon.stop",
+        data: json!({"state": "already_stopped"}),
+        human: "Daemon already stopped".into(),
+    }
+}
+
 pub fn run_from<I, T>(arguments: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
@@ -2014,6 +2088,18 @@ where
         emit_success(cli.json, completions::execute(shell));
         return ExitCode::SUCCESS;
     }
+
+    let stopping_daemon = matches!(
+        &cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::Stop { .. }
+        }
+    );
+    let no_start = stopping_daemon
+        || cli.no_start
+        || std::env::var("CAGENTS_NO_START")
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
 
     // Local evidence must remain readable when a staged owner, backend, or
     // daemon cannot start. Do not select/prepare a device or follow a route.
@@ -2056,7 +2142,7 @@ where
         return ExitCode::FAILURE;
     }
     if !crate::device::is_remote() && routes_to_staged_owner(&cli.command) {
-        let recover = staged_command_requires_daemon(&cli.command);
+        let recover = !no_start && staged_command_requires_daemon(&cli.command);
         match crate::install_guard::staged_owner_bin(
             &std::env::current_exe().unwrap_or_default(),
             recover,
@@ -2065,6 +2151,12 @@ where
                 use std::os::unix::process::CommandExt;
                 let mut command =
                     Command::new(bin.join(crate::companion::Product::Cli.file_name()));
+                // Carry implicit stop/environment policy into the matched CLI.
+                // An older owner that lacks this flag must refuse parsing
+                // rather than recover/start services before handling the read.
+                if no_start && !cli.no_start {
+                    command.arg("--no-start");
+                }
                 command.args(&arguments[1..]);
                 crate::install_guard::sanitize_child_environment(&mut command);
                 let error = command.exec();
@@ -2086,6 +2178,10 @@ where
     ) {
         return match crate::device::serve_stdio() {
             Ok(()) => ExitCode::SUCCESS,
+            Err(error) if crate::device::daemon_absent(&error) => {
+                crate::device::report_absent_bridge();
+                ExitCode::from(crate::device::BRIDGE_ABSENT_EXIT)
+            }
             Err(error) => {
                 eprintln!("cagents daemon bridge: {error}");
                 ExitCode::FAILURE
@@ -2094,6 +2190,14 @@ where
     }
     if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. }) {
         if let Err(error) = crate::device::prepare() {
+            if crate::device::daemon_absent(&error) {
+                if stopping_daemon {
+                    emit_success(cli.json, already_stopped());
+                    return ExitCode::SUCCESS;
+                }
+                emit_error(cli.json, &AppError::new("daemon_not_running", error));
+                return ExitCode::FAILURE;
+            }
             emit_error(cli.json, &AppError::new("device", error));
             return ExitCode::FAILURE;
         }
@@ -2557,8 +2661,12 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             })
         }
         DaemonCommand::Start => {
-            let socket = terminal::ensure_daemon_ready()
-                .map_err(|error| AppError::new("daemon_start", error))?;
+            let socket = control_daemon_socket()?;
+            if daemon_autostart_disabled() {
+                // Readiness still requires the matched protocol; a listener
+                // alone does not prove this daemon can serve CLI requests.
+                let _client = ControlClient::connect(&socket).map_err(protocol_error)?;
+            }
             let mut data = json!({ "instance": instance::NAME, "running": true, "socket": socket });
             // Installers discard a successful start's output, but a daemon that
             // came up without some retained conversations must still say so.
@@ -2636,7 +2744,14 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
         } => {
             let socket =
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
-            let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+            let mut client = match ControlClient::connect(&socket) {
+                Ok(client) => client,
+                Err(ControlError::Connect(error)) if daemon_missing(&error) => {
+                    confirm_daemon_absent(&socket)?;
+                    return Ok(already_stopped());
+                }
+                Err(error) => return Err(protocol_error(error)),
+            };
             let outcome = match confirm {
                 // A capability is already a counted, daemon-bound, expiring
                 // authority over one observed inventory, so a script that
@@ -2923,8 +3038,7 @@ pub enum StopReport {
 }
 
 fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError> {
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     // Inside a hosted session the daemon lets these commands change only the
@@ -2941,18 +3055,19 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         client.authenticate(authority).map_err(protocol_error)?;
     }
     match command {
-        TerminalCommand::List => {
+        TerminalCommand::List { all, exited } => {
             let terminals = client.list().map_err(protocol_error)?;
-            let human = terminals
+            Ok(terminal_list::list(&terminals, client.proof(), all, exited))
+        }
+        TerminalCommand::Show { terminal_id } => {
+            let terminals = client.list().map_err(protocol_error)?;
+            let terminal = terminals
                 .iter()
-                .map(descriptor_line)
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(CommandOutput {
-                command: "terminal.list",
-                data: json!({ "terminals": terminals }),
-                human,
-            })
+                .find(|terminal| terminal.session.id == terminal_id)
+                .ok_or_else(|| {
+                    AppError::new("not_found", format!("Unknown terminal {terminal_id}"))
+                })?;
+            Ok(terminal_list::show(terminal, client.proof()))
         }
         TerminalCommand::Spawn { cwd, argv } => {
             let cwd = absolute_working_directory(cwd)
@@ -3085,8 +3200,7 @@ fn execute_project(command: ProjectCommand) -> Result<CommandOutput, AppError> {
         }
         ProjectCommand::List => None,
     };
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     let model = selected
@@ -3283,8 +3397,7 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
         } => Some(project_directory(Some(path.clone()))?),
         _ => None,
     };
-    let socket =
-        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let socket = control_daemon_socket()?;
     let mut client = ControlClient::connect(&socket)
         .map_err(|error| AppError::new("daemon_connection", error))?;
     let model = selected
@@ -3411,11 +3524,7 @@ fn channel_output(
                 })
                 .collect::<Vec<_>>();
             channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
-            let human = channels
-                .iter()
-                .map(|channel| channel_line(channel))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = channel_list_human(&channels);
             Ok(CommandOutput {
                 command: "channel.list",
                 data: json!({ "channels": channels, "sequence": model.sequence }),
@@ -3433,6 +3542,23 @@ fn channel_output(
             })
         }
     }
+}
+
+fn channel_list_human(channels: &[&ModelChannel]) -> String {
+    format::table(
+        ["CHANNEL", "REPOSITORY", "TITLE"],
+        channels
+            .iter()
+            .map(|channel| {
+                [
+                    channel.id.to_string(),
+                    channel.repository.display().to_string(),
+                    channel.title.clone(),
+                ]
+            })
+            .collect(),
+        "No channels",
+    )
 }
 
 /// One channel per line: id, repository, title.
@@ -3640,6 +3766,33 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readable_channel_list_has_headers_and_a_plain_empty_state() {
+        assert_eq!(channel_list_human(&[]), "No channels");
+        let channel = ModelChannel {
+            id: ChannelId::new(),
+            repository: "/repo/.git".into(),
+            title: "Build\nlogs".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+        };
+        let human = channel_list_human(&[&channel]);
+        assert_eq!(human.lines().count(), 2);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["CHANNEL", "REPOSITORY", "TITLE"]
+        );
+        assert!(human.ends_with("Build logs"));
+        assert!(human.contains(&channel.id.to_string()));
+        // Channel repository identity is retained; it is not asserted to be a checkout path.
+        assert!(human.contains("/repo/.git"));
+    }
+
     #[test]
     fn rebuild_stop_requires_explicit_permission_before_touching_a_daemon() {
         let error = execute_daemon(DaemonCommand::StopForRebuild {

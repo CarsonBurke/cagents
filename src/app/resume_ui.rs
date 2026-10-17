@@ -263,7 +263,7 @@ fn index(
         let mut conversations = Vec::new();
         let mut titles = Vec::new();
         for mut found in catalog::find_all(cache, &seeds, batch, workers, cancel) {
-            if let Some(name) = names.get(&found.id) {
+            if let Some(name) = names.get(found.seed).and_then(|names| names.get(&found.id)) {
                 found.title = name.clone();
                 found.titled = true;
                 found.named = true;
