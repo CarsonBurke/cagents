@@ -5974,6 +5974,79 @@ mod tests {
     }
 
     #[test]
+    fn superseded_early_completion_cannot_reclaim_notification_authority_after_idle() {
+        for supersession in ["active", "metadata-active", "systemError", "closed"] {
+            for managed in [false, true] {
+                let mut adapter = adapter();
+                let run = crate::model::RunId::new();
+                let command = Command::Prompt {
+                    text: "Old prompt".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                };
+                let submitted = if managed {
+                    adapter.command_for_run(run, command).unwrap()
+                } else {
+                    adapter.command(command).unwrap()
+                };
+                let request = submitted.writes[0]["id"].clone();
+                adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"old","status":"completed","items":[{"id":"old-answer","type":"agentMessage","text":"Old answer"}]}}})).unwrap();
+                if supersession == "closed" {
+                    adapter
+                        .receive(
+                            json!({"method":"thread/closed","params":{"threadId":"thread-exact"}}),
+                        )
+                        .unwrap();
+                } else if supersession == "metadata-active" {
+                    let refresh = adapter.command(Command::Refresh).unwrap();
+                    let read = refresh
+                        .writes
+                        .iter()
+                        .find(|frame| frame["method"] == "thread/read")
+                        .unwrap();
+                    adapter.receive(json!({"id":read["id"],"result":{"thread":{"id":"thread-exact","status":{"type":"active"}}}})).unwrap();
+                } else {
+                    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":supersession}}})).unwrap();
+                }
+                if matches!(supersession, "active" | "metadata-active") {
+                    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}})).unwrap();
+                }
+                let revision = adapter.lifecycle_revision;
+                let acknowledged = adapter
+                    .receive(json!({"id":request,"result":{"turn":{"id":"old"}}}))
+                    .unwrap();
+                assert!(
+                    acknowledged.suppress_current_notification,
+                    "{supersession}, managed={managed}"
+                );
+                assert!(
+                    acknowledged.notification_preview.is_none(),
+                    "{supersession}, managed={managed}"
+                );
+                assert!(
+                    !acknowledged.events.iter().any(|event| matches!(
+                        event,
+                        Event::TurnFinished { .. } | Event::TurnStarted | Event::TurnSettled
+                    )),
+                    "{supersession}, managed={managed}: {:?}",
+                    acknowledged.events
+                );
+                assert_eq!(adapter.lifecycle_revision, revision);
+                assert!(adapter.notification_turn.is_none());
+                assert!(!adapter.busy);
+                assert_eq!(acknowledged.events.iter().filter(|event| matches!(event,
+                    Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *actual == run
+                )).count(), usize::from(managed));
+                if managed {
+                    assert!(acknowledged.events.iter().any(|event| matches!(event,
+                        Event::Item(Item { content: ItemContent::Text { text, .. }, .. }) if text == "Old answer"
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn managed_completion_publishes_final_content_once_per_step_in_either_ack_order() {
         for completion_first in [false, true] {
             let mut adapter = adapter();
