@@ -147,6 +147,98 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() {
+    let fixture = Fixture::with_provider(include_str!("fixtures/automation-claude.sh"));
+    let project_path = fixture.root.path().join("project");
+    let project = project_path.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let mut completed = std::collections::BTreeMap::new();
+    let mut first = None;
+    for index in 0..100 {
+        let name = format!("capacity-{index}");
+        let accepted = fixture.cli(&[
+            "agent",
+            "spawn",
+            "--provider",
+            "claude",
+            "--repository",
+            project,
+            "--directory",
+            project,
+            "--surface",
+            "chat",
+            "--name",
+            &name,
+            "--prompt",
+            "capacity fixture",
+            "--idempotency-key",
+            &name,
+            "--wait",
+            "--timeout",
+            "10",
+        ]);
+        assert_eq!(accepted["created"], true, "conversation {index}");
+        assert_eq!(accepted["timed_out"], false);
+        assert_eq!(accepted["agent"]["origin"], "User");
+        assert_eq!(accepted["agent"]["closed"], false);
+        assert!(accepted["agent"]["session"]["Chat"].is_object());
+        assert_eq!(accepted["run"]["state"], "Succeeded");
+        assert_eq!(accepted["run"]["result"]["text"], "SCHEDULED_RESULT");
+        let agent = accepted["agent"]["id"].as_str().unwrap().to_owned();
+        let run = accepted["run"]["id"].as_str().unwrap().to_owned();
+        assert!(completed.insert(agent, run).is_none());
+        if index == 0 {
+            first = Some(accepted);
+        }
+    }
+    assert_eq!(completed.len(), 100);
+    // `agent list` currently has no cursor and reads at most 1024 summaries.
+    // Query every exact ID through its documented bounded status command:
+    // this avoids aggregating 100 verbose JSON rows in the fixture's stdout pipe.
+    // All 100 remain open; neither this loop nor setup closes an agent.
+    for (agent, run) in &completed {
+        let retained = fixture.cli(&["agent", "status", agent]);
+        assert_eq!(retained["agent"]["id"].as_str(), Some(agent.as_str()));
+        assert_eq!(retained["run"]["id"].as_str(), Some(run.as_str()));
+        assert_eq!(retained["agent"]["origin"], "User");
+        assert_eq!(retained["agent"]["closed"], false);
+        assert_eq!(retained["run"]["state"], "Succeeded");
+    }
+    let retried = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "claude",
+        "--repository",
+        project,
+        "--directory",
+        project,
+        "--surface",
+        "chat",
+        "--name",
+        "capacity-0",
+        "--prompt",
+        "capacity fixture",
+        "--idempotency-key",
+        "capacity-0",
+        "--wait",
+        "--timeout",
+        "10",
+    ]);
+    let first = first.unwrap();
+    assert_eq!(retried["created"], false);
+    assert_eq!(retried["agent"]["id"], first["agent"]["id"]);
+    assert_eq!(retried["run"]["id"], first["run"]["id"]);
+    assert_eq!(retried["run"]["state"], "Succeeded");
+    assert_eq!(retried["agent"]["closed"], false);
+    let prompts = fs::read_to_string(fixture.root.path().join("prompts")).unwrap();
+    assert_eq!(prompts.lines().count(), 100);
+    assert!(prompts.lines().all(|line| line == "prompt"));
+    // Existing fixture Drop retires the private counted inventory only after
+    // all retained-conversation and exactly-once provider assertions above.
+}
+
+#[test]
 fn terminal_console_answers_requests_and_submits_durable_followups() {
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");

@@ -64,6 +64,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
             history_only,
             cwd: launch.recipe.working_directory.clone(),
             history,
+            titles: super::claude_titles::ClaudeTitles::new(launch),
             ..Claude::default()
         }),
     ))
@@ -299,6 +300,7 @@ enum ReportTask {
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
+    titles: Option<super::claude_titles::ClaudeTitles>,
     /// Whether this process was launched to resume `session_id`, as opposed
     /// to being handed a new one that names nothing until its first prompt.
     resumed: bool,
@@ -401,6 +403,18 @@ struct Claude {
     history_only: bool,
 }
 impl Claude {
+    fn observe_title(&mut self, step: &mut Step) {
+        if let Some(id) = self.session_id.clone()
+            && let Some(titles) = &mut self.titles
+            && let Some(title) = titles.update(&id)
+        {
+            step.events.push(Event::Session {
+                id,
+                title: Some(title),
+            });
+        }
+    }
+
     fn control(&mut self, mut request: Value) -> Result<Step, String> {
         if self.controls.len() >= MAX_PENDING {
             return Err("Too many pending Claude control operations".into());
@@ -415,6 +429,8 @@ impl Claude {
         wire.remove("_cagents_permissions");
         wire.remove("_cagents_permission_update");
         Ok(Step {
+            suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![json!({"type":"control_request","request_id":id,"request":request})],
             events: vec![],
         })
@@ -750,6 +766,8 @@ impl Claude {
             return Err("Claude permission response must be smaller than 30 MiB".into());
         }
         let mut step = Step {
+            suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![
                 json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":response}}),
             ],
@@ -817,6 +835,8 @@ impl Claude {
                 string(request, "subtype")
             );
             return Ok(Step {
+                suppress_current_notification: false,
+                notification_preview: None,
                 writes: vec![
                     json!({"type":"control_response", "response":{"subtype":"error", "request_id":id, "error":error}}),
                 ],
@@ -1678,6 +1698,7 @@ impl Adapter for Claude {
             self.history = Some(history);
         }
         if self.history_only {
+            self.observe_title(&mut step);
             let reason = format!(
                 "The saved working directory {} is unavailable. Conversation history is read-only.",
                 self.cwd.display()
@@ -2001,6 +2022,13 @@ impl Adapter for Claude {
                     if let Some((key, outcome, execution)) =
                         self.deferred_attention.remove(&generation)
                     {
+                        // This acknowledgement may settle the old run after
+                        // another accepted prompt has begun. Keep its exact
+                        // execution result without replacing that prompt's
+                        // current notification context.
+                        step.suppress_current_notification = generation
+                            != self.attention_generation
+                            && self.started_generation == Some(self.attention_generation);
                         let outcome = if accepted {
                             crate::notifications::Kind::Cancelled
                         } else {
@@ -2067,6 +2095,9 @@ impl Adapter for Claude {
                                     id: id.clone(),
                                     title: None,
                                 });
+                            }
+                            if self.resumed {
+                                self.observe_title(&mut step);
                             }
                             self.metadata(&response["response"], &mut step);
                             self.fast_mode_metadata(&response["response"], &mut step);
@@ -2212,6 +2243,9 @@ impl Adapter for Claude {
                 }
             }
             "result" => {
+                if frame["parent_tool_use_id"].is_null() {
+                    self.observe_title(&mut step);
+                }
                 let can_suggest = frame["parent_tool_use_id"].is_null()
                     && frame["is_error"] != true
                     && frame["subtype"] == "success"
@@ -4868,6 +4902,8 @@ impl Claude {
             return Err("Claude elicitation response must be smaller than 30 MiB".into());
         }
         let mut step = Step {
+            suppress_current_notification: false,
+            notification_preview: None,
             writes: vec![
                 json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":response}}),
             ],
@@ -5036,6 +5072,106 @@ mod tests {
     use crate::agent::Provider;
     use crate::chat::{ChangeKind, FileChange};
     use std::io::Write as _;
+
+    #[test]
+    fn confirmed_claude_session_observes_only_its_saved_names_at_result_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let config = cwd.join("claude-config");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let project = config.join("projects").join(project);
+        std::fs::create_dir_all(&project).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = project.join(format!("{id}.jsonl"));
+        std::fs::write(&path, format!("{}\n{}\n",
+            json!({"type":"user","sessionId":id,"cwd":cwd,"message":{"content":"Review encrypted bundles"}}),
+            json!({"type":"summary","summary":"Bundle encryption and throughput"}))).unwrap();
+        let launch = Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.clone()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd.clone(),
+                environment: [
+                    ("HOME".into(), cwd.to_string_lossy().into_owned()),
+                    (
+                        "CLAUDE_CONFIG_DIR".into(),
+                        config.to_string_lossy().into_owned(),
+                    ),
+                ]
+                .into(),
+                unset_environment: Default::default(),
+            },
+        };
+        let mut adapter = Claude {
+            session_id: Some(id.clone()),
+            titles: super::super::claude_titles::ClaudeTitles::new(&launch),
+            ..Default::default()
+        };
+        let foreign = uuid::Uuid::new_v4().to_string();
+        assert!(
+            adapter
+                .receive(json!({"type":"result","session_id":foreign}))
+                .is_err()
+        );
+        let result = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(event,
+            Event::Session { id: actual, title: Some(title) }
+            if actual == &id && title == "Bundle encryption and throughput")));
+        let unchanged = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
+        assert!(
+            !unchanged
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Session { title: Some(_), .. }))
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated encryption review"})
+        )
+        .unwrap();
+        let generated = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
+        assert!(generated.events.iter().any(|event| matches!(event,
+            Event::Session { title: Some(title), .. } if title == "Generated encryption review")));
+
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Encrypted bundle audit"})
+        )
+        .unwrap();
+        let streaming = adapter
+            .receive(json!({"type":"stream_event","session_id":id,"event":{}}))
+            .unwrap();
+        assert!(
+            !streaming
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Session { title: Some(_), .. }))
+        );
+        let result = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(event,
+            Event::Session { title: Some(title), .. } if title == "Encrypted bundle audit")));
+    }
 
     #[test]
     fn fast_mode_setting_requires_confirmation_and_preserves_model_and_effort() {
@@ -8364,6 +8500,203 @@ mod tests {
     }
 
     #[test]
+    fn notification_questions_use_real_claude_prompts_across_pending_requests() {
+        let question = |id: &str, text: &str| {
+            json!({
+                "type":"control_request", "request_id":id,
+                "request":{"subtype":"can_use_tool", "tool_name":"AskUserQuestion",
+                    "input":{"questions":[{"question":text,"header":"Migration",
+                        "options":[{"label":"Keep","description":"Keep existing"},
+                            {"label":"Replace","description":"Use replacement"}],
+                        "multiSelect":false}]}}
+            })
+        };
+        let frames = vec![
+            question("question-a", "Which config_file.rs strategy should A use?"),
+            question("question-b", "Which migration should B use?"),
+            json!({"type":"control_cancel_request","request_id":"question-a"}),
+            // Claude rejects duplicate pending IDs, so this must not invent a
+            // provider-supported same-ID question edit or a third notice.
+            question("question-b", "Unsupported duplicate wording"),
+        ];
+        let receipts = crate::chat::runtime::notification_frames_for_test(
+            Box::new(Claude {
+                busy: true,
+                ready: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        assert_eq!(receipts.len(), 2);
+        assert!(
+            receipts[0]
+                .1
+                .preview
+                .contains("Which config_file.rs strategy should A use?")
+        );
+        assert!(
+            receipts[1]
+                .1
+                .preview
+                .contains("Which migration should B use?")
+        );
+        assert!(!receipts[1].1.preview.contains("Unsupported duplicate"));
+        assert_ne!(receipts[0].0.key, receipts[1].0.key);
+        for (evidence, content) in receipts {
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(
+                content.request,
+                Some(crate::notifications::RequestType::Question)
+            );
+            assert!(!content.preview.contains("waiting for your answers"));
+        }
+    }
+
+    #[test]
+    fn notification_old_interrupt_ack_preserves_the_new_question_and_topic() {
+        for accepted in [false, true] {
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            adapter
+                .send_prompt("Old A".into(), Vec::new(), PromptMode::Send)
+                .unwrap();
+            let interrupt = adapter.command(Command::Interrupt).unwrap();
+            let id = interrupt.writes[0]["request_id"].as_str().unwrap();
+            adapter
+                .receive(json!({"type":"result","uuid":"old-a","is_error":false}))
+                .unwrap();
+            adapter
+                .send_prompt("Review B migration".into(), Vec::new(), PromptMode::Send)
+                .unwrap();
+            let ack = if accepted {
+                reply(id, json!({}))
+            } else {
+                json!({"type":"control_response","response":{"request_id":id,"subtype":"error","error":"already settled"}})
+            };
+            let (callbacks, state) =
+                crate::chat::runtime::notification_frames_with_snapshot_for_test(
+                    Box::new(adapter),
+                    vec![
+                        json!({"type":"user","uuid":"new-b-user","session_id":"44444444-4444-4444-8444-444444444444",
+                        "message":{"role":"user","content":[{"type":"text","text":"Review B migration"}]}}),
+                        json!({"type":"control_request","request_id":"question-b","request":{
+                        "subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{
+                            "question":"Which B migration should I prepare?","header":"Migration",
+                            "options":[{"label":"Keep","description":"Preserve existing"},{"label":"Replace","description":"Use the new migration"}],"multiSelect":false}]}}}),
+                        ack,
+                    ],
+                    false,
+                );
+            assert_eq!(
+                callbacks.len(),
+                1,
+                "old acknowledgement cannot publish a current outcome"
+            );
+            assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(callbacks[0].1.conversation, "Review B migration");
+            assert!(callbacks[0].1.preview.contains("Which B migration"));
+            assert_eq!(state.requests.len(), 1);
+            assert_eq!(state.requests[0].id, "question-b");
+            assert!(state.error.is_none());
+            assert_eq!(state.activity(), crate::agent::ActivityState::Waiting);
+        }
+    }
+
+    #[test]
+    fn notification_label_survives_the_actual_send_step_event_order() {
+        let mut adapter = Claude {
+            ready: true,
+            ..Default::default()
+        };
+        let mut step = adapter
+            .send_prompt(
+                "Repair `config_file.rs`".into(),
+                Vec::new(),
+                PromptMode::Send,
+            )
+            .unwrap();
+        let user = step
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::Item(item) if item.role == Role::User))
+            .unwrap();
+        let started = step
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::TurnStarted))
+            .unwrap();
+        assert!(user < started, "exercise the real command-step ordering");
+        step.events.push(Event::TurnFinished {
+            key: Some("fixture-turn".into()),
+            outcome: crate::notifications::Kind::Succeeded,
+        });
+        let contexts =
+            crate::chat::notification::FrameContext::capture(&crate::chat::Snapshot::default())
+                .project(&step.events);
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].conversation, "Repair config_file.rs");
+    }
+
+    #[test]
+    fn notification_without_provider_title_uses_its_current_message_label() {
+        let receipts = crate::chat::runtime::notification_frames_for_test(
+            Box::new(Claude {
+                busy: true,
+                ready: true,
+                ..Default::default()
+            }),
+            vec![
+                json!({"type":"user","uuid":"notification-topic-user","session_id":"44444444-4444-4444-8444-444444444444",
+                    "message":{"role":"user","content":[{"type":"text","text":"Repair `config_file.rs`"}]}}),
+                json!({"type":"assistant","uuid":"notification-topic-answer","session_id":"44444444-4444-4444-8444-444444444444",
+                    "message":{"role":"assistant","content":[{"type":"text","text":"The configuration is ready to review."}]}}),
+                json!({"type":"result","uuid":"notification-topic-result","session_id":"44444444-4444-4444-8444-444444444444","is_error":false}),
+            ],
+            false,
+        );
+        let (evidence, content) = receipts.last().expect("real actor publishes completion");
+        assert_eq!(evidence.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(content.conversation, "Repair config_file.rs");
+        assert_eq!(content.preview, "The configuration is ready to review.");
+        let mut event = crate::notifications::Event::session(
+            crate::model::TerminalId::new(),
+            crate::agent::Provider::Claude,
+            "/project".into(),
+            evidence.clone(),
+        );
+        event.content = Some(content.clone());
+        event.validate().unwrap();
+        assert_eq!(
+            crate::notifications::presentation::message(&event, true).title,
+            "Repair config_file.rs"
+        );
+        assert!(
+            !crate::notifications::presentation::message(&event, false)
+                .title
+                .contains("config_file")
+        );
+    }
+
+    #[test]
+    fn notification_callback_sees_the_failed_result_diagnosis() {
+        let adapter = Claude {
+            busy: true,
+            ready: true,
+            ..Default::default()
+        };
+        let (evidence, content) = crate::chat::runtime::notification_frame_for_test(
+            Box::new(adapter),
+            json!({"type":"result","uuid":"failed-notification-result","is_error":true,"subtype":"error_during_execution","errors":["The provider rejected this request"]}),
+            false,
+        );
+        assert_eq!(evidence.kind, crate::notifications::Kind::Failed);
+        assert_eq!(content.preview, "The provider rejected this request");
+    }
+
+    #[test]
     fn interrupt_result_before_ack_cannot_cancel_the_following_turn() {
         for accepted in [false, true] {
             let mut adapter = Claude {
@@ -8402,6 +8735,7 @@ mod tests {
                 json!({"type":"control_response","response":{"request_id":request_id,"subtype":"error","error":"already settled"}})
             };
             let acknowledged = adapter.receive(acknowledgment).unwrap();
+            assert!(acknowledged.suppress_current_notification);
             let expected = if accepted {
                 crate::notifications::Kind::Cancelled
             } else {

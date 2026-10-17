@@ -247,6 +247,18 @@ fn before(items: &[Item], source: CardId, x: f32) -> Option<CardId> {
         .map(|item| item.id)
 }
 
+fn clear_channel_gesture(tree: &mut Tree) {
+    if tree.tag == tree::Tag::of::<State>() {
+        let state = tree.state.downcast_mut::<State>();
+        state.channel_drag = None;
+        state.channel_targeted = false;
+        state.suppress_release |= state.drag.take().is_some();
+    }
+    for child in &mut tree.children {
+        clear_channel_gesture(child);
+    }
+}
+
 impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
@@ -271,7 +283,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                 state.suppress_release |= state.drag.take().is_some();
             }
         }
+        let cancel_channel = matches!(&self.kind, Kind::ChannelScope { generation, enabled, .. }
+            if !enabled || state.channel_drag.as_ref().is_some_and(|drag| drag.generation != *generation));
         tree.diff_children(std::slice::from_mut(&mut self.content));
+        if cancel_channel {
+            // A modal overlay can consume release without updating the base tree.
+            clear_channel_gesture(tree);
+        }
     }
     fn size(&self) -> Size<Length> {
         self.content.as_widget().size()
@@ -1303,5 +1321,136 @@ mod tests {
         surface.tree.diff(replacement.as_widget_mut());
         surface.element = replacement;
         assert!(surface.release(140.0).is_empty());
+    }
+
+    #[test]
+    fn modal_captured_release_cannot_resume_a_channel_drag_after_view_diff() {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        struct Highlights(usize);
+        impl Operation for Highlights {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+                if let Some(target) = state.downcast_ref::<ChannelTarget>() {
+                    self.0 += usize::from(target.highlighted);
+                }
+            }
+        }
+        let ids = [CardId::new(), CardId::new()];
+        let channel = ChannelId::new();
+        let make = |generation, modal: bool| {
+            let target = channel_target(
+                widget::button::custom(widget::Space::new())
+                    .width(120)
+                    .height(30)
+                    .on_press(Action::Select(ids[1])),
+                channel,
+                true,
+            );
+            let base = channel_scope(
+                widget::row::with_children(vec![target, tabs(&ids, false)]),
+                Id::new("reorder.test"),
+                generation,
+                !modal,
+                |_, _| true,
+                Action::Move,
+            );
+            let popover = widget::popover(base).id(Id::new("reorder.modal"));
+            let popover = if modal {
+                popover
+                    .modal(true)
+                    .popup(widget::Space::new().width(10).height(10))
+            } else {
+                popover
+            };
+            Element::from(popover)
+        };
+        let moved = |x| {
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(x, 15.0),
+            })
+        };
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let mut renderer = Surface::new(&ids, false).renderer;
+        for modal in [true, false] {
+            let mut ui = UserInterface::build(
+                make(1, false),
+                Size::new(280.0, 30.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[moved(130.0), press.clone(), moved(20.0)],
+                mouse::Cursor::Available(Point::new(20.0, 15.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(messages.is_empty());
+            let mut highlighted = Highlights(0);
+            ui.operate(&renderer, &mut highlighted);
+            assert_eq!(
+                highlighted.0, 1,
+                "the actual native drag reached its channel target"
+            );
+            let generation = if modal { 1 } else { 2 };
+            ui = UserInterface::build(
+                make(generation, modal),
+                Size::new(280.0, 30.0),
+                ui.into_cache(),
+                &mut renderer,
+            );
+            let mut highlighted = Highlights(0);
+            ui.operate(&renderer, &mut highlighted);
+            assert_eq!(
+                highlighted.0, 0,
+                "diff must clear highlights before any base event"
+            );
+            let (_, statuses) = ui.update(
+                &[release.clone()],
+                mouse::Cursor::Available(Point::new(20.0, 15.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            if modal {
+                assert_eq!(statuses, vec![cosmic::iced::event::Status::Captured]);
+            }
+            assert!(messages.is_empty());
+            ui = UserInterface::build(
+                make(generation, false),
+                Size::new(280.0, 30.0),
+                ui.into_cache(),
+                &mut renderer,
+            );
+            let _ = ui.update(
+                &[press.clone(), release.clone()],
+                mouse::Cursor::Available(Point::new(20.0, 15.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(
+                messages,
+                vec![Action::Select(ids[1])],
+                "a new channel click cannot reuse the old pane drag"
+            );
+            messages.clear();
+            let _ = ui.update(
+                &[moved(130.0), press.clone(), moved(20.0), release.clone()],
+                mouse::Cursor::Available(Point::new(20.0, 15.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(
+                messages,
+                vec![Action::Move(ids[0], channel)],
+                "a fresh drag still works"
+            );
+        }
     }
 }
