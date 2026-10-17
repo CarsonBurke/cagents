@@ -398,7 +398,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         // Preserve inline code surfaces, emphasis, links and strike-throughs
         // without allocating a second rich-text widget or shaped buffer.
         for (index, span) in self.spans.iter().enumerate() {
-            if span.highlight.is_none() && !span.underline && !span.strikethrough {
+            if span.highlight.is_none() {
                 continue;
             }
             for bounds in paragraph.span_bounds(index) {
@@ -416,6 +416,31 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                         highlight.background,
                     );
                 }
+            }
+        }
+        paint_ranges(
+            renderer,
+            paragraph,
+            &self.matches,
+            translation,
+            design::accent_wash(theme),
+        );
+        let selection = state.anchor.min(state.end)..state.anchor.max(state.end);
+        if !selection.is_empty() {
+            paint_ranges(
+                renderer,
+                paragraph,
+                &[selection],
+                translation,
+                design::accent_color(theme),
+            );
+        }
+        // Decorations remain visible over opaque selection/Find backgrounds.
+        for (index, span) in self.spans.iter().enumerate() {
+            if !span.underline && !span.strikethrough {
+                continue;
+            }
+            for bounds in paragraph.span_bounds(index) {
                 let size = span.size.unwrap_or(self.size);
                 let line_height = span.line_height.unwrap_or_default().to_absolute(size).0;
                 let baseline = size.0 + (line_height - size.0) / 2.0;
@@ -439,23 +464,6 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                     }
                 }
             }
-        }
-        paint_ranges(
-            renderer,
-            paragraph,
-            &self.matches,
-            translation,
-            design::accent_wash(theme),
-        );
-        let selection = state.anchor.min(state.end)..state.anchor.max(state.end);
-        if !selection.is_empty() {
-            paint_ranges(
-                renderer,
-                paragraph,
-                &[selection],
-                translation,
-                design::accent_color(theme),
-            );
         }
         renderer.fill_paragraph(paragraph, layout.position(), defaults.text_color, *viewport);
     }
@@ -573,6 +581,110 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_and_find_preserve_markdown_strikes_and_span_underlines() {
+        use iced::advanced::renderer::{Headless, Renderer};
+
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: "~~x       x~~".to_owned(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let markdown::Item::Paragraph(text) = &cached.markdown.items()[0] else {
+            panic!("fixture must render as an ordinary Markdown paragraph");
+        };
+        let authored = text.spans(markdown::Style::from(iced::Theme::Light));
+        assert!(authored.iter().all(|span| span.strikethrough));
+        for underline in [false, true] {
+            // Integer decoration positions isolate an opaque foreground pixel
+            // inside whitespace, where text glyphs cannot hide a lost stroke.
+            let (size, line_height, stroke_y) = if underline {
+                (25.0_f32, 31.0_f32, 26)
+            } else {
+                (20.0_f32, 24.0_f32, 12)
+            };
+            for mode in 0..3 {
+                let mut renderer = crate::app::tests::headless_renderer();
+                let spans: Arc<[_]> = authored
+                    .iter()
+                    .cloned()
+                    .map(|mut span| {
+                        span.color = Some(iced::Color::BLACK);
+                        span.underline = underline;
+                        span.strikethrough = !underline;
+                        span.line_height =
+                            Some(iced::widget::text::LineHeight::Absolute(line_height.into()));
+                        span
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                let plain: Arc<str> = spans
+                    .iter()
+                    .map(|span| span.text.as_ref())
+                    .collect::<String>()
+                    .into();
+                let mut selectable = Selectable {
+                    plain: plain.clone(),
+                    spans,
+                    matches: vec![],
+                    size: size.into(),
+                    font: iced::Font::default(),
+                    target: Target {
+                        card: CardId::new(),
+                        generation: 0,
+                    },
+                };
+                let mut tree =
+                    Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+                let node = selectable.layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0)),
+                );
+                let state = tree.state.downcast_mut::<State>();
+                let x = state
+                    .paragraph()
+                    .buffer()
+                    .layout_runs()
+                    .find_map(|run| {
+                        run.glyphs
+                            .iter()
+                            .find(|glyph| run.text[glyph.start..glyph.end].trim().is_empty())
+                            .map(|glyph| (glyph.x + glyph.w * 0.5) as usize)
+                    })
+                    .expect("fixture must contain a shaped whitespace region");
+                match mode {
+                    1 => {
+                        state.anchor = 0;
+                        state.end = plain.len();
+                    }
+                    2 => selectable.matches = vec![0..plain.len()],
+                    _ => {}
+                }
+                let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
+                renderer.reset(viewport);
+                selectable.draw(
+                    &tree,
+                    &mut renderer,
+                    &cosmic::theme::active(),
+                    &renderer::Style::default(),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &viewport,
+                );
+                let pixels = renderer.screenshot(Size::new(400, 100), 1.0, iced::Color::WHITE);
+                assert_eq!(
+                    &pixels[(stroke_y * 400 + x) * 4..][..4],
+                    &[0, 0, 0, 255],
+                    "decoration disappears over highlight: underline={underline}, mode={mode}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn selection_paints_every_selected_glyph_across_bidirectional_visual_runs() {
