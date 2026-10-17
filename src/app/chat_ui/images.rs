@@ -367,11 +367,22 @@ pub(super) fn sync(runtime: &mut Runtime) {
         .into_iter()
         .map(|item| item.id.clone())
         .collect();
-    for (id, cached) in &mut runtime.cache {
+    let parent = runtime.selected_subagent.is_none();
+    for (active, id, cached) in runtime
+        .cache
+        .iter_mut()
+        .map(|(id, cached)| (parent, id, cached))
+        .chain(
+            runtime
+                .child_cache
+                .iter_mut()
+                .map(|(id, cached)| (!parent, id, cached)),
+        )
+    {
         if cached.image_item.is_none() && cached.image_source.is_none() && cached.image.is_none() {
             continue;
         }
-        if !interested.contains(id) {
+        if !active || !interested.contains(id) {
             retire(cached, false);
         } else if cached.image.is_none()
             && cached.image_source.is_none()
@@ -394,11 +405,11 @@ pub(super) fn request(runtime: &mut Runtime, id: &str) {
     else {
         return;
     };
-    if !runtime.cache.contains_key(id) {
+    if !runtime.presentation_cache().contains_key(id) {
         return;
     }
     runtime.preview_request = Some(id.to_owned());
-    if let Some(cached) = runtime.cache.get_mut(id) {
+    if let Some(cached) = runtime.presentation_cache_mut().get_mut(id) {
         cached.image_item = Some(item.clone());
         if cached.image.is_none() {
             cached.image_source = Some(item);
@@ -428,7 +439,7 @@ pub(super) fn evict_ready(runtime: &mut Runtime, mut missing: usize) -> usize {
         if missing == 0 {
             break;
         }
-        if let Some(cached) = runtime.cache.get_mut(id)
+        if let Some(cached) = runtime.presentation_cache_mut().get_mut(id)
             && cached.image.is_some()
         {
             missing = missing.saturating_sub(pixel_bytes(cached));
@@ -454,7 +465,7 @@ pub(super) fn complete(
     let Some(priority) = order.iter().position(|id| *id == item.id) else {
         return None;
     };
-    let Some(cached) = runtime.cache.get(&item.id) else {
+    let Some(cached) = runtime.presentation_cache().get(&item.id) else {
         return None;
     };
     if cached.image_attempt != attempt
@@ -479,7 +490,7 @@ pub(super) fn complete(
                 if missing == 0 {
                     break;
                 }
-                if let Some(cached) = runtime.cache.get_mut(id)
+                if let Some(cached) = runtime.presentation_cache_mut().get_mut(id)
                     && cached.image.is_some()
                 {
                     missing = missing.saturating_sub(pixel_bytes(cached));
@@ -488,7 +499,7 @@ pub(super) fn complete(
                 }
             }
         }
-        let cached = runtime.cache.get_mut(&item.id).unwrap();
+        let cached = runtime.presentation_cache_mut().get_mut(&item.id).unwrap();
         if !pressure.retained || explicit || evicted || cached.image_wait.is_some() {
             cached.image_wait = Some(pressure);
             cached.image_attempt = cached.image_attempt.wrapping_add(1);
@@ -502,7 +513,7 @@ pub(super) fn complete(
             && cached.image_wait.as_ref().is_some_and(|wait| wait.retained))
         .then_some(missing);
     }
-    let cached = runtime.cache.get_mut(&item.id).unwrap();
+    let cached = runtime.presentation_cache_mut().get_mut(&item.id).unwrap();
     cached.image_source = None;
     cached.image_wait = None;
     cached.image_unavailable = matches!(loaded, Loaded::Unavailable);
@@ -516,7 +527,7 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
     interest(runtime)
         .into_iter()
         .find_map(|item| {
-            let cached = runtime.cache.get(&item.id)?;
+            let cached = runtime.presentation_cache().get(&item.id)?;
             let source = cached.image_source.as_ref()?;
             Some(Subscription::run_with(
                 Source {
@@ -570,7 +581,7 @@ impl Gallery {
                     } else {
                         description.clone()
                     },
-                    handle: runtime.cache.get(&item.id)?.image.clone()?,
+                    handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
                 })
             })
             .collect();
