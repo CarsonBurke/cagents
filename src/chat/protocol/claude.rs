@@ -5067,6 +5067,9 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
 }
 
 #[cfg(test)]
+mod history_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::Provider;
