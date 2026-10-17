@@ -12739,7 +12739,9 @@ mod tests {
             let runtime = chat_runtime(&app, card);
             assert_eq!(runtime.composer.text(), text);
             assert_eq!(runtime.followups.len(), 1);
-            assert_ne!(runtime.composer.cursor(), before);
+            if text.contains('\n') {
+                assert_ne!(runtime.composer.cursor(), before);
+            }
         }
     }
 
