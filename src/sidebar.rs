@@ -2921,6 +2921,17 @@ impl SidebarState {
         self.agent_updates.remove(&card);
     }
 
+    pub(crate) fn unread_updates(&self) -> &BTreeMap<CardId, Option<(ProjectId, WorktreeId)>> {
+        &self.agent_updates
+    }
+
+    pub(crate) fn restore_unread_updates(
+        &mut self,
+        updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
+    ) {
+        self.agent_updates = updates;
+    }
+
     /// A removed surface is no longer an attention target. This is not a
     /// read acknowledgement: do not retain a dim row or acknowledge a journal.
     pub fn forget_card_attention(&mut self, card: CardId) {
