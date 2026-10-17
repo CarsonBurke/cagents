@@ -24718,50 +24718,74 @@ mod tests {
             .build()
             .unwrap();
         let _entered = executor.enter();
-        let mut app = lsp_test_app();
-        app.lsp = LspManager::new(AppSettings::default().language_servers);
-        let card = repository_card(&mut app, "/repo");
-        let (runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "first\nerror\r");
-        app.cards
-            .insert(card, CardRuntime::Repository(Box::new(runtime)));
-        drop(app.drain_lsp_intents(card));
-        let doc = app.lsp_document(card).unwrap();
-        assert_eq!(app.lsp.document_version(doc), Some(1));
-        let publish = |version| {
-            Message::Lsp(LspEvent::Diagnostics {
-                doc,
-                version,
-                items: vec![diagnostic("standing error")],
-            })
-        };
-        drop(app.update(publish(1)));
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
-            unreachable!()
-        };
-        runtime.move_cursor_to(LspPosition::new(0, 0));
-        drop(runtime.update(RepositoryAction::EditorAction {
-            card,
-            action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(Arc::new(
-                "\n".into(),
-            ))),
-        }));
-        drop(app.drain_lsp_intents(card));
-        assert_eq!(app.lsp.document_version(doc), Some(2));
-        assert!(app.lsp_contexts[&card].context.diagnostics.is_empty());
-        assert_eq!(app.lsp_contexts[&card].diagnostics_version, None);
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
-            unreachable!()
-        };
-        assert!(!runtime.diagnostic_navigation_available());
-        // A late publication cannot reinstall marks for the old coordinates.
-        drop(app.update(publish(1)));
-        assert!(app.lsp_contexts[&card].context.diagnostics.is_empty());
-        drop(app.update(publish(2)));
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
-            unreachable!()
-        };
-        assert!(runtime.diagnostic_navigation_available());
-        assert_eq!(app.lsp_contexts[&card].diagnostics_version, Some(2));
+        for (original, published_version, preserves) in [
+            ("first\nerror\r", 1, false),
+            ("first\nerror\n", 0, false),
+            ("first\nerror\n", 1, true),
+        ] {
+            let mut app = lsp_test_app();
+            app.lsp = LspManager::new(AppSettings::default().language_servers);
+            let card = repository_card(&mut app, "/repo");
+            let (runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", original);
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+            drop(app.drain_lsp_intents(card));
+            let doc = app.lsp_document(card).unwrap();
+            assert_eq!(app.lsp.document_version(doc), Some(1));
+            let publish = |version| {
+                Message::Lsp(LspEvent::Diagnostics {
+                    doc,
+                    version,
+                    items: vec![diagnostic("standing error")],
+                })
+            };
+            drop(app.update(publish(1)));
+            // A manager reopen can advance beyond the standing publication before
+            // the next edit. Its old coordinates must not become current again.
+            app.lsp_contexts.get_mut(&card).unwrap().diagnostics_version = Some(published_version);
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+                unreachable!()
+            };
+            runtime.move_cursor_to(LspPosition::new(0, 0));
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("\n".into()),
+                )),
+            }));
+            drop(app.drain_lsp_intents(card));
+            assert_eq!(app.lsp.document_version(doc), Some(2));
+            assert_eq!(
+                app.lsp_contexts[&card].context.diagnostics.is_empty(),
+                !preserves
+            );
+            assert_eq!(
+                app.lsp_contexts[&card].diagnostics_version,
+                preserves.then_some(2)
+            );
+            if preserves {
+                assert_eq!(
+                    app.lsp_contexts[&card].context.diagnostics[0].range.start,
+                    LspPosition::new(1, 0)
+                );
+            }
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert_eq!(runtime.diagnostic_navigation_available(), preserves);
+            // A late publication cannot reinstall marks for the old coordinates.
+            drop(app.update(publish(1)));
+            assert_eq!(
+                app.lsp_contexts[&card].context.diagnostics.is_empty(),
+                !preserves
+            );
+            drop(app.update(publish(2)));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert!(runtime.diagnostic_navigation_available());
+            assert_eq!(app.lsp_contexts[&card].diagnostics_version, Some(2));
+        }
     }
 
     #[test]

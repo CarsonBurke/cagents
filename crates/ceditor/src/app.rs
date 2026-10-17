@@ -7027,63 +7027,80 @@ mod tests {
             .build()
             .unwrap();
         let _entered = executor.enter();
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("a.rs"), "first\nerror\r").unwrap();
-        let mut app = editor();
-        app.language_server_assistance = true;
-        app.lsp = LspManager::new(app.settings.language_servers.clone());
-        let id = add(&mut app, directory.path().to_str().unwrap(), Some("a.rs"));
-        file_loaded(&mut app, id, directory.path(), "a.rs");
-        let doc = app.tab(id).unwrap().runtime.lsp_document().unwrap();
-        let generation = app.lsp.generation();
-        let publish = |version| {
-            Message::Lsp(
-                generation,
-                Some(LspEvent::Diagnostics {
-                    doc,
-                    version,
-                    items: vec![LspDiagnostic::new(
-                        LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 5)),
-                        LspSeverity::Error,
-                        "standing error".into(),
-                        None,
-                        None,
-                    )],
-                }),
-            )
-        };
-        drop(app.update(publish(1)));
-        app.tab_mut(id)
-            .unwrap()
-            .runtime
-            .move_cursor_to(LspPosition::new(0, 0));
-        drop(
-            app.update(Message::Repository(RepositoryAction::EditorAction {
-                card: id,
-                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
-                    Arc::new("\n".into()),
-                )),
-            })),
-        );
-        assert_eq!(app.lsp.document_version(doc), Some(2));
-        assert!(app.tab(id).unwrap().diagnostics.is_empty());
-        assert_eq!(app.tab(id).unwrap().diagnostics_version, None);
-        assert!(
-            !app.tab(id)
+        for (original, published_version, preserves) in [
+            ("first\nerror\r", 1, false),
+            ("first\nerror\n", 0, false),
+            ("first\nerror\n", 1, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("a.rs"), original).unwrap();
+            let mut app = editor();
+            app.language_server_assistance = true;
+            app.lsp = LspManager::new(app.settings.language_servers.clone());
+            let id = add(&mut app, directory.path().to_str().unwrap(), Some("a.rs"));
+            file_loaded(&mut app, id, directory.path(), "a.rs");
+            let doc = app.tab(id).unwrap().runtime.lsp_document().unwrap();
+            let generation = app.lsp.generation();
+            let publish = |version| {
+                Message::Lsp(
+                    generation,
+                    Some(LspEvent::Diagnostics {
+                        doc,
+                        version,
+                        items: vec![LspDiagnostic::new(
+                            LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 5)),
+                            LspSeverity::Error,
+                            "standing error".into(),
+                            None,
+                            None,
+                        )],
+                    }),
+                )
+            };
+            drop(app.update(publish(1)));
+            app.tab_mut(id).unwrap().diagnostics_version = Some(published_version);
+            app.tab_mut(id)
                 .unwrap()
                 .runtime
-                .diagnostic_navigation_available()
-        );
-        drop(app.update(publish(1)));
-        assert!(app.tab(id).unwrap().diagnostics.is_empty());
-        drop(app.update(publish(2)));
-        assert!(
-            app.tab(id)
-                .unwrap()
-                .runtime
-                .diagnostic_navigation_available()
-        );
-        assert!(app.diagnostics_are_current(id));
+                .move_cursor_to(LspPosition::new(0, 0));
+            drop(
+                app.update(Message::Repository(RepositoryAction::EditorAction {
+                    card: id,
+                    action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                        Arc::new("\n".into()),
+                    )),
+                })),
+            );
+            assert_eq!(app.lsp.document_version(doc), Some(2));
+            assert_eq!(app.tab(id).unwrap().diagnostics.is_empty(), !preserves);
+            assert_eq!(
+                app.tab(id).unwrap().diagnostics_version,
+                preserves.then_some(2)
+            );
+            if preserves {
+                assert_eq!(
+                    app.tab(id).unwrap().diagnostics[0].range.start,
+                    LspPosition::new(2, 0)
+                );
+            }
+            assert_eq!(
+                app.tab(id)
+                    .unwrap()
+                    .runtime
+                    .diagnostic_navigation_available(),
+                preserves
+            );
+            drop(app.update(publish(1)));
+            assert_eq!(app.tab(id).unwrap().diagnostics.is_empty(), !preserves);
+            drop(app.update(publish(2)));
+            assert!(
+                app.tab(id)
+                    .unwrap()
+                    .runtime
+                    .diagnostic_navigation_available()
+            );
+            assert!(app.diagnostics_are_current(id));
+        }
     }
 
     #[test]
