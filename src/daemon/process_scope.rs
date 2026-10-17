@@ -43,10 +43,21 @@ pub(crate) fn enroll_holder() -> io::Result<()> {
 /// Enroll an unreaped owned provider before its first prompt is submitted.
 /// The caller keeps the Child alive until this operation has completed.
 pub(crate) fn enroll_process(pid: u32) -> io::Result<()> {
+    enroll_process_as(pid, "cagents-session")
+}
+
+/// Upgrade launchers must retain their inherited admission descriptor, which
+/// systemd-run cannot forward. Move the admitted daemon itself before it takes
+/// the inventory lease or restores any conversation, preserving that authority.
+pub(crate) fn enroll_daemon() -> io::Result<()> {
+    enroll_process_as(std::process::id(), "cagentsd")
+}
+
+fn enroll_process_as(pid: u32, prefix: &str) -> io::Result<()> {
     if !manager_available() {
         return Ok(());
     }
-    let unit = format!("cagents-session-{}.scope", uuid::Uuid::new_v4());
+    let unit = format!("{prefix}-{}.scope", uuid::Uuid::new_v4());
     let mut command = Command::new("busctl");
     command
         .env("XDG_RUNTIME_DIR", manager_runtime())
@@ -205,6 +216,27 @@ pub(crate) fn warn_if_bootstrap_shared(root: u32) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn daemon_enrollment_uses_an_independent_user_scope() {
+        const CHILD: &str = "CAGENTS_DAEMON_SCOPE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            enroll_daemon().unwrap();
+            let membership = cgroup(std::process::id()).unwrap();
+            let unit = membership.rsplit('/').next().unwrap();
+            assert!(
+                unit.starts_with("cagentsd-") && unit.ends_with(".scope"),
+                "{membership}"
+            );
+            return;
+        }
+        if !manager_available() {
+            return;
+        }
+        assert!(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "daemon::process_scope::tests::daemon_enrollment_uses_an_independent_user_scope", "--nocapture"])
+            .env(CHILD, "1").status().unwrap().success());
+    }
+
     #[test]
     fn rejected_scope_request_preserves_fallback() {
         let error = enroll_with(

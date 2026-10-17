@@ -73,7 +73,13 @@ pub(super) fn perform(
     root: &Path,
 ) -> Result<(), UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
-    if served_version_root(&layout)? != root || root == layout.version_root {
+    let (source_protocol, source_proof) = source::inspect_identity(None)?;
+    // Never move a same-namespace service owned by another installation.
+    let _source_owner = installed_daemon_owner(&layout)?;
+    let legacy_source = source_proof.is_some()
+        && source_protocol == 77
+        && crate::terminal_ipc::PROTOCOL_VERSION > 77;
+    if served_version_root(&layout)? != root || (root == layout.version_root && !legacy_source) {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
@@ -110,7 +116,7 @@ pub(super) fn perform(
         }
         staged.preview(policy)
     };
-    if staged.identity.protocol == crate::terminal_ipc::PROTOCOL_VERSION {
+    if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
     let confirmed = confirmation::wait(state, job, observe)?;
@@ -121,7 +127,34 @@ pub(super) fn perform(
         "Saving and closing application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    let windows = guard.prepare_and_close_windows(Duration::from_secs(45))?;
+    crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
+    let before_close = observe(
+        confirmed
+            .daemon
+            .as_ref()
+            .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
+    )?;
+    validate_before_close(&confirmed, &before_close)?;
+    let windows =
+        guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+            crate::install_guard::preflight_source_panes(
+                guard,
+                confirmed
+                    .daemon
+                    .as_ref()
+                    .map(|daemon| daemon.capability.proof.clone()),
+                confirmed.replaces_daemon,
+            )?;
+            let latest = observe(
+                confirmed
+                    .daemon
+                    .as_ref()
+                    .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
+            )
+            .map_err(io::Error::other)?;
+            validate_before_close(&confirmed, &latest).map_err(io::Error::other)
+        })?;
+    let mut startup_pending = false;
     let result = (|| {
         let current = observe(
             confirmed
@@ -135,9 +168,10 @@ pub(super) fn perform(
             ));
         }
         if let Some(daemon) = current.daemon {
+            crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
             let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client = crate::control::ControlClient::connect(&socket)
-                .map_err(|error| invalid(error.to_string()))?;
+            let mut client =
+                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -153,25 +187,38 @@ pub(super) fn perform(
             root.join("bin")
                 .join(crate::companion::Product::Cli.file_name()),
         );
-        command.args(["--json", "daemon", "start"]);
+        command
+            .args(["--json", "daemon", "start"])
+            .stderr(Stdio::null());
         guard.inherit_for_install(&mut command)?;
-        let started = bounded_command(
+        let started = crate::install_guard::wait_daemon_start(
             &mut command,
-            "installed daemon startup",
-            SMALL_ASSET_LIMIT,
-            Duration::from_secs(30),
-            &cancellation,
+            crate::install_guard::daemon_start_timeout()?,
         );
+        startup_pending = started
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut);
+        if crate::daemon::running_executable().map_err(|error| invalid(error.to_string()))?
+            != Some(root.join("bin/cagentsd"))
+        {
+            return Err(invalid(
+                "The terminal service does not belong to the confirmed installation; retained the saved panes and recovery state. Check `cagents daemon status` before retrying",
+            ));
+        }
         if let Err(error) = started {
             if !staged.daemon_running(&cancellation).unwrap_or(false) {
-                return Err(error);
+                return Err(error.into());
             }
         }
         Ok(())
     })();
     // Only the confirmed installation may be relaunched. If another installer
     // moved current during failure recovery, retain the old matched executable.
-    let reopen = if result.is_ok() {
+    let successor_owns_runtime = crate::daemon::running_executable()
+        .map_err(|error| invalid(error.to_string()))?
+        .is_some_and(|executable| executable == root.join("bin/cagentsd"));
+    let reopen = if result.is_ok() || successor_owns_runtime || startup_pending {
         root.to_owned()
     } else {
         installation

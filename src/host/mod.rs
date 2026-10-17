@@ -179,6 +179,11 @@ pub fn run_automation_helper() -> Option<Result<(), String>> {
     automations::helper_entry()
 }
 
+mod upgrade_inspect;
+pub fn run_upgrade_inspection_helper() -> Option<Result<(), String>> {
+    upgrade_inspect::entry()
+}
+
 /// Holds launch exclusion until the daemon listener is ready.
 pub struct DaemonAdmission {
     _guard: crate::instance::DaemonAdmissionGuard,
@@ -190,7 +195,16 @@ pub struct DaemonAdmission {
 /// Call from the single-threaded entry point: this clears inherited authority
 /// markers so later terminal children cannot inherit a consumed descriptor.
 pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
+    let inherited = crate::instance::has_inherited_daemon_fence()?;
     let admission = crate::instance::DaemonAdmissionGuard::acquire()?;
+    if inherited {
+        // The fence requires direct exec instead of systemd-run. A process
+        // group alone does not protect restoration from the old UI's cgroup
+        // teardown. Verify an independent daemon scope before starting owners.
+        crate::daemon::process_scope::enroll_daemon().map_err(|error| {
+            io::Error::other(format!("cannot isolate the upgrade successor before restoration: {error}; recovery checkpoint retained"))
+        })?;
+    }
     // SAFETY: the caller guarantees that no other thread accesses environment.
     unsafe {
         std::env::remove_var(crate::instance::DAEMON_FENCE_ENV);

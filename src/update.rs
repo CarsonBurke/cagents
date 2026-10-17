@@ -3,6 +3,7 @@
 mod candidate;
 mod confirmation;
 mod installed;
+pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
 pub mod impact;
 use std::{
@@ -414,7 +415,10 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
-    if served == layout.version_root && !daemon_protocol_mismatch() {
+    // Discovery is upgrade-specific and bounded across the entire handshake.
+    // Do not run the ordinary per-read version probe before this adapter.
+    let (source_protocol, source_proof) = source::inspect_identity(None)?;
+    if served == layout.version_root && source_protocol == crate::terminal_ipc::PROTOCOL_VERSION {
         return Err(invalid("the installed application is already running"));
     }
     if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
@@ -423,14 +427,25 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
         ));
     }
     // A newly opened UI may already be current while an older daemon still
-    // owns the sessions. Its own CLI must perform the preview and checkpoint.
-    installation.version =
-        installation_worker_version(&layout, &served, installed_daemon_owner(&layout)?.as_ref());
-    if served
-        == installation
-            .prefix
-            .join("versions")
-            .join(&installation.version)
+    // owns the sessions. Route the authenticated source to its qualified coordinator.
+    let daemon_owner = installed_daemon_owner(&layout)?;
+    let new_coordinator_for_legacy_source = source_proof.is_some()
+        && source_protocol == 77
+        && crate::terminal_ipc::PROTOCOL_VERSION > 77;
+    // An unpatched77 owner CLI cannot run the newly installed pane inspector
+    // or source adapter. The new matched set owns this explicit migration.
+    installation.version = installation_worker_version(
+        &layout,
+        &served,
+        daemon_owner.as_ref(),
+        new_coordinator_for_legacy_source,
+    );
+    if !new_coordinator_for_legacy_source
+        && served
+            == installation
+                .prefix
+                .join("versions")
+                .join(&installation.version)
     {
         return Err(invalid("the installed application is already running"));
     }
@@ -450,7 +465,11 @@ fn installation_worker_version(
     window: &InstallLayout,
     served: &Path,
     daemon: Option<&InstallLayout>,
+    new_coordinator_for_legacy_source: bool,
 ) -> String {
+    if new_coordinator_for_legacy_source {
+        return window.version.clone();
+    }
     // Once the candidate already owns the daemon, the old window's worker
     // must perform the remaining UI-only replacement. A current worker would
     // correctly reject replacing its own installation with itself.
@@ -981,7 +1000,8 @@ fn perform_update(
     )?;
     verify_digest(&mut archive, &archive_hash)?;
     let staged = candidate::Staged::from_archive(&release, &archive, &archive_hash, &cancellation)?;
-    if staged.identity.protocol == crate::terminal_ipc::PROTOCOL_VERSION {
+    let (source_protocol, _) = source::inspect_identity(None)?;
+    if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
     let confirmed = confirmation::wait(state, job, |policy| {
@@ -995,7 +1015,35 @@ fn perform_update(
         "Saving and closing all application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    let windows = guard.prepare_and_close_windows(Duration::from_secs(45))?;
+    crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
+    let before_close = observe_impact(
+        &staged.identity,
+        confirmed
+            .daemon
+            .as_ref()
+            .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
+    )?;
+    validate_before_close(&confirmed, &before_close)?;
+    let windows =
+        guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+            crate::install_guard::preflight_source_panes(
+                guard,
+                confirmed
+                    .daemon
+                    .as_ref()
+                    .map(|daemon| daemon.capability.proof.clone()),
+                confirmed.replaces_daemon,
+            )?;
+            let latest = observe_impact(
+                &staged.identity,
+                confirmed
+                    .daemon
+                    .as_ref()
+                    .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
+            )
+            .map_err(io::Error::other)?;
+            validate_before_close(&confirmed, &latest).map_err(io::Error::other)
+        })?;
     let install_result = (|| {
         Installation::detect()?;
         let current = observe_impact(
@@ -1011,9 +1059,10 @@ fn perform_update(
             ));
         }
         if let Some(daemon) = current.daemon {
+            crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
             let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client = crate::control::ControlClient::connect(&socket)
-                .map_err(|error| invalid(error.to_string()))?;
+            let mut client =
+                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -1045,12 +1094,167 @@ fn perform_update(
     reopen_result
 }
 
+/// Revalidate before the first irreversible window close, rather than finding
+/// a migration blocker only after every source pane is no longer usable.
+fn validate_before_close(
+    confirmed: &impact::Preview,
+    current: &impact::Preview,
+) -> Result<(), UpdateError> {
+    if !confirmed.preserves_consent(current)
+        || current
+            .daemon
+            .as_ref()
+            .is_some_and(|daemon| !daemon.ready())
+    {
+        return Err(invalid(
+            "Session migration or ownership changed; the existing windows were kept open. Review the update again",
+        ));
+    }
+    Ok(())
+}
+
+/// Invoke only the matched host implementation: SQLite stays out of the CLI
+/// graph, and an older helper must refuse its unknown option before admission.
+pub(crate) fn inspect_source_panes(
+    guard: &crate::instance::UiUpdateGuard,
+    proof: Option<crate::model::HostSessionProof>,
+    require_resumable: bool,
+) -> Result<(), UpdateError> {
+    let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
+    let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
+    let before = fs::symlink_metadata(&helper)?;
+    if !before.is_file()
+        || !crate::install_guard::trusted_executable_owner(before.uid())
+        || before.mode() & 0o022 != 0
+    {
+        return Err(invalid(
+            "The matched source inspector is unavailable; source windows remain usable",
+        ));
+    }
+    let request = crate::install_guard::SourceInspectionRequest {
+        protocol,
+        proof,
+        require_resumable,
+    };
+    let mut command = Command::new(&helper);
+    crate::install_guard::sanitize_child_environment(&mut command);
+    command.args([
+        "--inspect-upgrade-source",
+        &serde_json::to_string(&request)?,
+    ]);
+    guard.inherit_for_install(&mut command)?;
+    let mut output = bounded_command(
+        &mut command,
+        "source pane inspection (windows remain open)",
+        16 * 1024,
+        Duration::from_secs(35),
+        &CancellationToken::new(),
+    )?;
+    let after = fs::symlink_metadata(helper)?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        return Err(invalid(
+            "The source inspector changed during inspection; source windows remain usable",
+        ));
+    }
+    let result: Result<(), String> = serde_json::from_reader(&mut output)?;
+    result.map_err(invalid)?;
+    let (current_protocol, current_proof) = source::inspect_identity(request.proof.as_ref())?;
+    if current_protocol != request.protocol || current_proof != request.proof {
+        return Err(invalid(
+            "Source ownership changed during pane inspection; source windows remain usable",
+        ));
+    }
+    Ok(())
+}
+
+/// Probe only a fixed, owned companion beside an authenticated editor process.
+/// No daemon startup command or inherited installer authority is passed.
+pub(crate) fn companion_protocol(executable: &Path) -> Result<u16, UpdateError> {
+    let envelope = companion_read(executable, &["--json", "daemon", "protocol-version"], None)?;
+    envelope
+        .get("data")
+        .and_then(|data| data.get("protocol_version"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .filter(|version| *version > 0)
+        .ok_or_else(|| invalid("Ceditor's companion did not report a valid protocol"))
+}
+
+pub(crate) fn companion_namespace(executable: &Path) -> Result<String, UpdateError> {
+    // `daemon status` reports the compiled instance even when stopped. Give it
+    // a fresh nonexistent runtime, so it cannot contact production or start a
+    // service. This also works with older unmarked companion sets.
+    let isolated = std::env::temp_dir().join(format!(
+        "cagents-namespace-inspect-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let envelope = companion_read(executable, &["--json", "daemon", "status"], Some(&isolated))?;
+    match envelope
+        .get("data")
+        .and_then(|data| data.get("instance"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(instance @ ("production" | "development")) => Ok(instance.into()),
+        _ => Err(invalid(
+            "Ceditor's companion has no verifiable application instance",
+        )),
+    }
+}
+
+fn companion_read(
+    executable: &Path,
+    arguments: &[&str],
+    runtime: Option<&Path>,
+) -> Result<serde_json::Value, UpdateError> {
+    let before = fs::symlink_metadata(executable)?;
+    if !before.is_file()
+        || !crate::install_guard::trusted_executable_owner(before.uid())
+        || before.mode() & 0o022 != 0
+    {
+        return Err(invalid("Ceditor's companion is not an owned executable"));
+    }
+    let mut command = Command::new(executable);
+    crate::install_guard::sanitize_child_environment(&mut command);
+    command.args(arguments);
+    if let Some(runtime) = runtime {
+        command.env("XDG_RUNTIME_DIR", runtime);
+    }
+    let mut output = bounded_command(
+        &mut command,
+        "editor companion protocol check",
+        SMALL_ASSET_LIMIT,
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )?;
+    let after = fs::symlink_metadata(executable)?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.uid() != after.uid()
+        || before.mode() != after.mode()
+    {
+        return Err(invalid("Ceditor's companion changed during preflight"));
+    }
+    Ok(serde_json::from_reader(&mut output)?)
+}
+
 fn observe_impact(
     candidate: &impact::Candidate,
     policy: impact::Policy,
 ) -> Result<impact::Preview, UpdateError> {
     let socket = crate::terminal_ipc::daemon_socket_path()?;
-    let mut client = match crate::control::ControlClient::connect(&socket) {
+    let mut client = match source::Client::connect(&socket) {
         Ok(client) => Some(client),
         Err(crate::control::ControlError::Connect(error))
             if matches!(
@@ -1071,8 +1275,9 @@ fn observe_impact(
         }
         Err(error) => return Err(invalid(error.to_string())),
     };
-    let replaces_daemon =
-        client.is_some() && candidate.protocol != crate::terminal_ipc::PROTOCOL_VERSION;
+    let replaces_daemon = client
+        .as_ref()
+        .is_some_and(|client| candidate.protocol != client.protocol());
     let daemon = if replaces_daemon {
         Some(
             client
@@ -1676,6 +1881,65 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 mod tests {
 
     #[test]
+    fn preclose_gate_refuses_changed_migration_before_window_shutdown() {
+        let confirmed = impact::Preview {
+            candidate: impact::Candidate {
+                version: "next".into(),
+                protocol: 77,
+                digest: "verified".into(),
+            },
+            replaces_daemon: false,
+            daemon: None,
+        };
+        assert!(validate_before_close(&confirmed, &confirmed).is_ok());
+        let mut changed = confirmed.clone();
+        changed.candidate.digest = "replaced".into();
+        assert!(validate_before_close(&confirmed, &changed).is_err());
+        let mut blocked = confirmed;
+        blocked.daemon = Some(impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("source"),
+                    boot_id: crate::model::BootId::new("boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("owner"),
+                },
+                token: "token".into(),
+                inventory_generation: 1,
+                live_terminals: 1,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: 1,
+            },
+            policy: impact::Policy::WhenIdle,
+            sessions: vec![],
+            blockers: vec!["saved pane needs migration".into()],
+        });
+        assert!(validate_before_close(&blocked, &blocked).is_err());
+    }
+
+    #[test]
+    fn editor_namespace_probe_is_offline_and_does_not_use_the_real_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("cagents");
+        fs::write(&executable, "#!/bin/sh\n[ \"$*\" = '--json daemon status' ] || exit 42\n[ ! -e \"$XDG_RUNTIME_DIR\" ] || exit 43\nprintf '%s\\n' '{\"data\":{\"instance\":\"development\",\"running\":false}}'\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(companion_namespace(&executable).unwrap(), "development");
+    }
+
+    #[test]
+    fn editor_protocol_probe_is_informational_and_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("cagents");
+        fs::write(&executable, "#!/bin/sh\n[ \"$*\" = '--json daemon protocol-version' ] || exit 42\nprintf '%s\\n' '{\"data\":{\"protocol_version\":56}}'\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(companion_protocol(&executable).unwrap(), 56);
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(companion_protocol(&executable).is_err());
+    }
+
+    #[test]
     fn streaming_capture_failure_cleans_fresh_original_before_returning_error() {
         let child = Command::new("/bin/sleep")
             .arg("30")
@@ -2090,24 +2354,30 @@ sys.exit(7)
         let new = layout("new");
         // A newer UI cannot speak the old service's protocol.
         assert_eq!(
-            installation_worker_version(&new, &new.version_root, Some(&old)),
+            installation_worker_version(&new, &new.version_root, Some(&old), false),
             "old"
+        );
+        // The explicit protocol-77 adapter and pane inspector live in the new
+        // coordinator; delegating back to the unpatched source loses both.
+        assert_eq!(
+            installation_worker_version(&new, &new.version_root, Some(&old), true),
+            "new"
         );
         // Once that service is already new, the old UI still needs replacement:
         // selecting the new worker would reject its candidate as itself.
         assert_eq!(
-            installation_worker_version(&old, &new.version_root, Some(&new)),
+            installation_worker_version(&old, &new.version_root, Some(&new), false),
             "old"
         );
         // Repeated staging must use the actual owner, not the window or current.
         let staged = layout("third");
         assert_eq!(
-            installation_worker_version(&old, &staged.version_root, Some(&new)),
+            installation_worker_version(&old, &staged.version_root, Some(&new), false),
             "new"
         );
         // Without a service, the old window's worker can start the candidate.
         assert_eq!(
-            installation_worker_version(&old, &new.version_root, None),
+            installation_worker_version(&old, &new.version_root, None, false),
             "old"
         );
     }
