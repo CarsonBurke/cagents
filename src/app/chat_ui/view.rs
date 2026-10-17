@@ -1874,7 +1874,7 @@ impl Runtime {
             .width(Length::Fill)
             .into()
         } else {
-            // Up on a draft's first line starts browsing sent messages.
+            // Up first asks the native editor to resolve its rendered rows.
             // While browsing, both arrows walk whole history entries so a
             // multiline recalled prompt cannot trap the original draft.
             let (recall_older, recall_newer) = self.history_navigation();
@@ -1972,7 +1972,7 @@ impl Runtime {
                     }
                     if let Some(older) = history_key(&press, recall_older, recall_newer) {
                         return Some(text_editor::Binding::Custom(action(if older {
-                            Action::HistoryOlder(target)
+                            Action::ComposerUp(target)
                         } else {
                             Action::HistoryNewer(target)
                         })));
