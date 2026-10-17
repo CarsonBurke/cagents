@@ -158,6 +158,9 @@ impl Drop for ScriptedDaemon {
 
 fn settle(app: &mut Cagents, task: Task<Message>) {
     use cosmic::iced::futures::StreamExt;
+    // Renderer initialization owns an executor. Build it before entering the
+    // task executor; widget effects must not start a nested Tokio runtime.
+    let renderer = crate::app::tests::headless_renderer();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -183,7 +186,6 @@ fn settle(app: &mut Cagents, task: Task<Message>) {
                             Layout, layout,
                             widget::{Tree, operation::Outcome},
                         };
-                        let renderer = crate::app::tests::headless_renderer();
                         let mut element = cosmic::Application::view(app);
                         let mut tree = Tree::new(element.as_widget());
                         let node = element.as_widget_mut().layout(
