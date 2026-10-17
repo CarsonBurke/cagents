@@ -104,3 +104,56 @@ fn earlier_history_refuses_changed_session_and_can_retry_the_original_source() {
     ));
     assert!(earlier.events.iter().any(|event| matches!(event, Event::History { items, .. } if items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 0")))));
 }
+
+#[test]
+fn initialize_refuses_a_changed_off_page_tool_dependency() {
+    let mut fixture = Fixture::new();
+    let mut frames: Vec<Value> = String::from_utf8(fixture.bytes.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    frames[0]["type"] = json!("assistant");
+    frames[0]["message"] = json!({"role":"assistant","content":[{"type":"tool_use","id":"old-call","name":"Read","input":{"file_path":"/original"}}]});
+    frames[129]["message"] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"old-call","content":"original result"}]});
+    fixture.bytes.clear();
+    for frame in frames {
+        writeln!(fixture.bytes, "{frame}").unwrap();
+    }
+    std::fs::write(&fixture.path, &fixture.bytes).unwrap();
+    let (_, mut adapter) = create(&fixture.launch).unwrap();
+    // The first record is outside the newest 100-row page, but its tool call
+    // must be loaded to interpret the result in that page.
+    let replacement =
+        String::from_utf8(fixture.bytes.clone())
+            .unwrap()
+            .replacen(SESSION, OTHER_SESSION, 1);
+    assert_eq!(replacement.len(), fixture.bytes.len());
+    std::fs::write(&fixture.path, replacement).unwrap();
+    let error = adapter
+        .initialize()
+        .err()
+        .expect("foreign off-page tool dependency must be refused");
+    assert!(error.contains("session identity"), "{error}");
+}
+
+#[test]
+fn legacy_history_without_record_session_ids_remains_readable() {
+    let fixture = Fixture::new();
+    let mut bytes = Vec::new();
+    for line in String::from_utf8(fixture.bytes.clone()).unwrap().lines() {
+        let mut frame: Value = serde_json::from_str(line).unwrap();
+        frame.as_object_mut().unwrap().remove("sessionId");
+        writeln!(bytes, "{frame}").unwrap();
+    }
+    std::fs::write(&fixture.path, bytes).unwrap();
+    let (_, mut adapter) = create(&fixture.launch).unwrap();
+    let initial = adapter.initialize().unwrap();
+    assert!(initial.events.iter().any(
+        |event| matches!(event, Event::History { items, has_earlier: true } if items.len() == 100)
+    ));
+    let earlier = adapter.command(Command::LoadEarlier).unwrap();
+    assert!(earlier.events.iter().any(
+        |event| matches!(event, Event::History { items, has_earlier: false } if items.len() == 30)
+    ));
+}
