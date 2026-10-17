@@ -12746,6 +12746,57 @@ mod tests {
     }
 
     #[test]
+    fn native_composer_up_uses_native_layout_at_different_font_sizes() {
+        use iced::advanced::{layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        // The app currently fixes the composer to TEXT_PROSE; there is no
+        // chat-font setting to vary. Exercise the native field's supported
+        // size API against the same Content and controller, in addition to
+        // the full chat-view key-binding regressions above.
+        for font_size in [13.0, 23.0] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("font-size-history"));
+            let draft = "Unicode café 🦀 日本語 remains a draft while moving through native rows. "
+                .repeat(12);
+            write(&mut app, card, &draft);
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.history = vec!["previous prompt".into()];
+            runtime
+                .composer
+                .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+            {
+                let mut field: iced::Element<'_, Message, cosmic::Theme, cosmic::Renderer> =
+                    crate::ui_controls::field::editor("Message", &runtime.composer)
+                        .size(font_size)
+                        .on_action(move |event| Message::ChatUi(Action::Composer(target, event)))
+                        .into();
+                let mut tree = Tree::new(field.as_widget());
+                let _ = field.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 200.0)),
+                );
+            }
+            let before = chat_runtime(&app, card).composer.cursor();
+            drop(app.update(Message::ChatUi(Action::ComposerUp(target))));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), draft);
+            assert_ne!(runtime.composer.cursor(), before);
+            assert_eq!(runtime.history_cursor, None);
+
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .composer
+                .perform(text_editor::Action::Move(
+                    text_editor::Motion::DocumentStart,
+                ));
+            drop(app.update(Message::ChatUi(Action::ComposerUp(target))));
+            assert_eq!(chat_runtime(&app, card).composer.text(), "previous prompt");
+        }
+    }
+
+    #[test]
     fn multiline_prompt_history_restores_the_exact_unsent_draft_and_attachments() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("history"));
