@@ -375,7 +375,7 @@ fn native_transaction_phases_preserve_current_and_fast_forward_checkouts() {
         let verified = fixture.apply(&plan).unwrap();
         assert_eq!(verified.head(), &expected);
         let phases = fs::read_to_string(fixture.root.join(".git/observed-phases")).unwrap();
-        println!("actual native transaction phases (advance={advance}): {phases}");
+        eprintln!("actual native transaction phases (advance={advance}): {phases}");
         assert!(phases.lines().any(|phase| phase == "probe:prepared"));
         // Earlier Git versions emit no preparing notification. When native
         // Git emits it, retain proof that symbolic HEAD was still unresolved.
@@ -489,7 +489,7 @@ fn native_prepared_config_guard_still_refuses_after_policy_edits() {
     let fixture = Fixture::new(true);
     let expected = fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap());
     let policy = fixture.root.join(".git/hooks/reference-transaction");
-    fs::write(&policy, "#!/bin/sh\n/bin/cat >/dev/null\nif [ \"$1\" = prepared ]; then printf '\\n[fixture]\\n concurrent = retained\\n' >> \"$CAGENTS_PR_WORKTREE/.git/config\"; fi\n").unwrap();
+    fs::write(&policy, "#!/bin/sh\n/bin/cat >/dev/null\nif [ \"${CAGENTS_PR_MODE:-}\" = effect ] && [ \"$1\" = prepared ]; then printf '\\n[fixture]\\n concurrent = retained\\n' >> \"$CAGENTS_PR_WORKTREE/.git/config\"; fi\n").unwrap();
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o700)).unwrap();
     let plan = fixture.prepare(&fixture.request(expected));
     observe_transaction_phases(&fixture);
