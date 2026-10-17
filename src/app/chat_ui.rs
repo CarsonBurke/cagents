@@ -11758,11 +11758,12 @@ mod tests {
     #[test]
     fn account_picker_keyboard_reaches_manage_accounts_and_activates_it() {
         use crate::workspace_widget::GlobalShortcut;
-        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
-        use cosmic::iced::{Event, Rectangle, Size};
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Size, futures::StreamExt, mouse};
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.account_ui.add_managed_fixture(Provider::Codex, 22);
-        let renderer = crate::app::tests::headless_renderer();
+        let mut renderer = crate::app::tests::headless_renderer();
         let card = draft_chat(&mut app);
         drop(app.open_chat_control(GlobalShortcut::ChatAccount));
         let press = |key, code| keyboard::Event::KeyPressed {
@@ -11791,49 +11792,50 @@ mod tests {
         assert_eq!(chat_runtime(&app, card).picker_focus, choices);
         assert!(app.chat_picker_key(&down).is_some());
         assert_eq!(chat_runtime(&app, card).picker_focus, 0);
+        let mut navigation = None;
         for _ in 0..choices {
-            assert!(app.chat_picker_key(&down).is_some());
+            navigation = Some(app.chat_picker_key(&down).expect("next account control"));
         }
         assert_eq!(chat_runtime(&app, card).picker_focus, choices);
         let mut messages = Vec::new();
         {
-            let mut element = app.chat_view(card);
-            let mut tree = Tree::new(element.as_widget());
-            let viewport = Rectangle::with_size(Size::new(320.0, 600.0));
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
+            let mut ui = UserInterface::build(
+                app.chat_view(card),
+                Size::new(320.0, 600.0),
+                Cache::new(),
+                &mut renderer,
             );
-            let mut overlay = element
-                .as_widget_mut()
-                .overlay(
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                    &viewport,
-                    iced::Vector::ZERO,
+            // At compact widths the account menu is nested inside More.
+            // UserInterface traverses those live overlays when applying the
+            // actual arrow-navigation task and dispatching Enter.
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            executor.block_on(async {
+                let mut stream = cosmic::iced::runtime::task::into_stream(
+                    navigation.expect("the account ring has a next control"),
                 )
-                .expect("account menu overlay");
-            let popup = overlay.as_overlay_mut().layout(&renderer, viewport.size());
-            overlay.as_overlay_mut().operate(
-                Layout::new(&popup),
-                &renderer,
-                &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
-                    card,
-                    "chat-manage-accounts",
-                )),
-            );
-            overlay.as_overlay_mut().update(
-                &Event::Keyboard(press(
+                .expect("navigation produces a widget operation");
+                let mut applied = false;
+                while let Ok(Some(cosmic::iced::runtime::Action::Widget(mut operation))) =
+                    tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+                {
+                    ui.operate(&renderer, operation.as_mut());
+                    applied = true;
+                }
+                assert!(applied, "apply the native account-navigation operation");
+            });
+            executor.shutdown_background();
+            ui.update(
+                &[Event::Keyboard(press(
                     keyboard::key::Named::Enter,
                     keyboard::key::Code::Enter,
-                )),
-                Layout::new(&popup),
+                ))],
                 mouse::Cursor::Unavailable,
-                &renderer,
+                &mut renderer,
                 &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
+                &mut messages,
             );
         }
         assert!(messages.iter().any(|message| matches!(
