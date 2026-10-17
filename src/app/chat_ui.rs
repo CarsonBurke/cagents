@@ -161,6 +161,7 @@ pub enum Action {
     Ready(Target, Ready),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
+    RetainedCopyCommitted(CardId, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
     /// stopped holding it: a closed card, an abandoned start, or a start that
     /// finished for a card which could no longer hold it.
@@ -321,6 +322,7 @@ impl Action {
             Self::Ready(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
+                | Self::RetainedCopyCommitted(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
@@ -419,6 +421,8 @@ struct Attempt {
     session: chat::Session,
     recovery: Option<AccountRecovery>,
     upgrade_committed: bool,
+    /// Exact authoritative target; only authenticated upgrade resolution may bind its draft.
+    upgrade_admission: Option<chat::Session>,
 }
 
 struct LocalReturn {
@@ -3983,6 +3987,7 @@ impl Cagents {
                 target,
                 session: replacement.clone(),
                 upgrade_committed: false,
+                upgrade_admission: None,
                 recovery: Some(AccountRecovery {
                     source: source.clone(),
                     committed: false,
@@ -4355,7 +4360,19 @@ impl Cagents {
         if agent_updates != self.durable.agent_updates {
             Arc::make_mut(&mut self.durable).agent_updates = agent_updates;
         }
+        let admission_sources = self
+            .chat_ui
+            .phases
+            .iter()
+            .filter_map(|(card, phase)| match phase {
+                Phase::Starting(attempt) if attempt.upgrade_admission.is_some() => {
+                    Some((*card, &attempt.session))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         if defaults.is_empty()
+            && admission_sources.is_empty()
             && chat_drafts == self.durable.chat_drafts
             && repository_navigation == self.durable.repository_navigation
         {
@@ -4364,6 +4381,16 @@ impl Cagents {
         let mut saved = (*self.durable).clone();
         saved.chat_drafts = chat_drafts;
         saved.repository_navigation = repository_navigation;
+        for card in &mut saved.cards {
+            if let Some(source) = admission_sources.get(&card.id) {
+                // The canonical view permits an attachment, not a speculative
+                // snapshot rewrite of the saved conversation's ownership.
+                card.kind = CardKind::Chat((**source).clone());
+                saved
+                    .pending_chat_admissions
+                    .insert(card.id, (**source).clone());
+            }
+        }
         if defaults.is_empty() {
             return Arc::new(saved);
         }
@@ -5322,6 +5349,34 @@ impl Cagents {
         if self.chat_awaiting_admission(card) {
             return Task::none();
         }
+        self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None)
+    }
+
+    pub(in crate::app) fn start_shared_chat_upgrade(
+        &mut self,
+        card: CardId,
+        source: chat::Session,
+        canonical: chat::Session,
+    ) -> Task<Message> {
+        self.start_chat_with_upgrade(
+            card,
+            source,
+            chat::Intent::Restore,
+            None,
+            false,
+            Some(canonical),
+        )
+    }
+
+    fn start_chat_with_upgrade(
+        &mut self,
+        card: CardId,
+        session: chat::Session,
+        intent: chat::Intent,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+        upgrade_admission: Option<chat::Session>,
+    ) -> Task<Message> {
         let selection = None;
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
@@ -5331,6 +5386,7 @@ impl Cagents {
                 session: session.clone(),
                 recovery: None,
                 upgrade_committed: false,
+                upgrade_admission: upgrade_admission.clone(),
             }),
         );
         let sender = self.chat_ui.sender.clone();
@@ -5341,16 +5397,22 @@ impl Cagents {
                 // UI thread then only sees a join error and can still draw.
                 Self::started_chat(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || {
-                        ClientHandle::connect(
-                            session,
-                            intent,
-                            source,
-                            terminate_source,
-                            selection,
-                            move |wake| {
-                                let _ = sender.try_send((target, wake));
-                            },
-                        )
+                        let wake = move |wake| {
+                            let _ = sender.try_send((target, wake));
+                        };
+                        match upgrade_admission {
+                            Some(canonical) => {
+                                ClientHandle::connect_upgrade(session, canonical, wake)
+                            }
+                            None => ClientHandle::connect(
+                                session,
+                                intent,
+                                source,
+                                terminate_source,
+                                selection,
+                                wake,
+                            ),
+                        }
                         .map(Arc::new)
                     },
                 )))
@@ -6360,6 +6422,21 @@ impl Cagents {
                     _ => return Task::none(),
                 }
             }
+            Action::RetainedCopyCommitted(card, result) => {
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::error(format!(
+                        "The saved draft copy could not be stored: {error}. Keep this window open and retry saving."
+                    )));
+                } else if !self
+                    .card_state(card)
+                    .is_some_and(|state| state.existence.is_open())
+                {
+                    // An explicit disposal may have followed the checkpoint.
+                    // Its ordinary snapshot remains the latest intention.
+                    self.persist();
+                }
+                return Task::none();
+            }
             Action::UpgradeCommitted(target, ready, result) => {
                 match result {
                     Ok(()) => {
@@ -6432,12 +6509,19 @@ impl Cagents {
                 if !self.card_state(target.card).is_some_and(|card| {
                     card.existence.is_open()
                         && match &card.kind {
-                            CardKind::Chat(session) => account_source
-                                .as_ref()
-                                .or(upgrade_source)
-                                .map_or(session.id == attempt.session.id, |source| {
-                                    session == source
-                                }),
+                            CardKind::Chat(session) => {
+                                attempt.upgrade_admission.as_ref().map_or_else(
+                                    || {
+                                        account_source
+                                            .as_ref()
+                                            .or(upgrade_source)
+                                            .map_or(session.id == attempt.session.id, |source| {
+                                                session == source
+                                            })
+                                    },
+                                    |canonical| session == canonical,
+                                )
+                            }
                             CardKind::Terminal(session) => {
                                 attempt.session.terminal.as_ref().is_some_and(|source| {
                                     source.id == session.id && source.launch == session.launch
@@ -6446,6 +6530,16 @@ impl Cagents {
                             _ => false,
                         }
                 }) {
+                    if attempt.upgrade_admission.is_some() {
+                        // A newer authoritative descriptor cannot inherit
+                        // this old source's Content, even if a receipt landed
+                        // before its UI acknowledgment. Preserve it under a
+                        // fresh inert identity; the late handle only detaches.
+                        drop(result);
+                        let retained = self.retain_shared_upgrade_source(target.card);
+                        self.persist();
+                        return retained.0;
+                    }
                     // The conversation started, but this card can no longer
                     // hold it. Leaving it alone left a daemon writer and its
                     // provider process running with nothing on screen able to
@@ -6461,8 +6555,43 @@ impl Cagents {
                     }
                     return Task::none();
                 }
+                if result.is_err() && attempt.upgrade_admission.is_some() {
+                    // Unproved lineage cannot bind the saved Content to the
+                    // canonical actor. Keep it as an inert copy and leave
+                    // reconnection explicit; no provider restart is authorized.
+                    if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                        runtime.connection = Connection::AwaitingAdmission;
+                    }
+                    if let Some(pane) = self
+                        .workspace_model
+                        .views
+                        .iter()
+                        .flat_map(|view| &view.panes)
+                        .find(|pane| {
+                            pane.id == target.card
+                                && matches!(&pane.kind, CardKind::Chat(session)
+                                if Some(session) == attempt.upgrade_admission.as_ref())
+                        })
+                        .cloned()
+                    {
+                        let retained = self.retain_unresolved_shared_upgrade(&pane);
+                        self.persist();
+                        return retained.0;
+                    }
+                    return Task::none();
+                }
                 match result {
                     Ok(handle) => {
+                        if attempt.upgrade_admission.as_ref().is_some_and(|canonical| {
+                            handle.upgrade_recovery().is_none_or(|(source, resolved)| {
+                                source != &attempt.session || resolved != canonical
+                            })
+                        }) {
+                            self.status = Some(TransientNotice::error(
+                                "The shared conversation did not confirm its saved upgrade lineage.",
+                            ));
+                            return Task::none();
+                        }
                         if let Some((source, resolved)) = handle.upgrade_recovery() {
                             let replacement = handle.session();
                             if account_source.is_some()
@@ -6562,6 +6691,11 @@ impl Cagents {
                                 });
                             }
                         }
+                        if attempt.upgrade_admission.is_some() {
+                            Arc::make_mut(&mut self.durable)
+                                .pending_chat_admissions
+                                .remove(&target.card);
+                        }
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_ui.removed_accounts.remove(&target.card);
                         let mut session = handle.session();
@@ -6620,7 +6754,10 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
                         }
-                        if account_source.is_some() {
+                        if account_source.is_some() || attempt.upgrade_admission.is_some() {
+                            // Shared projection may already hold the canonical
+                            // descriptor. Still save the confirmed draft and
+                            // removal of its pending marker after the receipt.
                             self.install_chat_session(target.card, session.clone());
                             self.persist();
                         } else {
@@ -16457,6 +16594,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    upgrade_admission: None,
                 }),
             );
             app.cards.remove(&card);
@@ -16513,6 +16651,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        upgrade_admission: None,
                     }),
                 );
                 let _ = app.update(receipt);

@@ -327,6 +327,100 @@ pub struct PendingOperation {
     pub updated_at_unix_ms: i64,
 }
 
+/// A fresh local view of saved bytes. This grants no provider, retirement,
+/// descriptor replacement, or canonical-pane ownership authority.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetainedChatCopy {
+    pub workspace: WorkspaceId,
+    pub source_card: CardId,
+    pub source: crate::chat::Session,
+    pub copy: CardState,
+    pub draft: String,
+    pub scope: Option<PathBuf>,
+    pub channel: Option<crate::model::ChannelId>,
+}
+
+impl RetainedChatCopy {
+    fn validate(&self) -> Result<()> {
+        if self.copy.id == self.source_card
+            || !self.copy.existence.is_open()
+            || !self.copy.width_fraction.is_finite()
+            || self.copy.width_fraction <= 0.0
+            || !matches!(&self.copy.kind, CardKind::Chat(session) if session == &self.source)
+            || !self.source.has_valid_native_continuity()
+            || (self.source.owned_codex_listener.is_some() && !self.source.owns_codex_listener())
+        {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy changed its captured source".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Keep a committed copy reachable in snapshots captured before its receipt.
+    /// Only an explicit tombstone can remove it; omission cannot spend it.
+    pub(crate) fn project(&self, state: &mut WorkspaceState) -> Result<()> {
+        self.validate()?;
+        if state.id != self.workspace {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy belongs to another workspace".into(),
+            ));
+        }
+        if let Some(card) = state.cards.iter().find(|card| card.id == self.copy.id) {
+            if !card.existence.is_open() {
+                return Ok(());
+            }
+            if card.kind != self.copy.kind {
+                return Err(StoreError::InvalidState(
+                    "Retained chat copy source changed before saving".into(),
+                ));
+            }
+        } else {
+            state.cards.push(self.copy.clone());
+        }
+        if state
+            .chat_drafts
+            .get(&self.copy.id)
+            .is_some_and(|draft| draft != &self.draft)
+        {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy text changed before saving".into(),
+            ));
+        }
+        state.chat_drafts.insert(self.copy.id, self.draft.clone());
+        state.local_only_cards.insert(self.copy.id);
+        state
+            .pending_chat_admissions
+            .insert(self.copy.id, self.source.clone());
+        let channel = self
+            .channel
+            .and_then(|id| state.channels.iter_mut().find(|channel| channel.id == id));
+        if let Some(channel) = channel {
+            if !channel.cards.contains(&self.copy.id) {
+                let index = channel
+                    .cards
+                    .iter()
+                    .position(|card| *card == self.source_card)
+                    .map_or(channel.cards.len(), |index| index + 1);
+                channel.cards.insert(index, self.copy.id);
+            }
+        } else {
+            // Do not recreate a channel another client deleted. The source's
+            // directory still provides a local navigation home for its text.
+            state.card_scopes.insert(
+                self.copy.id,
+                self.scope
+                    .clone()
+                    .unwrap_or_else(|| self.source.launch.recipe.working_directory.clone()),
+            );
+        }
+        if let Some(scope) = &self.scope {
+            state.card_scopes.insert(self.copy.id, scope.clone());
+        }
+        Ok(())
+    }
+}
+
 /// The storage generations a snapshot is written against.
 ///
 /// The persistence lane owns these, not the UI. A snapshot travels to the
@@ -1333,6 +1427,149 @@ impl StateStore {
         transaction.execute(INVALIDATE_CARD_HASH, [card_id.to_string()])?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Commit only a new inert copy, even when a newer canonical descriptor
+    /// makes the caller's full workspace snapshot unacceptable. Existing card
+    /// payloads and generations are never rewritten by this operation.
+    pub fn preserve_chat_copy(&self, copy: &RetainedChatCopy) -> Result<WorkspaceCommit> {
+        copy.validate()?;
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_descriptor_write(&transaction)?;
+        let workspace = copy.workspace.to_string();
+        let generation = select_generation(&transaction, SELECT_WORKSPACE_GENERATION, &workspace)?
+            .ok_or_else(|| {
+                StoreError::InvalidState("Retained chat copy needs its existing workspace".into())
+            })?;
+        if !select_existence(&transaction, SELECT_WORKSPACE_EXISTENCE, &workspace)?
+            .is_some_and(|existence| existence.is_open())
+        {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy workspace is closed".into(),
+            ));
+        }
+        let owner: Option<String> = transaction
+            .query_row(
+                SELECT_CARD_WORKSPACE,
+                [copy.source_card.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner.as_deref() != Some(workspace.as_str()) {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy origin is outside this workspace".into(),
+            ));
+        }
+        let receipt_key = format!("workspace:{workspace}:retained_chat_copy:{}", copy.copy.id);
+        use sha2::Digest;
+        // A receipt verifies retries without retaining another hidden copy of
+        // draft text or account configuration after an explicit discard.
+        let digest = format!("{:x}", sha2::Sha256::digest(to_json(copy)?.as_bytes()));
+        let mut manifest = load_workspace_manifest_connection(&transaction, copy.workspace)?
+            .ok_or_else(|| {
+                StoreError::InvalidState("Retained chat copy workspace disappeared".into())
+            })?;
+        let existing = existing_cards(&transaction, &workspace)?;
+        if let Some(receipt) = metadata(&transaction, &receipt_key)? {
+            if receipt != digest
+                || !existing
+                    .get(&copy.copy.id)
+                    .is_some_and(|card| card.existence.is_open())
+                || load_card_connection(&transaction, copy.copy.id, &self.boot_id, None)?
+                    .is_none_or(|card| card.kind != copy.copy.kind)
+                || manifest.chat_drafts.get(&copy.copy.id) != Some(&copy.draft)
+                || !manifest.local_only_cards.contains(&copy.copy.id)
+                || manifest.pending_chat_admissions.get(&copy.copy.id) != Some(&copy.source)
+                || !(manifest.card_scopes.contains_key(&copy.copy.id)
+                    || manifest
+                        .channels
+                        .iter()
+                        .any(|channel| channel.cards.contains(&copy.copy.id)))
+            {
+                return Err(StoreError::InvalidState(
+                    "Retained chat copy retry changed its committed payload".into(),
+                ));
+            }
+            return Ok(WorkspaceCommit {
+                generation,
+                card_generations: existing
+                    .into_iter()
+                    .map(|(id, card)| (id, card.generation))
+                    .collect(),
+            });
+        }
+        if transaction
+            .query_row(SELECT_CARD_WORKSPACE, [copy.copy.id.to_string()], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy identity is already occupied".into(),
+            ));
+        }
+        let ordinal: usize = transaction.query_row(
+            "SELECT coalesce(max(ordinal) + 1, 0) FROM cards WHERE workspace_id = ?1",
+            [&workspace],
+            |row| row.get(0),
+        )?;
+        let card_generation = save_card(
+            &transaction,
+            &workspace,
+            ordinal,
+            &copy.copy,
+            0,
+            None,
+            now_unix_ms(),
+        )?;
+        // Merge navigation from the current transaction, never from a captured
+        // UI snapshot that could replace the canonical pane or unrelated edits.
+        manifest
+            .chat_drafts
+            .insert(copy.copy.id, copy.draft.clone());
+        manifest.local_only_cards.insert(copy.copy.id);
+        manifest
+            .pending_chat_admissions
+            .insert(copy.copy.id, copy.source.clone());
+        let mut state = WorkspaceState::default();
+        state.id = copy.workspace;
+        state.channels = manifest.channels;
+        state.card_scopes = manifest.card_scopes;
+        copy.project(&mut state)?;
+        for (name, value) in [
+            ("chat_drafts", to_json(&manifest.chat_drafts)?),
+            ("local_only_cards", to_json(&manifest.local_only_cards)?),
+            (
+                "pending_chat_admissions",
+                to_json(&manifest.pending_chat_admissions)?,
+            ),
+            (CHANNELS_FIELD, to_json(&state.channels)?),
+            ("card_scopes", to_json(&state.card_scopes)?),
+        ] {
+            set_metadata(
+                &transaction,
+                &format!("workspace:{workspace}:navigation:{name}"),
+                &value,
+            )?;
+        }
+        set_metadata(&transaction, &receipt_key, &digest)?;
+        let next = next_generation(generation, "workspace", copy.workspace)?;
+        transaction.execute("UPDATE workspaces SET generation = ?1, updated_at_unix_ms = ?2 WHERE workspace_id = ?3", params![u64_to_i64(next, "workspace generation")?, now_unix_ms(), &workspace])?;
+        let mut card_generations = existing
+            .into_iter()
+            .map(|(id, card)| (id, card.generation))
+            .collect::<BTreeMap<_, _>>();
+        card_generations.insert(copy.copy.id, card_generation);
+        transaction.commit()?;
+        Ok(WorkspaceCommit {
+            generation: next,
+            card_generations,
+        })
     }
 
     pub fn save_project(&self, project: &ProjectState) -> Result<u64> {
@@ -2374,6 +2611,45 @@ pub(crate) fn read_open_migration_sessions_with_budget(
     path: &Path,
     budget: &mut MigrationInspectionBudget,
 ) -> Result<Vec<(CardId, CardKind)>> {
+    // Local presentation markers are not daemon authority. Read them under
+    // the same snapshot and budget as their exact saved source descriptors.
+    fn retained_metadata<T: serde::de::DeserializeOwned + Default>(
+        transaction: &Transaction<'_>,
+        workspace: WorkspaceId,
+        name: &str,
+        budget: &mut MigrationInspectionBudget,
+    ) -> Result<T> {
+        budget.check_deadline()?;
+        let key = format!("workspace:{workspace}:navigation:{name}");
+        let bytes: Option<u64> = transaction
+            .query_row(
+                "SELECT length(CAST(value AS BLOB)) FROM metadata WHERE key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(bytes) = bytes else {
+            return Ok(T::default());
+        };
+        if bytes > 4 * 1024 * 1024 {
+            return Err(StoreError::InvalidState(
+                "Saved pane admission metadata exceeds the migration inspection limit".into(),
+            ));
+        }
+        if bytes > budget.remaining_bytes {
+            return Err(StoreError::InvalidState(
+                "Saved pane inventory exceeds the migration inspection limit".into(),
+            ));
+        }
+        budget.remaining_bytes -= bytes;
+        let value = metadata(transaction, &key)?.ok_or_else(|| {
+            StoreError::InvalidState("Saved pane admission metadata disappeared".into())
+        })?;
+        let value = from_json("saved pane admission metadata", &value)?;
+        budget.check_deadline()?;
+        Ok(value)
+    }
+
     budget.check_deadline()?;
     let mut connection = Connection::open_with_flags(
         path,
@@ -2399,12 +2675,15 @@ pub(crate) fn read_open_migration_sessions_with_budget(
                     + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
                     + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
                FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=c.card_id)
-         END
+         END,
+         CASE WHEN length(CAST(w.workspace_id AS BLOB)) <= 128 THEN w.workspace_id ELSE NULL END
          FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
          WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id",
     )?;
     let mut rows = statement.query([])?;
     let mut sessions = Vec::new();
+    let mut retained =
+        HashMap::<WorkspaceId, (HashSet<CardId>, HashMap<CardId, crate::chat::Session>)>::new();
     while let Some(row) = rows.next()? {
         budget.check_deadline()?;
         let existence: String = row.get(3)?;
@@ -2422,6 +2701,37 @@ pub(crate) fn read_open_migration_sessions_with_budget(
         let content: Option<String> = row.get(2)?;
         let card = parse_id("migration card", &card)?;
         let session = read_migration_session_at(&transaction, card, &kind, content.as_deref())?;
+        if let CardKind::Chat(source) = &session {
+            let workspace: String = row.get(6)?;
+            let workspace = parse_id("migration workspace", &workspace)?;
+            let (local, pending) = match retained.entry(workspace) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let local =
+                        retained_metadata(&transaction, workspace, "local_only_cards", budget)?;
+                    let pending = retained_metadata(
+                        &transaction,
+                        workspace,
+                        "pending_chat_admissions",
+                        budget,
+                    )?;
+                    entry.insert((local, pending))
+                }
+            };
+            // A shared cache awaiting authority may still name a hosted actor.
+            // Only a deliberately retained local copy with an exact source
+            // marker is inert text rather than required hosted migration.
+            if local.contains(&card) && pending.get(&card) == Some(source) {
+                if !source.has_valid_native_continuity()
+                    || (source.owned_codex_listener.is_some() && !source.owns_codex_listener())
+                {
+                    return Err(StoreError::InvalidState(
+                        "Retained saved pane has invalid native continuity".into(),
+                    ));
+                }
+                continue;
+            }
+        }
         sessions.push((card, session));
     }
     budget.check_deadline()?;
@@ -6677,6 +6987,242 @@ mod tests {
     }
 
     #[test]
+    fn retained_chat_copy_is_atomic_idempotent_and_never_rewrites_canonical() {
+        for stage in ["source", "upgraded", "replaced"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("copy.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+            source.terminal = None;
+            source.proof = Some(HostSessionProof {
+                host_session_id: "old".into(),
+                boot_id: boot("chat-boot"),
+                host_incarnation: "old".into(),
+            });
+            let original = workspace.cards[0].id;
+            workspace.cards[0].kind = CardKind::Chat(source.clone());
+            workspace
+                .chat_drafts
+                .insert(original, "Canonical draft untouched".into());
+            workspace.agent_updates.insert(original, None);
+            SaveLane::default().save(&store, &workspace).unwrap();
+            let mut canonical = source.clone();
+            if stage != "source" {
+                canonical.proof.as_mut().unwrap().host_incarnation = "new".into();
+                store
+                    .rebind_chat_upgrade(original, &source, &canonical)
+                    .unwrap();
+            }
+            if stage == "replaced" {
+                let expected = canonical.id;
+                canonical.id = TerminalId::new();
+                canonical.launch.session_id = Some("replacement-thread".into());
+                canonical
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--different-recipe".into());
+                store
+                    .replace_chat_identity(original, expected, &canonical)
+                    .unwrap();
+            }
+            let before = store.load_card(original, None).unwrap().unwrap();
+            let mut card = workspace.cards[0].clone();
+            card.id = CardId::new();
+            let copy = RetainedChatCopy {
+                workspace: workspace.id,
+                source_card: original,
+                source: source.clone(),
+                copy: card,
+                draft: "Exact saved text  \nsecond line 🦀".into(),
+                scope: None,
+                channel: None,
+            };
+            let committed = store.preserve_chat_copy(&copy).unwrap();
+            let retry = store.preserve_chat_copy(&copy).unwrap();
+            assert_eq!(retry, committed, "{stage}");
+            assert_eq!(
+                store.load_card(original, None).unwrap().unwrap(),
+                before,
+                "{stage}"
+            );
+            for mutation in ["text", "source", "descriptor", "origin", "occupied"] {
+                let mut changed = copy.clone();
+                match mutation {
+                    "text" => changed.draft.push('!'),
+                    "source" => {
+                        changed
+                            .source
+                            .launch
+                            .recipe
+                            .arguments
+                            .push("--changed".into());
+                        changed.copy.kind = CardKind::Chat(changed.source.clone());
+                    }
+                    "descriptor" => changed.source.id = TerminalId::new(),
+                    "origin" => changed.source_card = CardId::new(),
+                    "occupied" => changed.copy.id = original,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    store.preserve_chat_copy(&changed).is_err(),
+                    "{stage}: {mutation}"
+                );
+                assert_eq!(
+                    store.stored_generations(workspace.id).unwrap().workspace,
+                    committed.generation
+                );
+            }
+            drop(store);
+            let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let saved = reopened
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved
+                    .cards
+                    .iter()
+                    .find(|card| card.id == copy.copy.id)
+                    .unwrap()
+                    .kind,
+                CardKind::Chat(source.clone())
+            );
+            assert_eq!(saved.chat_drafts[&copy.copy.id], copy.draft);
+            assert_eq!(saved.chat_drafts[&original], "Canonical draft untouched");
+            assert_eq!(saved.agent_updates, workspace.agent_updates);
+            assert!(saved.local_only_cards.contains(&copy.copy.id));
+            assert_eq!(saved.pending_chat_admissions[&copy.copy.id], source);
+            assert_eq!(
+                saved.card_scopes[&copy.copy.id],
+                source.launch.recipe.working_directory
+            );
+            let inner = reopened.lock_inner().unwrap();
+            let receipt = metadata(
+                &inner.connection,
+                &format!(
+                    "workspace:{}:retained_chat_copy:{}",
+                    workspace.id, copy.copy.id
+                ),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(receipt.len(), 64);
+            assert!(!receipt.contains("Exact saved text"));
+        }
+    }
+
+    #[test]
+    fn migration_inspection_omits_only_exact_retained_local_chat_sources() {
+        for mode in [
+            "retained",
+            "shared",
+            "unmarked",
+            "wrong-source",
+            "wrong-card",
+            "legacy",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("source.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
+            let card = workspace.cards[0].id;
+            workspace.cards[0].kind = CardKind::Chat(source.clone());
+            workspace.chat_drafts.insert(card, "Saved text only".into());
+            if mode != "shared" {
+                workspace.local_only_cards.insert(card);
+            }
+            if mode != "unmarked" {
+                workspace
+                    .pending_chat_admissions
+                    .insert(card, source.clone());
+            }
+            SaveLane::default().save(&store, &workspace).unwrap();
+            // Valid writers prune mismatched markers. Model damaged/stale
+            // metadata internally to prove the read-only intake also refuses
+            // to infer inertness from a different source or card identity.
+            if matches!(mode, "wrong-source" | "wrong-card" | "legacy") {
+                let mut inner = store.lock_inner().unwrap();
+                let transaction = inner.connection.transaction().unwrap();
+                let key = format!(
+                    "workspace:{}:navigation:pending_chat_admissions",
+                    workspace.id
+                );
+                if mode == "legacy" {
+                    transaction
+                        .execute("DELETE FROM metadata WHERE key = ?1", [&key])
+                        .unwrap();
+                    transaction
+                        .execute(
+                            "DELETE FROM metadata WHERE key = ?1",
+                            [format!(
+                                "workspace:{}:navigation:local_only_cards",
+                                workspace.id
+                            )],
+                        )
+                        .unwrap();
+                } else {
+                    let mut marked = source.clone();
+                    let marked_card = if mode == "wrong-card" {
+                        CardId::new()
+                    } else {
+                        marked.launch.recipe.arguments.push("--different".into());
+                        card
+                    };
+                    set_metadata(
+                        &transaction,
+                        &key,
+                        &to_json(&HashMap::from([(marked_card, marked)])).unwrap(),
+                    )
+                    .unwrap();
+                }
+                transaction.commit().unwrap();
+            }
+            drop(store);
+            let before = std::fs::read(&path).unwrap();
+            let sessions = read_open_migration_sessions(&path).unwrap();
+            if mode == "retained" {
+                assert!(sessions.is_empty());
+            } else {
+                assert_eq!(sessions, vec![(card, CardKind::Chat(source))], "{mode}");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{mode}");
+        }
+    }
+
+    #[test]
+    fn migration_inspection_retained_metadata_is_bounded_and_fail_closed() {
+        for value in ["not JSON".to_owned(), " ".repeat(4 * 1024 * 1024 + 1)] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("source.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
+            let card = workspace.cards[0].id;
+            workspace.cards[0].kind = CardKind::Chat(source.clone());
+            workspace.local_only_cards.insert(card);
+            workspace.pending_chat_admissions.insert(card, source);
+            SaveLane::default().save(&store, &workspace).unwrap();
+            let mut inner = store.lock_inner().unwrap();
+            let transaction = inner.connection.transaction().unwrap();
+            set_metadata(
+                &transaction,
+                &format!(
+                    "workspace:{}:navigation:pending_chat_admissions",
+                    workspace.id
+                ),
+                &value,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            drop(inner);
+            drop(store);
+            let before = std::fs::read(&path).unwrap();
+            assert!(read_open_migration_sessions(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn migration_session_inventory_budget_spans_windows_and_precedes_json_decode() {
         let directory = tempdir().unwrap();
         let mut paths = Vec::new();
@@ -6696,9 +7242,13 @@ mod tests {
             .unwrap();
         let connection =
             Connection::open_with_flags(&paths[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        let descriptor_bytes: u64 = connection
+        let inspection_bytes: u64 = connection
             .query_row(
-                "SELECT length(CAST(content_json AS BLOB)) FROM cards WHERE kind_tag='chat'",
+                "SELECT length(CAST(content_json AS BLOB)) +
+                 (SELECT coalesce(sum(length(CAST(value AS BLOB))), 0) FROM metadata
+                  WHERE key LIKE '%:navigation:local_only_cards'
+                     OR key LIKE '%:navigation:pending_chat_admissions')
+                 FROM cards WHERE kind_tag='chat'",
                 [],
                 |row| row.get(0),
             )
@@ -6710,7 +7260,7 @@ mod tests {
             if row_limited {
                 budget.remaining_rows = 1;
             } else {
-                budget.remaining_bytes = descriptor_bytes;
+                budget.remaining_bytes = inspection_bytes;
             }
             assert_eq!(
                 read_open_migration_sessions_with_budget(&paths[0], &mut budget)

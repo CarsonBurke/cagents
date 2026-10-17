@@ -340,6 +340,20 @@ impl Cagents {
         })
     }
 
+    pub(super) fn shared_views_ready_for_startup(&self) -> bool {
+        if self.durable.workspace_model_identity.is_none() && self.shared_views.attached.is_empty()
+        {
+            return true;
+        }
+        let scopes = self.local_view_scopes();
+        self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
+            && scopes.iter().all(|scope| {
+                self.shared_views.initialized.contains(scope)
+                    && !self.shared_views.seeding.contains(scope)
+                    && !self.shared_views.blocked.contains(scope)
+            })
+    }
+
     fn local_view_scopes(&self) -> Vec<Scope> {
         let mut scopes = self
             .durable
@@ -1467,6 +1481,7 @@ impl Cagents {
             return Task::none();
         }
         let mut tasks = Vec::new();
+        let mut retained_upgrades = Vec::new();
         for id in current.iter().copied() {
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
                 continue;
@@ -1478,6 +1493,9 @@ impl Cagents {
             {
                 continue;
             }
+            let (pending, saved_copy) = self.preserve_pending_shared_upgrade(id);
+            tasks.push(pending);
+            retained_upgrades.extend(saved_copy);
             if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())
                 || self.shared_chat_has_local_work(id)
             {
@@ -1500,6 +1518,7 @@ impl Cagents {
             }
             self.detach_shared_pane(id);
         }
+        current.extend(retained_upgrades);
         for shared in &view.panes {
             self.shared_views.closed_chats.remove(&shared.id);
             self.sync_closed_chat_draft(shared.id);
@@ -1555,6 +1574,11 @@ impl Cagents {
                 }
             }
             self.shared_views.attached.insert(pane.id);
+            if self.shared_upgrade_target_changed(pane) {
+                let (pending, saved_copy) = self.preserve_pending_shared_upgrade(pane.id);
+                tasks.push(pending);
+                current.extend(saved_copy);
+            }
             if self.chat_awaiting_admission(pane.id) {
                 let (task, saved_copy) = self.admit_shared_chat(pane);
                 tasks.push(task);

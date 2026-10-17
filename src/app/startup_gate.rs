@@ -30,7 +30,10 @@ impl Cagents {
             .filter(|card| {
                 card.existence.is_open()
                     && match &card.kind {
-                        CardKind::Chat(session) => !session.is_unstarted(),
+                        CardKind::Chat(session) => {
+                            !session.is_unstarted()
+                                && !self.retained_startup_draft(card.id, session)
+                        }
                         CardKind::Terminal(session) => !terminal_ended(session),
                         _ => false,
                     }
@@ -38,8 +41,20 @@ impl Cagents {
             .count()
     }
 
+    /// An exact retained local copy is saved data, not a hosted pane admitted
+    /// by this window. A pending marker on a shared pane alone cannot waive
+    /// its original attachment/readiness requirement.
+    fn retained_startup_draft(&self, card: CardId, session: &chat::Session) -> bool {
+        self.durable.local_only_cards.contains(&card)
+            && self.durable.pending_chat_admissions.get(&card) == Some(session)
+            && self.chat_awaiting_admission(card)
+    }
+
     pub(super) fn startup_pane_check(&self) -> Result<bool, String> {
-        let mut pending = false;
+        // A native window opens independently of the observer/SeedView task.
+        // Wait for that actual admission boundary before judging saved chats
+        // or declaring a formerly shared workspace recovered.
+        let mut pending = !self.shared_views_ready_for_startup();
         let mut failures = Vec::new();
         for card in self
             .durable
@@ -66,7 +81,10 @@ impl Cagents {
             let CardKind::Chat(session) = &card.kind else {
                 continue;
             };
-            if session.is_unstarted() {
+            if session.is_unstarted() || self.retained_startup_draft(card.id, session) {
+                continue;
+            }
+            if self.chat_awaiting_admission(card.id) && pending {
                 continue;
             }
             if self.chat_start_pending(card.id) {
