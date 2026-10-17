@@ -13310,6 +13310,8 @@ impl Application for Cagents {
             app.sidebar_state.restore_view(view.sidebar);
             app.worktree_offsets = view.worktree_offsets;
         }
+        app.sidebar_state
+            .restore_unread_updates(app.durable.agent_updates.clone());
         app.sidebar_model
             .apply_project_order(&app.durable.project_order);
         app.sidebar_state
@@ -25902,6 +25904,60 @@ mod tests {
         assert!(app.focus_save_pending);
         let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, true);
         assert!(!app.focus_save_pending);
+    }
+
+    #[test]
+    fn unread_agent_updates_snapshot_only_saved_open_cards_and_persist_reads() {
+        let mut app = context_inspector_test_app(true);
+        let open = app.workspace.focused().unwrap();
+        let owner = (
+            crate::model::ProjectId::new(),
+            crate::model::WorktreeId::new(),
+        );
+        let mut closed = terminal_card_state();
+        closed.existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed unread fixture".into()),
+            },
+        };
+        let closed_id = closed.id;
+        Arc::make_mut(&mut app.durable).cards.push(closed);
+        let missing = CardId::new();
+        app.sidebar_state
+            .observe_agent_update(open, owner.0, owner.1);
+        app.sidebar_state.observe_card_update(closed_id);
+        app.sidebar_state.observe_card_update(missing);
+
+        let saved = app.persistent_workspace();
+        assert_eq!(
+            saved.agent_updates,
+            std::collections::BTreeMap::from([(open, Some(owner))])
+        );
+        assert_eq!(app.durable.agent_updates, saved.agent_updates);
+        let retained = Arc::clone(&app.durable);
+        drop(app.persistent_workspace());
+        assert!(
+            Arc::ptr_eq(&retained, &app.durable),
+            "unchanged unread does not clone durable state"
+        );
+
+        let mut restored = sidebar::SidebarState::default();
+        restored.restore_unread_updates(saved.agent_updates.clone());
+        assert!(restored.has_card_update(open));
+        assert!(restored.has_agent_update(owner.0, owner.1));
+        assert!(!restored.has_card_update(closed_id));
+        assert!(!restored.has_card_update(missing));
+
+        app.sidebar_state.acknowledge_agent_update(open);
+        let read = app.persistent_workspace();
+        assert!(read.agent_updates.is_empty());
+        assert!(app.durable.agent_updates.is_empty());
+        assert!(
+            saved.agent_updates.contains_key(&open),
+            "a queued prior snapshot remains immutable"
+        );
     }
 
     /// Every snapshot handed to the session writer is one storage accepts,
