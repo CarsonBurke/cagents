@@ -316,8 +316,26 @@ pub enum LspIntent {
     Close,
 }
 
+/// File-surface commands share availability with their mounted toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorSurfaceCommand { Save, DiscardEdits, Edit, Preview, Diff }
+
+/// Runtime-side feature availability; server capabilities stay with LspManager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorLanguageFeature { Rename, FormatDocument, FormatSelection, CodeActions, Signature }
+
 #[derive(Debug, Clone)]
 pub enum EditorLspAction {
+    Rename,
+    RenameDraft(String),
+    SubmitRename(String),
+    CancelRename,
+    Format { selection: bool },
+    CodeActions,
+    CodeActionsAt(Option<LspPosition>),
+    CodeActionNext(bool),
+    ChooseCodeAction(usize),
+    Signature,
     Complete,
     CompleteAt {
         doc: LspDocumentId,
@@ -336,8 +354,17 @@ pub enum EditorLspAction {
     Dismiss,
 }
 
+struct EditorCodeAction { title: String, disabled: Option<String> }
+
 #[derive(Default)]
 struct EditorLanguageState {
+    rename: Option<String>,
+    code_actions: Vec<EditorCodeAction>,
+    code_action_selected: usize,
+    code_action_lines: Vec<usize>,
+    code_action_support: bool,
+    available_actions_at: Option<(u64, text_editor::Position)>,
+    signature: Option<crate::lsp::LspSignatureHelp>,
     diagnostics: Vec<crate::lsp::LspDiagnostic>,
     marks: Vec<text_editor::Diagnostic>,
     completions: Vec<LspCompletionItem>,
@@ -794,6 +821,9 @@ struct EditorDocument {
     /// reporting changes.
     lsp_version: i32,
     active_save: Option<SaveTicket>,
+    /// A prepared workspace edit holds this buffer stable while unopened files
+    /// are published. The ticket fences stale publication completions.
+    workspace_edit: Option<(u64, Vec<TextChange>)>,
     conflict: bool,
     error: Option<String>,
     durability_warning: Option<String>,
@@ -850,6 +880,7 @@ impl EditorDocument {
             revision: 0,
             lsp_version: 1,
             active_save: None,
+            workspace_edit: None,
             conflict: false,
             error: None,
             durability_warning: None,
@@ -1841,6 +1872,7 @@ pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
     worktree_protection: Option<crate::worktree_cleanup::Protection>,
     directory_only: bool,
+    external_source: Option<PathBuf>,
     standalone: bool,
     external_editors: Vec<crate::sidebar::SidebarEditor>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
@@ -2060,6 +2092,7 @@ impl RepositoryRuntime {
         let identity = descriptor.worktree.display().to_string();
         Self {
             directory_only: descriptor.selected_file.is_some(),
+            external_source: None,
             descriptor,
             worktree_protection: None,
             standalone: false,
@@ -2146,6 +2179,19 @@ impl RepositoryRuntime {
         runtime.directory_only = true;
         runtime
     }
+
+    pub fn set_external_source(&mut self, path: PathBuf) {
+        self.external_source = Some(path);
+        self.directory_only = true;
+        self.descriptor.selected_file = None;
+    }
+
+    pub fn is_read_only_source(&self) -> bool { self.external_source.is_some() }
+
+    pub fn source_tab_path(&self) -> Option<PathBuf> {
+        self.external_source.clone().or_else(|| self.workspace_edit_source()).or_else(|| self.descriptor.selected_file.as_ref().map(|path| self.descriptor.worktree.join(path)))
+    }
+
 
     /// Hides workbench launch controls in an independent editor window.
     pub fn set_standalone(&mut self, standalone: bool) {
@@ -2371,6 +2417,7 @@ impl RepositoryRuntime {
     /// that wants its own behaviour still has one: it can intercept
     /// [`RepositoryAction::Clipboard`] before forwarding it here.
     fn clipboard(&mut self, card: CardId, op: ClipboardOp) -> Task<RepositoryAction> {
+        if (self.is_read_only_source() || self.workspace_edit_pending()) && matches!(op, ClipboardOp::Cut | ClipboardOp::Paste) { return Task::none(); }
         match op {
             ClipboardOp::Copy => self
                 .selected_text()
@@ -2690,6 +2737,14 @@ impl RepositoryRuntime {
     /// Apply only navigation for this exact pane recipe. Shared projections can
     /// replace the recipe but cannot replace another window's local selection.
     pub(crate) fn restore_navigation(&mut self, navigation: &crate::model::RepositoryNavigation) {
+        if let Some(path) = &navigation.external_source {
+            if navigation.project == self.descriptor.project && navigation.worktree == self.descriptor.worktree
+                && path.is_absolute() && self.descriptor.selected_file.is_none() {
+                self.set_external_source(path.clone());
+                self.restored_navigation = Some(navigation.clone());
+            }
+            return;
+        }
         if navigation.project != self.descriptor.project
             || navigation.worktree != self.descriptor.worktree
             || navigation
@@ -2737,14 +2792,31 @@ impl RepositoryRuntime {
                 .map(|(_, editor)| *editor)
         };
         Some(crate::model::RepositoryNavigation {
+            external_source: self.external_source.clone(),
             project: self.descriptor.project,
             worktree: self.descriptor.worktree.clone(),
-            selected_file: Some(file.path.clone()),
+            selected_file: self.external_source.is_none().then(|| file.path.clone()),
             editor,
         })
     }
 
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if let Some(path) = self.external_source.clone() {
+            self.files = FileListState::Ready(Vec::new());
+            let restored = self.restored_navigation.take().and_then(|navigation| navigation.editor);
+            self.selected = Some(RepositoryFile { path: path.clone(), ..RepositoryFile::default() });
+            self.document = DocumentState::Loading;
+            self.source_surface = SourceSurface::Editor;
+            self.markdown_mode = MarkdownMode::Edit;
+            self.pending_editor_navigation = restored.map(|editor| (path.clone(), editor));
+            let identity = self.next_identity(card, path);
+            return cosmic::task::future(async move {
+                let source = identity.path.clone();
+                let result = tokio::task::spawn_blocking(move || crate::editor::load_external_source(&source)).await
+                    .map_err(|error| FileIoError::Io(format!("external source worker failed: {error}"))).and_then(|result| result);
+                RepositoryAction::FileLoaded { identity, result }
+            });
+        }
         if (self.descriptor.selected_file.is_some()
             || self
                 .restored_navigation
@@ -2822,6 +2894,7 @@ impl RepositoryRuntime {
     /// Poll only visible panes. Keep the mounted list, viewport, and document
     /// intact while discovering external changes, and never overlap a read.
     pub fn refresh_visible(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if self.is_read_only_source() { return Task::none(); }
         if self.descriptor.selected_file.is_some() {
             return Task::none();
         }
@@ -2873,6 +2946,7 @@ impl RepositoryRuntime {
     /// Refreshes Git's status and mutable comparisons without replacing the
     /// open buffer or changing the identity of its loads and saves.
     pub fn refresh_after_mutation(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if self.is_read_only_source() { return Task::none(); }
         self.mutation_refresh_pending = true;
         if let Some(path) = self.selected.as_ref().map(|file| file.path.clone())
             && let Some(index) = self.diffs.iter().position(|(basis, state)| {
@@ -2979,6 +3053,20 @@ impl RepositoryRuntime {
         caret_position(&document.content, document.content.cursor().position)
     }
 
+    pub fn scalar_position_for_utf16(&self, at: LspPosition) -> Option<LspPosition> {
+        let text = self.editor_text()?;
+        let span = line_span(&text, at.line)?;
+        let mut units = 0u32;
+        let mut scalars = 0u32;
+        for character in text[span].chars() {
+            if units == at.character { return Some(LspPosition::new(at.line, scalars)); }
+            units += character.len_utf16() as u32;
+            scalars += 1;
+            if units > at.character { return None; }
+        }
+        (units == at.character).then_some(LspPosition::new(at.line, scalars))
+    }
+
     pub fn set_editor_diagnostics(&mut self, diagnostics: Vec<crate::lsp::LspDiagnostic>) {
         self.language.marks = if let DocumentState::Editable(document) = &self.document {
             diagnostics
@@ -2994,8 +3082,34 @@ impl RepositoryRuntime {
         } else {
             vec![]
         };
+        self.language.code_action_lines = self.language.marks.iter().map(|diagnostic| diagnostic.start.line).collect();
+        self.language.code_action_lines.sort_unstable();
+        self.language.code_action_lines.dedup();
         self.language.diagnostics = diagnostics;
     }
+
+    pub fn set_editor_rename(&mut self, draft: Option<String>) {
+        if draft.is_some() { self.dismiss_editor_results(); }
+        self.language.rename = draft;
+    }
+    pub fn editor_feature_ui_open(&self) -> bool { self.language.rename.is_some() || !self.language.code_actions.is_empty() }
+    pub fn set_editor_code_actions(&mut self, items: &[crate::lsp::LspCodeAction]) {
+        self.language.available_actions_at = if items.is_empty() { None } else {
+            match &self.document { DocumentState::Editable(document) => Some((document.revision, document.content.cursor().position)), _ => None }
+        };
+        self.language.code_action_selected = items.iter().position(|item| item.is_preferred && item.disabled.is_none()).or_else(|| items.iter().position(|item| item.disabled.is_none())).unwrap_or(0);
+        self.language.code_actions = items.iter().map(|item| EditorCodeAction { title: item.title.clone(), disabled: item.disabled.clone() }).collect();
+        self.language.completions.clear();
+        self.language.hover.clear();
+    }
+    pub fn set_editor_code_action_support(&mut self, supported: bool) { self.language.code_action_support = supported; }
+    pub fn set_editor_signature(&mut self, signature: Option<crate::lsp::LspSignatureHelp>) {
+        self.language.signature = signature.filter(|help| help.signatures.get(help.active_signature).is_some());
+    }
+    pub fn editor_signature_visible(&self) -> bool { self.editor_signature_help().is_some() }
+    pub fn editor_signature_help(&self) -> Option<&crate::lsp::LspSignatureHelp> { self.language.signature.as_ref().filter(|help| help.signatures.get(help.active_signature).is_some()) }
+    pub fn editor_diagnostics(&self) -> &[crate::lsp::LspDiagnostic] { &self.language.diagnostics }
+    pub fn rename_focus_id(card: CardId) -> widget::Id { widget::Id::new(format!("editor.rename.{card}")) }
 
     pub fn set_editor_completions(&mut self, items: Vec<LspCompletionItem>) {
         self.language.selected = items.iter().position(|item| item.preselect).unwrap_or(0);
@@ -3011,10 +3125,16 @@ impl RepositoryRuntime {
         });
     }
 
-    pub fn dismiss_editor_results(&mut self) {
+    pub(crate) fn dismiss_editor_choices(&mut self) {
+        self.language.code_actions.clear();
         self.language.completions.clear();
         self.language.hover.clear();
         self.language.hover_at = None;
+    }
+
+    pub fn dismiss_editor_results(&mut self) {
+        self.dismiss_editor_choices();
+        self.language.signature = None;
     }
 
     /// Moves the caret to a protocol position, for jump-to-location.
@@ -3454,6 +3574,8 @@ impl RepositoryRuntime {
     /// consequently nothing to refuse on that ground, and pretending to check
     /// would only suggest the field exists.
     pub fn apply_completion(&mut self, item: &LspCompletionItem) -> bool {
+        if self.is_read_only_source() { return false; }
+        if self.workspace_edit_pending() { return false; }
         if self.source_surface != SourceSurface::Editor {
             return false;
         }
@@ -3753,11 +3875,138 @@ impl RepositoryRuntime {
     }
 
     /// The live buffer, or nothing while no editable document is open.
+    /// The standalone LSP concern retains the editor's existing four-space
+    /// default. The indentation concern supplies per-file detected/configured
+    /// values through this same small interface during integration.
+    pub fn editor_formatting_options(&self) -> (u32, bool) { (4, true) }
+
     pub fn editor_text(&self) -> Option<String> {
         match &self.document {
             DocumentState::Editable(document) => Some(document.content.text()),
             _ => None,
         }
+    }
+
+    pub fn workspace_edit_source(&self) -> Option<PathBuf> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        Some(self.descriptor.worktree.join(&document.source))
+    }
+
+    /// Includes pending and read-only selected files so a workspace edit cannot
+    /// classify a mounted file as unopened while its async read is completing.
+    pub fn workspace_edit_candidate_source(&self) -> Option<PathBuf> {
+        self.workspace_edit_source().or_else(|| self.selected.as_ref().map(|file| self.descriptor.worktree.join(&file.path)))
+    }
+
+    pub fn workspace_edit_snapshot_size(&self) -> usize {
+        match &self.document { DocumentState::Editable(document) => document.content.text_len(), _ => 0 }
+    }
+
+    /// Explicit operation snapshot, taken once for a server edit preview.
+    pub fn workspace_edit_snapshot(&self) -> Option<(PathBuf, crate::editor_workspace_edit::OpenSnapshot)> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        Some((self.descriptor.worktree.join(&document.source), crate::editor_workspace_edit::OpenSnapshot {
+            text: document.content.text().into(), version: document.lsp_version, protocol_version: None,
+            writable: !self.is_saving() && !self.is_read_only_source(),
+        }))
+    }
+
+    /// Proves that the preview still addresses this exact buffer, then freezes
+    /// mutations until the disk phase completes. No edit is made in this phase.
+    pub fn begin_workspace_edit(&mut self, ticket: u64, plan: &crate::editor_workspace_edit::DocumentPlan) -> Result<(), String> {
+        if self.is_read_only_source() { return Err("Dependency sources are read-only".into()); }
+        self.flush_lsp_change();
+        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
+        if document.active_save.is_some() || document.workspace_edit.is_some()
+            || Some(document.lsp_version) != plan.version || !content_matches(&document.content, &plan.before) {
+            return Err("An edited buffer changed after the preview was prepared".into());
+        }
+        let offsets = plan.edits.iter().flat_map(|edit| [edit.range.start, edit.range.end]).collect::<Vec<_>>();
+        let positions = document.content.positions_for_offsets(&offsets).ok_or("The server edit names an invalid native boundary")?;
+        let mut changes = Vec::new();
+        for (index, edit) in plan.edits.iter().enumerate().rev() {
+            if plan.before.get(edit.range.clone()) == Some(edit.new_text.as_str()) { continue; }
+            let (start, end) = (positions[index * 2], positions[index * 2 + 1]);
+            let expected = plan.before.get(edit.range.clone()).ok_or("The server edit has an invalid range")?;
+            if document.content.range_end(start, expected) != Some(end) { return Err("The server edit does not address the native buffer".into()); }
+            let change = document.content.range_change(start, end, &edit.new_text).ok_or("The server edit does not address a native text range")?;
+            changes.push(change);
+        }
+        // Keep the explicit whole-transition helper usable for reload/tests.
+        if plan.edits.is_empty() && plan.before != plan.after {
+            changes.push(document.content.replacement_to_text(&plan.after).ok_or("This buffer cannot represent the server edit safely")?);
+        }
+        document.workspace_edit = Some((ticket, changes));
+        Ok(())
+    }
+
+    pub fn cancel_workspace_edit(&mut self, ticket: u64) {
+        if let DocumentState::Editable(document) = &mut self.document {
+            if document.workspace_edit.as_ref().is_some_and(|(current, _)| *current == ticket) {
+                document.workspace_edit = None;
+            }
+        }
+    }
+
+    /// Publishes one prepared transition as exactly one ordinary per-buffer Undo
+    /// step. The saved disk baseline is retained, so the resulting open buffer
+    /// remains dirty until the user saves it.
+    pub fn finish_workspace_edit(&mut self, ticket: u64) -> Result<(), String> {
+        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
+        if !document.workspace_edit.as_ref().is_some_and(|(current, _)| *current == ticket) {
+            return Err("The workspace-edit publication is stale".into());
+        }
+        let (_, changes) = document.workspace_edit.take().unwrap();
+        if changes.is_empty() { return Ok(()); }
+        let cursor = document.content.cursor();
+        let scroll = document.content.scroll_position();
+        let mut buffer = ProtocolTracked { content: &mut document.content, edits: Vec::new() };
+        for (index, change) in changes.iter().enumerate() {
+            if !buffer.replace(change.start, &change.removed, &change.inserted, &change.inserted_breaks) {
+                let mut restored = true;
+                for previous in changes[..index].iter().rev() {
+                    restored &= buffer.replace(previous.start, &previous.inserted, &previous.removed, &previous.removed_breaks);
+                }
+                buffer.content.set_cursor(cursor);
+                buffer.content.restore_scroll_position(scroll);
+                return Err(if restored { "The prepared edit could not be applied; the buffer was preserved" } else { "The prepared edit failed and its buffer rollback could not complete" }.into());
+            }
+        }
+        document.content.set_cursor(cursor);
+        document.content.restore_scroll_position(scroll);
+        document.history.record_group(changes, cursor, document.content.cursor(), Instant::now());
+        document.text_changed();
+        if let Some(version) = document.bump_lsp_version() {
+            self.lsp_edits.clear();
+            self.lsp_edits_exact = false;
+            self.lsp_intents.push(LspIntent::Change { version, text: document.content.text() });
+        }
+        self.refresh_find_matches();
+        Ok(())
+    }
+
+    pub fn editor_text_in_range(&self, range: LspRange) -> Option<String> {
+        let text = self.editor_text()?;
+        text.get(byte_offset(&text, range.start)?..byte_offset(&text, range.end)?).map(str::to_owned)
+    }
+
+    pub fn editor_selection_range(&self) -> Option<LspRange> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        let (start, end) = document.content.selected_bounds()?;
+        Some(LspRange::new(caret_position(&document.content, start)?, caret_position(&document.content, end)?))
+    }
+
+    /// Installs a worker-built, virtualized comparison in a dedicated preview
+    /// runtime. This runtime never owns an editable document or a Git baseline.
+    pub fn set_workspace_preview(&mut self, path: PathBuf, model: DiffModel) {
+        self.files = FileListState::Ready(Vec::new());
+        self.selected = Some(RepositoryFile { path, unstaged: true, ..RepositoryFile::default() });
+        self.document = DocumentState::None;
+        self.source_surface = SourceSurface::Diff;
+        self.diff_basis = DiffBasis::IndexToWorktree;
+        self.set_diff_state(self.diff_basis.clone(), DiffState::ready(RenderedDiff::Text {
+            model, old_label: "Before".into(), new_label: "After applying".into(),
+        }));
     }
 
     pub fn selected_staging_selection(
@@ -3944,9 +4193,10 @@ impl RepositoryRuntime {
     fn step_history(&mut self, card: CardId, redo: bool) -> Task<RepositoryAction> {
         // The same gates as typing: a history step is an edit, and find
         // holds the buffer read-only while it is open.
-        if self.search_mode || self.source_surface != SourceSurface::Editor {
+        if self.search_mode || self.source_surface != SourceSurface::Editor || self.workspace_edit_pending() || self.is_read_only_source() {
             return Task::none();
         }
+        self.dismiss_editor_results();
         let DocumentState::Editable(document) = &mut self.document else {
             return Task::none();
         };
@@ -4063,6 +4313,7 @@ impl RepositoryRuntime {
     /// one timer or one immutable CPU snapshot exists, even under continuous
     /// typing or selection/basis churn. The timer observes the latest deadline.
     pub fn working_diff_task(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if self.is_read_only_source() { return Task::none(); }
         let wanted = self.wanted_working_diff();
         if !same_diff_revision(&wanted, &self.working_diff.desired) {
             self.working_diff.desired = wanted;
@@ -4313,8 +4564,48 @@ impl RepositoryRuntime {
         matches!(&self.document, DocumentState::Editable(document) if document.dirty)
     }
 
+    /// Builds a language-feature action only for the mounted source buffer.
+    /// Applications also check the corresponding live server capability.
+    pub fn editor_language_feature_action(&self, card: CardId, feature: EditorLanguageFeature) -> Option<RepositoryAction> {
+        self.editor_focus_target(card)?;
+        self.lsp_document()?;
+        self.cursor_position()?;
+        if self.is_saving() || (feature != EditorLanguageFeature::Signature && self.is_read_only_source()) { return None; }
+        let action = match feature {
+            EditorLanguageFeature::Rename => EditorLspAction::Rename,
+            EditorLanguageFeature::FormatDocument => EditorLspAction::Format { selection: false },
+            EditorLanguageFeature::FormatSelection => {
+                self.editor_selection_range()?;
+                EditorLspAction::Format { selection: true }
+            }
+            EditorLanguageFeature::CodeActions => EditorLspAction::CodeActions,
+            EditorLanguageFeature::Signature => EditorLspAction::Signature,
+        };
+        Some(RepositoryAction::Language { card, action })
+    }
+
+    /// Returns the exact toolbar action when its current document can accept
+    /// it. Palette and remapped shortcuts use this same activation-time guard.
+    pub fn editor_surface_command_action(&self, card: CardId, command: EditorSurfaceCommand) -> Option<RepositoryAction> {
+        self.selected.as_ref()?;
+        Some(match command {
+            EditorSurfaceCommand::Save if self.can_save() => RepositoryAction::Save { card, overwrite: false },
+            EditorSurfaceCommand::DiscardEdits if self.can_discard_edits() => RepositoryAction::DiscardEdits { card },
+            EditorSurfaceCommand::Edit if self.can_apply_markdown_mode(false) => RepositoryAction::ApplyMarkdownMode { card, preview: false },
+            EditorSurfaceCommand::Preview => {
+                let file_information = !matches!(&self.document, DocumentState::Editable(_) | DocumentState::Image { .. });
+                if file_information && !self.is_saving() { RepositoryAction::ApplySourceSurface { card, diff: false } }
+                else if !file_information && self.can_apply_markdown_mode(true) { RepositoryAction::ApplyMarkdownMode { card, preview: true } }
+                else { return None; }
+            }
+            EditorSurfaceCommand::Diff if self.can_show_diff() => RepositoryAction::ApplySourceSurface { card, diff: true },
+            _ => return None,
+        })
+    }
+
     pub fn can_save(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none())
+        if self.is_read_only_source() { return false; }
+        matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none() && document.workspace_edit.is_none())
     }
 
     fn can_discard_edits(&self) -> bool {
@@ -4325,8 +4616,12 @@ impl RepositoryRuntime {
         !self.standalone && self.selected.is_some() && !self.is_saving()
     }
 
+    pub fn workspace_edit_pending(&self) -> bool {
+        matches!(&self.document, DocumentState::Editable(document) if document.workspace_edit.is_some())
+    }
+
     pub fn is_saving(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if document.active_save.is_some())
+        matches!(&self.document, DocumentState::Editable(document) if document.active_save.is_some() || document.workspace_edit.is_some())
     }
 
     pub fn blocks_navigation(&self) -> bool {
@@ -4345,7 +4640,7 @@ impl RepositoryRuntime {
             &self.document,
             DocumentState::Editable(document)
                 if document.dirty
-                    && document.active_save.is_none()
+                    && document.active_save.is_none() && document.workspace_edit.is_none()
                     && document.durability_warning.is_none()
         )
     }
@@ -4495,6 +4790,7 @@ impl RepositoryRuntime {
             can_select_staged_diff: self.can_select_diff_basis(&DiffBasis::HeadToIndex),
             can_select_unstaged_diff: self.can_select_diff_basis(&DiffBasis::IndexToWorktree),
             can_back: selected
+                && !self.is_read_only_source()
                 && self.descriptor.selected_file.is_none()
                 && !self.blocks_navigation(),
         }
@@ -4574,7 +4870,7 @@ impl RepositoryRuntime {
             DocumentState::Editable(document)
                 if self.auto_save
                     && document.dirty
-                    && document.active_save.is_none()
+                    && document.active_save.is_none() && document.workspace_edit.is_none()
                     && !document.conflict
                     && document.error.is_none()
                     && document.durability_warning.is_none() =>
@@ -4613,6 +4909,13 @@ impl RepositoryRuntime {
         })
     }
 
+    pub fn take_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) -> bool {
+        if ticket != self.next_auto_save_ticket || !self.accepts_selected(identity)
+            || self.auto_save_pending != Some((identity.generation, revision)) || self.auto_save_revision() != Some(revision) { return false; }
+        self.auto_save_pending = None;
+        true
+    }
+
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
         self.request_save_inner(card, overwrite, true)
     }
@@ -4623,10 +4926,11 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
+        if self.is_read_only_source() { return Task::none(); }
         let (path, destination, text, disk_hash, revision) = match &self.document {
             DocumentState::Editable(document)
                 if (document.dirty || document.durability_warning.is_some())
-                    && document.active_save.is_none() =>
+                    && document.active_save.is_none() && document.workspace_edit.is_none() =>
             {
                 (
                     document.path.clone(),
@@ -4684,6 +4988,7 @@ impl RepositoryRuntime {
     }
 
     fn update_inner(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
+        if self.workspace_edit_pending() && matches!(&action, RepositoryAction::FileLoaded { .. }) { return Task::none(); }
         if matches!(
             &action,
             RepositoryAction::Save { .. }
@@ -5167,6 +5472,7 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::EditorAction { card, action } => {
+                if (self.workspace_edit_pending() || self.is_read_only_source()) && matches!(action, text_editor::Action::Edit(_)) { return Task::none(); }
                 if self.search_mode && !matches!(action, text_editor::Action::Scroll { .. }) {
                     return Task::none();
                 }
@@ -5176,7 +5482,11 @@ impl RepositoryRuntime {
                 if self.source_surface != SourceSurface::Editor {
                     return Task::none();
                 }
-                if !matches!(action, text_editor::Action::Scroll { .. }) {
+                if matches!(action, text_editor::Action::Edit(_)) {
+                    // Ordinary argument typing closes choices but keeps the
+                    // call signature until a trigger refresh, ')' or Escape.
+                    self.dismiss_editor_choices();
+                } else if !matches!(action, text_editor::Action::Scroll { .. }) {
                     self.dismiss_editor_results();
                 }
                 let applied = match &mut self.document {
@@ -5197,6 +5507,13 @@ impl RepositoryRuntime {
             }
             RepositoryAction::Language { action, .. } => {
                 match action {
+                    EditorLspAction::CodeActionNext(forward) if !self.language.code_actions.is_empty() => {
+                        let count = self.language.code_actions.len();
+                        for _ in 0..count {
+                            self.language.code_action_selected = if forward { (self.language.code_action_selected + 1) % count } else { (self.language.code_action_selected + count - 1) % count };
+                            if self.language.code_actions[self.language.code_action_selected].disabled.is_none() { break; }
+                        }
+                    }
                     EditorLspAction::Next(forward) if !self.language.completions.is_empty() => {
                         let count = self.language.completions.len();
                         self.language.selected = if forward {
@@ -5336,6 +5653,7 @@ impl RepositoryRuntime {
                 }
             }
             RepositoryAction::Reload { card } => {
+                if self.is_read_only_source() { return self.initial_load(card); }
                 if self.is_saving() {
                     return Task::none();
                 }
@@ -5367,7 +5685,7 @@ impl RepositoryRuntime {
             RepositoryAction::Undo { card } => self.step_history(card, false),
             RepositoryAction::Redo { card } => self.step_history(card, true),
             RepositoryAction::BackToFiles { card } => {
-                if self.descriptor.selected_file.is_some() || self.blocks_navigation() {
+                if self.is_read_only_source() || self.descriptor.selected_file.is_some() || self.blocks_navigation() {
                     return Task::none();
                 }
                 self.retain_viewports();
@@ -5818,10 +6136,12 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ToggleReplace { .. } => {
+                if self.is_read_only_source() { return Task::none(); }
                 self.replace_open = !self.replace_open;
                 Task::none()
             }
             RepositoryAction::ReplaceMatch { card, all } => {
+                if self.is_read_only_source() || self.workspace_edit_pending() { return Task::none(); }
                 if self.is_saving() {
                     return Task::none();
                 }
@@ -5965,6 +6285,7 @@ impl RepositoryRuntime {
     /// cached, but navigating away cancels unfinished work rather than merely
     /// discarding its expensive result later.
     fn ensure_current_diff(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if self.is_read_only_source() { return Task::none(); }
         let showing_diff =
             self.source_surface == SourceSurface::Diff && self.basis_resolution.is_none();
         self.diffs.retain(|(basis, state)| {
@@ -6070,6 +6391,37 @@ impl RepositoryRuntime {
         self.request_diff(identity, basis, old_path)
     }
 
+    /// Open a repository-relative location, even before the directory listing
+    /// arrives. Coordinates are zero-based native line/UTF-8 byte positions.
+    /// The requested range is clamped when the asynchronous file read finishes.
+    pub fn open_file_location(&mut self, card: CardId, path: PathBuf, line: usize, column: usize, selection_bytes: usize) -> Task<RepositoryAction> {
+        if crate::repository::RepoPath::parse(&path).is_err() { return Task::none(); }
+        let caret = text_editor::Position { line, column };
+        let selection = (selection_bytes > 0).then_some(text_editor::Position { line, column: column.saturating_add(selection_bytes) });
+        if self.selected_path() == Some(path.as_path())
+            && let DocumentState::Editable(document) = &mut self.document
+        {
+            document.content.set_cursor(text_editor::Cursor { position: caret, selection });
+            document.content.restore_scroll_position(text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 });
+            self.source_surface = SourceSurface::Editor;
+            self.markdown_mode = MarkdownMode::Edit;
+            return self.focus_editor(card);
+        }
+        if self.blocks_navigation() { return Task::none(); }
+        let loading_same = self.selected_path() == Some(path.as_path()) && matches!(self.document, DocumentState::Loading);
+        let task = if loading_same { Task::none() } else {
+            let file = self.file(&path).cloned().unwrap_or(RepositoryFile { path: path.clone(), ..RepositoryFile::default() });
+            if file.directory { return Task::none(); }
+            self.open_file_entry(card, file)
+        };
+        self.pending_editor_navigation = Some((path, crate::model::EditorNavigation {
+            caret: crate::model::EditorPosition { line, column },
+            selection: selection.map(|position| crate::model::EditorPosition { line: position.line, column: position.column }),
+            scroll_line: line.saturating_sub(10), scroll_vertical: 0.0, scroll_horizontal: 0.0,
+        }));
+        task
+    }
+
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
         let file = match self.file(&path).cloned() {
             Some(file) => file,
@@ -6094,6 +6446,7 @@ impl RepositoryRuntime {
     }
 
     fn open_file_entry(&mut self, card: CardId, file: RepositoryFile) -> Task<RepositoryAction> {
+        if self.is_read_only_source() { return Task::none(); }
         if let Err(error) = self.protect_editor_worktree(&self.descriptor.worktree.clone()) {
             self.files = FileListState::Failed(error.to_string());
             return Task::none();
@@ -7437,6 +7790,7 @@ impl widget::menu::Action for EditorMenuCommand {
 fn editor_context_menu(
     card: CardId,
     document: &EditorDocument,
+    read_only: bool,
 ) -> Vec<widget::menu::Tree<RepositoryAction>> {
     use widget::menu::{Item, KeyBind, key_bind::Modifier};
     let chord = |modifiers: &[Modifier], key: &str| KeyBind {
@@ -7449,19 +7803,19 @@ fn editor_context_menu(
             "Undo",
             EditorMenuCommand::Undo(card),
             chord(&ctrl, "z"),
-            document.history.can_undo(),
+            !read_only && document.history.can_undo(),
         ),
         (
             "Redo",
             EditorMenuCommand::Redo(card),
             chord(&[Modifier::Ctrl, Modifier::Shift], "z"),
-            document.history.can_redo(),
+            !read_only && document.history.can_redo(),
         ),
         (
             "Cut",
             EditorMenuCommand::Clipboard(card, ClipboardOp::Cut),
             chord(&ctrl, "x"),
-            true,
+            !read_only,
         ),
         (
             "Copy",
@@ -7473,7 +7827,7 @@ fn editor_context_menu(
             "Paste",
             EditorMenuCommand::Clipboard(card, ClipboardOp::Paste),
             chord(&ctrl, "v"),
-            true,
+            !read_only,
         ),
         (
             "Select all",
@@ -7625,23 +7979,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             && (!editable || !editing)
             && (file_information || runtime.can_apply_markdown_mode(true)),
     )
-    .on_press_maybe(
-        (if file_information {
-            !runtime.is_saving()
-        } else {
-            runtime.can_apply_markdown_mode(true)
-        })
-        .then(|| {
-            if file_information {
-                RepositoryAction::ApplySourceSurface { card, diff: false }
-            } else {
-                RepositoryAction::ApplyMarkdownMode {
-                    card,
-                    preview: true,
-                }
-            }
-        }),
-    );
+    .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Preview));
     let preview = if editable {
         preview
     } else {
@@ -7649,12 +7987,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     };
     let edit = icon_button(Icon::Edit, "Edit file")
         .selected(editable && editing && runtime.can_apply_markdown_mode(false))
-        .on_press_maybe(runtime.can_apply_markdown_mode(false).then(|| {
-            RepositoryAction::ApplyMarkdownMode {
-                card,
-                preview: false,
-            }
-        }));
+        .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Edit));
     let edit = if editable {
         edit.id(focus_restore_id(card))
     } else {
@@ -7666,11 +7999,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             edit.into(),
             icon_button(Icon::Diff, "View diff")
                 .selected(runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff())
-                .on_press_maybe(
-                    runtime
-                        .can_show_diff()
-                        .then(|| RepositoryAction::ApplySourceSurface { card, diff: true }),
-                )
+                .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Diff))
                 .into(),
         ])];
     // File actions stay mounted whether or not they can run: an inactive
@@ -7683,11 +8012,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 Icon::RevertFile,
                 "Discard unsaved edits (Ctrl+Z restores them)",
             )
-            .on_press_maybe(
-                runtime
-                    .can_discard_edits()
-                    .then(|| RepositoryAction::DiscardEdits { card }),
-            )
+            .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::DiscardEdits))
             .into(),
         );
         controls.push(
@@ -7702,10 +8027,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 },
             )
             .selected(runtime.is_dirty())
-            .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
-                card,
-                overwrite: false,
-            }))
+            .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Save))
             .into(),
         );
     }
@@ -7878,7 +8200,7 @@ fn find_strip<'a>(
     let mut row: Vec<Element<'a, RepositoryAction>> = vec![
         icon_button(Icon::Search, "Find and replace")
             .selected(runtime.replace_open)
-            .on_press(RepositoryAction::ToggleReplace { card })
+            .on_press_maybe((!runtime.is_read_only_source()).then_some(RepositoryAction::ToggleReplace { card }))
             .into(),
         crate::ui_controls::field::search("Find in file", &runtime.find_query)
             .id(find_focus_id(card))
@@ -7938,7 +8260,7 @@ fn find_strip<'a>(
         .align_y(Alignment::Center)
         .width(Length::Fill);
     let mut strips: Vec<Element<'a, RepositoryAction>> = vec![find.into()];
-    if runtime.replace_open {
+    if runtime.replace_open && !runtime.is_read_only_source() {
         strips.push(
             widget::row::with_children(vec![
                 crate::ui_controls::field::text("Replace with", &runtime.replace_query)
@@ -8508,6 +8830,7 @@ fn editable_document_view<'a>(
                 &[]
             })
             .diagnostics(&runtime.language.marks)
+            .code_action_lines(&runtime.language.code_action_lines, runtime.language.available_actions_at.filter(|(revision, _)| *revision == document.revision).map(|(_, at)| at))
             .popup(
                 popup,
                 if runtime.language.completions.is_empty() {
@@ -8541,6 +8864,9 @@ fn editable_document_view<'a>(
             })
             .key_binding(move |press| {
                 use iced::keyboard::{Key, key::Named};
+                // Highlighted dependency sources retain caret/copy/navigation,
+                // while Tab leaves the read-only viewer through normal focus traversal.
+                if runtime.is_read_only_source() && matches!(&press.key, Key::Named(Named::Tab)) { return None; }
                 if let Some(delta) = crate::interaction::font_zoom_chord(
                     &press.key,
                     press.physical_key,
@@ -8569,6 +8895,8 @@ fn editable_document_view<'a>(
                     {
                         Some(EditorLspAction::Complete)
                     }
+                    Key::Named(Named::F2) if press.modifiers.is_empty() => Some(EditorLspAction::Rename),
+                    Key::Character(character) if character.as_str() == "." && press.modifiers.command() => Some(EditorLspAction::CodeActions),
                     Key::Named(Named::F12) => Some(if press.modifiers.shift() {
                         EditorLspAction::References
                     } else {
@@ -8576,10 +8904,15 @@ fn editable_document_view<'a>(
                     }),
                     Key::Named(Named::Escape)
                         if !runtime.language.completions.is_empty()
-                            || !runtime.language.hover.is_empty() =>
+                            || !runtime.language.hover.is_empty()
+                            || runtime.language.signature.is_some()
+                            || !runtime.language.code_actions.is_empty() =>
                     {
                         Some(EditorLspAction::Dismiss)
                     }
+                    Key::Named(Named::ArrowDown) if !runtime.language.code_actions.is_empty() => Some(EditorLspAction::CodeActionNext(true)),
+                    Key::Named(Named::ArrowUp) if !runtime.language.code_actions.is_empty() => Some(EditorLspAction::CodeActionNext(false)),
+                    Key::Named(Named::Enter) if !runtime.language.code_actions.is_empty() => Some(EditorLspAction::ChooseCodeAction(runtime.language.code_action_selected)),
                     Key::Named(Named::ArrowDown) if !runtime.language.completions.is_empty() => {
                         Some(EditorLspAction::Next(true))
                     }
@@ -8603,10 +8936,61 @@ fn editable_document_view<'a>(
                     })
                     .or_else(|| text_editor::default_bindings(press))
             });
+        let editor = if runtime.language.code_action_support && !runtime.is_read_only_source() {
+            editor.on_code_action(move |at| RepositoryAction::Language { card, action: EditorLspAction::CodeActionsAt(caret_position(&document.content, at)) })
+        } else { editor };
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
-        crate::interaction::context_menu(editor, editor_context_menu(card, document))
+        crate::interaction::context_menu(editor, editor_context_menu(card, document, runtime.is_read_only_source()))
     };
+    if runtime.is_read_only_source() {
+        error_rows.push(crate::design::caption("Read-only dependency source · Go to definition remains available").into());
+    }
+    if let Some(draft) = &runtime.language.rename {
+        error_rows.push(widget::row::with_children(vec![
+            crate::ui_controls::field::text("New symbol name", draft)
+                .id(RepositoryRuntime::rename_focus_id(card))
+                .on_input(move |draft| RepositoryAction::Language { card, action: EditorLspAction::RenameDraft(draft) })
+                .on_submit(move |value| RepositoryAction::Language { card, action: EditorLspAction::SubmitRename(value) })
+                .width(Length::Fill).into(),
+            crate::ui_controls::button::primary("Preview rename").on_press(RepositoryAction::Language { card, action: EditorLspAction::SubmitRename(draft.clone()) }).into(),
+            crate::ui_controls::button::secondary("Cancel").on_press(RepositoryAction::Language { card, action: EditorLspAction::CancelRename }).into(),
+        ]).spacing(space::S).align_y(Alignment::Center).into());
+    }
+    if !runtime.language.code_actions.is_empty() {
+        let first = runtime.language.code_action_selected / 8 * 8;
+        let end = (first + 8).min(runtime.language.code_actions.len());
+        let rows = runtime.language.code_actions.iter().enumerate().skip(first).take(8).map(|(index, action)| {
+            let label = crate::design::body(action.disabled.as_ref().map_or_else(|| action.title.clone(), |reason| format!("{} — {reason}", action.title)))
+                .wrapping(iced::widget::text::Wrapping::None).ellipsize(iced::widget::text::Ellipsize::End(iced::advanced::text::EllipsizeHeightLimit::Lines(1)));
+            widget::button::custom(label).class(crate::ui_controls::control_style(index == runtime.language.code_action_selected, None))
+                .width(Length::Fill).on_press_maybe(action.disabled.is_none().then_some(RepositoryAction::Language { card, action: EditorLspAction::ChooseCodeAction(index) })).into()
+        }).collect::<Vec<_>>();
+        error_rows.push(widget::container(widget::scrollable(widget::column::with_children(rows).spacing(space::XS)).height(Length::Shrink)).max_height(240).into());
+        error_rows.push(widget::row::with_children(vec![
+            crate::design::caption(format!("Actions {}–{} of {} · ↑ ↓ choose · Enter apply · Escape close", first + 1, end, runtime.language.code_actions.len())).width(Length::Fill).into(),
+            crate::ui_controls::button::secondary("Previous").on_press(RepositoryAction::Language { card, action: EditorLspAction::CodeActionNext(false) }).into(),
+            crate::ui_controls::button::secondary("Next").on_press(RepositoryAction::Language { card, action: EditorLspAction::CodeActionNext(true) }).into(),
+        ]).spacing(space::S).into());
+    }
+    if let Some(help) = &runtime.language.signature {
+        if let Some(signature) = help.signatures.get(help.active_signature) {
+            let active = signature.active_parameter.or(help.active_parameter).and_then(|index| signature.parameters.get(index));
+            let active_range = active.and_then(|parameter| parameter.range.clone()).filter(|range| range.start <= range.end && signature.label.is_char_boundary(range.start) && signature.label.is_char_boundary(range.end) && range.end <= signature.label.len());
+            let label: Element<'_, RepositoryAction> = if let Some(range) = active_range {
+                widget::row::with_children(vec![
+                    crate::design::body(&signature.label[..range.start]).font(Font::MONOSPACE).into(),
+                    crate::design::body(&signature.label[range.clone()]).font(Font { weight: iced::font::Weight::Bold, ..Font::MONOSPACE }).into(),
+                    crate::design::body(&signature.label[range.end..]).font(Font::MONOSPACE).into(),
+                ]).into()
+            } else { crate::design::body(signature.label.clone()).font(Font::MONOSPACE).into() };
+            let mut rows = vec![label];
+            if let Some(parameter) = active {
+                rows.push(crate::design::caption(format!("Parameter: {}{}", parameter.label, parameter.documentation.as_ref().map_or(String::new(), |doc| format!(" · {doc}")))).font(Font { weight: iced::font::Weight::Bold, ..Font::MONOSPACE }).into());
+            }
+            error_rows.push(widget::column::with_children(rows).spacing(space::XS).into());
+        }
+    }
     // Keep the named editor in the same slot when save warnings appear.
     let error_slot = widget::column::with_children(error_rows).width(Length::Fill);
     widget::column::with_children([error_slot.into(), content])
@@ -10493,6 +10877,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn argument_typing_retains_signature_help_but_explicit_dismiss_closes_it() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "call.rs", "call(");
+        runtime.set_editor_signature(Some(crate::lsp::LspSignatureHelp { signatures: vec![crate::lsp::LspSignature { label: "call(argument: i32)".into(), documentation: None, parameters: Vec::new(), active_parameter: Some(0) }], active_signature: 0, active_parameter: Some(0) }));
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('1')) }));
+        assert!(runtime.language.signature.is_some());
+        drop(runtime.update(RepositoryAction::Language { card, action: EditorLspAction::Dismiss }));
+        assert!(runtime.language.signature.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_loaded_alias_reports_the_actual_source_identity_for_tab_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("real.rs"), "source\n").unwrap();
+        std::os::unix::fs::symlink("real.rs", root.path().join("alias.rs")).unwrap();
+        let card = CardId::new();
+        let view = RepositoryView { project: crate::model::ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: Some("alias.rs".into()) };
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        let task = runtime.open_file_location(card, "alias.rs".into(), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(runtime.editor_text().as_deref(), Some("source\n"));
+        assert_eq!(runtime.source_tab_path(), Some(root.path().join("real.rs")));
+    }
+
+    #[tokio::test]
+    async fn external_source_tabs_restore_navigation_and_refuse_every_editing_path() {
+        let worktree = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let path = external.path().join("stdlib.rs");
+        let original = "pub fn source() {}\nsource();\n";
+        std::fs::write(&path, original).unwrap();
+        let card = CardId::new();
+        let view = RepositoryView { project: crate::model::ProjectId::new(), repository: worktree.path().into(), worktree: worktree.path().into(), selected_file: None };
+        let mut runtime = RepositoryRuntime::new(view.clone());
+        runtime.set_external_source(path.clone());
+        let load = runtime.initial_load(card);
+        finish_navigation_task(&mut runtime, load).await;
+        assert_eq!(runtime.editor_text().unwrap(), original);
+        assert!(runtime.is_read_only_source());
+        let intents = runtime.take_lsp_intents();
+        assert!(matches!(&intents[..], [LspIntent::Open { absolute_path, worktree: owner, .. }] if absolute_path == &path && owner == worktree.path()));
+        assert!(runtime.move_cursor_to(LspPosition::new(1, 3)));
+        for action in [
+            RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) },
+            RepositoryAction::Undo { card }, RepositoryAction::Redo { card },
+            RepositoryAction::Save { card, overwrite: true },
+            RepositoryAction::ReplaceMatch { card, all: true },
+            RepositoryAction::Clipboard { card, op: ClipboardOp::Cut },
+        ] { drop(runtime.update(action)); }
+        assert_eq!(runtime.editor_text().unwrap(), original);
+        assert!(!runtime.can_save());
+        assert!(!runtime.is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let navigation = runtime.navigation().unwrap();
+        assert_eq!(navigation.external_source.as_ref(), Some(&path));
+        assert!(navigation.selected_file.is_none());
+        let encoded = serde_json::to_string(&navigation).unwrap();
+        let navigation = serde_json::from_str(&encoded).unwrap();
+        let mut restored = RepositoryRuntime::new(view);
+        restored.restore_navigation(&navigation);
+        let load = restored.initial_load(card);
+        finish_navigation_task(&mut restored, load).await;
+        assert!(restored.is_read_only_source());
+        assert_eq!(restored.editor_text().unwrap(), original);
+        assert_eq!(restored.cursor_position(), Some(LspPosition::new(1, 3)));
+        drop(restored.refresh_visible(card));
+    }
+
     #[tokio::test]
     async fn folder_editor_navigation_survives_saved_file_and_sqlite_restart() {
         use crate::model::{CardKind, CardState, WorkspaceState};
@@ -10623,6 +11077,7 @@ mod tests {
             selected_file: None,
         };
         let navigation = crate::model::RepositoryNavigation {
+            external_source: None,
             project: view.project,
             worktree: view.worktree.clone(),
             selected_file: Some("notes.txt".into()),
@@ -10657,6 +11112,7 @@ mod tests {
             selected_file: Some("notes.txt".into()),
         };
         let navigation = crate::model::RepositoryNavigation {
+            external_source: None,
             project: view.project,
             worktree: view.worktree.clone(),
             selected_file: view.selected_file.clone(),
@@ -10708,6 +11164,7 @@ mod tests {
             selected_file: None,
         };
         let navigation = crate::model::RepositoryNavigation {
+            external_source: None,
             project: view.project,
             worktree: root,
             selected_file: Some("notes.txt".into()),
@@ -14627,6 +15084,7 @@ mod tests {
             message: "bad beta".into(),
             source: None,
             code: None,
+            protocol:None,
         }]);
         assert_eq!(runtime.language.marks.len(), 1);
         assert_eq!(
@@ -15845,6 +16303,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sparse_workspace_edits_retain_only_changed_fragments_in_one_undo_group() {
+        let card = CardId::new();
+        let before = format!("old();\n{}old();\n", "unchanged source line\n".repeat(16_000));
+        let after = before.replace("old()", "new_name()");
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, &before);
+        let last = before.rfind("old()").unwrap();
+        let plan = crate::editor_workspace_edit::DocumentPlan { path: "/repo/main.rs".into(), relative: "main.rs".into(),
+            before: before.clone().into(), after: after.clone().into(), before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: Vec::new(),
+            edits: [0, last].into_iter().map(|offset| crate::editor_workspace_edit::ResolvedEdit { range: offset..offset + 3, new_text: "new_name".into() }).collect() };
+        runtime.begin_workspace_edit(51, &plan).unwrap();
+        let DocumentState::Editable(document) = &runtime.document else { panic!("fixture editor"); };
+        let changes = &document.workspace_edit.as_ref().unwrap().1;
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().map(|change| change.removed.len() + change.inserted.len()).sum::<usize>() < 32, "the unchanged middle must not be copied into history");
+        runtime.finish_workspace_edit(51).unwrap();
+        assert_eq!(runtime.editor_text().unwrap(), after);
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), before);
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), after);
+    }
+
+    #[test]
+    fn workspace_edit_is_fenced_and_one_undo_step_per_buffer() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn old() {}\nold();\n");
+        let before = runtime.editor_text().unwrap();
+        let after = "fn renamed() {}\nrenamed();\n";
+        let plan = crate::editor_workspace_edit::DocumentPlan {
+            path: "/repo/main.rs".into(), relative: "main.rs".into(),
+            before: before.clone().into(), after: after.into(),
+            before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: vec![], edits: vec![],
+        };
+        runtime.begin_workspace_edit(42, &plan).unwrap();
+        assert!(runtime.is_saving());
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        assert_eq!(runtime.editor_text().unwrap(), before);
+        assert!(runtime.finish_workspace_edit(41).is_err());
+        runtime.finish_workspace_edit(42).unwrap();
+        assert_eq!(runtime.editor_text().unwrap(), after);
+        assert!(runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), before);
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), after);
+        assert!(runtime.begin_workspace_edit(43, &plan).is_err());
     }
 
     #[test]
@@ -18192,4 +18699,9 @@ mod tests {
             assert!(adjusted.b > adjusted.r && adjusted.r > adjusted.g);
         }
     }
+}
+
+/// The virtualized diff canvas used by a language-server workspace-edit preview.
+pub fn workspace_preview_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+    diff_surface(card, runtime, None)
 }

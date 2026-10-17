@@ -173,6 +173,8 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `show_status_bar` | boolean | `true` | Shows the bottom status bar with the usage limits left on each signed-in provider account. Hiding it also stops the usage checks that feed it, unless the Accounts pane is open |
 | `relaunch_agents_on_upgrade` | boolean | `true` | When a daemon upgrade finds an agent whose conversation cannot be resumed exactly, relaunches it into its provider's resume picker (or a fresh conversation, when it had none yet) instead of refusing the upgrade. Other running jobs still block the upgrade. `cagents daemon prepare-upgrade` and `install.sh --restart-daemon` follow this unless told otherwise; see [Daemon and upgrades](daemon.md#full-daemon-upgrades) |
 | `check_for_updates` | boolean | `true` | Looks for a new release at startup and every six hours. A background check that cannot reach the release server is logged and retried with backoff rather than reported; **Settings → About → Check for updates** always runs and reports its result |
+| `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |
+| `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
 | `shortcut_defaults_revision` | integer | `4` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
@@ -262,6 +264,17 @@ ansi = [
 ```
 
 ## Language servers
+
+Language servers are shared by workspace root. Rust selects the outermost Cargo
+workspace (or nearest Cargo package); JavaScript and TypeScript recognize npm
+workspaces, `pnpm-workspace.yaml`, and TypeScript project references. Discovery
+runs off the UI thread. The inspector lists live servers and their cached process
+RSS, refreshed in the background; RSS describes the server process, excluding its
+children. Closing the last document arms the idle timeout. Worktree removal
+retires its servers immediately; removals outside the app are detected within
+five seconds. When all slots have active documents, opening a new server reports
+the limit instead of evicting a server in use. Set the two scalar options before
+any TOML table headers.
 
 `language_servers` lists external Language Server Protocol (LSP) servers for
 the native editor. If the key is missing, cagents uses this built-in list. If
@@ -403,3 +416,62 @@ that is an absolute path to an executable file:
 This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
 unchanged.
+
+### Language-server editor options
+
+Each `[[language_servers]]` entry accepts `format_on_save` (default `false`),
+`formatting_timeout_ms` (default `1000`, range `50..=10000`),
+`initialization_options`, and `configuration`. Initialization options are sent
+unchanged in `initialize`; configuration is sent after initialization and used
+for `workspace/configuration` section requests. Dotted sections such as
+`rust-analyzer.check` select nested configuration objects. Each JSON value is
+limited to 1 MiB. For example, these fields belong to the rust-analyzer server:
+
+```toml
+format_on_save = true
+formatting_timeout_ms = 1000
+initialization_options = { check = { command = "clippy" } }
+configuration = { rust-analyzer = { check = { command = "clippy" } } }
+```
+
+Formatting timeouts report a terminal request failure and cancel the server
+request, allowing the application to continue saving. Workspace-edit file
+creation, file deletion, and file renaming are rejected before applying any
+text edits; ordinary multi-file text edits retain server versions and preview
+annotations for the application to validate and confirm.
+
+### Language-server editor commands
+
+With the text editor focused, `F2` prepares a symbol rename and opens an inline
+name field. Submit the field to inspect the proposed changes in a per-file diff
+preview, then apply or cancel. `Ctrl+.` requests code actions at the caret or
+selection. Disabled actions retain the server's explanation. The command palette
+also exposes Rename symbol, Format document, Format selection, Code actions, and
+Show signature help when the current server supports them. Signature help follows
+the server's trigger characters, emphasizes the active parameter, and closes on
+`)` or Escape.
+
+Rename and multi-file text edits require preview confirmation. Each participating
+open buffer retains one independent Undo step and remains unsaved. Unopened files
+use atomic, conflict-aware writes; if a later file refuses its write, earlier
+writes are restored only while their written contents still match. A concurrent
+outside edit is preserved and reported. Changed buffers, changed tab identities,
+overlapping ranges, unsupported file operations, and paths outside the worktree
+refuse the operation before application. Previews support up to 512 files and a
+64 MiB combined before/after text budget; ordinary editable-file limits still
+apply. Server confirmation labels and descriptions appear above the comparison.
+
+With `format_on_save = true`, explicit saves and autosaves request formatting
+first. A timeout or refusal reports the failure and continues the ordinary safe
+save; formatting never bypasses disk conflict checks. Formatting edits also
+retain Undo.
+
+Definitions outside the project open a highlighted, read-only source tab. Such
+tabs retain their original project's language-server workspace, so definition
+navigation continues to work inside dependency sources. Their source path and
+caret restore locally with the window; they do not become shared workspace
+recipes. Typing, clipboard cuts/pastes, formatting, refactoring, history replay,
+and saving cannot modify these dependency sources.
+
+Server errors remain dismissible notices. Informational server messages expire
+automatically, and server log messages go to the diagnostic log.

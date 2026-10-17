@@ -20,6 +20,7 @@ use crate::file_manager::{self, open_system_url};
 mod browser_backend;
 mod browser_host;
 mod file_ui;
+mod editor_features;
 mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
@@ -318,7 +319,12 @@ impl NoticeLog {
             repeats: 1,
         });
         while self.entries.len() > NOTICE_LOG_CAPACITY {
-            self.entries.pop_front();
+            // Keep unresolved failures visible when transient server messages
+            // arrive faster than their expiry. Within a severity, retire oldest.
+            let oldest = self.entries.iter().enumerate()
+                .min_by_key(|(_, entry)| entry.notice.severity)
+                .map(|(index, _)| index).expect("overflowing log is nonempty");
+            self.entries.remove(oldest);
         }
     }
 
@@ -4376,6 +4382,7 @@ pub enum Message {
     CancelResetSettings,
     SessionSaveHealthChanged(SessionSaveHealthEvent),
     Lsp(LspEvent),
+    EditorFeatures(editor_features::Action),
     LanguageServersReaped,
     RetrySessionSave,
     SessionRecovery(session_recovery::Action),
@@ -4841,6 +4848,7 @@ pub struct Cagents {
     /// session is per project root, not per card, so two cards in one worktree
     /// share the server rather than starting a second copy of it.
     lsp: LspManager,
+    editor_features: editor_features::State,
     /// Which card owns each open LSP document, so an event that names only a
     /// document reaches the surface that asked for it.
     lsp_documents: HashMap<LspDocumentId, CardId>,
@@ -10413,6 +10421,7 @@ impl Cagents {
                         .find(|channel| channel.cards.contains(&card.id))
                         .map(|channel| channel.id)
                         == self.durable.active_channel
+                    && self.durable.repository_navigation.get(&card.id).is_none_or(|navigation| navigation.external_source.is_none())
                     && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
             })
             .map(|card| card.id)
@@ -10547,7 +10556,7 @@ impl Cagents {
                     }
                     if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                         runtime.set_editor_diagnostics(vec![]);
-                        runtime.dismiss_editor_results();
+                        runtime.dismiss_editor_choices();
                     }
                 }
                 LspIntent::Save { text } => {
@@ -10601,14 +10610,14 @@ impl Cagents {
             // no server rather than reporting one that is broken.
             let state = self.lsp_contexts.entry(card).or_default();
             state.context.status = Some(LspStatus::Disabled);
-            self.lsp_pending_jumps.remove(&card);
-            return Task::none();
+            return self.flush_pending_lsp_jump(card, path);
         };
         let doc = LspDocumentId(self.next_lsp_document);
         self.next_lsp_document += 1;
         let status = self.lsp.open(doc, path, worktree, language, version, text);
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
             runtime.set_lsp_document(Some(doc));
+            runtime.set_editor_code_action_support(self.lsp.capabilities(doc).code_actions);
         }
         self.lsp_documents.insert(doc, card);
         let state = self.lsp_contexts.entry(card).or_default();
@@ -10618,6 +10627,7 @@ impl Cagents {
     }
 
     fn close_lsp_document(&mut self, card: CardId) {
+        self.retire_editor_features(card);
         if let Some(state) = self.lsp_contexts.get_mut(&card)
             && let Some(doc) = state.document.take()
         {
@@ -10653,10 +10663,15 @@ impl Cagents {
             // not open when the server answered. It is open now, so the
             // manager can place it against the text it actually indexes.
             LspCoordinates::Utf16 => {
-                let Some(doc) = self.lsp_document(card) else {
-                    return Task::none();
+                let converted = if let Some(doc) = self.lsp_document(card) {
+                    self.lsp.scalar_position(doc, jump.at).map_err(|error| error.to_string())
+                } else {
+                    match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => runtime.scalar_position_for_utf16(jump.at).ok_or_else(|| "the target position is outside the source text".to_owned()),
+                        _ => Err("the source buffer was closed".into()),
+                    }
                 };
-                match self.lsp.scalar_position(doc, jump.at) {
+                match converted {
                     Ok(at) => at,
                     Err(error) => {
                         self.status = Some(TransientNotice::warning(format!(
@@ -10691,16 +10706,81 @@ impl Cagents {
         })
     }
 
+    fn update_lsp_message(&mut self, event: LspEvent) -> Task<Message> {
+        if let Some(task) = self.editor_feature_event(&event) { return task; }
+        let navigation = if let LspEvent::Locations {
+            doc,
+            kind: crate::lsp::LocationKind::Definition,
+            items,
+            request,
+            ..
+        } = &event
+        {
+            self.lsp_documents.get(doc).copied().and_then(|card| {
+                let state = self.lsp_contexts.get_mut(&card)?;
+                if state.editor_navigation != Some(*request) {
+                    return None;
+                }
+                state.editor_navigation = None;
+                Some((card, items.clone()))
+            })
+        } else {
+            None
+        };
+        self.apply_lsp_event(event);
+        if let Some((card, locations)) = navigation {
+            if locations.len() == 1
+                && let (crate::lsp::LspTarget::Workspace { path } | crate::lsp::LspTarget::External { path }) = &locations[0].target
+            {
+                return self.jump_to_lsp_location(
+                    card,
+                    path.clone(),
+                    locations[0].range.start,
+                    locations[0].coordinates,
+                );
+            }
+            self.context_tab = ContextTab::Details;
+            self.context_inspector_open = true;
+        }
+        Task::none()
+    }
+
     /// Routes one language-server event onto the card whose document it names.
     fn apply_lsp_event(&mut self, event: LspEvent) {
+        if let LspEvent::RootDiscovered { doc, ticket, root } = event {
+            if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
+                && let Some(card) = self.lsp_documents.get(&doc)
+                && let Some(state) = self.lsp_contexts.get_mut(card)
+            {
+                state.context.status = Some(status);
+                state.context.live_servers = Arc::from(self.lsp.live_servers());
+            }
+            return;
+        }
+        if matches!(event, LspEvent::Resources { .. } | LspEvent::Status { .. }) {
+            let servers: Arc<[String]> = Arc::from(self.lsp.live_servers());
+            for state in self.lsp_contexts.values_mut() {
+                state.context.live_servers = servers.clone();
+            }
+        }
         let doc = match &event {
-            LspEvent::Diagnostics { doc, .. }
+            LspEvent::Resources { doc }
+            | LspEvent::RootDiscovered { doc, .. }
+            | LspEvent::Diagnostics { doc, .. }
             | LspEvent::Completion { doc, .. }
             | LspEvent::Hover { doc, .. }
             | LspEvent::Locations { doc, .. }
             | LspEvent::Status { doc, .. }
             | LspEvent::Progress { doc, .. }
             | LspEvent::RequestFailed { doc, .. }
+                        | LspEvent::PrepareRename { doc, .. }
+            | LspEvent::WorkspaceEdit { doc, .. }
+            | LspEvent::CodeActions { doc, .. }
+            | LspEvent::CodeActionResolved { doc, .. }
+            | LspEvent::SignatureHelp { doc, .. }
+            | LspEvent::ServerMessage { doc, .. }
+            | LspEvent::CommandExecuted { doc, .. }
+            | LspEvent::ApplyWorkspaceEdit { doc, .. }
             | LspEvent::DocumentDesynced { doc, .. } => *doc,
         };
         // An event for a document that has since been closed has no surface to
@@ -10713,6 +10793,16 @@ impl Cagents {
             return;
         };
         match event {
+            LspEvent::RootDiscovered { .. } => unreachable!("handled above"),
+            LspEvent::Resources { .. } => {}
+            LspEvent::PrepareRename {..} |
+            LspEvent::WorkspaceEdit {..} |
+            LspEvent::CodeActions {..} |
+            LspEvent::CodeActionResolved {..} |
+            LspEvent::SignatureHelp {..} |
+            LspEvent::ServerMessage {..} |
+            LspEvent::CommandExecuted {..} |
+            LspEvent::ApplyWorkspaceEdit {..} => {},
             LspEvent::Diagnostics { version, items, .. } => {
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.set_editor_diagnostics(
@@ -10733,8 +10823,10 @@ impl Cagents {
                     && runtime.cursor_position() == Some(at)
                 {
                     state.completion_request = None;
-                    runtime.set_editor_completions(items.clone());
-                    state.context.completions = items;
+                    if !runtime.editor_feature_ui_open() {
+                        runtime.set_editor_completions(items.clone());
+                        state.context.completions = items;
+                    }
                 }
             }
             LspEvent::Hover {
@@ -10751,7 +10843,10 @@ impl Cagents {
             LspEvent::Locations { kind, items, .. } => {
                 state.context.locations = Some((kind, items));
             }
-            LspEvent::Status { status, .. } => state.context.status = Some(status),
+            LspEvent::Status { status, .. } => {
+                state.context.status = Some(status);
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.set_editor_code_action_support(self.lsp.capabilities(doc).code_actions); }
+            },
             LspEvent::Progress { progress, .. } => {
                 // Progress is transient by definition, so it is shown in the
                 // notice slot the surface already has and cleared on `done`
@@ -10881,76 +10976,39 @@ impl Cagents {
         at: LspPosition,
         coordinates: LspCoordinates,
     ) -> Task<Message> {
-        let open_path = self
-            .lsp_contexts
-            .get(&card)
-            .and_then(|state| state.path.clone());
-        if open_path.as_deref() == Some(path.as_path()) {
-            // Already the open buffer, so the column is placeable now. A
-            // `Utf16` location for the open file cannot occur - the manager
-            // converts against every document it holds - but it is refused
-            // rather than trusted, because placing protocol code units as
-            // scalars silently lands the caret in the wrong column.
-            return match coordinates {
-                LspCoordinates::Scalar => self.move_lsp_caret(card, at),
-                LspCoordinates::Utf16 => {
-                    let Some(doc) = self.lsp_document(card) else {
-                        return Task::none();
-                    };
-                    match self.lsp.scalar_position(doc, at) {
-                        Ok(at) => return self.move_lsp_caret(card, at),
-                        Err(error) => {
-                            self.status = Some(TransientNotice::warning(format!(
-                                "could not place the caret: {error}"
-                            )));
-                        }
-                    }
-                    Task::none()
-                }
+        let open_path = match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) if runtime.workspace_edit_source().is_some() => runtime.source_tab_path(),
+            _ => None,
+        };
+        if open_path.as_ref() == Some(&path) {
+            let at = match coordinates {
+                LspCoordinates::Scalar => Some(at),
+                LspCoordinates::Utf16 => match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => runtime.scalar_position_for_utf16(at),
+                    _ => None,
+                },
             };
+            let Some(at) = at else {
+                self.status = Some(TransientNotice::warning("The source position is no longer valid"));
+                return Task::none();
+            };
+            if self.modal_is_open() || self.workspace.focused() != Some(card) { return Task::none(); }
+            return self.move_lsp_caret(card, at);
         }
-        // The card's file list is worktree-relative and a location is absolute.
-        // A target outside the worktree has no row to open, and the inspector
-        // already renders those as inert, so this is a refusal rather than a
-        // guess at which repository the path belongs to.
-        let worktree = match self.cards.get(&card) {
-            Some(CardRuntime::Repository(runtime)) => runtime.descriptor.worktree.clone(),
+        let (view, read_only, dirty) = match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => (runtime.descriptor.clone(), runtime.is_read_only_source(), runtime.blocks_navigation()),
             _ => return Task::none(),
         };
-        let Ok(relative) = path.strip_prefix(&worktree) else {
-            self.status = Some(TransientNotice::warning(
-                "that definition is outside this worktree",
-            ));
-            return Task::none();
-        };
-        let relative = relative.to_path_buf();
-        // `OpenFile` answers a path the card has no row for by doing nothing,
-        // so parking on that open would wait for something that never happens
-        // and leave the user with no answer at all. A generated or ignored
-        // source inside the worktree is the ordinary way to reach this.
-        let openable = match self.cards.get(&card) {
-            Some(CardRuntime::Repository(runtime)) => runtime.can_open_file(&relative),
-            _ => false,
-        };
-        if !openable {
-            self.status = Some(TransientNotice::warning(format!(
-                "{} is not in this worktree's file list",
-                relative.display()
-            )));
-            return Task::none();
+        let relative = path.strip_prefix(&view.worktree).ok().map(Path::to_path_buf);
+        if relative.is_none() || read_only || dirty {
+            return self.open_lsp_source_tab(view, path, at, coordinates, relative.is_none());
         }
-        self.lsp_pending_jumps.insert(
-            card,
-            PendingLspJump {
-                path,
-                at,
-                coordinates,
-            },
-        );
-        cosmic::task::message(Message::Repository(RepositoryAction::OpenFile {
-            card,
-            path: relative,
-        }))
+        let relative = relative.unwrap();
+        self.lsp_pending_jumps.insert(card, PendingLspJump { path, at, coordinates });
+        match self.cards.get_mut(&card) {
+            Some(CardRuntime::Repository(runtime)) => repository_task(runtime.open_file_location(card, relative, at.line as usize, 0, 0)),
+            _ => Task::none(),
+        }
     }
 
     fn apply_lsp_completion(&mut self, card: CardId, index: usize, label: &str) -> Task<Message> {
@@ -11024,12 +11082,32 @@ impl Cagents {
         action: repository_widget::EditorLspAction,
     ) -> Task<Message> {
         use repository_widget::EditorLspAction as Action;
+        use editor_features::Action as Feature;
+        if let Action::CodeActionsAt(at) = &action {
+            return match at {
+                Some(at) => { let focus = self.move_lsp_caret(card, *at); let request = self.update_editor_features(Feature::CodeActions(card)); Task::batch([focus, request]) },
+                None => Task::none(),
+            };
+        }
+        let feature = match &action {
+            Action::Rename => Some(Feature::Rename(card)),
+            Action::RenameDraft(draft) => Some(Feature::RenameDraft(card, draft.clone())),
+            Action::SubmitRename(value) => Some(Feature::SubmitRename(card, value.clone())),
+            Action::CancelRename => Some(Feature::CancelRename(card)),
+            Action::Format { selection } => Some(Feature::Format { card, selection: *selection, save_after: false }),
+            Action::CodeActions => Some(Feature::CodeActions(card)),
+            Action::ChooseCodeAction(index) => Some(Feature::ChooseCodeAction(card, *index)),
+            Action::Signature => Some(Feature::Signature(card, None)),
+            Action::Dismiss => Some(Feature::Dismiss(card)),
+            _ => None,
+        };
+        if let Some(feature) = feature { return self.update_editor_features(feature); }
         match action {
             Action::Complete => self.request_lsp(card, LspRequestKind::Completion),
             Action::CompleteAt { doc, version, at }
                 if self.lsp_document(card) == Some(doc)
                     && self.lsp.document_version(doc) == Some(version)
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(at)) =>
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(at) && !runtime.editor_feature_ui_open()) =>
             {
                 self.request_lsp(card, LspRequestKind::Completion)
             }
@@ -11084,7 +11162,7 @@ impl Cagents {
                 }
                 task
             }
-            Action::Next(_) | Action::Dismiss => {
+            Action::Next(_) | Action::CodeActionNext(_) | Action::Dismiss => {
                 if matches!(action, Action::Dismiss) {
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
@@ -11097,7 +11175,7 @@ impl Cagents {
                     _ => Task::none(),
                 }
             }
-            Action::CompleteAt { .. } => Task::none(),
+            Action::CompleteAt { .. } | Action::Rename | Action::RenameDraft(_) | Action::SubmitRename(_) | Action::CancelRename | Action::Format { .. } | Action::CodeActions | Action::CodeActionsAt(_) | Action::ChooseCodeAction(_) | Action::Signature => Task::none(),
         }
     }
 
@@ -11440,7 +11518,7 @@ impl Cagents {
     }
 
     fn other_modal_is_open(&self) -> bool {
-        self.form_dialog_is_open() || self.modal_over_form_dialogs()
+        self.editor_features.modal_open() || self.form_dialog_is_open() || self.modal_over_form_dialogs()
     }
 
     /// The worktree and pull request dialogs: forms, whose focused field
@@ -11454,6 +11532,7 @@ impl Cagents {
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if self.editor_features.modal_open() { return self.update_editor_features(editor_features::Action::CancelPreview); }
         if self.automation_approval_open() {
             return self.cancel_automation_approval();
         }
@@ -12092,6 +12171,7 @@ impl Cagents {
     }
 
     fn window_close_transient_blocker(&self) -> Option<&'static str> {
+        if self.editor_features.publishing() { return Some("Wait for the workspace edit to finish applying before closing the window."); }
         if let Some(blocker) = self.automation_ui.draft_close_blocker() {
             return Some(blocker);
         }
@@ -12902,7 +12982,13 @@ impl Cagents {
     /// re-announced to the replacement: leaving them would show the user files
     /// that look checked and are not.
     fn synchronize_language_servers(&mut self) -> Task<Message> {
-        if self.lsp.servers() == self.settings.language_servers.as_slice() {
+        if self.lsp.servers() == self.settings.language_servers.as_slice()
+            && self.lsp.lifecycle()
+                == (
+                    self.settings.lsp_idle_timeout_seconds.max(1),
+                    self.settings.lsp_max_sessions.clamp(1, 64),
+                )
+        {
             return Task::none();
         }
         // `shutdown` alone moves the sessions into the outgoing manager's own
@@ -12912,7 +12998,10 @@ impl Cagents {
         // `begin_shutdown` spawns the reap on the runtime the sessions run on,
         // so it survives the returned future being dropped here.
         drop(self.lsp.begin_shutdown());
-        self.lsp = LspManager::new(self.settings.language_servers.clone());
+        self.lsp = LspManager::new(self.settings.language_servers.clone()).with_lifecycle(
+            self.settings.lsp_idle_timeout_seconds,
+            self.settings.lsp_max_sessions,
+        );
         self.lsp_contexts.clear();
         self.lsp_documents.clear();
         self.lsp_pending_jumps.clear();
@@ -13135,7 +13224,9 @@ impl Application for Cagents {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
             }),
-            lsp: LspManager::new(settings.language_servers.clone()),
+            lsp: LspManager::new(settings.language_servers.clone())
+                .with_lifecycle(settings.lsp_idle_timeout_seconds, settings.lsp_max_sessions),
+            editor_features: editor_features::State::default(),
             lsp_documents: HashMap::new(),
             lsp_contexts: HashMap::new(),
             lsp_pending_jumps: HashMap::new(),
@@ -14246,6 +14337,19 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
+                if matches!(&action, RepositoryAction::Save { overwrite: false, .. }) {
+                    if let Some(task) = self.maybe_format_before_save(card) { return task; }
+                }
+                if let RepositoryAction::AutoSaveDue { identity, revision, ticket } = &action {
+                    if self.format_on_save_enabled(card) {
+                        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                            if runtime.take_auto_save_due(identity, *revision, *ticket) {
+                                return self.maybe_format_before_save(card).unwrap_or_else(Task::none);
+                            }
+                        }
+                        return Task::none();
+                    }
+                }
                 let completion_character = match &action {
                     RepositoryAction::EditorAction {
                         action:
@@ -14313,6 +14417,9 @@ impl Application for Cagents {
                             },
                         })
                     }));
+                }
+                if let Some(character) = completion_character {
+                    tasks.push(self.editor_signature_character(card, character));
                 }
                 let selected_view = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime))
@@ -15349,7 +15456,11 @@ impl Application for Cagents {
                 session,
                 result,
             } => self.completed_terminal_closed(card, session, result),
-            Message::SaveAndCloseRepository(id) => match self.cards.get_mut(&id) {
+            Message::SaveAndCloseRepository(id) => {
+                if self.dirty_repository_close.as_ref().is_some_and(|close| close.card == id) {
+                    if let Some(task) = self.maybe_format_before_save(id) { return task; }
+                }
+                match self.cards.get_mut(&id) {
                 Some(CardRuntime::Repository(runtime))
                     if self
                         .dirty_repository_close
@@ -15359,7 +15470,8 @@ impl Application for Cagents {
                     repository_task(runtime.request_save(id, false))
                 }
                 _ => Task::none(),
-            },
+                }
+            }
             Message::OverwriteAndCloseRepository(id) => match self.cards.get_mut(&id) {
                 Some(CardRuntime::Repository(runtime))
                     if self
@@ -16006,6 +16118,7 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if let Some(task) = self.editor_feature_key_event(&event) { return task; }
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
                 }
@@ -16519,43 +16632,8 @@ impl Application for Cagents {
                 let close = self.close_settings_reset();
                 close.chain(self.reset_settings())
             }
-            Message::Lsp(event) => {
-                let navigation = if let LspEvent::Locations {
-                    doc,
-                    kind: crate::lsp::LocationKind::Definition,
-                    items,
-                    request,
-                    ..
-                } = &event
-                {
-                    self.lsp_documents.get(doc).copied().and_then(|card| {
-                        let state = self.lsp_contexts.get_mut(&card)?;
-                        if state.editor_navigation != Some(*request) {
-                            return None;
-                        }
-                        state.editor_navigation = None;
-                        Some((card, items.clone()))
-                    })
-                } else {
-                    None
-                };
-                self.apply_lsp_event(event);
-                if let Some((card, locations)) = navigation {
-                    if locations.len() == 1
-                        && let crate::lsp::LspTarget::Workspace { path } = &locations[0].target
-                    {
-                        return self.jump_to_lsp_location(
-                            card,
-                            path.clone(),
-                            locations[0].range.start,
-                            locations[0].coordinates,
-                        );
-                    }
-                    self.context_tab = ContextTab::Details;
-                    self.context_inspector_open = true;
-                }
-                Task::none()
-            }
+            Message::EditorFeatures(action) => self.update_editor_features(action),
+            Message::Lsp(event) => self.update_lsp_message(event),
             Message::LanguageServersReaped => self.advance_exit(|exit| exit.servers_reaped = true),
             Message::WindowClosed(window) => self.advance_exit(|exit| {
                 if exit.closing == Some(window) {
@@ -16956,6 +17034,7 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = self.editor_feature_dialog() { return Some(dialog); }
         if let Some(dialog) = self.automation_approval_dialog() {
             return Some(dialog);
         }
@@ -24363,6 +24442,7 @@ mod tests {
             message: message.into(),
             source: None,
             code: None,
+            protocol:None,
         }
     }
 
@@ -24412,6 +24492,23 @@ mod tests {
             )),
         );
         card
+    }
+
+    #[test]
+    fn an_existing_loaded_readonly_target_places_utf16_without_a_language_server() {
+        let (mut app, card) = editing_repository_app();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "std.rs", "a😀éX\n");
+        let path = PathBuf::from("/dependencies/std.rs");
+        runtime.set_external_source(path.clone());
+        let view = runtime.descriptor.clone();
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.lsp_contexts.remove(&card);
+        let count = app.cards.len();
+        drop(app.open_lsp_source_tab(view, path, LspPosition::new(0, 4), LspCoordinates::Utf16, true));
+        assert_eq!(app.cards.len(), count);
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(LspPosition::new(0, 3)) && runtime.is_read_only_source()));
     }
 
     #[test]
@@ -25253,6 +25350,7 @@ mod tests {
             .kind = CardKind::Repository(view.clone());
         let mut runtime = RepositoryRuntime::new_directory(view.clone());
         runtime.restore_navigation(&crate::model::RepositoryNavigation {
+            external_source: None,
             project: view.project,
             worktree: view.worktree,
             selected_file: Some("notes.txt".into()),
@@ -25655,7 +25753,9 @@ mod tests {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
             }),
-            lsp: LspManager::new(settings.language_servers.clone()),
+            lsp: LspManager::new(settings.language_servers.clone())
+                .with_lifecycle(settings.lsp_idle_timeout_seconds, settings.lsp_max_sessions),
+            editor_features: editor_features::State::default(),
             lsp_documents: HashMap::new(),
             lsp_contexts: HashMap::new(),
             lsp_pending_jumps: HashMap::new(),

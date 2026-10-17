@@ -905,6 +905,7 @@ pub fn model_for_card(
 /// widget state.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LspInspectorContext {
+    pub live_servers: std::sync::Arc<[String]>,
     pub status: Option<LspStatus>,
     pub diagnostics: Vec<LspDiagnostic>,
     pub hover: Option<String>,
@@ -982,6 +983,15 @@ pub fn with_lsp(
         lsp.status.as_ref(),
         lsp.notice.as_deref(),
     ));
+    if !lsp.live_servers.is_empty() {
+        model.sections.push(Section::new(
+            "Live language servers",
+            lsp.live_servers
+                .iter()
+                .map(|server| Fact::new("Server", server))
+                .collect(),
+        ));
+    }
     model
         .sections
         .extend(diagnostics_section(card, &lsp.diagnostics));
@@ -1249,13 +1259,9 @@ fn location_fact(card: CardId, location: &LspLocation) -> Fact {
             at: location.range.start,
             coordinates: LspCoordinates::Utf16,
         }),
-        (LspTarget::External { path }, _) => Fact::new(
-            "Outside this worktree",
-            format!(
-                "{}: this card opens files from its own worktree only.",
-                path.display()
-            ),
-        ),
+        (LspTarget::External { path }, coordinates) => Fact::new(
+            format!("Read-only source · line {line}"), path.display().to_string(),
+        ).activated(InspectorAction::JumpToLspLocation { card, path: path.clone(), at: location.range.start, coordinates }),
         (LspTarget::Uri { uri }, _) => Fact::new(
             "Not a file",
             format!("{uri}: this card cannot open a location that is not a file."),
@@ -2455,6 +2461,7 @@ mod tests {
             message: message.to_owned(),
             source: None,
             code: None,
+            protocol:None,
         }
     }
 
@@ -2807,7 +2814,7 @@ mod tests {
     }
 
     #[test]
-    fn a_location_outside_the_worktree_states_a_reason_instead_of_a_jump() {
+    fn a_location_outside_the_worktree_opens_an_explicit_read_only_tab() {
         let card = repository_card();
         let lsp = LspInspectorContext {
             locations: Some((
@@ -2824,9 +2831,11 @@ mod tests {
         let model = lsp_model(&card, &lsp);
         let facts = &section(&model, "Definition").facts;
 
-        assert_eq!(facts[0].action, None, "an unopenable file offered a jump");
+        assert_eq!(facts[0].action, Some(InspectorAction::JumpToLspLocation {
+            card: card.id, path: "/usr/lib/std.rs".into(), at: LspPosition::new(7, 2), coordinates: LspCoordinates::Scalar,
+        }));
         assert!(facts[0].value.contains("/usr/lib/std.rs"), "{:?}", facts[0]);
-        assert!(facts[0].value.contains("worktree"), "{:?}", facts[0]);
+        assert!(facts[0].label.contains("Read-only"), "{:?}", facts[0]);
     }
 
     #[test]

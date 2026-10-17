@@ -912,6 +912,12 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    /// Seconds to keep a language server warm after its last document closes.
+    #[serde(default = "default_lsp_idle_timeout")]
+    pub lsp_idle_timeout_seconds: u64,
+    /// Maximum admitted servers; active documents are never evicted.
+    #[serde(default = "default_lsp_max_sessions")]
+    pub lsp_max_sessions: usize,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -979,10 +985,19 @@ impl Default for AppSettings {
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
+            lsp_idle_timeout_seconds: default_lsp_idle_timeout(),
+            lsp_max_sessions: default_lsp_max_sessions(),
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+fn default_lsp_idle_timeout() -> u64 {
+    600
+}
+fn default_lsp_max_sessions() -> usize {
+    8
 }
 
 /// One language a server handles, and the file extensions that select it.
@@ -1005,6 +1020,22 @@ pub struct LanguageServerSettings {
     /// Relative marker names that identify a project root.
     #[serde(default)]
     pub root_markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "server_option_disabled")]
+    pub format_on_save: bool,
+    #[serde(default = "default_formatting_timeout", skip_serializing_if = "formatting_timeout_is_default")]
+    pub formatting_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "optional_json_absent")]
+    pub initialization_options: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub configuration: serde_json::Value,
+}
+
+fn server_option_disabled(value:&bool)->bool {!*value}
+fn default_formatting_timeout()->u64 {1000}
+fn formatting_timeout_is_default(value:&u64)->bool {*value == default_formatting_timeout()}
+fn optional_json_absent(value:&Option<serde_json::Value>)->bool {value.as_ref().is_none_or(serde_json::Value::is_null)}
+impl Default for LanguageServerSettings {
+    fn default()->Self {Self {id:String::new(),languages:Vec::new(),command:Vec::new(),root_markers:Vec::new(),format_on_save:false,formatting_timeout_ms:default_formatting_timeout(),initialization_options:None,configuration:serde_json::Value::Null}}
 }
 
 /// The built-in language-server list. A `language_servers` key in the settings
@@ -1030,6 +1061,7 @@ pub fn default_language_servers() -> Vec<LanguageServerSettings> {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
+            ..LanguageServerSettings::default()
         }
     }
 
@@ -1719,6 +1751,16 @@ impl AppSettings {
                 "managed_worktree_directory must be a nonempty path without control characters",
             ));
         }
+        if !(1..=64).contains(&self.lsp_max_sessions) {
+            return Err(SettingsError::Invalid(
+                "lsp_max_sessions must be between 1 and 64",
+            ));
+        }
+        if !(1..=604800).contains(&self.lsp_idle_timeout_seconds) {
+            return Err(SettingsError::Invalid(
+                "lsp_idle_timeout_seconds must be between 1 and 604800",
+            ));
+        }
         self.keyboard_shortcuts.validate()?;
         validate_language_servers(&self.language_servers)?;
         Ok(self)
@@ -1734,6 +1776,13 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
 
     for server in servers {
         let id = server.id.as_str();
+        if !(50..=10_000).contains(&server.formatting_timeout_ms) {
+            return Err(SettingsError::LanguageServer(format!("language server {id} formatting_timeout_ms must be between 50 and 10000")));
+        }
+        if server.initialization_options.as_ref().is_some_and(|value| serde_json::to_vec(value).map_or(true,|bytes| bytes.len() > 1024*1024))
+            || serde_json::to_vec(&server.configuration).map_or(true,|bytes| bytes.len() > 1024*1024) {
+            return Err(SettingsError::LanguageServer(format!("language server {id} configuration must fit within 1 MiB")));
+        }
         if id.is_empty() {
             return Err(SettingsError::LanguageServer(
                 "language_servers entry has an empty id".to_owned(),
@@ -2815,6 +2864,43 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn language_server_editor_options_round_trip_and_validate() {
+        let mut settings=AppSettings::default();
+        settings.language_servers[0].format_on_save=true;
+        settings.language_servers[0].formatting_timeout_ms=750;
+        settings.language_servers[0].initialization_options=Some(serde_json::json!({"check":{"command":"clippy"}}));
+        settings.language_servers[0].configuration=serde_json::json!({"rust-analyzer":{"check":{"command":"clippy"}}});
+        let text=toml::to_string(&settings).unwrap();
+        let decoded:AppSettings=toml::from_str(&text).unwrap();
+        assert_eq!(decoded.language_servers,settings.language_servers);
+        assert!(decoded.validate().is_ok());
+        for timeout in [0,49,10001,u64::MAX] {
+            let mut settings=AppSettings::default();settings.language_servers[0].formatting_timeout_ms=timeout;
+            assert!(settings.validate().is_err());
+        }
+        let mut settings=AppSettings::default();settings.language_servers[0].initialization_options=Some(serde_json::json!({"large":"x".repeat(1024*1024)}));
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn lsp_lifecycle_settings_reject_unbounded_or_zero_values() {
+        for cap in [0, 65, usize::MAX] {
+            let settings = AppSettings {
+                lsp_max_sessions: cap,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+        for timeout in [0, 604801, u64::MAX] {
+            let settings = AppSettings {
+                lsp_idle_timeout_seconds: timeout,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+    }
+
     #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
