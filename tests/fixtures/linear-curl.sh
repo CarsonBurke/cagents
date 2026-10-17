@@ -3,6 +3,7 @@
 set -eu
 printf '%s\n' "$@" > "$LINEAR_FIXTURE/argv"
 cat > "$LINEAR_FIXTURE/request"
+cat "$LINEAR_FIXTURE/request" >> "$LINEAR_FIXTURE/requests"
 printf 'request\n' >> "$LINEAR_FIXTURE/calls"
 if [ -f "$LINEAR_FIXTURE/fail" ]; then exit 28; fi
 case "$(cat "$LINEAR_FIXTURE/request")" in
