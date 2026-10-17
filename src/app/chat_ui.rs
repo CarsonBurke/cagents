@@ -12585,9 +12585,9 @@ mod tests {
         card: CardId,
         width: f32,
         key: keyboard::key::Named,
+        renderer: &cosmic::Renderer,
     ) {
         use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
-        let renderer = crate::app::tests::headless_renderer();
         let viewport = iced::Rectangle::with_size(iced::Size::new(width, 720.0));
         let mut messages = Vec::new();
         {
@@ -12595,13 +12595,13 @@ mod tests {
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
                 &mut tree,
-                &renderer,
+                renderer,
                 &layout::Limits::new(iced::Size::ZERO, viewport.size()),
             );
             element.as_widget_mut().operate(
                 &mut tree,
                 Layout::new(&node),
-                &renderer,
+                renderer,
                 &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
                     card,
                     "chat-composer",
@@ -12612,7 +12612,7 @@ mod tests {
                 &iced::Event::Keyboard(permission_key(key, keyboard::Modifiers::empty())),
                 Layout::new(&node),
                 iced::mouse::Cursor::Unavailable,
-                &renderer,
+                renderer,
                 &mut clipboard::Null,
                 &mut Shell::new(&mut messages),
                 &viewport,
@@ -12630,6 +12630,7 @@ mod tests {
     #[test]
     fn native_composer_up_crosses_wrapped_rows_before_history_and_restores_the_draft() {
         use keyboard::key::Named;
+        let renderer = crate::app::tests::headless_renderer();
         for width in [240.0, 420.0, 760.0] {
             for paragraph in [
                 "A paragraph whose soft wrapped rows belong to the unsent draft. ".repeat(12),
@@ -12653,7 +12654,7 @@ mod tests {
                 let mut boundary = None;
                 for _ in 0..256 {
                     let before = chat_runtime(&app, card).composer.cursor();
-                    composer_history_key(&mut app, card, width, Named::ArrowUp);
+                    composer_history_key(&mut app, card, width, Named::ArrowUp, &renderer);
                     let runtime = chat_runtime(&app, card);
                     if runtime.history_cursor.is_some() {
                         assert!(
@@ -12676,7 +12677,7 @@ mod tests {
                     chat_runtime(&app, card).composer.text(),
                     "previous sent prompt"
                 );
-                composer_history_key(&mut app, card, width, Named::ArrowDown);
+                composer_history_key(&mut app, card, width, Named::ArrowDown, &renderer);
                 let runtime = chat_runtime(&app, card);
                 assert_eq!(runtime.composer.text(), paragraph);
                 assert_eq!(runtime.composer.cursor(), boundary);
@@ -12688,6 +12689,7 @@ mod tests {
     #[test]
     fn native_composer_up_collapses_a_selection_before_starting_history() {
         use keyboard::key::Named;
+        let renderer = crate::app::tests::headless_renderer();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("selected-history"));
         write(&mut app, card, "selected draft");
@@ -12700,12 +12702,12 @@ mod tests {
         runtime
             .composer
             .perform(text_editor::Action::Select(text_editor::Motion::Right));
-        composer_history_key(&mut app, card, 420.0, Named::ArrowUp);
+        composer_history_key(&mut app, card, 420.0, Named::ArrowUp, &renderer);
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.composer.text(), "selected draft");
         assert_eq!(runtime.composer.cursor().selection, None);
         assert_eq!(runtime.history_cursor, None);
-        composer_history_key(&mut app, card, 420.0, Named::ArrowUp);
+        composer_history_key(&mut app, card, 420.0, Named::ArrowUp, &renderer);
         assert_eq!(chat_runtime(&app, card).composer.text(), "sent prompt");
     }
 
