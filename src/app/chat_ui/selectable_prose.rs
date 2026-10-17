@@ -497,6 +497,78 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_paints_every_selected_glyph_across_bidirectional_visual_runs() {
+        use iced::advanced::renderer::{Headless, Renderer};
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        let source = "hello שלום world";
+        let mut selectable = Selectable {
+            plain: source.into(),
+            spans: vec![Span::new(source)].into(),
+            matches: vec![],
+            size: design::TEXT_PROSE.into(),
+            font: iced::Font::default(),
+            target: Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            child: widget::text("").into(),
+        };
+        let mut tree =
+            Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0));
+        selectable.layout(&mut tree, &renderer, &limits);
+        // A logical selection cuts the RTL word and continues into LTR text.
+        // Its selected glyphs are separated by an unselected visual glyph.
+        let start = "hello ש".len();
+        let state = tree.state.downcast_mut::<State>();
+        state.anchor = start;
+        state.end = source.len();
+        let node = selectable.layout(&mut tree, &renderer, &limits);
+        let state = tree.state.downcast_ref::<State>();
+        let probes: Vec<_> = state
+            .paragraph()
+            .buffer()
+            .layout_runs()
+            .flat_map(|run| {
+                run.glyphs.iter().map(move |glyph| {
+                    (
+                        glyph.start,
+                        (glyph.x + glyph.w * 0.5) as usize,
+                        (run.line_top + 1.0) as usize,
+                    )
+                })
+            })
+            .collect();
+        let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
+        renderer.reset(viewport);
+        selectable.draw(
+            &tree,
+            &mut renderer,
+            &cosmic::theme::active(),
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        let pixels = renderer.screenshot(Size::new(400, 100), 1.0, iced::Color::WHITE);
+        let selected = design::accent_color(&cosmic::theme::active()).into_rgba8();
+        for (byte, x, y) in probes {
+            let pixel = &pixels[(y * 400 + x) * 4..][..4];
+            let painted = pixel
+                .iter()
+                .zip(selected)
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 1);
+            assert_eq!(
+                painted,
+                byte >= start,
+                "selection paint disagrees at source byte {byte}, pixel ({x}, {y}): {pixel:?}"
+            );
+        }
+    }
+
     #[test]
     fn prose_exposes_full_text_and_stable_accessible_identity() {
         let element = text(
