@@ -5418,6 +5418,15 @@ impl Cagents {
                     }
                 }
                 CardKind::Chat(session) => {
+                    if (self.shared_views.attached.contains(&card.id)
+                        && !self.durable.local_only_cards.contains(&card.id))
+                        || self.durable.pending_chat_admissions.get(&card.id) == Some(&session)
+                    {
+                        // Show saved text without admitting provider effects
+                        // from a cached shared descriptor.
+                        self.await_shared_chat_admission(card.id, session);
+                        continue;
+                    }
                     // Whether this is an attach, a daemon-proven upgrade
                     // handoff or a fresh resume is not knowable here: only the
                     // live daemon proof answers it, and that is read on the

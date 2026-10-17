@@ -26,6 +26,7 @@ mod images;
 mod layout;
 mod markdown_source;
 mod monospace;
+mod pending_admission;
 mod permissions;
 mod prose;
 mod retained;
@@ -1465,6 +1466,10 @@ enum Connection {
     /// choices that cost nothing to change, and an unused card leaves no
     /// process behind.
     Draft,
+    /// A cached shared descriptor has not been admitted by the current view.
+    AwaitingAdmission,
+    /// Canonical admission has started an attachment, with no handle yet.
+    Connecting,
     Live(Arc<ClientHandle>),
 }
 
@@ -2307,7 +2312,7 @@ impl Runtime {
     /// The live connection, once the conversation has started.
     fn handle(&self) -> Option<&Arc<ClientHandle>> {
         match &self.connection {
-            Connection::Draft => None,
+            Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
             Connection::Live(handle) => Some(handle),
         }
     }
@@ -4588,6 +4593,9 @@ impl Cagents {
         session: chat::Session,
         intent: chat::Intent,
     ) -> Task<Message> {
+        if self.chat_awaiting_admission(card) {
+            return Task::none();
+        }
         if !session.is_unstarted() {
             return self.start_chat(card, session, intent, None, false);
         }
@@ -4970,6 +4978,15 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        if self.chat_awaiting_admission(card) {
+            let Some(remove) = self.remove_chat_card(card, None) else {
+                return Task::none();
+            };
+            Arc::make_mut(&mut self.durable)
+                .pending_chat_admissions
+                .remove(&card);
+            return remove;
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
@@ -5270,6 +5287,9 @@ impl Cagents {
         source: Option<HostSessionProof>,
         terminate_source: bool,
     ) -> Task<Message> {
+        if self.chat_awaiting_admission(card) {
+            return Task::none();
+        }
         let selection = None;
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
@@ -5809,7 +5829,7 @@ impl Cagents {
         snapshot.permission_mode = draft_permission_mode(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
-            Connection::Draft => None,
+            Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
         };
         runtime.session = draft.clone();
         runtime.snapshot = Arc::new(snapshot);
@@ -6078,7 +6098,8 @@ impl Cagents {
     }
     fn handle_chat_action(&mut self, action: Action) -> Task<Message> {
         if let Some(target) = action.mutation_target()
-            && (self.chat_start_pending(target.card)
+            && (self.chat_awaiting_admission(target.card)
+                || self.chat_start_pending(target.card)
                 || self
                     .card_state(target.card)
                     .is_none_or(|state| !state.existence.is_open()))
@@ -6086,7 +6107,9 @@ impl Cagents {
             return Task::none();
         }
         if let Some(card) = action.starts_session()
-            && (self.chat_closed_elsewhere(card) || self.refuse_for_deleting_card(card))
+            && (self.chat_awaiting_admission(card)
+                || self.chat_closed_elsewhere(card)
+                || self.refuse_for_deleting_card(card))
         {
             return Task::none();
         }

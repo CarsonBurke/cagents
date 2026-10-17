@@ -728,6 +728,7 @@ impl Cagents {
             .iter()
             .find(|card| {
                 card.existence.is_open()
+                    && !self.chat_awaiting_admission(card.id)
                     && match &card.kind {
                         CardKind::Chat(current) => same_conversation(current, session),
                         CardKind::Terminal(current) => chat_ui::conversion(current)
@@ -764,7 +765,10 @@ impl Cagents {
             };
             return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
         }
-        if entry.open {
+        let local_pending = self.chat_awaiting_admission(entry.card)
+            && matches!(self.card_state(entry.card).map(|card| &card.kind),
+                Some(CardKind::Chat(session)) if session == &entry.session);
+        if entry.open && !local_pending {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");
             return Task::none();
         }
