@@ -678,6 +678,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectoryListed { .. }
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::ConfiguredFileLoaded { .. }
+            | RepositoryAction::BinaryPageLoaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
@@ -1441,6 +1443,7 @@ impl Editor {
         };
         runtime.set_standalone(true);
         runtime.set_auto_save(self.settings.editor_auto_save);
+        runtime.set_editor_tab_width(self.settings.editor_tab_width);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_line_height(self.settings.terminal_line_height);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
@@ -3510,7 +3513,7 @@ impl Application for Editor {
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
-                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. })
+                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. } | RepositoryAction::ConfiguredFileLoaded { .. })
                         && self.active == Some(id)
                         && !self.modal_open();
                     let saved = matches!(action, RepositoryAction::SaveFinished { .. });
@@ -4060,6 +4063,7 @@ impl Application for Editor {
                     self.shortcut_draft = self.shortcuts.clone();
                     for tab in &mut self.tabs {
                         tab.runtime.set_auto_save(self.settings.editor_auto_save);
+                        tab.runtime.set_editor_tab_width(self.settings.editor_tab_width);
                         tab.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                         tab.runtime
                             .set_line_height(self.settings.terminal_line_height);
@@ -7657,6 +7661,68 @@ mod tests {
                 ),
             })),
         );
+    }
+
+    #[test]
+    fn configured_file_completion_survives_modal_and_uses_saved_tab_width() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("empty.rs"), "").unwrap();
+        let mut app = configured(&directory);
+        app.settings.editor_auto_save = false;
+        app.settings.editor_tab_width = 8;
+        let task = app.add(Opened { root: directory.path().into(), file: Some("empty.rs".into()), snapshot: None }, true);
+        let card = app.active.unwrap();
+        let completion = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            use cosmic::iced::futures::StreamExt;
+            let mut pending = vec![task];
+            while let Some(task) = pending.pop() {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                            if matches!(&message, Message::Repository(RepositoryAction::ConfiguredFileLoaded { .. })) { return message; }
+                            pending.push(app.update(message));
+                        }
+                    }
+                }
+            }
+            panic!("actual configured file worker completion");
+        });
+        app.settings_open = true;
+        let task = app.update(completion);
+        run_tasks(&mut app, task);
+        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some(""));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (8, true));
+        app.settings_open = false;
+        drop(app.update(Message::ResetSettings));
+        drop(app.update(Message::ResetSettings));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (4, true));
+    }
+
+    #[test]
+    fn binary_page_worker_finishes_behind_settings_and_updates_the_mounted_range() {
+        use cosmic::iced::advanced::{layout, widget::Tree, Layout, renderer::Headless};
+        let directory = tempfile::tempdir().unwrap();
+        let page = cagents::editor::BINARY_PREVIEW_BYTES;
+        std::fs::write(directory.path().join("bytes.bin"), vec![0; page as usize + 1]).unwrap();
+        let mut app = configured(&directory);
+        let task = app.add(Opened { root: directory.path().into(), file: Some("bytes.bin".into()), snapshot: None }, true);
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        let task = app.update(Message::Repository(RepositoryAction::BinaryPage { card, offset: page }));
+        app.settings_open = true;
+        run_tasks(&mut app, task);
+        app.settings_open = false;
+
+        let renderer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(cosmic::Renderer::new(cosmic::iced::Font::MONOSPACE, cosmic::iced::Pixels(14.0), Some("tiny-skia")))
+            .expect("headless renderer");
+        let mut element = cagents::repository_widget::view(card, &app.tab(card).unwrap().runtime);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(cosmic::iced::Size::ZERO, cosmic::iced::Size::new(1000.0, 700.0)));
+        let accessible = element.as_widget().a11y_nodes(Layout::new(&node), &tree, cosmic::iced::mouse::Cursor::Unavailable);
+        let expected = format!("bytes {}–{}", page, page + 1);
+        assert!(accessible.root().iter().chain(accessible.children()).any(|node| node.node().label().is_some_and(|label| label.contains(&expected))), "the actual completed second page must replace the first page behind a modal");
     }
 
     #[test]
