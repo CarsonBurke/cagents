@@ -8,14 +8,35 @@ impl Runtime {
 
     pub(super) fn pending_admission_view(&self) -> Element<'_, Message> {
         let text = self.unsent_text();
-        widget::column::with_children(vec![
+        let copy = widget::button::custom(design::body("Copy saved draft"))
+            .class(crate::ui_controls::control_style(false, None))
+            .padding([space::S as u16, space::M as u16])
+            .on_press_maybe(
+                (!text.is_empty()).then(|| Message::ChatUi(Action::CopyLiteral(text.clone()))),
+            );
+        let header = widget::flex_row(vec![design::heading("Saved draft").into(), copy.into()])
+            .align_items(Alignment::Center)
+            .spacing(space::M as u16);
+        let draft = widget::container(view::body(text))
+            .width(Length::Fill)
+            .padding(space::M)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_M; 4],
+                false,
+            ));
+        let content = widget::column::with_children(vec![
+            header.into(),
             design::body("This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history.").into(),
-            widget::scrollable(view::body(text.clone())).height(Length::Fill).into(),
-            widget::button::custom(design::caption("Copy saved draft"))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press_maybe((!text.is_empty()).then(|| Message::ChatUi(Action::CopyLiteral(text))))
-                .into(),
-        ]).spacing(space::S).into()
+            widget::scrollable(draft).height(Length::Fill).into(),
+        ])
+        .spacing(space::M)
+        .width(Length::Fill);
+        widget::container(widget::container(content).max_width(design::READABLE_MEASURE))
+            .padding(space::L)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 }
 
