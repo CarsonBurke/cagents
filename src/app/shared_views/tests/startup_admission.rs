@@ -350,7 +350,8 @@ fn authoritative_offscreen_chat_executes_exact_descriptor_once() {
     assert_eq!(
         app.persistent_workspace()
             .chat_drafts
-            .get(&pane.id)
+            .values()
+            .find(|text| text.as_str() == "Deferred shared draft")
             .map(String::as_str),
         Some("Deferred shared draft")
     );
@@ -394,5 +395,294 @@ fn local_only_cached_chat_still_restores_and_preserves_its_draft() {
             .get(&pane.id)
             .map(String::as_str),
         Some("Unsent original draft")
+    );
+}
+
+fn visible_text(app: &Cagents, card: CardId) -> String {
+    use cosmic::iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    #[derive(Default)]
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: cosmic::iced::Rectangle, text: &str) {
+            self.0.push(text.to_owned());
+        }
+    }
+    let renderer = crate::app::tests::headless_renderer();
+    let mut element = app.chat_view(card);
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(
+            cosmic::iced::Size::ZERO,
+            cosmic::iced::Size::new(900.0, 980.0),
+        ),
+    );
+    let mut texts = Texts::default();
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+    texts.0.join("\n")
+}
+
+#[test]
+fn retired_cached_draft_stays_readable_and_cannot_start_provider() {
+    if isolated("retired_cached_draft_stays_readable_and_cannot_start_provider") {
+        return;
+    }
+    let daemon = ScriptedDaemon::start();
+    let (mut app, active, hidden, pane, identity) = cached_chat();
+    let text = "Never sent\nKeep exact spaces  ";
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, text.into())]));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    let mut view = View::empty(hidden);
+    view.retired.push(pane.id);
+    admit(
+        &mut app,
+        active,
+        hidden,
+        model(identity, active, hidden, view),
+    );
+    assert!(app.chat_awaiting_admission(pane.id));
+    let visible = visible_text(&app, pane.id);
+    assert!(
+        visible.contains(text) && visible.contains("Copy saved draft"),
+        "{visible}"
+    );
+    assert!(
+        !visible.contains("Closed in another window"),
+        "cache is not closure proof"
+    );
+    let target = match app.cards.get(&pane.id).unwrap() {
+        CardRuntime::Chat(runtime) => runtime.target,
+        _ => panic!("saved draft must have a readable runtime"),
+    };
+    for action in [
+        chat_ui::Action::Reconnect(target),
+        chat_ui::Action::StartFresh(pane.id),
+        chat_ui::Action::Switch(pane.id),
+        chat_ui::Action::Submit(target, crate::chat::PromptMode::Send),
+    ] {
+        let task = app.handle_chat_ui(action);
+        settle(&mut app, task);
+    }
+    assert!(daemon.requests().is_empty());
+    let refused = app.begin_chat_close(pane.id);
+    settle(&mut app, refused);
+    assert!(
+        app.card_state(pane.id).unwrap().existence.is_open(),
+        "offstrip close must refuse without spending its restart fence"
+    );
+    assert!(app.durable.pending_chat_admissions.contains_key(&pane.id));
+    let saved = app.persistent_workspace();
+    assert_eq!(
+        saved.chat_drafts.get(&pane.id).map(String::as_str),
+        Some(text)
+    );
+    let disk = tempfile::tempdir().unwrap();
+    let store = crate::persistence::StateStore::open(
+        disk.path().join("state.sqlite"),
+        crate::model::BootId::new("startup-test"),
+    )
+    .unwrap();
+    store
+        .save_workspace(
+            &saved,
+            crate::persistence::SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    let loaded = store.load_workspace(saved.id, None).unwrap().unwrap();
+    assert_eq!(
+        loaded.pending_chat_admissions,
+        saved.pending_chat_admissions
+    );
+    let (mut restored, _, _, _) = fixture();
+    restored.chat_ui = chat_ui::State::with_drafts(loaded.chat_drafts.clone());
+    restored.durable = Arc::new(loaded);
+    restored.shared_views = State::for_workspace(&restored.durable);
+    restored.workspace = Cagents::rebuild_workspace(&restored.durable);
+    restored.workspace_model = Default::default();
+    let task = restored.initialize_runtimes();
+    settle(&mut restored, task);
+    assert!(restored.chat_awaiting_admission(pane.id));
+    assert!(visible_text(&restored, pane.id).contains(text));
+    assert!(
+        daemon.requests().is_empty(),
+        "save/load must not turn retained text into provider admission"
+    );
+    let select = restored.select_channel(hidden);
+    settle(&mut restored, select);
+    let close = restored.begin_chat_close(pane.id);
+    settle(&mut restored, close);
+    assert!(
+        daemon.requests().is_empty(),
+        "closing saved text cannot retire its unadmitted source"
+    );
+    assert!(!restored.card_state(pane.id).unwrap().existence.is_open());
+    assert!(
+        !restored
+            .durable
+            .pending_chat_admissions
+            .contains_key(&pane.id)
+    );
+}
+
+#[test]
+fn replacement_admission_keeps_old_draft_beside_exact_canonical_chat() {
+    if isolated("replacement_admission_keeps_old_draft_beside_exact_canonical_chat") {
+        return;
+    }
+    let daemon = ScriptedDaemon::start();
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    Arc::make_mut(&mut app.durable).active_channel = Some(hidden);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, "Old source only".into())]));
+    let original = pane.kind.clone();
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    let CardKind::Chat(replacement) = &mut pane.kind else {
+        unreachable!()
+    };
+    replacement.id = TerminalId::new();
+    replacement.launch.session_id = Some("canonical-replacement-thread".into());
+    let expected = replacement.clone();
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    admit(
+        &mut app,
+        active,
+        hidden,
+        model(identity, active, hidden, view),
+    );
+    assert_eq!(daemon.requests().len(), 1);
+    assert_eq!(daemon.requests()[0].id, expected.id);
+    let saved = app.persistent_workspace();
+    assert!(!saved.chat_drafts.contains_key(&pane.id));
+    let copy = *saved
+        .chat_drafts
+        .iter()
+        .find(|(_, text)| text.as_str() == "Old source only")
+        .unwrap()
+        .0;
+    assert_ne!(copy, pane.id);
+    assert_eq!(app.card_state(copy).unwrap().kind, original);
+    assert!(app.chat_awaiting_admission(copy));
+    assert!(
+        app.workspace.card(copy).is_some(),
+        "saved copy must be immediately reachable"
+    );
+    assert!(visible_text(&app, copy).contains("Old source only"));
+    assert!(saved.pending_chat_admissions.contains_key(&copy));
+    assert!(!saved.pending_chat_admissions.contains_key(&pane.id));
+    let disk = tempfile::tempdir().unwrap();
+    let store = crate::persistence::StateStore::open(
+        disk.path().join("retained-copy.sqlite"),
+        crate::model::BootId::new("replacement-startup"),
+    )
+    .unwrap();
+    store
+        .save_workspace(
+            &saved,
+            crate::persistence::SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    let loaded = store.load_workspace(saved.id, None).unwrap().unwrap();
+    let (mut restored, _, _, _) = fixture();
+    restored.chat_ui = chat_ui::State::with_drafts(loaded.chat_drafts.clone());
+    restored.durable = Arc::new(loaded);
+    restored.workspace = Cagents::rebuild_workspace(&restored.durable);
+    restored.shared_views = State::for_workspace(&restored.durable);
+    restored.workspace_model = Default::default();
+    let startup = restored.initialize_runtimes();
+    settle(&mut restored, startup);
+    assert!(restored.chat_awaiting_admission(copy));
+    assert!(visible_text(&restored, copy).contains("Old source only"));
+    assert_eq!(
+        daemon.requests().len(),
+        1,
+        "a retained incompatible copy must stay inert after real storage roundtrip"
+    );
+}
+
+#[test]
+fn history_picker_does_not_focus_retained_unadmitted_cache() {
+    if isolated("history_picker_does_not_focus_retained_unadmitted_cache") {
+        return;
+    }
+    let daemon = ScriptedDaemon::start();
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    let CardKind::Chat(session) = &mut pane.kind else {
+        unreachable!()
+    };
+    session.launch.recipe.working_directory = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let saved_session = session.clone();
+    app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
+    app.chat_ui =
+        chat_ui::State::with_drafts(HashMap::from([(pane.id, "Retained source draft".into())]));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    let mut view = View::empty(hidden);
+    view.retired.push(pane.id);
+    admit(
+        &mut app,
+        active,
+        hidden,
+        model(identity, active, hidden, view),
+    );
+    let disk = tempfile::tempdir().unwrap();
+    let store = crate::persistence::StateStore::open(
+        disk.path().join("history.sqlite"),
+        crate::model::BootId::new("history-startup"),
+    )
+    .unwrap();
+    let saved = app.persistent_workspace();
+    store
+        .save_workspace(
+            &saved,
+            crate::persistence::SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    let entry = store
+        .saved_conversations()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.card == pane.id)
+        .unwrap();
+    assert!(
+        entry.open,
+        "actual saved history marks this retained local card open"
+    );
+    let task = app.resume_saved_conversation(entry);
+    settle(&mut app, task);
+    let requests = daemon.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "actual picker dispatch must open history, not focus inert text"
+    );
+    assert_eq!(requests[0].launch, saved_session.launch);
+    assert_ne!(requests[0].id, saved_session.id);
+    assert!(app.chat_awaiting_admission(pane.id));
+    assert!(
+        app.persistent_workspace()
+            .chat_drafts
+            .values()
+            .any(|text| text == "Retained source draft")
     );
 }
