@@ -623,10 +623,11 @@ printf '%s\n' "$*"
         &runtime,
         &root.path().join("surviving-ui-ready"),
     );
-    for args in [
-        vec!["--json", "daemon", "status"],
-        vec!["daemon", "preflight"],
-        vec!["daemon", "stop"],
+    for (args, expected) in [
+        (vec!["--json", "daemon", "status"], "--json daemon status"),
+        (vec!["daemon", "preflight"], "daemon preflight"),
+        // Stop carries its implicit no-start policy to the matched owner.
+        (vec!["daemon", "stop"], "--no-start daemon stop"),
     ] {
         let output = Command::new(new.join("cagents"))
             .args(&args)
@@ -635,10 +636,7 @@ printf '%s\n' "$*"
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            args.join(" ")
-        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
     }
     assert_eq!(fs::read_to_string(&actions).unwrap().lines().count(), 3);
     let handoff = OpenOptions::new()
@@ -680,7 +678,7 @@ printf '%s\n' "$*"
     );
     assert_eq!(
         fs::read_to_string(&actions).unwrap(),
-        "--json daemon status\ndaemon preflight\ndaemon stop\ndaemon start\n"
+        "--json daemon status\ndaemon preflight\n--no-start daemon stop\ndaemon start\n"
     );
     drop(window);
     // A stopped owner does not authorize stale routing: the candidate reports
