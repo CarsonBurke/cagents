@@ -969,7 +969,7 @@ fn exact_retained_saved_text_is_data_after_scope_admission_not_a_hosted_waiver()
     assert!(daemon.requests().is_empty());
 }
 
-fn exercise_canonical_upgrade(refuse_lineage: bool) {
+fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
     use crate::app::workspace_model_sync::ModelUpdate;
     let (mut app, active, hidden, mut pane, identity) = cached_chat();
     let CardKind::Chat(source) = &pane.kind else {
@@ -1036,7 +1036,7 @@ fn exercise_canonical_upgrade(refuse_lineage: bool) {
         operation: None,
         model: authoritative,
     });
-    if !refuse_lineage {
+    if !refuse_lineage && !retire_before_ready {
         let before = app.persistent_workspace();
         assert_eq!(
             before
@@ -1053,12 +1053,26 @@ fn exercise_canonical_upgrade(refuse_lineage: bool) {
             Some(text)
         );
     }
+    if retire_before_ready {
+        let mut retired = View::empty(hidden);
+        retired.retired.push(pane.id);
+        let mut newer = model(identity, active, hidden, retired);
+        newer.sequence = 2;
+        let projection = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+            scope: Scope::Channel(hidden),
+            operation: None,
+            model: newer,
+        });
+        settle(&mut app, projection);
+        assert!(!app.chat_start_pending(pane.id));
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    }
     let mut ready_seen = false;
     let mut receipt_seen = false;
     settle_observing(&mut app, admission, |app, message| {
         if matches!(message, Message::ChatUi(chat_ui::Action::Ready(..))) && !ready_seen {
             ready_seen = true;
-            if !refuse_lineage {
+            if !refuse_lineage && !retire_before_ready {
                 assert_eq!(
                     app.persistent_workspace()
                         .cards
@@ -1091,6 +1105,71 @@ fn exercise_canonical_upgrade(refuse_lineage: bool) {
     );
     assert!(!app.chat_start_pending(pane.id));
     let saved = app.persistent_workspace();
+    if retire_before_ready {
+        assert!(
+            !receipt_seen,
+            "a stale Ready cannot authorize a writer rebind"
+        );
+        let copy = *saved
+            .chat_drafts
+            .iter()
+            .find(|(_, draft)| draft.as_str() == text)
+            .unwrap()
+            .0;
+        assert_ne!(copy, pane.id);
+        assert!(app.chat_awaiting_admission(copy));
+        assert_eq!(
+            app.card_state(copy).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        let CardRuntime::Chat(runtime) = app.cards.get(&copy).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            &**runtime as *const chat_ui::Runtime as usize, allocation,
+            "retirement must move the full original Content owner before the late Ready"
+        );
+        assert_eq!(saved.pending_chat_admissions.get(&copy), Some(&source));
+        assert_eq!(app.startup_pane_check(), Ok(true));
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let loaded = app
+            .session
+            .as_ref()
+            .unwrap()
+            .operation_store()
+            .load_workspace(saved.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded
+                .cards
+                .iter()
+                .find(|card| card.id == copy)
+                .unwrap()
+                .kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(loaded.pending_chat_admissions.get(&copy), Some(&source));
+        assert_eq!(
+            loaded.chat_drafts.get(&copy).map(String::as_str),
+            Some(text)
+        );
+        assert!(
+            !loaded
+                .cards
+                .iter()
+                .find(|card| card.id == pane.id)
+                .unwrap()
+                .existence
+                .is_open()
+        );
+        return;
+    }
     if refuse_lineage {
         assert!(
             !receipt_seen,
@@ -1104,7 +1183,10 @@ fn exercise_canonical_upgrade(refuse_lineage: bool) {
             .0;
         assert_ne!(copy, pane.id);
         assert!(app.chat_awaiting_admission(copy));
-        assert_eq!(app.card_state(copy).unwrap().kind, CardKind::Chat(source));
+        assert_eq!(
+            app.card_state(copy).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
         assert_eq!(
             saved.pending_chat_admissions.get(&copy),
             match &app.card_state(copy).unwrap().kind {
@@ -1182,6 +1264,33 @@ fn exercise_canonical_upgrade(refuse_lineage: bool) {
         .unwrap()
         .unwrap();
     assert_eq!(stored.kind, CardKind::Chat(canonical));
+    if refuse_lineage {
+        let loaded = app
+            .session
+            .as_ref()
+            .unwrap()
+            .operation_store()
+            .load_workspace(saved.id, None)
+            .unwrap()
+            .unwrap();
+        let copy = *loaded
+            .chat_drafts
+            .iter()
+            .find(|(_, draft)| draft.as_str() == text)
+            .unwrap()
+            .0;
+        assert_ne!(copy, pane.id);
+        assert_eq!(
+            loaded
+                .cards
+                .iter()
+                .find(|card| card.id == copy)
+                .unwrap()
+                .kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(loaded.pending_chat_admissions.get(&copy), Some(&source));
+    }
     assert!(app.card_state(pane.id).unwrap().existence.is_open());
 }
 
@@ -1192,7 +1301,7 @@ fn canonical_upgrade_authenticates_lineage_and_preserves_original_content_throug
     ) {
         return;
     }
-    exercise_canonical_upgrade(false);
+    exercise_canonical_upgrade(false, false);
 }
 
 #[test]
@@ -1200,5 +1309,16 @@ fn refused_canonical_upgrade_preserves_source_draft_without_provider_activation(
     if isolated("refused_canonical_upgrade_preserves_source_draft_without_provider_activation") {
         return;
     }
-    exercise_canonical_upgrade(true);
+    exercise_canonical_upgrade(true, false);
+}
+
+#[test]
+fn canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignores_late_attachment()
+{
+    if isolated(
+        "canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignores_late_attachment",
+    ) {
+        return;
+    }
+    exercise_canonical_upgrade(false, true);
 }
