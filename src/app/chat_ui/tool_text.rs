@@ -59,13 +59,15 @@ pub(super) struct Preview {
 /// A tool's short target when the input supplies one; otherwise describe
 /// the disclosure without promoting arbitrary payload text into the transcript.
 fn tool_preview(input: &str) -> String {
+    // Bound all inspection, including trimming a whitespace-only JSON prefix
+    // that Claude can publish before the rest of its streamed input arrives.
+    if input.len() > CachedItem::HIGHLIGHT_LIMIT {
+        return "Input available".into();
+    }
     if input.trim().is_empty() {
         return String::new();
     }
-    // Parsing an optional preview must not scale with an entire tool payload.
-    let object = (input.len() <= CachedItem::HIGHLIGHT_LIMIT)
-        .then(|| serde_json::from_str::<serde_json::Value>(input).ok())
-        .flatten();
+    let object = serde_json::from_str::<serde_json::Value>(input).ok();
     let Some(object) = object.as_ref().and_then(serde_json::Value::as_object) else {
         return "Input available".into();
     };
@@ -832,6 +834,27 @@ mod tests {
             crate::settings::EditorSyntaxTheme::Auto,
         );
         assert_eq!(preview.text, "Input available");
+        // A partial JSON stream can consist entirely of whitespace; it is
+        // still bounded before inspecting any of those bytes.
+        let whitespace = " ".repeat(CachedItem::HIGHLIGHT_LIMIT + 1);
+        assert_eq!(
+            Preview::update(
+                None,
+                &tool(&whitespace),
+                crate::settings::EditorSyntaxTheme::Auto
+            )
+            .text,
+            "Input available"
+        );
+        assert!(
+            Preview::update(
+                None,
+                &tool(" \n\t"),
+                crate::settings::EditorSyntaxTheme::Auto
+            )
+            .text
+            .is_empty()
+        );
     }
 
     #[test]
