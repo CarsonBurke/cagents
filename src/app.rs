@@ -10550,6 +10550,7 @@ impl Cagents {
                     // against the old text is dropped in the same breath: a
                     // completion range or a hover span that predates a
                     // keystroke describes characters the buffer no longer has.
+                    let previous_version = self.lsp.document_version(doc);
                     match text {
                         repository_widget::LspChangeText::Text(text) => {
                             self.lsp.change(doc, version, &edits, &text)
@@ -10561,8 +10562,17 @@ impl Cagents {
                     let synchronized_version = self.lsp.document_version(doc);
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
-                        crate::lsp::shift_diagnostics(&mut state.context.diagnostics, &edits);
-                        state.diagnostics_version = synchronized_version;
+                        if !edits.is_empty()
+                            && diagnostics_are_current(state.diagnostics_version, previous_version)
+                        {
+                            crate::lsp::shift_diagnostics(&mut state.context.diagnostics, &edits);
+                            state.diagnostics_version = synchronized_version;
+                        } else {
+                            // A full-text transition carries no safe coordinate mapping.
+                            // Clear native marks too, since F8 navigates those directly.
+                            state.context.diagnostics.clear();
+                            state.diagnostics_version = None;
+                        }
                     }
                     if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                         if let Some(state) = self.lsp_contexts.get(&card) {
@@ -10757,6 +10767,13 @@ impl Cagents {
             let servers: Arc<[String]> = Arc::from(self.lsp.live_servers());
             for state in self.lsp_contexts.values_mut() {
                 state.context.live_servers = servers.clone();
+                if matches!(event, LspEvent::Resources { .. })
+                    && let Some(doc) = state.document
+                {
+                    // A shared session can retire after its last routing document
+                    // closed. Refresh every attachment before resolving that identity.
+                    state.context.status = Some(self.lsp.status(doc));
+                }
             }
         }
         let doc = match &event {
@@ -10782,12 +10799,7 @@ impl Cagents {
         };
         match event {
             LspEvent::RootDiscovered { .. } => unreachable!("handled above"),
-            LspEvent::Resources { .. } => {
-                // A root can retire while its editor remains open. Session
-                // retirement suppresses late protocol events, so refresh its
-                // status here instead of leaving a stale Ready indicator.
-                state.context.status = Some(self.lsp.status(doc));
-            }
+            LspEvent::Resources { .. } => {}
             LspEvent::Diagnostics { version, items, .. } => {
                 // A delayed publication must not erase the shifted standing
                 // set for a newer buffer revision.
@@ -24697,6 +24709,93 @@ mod tests {
         // Nothing published: there is no list to jump into.
         assert!(!diagnostics_are_current(None, Some(4)));
         assert!(!diagnostics_are_current(None, None));
+    }
+
+    #[test]
+    fn inexact_editor_changes_invalidate_diagnostics_through_the_real_drain() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let mut app = lsp_test_app();
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        let card = repository_card(&mut app, "/repo");
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "first\nerror\r");
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        drop(app.drain_lsp_intents(card));
+        let doc = app.lsp_document(card).unwrap();
+        assert_eq!(app.lsp.document_version(doc), Some(1));
+        let publish = |version| {
+            Message::Lsp(LspEvent::Diagnostics {
+                doc,
+                version,
+                items: vec![diagnostic("standing error")],
+            })
+        };
+        drop(app.update(publish(1)));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
+        runtime.move_cursor_to(LspPosition::new(0, 0));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(Arc::new(
+                "\n".into(),
+            ))),
+        }));
+        drop(app.drain_lsp_intents(card));
+        assert_eq!(app.lsp.document_version(doc), Some(2));
+        assert!(app.lsp_contexts[&card].context.diagnostics.is_empty());
+        assert_eq!(app.lsp_contexts[&card].diagnostics_version, None);
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert!(!runtime.diagnostic_navigation_available());
+        // A late publication cannot reinstall marks for the old coordinates.
+        drop(app.update(publish(1)));
+        assert!(app.lsp_contexts[&card].context.diagnostics.is_empty());
+        drop(app.update(publish(2)));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert!(runtime.diagnostic_navigation_available());
+        assert_eq!(app.lsp_contexts[&card].diagnostics_version, Some(2));
+    }
+
+    #[test]
+    fn resource_events_refresh_every_document_even_when_the_routing_document_closed() {
+        for close_routing_document in [false, true] {
+            let mut app = lsp_test_app();
+            let first = repository_card(&mut app, "/repo");
+            let last = repository_card(&mut app, "/repo");
+            for (card, doc) in [(first, LspDocumentId(1)), (last, LspDocumentId(2))] {
+                let state = lsp_state(&mut app, card);
+                state.document = Some(doc);
+                state.context.status = Some(LspStatus::Ready);
+                app.lsp_documents.insert(doc, card);
+            }
+            if close_routing_document {
+                app.close_lsp_document(last);
+            }
+            // This is the state after the watchdog retires the shared session:
+            // the manager reports Disabled while the UI still caches Ready.
+            assert_eq!(app.lsp.status(LspDocumentId(1)), LspStatus::Disabled);
+            drop(app.update(Message::Lsp(LspEvent::Resources {
+                doc: LspDocumentId(2),
+            })));
+            assert_eq!(
+                app.lsp_contexts[&first].context.status,
+                Some(app.lsp.status(LspDocumentId(1)))
+            );
+            if !close_routing_document {
+                assert_eq!(
+                    app.lsp_contexts[&last].context.status,
+                    Some(app.lsp.status(LspDocumentId(2)))
+                );
+            }
+        }
     }
 
     /// The jump arm must consult that predicate rather than jumping blind.

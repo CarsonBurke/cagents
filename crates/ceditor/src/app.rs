@@ -1991,6 +1991,10 @@ impl Editor {
                     }
                 }
                 LspIntent::Change { version, text } => {
+                    let previous_version = self
+                        .tab(id)
+                        .and_then(|tab| tab.runtime.lsp_document())
+                        .and_then(|doc| self.lsp.document_version(doc));
                     if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
                         match text {
                             cagents::repository_widget::LspChangeText::Text(text) => {
@@ -2008,8 +2012,17 @@ impl Editor {
                     if let Some(tab) = self.tab_mut(id) {
                         tab.completions.clear();
                         tab.hover = None;
-                        cagents::lsp::shift_diagnostics(&mut tab.diagnostics, &edits);
-                        tab.set_diagnostics(tab.diagnostics.clone(), synchronized_version);
+                        if !edits.is_empty()
+                            && previous_version.is_some()
+                            && tab.diagnostics_version == previous_version
+                        {
+                            cagents::lsp::shift_diagnostics(&mut tab.diagnostics, &edits);
+                            tab.set_diagnostics(tab.diagnostics.clone(), synchronized_version);
+                        } else {
+                            // Unknown ranges cannot preserve either current diagnostics
+                            // or the native marks used by F8 navigation.
+                            tab.set_diagnostics(Vec::new(), None);
+                        }
                     }
                 }
                 LspIntent::Save { text } => {
@@ -7004,6 +7017,73 @@ mod tests {
                 .runtime
                 .diagnostic_navigation_available()
         );
+    }
+
+    #[test]
+    fn inexact_editor_changes_invalidate_standalone_diagnostics_through_the_real_drain() {
+        use cagents::lsp::{LspRange, LspSeverity};
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.rs"), "first\nerror\r").unwrap();
+        let mut app = editor();
+        app.language_server_assistance = true;
+        app.lsp = LspManager::new(app.settings.language_servers.clone());
+        let id = add(&mut app, directory.path().to_str().unwrap(), Some("a.rs"));
+        file_loaded(&mut app, id, directory.path(), "a.rs");
+        let doc = app.tab(id).unwrap().runtime.lsp_document().unwrap();
+        let generation = app.lsp.generation();
+        let publish = |version| {
+            Message::Lsp(
+                generation,
+                Some(LspEvent::Diagnostics {
+                    doc,
+                    version,
+                    items: vec![LspDiagnostic::new(
+                        LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 5)),
+                        LspSeverity::Error,
+                        "standing error".into(),
+                        None,
+                        None,
+                    )],
+                }),
+            )
+        };
+        drop(app.update(publish(1)));
+        app.tab_mut(id)
+            .unwrap()
+            .runtime
+            .move_cursor_to(LspPosition::new(0, 0));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("\n".into()),
+                )),
+            })),
+        );
+        assert_eq!(app.lsp.document_version(doc), Some(2));
+        assert!(app.tab(id).unwrap().diagnostics.is_empty());
+        assert_eq!(app.tab(id).unwrap().diagnostics_version, None);
+        assert!(
+            !app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
+        drop(app.update(publish(1)));
+        assert!(app.tab(id).unwrap().diagnostics.is_empty());
+        drop(app.update(publish(2)));
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
+        assert!(app.diagnostics_are_current(id));
     }
 
     #[test]
