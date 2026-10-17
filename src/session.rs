@@ -4565,6 +4565,253 @@ mod tests {
     }
 
     #[test]
+    fn retained_copy_explicit_retry_commits_real_bytes_after_its_initial_error() {
+        struct FailFirstCopy {
+            store: Arc<StateStore>,
+            attempts: Arc<AtomicUsize>,
+        }
+        impl SessionStore for FailFirstCopy {
+            fn preserve_chat_copy(
+                &self,
+                copy: &crate::persistence::RetainedChatCopy,
+            ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(StoreError::Io(std::io::Error::from_raw_os_error(
+                        libc::ENOSPC,
+                    )));
+                }
+                self.store.preserve_chat_copy(copy)
+            }
+            fn replace_terminal_identity(
+                &self,
+                card: CardId,
+                expected: TerminalId,
+                replacement: &TerminalSession,
+            ) -> Result<(), StoreError> {
+                self.store
+                    .replace_terminal_identity(card, expected, replacement)
+            }
+            fn replace_chat_identity(
+                &self,
+                card: CardId,
+                expected: TerminalId,
+                replacement: &crate::chat::Session,
+            ) -> Result<(), StoreError> {
+                self.store
+                    .replace_chat_identity(card, expected, replacement)
+            }
+            fn save_workspace(
+                &self,
+                state: &WorkspaceState,
+                base: SnapshotBase<'_>,
+            ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+                self.store.save_workspace(state, base)
+            }
+            fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError> {
+                self.store.save_project(project)
+            }
+            fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError> {
+                self.store.save_worktree(worktree)
+            }
+            fn stored_generations(
+                &self,
+                workspace: WorkspaceId,
+            ) -> Result<StoredGenerations, StoreError> {
+                self.store.stored_generations(workspace)
+            }
+            fn stored_project_generation(
+                &self,
+                project: ProjectId,
+            ) -> Result<Option<u64>, StoreError> {
+                self.store.stored_project_generation(project)
+            }
+            fn stored_worktree_generation(
+                &self,
+                worktree: WorktreeId,
+            ) -> Result<Option<u64>, StoreError> {
+                self.store.stored_worktree_generation(worktree)
+            }
+            fn shutdown(&self) -> Result<(), StoreError> {
+                self.store.shutdown()
+            }
+        }
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("late-copy.db");
+        let scope = directory.path().join("project");
+        std::fs::create_dir(&scope).unwrap();
+        let store = Arc::new(StateStore::open(&path, BootId::new("boot")).unwrap());
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "old".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "old".into(),
+            }),
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: scope.clone(),
+                    environment: BTreeMap::new(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let mut original = workspace();
+        let origin = original.cards[0].id;
+        original.cards[0].kind = CardKind::Chat(source.clone());
+        original
+            .chat_drafts
+            .insert(origin, "Canonical draft stays here".into());
+        let committed = store
+            .save_workspace(
+                &original,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let canonical_before = store.load_card(origin, None).unwrap().unwrap();
+        let mut card = original.cards[0].clone();
+        card.id = CardId::new();
+        let copy = crate::persistence::RetainedChatCopy {
+            workspace: original.id,
+            source_card: origin,
+            source: source.clone(),
+            copy: card,
+            draft: "Retry exact bytes  \nUnicode 🦀".into(),
+            scope: Some(scope.clone()),
+            channel: None,
+        };
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                conversions: VecDeque::from([ConversionCheckpoint::RetainedChatCopy {
+                    copy: copy.clone(),
+                    reply: Some(reply),
+                }]),
+                ordered_identities: true,
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let wrapped = FailFirstCopy {
+            store: Arc::clone(&store),
+            attempts: Arc::clone(&attempts),
+        };
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let health = HealthPublisher::new(health_tx);
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                wrapped,
+                PendingWrites::restored(
+                    committed.generation,
+                    committed.card_generations,
+                    HashMap::new(),
+                    HashMap::new(),
+                ),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                health,
+                fast_persistence_config(1),
+            )
+        });
+
+        let first_receipt = receipt.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            first_receipt.is_err(),
+            "the failed first attempt is never a successful receipt"
+        );
+        let failed = health_until(&health_rx, |event| {
+            matches!(
+                event.health,
+                SessionSaveHealth::RetryExhausted {
+                    category: SaveFailureCategory::DiskFull,
+                    attempts: 1,
+                    ..
+                }
+            )
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(store.load_card(copy.copy.id, None).unwrap().is_none());
+        assert_eq!(
+            store.load_card(origin, None).unwrap().unwrap(),
+            canonical_before
+        );
+
+        // This is the queue action used by Retry Saving. No second copy,
+        // different descriptor, replacement snapshot or actor action is sent.
+        let (lock, changed) = &*queue;
+        lock.lock().unwrap().retry_requested = true;
+        changed.notify_one();
+        let recovered = health_until(&health_rx, |event| {
+            matches!(event.health, SessionSaveHealth::Recovered { .. })
+        });
+        assert!(recovered.revision > failed.revision);
+        assert!(recovered.last_successful_flush_at_unix_ms.is_some());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            matches!(
+                receipt.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "late recovery is a health event, not a changed first receipt"
+        );
+        let saved = store.load_workspace(copy.workspace, None).unwrap().unwrap();
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .find(|card| card.id == copy.copy.id)
+                .unwrap()
+                .kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(saved.chat_drafts[&copy.copy.id], copy.draft);
+        assert!(saved.local_only_cards.contains(&copy.copy.id));
+        assert_eq!(saved.pending_chat_admissions[&copy.copy.id], source);
+        assert_eq!(saved.card_scopes[&copy.copy.id], scope);
+        assert_eq!(saved.chat_drafts[&origin], "Canonical draft stays here");
+        assert_eq!(
+            store.load_card(origin, None).unwrap().unwrap(),
+            canonical_before
+        );
+
+        lock.lock().unwrap().shutdown = true;
+        changed.notify_one();
+        worker.join().unwrap();
+        drop(store);
+        let reopened = StateStore::open(&path, BootId::new("boot")).unwrap();
+        let restored = reopened
+            .load_workspace(copy.workspace, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            restored
+                .cards
+                .iter()
+                .any(|card| card.id == copy.copy.id && card.existence.is_open())
+        );
+        assert_eq!(restored.chat_drafts[&copy.copy.id], copy.draft);
+        assert!(restored.local_only_cards.contains(&copy.copy.id));
+        assert_eq!(restored.pending_chat_admissions[&copy.copy.id], copy.source);
+        assert_eq!(restored.card_scopes[&copy.copy.id], scope);
+        assert_eq!(
+            reopened.load_card(origin, None).unwrap().unwrap().kind,
+            canonical_before.kind
+        );
+    }
+
+    #[test]
     fn retained_copy_writer_survives_refused_canonical_snapshots_and_explicit_close() {
         for after_upgrade in [false, true] {
             let directory = tempfile::tempdir().unwrap();
