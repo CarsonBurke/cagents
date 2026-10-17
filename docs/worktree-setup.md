@@ -76,3 +76,21 @@ If the source group cannot be preserved, setup stops and keeps the worktree.
 Glob traversal is bounded to 64 directory levels as well as the existing entry
 and copy limits. A deeper selection fails setup before copying files; the new
 checkout remains available.
+
+## Managed directory
+
+Local and device creation default to `.worktrees/` beneath the checkout. An
+explicit `managed_worktree_directory` setting keeps its configured location.
+Before creating inside the primary checkout, cagents adds an anchored rule to
+the clone's common `info/exclude`, using Git's lock-and-rename convention. It
+keeps existing rules and skips the write when Git already ignores the directory
+or the managed location is outside the primary checkout. Tracked `.gitignore`
+is unchanged.
+
+A destination override excludes only that exact checkout, so other files in a
+shared parent remain visible. If a higher-priority `.gitignore` rule explicitly
+keeps the destination visible, creation stops and asks you to adjust that rule.
+
+Existing registered worktrees under the old `worktrees/` directory stay in
+place. The next worktree creation excludes that legacy directory too; changing
+the default does not move or delete existing worktrees.

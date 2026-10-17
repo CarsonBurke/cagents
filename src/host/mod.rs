@@ -10,6 +10,8 @@ pub(crate) mod descriptor_limit;
 mod lock;
 mod model;
 mod notifications;
+#[cfg(all(test, target_os = "linux"))]
+mod provider_shutdown_tests;
 mod service;
 mod state;
 
@@ -456,7 +458,15 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
                     }
                 }
             }
-            Err(error) => tracing::warn!(%error, "provider shutdown was not confirmed"),
+            Err(error) => {
+                tracing::warn!(%error, "provider shutdown was not confirmed");
+                if result.is_ok() {
+                    result = Err(format!(
+                        "Provider {} shutdown was not confirmed: {error}",
+                        session.id
+                    ));
+                }
+            }
             Ok(()) => {}
         }
     }
