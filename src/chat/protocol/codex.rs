@@ -720,7 +720,12 @@ impl Codex {
         }
         Ok(())
     }
-    fn finish_execution(&mut self, turn: &Value, step: &mut Step) -> Result<(), String> {
+    fn finish_execution(
+        &mut self,
+        turn: &Value,
+        step: &mut Step,
+        publish_content: bool,
+    ) -> Result<(), String> {
         let Some(execution) = self.execution.as_mut() else {
             return Ok(());
         };
@@ -751,17 +756,19 @@ impl Codex {
             _ => return Err("Codex completed an accepted run with an unknown outcome".into()),
         };
         let execution = self.execution.take().unwrap();
-        // Full completed-turn items also cover output that arrived before the
-        // request acknowledgement. They upsert the same transcript identities.
-        for value in array(turn, "items")? {
-            step.events
-                .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
-        }
-        if let Some(message) = turn["error"]["message"].as_str() {
-            step.events.push(Event::Error {
-                message: message.into(),
-                fatal: false,
-            });
+        // An ACK can recover a completion whose content arrived before exact
+        // execution binding. Ordinary completed frames already publish it.
+        if publish_content {
+            for value in array(turn, "items")? {
+                step.events
+                    .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
+            }
+            if let Some(message) = turn["error"]["message"].as_str() {
+                step.events.push(Event::Error {
+                    message: message.into(),
+                    fatal: false,
+                });
+            }
         }
         execution_end(execution.run, outcome, step);
         Ok(())
@@ -2258,11 +2265,17 @@ impl Adapter for Codex {
                     let id = string(&result["turn"], "id")?;
                     let owns_current = notification_revision == self.notification_revision
                         || self.notification_turn.as_deref() == Some(id);
-                    let early_completion = early.remove(id).filter(|_| owns_current);
+                    // An active-status update may announce newer work before
+                    // its turn ID arrives. The old request's correlation alone
+                    // cannot assign that lifecycle to its acknowledged turn.
+                    let owns_lifecycle = owns_current
+                        && (revision == self.lifecycle_revision
+                            || self.notification_turn.as_deref() == Some(id));
+                    let early_completion = early.remove(id).filter(|_| owns_lifecycle);
                     self.remember_turn_pricing(id, model, tier);
                     // Notifications can finish this turn or start another before
                     // its RPC reply. An acknowledgement only fills missing state.
-                    if owns_current {
+                    if owns_lifecycle {
                         self.notification_turn = Some(id.to_owned());
                     }
                     if revision == self.lifecycle_revision {
@@ -2275,7 +2288,7 @@ impl Adapter for Codex {
                             detail: "Codex turn started".into(),
                         });
                     }
-                    if let Some(execution) = self.execution.as_mut()
+                    let execution_completion = if let Some(execution) = self.execution.as_mut()
                         && frame["id"].as_str() == Some(execution.request.as_str())
                     {
                         let turn = string(&result["turn"], "id")?.to_owned();
@@ -2283,18 +2296,10 @@ impl Adapter for Codex {
                         let completed = execution.early.remove(&turn);
                         execution.early.clear();
                         execution.early_bytes = 0;
-                        if let Some(completed) = completed {
-                            self.finish_execution(&completed, &mut step)?;
-                            if !self.busy || self.turn.as_deref() == Some(turn.as_str()) {
-                                self.busy = false;
-                                self.turn = None;
-                                step.events.push(Event::Status {
-                                    busy: false,
-                                    detail: turn_detail(&completed["status"]),
-                                });
-                            }
-                        }
-                    }
+                        completed
+                    } else {
+                        None
+                    };
                     if let Some(early) = early_completion {
                         if !early.preview_transferred {
                             step.notification_preview = Some(early.preview);
@@ -2309,8 +2314,24 @@ impl Adapter for Codex {
                             step.events.extend(completion.events);
                             step.writes.extend(completion.writes);
                         }
-                    } else if !owns_current {
+                    } else if !owns_lifecycle {
                         step.suppress_current_notification = true;
+                    }
+                    if let Some(completed) = execution_completion
+                        && self.execution.is_some()
+                    {
+                        // The replay above normally settles the exact managed
+                        // execution too. Otherwise retain its outcome without
+                        // changing a newer conversation lifecycle.
+                        self.finish_execution(&completed, &mut step, true)?;
+                        if !self.busy || self.turn.as_deref() == Some(id) {
+                            self.busy = false;
+                            self.turn = None;
+                            step.events.push(Event::Status {
+                                busy: false,
+                                detail: turn_detail(&completed["status"]),
+                            });
+                        }
                     }
                 }
                 // The one visible effect of compaction is the context figure,
@@ -2394,6 +2415,15 @@ impl Adapter for Codex {
                         child.materialized = true;
                         if result["initialTurnsPage"].is_object() {
                             child.page(&result["initialTurnsPage"], &mut content, false)?;
+                            // This is the child's coherent initial attachment;
+                            // buffered live frames have not been replayed yet.
+                            // Later history pages remain presentation only.
+                            if child.notification_revision == 0
+                                && child.notification_turn.is_none()
+                                && child.busy
+                            {
+                                child.notification_turn = child.turn.clone();
+                            }
                         } else {
                             for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
                                 for value in turn["items"].as_array().into_iter().flatten() {
@@ -2749,7 +2779,7 @@ impl Adapter for Codex {
                     });
                 }
                 if method == "turn/completed" {
-                    self.finish_execution(turn, &mut step)?;
+                    self.finish_execution(turn, &mut step, false)?;
                     if current {
                         self.notification_revision = self.notification_revision.wrapping_add(1);
                         self.notification_turn = None;
@@ -5313,6 +5343,7 @@ mod tests {
         adapter.receive(json!({"id":sent.writes[0]["id"],"result":{"turn":{"id":"old","status":"inProgress","items":[]}}})).unwrap();
         assert!(adapter.busy);
         assert_eq!(adapter.turn, None);
+        assert_eq!(adapter.notification_turn, None);
     }
 
     #[test]
@@ -5327,6 +5358,7 @@ mod tests {
             child.thread = Some("child".into());
             child.is_child = true;
             parent.children.insert("child".into(), Box::new(child));
+            parent.receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"t","status":"inProgress","items":[]}}})).unwrap();
             parent.receive(json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"t","status":outcome,"items":[]}}})).unwrap();
             for frame in [
                 json!({"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"idle"}}}),
@@ -5502,6 +5534,10 @@ mod tests {
         let live = adapter.receive(json!({"method":"item/agentMessage/delta","params":{"threadId":"child-exact","turnId":"turn","itemId":"answer","delta":" tail"}})).unwrap();
         assert!(live.events.is_empty());
         let hydrated = adapter.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"active"}},"initialTurnsPage":{"data":[{"id":"turn","status":"inProgress","items":[{"id":"answer","type":"agentMessage","text":"head"}]}],"nextCursor":null}}})).unwrap();
+        assert_eq!(
+            adapter.children["child-exact"].notification_turn.as_deref(),
+            Some("turn")
+        );
         assert!(hydrated.events.iter().any(|event| matches!(event, Event::SubagentTextDelta { id, delta, .. } if id == "child-exact" && delta == " tail")));
         assert!(
             !hydrated
@@ -5518,6 +5554,15 @@ mod tests {
             .receive(json!({"id":invalidated.writes[0]["id"],"result":{"data":[]}}))
             .unwrap();
         assert!(replied.events.is_empty());
+        let stale = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"child-exact","turn":{"id":"older","status":"failed","items":[]}}})).unwrap();
+        assert!(adapter.children["child-exact"].busy);
+        assert!(!stale.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                status: Some(ToolStatus::Failed),
+                ..
+            }
+        )));
         let completed = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"child-exact","turn":{"id":"turn","status":"completed","items":[]}}})).unwrap();
         assert!(completed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "child-exact")));
         let foreign = adapter.receive(json!({"method":"turn/started","params":{"threadId":"unrelated","turn":{"id":"bad","items":[]}}})).unwrap();
@@ -5723,6 +5768,7 @@ mod tests {
         );
         let attached = parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"model":"gpt-child","thread":{"id":"child","status":{"type":"active","activeFlags":["waitingOnApproval"]}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
         assert!(attached.events.iter().any(|event| matches!(event, Event::Subagent { model:Some(model), waiting:Some(true), detail:Some(detail), .. } if model == "gpt-child" && detail == "Waiting for your approval")));
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"latest","status":"inProgress","items":[]}}})).unwrap();
         let answered = parent.receive(json!({"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"active","activeFlags":[]}}})).unwrap();
         assert!(answered.events.iter().any(|event| matches!(event, Event::Subagent { model:Some(model), waiting:Some(false), detail:Some(detail), status:Some(ToolStatus::Running), .. } if model == "gpt-child" && detail.is_empty())));
         parent.receive(json!({"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}})).unwrap();
@@ -5781,6 +5827,7 @@ mod tests {
             .discover_child("child-exact", &json!({"status":"running"}), &mut discovered)
             .unwrap();
         adapter.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"active"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
+        adapter.receive(json!({"method":"turn/started","params":{"threadId":"child-exact","turn":{"id":"turn","status":"inProgress","items":[]}}})).unwrap();
         let approval = |id| json!({"id":id,"method":"item/commandExecution/requestApproval","params":{"threadId":"child-exact","turnId":"turn","itemId":"tool","availableDecisions":["accept","decline"],"command":"echo requested"}});
         let requested = adapter.receive(approval(71)).unwrap();
         assert!(requested.events.iter().any(|event| matches!(event, Event::Request(request) if request.title.starts_with("Child agent"))));
@@ -5921,6 +5968,119 @@ mod tests {
         assert_eq!(texts, ["Owned answer"]);
         assert!(!adapter.busy);
         assert!(adapter.execution.is_none());
+    }
+
+    #[test]
+    fn managed_completion_publishes_final_content_once_per_step_in_either_ack_order() {
+        for completion_first in [false, true] {
+            let mut adapter = adapter();
+            let run = crate::model::RunId::new();
+            let sent = adapter
+                .command_for_run(
+                    run,
+                    Command::Prompt {
+                        text: "Owned prompt".into(),
+                        attachments: vec![],
+                        mode: PromptMode::Send,
+                    },
+                )
+                .unwrap();
+            let request = sent.writes[0]["id"].clone();
+            let ack = json!({"id":request,"result":{"turn":{"id":"owned"}}});
+            let completion = json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"owned","status":"failed","error":{"message":"Exact failure"},"items":[{"id":"answer","type":"agentMessage","text":"Partial answer"}]}}});
+            let final_step = if completion_first {
+                adapter.receive(completion).unwrap();
+                adapter.receive(ack).unwrap()
+            } else {
+                adapter.receive(ack).unwrap();
+                adapter.receive(completion).unwrap()
+            };
+            assert_eq!(final_step.events.iter().filter(|event| matches!(event,
+                Event::Item(Item { content: ItemContent::Text { text, .. }, .. }) if text == "Partial answer"
+            )).count(), 1, "{:?}", final_step.events);
+            assert_eq!(
+                final_step
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        Event::Error { message, .. } if message == "Exact failure"
+                    ))
+                    .count(),
+                1,
+                "{:?}",
+                final_step.events
+            );
+            assert_eq!(final_step.events.iter().filter(|event| matches!(event,
+                Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Failed } } if *actual == run
+            )).count(), 1, "{:?}", final_step.events);
+            assert!(adapter.execution.is_none());
+            assert!(!adapter.busy);
+        }
+    }
+
+    #[test]
+    fn managed_late_ack_settles_its_run_without_claiming_new_unidentified_work() {
+        let mut adapter = adapter();
+        let run = crate::model::RunId::new();
+        let sent = adapter
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "Owned prompt".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"owned","status":"completed","items":[{"id":"answer","type":"agentMessage","text":"Owned answer"}]}}})).unwrap();
+        adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active","activeFlags":["waitingOnApproval"]}}})).unwrap();
+        let revision = adapter.lifecycle_revision;
+        let ack = adapter
+            .receive(json!({"id":sent.writes[0]["id"],"result":{"turn":{"id":"owned"}}}))
+            .unwrap();
+        assert!(ack.events.iter().any(|event| matches!(event,
+            Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *actual == run
+        )));
+        assert!(ack.suppress_current_notification);
+        assert!(ack.notification_preview.is_none());
+        assert!(!ack.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished { .. } | Event::Status { busy: false, .. }
+        )));
+        assert!(adapter.execution.is_none());
+        assert!(adapter.busy && adapter.subagent_waiting);
+        assert_eq!(adapter.lifecycle_revision, revision);
+        assert!(adapter.turn.is_none() && adapter.notification_turn.is_none());
+        adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"new","status":"inProgress","items":[]}}})).unwrap();
+        let finished = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"new","status":"completed","items":[]}}})).unwrap();
+        assert!(!adapter.busy);
+        assert!(finished.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn child_buffered_new_turn_supersedes_its_initial_active_history_binding() {
+        let mut parent = adapter();
+        let mut discovered = Step::default();
+        parent
+            .discover_child("child", &json!({}), &mut discovered)
+            .unwrap();
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"new","status":"inProgress","items":[]}}})).unwrap();
+        parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child","status":{"type":"active"}},"initialTurnsPage":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}}})).unwrap();
+        assert_eq!(
+            parent.children["child"].notification_turn.as_deref(),
+            Some("new")
+        );
+        parent.receive(json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"old","status":"failed","items":[]}}})).unwrap();
+        assert!(parent.children["child"].busy);
+        let completed = parent.receive(json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"new","status":"completed","items":[]}}})).unwrap();
+        assert!(!parent.children["child"].busy);
+        assert!(completed.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Succeeded), .. } if id == "child")));
     }
 
     fn account_fixture(name: &str) -> Value {
@@ -6808,7 +6968,7 @@ mod tests {
     #[test]
     fn oversized_tool_output_keeps_stream_and_completion_alive() {
         let mut adapter = adapter();
-        adapter.busy = true;
+        adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"inProgress","items":[]}}})).unwrap();
         let mut item = json!({"id":"large","type":"commandExecution","command":"cat data","cwd":"/tmp","status":"inProgress","aggregatedOutput":""});
         adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();
         let delta = "🦀".repeat(MAX_ITEM_BYTES);
