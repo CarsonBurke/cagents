@@ -758,15 +758,21 @@ impl Registry {
                 // Persist the resolved account for this accepted launch while
                 // keeping the caller's original request as its retry key.
                 let spec = selected.unwrap_or(spec);
-                let children: usize = tx
-                    .query_row(
-                        "SELECT count(*) FROM agents WHERE origin = ?1 AND closed = 0",
-                        [&origin_json],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if children >= MAX_CHILDREN {
-                    return Err("Agent child limit reached; close an existing child first".into());
+                // Fanout bounds delegated work, not the user's retained
+                // conversations. Every origin still pays the run limits above.
+                if !matches!(origin, Origin::User) {
+                    let children: usize = tx
+                        .query_row(
+                            "SELECT count(*) FROM agents WHERE origin = ?1 AND closed = 0",
+                            [&origin_json],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if children >= MAX_CHILDREN {
+                        return Err(
+                            "Agent child limit reached; close an existing child first".into()
+                        );
+                    }
                 }
                 if let Some(name) = &request.name {
                     let used: bool = tx.query_row(
@@ -2801,6 +2807,321 @@ mod tests {
                 .contains("channel")
         );
         assert_eq!(registry.model().unwrap(), model);
+    }
+
+    fn finish_capacity_run(registry: &mut Registry, accepted: &Accepted) -> Run {
+        let running = registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: format!("fixture-turn-{}", accepted.run.id),
+                },
+                20,
+            )
+            .unwrap();
+        registry
+            .update_agent_run(
+                running.id,
+                running.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: Default::default(),
+                },
+                30,
+            )
+            .unwrap()
+    }
+
+    fn capacity_child_origin(registry: &mut Registry) -> Origin {
+        let authority = registry.register_agent_authority(&source()).unwrap();
+        let origin = registry.execution_origin(&authority).unwrap();
+        assert!(matches!(origin, Origin::Child { .. }));
+        origin
+    }
+
+    #[test]
+    fn user_retains_100_completed_conversations_with_names_ownership_and_retries() {
+        let (mut registry, directory, mut request) = fixture();
+        let origin = registry.execution_origin(&Authority::default()).unwrap();
+        assert_eq!(origin, Origin::User);
+        let mut completed = Vec::new();
+        let mut first_request = None;
+        for index in 0..100 {
+            request.idempotency_key = format!("user-{index}");
+            request.name = Some(format!("conversation-{index}"));
+            let accepted = registry.submit_agent(&origin, &request, 10).unwrap();
+            assert!(accepted.created);
+            let finished = finish_capacity_run(&mut registry, &accepted);
+            if index == 0 {
+                first_request = Some(request.clone());
+            }
+            completed.push((accepted.agent, finished));
+        }
+        drop(registry);
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(registry.agents(Some(&origin)).unwrap().len(), 100);
+        assert_eq!(registry.model().unwrap().channels.len(), 100);
+        for (agent, run) in &completed {
+            assert!(!agent.closed);
+            assert_eq!(agent.origin, Origin::User);
+            assert_eq!(registry.agent(agent.id).unwrap(), *agent);
+            assert_eq!(registry.agent_run(run.id).unwrap(), *run);
+            assert_eq!(run.state, State::Succeeded);
+        }
+        let first_request = first_request.unwrap();
+        let retried = registry.submit_agent(&origin, &first_request, 40).unwrap();
+        assert!(!retried.created);
+        assert_eq!(retried.agent, completed[0].0);
+        assert_eq!(retried.run, completed[0].1);
+        let before = registry.model().unwrap();
+        let mut changed = first_request.clone();
+        changed.prompt = "Different work".into();
+        assert!(
+            registry
+                .submit_agent(&origin, &changed, 41)
+                .unwrap_err()
+                .contains("idempotency")
+        );
+        let mut duplicate_name = first_request;
+        duplicate_name.idempotency_key = "duplicate-name".into();
+        assert!(
+            registry
+                .submit_agent(&origin, &duplicate_name, 42)
+                .unwrap_err()
+                .contains("named conversation-0")
+        );
+        let child = capacity_child_origin(&mut registry);
+        let foreign = Submit {
+            name: None,
+            destination: Destination::Existing(completed[0].0.id),
+            prompt: "Foreign caller".into(),
+            idempotency_key: "foreign".into(),
+        };
+        assert!(
+            registry
+                .submit_agent(&child, &foreign, 43)
+                .unwrap_err()
+                .contains("does not own")
+        );
+        assert_eq!(registry.model().unwrap(), before);
+        assert_eq!(registry.agents(Some(&origin)).unwrap().len(), 100);
+    }
+
+    #[test]
+    fn child_and_automation_keep_64_open_conversation_limit_after_completion() {
+        for automated in [false, true] {
+            let (mut registry, _directory, mut request) = fixture();
+            let origin = if automated {
+                Origin::Automation {
+                    id: uuid::Uuid::new_v4(),
+                }
+            } else {
+                capacity_child_origin(&mut registry)
+            };
+            let mut last = None;
+            for index in 0..MAX_CHILDREN {
+                request.idempotency_key = format!("delegated-{index}");
+                let accepted = registry.submit_agent(&origin, &request, 10).unwrap();
+                finish_capacity_run(&mut registry, &accepted);
+                last = Some(accepted.agent.id);
+            }
+            let retry = registry.submit_agent(&origin, &request, 40).unwrap();
+            assert!(!retry.created);
+            assert_eq!(Some(retry.agent.id), last);
+            let before = registry.model().unwrap();
+            request.idempotency_key = "delegated-over-limit".into();
+            assert!(
+                registry
+                    .submit_agent(&origin, &request, 41)
+                    .unwrap_err()
+                    .contains("child limit")
+            );
+            assert_eq!(registry.agents(Some(&origin)).unwrap().len(), MAX_CHILDREN);
+            assert_eq!(registry.model().unwrap(), before);
+            assert!(
+                registry
+                    .agents(Some(&origin))
+                    .unwrap()
+                    .iter()
+                    .all(|agent| !agent.closed)
+            );
+            // A full delegated scope does not consume the user's open quota.
+            assert!(
+                registry
+                    .submit_agent(&Origin::User, &request, 42)
+                    .unwrap()
+                    .created
+            );
+        }
+    }
+
+    #[test]
+    fn every_origin_keeps_eight_concurrent_or_uncertain_runs() {
+        for kind in 0..3 {
+            let (mut registry, _directory, mut request) = fixture();
+            let origin = match kind {
+                0 => registry.execution_origin(&Authority::default()).unwrap(),
+                1 => capacity_child_origin(&mut registry),
+                _ => Origin::Automation {
+                    id: uuid::Uuid::new_v4(),
+                },
+            };
+            for index in 0..MAX_PARENT_RUNNING {
+                request.idempotency_key = format!("active-{index}");
+                let accepted = registry.submit_agent(&origin, &request, 10).unwrap();
+                match index % 4 {
+                    0 => {} // Accepted work still has an owner.
+                    1 | 2 => {
+                        let run = registry
+                            .update_agent_run(
+                                accepted.run.id,
+                                1,
+                                Update::Started {
+                                    provider_key: format!("turn-{index}"),
+                                },
+                                11,
+                            )
+                            .unwrap();
+                        if index % 4 == 2 {
+                            registry
+                                .update_agent_run(run.id, run.revision, Update::Waiting, 12)
+                                .unwrap();
+                        }
+                    }
+                    _ => {
+                        registry
+                            .update_agent_run(
+                                accepted.run.id,
+                                1,
+                                Update::Finished {
+                                    state: State::Interrupted,
+                                    result: Default::default(),
+                                },
+                                12,
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+            assert!(
+                !registry
+                    .submit_agent(&origin, &request, 15)
+                    .unwrap()
+                    .created
+            );
+            let before = registry.model().unwrap();
+            request.idempotency_key = "ninth".into();
+            assert!(
+                registry
+                    .submit_agent(&origin, &request, 20)
+                    .unwrap_err()
+                    .contains("concurrency limit")
+            );
+            assert_eq!(registry.model().unwrap(), before);
+            assert_eq!(
+                registry.agents(Some(&origin)).unwrap().len(),
+                MAX_PARENT_RUNNING
+            );
+        }
+    }
+
+    #[test]
+    fn global_32_run_limit_spans_user_child_and_automation_origins() {
+        let (mut registry, _directory, mut request) = fixture();
+        let origins = [
+            registry.execution_origin(&Authority::default()).unwrap(),
+            capacity_child_origin(&mut registry),
+            capacity_child_origin(&mut registry),
+            Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            },
+        ];
+        let mut first = None;
+        for (scope, origin) in origins.iter().enumerate() {
+            for index in 0..MAX_PARENT_RUNNING {
+                request.idempotency_key = format!("global-{scope}-{index}");
+                let accepted = registry.submit_agent(origin, &request, 10).unwrap();
+                if first.is_none() {
+                    first = Some(accepted);
+                }
+            }
+        }
+        assert_eq!(registry.agents(None).unwrap().len(), MAX_RUNNING);
+        let other = Origin::Automation {
+            id: uuid::Uuid::new_v4(),
+        };
+        let before = registry.model().unwrap();
+        request.idempotency_key = "global-over-limit".into();
+        assert!(
+            registry
+                .submit_agent(&other, &request, 20)
+                .unwrap_err()
+                .contains("concurrency limit")
+        );
+        assert_eq!(registry.model().unwrap(), before);
+        finish_capacity_run(&mut registry, &first.unwrap());
+        assert!(registry.submit_agent(&other, &request, 40).unwrap().created);
+        // Completed conversation remains open alongside the 32 owned runs.
+        assert_eq!(registry.agents(None).unwrap().len(), MAX_RUNNING + 1);
+    }
+
+    #[test]
+    fn competing_transactions_preserve_child_and_user_run_boundaries() {
+        for child_limit in [true, false] {
+            let (mut registry, _directory, mut request) = fixture();
+            let origin = if child_limit {
+                capacity_child_origin(&mut registry)
+            } else {
+                Origin::User
+            };
+            let count = if child_limit {
+                MAX_CHILDREN - 1
+            } else {
+                MAX_PARENT_RUNNING - 1
+            };
+            for index in 0..count {
+                request.idempotency_key = format!("before-race-{index}");
+                let accepted = registry.submit_agent(&origin, &request, 10).unwrap();
+                if child_limit {
+                    finish_capacity_run(&mut registry, &accepted);
+                }
+            }
+            let before = registry.model().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mut workers = Vec::new();
+            for index in 0..2 {
+                let mut connection = registry.execution_connection().unwrap();
+                let mut request = request.clone();
+                request.idempotency_key = format!("race-{index}");
+                let origin = origin.clone();
+                let barrier = barrier.clone();
+                workers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    connection.submit_agent(&origin, &request, 40)
+                }));
+            }
+            let results = workers
+                .into_iter()
+                .map(|worker| worker.join())
+                .collect::<Vec<_>>();
+            let results = results.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+            let rejected = results
+                .iter()
+                .find_map(|result| result.as_ref().err())
+                .unwrap();
+            assert!(rejected.contains(if child_limit {
+                "child limit"
+            } else {
+                "concurrency limit"
+            }));
+            assert_eq!(registry.agents(Some(&origin)).unwrap().len(), count + 1);
+            assert_eq!(
+                registry.model().unwrap().channels.len(),
+                before.channels.len() + 1
+            );
+        }
     }
 
     #[test]

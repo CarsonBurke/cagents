@@ -21,11 +21,13 @@ mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
 mod channels;
+mod format;
 pub use agents::AgentCommand;
 mod automations;
 mod completions;
 pub use automations::AutomationCommand;
 mod sessions;
+mod terminal_list;
 pub use sessions::SessionsArgs;
 mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
@@ -292,8 +294,20 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum TerminalCommand {
-    /// List terminal descriptors known to the daemon.
-    List,
+    /// List running terminals with their observed state and title.
+    List {
+        /// Include retained terminals that are not running.
+        #[arg(long, conflicts_with = "exited")]
+        all: bool,
+        /// Show only terminals with a recorded process exit.
+        #[arg(long)]
+        exited: bool,
+    },
+    /// Read one terminal's full descriptor, including launch and recovery details.
+    Show {
+        /// The daemon terminal ID.
+        terminal_id: TerminalId,
+    },
     /// Spawn a terminal with an optional argv-based command.
     Spawn {
         /// Working directory for the terminal (defaults to the current directory).
@@ -3041,18 +3055,19 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         client.authenticate(authority).map_err(protocol_error)?;
     }
     match command {
-        TerminalCommand::List => {
+        TerminalCommand::List { all, exited } => {
             let terminals = client.list().map_err(protocol_error)?;
-            let human = terminals
+            Ok(terminal_list::list(&terminals, client.proof(), all, exited))
+        }
+        TerminalCommand::Show { terminal_id } => {
+            let terminals = client.list().map_err(protocol_error)?;
+            let terminal = terminals
                 .iter()
-                .map(descriptor_line)
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(CommandOutput {
-                command: "terminal.list",
-                data: json!({ "terminals": terminals }),
-                human,
-            })
+                .find(|terminal| terminal.session.id == terminal_id)
+                .ok_or_else(|| {
+                    AppError::new("not_found", format!("Unknown terminal {terminal_id}"))
+                })?;
+            Ok(terminal_list::show(terminal, client.proof()))
         }
         TerminalCommand::Spawn { cwd, argv } => {
             let cwd = absolute_working_directory(cwd)
@@ -3509,11 +3524,7 @@ fn channel_output(
                 })
                 .collect::<Vec<_>>();
             channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
-            let human = channels
-                .iter()
-                .map(|channel| channel_line(channel))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = channel_list_human(&channels);
             Ok(CommandOutput {
                 command: "channel.list",
                 data: json!({ "channels": channels, "sequence": model.sequence }),
@@ -3531,6 +3542,23 @@ fn channel_output(
             })
         }
     }
+}
+
+fn channel_list_human(channels: &[&ModelChannel]) -> String {
+    format::table(
+        ["CHANNEL", "REPOSITORY", "TITLE"],
+        channels
+            .iter()
+            .map(|channel| {
+                [
+                    channel.id.to_string(),
+                    channel.repository.display().to_string(),
+                    channel.title.clone(),
+                ]
+            })
+            .collect(),
+        "No channels",
+    )
 }
 
 /// One channel per line: id, repository, title.
@@ -3738,6 +3766,33 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readable_channel_list_has_headers_and_a_plain_empty_state() {
+        assert_eq!(channel_list_human(&[]), "No channels");
+        let channel = ModelChannel {
+            id: ChannelId::new(),
+            repository: "/repo/.git".into(),
+            title: "Build\nlogs".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+        };
+        let human = channel_list_human(&[&channel]);
+        assert_eq!(human.lines().count(), 2);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["CHANNEL", "REPOSITORY", "TITLE"]
+        );
+        assert!(human.ends_with("Build logs"));
+        assert!(human.contains(&channel.id.to_string()));
+        // Channel repository identity is retained; it is not asserted to be a checkout path.
+        assert!(human.contains("/repo/.git"));
+    }
+
     #[test]
     fn rebuild_stop_requires_explicit_permission_before_touching_a_daemon() {
         let error = execute_daemon(DaemonCommand::StopForRebuild {

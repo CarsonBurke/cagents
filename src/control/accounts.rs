@@ -1,8 +1,34 @@
 use super::*;
 use crate::account::info::{Query, Report};
 
+mod list;
+mod preferences;
+mod removal;
+
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountCommand {
+    /// Choose the selected daemon's account for new conversations.
+    Default {
+        /// Provider whose default changes: claude, codex, or omp (automatic only).
+        #[arg(value_parser = crate::control::agents::parse_provider)]
+        provider: crate::agent::Provider,
+        /// A full ID from account list (for example claude/system), or automatic.
+        selection: crate::account::preferences::DefaultSelection,
+    },
+    /// Forget a linked account registration; managed file deletion remains unavailable.
+    Remove {
+        /// Stable account ID from account list on the selected device.
+        account: crate::account::AccountId,
+        /// Confirm removing the registration; linked files are left unchanged.
+        #[arg(long, required = true)]
+        yes: bool,
+    },
+    /// List active accounts and any retained caller account from the selected daemon.
+    List {
+        /// Limit rows to claude, codex, or omp; never probe its CLI.
+        #[arg(long, value_parser = crate::control::agents::parse_provider)]
+        provider: Option<crate::agent::Provider>,
+    },
     /// Read caller context and configured account plan allowances without probing.
     Info {
         /// Limit account rows to claude, codex, or omp.
@@ -18,23 +44,52 @@ pub enum AccountCommand {
 }
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
-    let AccountCommand::Info {
-        provider,
-        account,
-        refresh,
-    } = command;
-    let socket = control_daemon_socket()?;
-    let mut client =
-        ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
-    let deadline = refresh.then(|| Instant::now() + Duration::from_secs(90));
-    let report = match client
-        .agent_before(
-            Authority::from_environment(),
-            crate::agent_execution::Operation::AccountInfo(Query {
+    let (query, listing) = match command {
+        AccountCommand::Default {
+            provider,
+            selection,
+        } => return preferences::execute(provider, selection),
+        AccountCommand::Remove { account, yes } => return removal::execute(account, yes),
+        AccountCommand::List { provider } => (list::query(provider), true),
+        AccountCommand::Info {
+            provider,
+            account,
+            refresh,
+        } => (
+            Query {
                 provider,
                 account,
                 refresh,
-            }),
+            },
+            false,
+        ),
+    };
+    let socket = control_daemon_socket()?;
+    let mut client =
+        ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    let report = read_report(&mut client, Authority::from_environment(), query)?;
+    if listing {
+        return Ok(list::output(&report));
+    }
+    Ok(CommandOutput {
+        command: "account.info",
+        human: human(&report),
+        data: serde_json::to_value(report).map_err(|e| AppError::new("account_info", e))?,
+    })
+}
+
+fn read_report(
+    client: &mut ControlClient,
+    authority: Authority,
+    query: Query,
+) -> Result<Report, AppError> {
+    let deadline = query
+        .refresh
+        .then(|| Instant::now() + Duration::from_secs(90));
+    let report = match client
+        .agent_before(
+            authority,
+            crate::agent_execution::Operation::AccountInfo(query),
             deadline,
         )
         .map_err(protocol_error)?
@@ -47,11 +102,7 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
             ));
         }
     };
-    Ok(CommandOutput {
-        command: "account.info",
-        human: human(&report),
-        data: serde_json::to_value(report).map_err(|e| AppError::new("account_info", e))?,
-    })
+    Ok(report)
 }
 
 fn human(report: &Report) -> String {

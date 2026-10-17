@@ -104,6 +104,7 @@ impl ObservedRequests {
 impl ObservedRequests {
     pub fn events(self) -> impl Iterator<Item = super::Event> {
         self.requests.into_iter().map(move |request| super::Event {
+            content: None,
             evidence: super::Evidence {
                 key: request.request.clone(),
                 kind: super::Kind::ReviewRequested,

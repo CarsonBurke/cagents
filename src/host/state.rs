@@ -70,6 +70,8 @@ pub(crate) struct TerminalRecord {
     events: VecDeque<(u64, WireTerminalEvent)>,
     /// Stable provider metadata must survive eviction from the transition log.
     conversation_title: Option<(u64, String)>,
+    /// Actual OSC/display title, separate from provider conversation metadata.
+    display_title: Option<String>,
     working_directory: Option<(u64, PathBuf)>,
 }
 
@@ -629,6 +631,65 @@ impl HostState {
                 }
             }
         }
+        if let ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title,
+            source,
+        } = &edit
+        {
+            let expected = self
+                .registry()?
+                .title_conversation(*id, *card, *expected_revision)
+                .map_err(model_unavailable)?;
+            let invalid = || {
+                ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "The conversation's current name or source changed; refresh before suggesting a title",
+                    false,
+                )
+            };
+            let actual = self.chats.get(&expected.id).ok_or_else(invalid)?;
+            if expected.proof.as_ref() != Some(self.proof())
+                || actual.session.launch.provider != expected.launch.provider
+                || actual.session.launch.recipe != expected.launch.recipe
+            {
+                return Err(invalid());
+            }
+            // Model mutations serialize under this HostLock. Read only resident
+            // metadata, not Store, snapshot/history or files. A later B edit
+            // cannot overtake this A admission; a delayed A sees B's current name.
+            let (session, current_title) =
+                actual.handle.conversation_title().map_err(|reason| {
+                    let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
+                    ProtocolError::new(
+                        if busy {
+                            ProtocolErrorCode::QueueFull
+                        } else {
+                            ProtocolErrorCode::Internal
+                        },
+                        if busy {
+                            "Conversation metadata is busy; retry the original title suggestion"
+                        } else {
+                            "Conversation metadata is unavailable"
+                        },
+                        busy,
+                    )
+                })?;
+            if session.is_none() || session != expected.launch.session_id {
+                return Err(invalid());
+            }
+            let current_title = current_title
+                .as_deref()
+                .and_then(crate::workspace_model::channel_title);
+            match source {
+                crate::model::ChannelTitleSource::Provider
+                    if current_title.as_ref() == Some(title) => {}
+                crate::model::ChannelTitleSource::Prompt if current_title.is_none() => {}
+                _ => return Err(invalid()),
+            }
+        }
         let registry = self.registry()?;
         let applied = registry.apply(&edit).map_err(|error| {
             if error == super::model::Registry::VIEW_SOURCE_CONFLICT {
@@ -1002,6 +1063,7 @@ impl HostState {
             ),
             upgrade_sources: record.upgrade_sources.clone(),
             upgrade_relaunches: record.upgrade_relaunches.clone(),
+            title: record.display_title.clone(),
         })
     }
 
@@ -1203,6 +1265,7 @@ impl HostState {
                 event_sequence: 0,
                 events: VecDeque::new(),
                 conversation_title: None,
+                display_title: None,
                 working_directory: None,
             },
         );
@@ -4067,6 +4130,14 @@ fn record_event_from(
         }
         record.event_sequence = record.event_sequence.saturating_add(1);
         let sequence = record.event_sequence;
+        if let WireTerminalEvent::TitleChanged { title } = &wire_event {
+            record.display_title = Some(
+                title
+                    .chars()
+                    .take(crate::terminal_ipc::MAX_TERMINAL_TITLE_CHARACTERS)
+                    .collect(),
+            );
+        }
         if let WireTerminalEvent::ConversationTitleChanged { title } = &wire_event {
             record.conversation_title = Some((sequence, title.clone()));
         }
@@ -4177,6 +4248,192 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn channel_title_admission_rejects_delayed_names_from_the_same_resident_actor() {
+        use crate::{
+            chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec},
+            chat::{self, Command, Event},
+            model::{CardId, CardKind, ChannelId, ChannelTitleSource, LaunchRecipe},
+            workspace_model::views::{Pane, Scope},
+        };
+        const SESSION: &str = "12345678-1234-4234-8234-123456789abc";
+        struct Names(usize);
+        impl Adapter for Names {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Session {
+                            id: SESSION.into(),
+                            title: Some("Initial bundle audit".into()),
+                        },
+                        Event::Ready(true),
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.0 += 1;
+                Ok(Step {
+                    events: vec![Event::Session {
+                        id: SESSION.into(),
+                        title: Some(
+                            if self.0 == 1 {
+                                "Encryption performance review"
+                            } else {
+                                "Final encryption audit"
+                            }
+                            .into(),
+                        ),
+                    }],
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = test_host();
+        state.install_model(
+            super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+        );
+        let recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut spec = ProcessSpec::from(&recipe);
+        spec.transport = TransportSpec::History;
+        let mut adapter = Names(0);
+        let mut initial = adapter.initialize().unwrap();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle =
+            chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle
+            .conversation_title()
+            .ok()
+            .and_then(|(session, _)| session)
+            .as_deref()
+            != Some(SESSION)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "history worker did not publish its exact session"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let session = chat::Session {
+            id: TerminalId::new(),
+            proof: Some(state.proof().clone()),
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe,
+                session_id: Some(SESSION.into()),
+            },
+        };
+        state.chats.insert(
+            session.id,
+            super::super::chat::Record {
+                execution_instance: uuid::Uuid::new_v4(),
+                session: session.clone(),
+                handle: handle.clone(),
+                console_recipe: None,
+                paired_terminal: None,
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let id = ChannelId::new();
+        let card = CardId::new();
+        state
+            .edit_model(
+                1,
+                ModelEdit::OpenProject {
+                    repository: directory.path().into(),
+                    name: "project".into(),
+                    kind: Default::default(),
+                },
+            )
+            .unwrap();
+        state
+            .edit_model(
+                1,
+                ModelEdit::CreateChannel {
+                    id,
+                    repository: directory.path().into(),
+                    title: String::new(),
+                    title_source: Default::default(),
+                },
+            )
+            .unwrap();
+        let model = state
+            .edit_model(
+                1,
+                ModelEdit::SeedView {
+                    scope: Scope::Channel(id),
+                    closed: Vec::new(),
+                    panes: vec![Pane {
+                        id: card,
+                        title: "Chat".into(),
+                        user_title: None,
+                        pending_terminal_start: false,
+                        width_fraction: 1.,
+                        scope: Some(directory.path().into()),
+                        kind: CardKind::Chat(session),
+                    }],
+                },
+            )
+            .unwrap();
+        let revision = model.views[0].revision;
+        let suggest = |name: &str| ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision: revision,
+            title: name.into(),
+            source: ChannelTitleSource::Provider,
+        };
+        let apply = |state: &mut HostState, origin, edit: ModelEdit| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match state.edit_model(origin, edit.clone()) {
+                    Err(error) if error.retryable && error.code == ProtocolErrorCode::QueueFull => {
+                        assert!(Instant::now() < deadline, "resident metadata remained busy");
+                        std::thread::yield_now();
+                    }
+                    result => break result,
+                }
+            }
+        };
+        apply(&mut state, 1, suggest("Initial bundle audit")).unwrap();
+        handle.command(Command::Compact).unwrap();
+        apply(&mut state, 2, suggest("Encryption performance review")).unwrap();
+        assert!(
+            apply(&mut state, 1, suggest("Initial bundle audit")).is_err(),
+            "delayed A must not replace accepted B at the same view revision"
+        );
+        assert_eq!(
+            state.read_model().unwrap().channels[0].title,
+            "Encryption performance review"
+        );
+        handle.command(Command::Compact).unwrap();
+        apply(&mut state, 1, suggest("Final encryption audit")).unwrap();
+        assert_eq!(
+            state.read_model().unwrap().channels[0].title,
+            "Final encryption audit"
+        );
+        handle.close().unwrap();
     }
 
     #[test]
@@ -6177,6 +6434,149 @@ for line in sys.stdin:
             assert_eq!(count, expected);
         }
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn terminal_descriptor_retains_only_native_display_title_after_event_eviction() {
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/cat".into(),
+            arguments: vec![],
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        let id = TerminalId::new();
+        let session = TerminalSession {
+            id,
+            recovery_origin: None,
+            predecessor: None,
+            owned_codex_listener: None,
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .finish_spawn(1, session, handle.clone(), false)
+            .unwrap();
+        let weak = Arc::downgrade(&shared);
+        let observations = (|| -> Result<_, ProtocolError> {
+            let initial = shared.lock().unwrap().descriptor(1, id)?.title;
+            record_event(
+                &weak,
+                id,
+                TerminalEvent::ConversationTitleChanged("Provider conversation".into()),
+            );
+            let provider_only = shared.lock().unwrap().descriptor(1, id)?.title;
+            record_event_from(
+                &weak,
+                id,
+                TerminalEvent::TitleChanged("界".repeat(300)),
+                Some(&handle),
+            );
+            for _ in 0..EVENT_REPLAY_CAPACITY {
+                record_event(&weak, id, TerminalEvent::Bell);
+            }
+            let (retained, evicted) = {
+                let state = shared.lock().unwrap();
+                (
+                    state
+                        .list(1)
+                        .into_iter()
+                        .find(|row| row.session.id == id)
+                        .unwrap()
+                        .title,
+                    state
+                        .replay_events(id, 0)?
+                        .iter()
+                        .all(|(_, event)| !matches!(event, WireTerminalEvent::TitleChanged { .. })),
+                )
+            };
+            record_event_from(
+                &weak,
+                id,
+                TerminalEvent::TitleChanged(String::new()),
+                Some(&handle),
+            );
+            let cleared = shared.lock().unwrap().descriptor(1, id)?.title;
+            Ok((initial, provider_only, retained, evicted, cleared))
+        })();
+        handle.shutdown().unwrap();
+        let (initial, provider_only, retained, evicted, cleared) = observations.unwrap();
+        assert_eq!(initial, None);
+        assert_eq!(
+            provider_only, None,
+            "provider conversation titles are a different observation"
+        );
+        assert_eq!(retained, Some("界".repeat(256)));
+        assert!(evicted, "the title must survive actual transition eviction");
+        assert_eq!(cleared, Some(String::new()));
+    }
+
+    #[test]
+    fn terminal_descriptor_title_comes_from_an_actual_pty_osc_event() {
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "printf '\\033]2;Native terminal title\\007'; exec /bin/cat".into(),
+            ],
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        let id = TerminalId::new();
+        let session = TerminalSession {
+            id,
+            recovery_origin: None,
+            predecessor: None,
+            owned_codex_listener: None,
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let (_, handle) = spawn_terminal_view_owned(
+            &shared,
+            1,
+            session,
+            TerminalSpawnOptions::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observation = (|| -> Result<_, String> {
+            loop {
+                let title = shared
+                    .lock()
+                    .unwrap()
+                    .descriptor(1, id)
+                    .map_err(|error| error.message)?
+                    .title;
+                if title.as_deref() == Some("Native terminal title") {
+                    return Ok(title);
+                }
+                if Instant::now() >= deadline {
+                    return Err("production event observer did not publish the PTY title".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        })();
+        handle.shutdown().unwrap();
+        assert_eq!(observation.unwrap(), Some("Native terminal title".into()));
     }
 
     #[test]
