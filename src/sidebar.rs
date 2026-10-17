@@ -5410,7 +5410,9 @@ fn compact_project_identity(
     let identity: Element<'static, SidebarAction> = if project.avatar.is_some() {
         project_icon(project, ROW_ICON_WIDTH as u16)
     } else {
-        design::caption(initials).into()
+        design::caption(initials)
+            .class(theme::Text::Color(cosmic::iced::Color::WHITE))
+            .into()
     };
     let chip = widget::container(identity)
         .center_x(ROW_ICON_WIDTH)
@@ -11509,6 +11511,83 @@ pub(crate) mod tests {
                     && name.contains("agent is waiting for input")),
             "{names:?}"
         );
+    }
+
+    #[test]
+    fn compact_project_initials_paint_bright_inside_the_colored_chip() {
+        use cosmic::iced::{
+            Color, Rectangle,
+            advanced::{
+                mouse,
+                renderer::{Headless, Style},
+            },
+        };
+
+        for theme in [cosmic::Theme::light(), cosmic::Theme::dark()] {
+            for name in ["Alpha", "Atlas", "Beta", "Gamma"] {
+                let mut project = project();
+                project.name = name.into();
+                project.avatar = None;
+                let mut renderer = headless_renderer();
+                // No selected outline or hover: bright ink inside the chip
+                // must come from its actual initials, not a white border.
+                let mut element =
+                    compact_project_identity(&project, false, false, &SidebarState::default());
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(COMPACT_WIDTH, WORKTREE_ROW_HEIGHT));
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                element.as_widget().draw(
+                    &tree,
+                    &mut renderer,
+                    &theme,
+                    &Style::default(),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &viewport,
+                );
+                let width = COMPACT_WIDTH as usize;
+                let pixels = renderer.screenshot(
+                    Size::new(width as u32, WORKTREE_ROW_HEIGHT as u32),
+                    1.0,
+                    Color::BLACK,
+                );
+                let background = project_identity(name).1.into_rgba8();
+                let chip: Vec<_> = pixels
+                    .chunks_exact(4)
+                    .enumerate()
+                    .filter(|(_, pixel)| {
+                        pixel
+                            .iter()
+                            .zip(background)
+                            .all(|(a, b)| a.abs_diff(b) <= 1)
+                    })
+                    .map(|(index, _)| (index % width, index / width))
+                    .collect();
+                assert!(
+                    !chip.is_empty(),
+                    "missing actual chip background for {name}"
+                );
+                let left = chip.iter().map(|(x, _)| *x).min().unwrap();
+                let right = chip.iter().map(|(x, _)| *x).max().unwrap();
+                let top = chip.iter().map(|(_, y)| *y).min().unwrap();
+                let bottom = chip.iter().map(|(_, y)| *y).max().unwrap();
+                let bright_ink = (top + 2..bottom.saturating_sub(1))
+                    .flat_map(|y| (left + 2..right.saturating_sub(1)).map(move |x| (x, y)))
+                    .filter(|(x, y)| {
+                        let offset = (y * width + x) * 4;
+                        pixels[offset..offset + 3].iter().all(|value| *value >= 210)
+                    })
+                    .count();
+                assert!(
+                    bright_ink >= 3,
+                    "{name} initials lack bright foreground ink"
+                );
+            }
+        }
     }
 
     #[test]
