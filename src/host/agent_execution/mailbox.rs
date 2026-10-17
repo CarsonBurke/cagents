@@ -351,6 +351,10 @@ struct Inner {
     seal: Arc<Seal>,
     state: Mutex<WakeState>,
     changed: Condvar,
+    #[cfg(test)]
+    scanned_generation: Mutex<Option<u64>>,
+    #[cfg(test)]
+    scanned: Condvar,
 }
 
 /// Wakes the courier. Cheap enough to call on every activity edge.
@@ -372,6 +376,42 @@ pub(in crate::host) struct Courier {
 }
 
 impl Courier {
+    /// A completed scan witness only: waiting never wakes or advances delivery.
+    #[cfg(test)]
+    pub(in crate::host) fn wait_for_scan(&self, generation: u64) {
+        let completed = self
+            .handle
+            .0
+            .scanned_generation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (completed, _) = self
+            .handle
+            .0
+            .scanned
+            .wait_timeout_while(completed, Duration::from_secs(5), |completed| {
+                completed.is_none_or(|completed| completed < generation)
+            })
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(
+            completed.is_some_and(|completed| completed >= generation),
+            "courier did not finish the requested scan"
+        );
+    }
+
+    #[cfg(test)]
+    pub(in crate::host) fn wake_and_wait_for_scan(&self) {
+        self.handle.wake();
+        let generation = self
+            .handle
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation;
+        self.wait_for_scan(generation);
+    }
+
     pub(in crate::host) fn start(host: &SharedHost) -> Result<Self, String> {
         let registry = registry(host)?;
         let seal = host
@@ -386,6 +426,10 @@ impl Courier {
             seal,
             state: Mutex::new(WakeState::default()),
             changed: Condvar::new(),
+            #[cfg(test)]
+            scanned_generation: Mutex::new(None),
+            #[cfg(test)]
+            scanned: Condvar::new(),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -454,6 +498,15 @@ impl Handle {
                 }
             };
             drop(host);
+            #[cfg(test)]
+            {
+                *self
+                    .0
+                    .scanned_generation
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(observed);
+                self.0.scanned.notify_all();
+            }
             let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
             let (state, _) = self
                 .0
@@ -657,6 +710,8 @@ mod tests {
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
             changed: Condvar::new(),
+            scanned_generation: Mutex::new(None),
+            scanned: Condvar::new(),
         }));
         let owner = handle.clone();
         let (reported, received) = std::sync::mpsc::channel();

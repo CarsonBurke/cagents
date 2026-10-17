@@ -421,14 +421,8 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let proof = state.proof().clone();
     // A conversation that starts or settles may take the messages left for it.
-    if matches!(
-        &update,
-        Update::Ready
-            | Update::Activity {
-                state: crate::agent::ActivityState::Idle,
-                ..
-            }
-    ) && let Some(courier) = &state.mailbox
+    if matches!(&update, Update::PromptAvailable)
+        && let Some(courier) = &state.mailbox
     {
         courier.wake();
     }

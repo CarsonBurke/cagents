@@ -103,6 +103,20 @@ while IFS= read -r frame; do
       n=$((n + 1))
       printf 'prompt\n' >> "$HOME/../prompts"
       case "$frame" in
+        *COURIER_BACKGROUND*)
+          printf '{"type":"assistant","uuid":"launch-child","message":{"id":"launch-child","role":"assistant","content":[{"type":"tool_use","id":"courier-child","name":"Agent","input":{"run_in_background":true}}]}}\n'
+          printf '{"type":"user","uuid":"child-launch-result","tool_use_result":{"status":"async_launched","agentId":"courier-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"courier-child","content":"Launched"}]}}\n'
+          printf '{"type":"system","subtype":"task_started","task_id":"courier-agent","tool_use_id":"courier-child","task_type":"local_agent"}\n'
+          : > "$HOME/../courier-busy"
+          attempts=0
+          while [ ! -e "$HOME/../courier-release" ]; do
+            attempts=$((attempts + 1))
+            [ "$attempts" -lt 500 ] || exit 1
+            sleep 0.01
+          done
+          ;;
+      esac
+      case "$frame" in
         *BACKGROUND_PERMISSION*)
           # A background subagent asks, then the main turn ends without it.
           printf '{"type":"control_request","request_id":"background-%s","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-%s","input":{"command":"true"}}}\n' "$n" "$n"
@@ -3040,6 +3054,125 @@ fn disconnected_blocked_inbox_poll_keeps_mail_pending() {
             .state,
         Delivery::Read
     );
+}
+
+#[test]
+fn queued_mail_wakes_when_parent_settles_with_a_running_background_child() {
+    use crate::agent_execution::mailbox::{Outgoing, State as Delivery, To};
+    if isolated("queued_mail_wakes_when_parent_settles_with_a_running_background_child").is_some() {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap();
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, "release");
+        }
+    }
+    let release = Release(root.join("courier-release"));
+    request.prompt = "COURIER_BACKGROUND".into();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (session, handle) = loop {
+        let session = registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .session;
+        if let Some(HostedSession::Chat(session)) = session
+            && let Some(handle) = host
+                .lock()
+                .unwrap()
+                .chats
+                .get(&session.id)
+                .map(|record| record.handle.clone())
+            && root.join("courier-busy").exists()
+            && handle.background_subagents().len() == 1
+        {
+            assert!(!handle.is_idle());
+            break (session.id, handle);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture never reached its gated busy parent"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let Reply::Sent(sent) = process(
+        &host,
+        Authority::default(),
+        Operation::SendMessage(Outgoing {
+            to: To::Session(session.to_string()),
+            body: "Exact courier delivery after parent result".into(),
+            wait_ms: None,
+        }),
+    )
+    .unwrap() else {
+        panic!("sent receipt");
+    };
+    let stored = || {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(sent.message.id)
+            .unwrap()
+            .unwrap()
+    };
+    let courier = mailbox::Courier::start(&host).unwrap();
+    courier.wait_for_scan(0); // Completes before result; never wakes the courier.
+    assert_eq!(stored().state, Delivery::Pending);
+    assert_eq!(handle.activity(), crate::agent::ActivityState::Working);
+    std::fs::write(&release.0, "release").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = handle.snapshot(None).unwrap();
+        let deliveries = snapshot
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(&item.content,
+            chat::ItemContent::Delivery { body, .. } if body == &sent.message.body)
+            })
+            .count();
+        if deliveries == 1 && handle.is_idle() {
+            assert_eq!(snapshot.activity(), crate::agent::ActivityState::Working);
+            assert_eq!(
+                snapshot
+                    .subagents
+                    .iter()
+                    .filter(|child| child.status == chat::ToolStatus::Running)
+                    .count(),
+                1
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "eligible mail missed its parent-ready wake: {} visible deliveries",
+            deliveries
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let delivered = stored();
+    assert_eq!(delivered.state, Delivery::Delivered);
+    assert_eq!(delivered.to.session, Some(session));
+    assert_eq!(delivered.to.lineage, sent.message.to.lineage);
+    courier.wake_and_wait_for_scan();
+    assert_eq!(stored(), delivered);
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "one original prompt and one courier prompt, including after another scan"
+    );
+    drop(courier);
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
 }
 
 #[test]
