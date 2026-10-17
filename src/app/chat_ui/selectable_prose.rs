@@ -588,84 +588,88 @@ mod tests {
     fn selection_and_find_paint_only_the_hit_testable_part_of_a_ligature() {
         use iced::advanced::renderer::{Headless, Renderer};
 
-        for find in [false, true] {
-            let mut renderer = crate::app::tests::headless_renderer();
-            let source = "office affinity";
-            let mut selectable = Selectable {
-                plain: source.into(),
-                spans: vec![Span::new(source)].into(),
-                matches: vec![],
-                size: 32.0.into(),
-                font: iced::Font::with_name("DejaVu Sans"),
-                target: Target {
-                    card: CardId::new(),
-                    generation: 0,
-                },
-            };
-            let mut tree =
-                Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
-            let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0));
-            let node = selectable.layout(&mut tree, &renderer, &limits);
-            let state = tree.state.downcast_mut::<State>();
-            let (start, end, x, y, width, count) = state
-                .paragraph()
-                .buffer()
-                .layout_runs()
-                .find_map(|run| {
-                    run.glyphs.iter().find_map(|glyph| {
-                        let cluster = &run.text[glyph.start..glyph.end];
-                        let count = cluster.graphemes(true).count();
-                        (count > 1).then(|| {
-                            (
-                                glyph.start,
-                                glyph.start + cluster.graphemes(true).next().unwrap().len(),
-                                glyph.x,
-                                run.line_top,
-                                glyph.w / count as f32,
-                                count,
-                            )
+        for (source, expected, rtl) in [("office affinity", "f", false), ("لا", "ل", true)] {
+            for find in [false, true] {
+                let mut renderer = crate::app::tests::headless_renderer();
+                let mut selectable = Selectable {
+                    plain: source.into(),
+                    spans: vec![Span::new(source)].into(),
+                    matches: vec![],
+                    size: 32.0.into(),
+                    font: iced::Font::with_name("DejaVu Sans"),
+                    target: Target {
+                        card: CardId::new(),
+                        generation: 0,
+                    },
+                };
+                let mut tree =
+                    Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+                let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0));
+                let node = selectable.layout(&mut tree, &renderer, &limits);
+                let state = tree.state.downcast_mut::<State>();
+                let (start, end, x, y, width, count) = state
+                    .paragraph()
+                    .buffer()
+                    .layout_runs()
+                    .find_map(|run| {
+                        run.glyphs.iter().find_map(|glyph| {
+                            let cluster = &run.text[glyph.start..glyph.end];
+                            let count = cluster.graphemes(true).count();
+                            (count > 1).then(|| {
+                                (
+                                    glyph.start,
+                                    glyph.start + cluster.graphemes(true).next().unwrap().len(),
+                                    glyph.x,
+                                    run.line_top,
+                                    glyph.w / count as f32,
+                                    count,
+                                )
+                            })
                         })
                     })
-                })
-                .expect("fixture font must shape a real multi-grapheme ligature");
-            assert_eq!(
-                state.hit(Point::new(x + width * 0.75, y + 1.0)),
-                end,
-                "the first ligature component must expose its own caret endpoint"
-            );
-            assert_eq!(&source[start..end], "f");
-            if find {
-                selectable.matches = vec![start..end];
-            } else {
-                state.anchor = start;
-                state.end = end;
-            }
-            let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
-            renderer.reset(viewport);
-            selectable.draw(
-                &tree,
-                &mut renderer,
-                &cosmic::theme::active(),
-                &renderer::Style::default(),
-                Layout::new(&node),
-                mouse::Cursor::Unavailable,
-                &viewport,
-            );
-            let pixels = renderer.screenshot(Size::new(400, 100), 1.0, iced::Color::WHITE);
-            let color = if find {
-                design::accent_wash(&cosmic::theme::active())
-            } else {
-                design::accent_color(&cosmic::theme::active())
-            }
-            .into_rgba8();
-            for part in 0..count {
-                let px = (x + width * (part as f32 + 0.5)) as usize;
-                let py = (y + 1.0) as usize;
-                let painted = pixels[(py * 400 + px) * 4..][..4]
-                    .iter()
-                    .zip(color)
-                    .all(|(actual, expected)| actual.abs_diff(expected) <= 1);
-                assert_eq!(painted, part == 0, "ligature component {part}, find={find}");
+                    .expect("fixture font must shape a real multi-grapheme ligature");
+                assert_eq!(
+                    state.hit(Point::new(
+                        x + width * if rtl { 0.25 } else { 0.75 },
+                        y + 1.0
+                    )),
+                    end,
+                    "the first ligature component must expose its own caret endpoint"
+                );
+                assert_eq!(&source[start..end], expected);
+                if find {
+                    selectable.matches = vec![start..end];
+                } else {
+                    state.anchor = start;
+                    state.end = end;
+                }
+                let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
+                renderer.reset(viewport);
+                selectable.draw(
+                    &tree,
+                    &mut renderer,
+                    &cosmic::theme::active(),
+                    &renderer::Style::default(),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &viewport,
+                );
+                let pixels = renderer.screenshot(Size::new(400, 100), 1.0, iced::Color::WHITE);
+                let color = if find {
+                    design::accent_wash(&cosmic::theme::active())
+                } else {
+                    design::accent_color(&cosmic::theme::active())
+                }
+                .into_rgba8();
+                for part in 0..count {
+                    let px = (x + width * (part as f32 + 0.5)) as usize;
+                    let py = (y + 1.0) as usize;
+                    let painted = pixels[(py * 400 + px) * 4..][..4]
+                        .iter()
+                        .zip(color)
+                        .all(|(actual, expected)| actual.abs_diff(expected) <= 1);
+                    assert_eq!(painted, part == 0, "ligature component {part}, find={find}");
+                }
             }
         }
     }
