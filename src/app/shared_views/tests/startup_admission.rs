@@ -172,11 +172,42 @@ fn settle(app: &mut Cagents, task: Task<Message>) {
                 .await
                 .expect("startup Task must settle against the scripted daemon")
             {
-                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
-                    message @ Message::ChatUi(_),
-                )) = action
-                {
-                    pending.push_back(app.update(message));
+                match action {
+                    cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                        // Scope selection also schedules lifecycle/focus work.
+                        // Drive those actual reducers, not only chat replies.
+                        pending.push_back(app.update(message));
+                    }
+                    cosmic::iced::runtime::Action::Widget(mut operation) => {
+                        use cosmic::iced::advanced::{
+                            Layout, layout,
+                            widget::{Tree, operation::Outcome},
+                        };
+                        let renderer = crate::app::tests::headless_renderer();
+                        let mut element = cosmic::Application::view(app);
+                        let mut tree = Tree::new(element.as_widget());
+                        let node = element.as_widget_mut().layout(
+                            &mut tree,
+                            &renderer,
+                            &layout::Limits::new(
+                                cosmic::iced::Size::ZERO,
+                                cosmic::iced::Size::new(1600.0, 1200.0),
+                            ),
+                        );
+                        loop {
+                            element.as_widget_mut().operate(
+                                &mut tree,
+                                Layout::new(&node),
+                                &renderer,
+                                &mut operation,
+                            );
+                            match operation.finish() {
+                                Outcome::Chain(next) => operation = next,
+                                _ => break,
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -185,6 +216,14 @@ fn settle(app: &mut Cagents, task: Task<Message>) {
 
 fn cached_chat() -> (Cagents, ChannelId, ChannelId, Pane, uuid::Uuid) {
     let (mut app, active, hidden, mut pane) = fixture();
+    // Navigation schedules the configured offscreen maintenance grace. Keep
+    // it bounded in this fixture while still executing its real reducer;
+    // provider admission retains its independent five-second timeout.
+    app.settings.hibernation_delay_ms = 0;
+    app.lifecycle = LifecycleManager::new(LifecycleBudget {
+        max_hot_cards: app.settings.max_hot_cards,
+        offscreen_grace: Duration::ZERO,
+    });
     let identity = app.workspace_model.identity;
     pane.kind = CardKind::Chat(Session {
         id: TerminalId::new(),
@@ -506,7 +545,7 @@ fn retired_cached_draft_stays_readable_and_cannot_start_provider() {
         loaded.pending_chat_admissions,
         saved.pending_chat_admissions
     );
-    let (mut restored, _, _, _) = fixture();
+    let (mut restored, _, _, _, _) = cached_chat();
     restored.chat_ui = chat_ui::State::with_drafts(loaded.chat_drafts.clone());
     restored.durable = Arc::new(loaded);
     restored.shared_views = State::for_workspace(&restored.durable);
@@ -600,7 +639,7 @@ fn replacement_admission_keeps_old_draft_beside_exact_canonical_chat() {
         )
         .unwrap();
     let loaded = store.load_workspace(saved.id, None).unwrap().unwrap();
-    let (mut restored, _, _, _) = fixture();
+    let (mut restored, _, _, _, _) = cached_chat();
     restored.chat_ui = chat_ui::State::with_drafts(loaded.chat_drafts.clone());
     restored.durable = Arc::new(loaded);
     restored.workspace = Cagents::rebuild_workspace(&restored.durable);
