@@ -1965,6 +1965,8 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod startup_admission;
+
     use super::*;
     use crate::model::{
         BrowserId, BrowserRestoreFidelity, BrowserSession, ChannelId, ProjectChannel, ProjectId,
