@@ -5,6 +5,7 @@ use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
+pub mod notification;
 pub mod presentation;
 pub mod pricing;
 
@@ -12,6 +13,8 @@ pub mod pricing;
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod claude_metadata;
 #[cfg(feature = "ui")]
 pub mod client;
 #[cfg(feature = "host")]
@@ -865,6 +868,10 @@ impl PromptSuggestion {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Resident live-turn excerpt; never transcript serialization or wire state.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub notification_preview: std::sync::Arc<notification::Preview>,
     /// Daemon wall-clock milliseconds sampled for this publication. Clients
     /// advance this with their monotonic clock instead of comparing timestamps
     /// from two machines. Absent only in older data and synthetic snapshots.
@@ -1904,6 +1911,7 @@ pub enum Event {
     },
     Session {
         id: String,
+        /// Absent means no new name. A different session or Reset clears an old name.
         title: Option<String>,
     },
     Capabilities(Capabilities),

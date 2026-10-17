@@ -421,6 +421,8 @@ pub struct SidebarChannel {
     pub selected: bool,
     pub activity: Option<crate::agent::ActivityState>,
     pub unread: bool,
+    /// Bounded derived context from the shared notification journal.
+    pub notification_preview: Option<String>,
     pub chats: usize,
     pub has_panes: bool,
     /// The creation rank the shared registry assigned. Carried on the row
@@ -437,6 +439,19 @@ pub struct SidebarChannel {
 }
 
 impl SidebarChannel {
+    #[cfg(test)]
+    pub(crate) fn tooltip_for_test(&self) -> &str {
+        &self.tooltip
+    }
+
+    pub fn with_notification_preview(mut self, preview: Option<String>) -> Self {
+        if let Some(preview) = &preview {
+            self.tooltip = format!("{}\n{preview}", self.tooltip).into_boxed_str();
+            self.accessible_name = format!("{}, {preview}", self.accessible_name).into_boxed_str();
+        }
+        self.notification_preview = preview;
+        self
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ChannelId,
@@ -457,6 +472,7 @@ impl SidebarChannel {
             selected,
             activity,
             unread,
+            notification_preview: None,
             chats,
             has_panes,
             ordinal,
@@ -2903,6 +2919,22 @@ impl SidebarState {
 
     pub fn acknowledge_agent_update(&mut self, card: CardId) {
         self.agent_updates.remove(&card);
+    }
+
+    /// A removed surface is no longer an attention target. This is not a
+    /// read acknowledgement: do not retain a dim row or acknowledge a journal.
+    pub fn forget_card_attention(&mut self, card: CardId) {
+        self.agent_updates.remove(&card);
+        self.clear_agent_activity(card);
+    }
+
+    /// The caller has proved alias and canonical are the same conversation.
+    /// Keep existing canonical attribution; otherwise await its current filing
+    /// instead of carrying the alias's historical worktree into another view.
+    pub fn transfer_card_update(&mut self, alias: CardId, canonical: CardId) {
+        if alias != canonical && self.agent_updates.remove(&alias).is_some() {
+            self.agent_updates.entry(canonical).or_insert(None);
+        }
     }
 
     pub fn has_card_update(&self, card: CardId) -> bool {
@@ -5853,19 +5885,23 @@ fn channel_view(
         channel.delete_id.clone(),
         compact,
     );
-    grid.mount(with_deletion_retry(
-        channel_context_controls(action, channel.id, inert, selection_count),
-        deletion,
-        compact,
-        &channel.title,
-        gated(
-            SidebarAction::RetryChannelDeletion {
-                channel_id: channel.id,
-            },
-            modal_open,
-        ),
-        entity_id("channel.retry-delete", channel.id),
-    ))
+    crate::reorder::channel_target(
+        grid.mount(with_deletion_retry(
+            channel_context_controls(action, channel.id, inert, selection_count),
+            deletion,
+            compact,
+            &channel.title,
+            gated(
+                SidebarAction::RetryChannelDeletion {
+                    channel_id: channel.id,
+                },
+                modal_open,
+            ),
+            entity_id("channel.retry-delete", channel.id),
+        )),
+        channel.id,
+        !inert,
+    )
 }
 
 /// Keep the row's primary button and its destructive quick action separate.
@@ -6337,6 +6373,14 @@ impl widget::menu::Action for ContextCommand<'_> {
     }
 }
 
+fn project_channel_command_label(worktree: Option<WorktreeId>) -> &'static str {
+    if worktree.is_some() {
+        "New thread"
+    } else {
+        "New channel"
+    }
+}
+
 fn context_controls<'a>(
     content: impl Into<Element<'a, SidebarAction>>,
     project_id: ProjectId,
@@ -6357,7 +6401,11 @@ fn context_controls<'a>(
         let mut commands = vec![
             ("Open folder".to_owned(), None, ProjectCommand::Reveal),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
-            ("New thread".to_owned(), None, ProjectCommand::NewChannel),
+            (
+                project_channel_command_label(worktree_id).to_owned(),
+                None,
+                ProjectCommand::NewChannel,
+            ),
         ];
         if git {
             commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
@@ -10690,6 +10738,15 @@ mod row_interaction {
                     .0
                     .set(layout.bounds().y + layout.virtual_offset().y);
             }
+            if matches!(self.kind, Kind::Group { .. })
+                && let Some(header) =
+                    child_layouts(&self.kind, tree.state.downcast_ref::<State>(), layout).next()
+            {
+                crate::reorder::block_channel_drop(
+                    operation,
+                    header.bounds() - header.virtual_offset(),
+                );
+            }
             operation.container(None, layout.bounds());
             operation.traverse(&mut |operation| {
                 for ((child, tree), layout) in
@@ -11343,6 +11400,15 @@ mod row_interaction {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn project_and_worktree_menu_creation_labels_match_their_scope() {
+        assert_eq!(super::project_channel_command_label(None), "New channel");
+        assert_eq!(
+            super::project_channel_command_label(Some(crate::model::WorktreeId::new())),
+            "New thread"
+        );
+    }
+
     #[test]
     fn inspector_header_exposes_an_explicit_copy_branch_action() {
         let renderer = headless_renderer();
@@ -12414,6 +12480,57 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn attention_forgetting_closed_surface_is_not_read_retention_and_keeps_other_updates() {
+        let mut state = SidebarState::default();
+        let closed = CardId::new();
+        let other = CardId::new();
+        let project = project_id(1);
+        let worktree = WorktreeId::new();
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.observe_agent_update(closed, project, worktree);
+        state.observe_card_update(other);
+        state.set_agent_activity(
+            closed,
+            project,
+            worktree,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Codex,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        state.forget_card_attention(closed);
+        assert!(!state.has_card_update(closed));
+        assert!(!state.has_agent_update(project, worktree));
+        assert!(state.card_activity(closed).is_none());
+        assert!(state.has_card_update(other));
+    }
+
+    #[test]
+    fn attention_alias_update_transfer_preserves_canonical_owner_without_old_worktree_attribution()
+    {
+        let mut state = SidebarState::default();
+        let alias = CardId::new();
+        let canonical = CardId::new();
+        let project = project_id(1);
+        let old = WorktreeId::new();
+        let current = WorktreeId::new();
+        state.observe_agent_update(alias, project, old);
+        state.transfer_card_update(alias, canonical);
+        assert!(!state.has_card_update(alias));
+        assert_eq!(state.agent_updates.get(&canonical), Some(&None));
+        assert!(!state.has_agent_update(project, old));
+        state.observe_agent_update(canonical, project, current);
+        state.observe_agent_update(alias, project, old);
+        state.transfer_card_update(alias, canonical);
+        assert_eq!(
+            state.agent_updates.get(&canonical),
+            Some(&Some((project, current)))
+        );
+        state.transfer_card_update(canonical, canonical);
+        assert!(state.has_card_update(canonical));
     }
 
     #[test]
