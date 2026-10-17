@@ -25037,6 +25037,7 @@ mod tests {
         }
         assert_eq!(app.sidebar_state.files_query(), "");
         assert!(!app.sidebar_state.files_filter_open());
+        let unchanged_sidebar = app.sidebar_state.clone();
         let departed = ActiveWorktreeKey {
             worktree_id: WorktreeId::new(),
             ..key
@@ -25052,11 +25053,21 @@ mod tests {
             },
             SidebarAction::ToggleFilesFilter { key: departed },
         ] {
-            assert!(
-                iced::runtime::task::into_stream(app.update(Message::Sidebar(action))).is_none()
-            );
+            // The public dispatch postlude may wrap an empty result in a
+            // batch. Refused stale input must emit no effects, regardless of
+            // whether that batch has a stream allocation.
+            if let Some(mut effects) =
+                iced::runtime::task::into_stream(app.update(Message::Sidebar(action)))
+            {
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                assert!(executor.block_on(effects.next()).is_none());
+            }
             assert_eq!(app.sidebar_state.files_query(), "");
             assert!(!app.sidebar_state.files_filter_open());
+            assert_eq!(app.sidebar_state, unchanged_sidebar);
         }
     }
 
