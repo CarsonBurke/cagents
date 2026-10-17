@@ -4320,6 +4320,14 @@ impl Cagents {
                 }
             }
         }
+        // Unread state belongs to the saved workspace, not its visible strip.
+        // Update durable before the unchanged-snapshot fast path so reads also
+        // persist when no draft or editor navigation changed.
+        let mut agent_updates = self.sidebar_state.unread_updates().clone();
+        agent_updates.retain(|card, _| open_cards.contains(card));
+        if agent_updates != self.durable.agent_updates {
+            Arc::make_mut(&mut self.durable).agent_updates = agent_updates;
+        }
         if defaults.is_empty()
             && chat_drafts == self.durable.chat_drafts
             && repository_navigation == self.durable.repository_navigation

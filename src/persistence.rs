@@ -261,6 +261,7 @@ pub struct WorkspaceManifest {
     pub active_channel: Option<ChannelId>,
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
+    pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
@@ -1744,6 +1745,7 @@ impl StateStore {
             active_channel: manifest.active_channel,
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
+            agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
@@ -1760,6 +1762,17 @@ impl StateStore {
         });
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
+        }
+        // A stored unread owner cannot keep a worktree in Attention when its
+        // card failed to restore, was closed, or no longer belongs here.
+        if !state.agent_updates.is_empty() {
+            let open: HashSet<_> = state
+                .cards
+                .iter()
+                .filter(|card| card.existence.is_open())
+                .map(|card| card.id)
+                .collect();
+            state.agent_updates.retain(|card, _| open.contains(card));
         }
         Ok(Some(RestoredWorkspace { state, warnings }))
     }
@@ -3315,6 +3328,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:agent_updates"),
+        &to_json(&state.agent_updates)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:chat_drafts"),
         &to_json(&state.chat_drafts)?,
     )?;
@@ -4677,6 +4695,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace editor navigation", &value))
         .transpose()?
         .unwrap_or_default(),
+        agent_updates: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:agent_updates"),
+        )?
+        .map(|value| from_json("workspace unread agent updates", &value))
+        .transpose()?
+        .unwrap_or_default(),
         chat_drafts: metadata(
             connection,
             &format!("workspace:{id}:navigation:chat_drafts"),
@@ -5312,6 +5337,7 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
@@ -6236,6 +6262,152 @@ mod tests {
             serde_json::from_value::<WorkspaceState>(legacy)
                 .unwrap()
                 .workspace_history
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unread_agent_updates_survive_autosave_restore_and_read() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("state.db");
+        let boot_id = boot("unread");
+        let store = StateStore::open(&database, boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let card = workspace.cards[0].id;
+        workspace
+            .agent_updates
+            .insert(card, Some((ProjectId::new(), WorktreeId::new())));
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let store = StateStore::open(&database, boot_id.clone()).unwrap();
+        assert_eq!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .agent_updates,
+            workspace.agent_updates
+        );
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .agent_updates,
+            workspace.agent_updates
+        );
+        workspace.agent_updates.clear();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let store = StateStore::open(&database, boot_id).unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .agent_updates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unread_agent_updates_cold_restore_drops_unreadable_closed_and_missing_owners() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("partial.db");
+        let boot_id = boot("partial-unread");
+        let store = StateStore::open(&database, boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let survivor = workspace.cards[0].id;
+        let survivor_owner = (ProjectId::new(), WorktreeId::new());
+        let mut broken = workspace.cards[0].clone();
+        broken.id = CardId::new();
+        let broken_id = broken.id;
+        let broken_terminal = TerminalId::new();
+        let CardKind::Terminal(session) = &mut broken.kind else {
+            unreachable!()
+        };
+        session.id = broken_terminal;
+        session.transcript_path = None;
+        let mut closed = broken.clone();
+        closed.id = CardId::new();
+        let closed_id = closed.id;
+        closed.existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        let CardKind::Terminal(session) = &mut closed.kind else {
+            unreachable!()
+        };
+        session.id = TerminalId::new();
+        workspace.cards.extend([broken, closed]);
+        workspace.agent_updates = BTreeMap::from([
+            (survivor, Some(survivor_owner)),
+            (broken_id, Some((ProjectId::new(), WorktreeId::new()))),
+            (closed_id, Some((ProjectId::new(), WorktreeId::new()))),
+            (CardId::new(), Some((ProjectId::new(), WorktreeId::new()))),
+        ]);
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let db = Connection::open(&database).unwrap();
+        db.execute(
+            "DELETE FROM terminal_recipes WHERE terminal_id=?1",
+            [broken_terminal.to_string()],
+        )
+        .unwrap();
+        drop(db);
+        let store = StateStore::open(&database, boot_id).unwrap();
+        let restored = store
+            .load_workspace_restored(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.warnings.len(), 1);
+        assert!(restored.warnings[0].contains(&broken_id.to_string()));
+        assert!(!restored.state.cards.iter().any(|card| card.id == broken_id));
+        assert_eq!(
+            restored.state.agent_updates,
+            BTreeMap::from([(survivor, Some(survivor_owner))])
+        );
+    }
+
+    #[test]
+    fn unread_agent_updates_legacy_workspace_metadata_defaults_to_read() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("legacy.db");
+        let boot_id = boot("unread-legacy");
+        let store = StateStore::open(&database, boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        workspace.agent_updates.insert(workspace.cards[0].id, None);
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let db = Connection::open(&database).unwrap();
+        db.execute(
+            "DELETE FROM metadata WHERE key=?1",
+            [format!(
+                "workspace:{}:navigation:agent_updates",
+                workspace.id
+            )],
+        )
+        .unwrap();
+        drop(db);
+        let store = StateStore::open(&database, boot_id).unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .agent_updates
+                .is_empty()
+        );
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        legacy.as_object_mut().unwrap().remove("agent_updates");
+        assert!(
+            serde_json::from_value::<WorkspaceState>(legacy)
+                .unwrap()
+                .agent_updates
                 .is_empty()
         );
     }
