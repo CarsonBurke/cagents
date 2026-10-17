@@ -1386,7 +1386,7 @@ mod tests {
                 &path,
                 format!(
                     "{}\n",
-                    serde_json::json!({"type":"user","sessionId":id,"cwd":root.path(),"message":{"content":format!("Prompt {age}")}})
+                    serde_json::json!({"type":"user","sessionId":id,"cwd":root.path(),"message":{"content":format!("Review prompt {age}")}})
                 ),
             )
             .unwrap();
@@ -1435,7 +1435,7 @@ mod tests {
         assert_eq!(conversations.len(), FIRST_BATCH - 2);
         assert_eq!(conversations[0].id, ids[0]);
         assert_eq!(conversations[1].id, ids[2]);
-        assert_eq!(titles, &[(entry.card, "Prompt 1".to_owned())]);
+        assert_eq!(titles, &[(entry.card, "Review prompt 1".to_owned())]);
         let Progress::Found { read, .. } = &progress[3] else {
             panic!("the rest follow")
         };
